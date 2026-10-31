@@ -5010,7 +5010,9 @@ unsigned qpf2k_gdn_parts() {
         if (!v || v[0] != '1') return 0U;
         const char* p = std::getenv("STRIX_QPF2K_GDN_PARTS");
         // default 55 = 23 | 32 (decay-NaN dispatch ON: exact, t5 in-engine 32K core 1434.8 -> 1287.2 + 3.7 ms flag; 32K ABA never slower)
-        return p ? static_cast<unsigned>(std::atoi(p)) & 255U : 55U;
+        // Gorgon: 51 (bit 4 off). On our nodes the cooperative fused core deadlocks after the PLE-reclaim drop evicts
+        // the KFD queues (GPU 100 % busy, no progress); the unfused kernels produce the same tokens.
+        return p ? static_cast<unsigned>(std::atoi(p)) & 255U : 51U;
     }();
     return qpf2k::suppressed(qpf2k::Item::gdn) ? 0U : parts;
 }

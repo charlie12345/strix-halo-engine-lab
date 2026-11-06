@@ -29,7 +29,10 @@ sesión sigue aparcada); la generación se detiene al final del contexto con el 
 Las sesiones de conversación están activadas por defecto en la ruta de servicio de dos nodos: una petición con id
 de `session` aparca su estado en la RAM del host justo después de la respuesta y se reanuda desde él en el turno
 siguiente (turno 2 de una conversación de 6,989 tokens, prompt de 6,989 tokens restaurado entero: respuesta completa
-3.84–5.16 s en lugar de 15.20–16.16 s, de los que el prefill simple son 12.51–13.46 s, 519–559 tok/s; salida idéntica). Presupuesto min(8 GiB, 25 % de la memoria libre tras cargar el modelo),
+3.84–5.16 s en lugar de 15.20–16.16 s, de los que el prefill simple son 12.51–13.46 s, 519–559 tok/s; salida idéntica).
+El guardado y la reanudación calculan el hash de cada sección del punto de control una sola vez, en paralelo: la
+respuesta con sesión del turno 2 tarda 2.78 s en lugar de 4.66 s (mediana, −40.7 %, IC 95 % −42.0 a −39.5 %, 20
+ejecuciones emparejadas, salida y bytes del punto de control idénticos). Presupuesto min(8 GiB, 25 % de la memoria libre tras cargar el modelo),
 como máximo 8 sesiones aparcadas; el nivel de disco es opcional (`--session-disk on` / `STRIX_SESSION_DISK=1`).
 Se desactiva con `--session-cache off` / `STRIX_SESSION_CACHE=0` o con los interruptores de baseline. Las
 peticiones con nombre decodifican sin el drafter DSpark (mantiene el prefill agrupado; los ids son los mismos);

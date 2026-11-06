@@ -30,6 +30,8 @@ Conversation sessions are on by default on the two-node serve route: a request w
 state in host RAM right after the reply and resumes from it on the next turn (turn 2 of a 6,989-token
 conversation, 6,989-token prompt all restored: whole reply 3.84–5.16 s instead of 15.20–16.16 s, of which the
 plain prefill is 12.51–13.46 s, 519–559 tok/s; identical output).
+Save and resume hash each checkpoint section once, in parallel: the turn-2 session reply takes 2.78 s instead
+of 4.66 s (median, −40.7 %, 95 % CI −42.0 to −39.5 %, 20 paired runs, identical output and checkpoint bytes).
 Budget min(8 GiB, 25 % of the memory free after the model load), at most 8 parked sessions; the disk tier is
 opt-in (`--session-disk on` / `STRIX_SESSION_DISK=1`). Turn off with `--session-cache off` /
 `STRIX_SESSION_CACHE=0` or the baseline switches. Named requests decode without the DSpark drafter (keeps

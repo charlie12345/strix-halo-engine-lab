@@ -230,6 +230,12 @@ int main() {
     auto d = c;
     d.generation = "different";
     check(state_digest(c) == state_digest(d), "canonical generation");
+    // Wire format is frozen: these digests come from the one-thread codec (public main b074b5361).
+    {
+      auto golden = sample();
+      check(sha(encode(golden)) == "013b6c86942310a2ab5e5efa18fbf94b811f9c942f4655a4d1ecd45629ea026c", "codec golden bytes");
+      check(state_digest(golden) == "35b11a2d46dd2ae182aae887be60e3f7dd41511b9c6ba17247fca3185ce4fc2b", "codec golden state digest");
+    }
     Bytes raw(5 * 76800, 0xA5);
     auto sections = split_state(raw, 5);
     check(join_state(sections) == raw, "cache row split/join");

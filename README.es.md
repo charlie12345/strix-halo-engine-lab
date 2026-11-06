@@ -224,6 +224,18 @@ compila nada); cada palanca de velocidad tiene su propio flag y sin ellas la eje
 [Instalación, ficheros del modelo, un comando por clip y vuelta atrás](docs/models/minimax-h3/README.es.md#h3-install) ·
 [desglose por etapas](docs/models/minimax-h3/README.es.md#h3-result).
 
+## Añadir un modelo
+
+Registrar metadatos descriptivos de un contrato compilado ya soportado requiere un archivo de descripción
+(`models/<nombre>.toml`) y una fila del registro (una tabla `[models.<id>]` en `models/registry.toml`). Estos archivos
+no añaden soporte de inferencia para otro tamaño o contrato de checkpoint. Cambiar el contrato sigue requiriendo
+adaptar el motor de la familia y superar su cualificación, y una arquitectura nueva necesita su propio módulo de familia
+(kernels, recorrido de capas, adaptador) que se conecta al código común de perfil, recibo y tabla de interruptores. El
+registro no se lee en tiempo de ejecución; `strix-model-registry-tests` solo comprueba nombres, existencia de archivos
+y cobertura. Alcance por familia, comandos y las comprobaciones en el dispositivo antes de dar un modelo por soportado:
+[docs/engine/adding-a-model.es.md](docs/engine/adding-a-model.es.md). La tabla de interruptores generada a partir de las
+tablas de valores por defecto de los motores: [docs/engine/optimization-table.md](docs/engine/optimization-table.md).
+
 ## Documentación
 
 - **Primeros pasos:** [requisitos, compilación y ejecución](docs/getting-started/README.es.md) ·

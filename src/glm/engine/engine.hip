@@ -16,6 +16,9 @@
 #include "glm/engine/glm_r1b.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
+#include "glm/load/glm_model_description.hpp"
+#include "glm/moe/glm_moe.hpp"
+#include "glm/prefill/glm_pf_moe.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "glm/spec/glm_spec_dev.hpp"
 #include "glm/xfer/glm_post_fast.hpp"
@@ -37,6 +40,19 @@
 #include <string>
 
 namespace strix::glm::engine {
+
+// The explicit host adapter checks the description against the common model
+// dimensions. Also bind the duplicated TP2 MoE and exchange constants here,
+// without changing their kernel headers or their compiled launch schedules.
+static_assert(moe::kHidden == kHidden && moe::kExperts == kExperts && moe::kTopE == kTopE && moe::kInter * 2 == kExpertI);
+static_assert(pf::kMoeHidden == kHidden && pf::kMoeExperts == kExperts && pf::kMoeTop == kTopE && pf::kMoeInter * 2 == kExpertI);
+static_assert(xfer::GlmSchedule::kLayers == kLayers && xfer::kRowF32 == std::size_t{kHidden} * sizeof(float));
+static_assert(kEps == static_cast<float>(model::contract::rms_eps) && kHcEps == static_cast<float>(model::contract::hc_eps));
+static_assert(kL2Eps == static_cast<float>(model::contract::l2_eps) && kLnEps == static_cast<float>(model::contract::ln_eps));
+static_assert(kGateLow == static_cast<float>(model::contract::gate_lower_bound) && kClamp == static_cast<float>(model::contract::clamp));
+static_assert(kRouteScale == static_cast<float>(model::contract::route_scale) && kRouteDenEps == static_cast<float>(model::contract::route_den_eps));
+static_assert(kInvSqrt128 == static_cast<float>(model::contract::inv_sqrt128) && kInvSqrt32 == static_cast<float>(model::contract::inv_sqrt32));
+static_assert(kMlaScale == static_cast<float>(model::contract::mla_scale));
 
 namespace {
 
@@ -889,6 +905,7 @@ struct Engine::Impl {
     }
 
     LoadReport load_checked(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows) {
+        model::validate_model_directory(opt.model_dir);
         load_identity = identity;
         const auto t0 = Clock::now();
         start_monitor();

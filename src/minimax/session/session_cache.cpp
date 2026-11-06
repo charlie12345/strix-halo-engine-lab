@@ -4,9 +4,11 @@
 #include "strix/model_content_hash.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <random>
@@ -14,6 +16,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -273,7 +276,44 @@ Receipt parse_receipt(std::span<const std::uint8_t> b) {
   r.end();
   return o;
 }
-std::string shared(const Checkpoint &c) {
+// Per-section work (hash, copy) is independent; spread it over a few host threads. Callers keep the
+// sequential check order, so results and refusal precedence match the one-thread codec.
+template <class F> void for_each_section(std::size_t n, F &&f) {
+  const unsigned hw = std::max(1U, std::thread::hardware_concurrency());
+  const std::size_t workers = std::min<std::size_t>({n, 8, hw});
+  if (workers <= 1) {
+    for (std::size_t i = 0; i < n; ++i)
+      f(i);
+    return;
+  }
+  std::atomic<std::size_t> next{0};
+  std::vector<std::exception_ptr> errors(workers);
+  auto run = [&](std::size_t w) {
+    try {
+      for (std::size_t i; (i = next.fetch_add(1)) < n;)
+        f(i);
+    } catch (...) {
+      errors[w] = std::current_exception();
+      next.store(n);
+    }
+  };
+  std::vector<std::thread> pool;
+  for (std::size_t w = 1; w < workers; ++w)
+    pool.emplace_back(run, w);
+  run(0);
+  for (auto &t : pool)
+    t.join();
+  for (auto &e : errors)
+    if (e)
+      std::rethrow_exception(e);
+}
+std::vector<std::string> section_digests(const std::vector<Section> &sections) {
+  std::vector<std::string> d(sections.size());
+  for_each_section(sections.size(), [&](std::size_t i) { d[i] = sha(sections[i].bytes); });
+  return d;
+}
+// `digests[i]` is SHA-256 of sections[i].bytes (computed or verified by the codec).
+std::string shared(const Checkpoint &c, const std::vector<std::string> &digests) {
   Writer w;
   w.text(c.id);
   w.text(c.compat);
@@ -281,10 +321,10 @@ std::string shared(const Checkpoint &c) {
   w.u64(c.history.size());
   for (auto t : c.history)
     w.u64(t);
-  for (const auto &s : c.sections)
-    if (s.replicated) {
-      w.text(s.name);
-      w.text(sha(s.bytes));
+  for (std::size_t i = 0; i < c.sections.size(); ++i)
+    if (c.sections[i].replicated) {
+      w.text(c.sections[i].name);
+      w.text(digests.at(i));
     }
   return sha(w.b);
 }
@@ -481,8 +521,13 @@ Bytes join_state(const std::vector<Section> &sections) {
       b.insert(b.end(), s.bytes.begin(), s.bytes.end());
   return b;
 }
-Bytes encode(const Checkpoint &c) {
+namespace {
+// Codec with its digests: `digests` = per-section SHA-256 (as recorded in the header), `root` = the
+// manifest root SHA-256 (the trailer). Same bytes as before; the section hashes run in parallel.
+Bytes encode_with(const Checkpoint &c, std::vector<std::string> &digests,
+                  std::string &root) {
   valid(c);
+  digests = section_digests(c.sections);
   Writer w;
   w.text("strix-session-v1");
   w.text("minimax-conversation-v1");
@@ -498,83 +543,141 @@ Bytes encode(const Checkpoint &c) {
     w.u64(t);
   w.u64(c.sections.size());
   std::uint64_t offset = 0;
-  for (const auto &s : c.sections) {
+  std::uint64_t payload = 0;
+  for (const auto &s : c.sections)
+    payload += s.bytes.size();
+  for (std::size_t i = 0; i < c.sections.size(); ++i) {
+    const auto &s = c.sections[i];
     w.text(s.name);
     w.u64(c.rank);
     w.u64(s.replicated);
     w.u64(offset);
     w.u64(s.bytes.size());
-    w.text(sha(s.bytes));
+    w.text(digests[i]);
     offset += s.bytes.size();
   }
-  for (const auto &s : c.sections)
-    w.raw(s.bytes);
-  w.text(sha(w.b));
+  const auto header = w.b.size();
+  w.b.reserve(header + payload + 72);
+  w.b.resize(header + payload);
+  std::vector<std::size_t> at(c.sections.size());
+  for (std::size_t i = 0, o = header; i < c.sections.size(); o += c.sections[i].bytes.size(), ++i)
+    at[i] = o;
+  for_each_section(c.sections.size(), [&](std::size_t i) {
+    std::copy(c.sections[i].bytes.begin(), c.sections[i].bytes.end(), w.b.begin() + at[i]);
+  });
+  root = sha(w.b);
+  w.text(root);
   return w.b;
 }
-Checkpoint decode(std::span<const std::uint8_t> b, const std::string &compat,
-                  std::uint32_t rank, std::uint32_t world,
-                  std::uint64_t max_bytes) {
+Checkpoint decode_with(std::span<const std::uint8_t> b, const std::string &compat,
+                       std::uint32_t rank, std::uint32_t world,
+                       std::uint64_t max_bytes, std::vector<std::string> &digests,
+                       std::string &root) {
   require(b.size() <= max_bytes && b.size() >= 72, "envelope size");
   auto body = b.first(b.size() - 72);
   Reader trailer{b.last(72)};
-  require(trailer.text() == sha(body), "session_corrupt: manifest root SHA-256");
-  Reader r{body};
-  require(r.text() == "strix-session-v1" &&
-              r.text() == "minimax-conversation-v1",
-          "schema");
+  const auto recorded_root = trailer.text();
+  // The root pass runs beside the header parse and the per-section hash+copy; the root is still
+  // checked first, so every refusal keeps its sequential precedence.
+  std::string computed_root;
+  std::exception_ptr root_error;
+  std::thread root_thread([&] {
+    try {
+      computed_root = sha(body);
+    } catch (...) {
+      root_error = std::current_exception();
+    }
+  });
+  auto check_root = [&] {
+    if (root_thread.joinable())
+      root_thread.join();
+    if (root_error)
+      std::rethrow_exception(root_error);
+    require(recorded_root == computed_root, "session_corrupt: manifest root SHA-256");
+  };
   Checkpoint c;
-  c.id = r.text();
-  c.generation = r.text();
-  c.compat = r.text();
-  require(c.compat == compat && r.text() == sha(string_bytes(compat)),
-          "session_incompatible: compat mismatch");
-  c.rank = r.u32();
-  c.world = r.u32();
-  require(c.rank == rank && c.world == world, "TP geometry mismatch");
-  auto &f = c.frontier;
-  f.consumed = r.u64();
-  f.emitted = r.u64();
-  f.accepted = r.u64();
-  f.drafter = r.u64();
-  f.control = r.u64();
-  f.pending = r.u32();
-  f.pending_valid = r.bit();
-  f.drafter_ready = r.bit();
-  f.sampling = r.text();
-  f.lineage = r.text();
-  auto n = r.u64();
-  require(n <= body.size() / 8, "history bounds");
-  for (std::uint64_t i = 0; i < n; ++i)
-    c.history.push_back(r.u32());
-  auto count = r.u64();
-  require(count <= 512, "section count");
   struct Desc {
     std::uint64_t n;
     std::string hash;
   };
   std::vector<Desc> desc;
-  std::uint64_t offset = 0;
-  for (std::uint64_t i = 0; i < count; ++i) {
-    Section s;
-    s.name = r.text();
-    require(r.u64() == rank, "section rank");
-    s.replicated = r.bit();
-    require(r.u64() == offset, "section offset");
-    auto size = r.u64();
-    require(size <= body.size() - offset, "section size");
-    offset += size;
-    desc.push_back({size, r.text()});
-    c.sections.push_back(std::move(s));
+  std::vector<std::span<const std::uint8_t>> payload;
+  std::vector<std::string> actual;
+  try {
+    Reader r{body};
+    require(r.text() == "strix-session-v1" &&
+                r.text() == "minimax-conversation-v1",
+            "schema");
+    c.id = r.text();
+    c.generation = r.text();
+    c.compat = r.text();
+    require(c.compat == compat && r.text() == sha(string_bytes(compat)),
+            "session_incompatible: compat mismatch");
+    c.rank = r.u32();
+    c.world = r.u32();
+    require(c.rank == rank && c.world == world, "TP geometry mismatch");
+    auto &f = c.frontier;
+    f.consumed = r.u64();
+    f.emitted = r.u64();
+    f.accepted = r.u64();
+    f.drafter = r.u64();
+    f.control = r.u64();
+    f.pending = r.u32();
+    f.pending_valid = r.bit();
+    f.drafter_ready = r.bit();
+    f.sampling = r.text();
+    f.lineage = r.text();
+    auto n = r.u64();
+    require(n <= body.size() / 8, "history bounds");
+    for (std::uint64_t i = 0; i < n; ++i)
+      c.history.push_back(r.u32());
+    auto count = r.u64();
+    require(count <= 512, "section count");
+    std::uint64_t offset = 0;
+    for (std::uint64_t i = 0; i < count; ++i) {
+      Section s;
+      s.name = r.text();
+      require(r.u64() == rank, "section rank");
+      s.replicated = r.bit();
+      require(r.u64() == offset, "section offset");
+      auto size = r.u64();
+      require(size <= body.size() - offset, "section size");
+      offset += size;
+      desc.push_back({size, r.text()});
+      c.sections.push_back(std::move(s));
+    }
+    for (const auto &d : desc)
+      payload.push_back(r.raw(d.n));
+    r.end();
+    actual.resize(desc.size());
+    for_each_section(desc.size(), [&](std::size_t i) {
+      actual[i] = sha(payload[i]);
+      c.sections[i].bytes.assign(payload[i].begin(), payload[i].end());
+    });
+  } catch (...) {
+    check_root();
+    throw;
   }
-  for (std::size_t i = 0; i < desc.size(); ++i) {
-    auto v = r.raw(desc[i].n);
-    require(sha(v) == desc[i].hash, "session_corrupt: section SHA-256");
-    c.sections[i].bytes.assign(v.begin(), v.end());
-  }
-  r.end();
+  check_root();
+  for (std::size_t i = 0; i < desc.size(); ++i)
+    require(actual[i] == desc[i].hash, "session_corrupt: section SHA-256");
   valid(c);
+  digests = std::move(actual);
+  root = recorded_root;
   return c;
+}
+} // namespace
+Bytes encode(const Checkpoint &c) {
+  std::vector<std::string> digests;
+  std::string root;
+  return encode_with(c, digests, root);
+}
+Checkpoint decode(std::span<const std::uint8_t> b, const std::string &compat,
+                  std::uint32_t rank, std::uint32_t world,
+                  std::uint64_t max_bytes) {
+  std::vector<std::string> digests;
+  std::string root;
+  return decode_with(b, compat, rank, world, max_bytes, digests, root);
 }
 std::string state_digest(const Checkpoint &c) {
   auto canonical = c;
@@ -775,20 +878,24 @@ void Cache::capture(Checkpoint c) {
   agree(ok, exchange_, "session_budget: capture-admission");
   identify(c);
   Bytes b;
+  std::vector<std::string> digests;
+  std::string root;
   bool encoded = true;
   try {
-    b = encode(c);
+    b = encode_with(c, digests, root);
   } catch (...) {
     encoded = false;
   }
   agree(encoded, exchange_, "capture-encoded");
   agree(b.size() <= budget_, exchange_, "ram-admission");
-  auto own = receipt({c.generation, sha(string_bytes(compat_)), shared(c),
-                      sha(b), rank_, world_, b.size()});
+  // RAM receipts carry the encoder's own root digest (the payload identity, never persisted).
+  const auto replicated = shared(c, digests);
+  auto own = receipt({c.generation, sha(string_bytes(compat_)), replicated,
+                      root, rank_, world_, b.size()});
   auto other = parse_receipt(world_ == 1 ? own : exchange_(own));
   require(other.generation == c.generation &&
               other.compat == sha(string_bytes(compat_)) &&
-              other.shared == shared(c) && other.world == world_ &&
+              other.shared == replicated && other.world == world_ &&
               other.rank == (world_ == 1 ? rank_ : 1 - rank_),
           "RAM peer frontier/replicated mismatch");
   auto old = entries_.find(c.id);
@@ -810,13 +917,15 @@ void Cache::checkpoint(Checkpoint c) {
   const auto start = std::chrono::steady_clock::now();
   double encode_seconds = 0, write_seconds = 0;
   Bytes b;
+  std::vector<std::string> digests;
+  std::string root;
   bool ok = true;
   try {
     std::uint64_t bytes = 1048576;
     for (const auto &s : c.sections)
       bytes += s.bytes.size();
     prepare_capture(bytes);
-    b = encode(c);
+    b = encode_with(c, digests, root);
     encode_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
             .count();
@@ -884,7 +993,7 @@ void Cache::checkpoint(Checkpoint c) {
   }
   agree(ok, exchange_, "rank-durable");
   Receipt local{c.generation, sha(string_bytes(compat_)),
-                shared(c),    sha(b),
+                shared(c, digests), sha(b),
                 rank_,        world_,
                 b.size()};
   auto own = receipt(local);
@@ -928,6 +1037,8 @@ Checkpoint Cache::resume(const std::string &id, bool disk) {
   const auto start = std::chrono::steady_clock::now();
   validate_id(id);
   Checkpoint c;
+  std::vector<std::string> digests;
+  std::string root, replicated;
   bool ok = true;
   std::string failure;
   Bytes group;
@@ -939,7 +1050,8 @@ Checkpoint Cache::resume(const std::string &id, bool disk) {
       require(it != entries_.end(), "session_not_found: RAM miss");
       prepare_resume(id, it->second.bytes.size());
       it = entries_.find(id);
-      c = decode(it->second.bytes, compat_, rank_, world_, budget_);
+      c = decode_with(it->second.bytes, compat_, rank_, world_, budget_, digests, root);
+      replicated = shared(c, digests);
       it->second.touched = ++clock_;
     } else {
       require(on_disk(id), "session_not_found: disk miss");
@@ -979,9 +1091,10 @@ Checkpoint Cache::resume(const std::string &id, bool disk) {
       read_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
       require(bytes.size() == rr[rank_].bytes && sha(bytes) == rr[rank_].digest,
               "session_corrupt: rank digest");
-      c = decode(bytes, compat_, rank_, world_, std::uint64_t{1} << 40);
+      c = decode_with(bytes, compat_, rank_, world_, std::uint64_t{1} << 40, digests, root);
+      replicated = shared(c, digests);
       require(c.id == id && c.generation == key.generation &&
-                  shared(c) == rr[rank_].shared,
+                  replicated == rr[rank_].shared,
               "rank identity");
     }
   } catch (const std::exception &e) {
@@ -997,10 +1110,11 @@ Checkpoint Cache::resume(const std::string &id, bool disk) {
   const auto peer_failure = exchange_(string_bytes(failure));
   if (!ok || !peer_failure.empty())
     throw std::runtime_error(!ok ? failure : std::string(peer_failure.begin(), peer_failure.end()));
-  auto own = receipt({c.generation, sha(string_bytes(compat_)), shared(c),
-                      disk ? sha(group) : state_digest(c), rank_, world_, 0});
+  // RAM: the verified manifest root identifies this rank's payload (the peer never compares it).
+  auto own = receipt({c.generation, sha(string_bytes(compat_)), replicated,
+                      disk ? sha(group) : root, rank_, world_, 0});
   auto other = parse_receipt(world_ == 1 ? own : exchange_(own));
-  require(other.generation == c.generation && other.shared == shared(c) &&
+  require(other.generation == c.generation && other.shared == replicated &&
               other.compat == sha(string_bytes(compat_)) &&
               (!disk || other.digest == sha(group)),
           "restore peer mismatch");

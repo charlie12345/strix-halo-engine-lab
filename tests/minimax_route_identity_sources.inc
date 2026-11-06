@@ -90,5 +90,5 @@
 {"src/minimax/serve/minimax_session.hpp", 0x2ae50e9cc0d1675eULL},
 {"src/minimax/session/runtime.cpp", 0xf381fd174925b7f4ULL},
 {"src/minimax/session/runtime.hpp", 0x0325df45ea3cdfe1ULL},
-{"src/minimax/session/session_cache.cpp", 0xcc59dfe1c24cc8fcULL},
+{"src/minimax/session/session_cache.cpp", 0x6555534b36923235ULL},
 {"src/minimax/model_description.cpp", 0x7f83cbd84d35894bULL},

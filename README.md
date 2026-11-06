@@ -218,6 +218,17 @@ its own flag, and without them the run is the dense reference.
 [Install, model files, one command per clip and rollback](docs/models/minimax-h3/README.md#h3-install) ·
 [stage breakdown](docs/models/minimax-h3/README.md#h3-result).
 
+## Adding a model
+
+Registering descriptive metadata for an already supported compiled contract requires one description file
+(`models/<name>.toml`) and one registry row (a `[models.<id>]` table in `models/registry.toml`). These files do not add
+inference support for a new size or checkpoint contract. A changed contract still requires family adapter/engine work
+and qualification, and a new architecture needs its own family module (kernels, layer walk, adapter) that plugs into
+the common profile, receipt and switch-table code. The registry is not read at run time;
+`strix-model-registry-tests` checks names, file existence and coverage only. Per-family scope, commands and the device
+checks before calling a model supported: [docs/engine/adding-a-model.md](docs/engine/adding-a-model.md). The switch table generated from the
+engines' defaults tables: [docs/engine/optimization-table.md](docs/engine/optimization-table.md).
+
 ## Documentation
 
 - **Getting started:** [requirements, build and run](docs/getting-started/README.md) ·

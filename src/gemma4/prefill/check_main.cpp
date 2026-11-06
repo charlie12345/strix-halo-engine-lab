@@ -1,7 +1,7 @@
 // Full-model diagnostics are an explicit CLI, never a ctest or admission token.
 #include "device.hpp"
 #include "qualification.hpp"
-#include "gemma4/engine/profile.hpp"
+#include "strix/profiles/gemma4.hpp"
 #include "gemma4/ref/npz.hpp"
 #include <algorithm>
 #include <chrono>

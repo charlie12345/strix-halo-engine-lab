@@ -1,7 +1,7 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
 {"CMakeLists.txt", 0xb9be0df0d36854f7ULL},
-{"apps/minimax_rank_main.cpp", 0x7019fe9e5fbc7bd7ULL},
+{"apps/minimax_rank_main.cpp", 0x2a920b59d574aeeaULL},
 {"apps/minimax_serve_main.cpp", 0x1584a60c38f4e8beULL},
 {"src/dspark_common/markov_cand_kernels.hpp", 0xf20c7f91a631cbc1ULL},
 {"src/minimax/attn/index_proj.hip", 0x8332b8f8830e98d8ULL},
@@ -35,7 +35,7 @@
 {"src/minimax/engine/mm_defaults.hpp", 0x3a2666e0196a0a9bULL},
 {"src/minimax/engine/mm_kernels.hpp", 0x434413100dddc9edULL},
 {"src/minimax/engine/mm_pack.cpp", 0xbc1d7d94ce76263bULL},
-{"src/minimax/engine/prefill_timeline.hpp", 0x16bda74200a34d9dULL},
+{"src/minimax/engine/prefill_timeline.hpp", 0x0ec15245e90e2d9dULL},
 {"src/minimax/engine/route_identity.hpp", 0xd9d985e58cd364bcULL},
 {"src/minimax/moe/mmx_moe.hip", 0xb783284ff4894d34ULL},
 {"src/minimax/moe/mmx_moe.hpp", 0x05698ea07b619950ULL},

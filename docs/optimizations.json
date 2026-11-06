@@ -280,6 +280,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Prompt-group size by load",
+    "flag_or_env": "STRIX_PROMPT_BATCH_AUTO, STRIX_PROMPT_BATCH_AUTO_QUEUE",
+    "default": "ON",
+    "exact": "Token ids equal on vs off in every request of 48 paired bursts; scheduling only.",
+    "gain": "8 x 1024 burst: first-token p50 8.62 vs 10.25 s (-21 %), mean completion 9.19 vs 11.22 s (-23 %), makespan +1.2 % (95 % CI -1.3 to +6.0 %, not resolved); 16 x 1024 burst (8 queued): first-token p50 12.63 vs 14.58 s (-15 %), mean completion 14.52 vs 15.51 s (-7.7 %), makespan +0.2 % (95 % CI -1.5 to +1.8 %). 24 paired bursts per cell, fresh server per arm, alternating order.",
+    "preconditions": "HTTP batched server with prompt grouping; no explicit STRIX_PROMPT_BATCH_ROWS. Fills the row budget when no slot is free and at least STRIX_PROMPT_BATCH_AUTO_QUEUE (default 1) requests wait.",
+    "off_switch": "STRIX_PROMPT_BATCH_AUTO=0",
+    "doc_anchor": "docs/optimizations.md#prompt-group-size-by-load"
+  },
+  {
+    "engine": "qwen",
     "name": "PLE page reclaim and prefetch admission",
     "flag_or_env": "STRIX_PLE_RECLAIMABLE=auto",
     "default": "auto",

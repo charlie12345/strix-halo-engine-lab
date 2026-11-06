@@ -328,6 +328,20 @@ In a prompt group, gather the next segment's PLE rows on a stage thread into the
 - **Measured gain:** Inline PLE gather of a cold first 8x1024 group 183 vs 403 ms. 8x1024 makespan in two paired legs: 25.30 vs 25.19 s (within noise). Warm per-segment gathers are 10-50 ms, so the ceiling is about 1 % of a group.
 - **Implementation / evidence:** `src/hip_ple_launcher.hip` (`stage_serve`), `include/strix/ple_staged_gather.hpp`
 
+### Prompt-group size by load
+
+**Engine:** `qwen`. **Control:** `STRIX_PROMPT_BATCH_AUTO`, `STRIX_PROMPT_BATCH_AUTO_QUEUE`. **Default:** ON (threshold 1).
+
+An HTTP prompt group takes at most 4 blocks, so the first prompts of a burst finish sooner, unless every slot is busy and at least `STRIX_PROMPT_BATCH_AUTO_QUEUE` requests wait for one; then it fills the row budget as before.
+
+- **Preconditions:** HTTP batched server with prompt grouping on; no explicit `STRIX_PROMPT_BATCH_ROWS`.
+- **Automatic selection:** Every prompt group; the cap follows the slot and queue state when the group forms (`STRIX_PROMPT_BATCH_LOG=1` ends each group line in `idle cap 4` or `backlog`).
+- **Fallback notice:** None; scheduling only.
+- **Exactness evidence:** Token ids equal on vs off in every request of all 48 paired bursts (each block runs the same arithmetic in any group).
+- **Off switch:** STRIX_PROMPT_BATCH_AUTO=0
+- **Measured gain:** One Strix Halo node, 8 slots, 4 output tokens, 24 paired bursts per cell (fresh server per arm, order alternating over six turns), on vs STRIX_PROMPT_BATCH_AUTO=0. 8 x 1024 burst: first-token p50 8.62 vs 10.25 s (-21 %), mean completion 9.19 vs 11.22 s (-23 %), makespan +1.2 % (95 % CI -1.3 to +6.0 %, not resolved). 16 x 1024 burst (8 queued): first-token p50 12.63 vs 14.58 s (-15 %), mean completion 14.52 vs 15.51 s (-7.7 %), makespan +0.2 % (95 % CI -1.5 to +1.8 %). Threshold sweep (one turn): 3 or 9 queued requests did not shorten 10/12/16 x 1024 bursts, so the default is 1.
+- **Implementation / evidence:** `apps/hip_mtp_decode_bridge.hpp` (`run_prompt_group`), `apps/hip_http_serve.hpp` (queued-request hint)
+
 <a id="qwen-l1"></a>
 
 ### PLE page reclaim and prefetch admission

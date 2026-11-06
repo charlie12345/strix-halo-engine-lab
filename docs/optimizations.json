@@ -2304,9 +2304,20 @@
   },
   {
     "engine": "glm",
+    "name": "Prefill dense rows v3 (grouped projections)",
+    "flag_or_env": "STRIX_GLM_PF_DENSE_ROWS",
+    "default": "3",
+    "exact": "Device test v3 == v2 bitwise over every tile and the grouped production shapes (417 checks, 0 failures); logits bitwise equal on both ranks at 8K across v3 / v2 / v1.",
+    "gain": "8,192-token TTFT at parity with v2 within noise (14.29 vs 14.33 s; 14.80 vs 14.72 s in a second pair run); grouped calls at 8192 rows KDA 9.33 -> 6.77 ms, indexer 8.98 -> 6.62 ms",
+    "preconditions": "Exact chunked prefill.",
+    "off_switch": "STRIX_GLM_PF_DENSE_ROWS=2 (v2) or 1 (v1); --baseline",
+    "doc_anchor": "docs/optimizations.md#glm-pf-dense-rows-v3"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill dense rows v2",
     "flag_or_env": "STRIX_GLM_PF_DENSE_ROWS",
-    "default": "2",
+    "default": "3 (v3); =2 selects v2",
     "exact": "Device test v2 == v1 bitwise over the production shapes (80/80); logits and state bitwise equal v1 on both ranks at 1K and 8K.",
     "gain": "8K TTFT 15.06 -> 14.92 s (544 -> 549 tok/s, -0.9 %), 1K warm 2.80 -> 2.75 s (366 -> 372 tok/s, -1.9 %)",
     "preconditions": "Exact chunked prefill.",
@@ -2400,6 +2411,17 @@
     "preconditions": "Exact chunked prefill with the v2 hyper-connection sites (the default; STRIX_GLM_PF_HC=1 keeps v1 unfused).",
     "off_switch": "STRIX_GLM_PF_HC_FUSE=0, or --baseline",
     "doc_anchor": "docs/optimizations.md#glm-pf-hc-fuse"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill TP2 partial sum on load in the fused mHC expand",
+    "flag_or_env": "STRIX_GLM_PF_SUMEXP, STRIX_GLM_PF_HC_HOIST",
+    "default": "1, 1",
+    "exact": "Pair kernel bitwise equal to the sum followed by the fused expand (35 checks, 0 failures); hoist placements bitwise (47 checks, 0 failures); pair logits bitwise at 1K, 8K and 32K.",
+    "gain": "Seam sum + fused expand 4.26 -> 3.91 ms per call (-8.2 %); 8,192-token TTFT unchanged within noise",
+    "preconditions": "Exact chunked prefill with async half regions and STRIX_GLM_PF_HC_FUSE=1.",
+    "off_switch": "STRIX_GLM_PF_SUMEXP=0; STRIX_GLM_PF_HC_HOIST=0; --baseline",
+    "doc_anchor": "docs/optimizations.md#glm-pf-sumexp"
   },
   {
     "engine": "glm",

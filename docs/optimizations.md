@@ -3591,11 +3591,30 @@ the v2 chain (k ascending from +0, fmaf), so the result has the same bits as v2.
 - **Measured gain:** Two-node pair, alternating arms: MLA GEMM time per rank 0.715 -> 0.425 s at 8K (-41 %), 2.853 -> 1.628 s at 32K (-43 %); TTFT 8,192 tokens 15.34 -> 15.05 s (534 -> 544 tok/s, -1.9 %), 32,768 tokens 62.36 -> 60.91 s (525 -> 538 tok/s, -2.3 %)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
+<a id="glm-pf-dense-rows-v3"></a>
+
+### Prefill dense rows v3 (grouped projections)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_DENSE_ROWS`. **Default:** 3.
+
+Up to three dense-row projections of the same input (KDA f_a / g_a / b, indexer wk / gate / weights_proj) run in one
+launch with a 128-row x 64-column tile, so x is read once per tile for all of them. Each output keeps the v2 chain
+(acc = +0, ascending k, fmaf with the same weight conversion). Single projections (router, KDA f_b / g_b) measured at
+parity and keep the v2 tile.
+
+- **Preconditions:** Exact chunked prefill.
+- **Automatic selection:** Unset resolves to 3; the engine default provides it; the resolver reports it. Explicit values win; values other than 1, 2 and 3 are rejected.
+- **Fallback notice:** None.
+- **Exactness evidence:** Device test v3 == v2 bitwise over every tile and the grouped production shapes (417 checks, 0 failures); logits bitwise equal on both ranks at 8K across v3 / v2 / v1.
+- **Off switch:** STRIX_GLM_PF_DENSE_ROWS=2 (v2) or 1 (v1)
+- **Measured gain:** TTFT at 8,192 tokens at parity with v2 within noise (14.29 vs 14.33 s; a second pair run 14.80 vs 14.72 s, medians of two runs; 14.49 s with v1). Grouped calls at 8192 rows: KDA 9.33 -> 6.77 ms, indexer 8.98 -> 6.62 ms; at 4096 rows 4.17 -> 2.89 ms and 4.14 -> 2.83 ms
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+
 <a id="glm-pf-dense-rows-v2"></a>
 
 ### Prefill dense rows v2
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_DENSE_ROWS`. **Default:** 2.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_DENSE_ROWS=2`. **Default:** superseded by v3, which keeps the v2 tile for single projections.
 
 Exact dense-row GEMV tiles of the chunked prefill with a new schedule: 8 x 4 independent chains per thread, packed F16 /
 BF16 weight loads and 32- / 64-column tiles chosen by shape. Each output keeps its chain (acc = +0, ascending k, fmaf
@@ -3603,7 +3622,7 @@ with the same weight conversion). Calls with more than 4096 inputs (the 16384-lo
 `STRIX_GLM_PF_HC=1`) keep the v1 tile.
 
 - **Preconditions:** Exact chunked prefill.
-- **Automatic selection:** Unset resolves to 2; the engine default provides it; the resolver reports it. Explicit values win.
+- **Automatic selection:** Selected explicitly with 2; single projections use this tile under the default 3.
 - **Fallback notice:** None.
 - **Exactness evidence:** Device test v2 == v1 bitwise over the production shapes (80/80); logits and state bitwise equal v1 on both ranks of the pair at 1K and 8K.
 - **Off switch:** STRIX_GLM_PF_DENSE_ROWS=1
@@ -3758,6 +3777,27 @@ the chain's 24 outputs over three CTAs (same bits).
 - **Off switch:** STRIX_GLM_PF_HC_FUSE=0, or --baseline
 - **Measured gain:** Two-node pair TTFT, ABBA x2: 1K -1.1 %, 8K -1.3 %
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+
+<a id="glm-pf-sumexp"></a>
+
+### Prefill TP2 partial sum on load in the fused mHC expand
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_SUMEXP`, `STRIX_GLM_PF_HC_HOIST`. **Default:** 1, 1.
+
+The pipelined prefill seam no longer writes p0 + p1 back into the partial buffer before the fused expand + norm reads it.
+The exchange hands both partials (rank order) to a pair variant of the fused expand kernel, which forms y = p0 + p1 with
+the exchange's sum expression on load; the summed rows are never stored. The receive staging (or the remote half region)
+is released after the expand, so the next exchange still overlaps the following FFN / attention. `STRIX_GLM_PF_HC_HOIST`
+places the expand's loads ahead of its dependent steps (`=2` adds restrict qualifiers); every expression and its order
+are unchanged.
+
+- **Preconditions:** Exact chunked prefill with async half regions and the fused `STRIX_GLM_PF_HC_FUSE=1` form.
+- **Automatic selection:** Unset resolves to 1 for both; the resolver reports `STRIX_GLM_PF_SUMEXP`. Explicit values win; other values are rejected.
+- **Fallback notice:** None.
+- **Exactness evidence:** Pair kernel bitwise equal to the sum followed by the fused expand over the device stress set (35 checks, 0 failures); hoist placements 0 / 1 / 2 bitwise (47 checks, 0 failures); pair logits bitwise on both ranks at 1K, 8K and 32K.
+- **Off switch:** STRIX_GLM_PF_SUMEXP=0 (sum, then the fused expand, previous seam order); STRIX_GLM_PF_HC_HOIST=0; --baseline
+- **Measured gain:** Seam sum + fused expand 4.26 -> 3.91 ms per call (-8.2 %); 8,192-token TTFT unchanged within noise (14.34-14.40 s on both arms)
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [engine seam](../src/glm/engine/engine.hip)
 
 <a id="glm-pf-mixnorm"></a>
 

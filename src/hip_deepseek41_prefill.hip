@@ -6,6 +6,8 @@
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
 #include "strix/dist/communicator.hpp"
+#include "xport/ds41_adapter.hpp"
+#include <optional>
 #include "strix/ds41_engram.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/hip_ds41_expert_tp.hpp"
@@ -1675,6 +1677,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // rows into `dst`, both padded to the larger count, pieces of <= 16 MB. The caller records gather_ready after the
     // producers (start_gather) and enqueues independent work on the main stream before exchange_rows, which blocks the
     // CPU until the pieces have crossed; join_gather() orders the main stream after them.
+    using PrefillRawCommunicator = std::remove_reference_t<decltype(*m.options.communicator)>;
+    using PrefillRawExchange = xport::Ds41RawSlotsExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>;
+    using PrefillStagedRawExchange = xport::Ds41RawSlotsStagedExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>;
     std::uint64_t exchange_seq = 0;
     const auto start_gather = [&] {
         if (!m.async_gather) return;
@@ -1688,9 +1693,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         hipStream_t gs = m.async_gather ? m.comm_stream : st;
         for (std::uint32_t p0 = 0; p0 < n; p0 += per) {
             const std::uint32_t pn = std::min(per, n - p0);
-            m.options.communicator->start(gs, static_cast<const std::uint8_t*>(own) + std::size_t{p0} * row_bytes, std::size_t{pn} * row_bytes,
-                                          dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
-            m.options.communicator->finish(gs, static_cast<std::uint8_t*>(dst) + std::size_t{p0} * row_bytes);
+            xport::ds41_exchange_raw_slots(*m.options.communicator, gs,
+                const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(own)) + std::size_t{p0} * row_bytes,
+                static_cast<std::uint8_t*>(dst) + std::size_t{p0} * row_bytes, std::size_t{pn} * row_bytes,
+                dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq}, [] {});
         }
     };
     // the same for several fields of the same rows (own buffers at this rank's first row, destinations at the peer's),
@@ -1738,6 +1744,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         Field{m.ids.p + std::size_t{own0} * K, m.peer_ids.p + std::size_t{p0} * K, K * 4U},
                         Field{m.route_w.p + std::size_t{own0} * K, m.peer_route_w.p + std::size_t{p0} * K, K * 4U}});
     };
+    std::optional<PrefillStagedRawExchange> moe_input_exchange;
     std::uint32_t moe_input_rows = 0;  // > 0: a staged MoE input is on the wire (rows of the message)
     // both ranks take the same path (staged_gather and the buffer size are the same on both): the same messages
     const auto begin_moe_input = [&](const Rows& R, std::uint32_t own0, std::uint32_t own_rows, std::uint32_t layer) {
@@ -1751,7 +1758,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         hipLaunchKernelGGL(pack_rows_kernel, dim3(n), dim3(256), 0, st, pf, send);
         check(hipGetLastError(), "pack rows");
-        m.options.communicator->start_staged(st, bytes, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
+        moe_input_exchange.emplace(*m.options.communicator, st, send, bytes,
+            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
         moe_input_rows = n;
     };
 
@@ -2325,10 +2333,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         check(hipMemcpyAsync(send_words + carry_at + 2U * D, L.carry_valid[L.carry_cur].p, 4U, hipMemcpyDefault, st),
                               "carry");
                     }
+                    std::optional<PrefillStagedRawExchange> entries_exchange;
                     const std::uint32_t* recv_words = m.pack_recv.p;
                     if (staged_send) {
-                        m.options.communicator->start_staged(st, entry_bytes,
-                                                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
+                        entries_exchange.emplace(*m.options.communicator, st, staged_send, entry_bytes,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
                         index_projections();  // while the entries cross
                         // the first chunk's q_b too, unless the task parks at that chunk's boundary (m.q is shared)
                         if (m.early_q_b && o0 < Tn && (m.task == nullptr || m.task->runs_through(PrefillUnitLevel::finest, 1U))) {
@@ -2337,7 +2346,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             mark_part(2);
                             first_q_b_done = true;
                         }
-                        recv_words = static_cast<const std::uint32_t*>(m.options.communicator->finish_staged(st));
+                        recv_words = static_cast<const std::uint32_t*>(entries_exchange->finish(st));
                     } else {
                         start_gather();
                         index_projections();  // while the entries cross
@@ -2362,7 +2371,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                               "carry");
                         L.carry_cur = 1 - L.carry_cur;
                     }
-                    if (staged_send) m.options.communicator->release_staged(st);
+                    if (staged_send) entries_exchange->release(st);
                 } else if (split) {  // the peer's window K/V (rows from k0) and compressor inputs (rows from x0)
                     const std::uint32_t pk0 = local_of(peer, R0.k0), px0 = local_of(peer, R0.x0);
                     const Field kv{m.kv.p + std::size_t{L0.k0} * D, m.peer_kv.p + std::size_t{pk0} * D, D * 4U};
@@ -2401,19 +2410,23 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 // TP: the peer's K-half of the chunk at `pending` (if any), then y = h0 + h1 of its rows
                 std::uint32_t pending = T;
                 float* staged_half = nullptr;
+                std::optional<PrefillRawExchange> halves_exchange;
+                std::optional<PrefillStagedRawExchange> staged_halves_exchange;
                 const auto close_halves = [&] {
                     if (pending == T) return;
                     const std::uint32_t n = std::min(C, Tn - pending);
                     const float* peer = m.y_other.p;
-                    if (staged_half) peer = static_cast<const float*>(m.options.communicator->finish_staged(st));
-                    else m.options.communicator->finish(st, m.y_other.p);
+                    if (staged_half) peer = static_cast<const float*>(staged_halves_exchange->finish(st));
+                    else halves_exchange->finish(st);
                     const float* own = staged_half ? staged_half : m.y_own.p;
                     const float* h0 = m.options.rank == 0U ? own : peer;
                     const float* h1 = m.options.rank == 0U ? peer : own;
                     const std::uint32_t count = n * H;
                     add_halves_kernel<<<(count + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p + std::size_t{pending} * H, count);
                     check(hipGetLastError(), "add halves");
-                    if (staged_half) m.options.communicator->release_staged(st);
+                    if (staged_half) staged_halves_exchange->release(st);
+                    staged_halves_exchange.reset();
+                    halves_exchange.reset();
                     staged_half = nullptr;
                     pending = T;
                 };
@@ -2605,8 +2618,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             if (fast_o_b) m.fast(&v, 1U, n, nullptr, 0U, m.o_low.p, st);
                             else m.dense(v,m.o_low.p,st,fp16_o_b);
                             const dist::Tag tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, r0 / C};
-                            if (staged_half) m.options.communicator->start_staged(st, bytes, tag);
-                            else m.options.communicator->start(st, m.y_own.p, bytes, tag);
+                            if (staged_half) staged_halves_exchange.emplace(*m.options.communicator, st, staged_half, bytes, tag);
+                            else halves_exchange.emplace(*m.options.communicator, st, m.y_own.p, m.y_other.p, bytes, tag);
                             pending = r0;
                         } else if (fast_o_b) {
                             v.width = OL;  // the whole K in one GEMM
@@ -2880,9 +2893,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     for (std::uint32_t p0 = 0; p0 < n; p0 += C) {
                         const std::uint32_t pn = std::min(C, n - p0);
                         const std::size_t at = std::size_t{r0 + p0} * H;
-                        m.options.communicator->start(cs, own + at, std::size_t{pn} * H * 4U,
-                                                      dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, (r0 + p0) / C});
-                        m.options.communicator->finish(cs, other + at);
+                        xport::ds41_exchange_half_sum(*m.options.communicator, cs, own + at, other + at,
+                            std::size_t{pn} * H * 4U,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, (r0 + p0) / C}, [] {});
                     }
                     check(hipEventRecord(m.half_received, cs), "half received");
                     check(hipStreamWaitEvent(st, m.half_received, 0), "half join");
@@ -2895,10 +2908,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     // rank's own rows run; the peer's half of this rank's rows comes back; y = (shared + low) + high
                     const std::uint32_t p0 = local_of(peer, R0.o0), np = Tp - p0;
                     if (moe_input_rows > 0U) {  // staged at the router: already on the wire
-                        const auto* recv = static_cast<const std::uint32_t*>(m.options.communicator->finish_staged(st));
+                        const auto* recv = static_cast<const std::uint32_t*>(moe_input_exchange->finish(st));
                         hipLaunchKernelGGL(unpack_rows_kernel, dim3(moe_input_rows), dim3(256), 0, st, moe_input_pack(R0, o0), recv);
                         check(hipGetLastError(), "unpack rows");
-                        m.options.communicator->release_staged(st);
+                        moe_input_exchange->release(st);
+                        moe_input_exchange.reset();
                         moe_input_rows = 0;
                     } else {
                         exchange_fields({Field{m.xcodes.p + std::size_t{o0} * H, m.peer_xcodes.p + std::size_t{p0} * H, H},
@@ -2928,11 +2942,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                                            ? static_cast<float*>(m.options.communicator->send_staging(half_bytes))
                                            : nullptr;
                     const bool staged = peer_half != nullptr;
+                    std::optional<xport::Ds41HalfSumStagedExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>>
+                        prefill_half_exchange;
                     if (!staged) peer_half = m.half_other.p;
                     if (m.moe_joint || T <= m.joint_max_rows) {  // one expert pass over [peer rows; own rows], the peer rows' half sums first
                         cut(PrefillUnitLevel::finest, s.layer, "moe.joint");
                         moe.enqueue_half_joint(pin, in, moe_half, peer_half, m.half_own.p, st, m.half_ready[0]);
-                        if (staged) m.options.communicator->start_staged(st, half_bytes, half_tag);
+                        if (staged) prefill_half_exchange.emplace(*m.options.communicator, st, peer_half, half_bytes, half_tag);
                     } else {  // task units: one per chunk pass (chunks(np) + chunks(no): the same count on both ranks)
                         for (std::uint32_t ch = 0; ch < pieces(np); ++ch) {
                             cut(PrefillUnitLevel::finest, s.layer, "moe.peer");
@@ -2940,7 +2956,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         }
                         check(hipEventRecord(m.half_ready[0], st), "peer half ready");
                         // staged: on the wire as soon as the peer rows are done, while the own rows below run
-                        if (staged) m.options.communicator->start_staged(st, half_bytes, half_tag);
+                        if (staged) prefill_half_exchange.emplace(*m.options.communicator, st, peer_half, half_bytes, half_tag);
                         for (std::uint32_t ch = 0; ch < pieces(no); ++ch) {
                             cut(PrefillUnitLevel::finest, s.layer, "moe.own");
                             half_piece(in, ch, m.half_own.p);
@@ -2950,11 +2966,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     // pass is one unit already); the same place on both ranks
                     if (!(m.moe_joint || T <= m.joint_max_rows)) cut(PrefillUnitLevel::finest, s.layer, "moe.sum");
                     if (staged) {
-                        const auto* recv = static_cast<const float*>(m.options.communicator->finish_staged(st));
+                        const auto* recv = static_cast<const float*>(prefill_half_exchange->finish(st));
                         const float* low = me == 0U ? m.half_own.p : recv;
                         const float* high = me == 0U ? recv : m.half_own.p;
                         if (no > 0U) ds41::enqueue_canonical_sum(in.shared, low, high, std::size_t{no} * H, y, st);
-                        m.options.communicator->release_staged(st);
+                        prefill_half_exchange->release(st);
                         if (!m.moe_persist || m.options.stream_experts) check(hipStreamSynchronize(st), "moe");
                         return;
                     }
@@ -2962,9 +2978,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     check(hipStreamWaitEvent(cs, m.half_ready[0], 0), "peer half ready");
                     for (std::uint32_t q0 = 0; q0 < nmax; q0 += C) {
                         const std::uint32_t qn = std::min(C, nmax - q0);
-                        m.options.communicator->start(cs, m.half_other.p + std::size_t{q0} * H, std::size_t{qn} * H * 4U,
-                                                      dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, q0 / C});
-                        m.options.communicator->finish(cs, m.half_recv.p + std::size_t{q0} * H);
+                        xport::ds41_exchange_half_sum(*m.options.communicator, cs,
+                            m.half_other.p + std::size_t{q0} * H, m.half_recv.p + std::size_t{q0} * H,
+                            std::size_t{qn} * H * 4U,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, q0 / C}, [] {});
                     }
                     check(hipEventRecord(m.half_received, cs), "half received");
                     check(hipStreamWaitEvent(st, m.half_received, 0), "half join");

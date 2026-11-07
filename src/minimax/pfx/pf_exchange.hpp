@@ -22,6 +22,7 @@
 // transport's own timeout, STRIX_DIST_USB4_TIMEOUT_MS).
 
 #include "minimax/pfx/pf_crc.hpp"
+#include "minimax/pfx/pf_wire.hpp"
 #include "strix/dist/communicator.hpp"
 
 #include <hip/hip_runtime.h>
@@ -38,31 +39,6 @@
 #include <vector>
 
 namespace strix::minimax::pfx {
-
-inline constexpr std::uint64_t kHeaderMagic = 0x3148584650584d4dULL;   // "MMXPFXH1"
-inline constexpr std::uint64_t kTrailerMagic = 0x3154584650584d4dULL;  // "MMXPFXT1"
-
-// Identity of one exchange; the header and the trailer both carry it and both ranks must agree on every field
-// except `rank`.
-struct Header {
-    std::uint64_t magic = kHeaderMagic;
-    std::uint64_t epoch = 0;
-    std::uint64_t plan = 0;
-    std::uint64_t sequence = 0;
-    std::uint64_t request = 0;   // the engine's call counter (prefill chunk group)
-    std::uint64_t bytes = 0;
-    std::uint32_t kind = 0;      // 1 = attention sum, 2 = FFN sum
-    std::uint32_t layer = 0;
-    std::uint32_t chunk = 0;     // wire chunk size | bit 31 = CRC trailer on (both ranks must agree)
-    std::uint32_t rank = 0;
-};
-static_assert(sizeof(Header) == 64);
-
-struct Tag {
-    std::uint32_t kind = 0;
-    std::uint32_t layer = 0;
-    std::uint64_t request = 0;
-};
 
 struct Options {
     std::uint32_t rank = 0;

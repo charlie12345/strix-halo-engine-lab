@@ -20,6 +20,7 @@
 #include "prefill_timeline.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
+#include "minimax/pfx/pf_route.hpp"
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
@@ -1181,24 +1182,27 @@ struct Engine::Impl {
     void exchange_post(std::size_t n, std::uint32_t layer, std::uint32_t which, const float* local, const float* norm_w,
                        const float* router_w, const float* bias) {
         mark();
-        const std::size_t bytes = n * kHidden * sizeof(float);
+        const std::size_t bytes = strix::minimax::pfx::PrefillTraits::payload_bytes(n, kHidden);
         if (pf_active) {  // prefill module: the copy kernel (or a publish kernel after an in-place producer), then the RX wait
             // STRIX_MM_PF_TIMELINE: the send span (copy / publish), then the post span; the stream gap before the post
             // span is this message's exposed exchange wait (producer done -> RX flag), reported per message.
             if (tl) tl->mark("exchange-send", true);
-            if (local == pf->tx()) pf->send(bytes, strix::minimax::pfx::Tag{which + 1, layer, calls});
-            else pf->send_copy(local, bytes, strix::minimax::pfx::Tag{which + 1, layer, calls});
+            strix::minimax::pfx::Route<strix::minimax::pfx::Exchanger, strix::minimax::pfx::Tag> pf_route(*pf);
+            const auto pf_post_ticket = pf_route.post(local, bytes, {which + 1, layer, calls});
             if (tl) tl->mark("exchange-send", false);
-            const auto x = pf->recv();
+            const auto x = pf_route.wait(pf_post_ticket);
             lap(prof.exchange);
             if (tl) tl->exchange_received(bytes);
             if (tl) tl->mark(which == 0 ? "attn-post" : "ffn-post", true);
             post_view(n, x, norm_w, router_w, bias);
+            pf_route.release(pf_post_ticket);
             if (tl) tl->mark(which == 0 ? "attn-post" : "ffn-post", false);
             lap(prof.post);
             return;
         }
         if (use_xfer()) {  // the module: device partial copied into its TX slot (publishing), the stream waits for RX
+            strix::xport::TransportBackend<mx::Exchanger> backend(*xf);
+            static_assert(strix::xport::Backend<decltype(backend)>);
             const mx::Tag tag{which == 0 ? mx::Kind::attn_sum : mx::Kind::ffn_sum, layer, calls};
             const auto warm_pt = xf->producer_target();  // this message's TX flag and sequence (STRIX_MM_XB_WARM gate)
             const bool inplace = xb_tx != nullptr && local == xb_tx;  // produced in the TX slot: publish only
@@ -1206,24 +1210,24 @@ struct Engine::Impl {
             xb_tx = nullptr;
             xb_pt = {};
             xb_published = false;
+            const auto xticket = inplace
+                ? backend.post_publish(tag, bytes, self_pub ? mx::Publish::producer : mx::Publish::kernel)
+                : backend.post_copy(tag, local, bytes);
             if (inplace) {
-                xf->send(bytes, tag, self_pub ? mx::Publish::producer : mx::Publish::kernel);
                 ++xb_count[1];
                 if (self_pub) ++xb_count[3];
-            } else {
-                xf->send_copy(local, bytes, tag);
             }
             if (xb_warm_mb != 0) xb_warm(layer, which, warm_pt.flag, warm_pt.sequence);
             moe::hip::PostExchangeView pv{static_cast<std::uint32_t>(n), h, nullptr, nullptr, norm_w, hn, router_w, bias, ids_d, nullptr};
             const float* peer = nullptr;
             if (xb_wait) {  // gated in-kernel wait (module recv_view): no stream wait packet before post_exchange
-                const auto rv = xf->recv_view();
+                const auto rv = backend.wait_view(xticket, xf->options().stream);
                 peer = static_cast<const float*>(rv.payload);
                 pv.rx_flag = rv.flag;
                 pv.rx_seq = rv.sequence;
                 ++xb_count[0];
             } else {
-                peer = static_cast<const float*>(xf->recv());
+                peer = static_cast<const float*>(backend.wait(xticket, xf->options().stream).remote);
             }
             wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
             pv.part0 = opt.rank == 0 ? local : peer;
@@ -1245,6 +1249,7 @@ struct Engine::Impl {
                 ++xb_count[2];
             }
             enqueue_post(pv, nullptr);
+            backend.release(xticket, xf->options().stream);
             lap(prof.exchange);
             return;
         }

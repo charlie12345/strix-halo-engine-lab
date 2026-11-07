@@ -18,8 +18,10 @@
 #include <string>
 #include <vector>
 
+namespace strix::xport { template<class Traits> class Channel; }
 namespace strix::minimax::xfer {
-class Exchanger;
+struct MinimaxTraits;
+using Exchanger = strix::xport::Channel<MinimaxTraits>;
 }
 namespace strix::minimax::pfx {
 class Exchanger;

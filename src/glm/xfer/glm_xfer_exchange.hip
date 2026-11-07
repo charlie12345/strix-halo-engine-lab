@@ -1,3 +1,4 @@
+#include "xport/transport_backend.hpp"
 // The GLM exchange module behind the engine's Exchange seam (see glm_xfer_exchange.hpp).
 #include "glm_xfer_exchange.hpp"
 #include "glm_post_exchange.hpp"
@@ -105,12 +106,15 @@ void XferExchange::reduce(float* p, unsigned rows, hipStream_t s) {
     if (rows == 0 || rows > max_rows_) throw std::invalid_argument("glm xfer exchange: rows");
     Exchanger& x = ensure(s);
     const std::size_t bytes = GlmSchedule::row_bytes(rows);
-    x.send_copy(p, bytes, Tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_});
+    strix::xport::TransportBackend<Exchanger> backend(x);
+    static_assert(strix::xport::Backend<decltype(backend)>);
+    const auto ticket = backend.post_copy(Tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_}, p, bytes);
     ++layer_;
-    const auto* peer = static_cast<const float*>(x.recv());
+    const auto* peer = static_cast<const float*>(backend.wait(ticket, s).remote);
     const std::size_t n = bytes / sizeof(float);
     reduce_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p, peer, rank_, n);
     ok(hipGetLastError(), "reduce");
+    backend.release(ticket, s);
 }
 
 void XferExchange::boundary(const float* part, const float* X, const float* mix, float* Xout, unsigned* flag, unsigned rows,
@@ -129,7 +133,8 @@ void XferExchange::boundary_rows(const float* part, const float* X, const float*
     if (rows == 0 || rows > max_rows_) throw std::invalid_argument("glm xfer exchange: rows");
     Exchanger& x = ensure(s);
     const std::size_t bytes = GlmSchedule::row_bytes(rows);
-    x.send_copy(part, bytes, Tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_});
+    strix::xport::TransportBackend<Exchanger> backend(x);
+    const auto ticket = backend.post_copy(Tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_}, part, bytes);
     ++layer_;
     if (use_bracket_) {
         if (bracket_ == nullptr) ok(hipMalloc(reinterpret_cast<void**>(&bracket_), GlmSchedule::row_bytes(max_rows_) * kHc), "bracket");
@@ -137,14 +142,15 @@ void XferExchange::boundary_rows(const float* part, const float* X, const float*
     }
     const RxView none{};
     if (kwait_) {
-        const RxView v = x.recv_view();
+        const RxView v = backend.wait_view(ticket, s);
         if (use_bracket_) post_expand_bracket(bracket_, mix, part, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
         else post_expand(X, mix, part, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
     } else {
-        const auto* peer = static_cast<const float*>(x.recv());
+        const auto* peer = static_cast<const float*>(backend.wait(ticket, s).remote);
         if (use_bracket_) post_expand_bracket(bracket_, mix, part, peer, none, rank_, Xout, flag, rows, s, flag_stride);
         else post_expand(X, mix, part, peer, none, rank_, Xout, flag, rows, s, flag_stride);
     }
+    backend.release(ticket, s);
 }
 
 void XferExchange::merge(MergeRow* rows, unsigned n, MergeCtl& ctl, hipStream_t s) {

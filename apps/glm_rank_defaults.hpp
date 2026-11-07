@@ -105,7 +105,9 @@ inline const std::vector<EnvItem>& env_items() {
         {"pf-mixnorm", "STRIX_GLM_PF_MIXNORM", "1", "0",
          "Measurement: mHC mix collapse + RMSNorm in one kernel (same operation order), logits bitwise on the pair at 1K / 8K / 32K; 8K TTFT 15.07 -> 14.95 s, 32K 63.23 -> 62.23 s (=0 restores the two-kernel path)", false, true},
         {"pf-sumexp", "STRIX_GLM_PF_SUMEXP", "1", "0",
-         "Measurement: TP2 partial sum formed on load by the fused mHC expand (rank order, the sum2 expression; summed rows not stored), logits bitwise on the pair; RECEIPT_PENDING (=0 restores sum2 + expand)", false, true},
+         "Measurement: TP2 partial sum formed on load by the fused mHC expand (rank order, the sum2 expression; summed rows not stored), logits bitwise on the pair; seam sum + fused expand 4.26 -> 3.91 ms per call, 8,192-token TTFT 14.55 -> 14.17 s with dense rows v3 and the output-bar v10 (=0 restores sum2 + expand)", false, true},
+        {"pf-hc-hoist", "STRIX_GLM_PF_HC_HOIST", "1", "0",
+         "Measurement: the fused mHC expand issues its loads (y, or y0 + y1 with the partial sum on load) ahead of its 16 dependent steps, bitwise on the device stress set (47 checks, 0 failures) (=0 keeps the loads inside each step)", false, true},
     };
     return items;
 }

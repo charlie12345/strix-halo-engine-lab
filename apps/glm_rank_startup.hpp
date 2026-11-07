@@ -20,6 +20,7 @@ inline void fallback_without_handshake(Effective& e, const Request& r, const Env
     fallback_without_handshake(e, comm, has_startup_handshake(r.world, r.xch, r.decode, r.reference_gate));
 }
 inline constexpr std::uint32_t kAutoRowsConfig = 1U << 11;
+inline constexpr std::uint32_t kPfWmmaConfig = 1U << 12;  // STRIX_GLM_PF_WMMA=1 (FAST prefill identity) on this rank
 
 struct StartupResult { unsigned rows; bool eligible; };
 

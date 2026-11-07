@@ -3,6 +3,7 @@
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/common/glm_math.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
+#include "glm/prefill/glm_pf_wmma_x.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdlib>
@@ -480,6 +481,7 @@ void launch_linear_s3(Args a, unsigned shared_bits, hipStream_t stream) {
     }
     ok(hipGetLastError(), "X3 shared linear");
 }
+#include "glm/prefill/glm_pf_wmma_moe.inc"
 template<bool Down, unsigned R>
 void launch_linear_s(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
@@ -654,7 +656,13 @@ __global__ __launch_bounds__(kPlanRows) void plan_scatter_kernel(PlanArgs p) {
 void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream) {
     input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "v3 gate/up input transform");
-    if (selected == 14) launch_linear_s3<false, true>(a, shared.gate.bits, stream);
+    // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): the X3 calls (V11 / V14) on the WMMA linears.
+    if ((selected == 11 || selected == 14) && wmma_x::enabled()) {
+        selected = 20;
+        wmma_x::moe_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (selected == 20) launch_linear_w<false>(a, shared.gate.bits, stream);
+    else if (selected == 14) launch_linear_s3<false, true>(a, shared.gate.bits, stream);
     else if (selected == 11) launch_linear_s3<false>(a, shared.gate.bits, stream);
     else if (selected == 10) launch_linear_s2<false>(a, shared.gate.bits, stream);
     else if (selected == 9) launch_linear_s<false, 8>(a, shared.gate.bits, stream);
@@ -664,7 +672,8 @@ void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const
     else launch_linear_v3<false>(a, shared.gate.bits, stream);
     activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "v3 R15/down transform");
-    if (selected == 14) launch_linear_s3<true, true>(a, shared.down.bits, stream);
+    if (selected == 20) launch_linear_w<true>(a, shared.down.bits, stream);
+    else if (selected == 14) launch_linear_s3<true, true>(a, shared.down.bits, stream);
     else if (selected == 11) launch_linear_s3<true>(a, shared.down.bits, stream);
     else if (selected == 10) launch_linear_s2<true>(a, shared.down.bits, stream);
     else if (selected == 9) launch_linear_s<true, 8>(a, shared.down.bits, stream);

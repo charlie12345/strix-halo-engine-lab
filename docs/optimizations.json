@@ -2263,7 +2263,7 @@
     "name": "Memory-admitted prefill chunk rows",
     "flag_or_env": "--max-rows; STRIX_GLM_MAX_ROWS_AUTO",
     "default": "8192 for two-rank decode prompt prefill when both ranks fit, otherwise 4096; reference prefill and no-handshake harnesses keep 4096",
-    "exact": "Measured 8192-row chunks produce the same logits and tokens as 4096 on the exact prefill route; chunk size preserves its arithmetic.",
+    "exact": "Measured 8,192-row chunks produce the same logits and tokens as 4096 on the exact prefill route; chunk size preserves its arithmetic.",
     "gain": "Chunked-prefill route at 8192 rows: 8K TTFT -4 %; 32K 116.3 -> 109.9 s (-5.5 %); about 7.3 GiB additional GPU memory per node; --pf-ttft requires explicit --max-rows 8192 to measure this",
     "preconditions": "Omitted --max-rows outside baseline. The 8192 default applies to prompt prefill in two-rank decode runs, including production decode with MTP self-speculation and plain chunked prefill inside --decode runs, when memory allows. Reference prefill (--prefill ref, automatic prefill under r1b-all or --idcheck with decode) keeps 4096 with source auto-4096-ref, without auto admission or a row-count agreement exchange. The calibrated load admission terms (physical plan, forward reserve, pinned staging, whole-tensor reads and bounce), RAM headroom after free CMA and CMA file pages, GTT headroom and margins, prefill path/workspace/install, communication growth and device-free guard must admit 8192. Retain the largest RAM margin of 8 GiB, load and prefill; otherwise choose 4096. Normal two-rank Comm decode reuses the existing eligibility exchange and OR vote: spare config bit for auto, negative row value for rank minimum; mixed auto/fixed refuses on both ranks. Fixed payload bytes, message count and tags are unchanged. After communication growth, a fresh admission check uses one auto-only minimum vote and shrinks both pools on a 4096 fallback. No common configuration exchange exists for prefill-only, reference gates or batch-only runs: Comm auto uses 4096 with source auto-4096-no-handshake, resolved independently from local flags before inspection or engine construction without a control exchange; --pf-ttft and gate harnesses keep 4096 unless --max-rows 8192 is explicit; fixed max_rows equality cannot be checked there without changing the protocol. External Xfer auto uses 4096 without any agreement exchange. Auto communication buffers start at 4096 and grow only after agreement on 8192, so fallback has off-switch capacity. Existing allocation guards protect against changing memory pressure. Inspection is host-independent; stderr reports headroom and final source.",
     "off_switch": "STRIX_GLM_MAX_ROWS_AUTO=0 restores fixed 4096; --max-rows N keeps N; --baseline keeps 1024 unless explicitly overridden",
@@ -2275,7 +2275,7 @@
     "flag_or_env": "STRIX_GLM_PF_EXACTMOE_V",
     "default": "auto",
     "exact": "Bitwise for all outputs: v7, v10, v11 and v14 route routed and shared experts through the X2 / X3 cores with the v3 expert order, gather/scatter and fold (X3 keeps the X2 DOT2 chains, reduce4 and split order; only the operand source changes); v3 and v11 row buckets run the same statements for every live row; the device plan's pairs, tiles and groups are byte-equal to the host plan for every gated call, and invalid ids raise the engine's flag instead of throwing; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.",
-    "gain": "8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8192-row chunks); MoE call v7 -> v11: 128 rows 17.2 -> 10.1 ms, 512 rows 29.2 -> 16.9 ms, 4096 rows 127 -> 75 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows",
+    "gain": "8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8,192-row chunks); MoE call v7 -> v11: 128 rows 17.2 -> 10.1 ms, 512 rows 29.2 -> 16.9 ms, 4096 rows 127 -> 75 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows",
     "preconditions": "Exact chunked prefill; auto takes v14 for MoE calls of at least 128 rows (STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS) and v3 below. 14 is v11 with each group's remainder above 32 rows run as one padded 64-row tile (one weight decode instead of two 32-row passes); 11 the previous default, 10 the X3 core with 32/64-row tiles per group, 7 the previous X2 core, 3 forces v3 for every call; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0 makes v3 compute 16 rows per tile again. The device plan needs a grouped variant (3, 6-11) and 16-row work tiles; STRIX_GLM_PF_EXACTMOE_PLAN=host keeps the host plan.",
     "off_switch": "STRIX_GLM_PF_EXACTMOE_V=11, 10, 7 (previous large-call cores) or 3; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0; STRIX_GLM_PF_EXACTMOE_PLAN=host; 1 for the baseline",
     "doc_anchor": "docs/optimizations.md#glm-pf-exact-moe-auto"
@@ -2499,6 +2499,17 @@
     "preconditions": "Plain decode steps (verify, MTP and prefill keep their checks).",
     "off_switch": "STRIX_GLM_STEP_FLAG=0, or --baseline",
     "doc_anchor": "docs/optimizations.md#glm-step-flag"
+  },
+  {
+    "engine": "glm",
+    "name": "FAST WMMA prefill linear cores (glm-pf-wmma-x)",
+    "flag_or_env": "STRIX_GLM_PF_WMMA",
+    "default": "off (opt-in FAST identity)",
+    "exact": "FAST identity (new FP32 summation order); pre-registered quality-parity check passed at 1K / 8K / 32K; OFF equals the exact 8K logits anchors on both ranks.",
+    "gain": "Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %",
+    "preconditions": "Dense calls of 2048+ rows (X3 route); MoE calls on V11/V14.",
+    "off_switch": "unset or STRIX_GLM_PF_WMMA=0",
+    "doc_anchor": "docs/optimizations.md#glm-pf-wmma-x"
   },
   {
     "engine": "glm",

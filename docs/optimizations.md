@@ -3515,7 +3515,7 @@ Use raw-only expert storage and the bitwise FastMoe implementation so the TP2 mo
 - **Inspection:** `--print-effective-config` reports the host-independent candidate and startup policy,
   without host measurements. Startup stderr logs admission headroom and the final `max-rows` value and source:
   `auto-8192`, `auto-4096-memory`, `auto-4096-no-handshake`, `auto-4096-ref`, `auto-4096-xfer`, `explicit` or `baseline`.
-- **Exactness evidence:** Measured 8192-row chunks produce the same logits and tokens as 4096 on the exact
+- **Exactness evidence:** Measured 8,192-row chunks produce the same logits and tokens as 4096 on the exact
   prefill route; chunk size preserves its arithmetic.
 - **Off switch:** `STRIX_GLM_MAX_ROWS_AUTO=0` restores fixed 4096; `--max-rows N` fixes an explicit size.
 - **Measured gain:** Chunked-prefill route at 8192 rows: TTFT -4 % at 8K; 32K 116.3 to 109.9 s (-5.5 %);
@@ -3535,7 +3535,7 @@ Grouped expert work in exact chunked prefill; calls of 128 rows or more run rout
 - **Fallback notice:** Below the row threshold v3 runs; invalid values fail. No silent numerical-identity substitution.
 - **Exactness evidence:** Bitwise for all outputs: v7, v10, v11 and v14 route routed and shared experts through the X2 / X3 cores with the v3 expert order, gather/scatter and fold (X3 keeps the X2 DOT2 chains, reduce4 and split order; only the operand source changes); v3 and v11 row buckets run the same statements for every live row; the device plan's pairs, tiles and groups are byte-equal to the host plan for every gated call, and invalid ids raise the engine's flag instead of throwing; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.
 - **Off switch:** STRIX_GLM_PF_EXACTMOE_V=11, 10, 7 (previous large-call cores) or 3; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0; STRIX_GLM_PF_EXACTMOE_PLAN=host; 1 for the baseline
-- **Measured gain:** 8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8192-row chunks); MoE call v7 -> v11: 128 rows 17.2 -> 10.1 ms, 512 rows 29.2 -> 16.9 ms, 4096 rows 127 -> 75 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows
+- **Measured gain:** 8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8,192-row chunks); MoE call v7 -> v11: 128 rows 17.2 -> 10.1 ms, 512 rows 29.2 -> 16.9 ms, 4096 rows 127 -> 75 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [MoE](../src/glm/prefill/glm_pf_exact_moe.hip), [tests](../tests/hip_glm_pf_exact_moe_tests.hip)
 
 <a id="glm-pf-exact-x"></a>
@@ -3906,6 +3906,26 @@ their checks.
 - **Off switch:** STRIX_GLM_STEP_FLAG=0, or --baseline
 - **Measured gain:** Pair, fresh process per arm, --mtp 0: C1 -0.2 % (39.07 / 39.12 -> 39.00 / 39.03 ms/token); R8 within noise
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
+
+<a id="glm-pf-wmma-x"></a>
+
+### FAST WMMA prefill linear cores (glm-pf-wmma-x)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (opt-in FAST identity).
+
+The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
+2048+ rows (X3 route) and the MoE gate/up/down of the V11/V14 route. Per (row, output) each stage of four 16-wide
+k-units is one WMMA chain from +0, folded into an FP32 total with round-to-nearest adds; 128-row tiles with two output
+tiles per wave (remainders on 64-row storage); the H128/svh epilogue, plan, transforms, activation and combine are the
+exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits.
+
+- **Preconditions:** dense calls of 2048+ rows (`STRIX_GLM_PF_EXACT_X` auto / 4); MoE calls on V11 or V14 (auto from 128 rows). Other calls stay exact.
+- **Automatic selection:** none (opt-in).
+- **Fallback notice:** None; each rank prints `prefill identity glm-pf-wmma-x FAST (... wmma calls dense D moe M)` only when WMMA calls ran, else `prefill identity exact` (`prefill identity prefill-wmma route` under `--prefill wmma`). Two ranks: the switch is part of the startup agreement (a mismatch stops both ranks); modes without that handshake refuse `STRIX_GLM_PF_WMMA=1`.
+- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
+- **Off switch:** unset or STRIX_GLM_PF_WMMA=0
+- **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
+- **Implementation / evidence:** [core](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
 <a id="glm-serve-g2"></a>
 

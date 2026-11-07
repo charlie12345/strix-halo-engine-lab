@@ -1,6 +1,7 @@
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
+#include "glm/prefill/glm_pf_wmma_x.hpp"
 #include <strix_trellis.h>
 #include <algorithm>
 #include <cstdlib>
@@ -153,9 +154,31 @@ __global__ __launch_bounds__(256) void x3_kernel(Mat m, const _Float16* t, float
     const unsigned nr = rows - row0 < 8U * R ? rows - row0 : 8U * R;
     exact_x::core_s<B, R>(m, XRows{t, y, ys, m.input, row0}, nr, splits, hp, lds);
 }
+// FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): 64-row blocks on the WMMA core.
+template<int B, unsigned Rows = 64, unsigned CP = 1>
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void w_kernel(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows) {
+    __shared__ wmma_x::StorageR<Rows> lds;
+    const unsigned row0 = blockIdx.y * Rows;
+    const unsigned nr = rows - row0 < Rows ? rows - row0 : Rows;
+    wmma_x::span<B, CP>(m, [&](unsigned r, unsigned) { return XRows{t, y, ys, m.input, row0 + r}; }, nr, lds);
+}
 template<int B, unsigned TM>
 void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s, std::size_t* scratch) {
-    if constexpr (TM == 3 || TM == 4) {
+    if constexpr (TM == 5) {
+        if (scratch) {
+            hipFuncAttributes a{};
+            ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&w_kernel<B>)));
+            *scratch = a.localSizeBytes;
+            return;
+        }
+        if (wmma_x::tile_rows() == 128U && wmma_x::cols_per_wave() == 2U)
+            w_kernel<B, 128, 2><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows);
+        else if (wmma_x::tile_rows() == 128U)
+            w_kernel<B, 128><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows);
+        else w_kernel<B><<<dim3(m.output / 128U, (rows - 1U) / wmma_x::kRowsMax + 1U), 256, 0, s>>>(m, t, y, ys, rows);
+        ok(hipGetLastError());
+        return;
+    } else if constexpr (TM == 3 || TM == 4) {
         constexpr unsigned R = TM == 3 ? 4U : 8U;
         if (scratch) {
             hipFuncAttributes a{};
@@ -206,6 +229,7 @@ void dispatch_tm(unsigned tm, Mat m, const _Float16* t, float* y, std::size_t ys
     case 0: dispatch<0>(m, t, y, ys, rows, s, scratch); break;
     case 3: dispatch<3>(m, t, y, ys, rows, s, scratch); break;
     case 4: dispatch<4>(m, t, y, ys, rows, s, scratch); break;
+    case 5: dispatch<5>(m, t, y, ys, rows, s, scratch); break;
     case 16: dispatch<16>(m, t, y, ys, rows, s, scratch); break;
     case 32: dispatch<32>(m, t, y, ys, rows, s, scratch); break;
     case 64: dispatch<64>(m, t, y, ys, rows, s, scratch); break;
@@ -266,8 +290,9 @@ void linear_rows(const engine::Linear& l, const float* x, std::size_t xs, float*
     const auto grid = static_cast<unsigned>((std::size_t{rows} * (m.input / 128U) + 3U) / 4U);
     input_kernel<<<grid, 128, 0, s>>>(x, xs, m, rows, t);
     ok(hipGetLastError());
-    const unsigned core = selected == Route::x3r8 ? 4U : selected == Route::x3 ? 3U :
+    const unsigned core = selected == Route::x3r8 && wmma_x::enabled() && m.input % 64U == 0 ? 5U : selected == Route::x3r8 ? 4U : selected == Route::x3 ? 3U :
         selected == Route::x2 ? 1U : (selected == Route::x ? 0U : tm);
+    if (core == 5U) wmma_x::dense_calls.fetch_add(1, std::memory_order_relaxed);
     dispatch_tm(core, m, t, y, ys, rows, s);
 }
 hipFuncAttributes x_resources(const engine::Linear& l, unsigned variant) {

@@ -58,8 +58,10 @@
 #include "glm/common/glm_math.hpp"
 #include "glm/engine/glm_mem.hpp"
 #include "glm/engine/glm_r1b.hpp"
+#include "bitcalc_measurement.hpp"
 #include "glm/engine/glm_fast_moe.hpp"
 #include "glm/prefill/glm_pf_path.hpp"
+#include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/spec/glm_spec_host.hpp"
 #include "glm/spec/glm_spec_run.hpp"
 #include "glm/xfer/glm_xfer_exchange.hpp"
@@ -73,6 +75,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -320,6 +323,11 @@ int main(int argc, char** argv) {
         }
         if (pf_swap_moe && (opt.world != 2 || pf_gate.empty())) throw std::invalid_argument("--pf-swap-moe needs --world 2 and --pf-gate");
         const bool startup_handshake = rd::has_startup_handshake(opt.world, xch_kind, decode_n > 0, reference_gate);
+        // FAST glm-pf-wmma-x is a per-rank env switch, checked by the startup agreement (kPfWmmaConfig). Modes without
+        // that handshake cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
+            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N, comm exchange, "
+                                        "no reference gate) so both ranks are checked to run the same prefill identity");
         ge::Engine eng(opt, comm.get());
         if (xfer_exchange) eng.set_exchange(xfer_exchange);
         bool startup_agreed = false;
@@ -333,7 +341,8 @@ int main(int argc, char** argv) {
                 ((prefill_mode == "ref" ? 1U : prefill_mode == "gemv" ? 2U : 3U) << 5) |
                 (static_cast<std::uint32_t>(eng.identity_mode()) << 7) |
                 (eff.env.at("STRIX_GLM_SPEC_XCH").value == "xfer" ? 1U << 9 : 0U) |
-                (eng.decode_xfer_enabled() ? 1U << 10 : 0U);
+                (eng.decode_xfer_enabled() ? 1U << 10 : 0U) |
+                (strix::glm::pf::wmma_x::enabled() ? rd::kPfWmmaConfig : 0U);  // FAST prefill identity must match on both ranks
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
                  static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},
@@ -895,8 +904,28 @@ int main(int argc, char** argv) {
         // its wait for the peer's load inside the first exchange. STRIX_GLM_PF_TIMER_BARRIER=0 restores the old start.
         const char* tb_env = std::getenv("STRIX_GLM_PF_TIMER_BARRIER");
         const bool timer_barrier = comm && !(tb_env != nullptr && std::string(tb_env) == "0");
+        // STRIX_GLM_BITCALC_CASES=FILE (quality-kit replay): line i = "<force tokens> <logits out>" for prompt i, so one
+        // process captures every case of a --prompt list (each prompt starts from a reset slot 0, as without it).
+        std::vector<std::pair<std::string, std::string>> bitcalc_cases;
+        if (const char* cf = std::getenv("STRIX_GLM_BITCALC_CASES"); cf && *cf) {
+            std::ifstream in(cf);
+            if (!in) throw std::invalid_argument(std::string("STRIX_GLM_BITCALC_CASES: cannot open ") + cf);
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream fields(line);
+                std::string case_force, case_out, extra;
+                if (!(fields >> case_force >> case_out) || (fields >> extra))
+                    throw std::invalid_argument("STRIX_GLM_BITCALC_CASES: each line must hold exactly two paths");
+                bitcalc_cases.emplace_back(case_force, case_out);
+            }
+            if (bitcalc_cases.size() != decode_prompts.size())
+                throw std::invalid_argument("STRIX_GLM_BITCALC_CASES: one line per --prompt entry required");
+        }
         for (const auto& toks : decode_prompts) {
             eng.reset(0);
+            if (!bitcalc_cases.empty() && (setenv("STRIX_BITCALC_FORCE_TOKENS", bitcalc_cases[pi].first.c_str(), 1) != 0 ||
+                                           setenv("STRIX_BITCALC_LOGITS_OUT", bitcalc_cases[pi].second.c_str(), 1) != 0))
+                throw std::runtime_error("STRIX_GLM_BITCALC_CASES: setenv");
             std::size_t free0 = 0, free1 = 0, total = 0;
             if (hipMemGetInfo(&free0, &total) != hipSuccess) throw std::runtime_error("mem info");
             if (timer_barrier) {
@@ -929,6 +958,15 @@ int main(int argc, char** argv) {
                             opt.rank, prefill_mode.c_str(), toks.size(), secs(t0, t1), 1000.0 * secs(t0, t1) / static_cast<double>(toks.size()), next,
                             static_cast<unsigned long long>(fnv(lg.data(), lg.size() * 4)), static_cast<unsigned long long>(fnv(st.data(), st.size())),
                             st.size());
+                // Identity witness (quality kit): executed arithmetic of this prefill = linear calls that ran on the WMMA
+                // core (dense X3 calls, MoE V11 calls); FAST only when at least one did. Otherwise the route's own
+                // identity: exact for ref/gemv, the --prefill wmma route's for wmma.
+                const char* wm = std::getenv("STRIX_GLM_PF_WMMA");
+                namespace W = strix::glm::pf::wmma_x;
+                const auto wd = W::dense_calls.exchange(0), wmo = W::moe_calls.exchange(0);
+                std::printf("rank %u prefill identity %s (STRIX_GLM_PF_WMMA=%s, prefill %s, wmma calls dense %llu moe %llu)\n",
+                            opt.rank, wd + wmo ? "glm-pf-wmma-x FAST" : prefill_mode == "wmma" ? "prefill-wmma route" : "exact", wm ? wm : "unset", prefill_mode.c_str(),
+                            static_cast<unsigned long long>(wd), static_cast<unsigned long long>(wmo));
             }
             if (!logits_out.empty()) {
                 std::vector<float> lg(eng.vocab_slice());
@@ -949,7 +987,34 @@ int main(int argc, char** argv) {
             if (decode_profile) eng.set_profiling(true);  // decode steps only (after the prefill)
             const ge::Profile p0 = eng.profile();
             sp::RunResult result;
-            if (mtp_spec_on) {
+            // Quality-kit capture (STRIX_BITCALC_FORCE_TOKENS / STRIX_BITCALC_LOGITS_OUT, plain decode only): each rank
+            // writes BCLG records of ITS vocabulary slice (rank r = [r V / world, (r + 1) V / world)); argmax is the
+            // merged greedy token, emitted the forced one, which both ranks feed back. Step 0 = the prefill's last row.
+            strix::decode_cli::BitcalcMeasurement bitcalc;
+            if (bitcalc.enabled()) {
+                if (mtp_spec_on) throw std::invalid_argument("STRIX_BITCALC capture needs plain decode (--mtp 0)");
+                if (decode_prompts.size() != 1 && bitcalc_cases.empty())
+                    throw std::invalid_argument("STRIX_BITCALC capture takes one prompt (STRIX_GLM_BITCALC_CASES for a list)");
+                bitcalc.prepare(strix::glm::kVocab, toks.size(), decode_n);
+                std::vector<float> lg(eng.vocab_slice());
+                auto emit = [&](std::uint64_t step, std::uint32_t argmax) {
+                    if (hipMemcpy(lg.data(), eng.last_logits(), lg.size() * 4, hipMemcpyDeviceToHost) != hipSuccess)
+                        throw std::runtime_error("logits copy");
+                    return bitcalc.hook()(step, pos - 1U, argmax, std::span<const float>(lg));
+                };
+                next = emit(0, next);
+                out = {next};
+                for (unsigned i = 1; i < decode_n; ++i) {
+                    const ge::Row r{0, next, pos++};
+                    next = emit(i, eng.step({&r, 1})[0]);
+                    out.push_back(next);
+                }
+                bitcalc.finish();
+                std::printf("{\"rank\":%u,\"prompt_index\":%u,\"bitcalc_forced_steps\":%llu,\"bitcalc_force_sha256\":\"%s\",\"vocab0\":%u,\"vocab_slice\":%u}\n",
+                            opt.rank, pi - 1U, static_cast<unsigned long long>(bitcalc.forced_steps()), bitcalc.force_tokens_sha256().c_str(),
+                            opt.rank * eng.vocab_slice(), eng.vocab_slice());
+                std::fflush(stdout);
+            } else if (mtp_spec_on) {
                 result = sp::decode_greedy(eng, 0, seed, {eff.kmax, eff.adaptive, eff.kmax, opt.capacity}, decode_n, control);
                 out = result.tokens;
             } else for (unsigned i = 1; i < decode_n; ++i) {

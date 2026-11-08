@@ -382,16 +382,7 @@ void Exchanger::process(const Job& job) {
     std::byte* rx = rx_slot(job.sequence);
     const std::size_t count = (job.bytes + options_.chunk - 1) / options_.chunk;
     if (options_.crc) post_lane(tx_lane_, tx, job.bytes, count);  // the TX slot is complete: every chunk is ready
-    Header mine;
-    mine.epoch = options_.epoch;
-    mine.plan = options_.plan;
-    mine.sequence = job.sequence;
-    mine.request = job.tag.request;
-    mine.bytes = job.bytes;
-    mine.kind = job.tag.kind;
-    mine.layer = job.tag.layer;
-    mine.chunk = static_cast<std::uint32_t>(options_.chunk) | (options_.crc ? 0x80000000U : 0U);  // bit 31: CRC trailer on
-    mine.rank = options_.rank;
+    const Header mine = PrefillTraits::header(options_, job.sequence, job.bytes, job.tag);
     Header peer;
     try {
         // The ranks agree on the identity and the size before any payload moves (a mismatch cannot desynchronise the
@@ -415,10 +406,7 @@ void Exchanger::process(const Job& job) {
         // Trailer: the identity again + this rank's per-chunk TX CRCs; the peer's list must equal our RX CRCs.
         wait_lane(tx_lane_, deadline);
         std::vector<std::byte> out(sizeof(Header) + count * 4), in(out.size());
-        Header t = mine;
-        t.magic = kTrailerMagic;
-        std::memcpy(out.data(), &t, sizeof(t));
-        std::memcpy(out.data() + sizeof(Header), tx_lane_.crcs.data(), count * 4);
+        PrefillTraits::trailer(out.data(), mine, tx_lane_.crcs.data(), count);
         try {
             transport_->exchange(out, in);
         } catch (const std::exception& e) {

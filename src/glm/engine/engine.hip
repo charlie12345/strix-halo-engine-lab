@@ -1,3 +1,6 @@
+#include "xport/channel.hpp"
+#include "xport/communicator_backend.hpp"
+#include "glm/xfer/glm_traits.hpp"
 // GLM-5.3-Flash engine (see include/strix/glm/engine.hpp, design notes).
 //
 // Skeleton v1: correctness first. Per layer: mHC pre (Tier A) -> RMSNorm -> attention seam -> TP reduction -> mHC
@@ -266,15 +269,70 @@ public:
 };
 
 // TP2 over the communicator: send this rank's partial, receive the peer's, y = p0 + p1 in rank order on both ranks.
+// Communicator framing remains unchanged. The core owns the slot leases and
+// their events; this backend supplies stream operations and the existing copies.
+struct CommStagingRuntime {
+    using Stream = hipStream_t;
+    using Event = hipEvent_t;
+    float*& storage;
+    unsigned& capacity;
+    unsigned depth;
+    hipStream_t stream = nullptr;
+    void destroy(Event event) { if (event) (void)hipEventDestroy(event); }
+    void init(Event& source, Event& remote, Stream s) {
+        if (!source) hip_ok(hipEventCreateWithFlags(&source, hipEventDisableTiming), "prefill source event");
+        if (!remote) {
+            hip_ok(hipEventCreateWithFlags(&remote, hipEventDisableTiming), "prefill remote event");
+            hip_ok(hipEventRecord(remote, s), "prefill initial remote lifetime");
+        }
+        stream = s;
+    }
+    void wait_source(Event source, Stream s) {
+        hip_ok(hipStreamWaitEvent(s, source, 0), "prefill source lifetime");
+    }
+    void reuse(Event source, Event, Stream s) {
+        wait_source(source, s);
+        // start_async enqueues remote_last_use on its H2D stream, as before.
+    }
+    void* remote(unsigned slot, unsigned offset) {
+        // The first two views retain today's disjoint half regions and bytes.
+        const std::size_t row = depth == 2 ? offset : std::size_t{slot} * capacity;
+        return storage + row * kHidden;
+    }
+    void copy(void* local, void* target, std::size_t bytes, Event remote_event) {
+        hip_ok(hipStreamWaitEvent(stream, remote_event, 0), "prefill staged slot lifetime");
+        const std::size_t n4 = bytes / sizeof(float4);
+        stage_copy_kernel<<<static_cast<unsigned>((n4 + 255) / 256), 256, 0, stream>>>(
+            reinterpret_cast<const float4*>(local), static_cast<float4*>(target), n4);
+        hip_ok(hipGetLastError(), "prefill stage copy");
+    }
+    void record_source(Event source, Stream s, bool staged) {
+        hip_ok(hipEventRecord(source, s), staged ? "prefill staged source lifetime" : "prefill fallback source lifetime");
+    }
+    void record_remote(Event remote, Stream s) {
+        hip_ok(hipEventRecord(remote, s), "prefill remote last use");
+    }
+};
+using CommBackend = xport::CommunicatorBackend<dist::Communicator, CommStagingRuntime, dist::Tag>;
+using CommStagingOps = xport::BackendStagingOps<CommBackend>;
+struct CommStagingTraits : glm::xfer::GlmTraits { using Tag = dist::Tag; };
+using CommStaging = xport::Channel<CommStagingTraits>::Staging<CommStagingOps>;
+
 class CommExchange final : public Exchange {
 public:
     CommExchange(dist::Communicator& comm, std::uint32_t rank, unsigned max_rows)
-        : comm_(comm), rank_(rank), capacity_(max_rows), remote_(dalloc<float>(static_cast<std::size_t>(max_rows) * kHidden)),
+        : comm_(comm), rank_(rank), capacity_(max_rows), slots_(xport::staging_slots(CommStagingTraits::kStagingSlots)),
+          remote_(dalloc<float>(static_cast<std::size_t>(max_rows) * kHidden * (slots_ == 2 ? 1 : slots_))),
+          staging_runtime_{remote_, capacity_, slots_}, staging_backend_{comm_, staging_runtime_}, staging_ops_{staging_backend_}, staging_channel_(staging_ops_, slots_, xport::staging_trace_enabled()),
           am_l_(dalloc<std::uint64_t>(max_rows)), am_r_(dalloc<std::uint64_t>(max_rows)),
           merge_l_(dalloc<std::uint8_t>(kMergeBytes)), merge_r_(dalloc<std::uint8_t>(kMergeBytes)) {}
     ~CommExchange() override {
-        for (auto e : source_free_) if (e) (void)hipEventDestroy(e);
-        for (auto e : remote_last_use_) if (e) (void)hipEventDestroy(e);
+        if (xport::staging_trace_enabled()) {
+            const auto& c = staging_channel_.counters();
+            std::fprintf(stderr, "xport prefill bytes=%llu copied=%llu messages=%llu exposed_wait=%llu\n",
+                static_cast<unsigned long long>(c.bytes), static_cast<unsigned long long>(c.staging_bytes),
+                static_cast<unsigned long long>(c.exchanges), static_cast<unsigned long long>(c.exposed_wait));
+        }
         (void)hipFree(remote_);
         (void)hipFree(am_l_);
         (void)hipFree(am_r_);
@@ -288,7 +346,7 @@ public:
         (void)hipFree(am_l_);
         (void)hipFree(am_r_);
         remote_ = nullptr; am_l_ = am_r_ = nullptr;
-        remote_ = dalloc<float>(static_cast<std::size_t>(rows) * kHidden);
+        remote_ = dalloc<float>(static_cast<std::size_t>(rows) * kHidden * (slots_ == 2 ? 1 : slots_));
         am_l_ = dalloc<std::uint64_t>(rows);
         am_r_ = dalloc<std::uint64_t>(rows);
         capacity_ = rows;
@@ -325,10 +383,11 @@ public:
         std::fprintf(stderr, "rank %u prefill exchange: %s (local %u, peer %u)\n", rank_,
                      staged_vote_ == 1 ? "staging views" : "chunked copies", static_cast<unsigned>(mine), static_cast<unsigned>(peer));
     }
-    // Only the N=2 opt-in schedule supplies a half and a disjoint row region.
+    // Producer buffers still have two halves; their latest ticket carries the
+    // source lifetime independently of the number of channel staging slots.
     void wait_source(unsigned half, hipStream_t s) {
         if (source_pending_[half]) {
-            hip_ok(hipStreamWaitEvent(s, source_free_[half], 0), "prefill source lifetime");
+            staging_channel_.wait_source(source_fence_[half], s);
             source_pending_[half] = false;
         }
     }
@@ -338,86 +397,43 @@ public:
         dist::Tag tag;
         tag.kind = static_cast<std::uint32_t>(dist::TagKind::half_sum);
         tag.request = seq_++;
-        pending_remote_ = remote_ + static_cast<std::size_t>(offset) * kHidden;
-        pending_half_ = half;
         const std::size_t bytes = static_cast<std::size_t>(rows) * kHidden * sizeof(float);
-        if (half >= 0 && staged_vote_ == 1) {
-            // Both ranks agreed on the staging views; a per-size refusal here (above max_bytes, a direct route) is
-            // rank-symmetric because the old chunked path depends on the same sizes and routes.
-            if (auto* tx = static_cast<float4*>(comm_.send_staging(bytes))) {
-                const std::size_t n4 = bytes / sizeof(float4);
-                stage_copy_kernel<<<static_cast<unsigned>((n4 + 255) / 256), 256, 0, s>>>(reinterpret_cast<const float4*>(p), tx, n4);
-                hip_ok(hipGetLastError(), "prefill stage copy");
-                comm_.start_staged(s, bytes, tag);
-                staged_ = true;
-                pending_part_ = p;
-                pending_rows_ = rows;
-                return;
-            }
-        }
+        const unsigned preferred = slots_ == 2 ? (half >= 0 ? static_cast<unsigned>(half) : 0U) : next_slot_++ % slots_;
+        auto view = staging_channel_.staging(p, offset, s, preferred);
+        pending_ticket_ = staging_channel_.post(tag, view, bytes, CommStagingOps::How{half >= 0 && staged_vote_ == 1, half >= 0});
         if (half >= 0) {
-            if (!source_free_[half]) hip_ok(hipEventCreateWithFlags(&source_free_[half], hipEventDisableTiming), "prefill source event");
-            if (!remote_last_use_[half]) {
-                hip_ok(hipEventCreateWithFlags(&remote_last_use_[half], hipEventDisableTiming), "prefill remote event");
-                hip_ok(hipEventRecord(remote_last_use_[half], s), "prefill initial remote lifetime");
-            }
-            source_pending_[half] = comm_.start_async(s, p, pending_remote_, bytes, tag, remote_last_use_[half], source_free_[half]);
-        } else comm_.start(s, p, bytes, tag);
+            source_fence_[half] = staging_channel_.source_fence(pending_ticket_);
+            source_pending_[half] = true;
+        }
         pending_part_ = p;
         pending_rows_ = rows;
     }
     void finish_reduce(hipStream_t s) override {
-        if (pending_part_ == nullptr) throw std::logic_error("prefill reduction not in flight");
         float* p = pending_part_;
         const std::size_t n = static_cast<std::size_t>(pending_rows_) * kHidden;
-        pending_part_ = nullptr;  // a failed finish stops the communicator; do not retry it during unwinding
-        if (staged_) {
-            staged_ = false;
-            // RX is read in place; release_staged fences its reuse after this sum2.
-            const auto* rx = static_cast<const float*>(comm_.finish_staged(s));
-            const float* p0 = rank_ == 0 ? p : rx;
-            const float* p1 = rank_ == 0 ? rx : p;
-            sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n);
-            hip_ok(hipGetLastError(), "sum2 prefill staged");
-            comm_.release_staged(s);
-            return;
-        }
-        // finish waits for checked peer bytes. Each half's last-use event protects
-        // its remote region from the next off-stream H2D; pinned staging is owned by comm_.
-        comm_.finish(s, pending_remote_);
-        const float* p0 = rank_ == 0 ? p : pending_remote_;
-        const float* p1 = rank_ == 0 ? pending_remote_ : p;
+        const float *p0 = nullptr, *p1 = nullptr;
+        finish_reduce_pair(s, &p0, &p1);
         sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n);
         hip_ok(hipGetLastError(), "sum2 prefill pipeline");
-        if (pending_half_ >= 0) hip_ok(hipEventRecord(remote_last_use_[pending_half_], s), "prefill remote last use");
+        release_pair(s);
     }
-    // STRIX_GLM_PF_SUMEXP: finish_reduce without the sum. *p0 / *p1 are the two partials in rank order, read by one
-    // consumer on s; release_pair (after that consumer, before the next start) fences RX / remote-region reuse exactly as
-    // finish_reduce does after its sum2. The partial itself is left unsummed.
+    // SUMEXP retains the lease until the fused consumer has been enqueued.
     void finish_reduce_pair(hipStream_t s, const float** p0, const float** p1) {
         if (pending_part_ == nullptr) throw std::logic_error("prefill reduction not in flight");
         if (held_) throw std::logic_error("prefill pair already held");
         const float* p = pending_part_;
         pending_part_ = nullptr;
-        const float* r = nullptr;
-        held_staged_ = staged_;
-        if (staged_) {
-            staged_ = false;
-            r = static_cast<const float*>(comm_.finish_staged(s));
-        } else {
-            comm_.finish(s, pending_remote_);
-            r = pending_remote_;
-        }
+        const float* r;
+        const auto view = staging_channel_.wait(pending_ticket_, s);
+        r = static_cast<const float*>(view.remote);
         held_ = true;
-        held_half_ = pending_half_;
-        *p0 = rank_ == 0 ? p : r;
-        *p1 = rank_ == 0 ? r : p;
+        held_ticket_ = pending_ticket_;
+        xport::rank_pair(rank_, p, r, p0, p1);
     }
     void release_pair(hipStream_t s) {
         if (!held_) throw std::logic_error("prefill pair not held");
         held_ = false;
-        if (held_staged_) comm_.release_staged(s);
-        else if (held_half_ >= 0) hip_ok(hipEventRecord(remote_last_use_[held_half_], s), "prefill remote last use");
+        staging_channel_.release(held_ticket_, s);
     }
     void complete(hipStream_t s) override {
         if (held_) release_pair(s);
@@ -480,7 +496,15 @@ private:
     dist::Communicator& comm_;
     std::uint32_t rank_;
     unsigned capacity_;
+    unsigned slots_;
+    unsigned next_slot_ = 0;
     float* remote_;
+    CommStagingRuntime staging_runtime_;
+    CommBackend staging_backend_;
+    CommStagingOps staging_ops_;
+    CommStaging staging_channel_;
+    CommStaging::Ticket pending_ticket_{}, held_ticket_{};
+    CommStaging::SourceFence source_fence_[2]{};
     static_assert(sizeof(MergeRow) == 12);
     static_assert(sizeof(MergeCtl) == 72);
     static constexpr std::size_t kMergeBytes = sizeof(MergeCtl) + 8 * sizeof(MergeRow);
@@ -489,14 +513,9 @@ private:
     std::uint64_t seq_ = 0;
     float* pending_part_ = nullptr;
     unsigned pending_rows_ = 0;
-    float* pending_remote_ = nullptr;
-    int pending_half_ = -1;
-    hipEvent_t source_free_[2] = {}, remote_last_use_[2] = {};
     bool source_pending_[2] = {};
-    bool staged_ = false;  // the in-flight reduction uses the staging views (STRIX_GLM_PF_STAGED)
     int staged_vote_ = -1;  // -1 not yet agreed, 0 chunked copies, 1 staging views (both ranks)
-    bool held_ = false, held_staged_ = false;  // finish_reduce_pair handed out RX / the remote region (until release_pair)
-    int held_half_ = -1;
+    bool held_ = false;  // the consumer holds a ticket until release_pair
 };
 
 // ---------------------------------------------------------------- layer weights

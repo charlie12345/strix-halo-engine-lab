@@ -5,6 +5,7 @@
 #include "strix/deepseek41_plan.hpp"
 #include "strix/dist/communicator.hpp"
 #include "hip_ds41_staged_ready.hpp"
+#include "xport/ds41_adapter.hpp"
 #include "strix/ds41_engram.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/ds41_moe.hpp"
@@ -39,6 +40,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include <fcntl.h>
@@ -1896,6 +1898,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         dv.out = m.shared.p;
         ds41::enqueue_routes_product(down_fmt, dv, st);
     };
+    using BatchRawCommunicator = std::remove_reference_t<decltype(*m.options.communicator)>;
+    using BatchRawExchange = xport::Ds41RawSlotsExchange<BatchRawCommunicator, hipStream_t, dist::Tag>;
+    std::optional<BatchRawExchange> batch_shared_raw_exchange;
     const Step* deferred_shared = nullptr;
     // STRIX_DS41_HC_SITE=1 / STRIX_DS41_QA_KV=1: as DeviceForward (one enqueue_hc_site per hyper-connection boundary,
     // q_a and kv in one launch over one A8 of the attention input), same bits. HC_SITE is off with layer timing.
@@ -2151,9 +2156,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 const std::uint32_t total = R * half, blocks = (total + 255U) / 256U;
                 engram_pack<<<blocks, 256, 0, st>>>(m.ekv.p, m.ekv_tx.p, R, n, half, v.first);
                 check(hipGetLastError(), "engram_pack");
-                m.options.communicator->start(st, m.ekv_tx.p, std::size_t{total} * 4U,
-                                              dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0x10000U | static_cast<std::uint32_t>(layer), 0U});
-                m.options.communicator->finish(st, m.ekv_rx.p);
+                xport::ds41_exchange_raw_slots(
+                    *m.options.communicator, st, m.ekv_tx.p, m.ekv_rx.p, std::size_t{total} * 4U,
+                    dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0x10000U | static_cast<std::uint32_t>(layer), 0U}, [] {});
                 engram_scatter<<<blocks, 256, 0, st>>>(m.ekv_rx.p, m.ekv.p, R, n, half, (1U - m.options.rank) * half);
                 check(hipGetLastError(), "engram_scatter");
             } else {
@@ -2262,15 +2267,18 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                             const std::uint32_t n = R * H;
                             ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
                             ready_detail::copy_publish(m.half_own.p, stage, n, st);
-                            m.options.communicator->start_staged_ready(st, std::size_t{R} * H * 4U,
-                                                                       dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
-                            enqueue_late_mix();
-                            if (m.prefetch_bytes) prefetch_after(s);
-                            const auto peer = m.options.communicator->finish_staged_ready();
-                            const auto* other = static_cast<const float*>(peer.data);
-                            ready_detail::add(m.options.rank == 0U ? m.half_own.p : other, m.options.rank == 0U ? other : m.half_own.p, m.y.p, n,
-                                              peer, st);
-                            m.options.communicator->release_staged_ready(st);
+                            xport::ds41_exchange_raw_slots_staged<true>(
+                                *m.options.communicator, st, stage.data, std::size_t{R} * H * 4U,
+                                dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U},
+                                [&] {
+                                    enqueue_late_mix();
+                                    if (m.prefetch_bytes) prefetch_after(s);
+                                },
+                                [&](const auto& batch_peer_view) {
+                                    const auto* other = static_cast<const float*>(batch_peer_view.data);
+                                    ready_detail::add(m.options.rank == 0U ? m.half_own.p : other, m.options.rank == 0U ? other : m.half_own.p, m.y.p, n,
+                                                      batch_peer_view, st);
+                                });
                             break;
                         }
                     if (tp) {
@@ -2278,11 +2286,13 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         // no send staging: it may be host memory, which the trellis plans do not take as output
                         const auto tag = dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U};
                         ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
-                        m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U, tag);
-                        enqueue_late_mix();
-                        prefetch_after(s);
-                        if (m.prefetch_bytes) prefetch_after(s);
-                        m.options.communicator->finish(st, m.half_other.p);
+                        xport::ds41_exchange_raw_slots(
+                            *m.options.communicator, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                            tag, [&] {
+                                enqueue_late_mix();
+                                prefetch_after(s);
+                                if (m.prefetch_bytes) prefetch_after(s);
+                            });
                         const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                         const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                         const std::uint32_t n = R * H;
@@ -2358,13 +2368,14 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         };
                         product(0U);
                         for (std::uint32_t k = 0; k < ob_k; ++k) {
-                            m.options.communicator->start(st, m.half_own.p + k * ob_chunk, ob_chunk * 4U,
-                                                          dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
-                            if (k == 0U) enqueue_late_mix();
-                        if (k == 0U && m.prefetch_bytes) prefetch_after(s);
-                            if (k + 1U < ob_k) product(k + 1U);
-                            if (k > 0U) add(k - 1U);
-                            m.options.communicator->finish(st, m.half_other.p + k * ob_chunk);
+                            xport::ds41_exchange_raw_slots(
+                                *m.options.communicator, st, m.half_own.p + k * ob_chunk, m.half_other.p + k * ob_chunk, ob_chunk * 4U,
+                                dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U}, [&] {
+                                    if (k == 0U) enqueue_late_mix();
+                                if (k == 0U && m.prefetch_bytes) prefetch_after(s);
+                                    if (k + 1U < ob_k) product(k + 1U);
+                                    if (k > 0U) add(k - 1U);
+                                });
                         }
                         add(ob_k - 1U);
                         break;
@@ -2373,42 +2384,54 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         auto* own = static_cast<float*>(stage.data);
                         v.out = own;
                         ready_detail::product(v, stage, st);
-                        m.options.communicator->start_staged_ready(st, std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
-                        enqueue_late_mix();
-                        if (m.prefetch_bytes) prefetch_after(s);
-                        const auto peer = m.options.communicator->finish_staged_ready();
-                        const auto* other = static_cast<const float*>(peer.data);
-                        const std::uint32_t n = R * H;
-                        ready_detail::add(m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own,
-                                          m.y.p, n, peer, st);
-                        m.options.communicator->release_staged_ready(st);
+                        xport::ds41_exchange_raw_slots_staged<true>(
+                            *m.options.communicator, st, stage.data, std::size_t{R} * H * 4U,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U},
+                            [&] {
+                                enqueue_late_mix();
+                                if (m.prefetch_bytes) prefetch_after(s);
+                            },
+                            [&](const auto& batch_peer_view) {
+                                const auto* other = static_cast<const float*>(batch_peer_view.data);
+                                const std::uint32_t n = R * H;
+                                ready_detail::add(m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own,
+                                                  m.y.p, n, batch_peer_view, st);
+                            });
                         break;
                     }
                     if (auto* staged = static_cast<float*>(m.options.communicator->send_staging(std::size_t{R} * H * 4U))) {
                         v.out = staged;
                         ds41::enqueue_q8_0_a8(v, st);
-                        m.options.communicator->start_staged(st, std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
-                        enqueue_late_mix();
-                        if (m.prefetch_bytes) prefetch_after(s);
-                        const auto* peer = static_cast<const float*>(m.options.communicator->finish_staged(st));
-                        const std::uint32_t n = R * H;
-                        add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? staged : peer, m.options.rank == 0U ? peer : staged, m.y.p, n);
-                        check(hipGetLastError(), "add_halves");
-                        m.options.communicator->release_staged(st);
+                        xport::ds41_exchange_raw_slots_staged<false>(
+                            *m.options.communicator, st, staged, std::size_t{R} * H * 4U,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U},
+                            [&] {
+                                enqueue_late_mix();
+                                if (m.prefetch_bytes) prefetch_after(s);
+                            },
+                            [&](const void* batch_peer_data) {
+                                const auto* peer = static_cast<const float*>(batch_peer_data);
+                                const std::uint32_t n = R * H;
+                                add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? staged : peer, m.options.rank == 0U ? peer : staged, m.y.p, n);
+                                check(hipGetLastError(), "add_halves");
+                            });
                         break;
                     }
                     v.out = m.half_own.p;
                     ds41::enqueue_q8_0_a8(v, st);
                     if (m.prefetch_bytes) {
-                        m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U,
-                                                      dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
-                        enqueue_late_mix();
-                        prefetch_after(s);
-                        m.options.communicator->finish(st, m.half_other.p);
+                        xport::ds41_exchange_raw_slots(
+                            *m.options.communicator, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U}, [&] {
+                                enqueue_late_mix();
+                                prefetch_after(s);
+                            });
                     } else {
-                        m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
-                        enqueue_late_mix();
-                        m.options.communicator->finish(st, m.half_other.p);
+                        xport::ds41_exchange_raw_slots(
+                            *m.options.communicator, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U}, [&] {
+                                enqueue_late_mix();
+                            });
                     }
                     const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                     const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
@@ -2772,8 +2795,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 gu.act_deltas = reinterpret_cast<float*>(m.shx_own.p + std::size_t{R} * hI);
                 gu.act_sums = m.sh_act_sums.p;
                 ds41::enqueue_gate_up(gu_fmt, gu, st);
-                m.options.communicator->start(st, m.shx_own.p, std::size_t{R} * hI + std::size_t{R} * hI / 32U * 4U,
-                                              dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 1U});
+                batch_shared_raw_exchange.emplace(*m.options.communicator, st, m.shx_own.p, m.shx_other.p,
+                                                  std::size_t{R} * hI + std::size_t{R} * hI / 32U * 4U,
+                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 1U});
                 break;
             }
             if (m.shared_mode == 1) {  // enqueued between the start and the finish of the half-sum exchange
@@ -2831,7 +2855,8 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 // the peer's activation half, the full activation, this rank's down rows [H/2 r, H/2 r + H/2) after its
                 // half sum in the same exchange, then (shared + low) + high on both ranks
                 const std::uint32_t hI = I / 2U, hH = H / 2U;
-                m.options.communicator->finish(st, m.shx_other.p);
+                batch_shared_raw_exchange->finish(st);
+                batch_shared_raw_exchange.reset();
                 const auto* first = m.options.rank == 0U ? m.shx_own.p : m.shx_other.p;
                 const auto* second = m.options.rank == 0U ? m.shx_other.p : m.shx_own.p;
                 const auto codes = [&](const std::uint8_t* b) { return reinterpret_cast<const std::int8_t*>(b); };
@@ -2865,15 +2890,11 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 v.half = m.expert_tp ? 0U : m.options.rank;  // expert TP: the fold of all the row's slots (low_counts = top_k)
                 v.out = m.half_own.p;
                 ds41::enqueue_half_sum(v, st);
-                if (m.prefetch_bytes) {
-                    m.options.communicator->start(st, m.half_own.p, (std::size_t{R} * H + std::size_t{R} * hH) * 4U,
-                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U});
-                    prefetch_after(s);
-                    m.options.communicator->finish(st, m.half_other.p);
-                } else {
-                    m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, (std::size_t{R} * H + std::size_t{R} * hH) * 4U,
-                                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U});
-                }
+                xport::ds41_exchange_half_sum(*m.options.communicator, st, m.half_own.p, m.half_other.p,
+                                              (std::size_t{R} * H + std::size_t{R} * hH) * 4U,
+                                              dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [&] {
+                                                  if (m.prefetch_bytes) prefetch_after(s);
+                                              });
                 const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                 const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                 ds41::enqueue_canonical_sum_split(low + std::size_t{R} * H, high + std::size_t{R} * H, low, high, R, H, m.y.p,
@@ -2897,48 +2918,42 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         auto* own = static_cast<float*>(stage.data);
                         v.out = own;
                         ds41::enqueue_half_sum_ready(v, stage, st);
-                        m.options.communicator->start_staged_ready(st, std::size_t{R} * H * 4U,
-                                                                   dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U});
-                        if (deferred_shared) {
-                            enqueue_shared(*deferred_shared);
-                            deferred_shared = nullptr;
-                        } else if (m.prefetch_bytes) {
-                            prefetch_after(s);
-                        }
-                        const auto peer = m.options.communicator->finish_staged_ready();
-                        const auto* other = static_cast<const float*>(peer.data);
-                        ds41::enqueue_canonical_sum_ready(m.shared.p, m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own,
-                                                          std::size_t{R} * H, m.y.p, peer, st);
-                        m.options.communicator->release_staged_ready(st);
+                        xport::ds41_exchange_half_sum_ready(*m.options.communicator, st, own, std::size_t{R} * H * 4U,
+                            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [&] {
+                                if (deferred_shared) {
+                                    enqueue_shared(*deferred_shared);
+                                    deferred_shared = nullptr;
+                                } else if (m.prefetch_bytes) {
+                                    prefetch_after(s);
+                                }
+                            }, [&](const auto& half_peer_view) {
+                                const auto* half_peer_data = static_cast<const float*>(half_peer_view.data);
+                                ds41::enqueue_canonical_sum_ready(m.shared.p, m.options.rank == 0U ? own : half_peer_data,
+                                    m.options.rank == 0U ? half_peer_data : own, std::size_t{R} * H, m.y.p, half_peer_view, st);
+                            });
                         break;
                     }
                 v.out = m.half_own.p;
                 ds41::enqueue_half_sum(v, st);
                 if (m.shexp_tp) {  // shexp-tp: S_r + P_r travels, y = (S0 + P0) + (S1 + P1)
                     ds41::enqueue_add_inplace_f32(m.half_own.p, m.shared.p, std::size_t{R} * H, st);
-                    m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
-                                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U});
+                    xport::ds41_exchange_half_sum(*m.options.communicator, st, m.half_own.p, m.half_other.p,
+                        std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [] {});
                     const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                     const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                     ds41::enqueue_add_f32(low, high, std::size_t{R} * H, m.y.p, st);
                     break;
                 }
-                if (deferred_shared) {
-                    m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U,
-                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U});
-                    enqueue_shared(*deferred_shared);
-                    deferred_shared = nullptr;
-                    // no read-ahead here: the shared expert already fills the half-sum transfer (ds41/batch-perf 8f869e3)
-                    m.options.communicator->finish(st, m.half_other.p);
-                } else if (m.prefetch_bytes) {
-                    m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U,
-                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U});
-                    prefetch_after(s);
-                    m.options.communicator->finish(st, m.half_other.p);
-                } else {
-                    m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
-                                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U});
-                }
+                xport::ds41_exchange_half_sum(*m.options.communicator, st, m.half_own.p, m.half_other.p,
+                    std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [&] {
+                        if (deferred_shared) {
+                            enqueue_shared(*deferred_shared);
+                            deferred_shared = nullptr;
+                            // no read-ahead here: the shared expert already fills the half-sum transfer (ds41/batch-perf 8f869e3)
+                        } else if (m.prefetch_bytes) {
+                            prefetch_after(s);
+                        }
+                    });
                 const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                 const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                 ds41::enqueue_canonical_sum(m.shared.p, low, high, std::size_t{R} * H, m.y.p, st);

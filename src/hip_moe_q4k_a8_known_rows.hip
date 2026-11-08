@@ -1,3 +1,4 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"
@@ -336,6 +337,112 @@ __device__ unsigned down_q51_word(const unsigned char* block,unsigned first) {
     }
     return result;
 }
+// Opt-in R16 projection: G-row activation staging, one weight load per expert batch.
+template<unsigned G,bool Q5K,bool A8Down>
+__global__ __launch_bounds__(256) void project_window_split(const unsigned char* gate,const unsigned char* up,DeviceRows view,DeviceCsr csr,
+    unsigned rows,unsigned hidden,unsigned outputs) {
+    unsigned failure=csr.summary[0];
+    for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
+    if((failure&~projection_nonfinite)||blockIdx.y>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
+    __shared__ __align__(16) signed char local_codes[G][max_hidden];
+    __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
+    __shared__ __align__(16) int local_sums[G][max_hidden/32U];
+    __shared__ float tile[2][16][32];
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,p=c/2U,h=c&1U,wave=threadIdx.x/32U;
+    const unsigned out=blockIdx.x*32U+wave*4U+lane/8U,blocks=hidden/256U;
+    constexpr unsigned block_bytes=Q5K?176U:144U;
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*blocks*block_bytes;
+    const unsigned g0=2U*p,g1=g0+1U;
+    constexpr unsigned max_blocks=max_hidden/256U;
+    static_assert(G==4U || G==8U);
+#pragma unroll
+    for(unsigned m=0;m<2U;++m) {
+        const unsigned char* w=(m==0U?gate:up)+offset;
+        uint4 staged_weights[Q5K?3U:2U][max_blocks];
+#pragma unroll
+        for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
+            const auto* packed=w+b*block_bytes;
+            staged_weights[0][b]=*reinterpret_cast<const uint4*>(packed);
+            staged_weights[1][b]=*reinterpret_cast<const uint4*>(packed+(Q5K?48U:16U)+c*16U);
+            if constexpr(Q5K)staged_weights[2][b]=*reinterpret_cast<const uint4*>(packed+16U+h*16U);
+        }
+        for(unsigned group=0;group<count;group+=G) {
+            __syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a];
+            for(unsigned i=16U*threadIdx.x;i<hidden;i+=4096U)
+                *reinterpret_cast<int4*>(local_codes[a]+i)=*reinterpret_cast<const int4*>(view.codes[r]+i);
+            for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U){local_deltas[a][i]=view.deltas[r][i];local_sums[a][i]=view.sums[r][i];}
+        }
+        __syncthreads();
+        float acc[G]={};
+#pragma unroll
+        for(unsigned b=0;b<max_blocks;++b)if(b<blocks) {
+#pragma unroll
+            for(unsigned a=0;a<G;++a)if(group+a<count) {
+                const int4 a0=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+h*16U);
+                const int4 a1=*reinterpret_cast<const int4*>(local_codes[a]+b*256U+p*64U+32U+h*16U);
+                float pair;
+                if constexpr(Q5K)pair=paired_q5k(staged_weights[0][b],staged_weights[1][b],staged_weights[2][b],p,a0,a1,
+                    local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                else pair=paired(coefficient(staged_weights[0][b],staged_weights[1][b],p),a0,a1,
+                    local_sums[a][b*8U+g0],local_sums[a][b*8U+g1],local_deltas[a][b*8U+g0],local_deltas[a][b*8U+g1]);
+                acc[a]=acc[a]+pair;
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a],2);
+            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a],4);
+            if(c==0U)tile[m][group+a][out%32U]=acc[a];
+        }
+        }
+    }
+    __syncthreads();
+    for(unsigned group=0;group<count;group+=G) {
+        if constexpr(!A8Down) {
+#pragma unroll
+            for(unsigned a=0;a<G;++a)if(group+a<count && c==0U) {
+                const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+                const float g=tile[0][group+a][out%32U],u=tile[1][group+a][out%32U];
+                const float silu=(g/(1.0F+expf(-g)))*u;
+                view.output[r][(slot*2U)*outputs+out]=silu;view.output[r][(slot*2U+1U)*outputs+out]=u;
+                if(nonfinite(g)||nonfinite(u)||nonfinite(silu))atomicOr(view.status[r],projection_nonfinite);
+            }
+        }
+        if constexpr(A8Down) {
+            // Serial down_activation_quantize for group blockIdx.x of each staged
+            // (row,slot): same lane = feature, collectives and fail-closed writes.
+            // One wave per staged (row, slot): rows are independent, each keeps the serial quantizer.
+            __syncthreads();
+            {
+                for(unsigned a=wave;a<G;a+=8U)if(group+a<count) {
+                    const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+                    const unsigned feature=blockIdx.x*32U+lane,at=slot*2U*outputs+feature;
+                    const float g=tile[0][group+a][lane],u=tile[1][group+a][lane];
+                    const float hv=(g/(1.0F+expf(-g)))*u;
+                    view.output[r][at+outputs]=u;
+                    const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
+                    if(bad!=0){view.output[r][at]=g;if(lane==0)atomicOr(view.status[r],projection_nonfinite);continue;}
+                    float x=fabsf(hv);
+                    for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
+                    const bool tiny=x>0.0F && x<0x1p-119F;
+                    const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
+                    const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
+                    const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+                    int sum=code;
+                    for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
+                    view.output[r][at]=hv;
+                    view.down_codes[r][slot*outputs+feature]=static_cast<signed char>(code);
+                    if(lane==0){view.down_deltas[r][slot*(outputs/32U)+blockIdx.x]=delta;view.down_sums[r][slot*(outputs/32U)+blockIdx.x]=sum;}
+                }
+            }
+        }
+    }
+}
+
 // Serial down_rawdots (Q5_1 s8xu5 / Q8_0 s8xs8 A8G32) per CSR batch: each
 // lane decodes its block words once and runs every staged row's chain with
 // the serial lane/group/tree order. Writes the incumbent raw slot dots. A
@@ -2125,7 +2232,16 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
             throw std::invalid_argument("A8 window down weights/geometry are invalid");
     }
     v.csr={p.csr.summary,p.csr.offsets,p.csr.touched,p.csr.rows,p.csr.slots,p.csr.experts,p.csr.begins};
-    enqueue_prologue(request,v,count,static_cast<unsigned>(window.clear[0].bytes/4U),stream,active);
+    const bool step16 = count==16U && cohort_step_rows()==16U;
+    static const unsigned r16_project_g=[] {
+        const char* value=std::getenv("STRIX_MOE_R16_PROJECT_G");
+        if(!value)return strix::cohort_auto()?4U:16U;
+        if(value[0]=='1' && value[1]=='6' && value[2]=='\0')return 16U;
+        if((value[0]=='8' && value[1]=='\0'))return 8U;
+        if((value[0]=='4' && value[1]=='\0'))return 4U;
+        throw std::invalid_argument("STRIX_MOE_R16_PROJECT_G must be 4, 8 or 16");
+    }();
+    enqueue_prologue(request,v,count,static_cast<unsigned>(window.clear[0].bytes/4U),stream,active,step16?16U:8U);
     const auto* gate=reinterpret_cast<const unsigned char*>(rows.front().gate.address);
     const auto* up=reinterpret_cast<const unsigned char*>(rows.front().up.address);
     const dim3 project_grid(request.shape.rows/32U,count*request.shape.top_k);
@@ -2139,7 +2255,9 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
             count,request.shape.hidden,request.shape.rows);
     };
     const auto iq_project=[&]<std::uint32_t T>(){
-        if(count==2U)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        if(step16)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,16U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+            count,request.shape.hidden,request.shape.rows);
+        else if(count==2U)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,4U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
@@ -2149,15 +2267,30 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     else if(request.gate_type==gsq_a8::type_iq3_s)iq_project.template operator()<gsq_a8::type_iq3_s>();
     else if(request.gate_type==gsq_a8::type_iq4_xs)iq_project.template operator()<gsq_a8::type_iq4_xs>();
     else if(q20){
-        if(count==2U)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+        if(step16)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<16U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+            count,request.shape.hidden,request.shape.rows);
+        else if(count==2U)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<4U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
     }
-    else if(!a8){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,false);}else{STRIX_A8_WINDOW_PROJECT(4U,false,false);}}
-    else if(!q5k && half_chunk){if(count==2U)chunked.template operator()<2U>();else chunked.template operator()<4U>();}
-    else if(!q5k){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,true);}else{STRIX_A8_WINDOW_PROJECT(4U,false,true);}}
-    else {if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,true,true);}else{STRIX_A8_WINDOW_PROJECT(4U,true,true);}}
+    else if(step16 && r16_project_g!=16U) {
+        const auto split_project=[&]<unsigned G,bool Q5,bool A8>() {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_split<G,Q5,A8>),project_grid,dim3(256),0,stream,
+                gate,up,p.rows,p.csr,count,request.shape.hidden,request.shape.rows);
+        };
+        const auto split_width=[&]<unsigned G>() {
+            if(!a8)split_project.template operator()<G,false,false>();
+            else if(q5k)split_project.template operator()<G,true,true>();
+            else split_project.template operator()<G,false,true>();
+        };
+        if(r16_project_g==8U)split_width.template operator()<8U>();
+        else split_width.template operator()<4U>();
+    }
+    else if(!a8){if(step16){STRIX_A8_WINDOW_PROJECT(16U,false,false);}else if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,false);}else{STRIX_A8_WINDOW_PROJECT(4U,false,false);}}
+    else if(!q5k && half_chunk){if(step16)chunked.template operator()<16U>();else if(count==2U)chunked.template operator()<2U>();else chunked.template operator()<4U>();}
+    else if(!q5k){if(step16){STRIX_A8_WINDOW_PROJECT(16U,false,true);}else if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,true);}else{STRIX_A8_WINDOW_PROJECT(4U,false,true);}}
+    else {if(step16){STRIX_A8_WINDOW_PROJECT(16U,true,true);}else if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,true,true);}else{STRIX_A8_WINDOW_PROJECT(4U,true,true);}}
 #undef STRIX_A8_WINDOW_PROJECT
     check(hipGetLastError(),"A8 window shared gate/up projection");
     if(!a8)return;
@@ -2166,21 +2299,21 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
 #define STRIX_A8_WINDOW_DOWN(R,Q51) \
     hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window<R,Q51>),down_grid,dim3(256),0,stream,down,p.rows,p.csr, \
         count,request.shape.hidden,request.shape.rows)
-    // Cohort unions of 9..32 rows: the CSR caps batches at 8 assignments, so the 8-row form stages every batch.
+    // Opt-in R16 stages a whole expert batch; all other unions retain the R8 batch cap.
     if(window.down_type==gsq_a8::type_iq4_nl){
         const auto iq_down=[&]<unsigned R>(){hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window_iq<gsq_a8::type_iq4_nl,R>),down_grid,dim3(256),0,
             stream,down,p.rows,p.csr,count,request.shape.hidden,request.shape.rows);};
-        if(count==2U)iq_down.template operator()<2U>();else if(count==4U)iq_down.template operator()<4U>();
+        if(step16)iq_down.template operator()<16U>();else if(count==2U)iq_down.template operator()<2U>();else if(count==4U)iq_down.template operator()<4U>();
         else iq_down.template operator()<8U>();
     }
     else if(window.down_type==42U){
         const auto q20_down=[&]<unsigned R>(){hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window_q20<R>),down_grid,dim3(256),0,stream,
             down,p.rows,p.csr,count,request.shape.hidden,request.shape.rows);};
-        if(count==2U)q20_down.template operator()<2U>();else if(count==4U)q20_down.template operator()<4U>();
+        if(step16)q20_down.template operator()<16U>();else if(count==2U)q20_down.template operator()<2U>();else if(count==4U)q20_down.template operator()<4U>();
         else q20_down.template operator()<8U>();
     }
-    else if(window.down_type==7U){if(count==2U){STRIX_A8_WINDOW_DOWN(2U,true);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,true);}else{STRIX_A8_WINDOW_DOWN(8U,true);}}
-    else {if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
+    else if(window.down_type==7U){if(step16){STRIX_A8_WINDOW_DOWN(16U,true);}else if(count==2U){STRIX_A8_WINDOW_DOWN(2U,true);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,true);}else{STRIX_A8_WINDOW_DOWN(8U,true);}}
+    else {if(step16){STRIX_A8_WINDOW_DOWN(16U,false);}else if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
 #undef STRIX_A8_WINDOW_DOWN
     check(hipGetLastError(),"A8 window shared integer down");
 }

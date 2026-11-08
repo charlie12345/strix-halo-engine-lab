@@ -37,7 +37,7 @@ See [HTTP prefill](../../engine/serving/serving.md#default-prompt-prefill). See 
 2/4/8, draft vocabulary): the complete command is in **[docs/getting-started/engine-reference.md → Command line](../../getting-started/engine-reference.md#command-line)**
 and [docs/engine/speculative/mtp-native-cli.md](../../engine/speculative/mtp-native-cli.md). The HTTP server, batched slots (`--http-batch`) and the
 prefix cache are in [docs/engine/serving/serving.md](../../engine/serving/serving.md); several requests in one process in
-[docs/engine/scheduling/multi-request-cohort.md](../../engine/scheduling/multi-request-cohort.md); sampling in
+[docs/engine/scheduling/multi-request-cohort.md](../../engine/scheduling/multi-request-cohort.md) (automatic per-cycle policy, on by default: 8 requests 69.3 tok/s aggregate, 62.9 tok/s before); sampling in
 [docs/engine/decode/sampled-decoding.md](../../engine/decode/sampled-decoding.md).
 
 Qwen's [prefix-state cache](../../engine/serving/prefix-state-cache.md) restores complete attention/GDN

@@ -1,4 +1,6 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/mtp_cohort_partition.hpp"
+#include "strix/cohort_small_plan.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
@@ -716,13 +718,63 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
 }
 namespace {
 struct CohortItem {std::size_t member;std::uint32_t rows;};
+void default_small_cohorts(std::span<const HipMtpGreedyCohortMember> members,
+    std::vector<CohortItem> items,std::vector<HipMtpGreedyCycleResult>& out,std::vector<bool>& open,
+    HipMtpGreedyCohortStats* stats) {
+        const auto fits=[&](const CohortItem& x,std::uint32_t rows) {
+            const auto& r=*members[x.member].runtime;
+            return r.window_verifier()->cohort_fits(r.target_session(),rows,r.drafted_candidates().size(),members[x.member].budget);
+        };
+    cohort_default_small_plan<CohortItem,MtpCohortVerifyDecline>(std::move(items),members.size(),fits,
+        [&](const auto& groups,const auto& solo,const auto& why) {
+        for(const auto& g:groups) {
+            if(g.empty()) continue;
+            std::uint32_t total=0;for(const auto& x:g)total+=x.rows;
+            // Primary: the idle owner of the cohort's rows of any member that verifies with fewer rows.
+            std::shared_ptr<HipKnownPrefixWindow> primary;
+            for(const auto& x:g) if(x.rows!=total && (primary=members[x.member].runtime->window_verifier()->owner_with_rows(total))) break;
+            require(!!primary,"MTP cohort has no idle owner of its total rows");
+            std::vector<HipMtpCohortVerifyRequest> requests;
+            for(const auto& x:g) {
+                const auto& c=members[x.member];auto& r=*c.runtime;
+                requests.push_back({r.window_verifier(),&r.target_session(),c.initial,r.drafted_candidates(),
+                    r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions(),c.transaction});
+            }
+            auto verified=HipMtpWindowVerifier::verify_cohort(requests,*primary);
+            for(std::size_t k=0;k<g.size();++k) {
+                const auto& c=members[g[k].member];
+                auto& o=out[g[k].member];
+                o=c.runtime->finish_cycle(*c.initial,std::move(verified[k]),c.budget,c.eos);
+                open[g[k].member]=false;
+                o.shared.verify_members=static_cast<std::uint32_t>(g.size());o.shared.verify_rows=g[k].rows;
+            }
+            if(stats){++stats->cohort_windows;stats->cohort_sessions+=g.size();stats->cohort_rows+=total;stats->shared.shared_window(g.size(),total);}
+        }
+        for(const auto& x:solo) {
+            const auto& c=members[x.member];auto& r=*c.runtime;
+            auto verified=r.window_verifier()->verify(r.target_session(),r.target_dispatcher(),*c.initial,r.drafted_candidates(),
+                c.budget,c.eos,r.drafted_probabilities(),r.drafted_distributions(),{},c.transaction);
+            out[x.member]=r.finish_cycle(*c.initial,std::move(verified),c.budget,c.eos);
+            open[x.member]=false;
+            out[x.member].shared.verify_decline=why[x.member];
+            if(stats){++stats->solo_windows;stats->shared.decline(why[x.member]);}
+        }
+        });
+}
+
 // Global row budget (STRIX_COHORT_ROWS): items (largest first) fill groups of at most `budget` rows; a group's
-// items fill chunks of at most eight rows; a chunk of two or more items runs on an idle owner of its total rows
+// items fill chunks of at most STRIX_COHORT_STEP_ROWS (default eight); a chunk of two or more items runs on an idle owner of its total rows
 // (4 or 8) that no member of the group verifies with, else its items run alone in the group's stream of steps.
 // A group of one item verifies alone.
 std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedyCohortMember> members,
     std::vector<CohortItem>& items,std::vector<HipMtpGreedyCycleResult>& out,std::vector<bool>& open,
     HipMtpGreedyCohortStats* stats,std::uint32_t budget) {
+    // F1 is opt-in; cache at startup like the row-budget controls.
+    static const bool small_default=[] {
+        const char* value=std::getenv("STRIX_COHORT_SMALL_DEFAULT");
+        if (!value) return strix::cohort_auto();
+        return value[0]=='1' && value[1]=='\0';
+    }();
     const auto sum_of=[](const std::vector<CohortItem>& v){std::uint32_t s=0;for(const auto& x:v)s+=x.rows;return s;};
     std::stable_sort(items.begin(),items.end(),[](const CohortItem& a,const CohortItem& b){return a.rows>b.rows;});
     std::vector<CohortItem> solo;
@@ -735,20 +787,18 @@ std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedy
         if(!placed)groups.push_back({item});
     }
     for(auto& g:groups) {
-        if(g.size()<2U){for(const auto& x:g) why[x.member]=MtpCohortVerifyDecline::alone;solo.insert(solo.end(),g.begin(),g.end());continue;}
-        // Chunks: first fit of the (descending) items into bins of eight rows; a bin of six rows gives its
-        // last item a chunk of its own, so every chunk of two or more items has 4 or 8 rows.
-        std::vector<std::vector<CohortItem>> bins;
-        for(const auto& item:g) {
-            bool placed=false;
-            for(auto& b:bins) if(sum_of(b)+item.rows<=8U){b.push_back(item);placed=true;break;}
-            if(!placed)bins.push_back({item});
+        if(cohort_default_small_group(sum_of(g),small_default)) {
+            default_small_cohorts(members,std::move(g),out,open,stats);
+            continue;
         }
+        if(g.size()<2U){for(const auto& x:g) why[x.member]=MtpCohortVerifyDecline::alone;solo.insert(solo.end(),g.begin(),g.end());continue;}
+        std::vector<std::uint32_t> row_counts;
+        for (const auto& item : g) row_counts.push_back(item.rows);
         std::vector<std::vector<CohortItem>> chunks;
-        for(auto& b:bins) {
-            const auto sum=sum_of(b);
-            if(sum!=4U && sum!=8U && b.size()>=2U){const auto last=b.back();b.pop_back();chunks.push_back(b);chunks.push_back({last});}
-            else chunks.push_back(b);
+        for (const auto& indices : cohort_step_plan(row_counts, cohort_step_rows())) {
+            std::vector<CohortItem> chunk;
+            for (const auto index : indices) chunk.push_back(g[index]);
+            chunks.push_back(std::move(chunk));
         }
         // Primaries: owners no member verifies with in this cycle, one per chunk.
         std::vector<const HipKnownPrefixWindow*> used;
@@ -764,7 +814,7 @@ std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedy
                 const auto total=sum_of(c);
                 std::shared_ptr<HipKnownPrefixWindow> primary;
                 for(const auto& x:g) {
-                    auto o=members[x.member].runtime->window_verifier()->owner_with_rows(total);
+                    auto o=members[x.member].runtime->window_verifier()->owner_with_rows(std::min(total,8U));
                     if(o && std::find(used.begin(),used.end(),o.get())==used.end()){primary=std::move(o);break;}
                 }
                 if(primary) {
@@ -1197,10 +1247,10 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
     // STRIX_COHORT_ROWS=16|32: a global row budget per cycle instead of one 8-row cohort. Each session keeps
     // the rows it gets in an 8-row cohort (8 / sessions, at least 2), so up to four sessions run as before and
     // more fill one group of up to the budget instead of several cohorts; the sessions of a group run in one
-    // stream of steps as chunks of at most eight rows (verify_cohort over chunks). Measured: more rows per
+    // stream of steps as chunks of at most eight rows (16 with STRIX_COHORT_STEP_ROWS=16). Measured: more rows per
     // session (4 at four sessions, 8 at two) cost more than the drafts they accept.
     static const std::uint32_t budget_rows=[]{const char* v=std::getenv("STRIX_COHORT_ROWS");
-        const auto n=v?std::atoi(v):0;return n==16||n==32?static_cast<std::uint32_t>(n):0U;}();
+        const auto n=v?std::atoi(v):(strix::cohort_auto()?16:0);return n==16||n==32?static_cast<std::uint32_t>(n):0U;}();
     const std::uint32_t cap=max_rows_override?max_rows_override:members.size()>=3U?2U:members.size()==2U?4U:8U;
     try {
         // Drafts: every session's chain in phases, step k of all sessions (each on its own stream) enqueued
@@ -1241,74 +1291,7 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
             stamp_drafts(out,drafts);
             return out;
         }
-        // Pack sessions into cohorts of 4 or 8 rows: larger windows first, each into the first cohort
-        // with room; a lone session, or one whose owner does not fit, verifies alone.
-        std::vector<Item> solo;
-        std::vector<MtpCohortVerifyDecline> why(members.size(),MtpCohortVerifyDecline::none); // a solo session's reason
-        std::vector<std::vector<Item>> groups;
-        std::stable_sort(items.begin(),items.end(),[](const Item& a,const Item& b){return a.rows>b.rows;});
-        for(const auto& item:items) {
-            if(!item.rows || item.rows>=8U){
-                solo.push_back(item);why[item.member]=item.rows?MtpCohortVerifyDecline::wide:MtpCohortVerifyDecline::no_rows;continue;
-            }
-            bool placed=false;
-            for(auto& g:groups) {
-                std::uint32_t sum=0;for(const auto& x:g)sum+=x.rows;
-                if(sum+item.rows<=8U){g.push_back(item);placed=true;break;}
-            }
-            if(!placed)groups.push_back({item});
-        }
-        const auto fits=[&](const Item& x,std::uint32_t rows) {
-            const auto& r=*members[x.member].runtime;
-            return r.window_verifier()->cohort_fits(r.target_session(),rows,r.drafted_candidates().size(),members[x.member].budget);
-        };
-        for(auto& g:groups) {
-            for(;;) {
-                if(g.size()<2U) break;
-                std::uint32_t sum=0;for(const auto& x:g)sum+=x.rows;
-                if(sum==4U || sum==8U) break;
-                // Round up to the next cohort size with the padding rows of a smaller window.
-                const auto target=sum<4U?4U:8U;
-                bool grown=false;
-                for(auto x=g.rbegin();x!=g.rend() && !grown;++x)
-                    for(const auto rows:{x->rows*2U,x->rows*4U})
-                        if(rows<=8U && sum-x->rows+rows==target && fits(*x,rows)){x->rows=rows;grown=true;break;}
-                if(!grown){why[g.back().member]=MtpCohortVerifyDecline::padding;solo.push_back(g.back());g.pop_back();}
-            }
-            if(g.size()==1U){why[g.front().member]=MtpCohortVerifyDecline::alone;solo.push_back(g.front());g.clear();}
-        }
-        for(const auto& g:groups) {
-            if(g.empty()) continue;
-            std::uint32_t total=0;for(const auto& x:g)total+=x.rows;
-            // Primary: the idle owner of the cohort's rows of any member that verifies with fewer rows.
-            std::shared_ptr<HipKnownPrefixWindow> primary;
-            for(const auto& x:g) if(x.rows!=total && (primary=members[x.member].runtime->window_verifier()->owner_with_rows(total))) break;
-            require(!!primary,"MTP cohort has no idle owner of its total rows");
-            std::vector<HipMtpCohortVerifyRequest> requests;
-            for(const auto& x:g) {
-                const auto& c=members[x.member];auto& r=*c.runtime;
-                requests.push_back({r.window_verifier(),&r.target_session(),c.initial,r.drafted_candidates(),
-                    r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions(),c.transaction});
-            }
-            auto verified=HipMtpWindowVerifier::verify_cohort(requests,*primary);
-            for(std::size_t k=0;k<g.size();++k) {
-                const auto& c=members[g[k].member];
-                auto& o=out[g[k].member];
-                o=c.runtime->finish_cycle(*c.initial,std::move(verified[k]),c.budget,c.eos);
-                open[g[k].member]=false;
-                o.shared.verify_members=static_cast<std::uint32_t>(g.size());o.shared.verify_rows=g[k].rows;
-            }
-            if(stats){++stats->cohort_windows;stats->cohort_sessions+=g.size();stats->cohort_rows+=total;stats->shared.shared_window(g.size(),total);}
-        }
-        for(const auto& x:solo) {
-            const auto& c=members[x.member];auto& r=*c.runtime;
-            auto verified=r.window_verifier()->verify(r.target_session(),r.target_dispatcher(),*c.initial,r.drafted_candidates(),
-                c.budget,c.eos,r.drafted_probabilities(),r.drafted_distributions(),{},c.transaction);
-            out[x.member]=r.finish_cycle(*c.initial,std::move(verified),c.budget,c.eos);
-            open[x.member]=false;
-            out[x.member].shared.verify_decline=why[x.member];
-            if(stats){++stats->solo_windows;stats->shared.decline(why[x.member]);}
-        }
+        default_small_cohorts(members,std::move(items),out,open,stats);
         stamp_drafts(out,drafts);
         return out;
     } catch(...) {

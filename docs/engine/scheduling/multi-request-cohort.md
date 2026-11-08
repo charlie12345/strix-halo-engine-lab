@@ -80,7 +80,7 @@ the window owners of all requests use one stream.
 `sequential` runs the requests one after another, each exactly as alone; it is the in-process reference
 for the aggregate rate.
 
-### Global row budget and wide steps (opt-in)
+### Global row budget and wide steps
 
 `STRIX_COHORT_ROWS=16|32` replaces the one 8-row cohort per cycle by a row budget. Each request keeps the
 rows it has in an 8-row cohort (8 / requests, at least 2; `STRIX_COHORT_MAX_ROWS` overrides), so up to four
@@ -120,6 +120,23 @@ depth by depth: step k of every session (each on its own stream) is enqueued bef
 its step (`STRIX_COHORT_DRAFT_INTERLEAVE=0`: one chain after another). A wide union's status covers all its rows: a failing row fails the
 whole cohort window, as in an 8-row cohort.
 
+### Automatic per-cycle policy (default)
+
+With `--mtp-cohort-request` each cohort cycle picks its form from the total rows its requests verify:
+
+| Rows in the cycle | Form |
+| --- | --- |
+| up to 8 | One 8-row cohort, as before |
+| 9 to 15 | Wide steps; the routed experts run as one 16-row union |
+| exactly 16 | Wide steps; the 16-row expert projection stages its activations 4 rows at a time |
+
+Chunks hold up to 16 rows and a request is never split across chunks. Every form keeps each row's
+arithmetic (see Exactness), so each request's token ids are identical to its single-request run. Measured on
+Qwen with the MTP drafter, aggregate decode: 8 requests 69.3 tok/s (62.9 tok/s with the previous defaults,
++10 %); 1, 2 and 4 requests unchanged. `STRIX_COHORT_AUTO=0` restores the previous defaults; a switch that is
+set explicitly (`STRIX_COHORT_ROWS`, `STRIX_COHORT_WIDE`, `STRIX_COHORT_STEP_ROWS`, `STRIX_MOE_R16_PROJECT_G`)
+takes precedence over the policy.
+
 ## Exactness
 
 The shared steps perform each row's arithmetic exactly as that row's own window does (per-row pointers,
@@ -148,6 +165,7 @@ tokens are compared with its own single-request run.
 | `STRIX_COHORT_GDN_SEGMENTS=0`, `STRIX_COHORT_DRAFT_INTERLEAVE=0` | Per-session GDN prepare/recurrence; one draft chain after another. |
 | `STRIX_COHORT_QSA_SEGMENTS=1` | State-free QSA sub-parts once for all rows (neutral). |
 | `STRIX_COHORT_AB=1`, `STRIX_COHORT_AB_OFF=gdnseg,qsaseg,combine,draft,gdn,...` | Measurement: odd cohort cycles run without the listed features (wide families by name); mean cycle ms, tokens and tok/s per parity at exit. |
+| `STRIX_COHORT_AUTO=0` | Turns the automatic per-cycle policy off: one 8-row cohort per cycle unless the switches above are set. |
 | `STRIX_COHORT_WIDE_LOG=1` | Per cohort call (first 4, then every 256th): chunks, rows and steps run wide, per chunk and per request; at exit, calls and mean wall ms per row total, chunk count and wide or not. |
 
 The receipt (`mode` `native-mtp-cohort-...`) reports `mtp_cohort_wall_ms`, `mtp_cohort_generated_tokens`,

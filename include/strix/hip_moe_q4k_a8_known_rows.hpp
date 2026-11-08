@@ -7,7 +7,7 @@
 
 namespace strix::moe_q4k_a8::known_rows {
 // Rows of one window union: verify windows of 2/4/8 rows, cohort unions of several sessions' windows
-// (16 or 32 rows; down batches of at most 8 assignments).
+// (16 or 32 rows; down batches of at most 8 assignments, or opt-in 16 at R16).
 inline constexpr unsigned max_union_rows = 32U, max_assignments = max_union_rows * 10U;
 inline constexpr std::string_view organization_identity =
     "a8-csr-gate-up-v1:shared-packed-weights:independent-row-pair4";
@@ -44,7 +44,7 @@ struct PrologueRows {
 // failures are only in row status: consumers must check status as well.
 // active (0 = rows): only the first active rows enter the expert union (CSR); the rest are still cleared,
 // route-checked and quantized.
-void enqueue_prologue(const Request&, const PrologueRows&, unsigned rows, unsigned clear_words, hipStream_t, unsigned active = 0);
+void enqueue_prologue(const Request&, const PrologueRows&, unsigned rows, unsigned clear_words, hipStream_t, unsigned active = 0, unsigned batch_cap = 8);
 // Window-owned rows: route weights and the per-row FP32 region zeroed by the
 // prologue. down_type 7/8 selects the A8 profile (Q5_1/Q8_0 A8G32 down) and
 // then needs each row's serial down image (codes/deltas/sums) and raw slot dots.

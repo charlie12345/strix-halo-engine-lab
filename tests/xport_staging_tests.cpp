@@ -26,9 +26,9 @@ struct Ops {
     std::array<float, 8> storage{};
     std::array<std::pair<std::shared_ptr<Signal>, std::shared_ptr<Signal>>, 8> dependencies{};
     std::array<bool, 8> occupied{};
-    std::map<Key, unsigned> locations;
-    std::map<Key, std::shared_ptr<Signal>> source;
-    std::map<unsigned, std::shared_ptr<Signal>> consumers;
+    std::map<Key, unsigned> locations{};
+    std::map<Key, std::shared_ptr<Signal>> source{};
+    std::map<unsigned, std::shared_ptr<Signal>> consumers{};
     unsigned initialized = 0, waits = 0, blocked = 0;
     void destroy(const Event&) {}
     void init(Event& src, Event& last, Stream) {

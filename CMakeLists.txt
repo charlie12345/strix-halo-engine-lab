@@ -358,9 +358,8 @@ include(CTest)
 add_library(strix_xport INTERFACE)
 target_include_directories(strix_xport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(strix_xport INTERFACE cxx_std_20)
-set_source_files_properties(src/xport/channel_impl.hip PROPERTIES HEADER_FILE_ONLY TRUE)
 target_sources(strix_xport INTERFACE
-    src/xport/channel.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/channel_impl.hip
+    src/xport/channel.hpp src/xport/channel_device.hpp src/xport/wire.hpp
     src/xport/transport_backend.hpp src/xport/staging.hpp src/xport/stats.hpp src/xport/backend.hpp src/xport/communicator_backend.hpp
     src/xport/ds41_adapter.hpp)
 if(BUILD_TESTING)

@@ -330,7 +330,11 @@ void declined_provenance() {
     const auto erase = [&](const char* key) { env.erase(key); return true; };
     pr::withdraw_declined(got.options.product_profile, lookup(env), erase);
     pr::apply(got.options.product_profile, [&](const char* key, const char* value) { env[key] = value; return true; });
-    check(env.empty(), "declined inherited proposal and provenance are removed before runtime");
+    check(env.size() == 2 && env.at("STRIX_QPF2K_QSA_BUDGET") == "1536" &&
+            env.count("STRIX_QWEN_PROFILE_OWNED_qsa_budget") == 1,
+        "declined inherited proposal and provenance are removed before runtime");
+    env.erase("STRIX_QPF2K_QSA_BUDGET");
+    env.erase("STRIX_QWEN_PROFILE_OWNED_qsa_budget");
     env["STRIX_QPF2K_MOE_ROUTE_BF16"] = "1";
     pr::withdraw_declined(got.options.product_profile, lookup(env), erase);
     check(env.at("STRIX_QPF2K_MOE_ROUTE_BF16") == "1", "withdrawal preserves unowned explicit environment");

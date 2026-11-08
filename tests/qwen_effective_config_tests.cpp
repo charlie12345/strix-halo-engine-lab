@@ -3161,7 +3161,8 @@ int main(int argc, char** arguments) {
                 expect(moe_prefill_storage_name(got.options.prefill_moe_route_bf16) ==
                     std::string_view(enabled ? "fp16-v1+moeroute16" : "fp16-v1") &&
                     got.options.product_profile.qualification() == (enabled ? (allow ?
-                        "qualification in progress: moe_route_bf16; unqualified: gdn_fp16_chunk" : "qualification in progress: moe_route_bf16")
+                        "qualification in progress: qsa_budget,moe_route_bf16; unqualified: gdn_fp16_chunk" :
+                        "qualification in progress: qsa_budget,moe_route_bf16")
                         : "qualified"),
                     "product receipt and actual storage identity agree");
                 const auto pair = numerical_profile_pair(got.options);
@@ -3182,7 +3183,8 @@ int main(int argc, char** arguments) {
                     expect(prefill_arithmetic_identity(pair, off.prefill_option_mask, false) != composed,
                         "HC restriction changes composed arithmetic identity independently of BF16 storage");
                     const auto report = serve::parse_json(effective_config_json(off));
-                    expect(report.find("prefill_identity")->as_string() == (master || !gdn ? "fp16-v1" : "fp16-v1+gdnchunk16") &&
+                    expect(report.find("prefill_identity")->as_string() == (master ? "fp16-v1" :
+                        std::string(gdn ? "fp16-v1+gdnchunk16" : "fp16-v1") + (enabled ? "+qsab1536" : "")) &&
                         report.find("prefill_moe_route_bf16")->as_bool() == enabled,
                         "inspection reports independent HC and BF16 controls");
                 }
@@ -3313,7 +3315,7 @@ int main(int argc, char** arguments) {
             const auto reason = got.options.prefill_moe_route_bf16_reason;
             expect(row && row->status == qwen::profile::Status::pending && row->value == "0" &&
                 row->reason == reason && !reason.empty() && reason != "off" &&
-                got.options.product_profile.qualification() == "qualified",
+                got.options.product_profile.qualification() == "qualification in progress: qsa_budget",
                 "declined row reports builtin, pending and the storage decline reason");
             Environment exported;
             qwen::profile::apply(got.options.product_profile, [&](const char* key, const char* value) {

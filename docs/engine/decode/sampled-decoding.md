@@ -12,7 +12,7 @@ object exists, no logits are copied to the host and every selection is the finit
 | `--mtp-sample-top-p P` | keep the shortest most-likely prefix holding mass P (1 = off) |
 | `--mtp-sample-min-p P` | keep tokens with probability at least P times the maximum (0 = off) |
 | `--mtp-sample-seed S` | seed of the counter-based random stream |
-| `--mtp-sample-speculation on\|off` | `off` proposes no drafts: plain sampling from the target, one token per cycle |
+| `--mtp-sample-speculation on\|off` | `off` proposes no drafts: plain sampling from the target, one token per cycle (single requests and the batched route: cohort requests, the server) |
 | `--mtp-sample-schedule fixed\|adaptive` | `fixed` (default) chooses windows and draft lengths from draft probabilities only; `adaptive` also uses measured cycle times (faster on average, not reproducible) |
 | `--mtp-sample-repeats N` | N independent requests over one loaded model, seeds S..S+N-1, one receipt each (distribution tests) |
 
@@ -41,6 +41,69 @@ Uniforms come from the existing counter-based generator keyed by seed, policy id
 so a position draws the same values whether it is decided in a window row, a serial step, or the serial replay of
 a restored window. The output at each position is distributed exactly as `p` given the preceding tokens, for any
 draft distribution.
+
+## Coupled acceptance (opt-in)
+
+`STRIX_MTP_SAMPLED_ACCEPT=coupled` (default `rejection`, the decisions above) changes how a drafted row is decided,
+on the host and device paths alike; plain rows and the policy identity are unchanged:
+
+- a drafted row at position `n` is decided exactly as without a draft: sample `p` with `U(n, plain)`. The draft is
+  accepted when it equals that token (the greedy verifier's prefix rule); no acceptance or residual uniform is
+  drawn and `q` is not read;
+- the draft for position `n` is drawn from `q` with the same `U(n, plain)` (the chain's existing position
+  `base + k + 2`, which is the position the verifying row decides), through the same transform and filters;
+- below `STRIX_MTP_SAMPLED_ARGMAX_BELOW` (default 0.7; 0 = never) drafts are `q`'s first entry by
+  `(z desc, id asc)` (the transform with top-k 1); target rows always sample.
+
+The tokens of one seed are then the tokens of plain sampling (`--mtp-sample-speculation off`) with that seed,
+whatever rows carry drafts, which drafts, the window sizes and the draft schedule: by induction, every committed
+row samples the unchanged target distribution with its unchanged keyed uniform, and a rejected row emits that very
+sample and drops the later rows. Acceptance is the overlap of matching inverse-CDF intervals of `p` and `q`, which
+can be lower than rejection sampling's `sum min(p, q)` (for example when `q` lacks an early high-probability
+token), so `rejection` stays the default until acceptance and throughput are measured.
+
+A window's accepted prefix ends at the last row the sampled selection decided. With natural decisions that is
+the row where the prefix rule stops anyway; the bound matters for the forced rejections below, whose token equals
+the next row's input.
+
+`strix-token-sampling-coupled-tests` checks the equality on synthetic target and draft rows (identical, close,
+close over a draft vocabulary subset in shuffled order, unrelated drafts), draft lengths 2, 4 and 8, fixed, random,
+truncated-window and adaptive (decision-dependent) schedules, forced rejections at rows 0, 1, 3 and 7 and rotating,
+cohort permutations against their single-request references, budget tails of 1 to 61 tokens, EOS at row 0 and
+inside windows, the argmax-draft gate at 0, 0.7 and 2, and temperature, top-k (including 1), top-p and min-p.
+
+### Forced rejection (test-only)
+
+`STRIX_MTP_SAMPLED_FORCE_REJECT=D` (`D` = 0..7) or `rotate` exists for gates only and requires
+`STRIX_MTP_SAMPLED_ACCEPT=coupled` (a sampler refuses it otherwise: with rejection sampling it would change the
+distribution). In every verified window the drafted row `D` (after `D` accepted drafts), when its draft was
+accepted, is decided as rejected: it keeps its token, the rows after it are dropped, the target and predictor
+roll back to the committed rows and the next cycle drafts from there. `rotate` forces row `w mod 8` in the `w`-th
+window, so every depth is exercised; a row without a draft (row 7 of an R8 window, or any row past the drafts) is
+never forced, which leaves the complete-acceptance boundary to the windows that reach it. The tokens must equal
+plain sampling's at every forced depth. The receipt's `sampling` object then lists `forced_rejection` and
+`forced_rejections` (the count, also included in `rejected_drafts`). Serial rows that carry a draft are not forced.
+
+## Request identity
+
+The counter-based uniforms are keyed by seed, a request identity, the policy identity, position and draw class.
+The request identity is 1 for every request by default, and stays 1: changing it would change the tokens of every
+seeded request that is not the first in its server, so the default keeps the legacy output (one seed gives one
+token stream for any request; the command line, the cohort command line and the server agree). This is deliberate:
+a unique identity per request is opt-in, not the default.
+
+`STRIX_SAMPLING_REQUEST_IDENTITY=counter` (HTTP server only) gives server requests identities 1, 2, 3, ... in
+admission order within the process: requests sharing a seed then draw different streams, and a seeded request
+reproduces only in a fresh server with the same admission order (the first request equals the command line).
+The receipt lists `request_identity` only when it is not 1. The command line (single requests, `--mtp-sample-repeats`
+and cohort requests, where request `i` uses seed + `i`) always uses identity 1.
+
+References and identity: coupled acceptance makes a drafted request equal to the plain sampled request with the same
+seed, policy and request identity. A reference for a served request under the counter must therefore have that
+request's identity, which depends on admission order: concurrent admission is not reproducible, so compare such
+requests with references keyed by the identity their receipts report (from a run that admits the same requests in
+the same order), never with command-line references, which have identity 1. The equality gate runs the default
+identity and pairs every request with its reference by prompt, seed and request identity.
 
 ## Where decisions happen
 
@@ -103,7 +166,7 @@ Which positions carry a draft, and which draft, depends on the window and draft-
 schedule derives both from draft probabilities only (the smallest owner covering the confident drafts, no
 cost-model continuation check), so a run is a function of the seed, policy, prompt and configuration. `adaptive`
 keeps the measured-cost choices of greedy decoding; it remains correct in distribution but two runs with one seed
-can differ.
+can differ. With coupled acceptance the tokens do not depend on these choices (see above).
 
 ## Cost
 
@@ -123,3 +186,23 @@ draft head's rows and completes before the next step; rows after the first rejec
   (T = 1, six tokens, 1,059 draft decisions) pass a two-sample chi-square test at every position.
 - Not yet measured: throughput. Single smoke runs at T = 0.6-0.7 produced 2-2.5 times the tokens per second of
   plain sampling.
+- Coupled acceptance on hardware (not run yet): `tests/sampled_coupled_gate.py` writes the campaign manifest
+  (`plan`), lists its jobs for a GPU runner (`jobs`), and gives the verdict (`compare`) and the measurement
+  (`measure`). The exactness part compares, for chat, code and Spanish prompts at T = 0.7 (top-k 20, top-p 0.8) and
+  T = 1.0, 10 seeds and 512 tokens, every request of fixed R2/R4/R8, fixed and adaptive 2,4,8 schedules, forced
+  rejections (rows 0, 1, 3 and rotate at R8), min-p, EOS and budget tails (7 and 61 tokens) with its plain sampled
+  reference (`--mtp-sample-speculation off` without the draft chain); and lockstep cohorts of four requests in
+  three member orders on the tiled prompt with the sequential cohort (each request as alone) of the same order. A
+  request matches its reference by prompt, seed and request identity: token IDs, the committed full-vocabulary
+  logits ledger (`STRIX_MTP_STEP_LOGITS_DIGEST=1`), the final target hidden row (`STRIX_MTP_LOGITS_DIGEST=1`) and,
+  on the tiled prompt, the final committed target state per component (`STRIX_FINAL_STATE_DIGEST=1` with
+  `STRIX_PREFIX_CACHE_DIGEST_COMPONENTS=1`, listed in the cohort receipt as `final_state_components`; the serial
+  prompt route has no state registry). Every target component is compared; the predictor's `mtp.kv`, `mtp.index`
+  and `mtp.held` are not, since drafting legitimately changes them (`final_state_digest` covers both, so it differs
+  between a drafted and a plain run). A lockstep cohort without drafts is compared too, which separates the cohort
+  itself from coupled acceptance. Auto EOS cells stop on a token that no request reaches before position 24, so
+  drafted arms draft before stopping. The verdict is PASS only when
+  every job, request and evidence line of the manifest is present and complete, so a partial campaign fails. The
+  measurement compares coupled, rejection and plain sampling without diagnostics in the order P A B B A P per cell,
+  for single requests (C1) and lockstep cohorts of four (C4): acceptance, committed tokens per window and per cycle,
+  and tokens per second. `strix-sampled-coupled-gate-tests` checks the tool on synthetic receipts.

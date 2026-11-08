@@ -16,6 +16,7 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -50,7 +51,7 @@ static std::vector<std::string> split(const std::string& s, char c) {
     return out;
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     if (argc < 5) { std::fprintf(stderr, "usage: qwen_prefill_e2e tables rope max_positions job...\n"); return 1; }
     qp::Config c;
     c.model_gguf = std::getenv("STRIX_QWEN_GGUF") ? std::getenv("STRIX_QWEN_GGUF") : "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf";
@@ -65,6 +66,8 @@ int main(int argc, char** argv) {
     if (const char* v = std::getenv("STRIX_QWEN_TAIL_LARGE")) c.tail_large = v[0] == '1';
     if (const char* v = std::getenv("STRIX_QWEN_FINAL_BLOCK_ROWS")) c.final_block_rows = static_cast<std::uint32_t>(std::stoul(v));
     if (const char* v = std::getenv("STRIX_QWEN_BY_LAYER")) c.release_by_layer = v[0] == '1';
+    // STRIX_QWEN_NO_EXPORT=1: the state stays on the device (no pinned staging, no pieces): RTX-only timing of long prompts
+    if (const char* v = std::getenv("STRIX_QWEN_NO_EXPORT")) c.export_state = v[0] != '1';
     std::printf("loading...\n");
     std::fflush(stdout);
     qp::Prefill p(c);
@@ -241,4 +244,14 @@ int main(int argc, char** argv) {
     }
     std::printf("%s\n", bad ? "E2E FAIL" : "E2E ALL BIT-IDENTICAL");
     return bad ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {  // e.g. the VRAM guard's refusal: say why instead of an unexplained abort
+        std::fprintf(stderr, "qwen_prefill_e2e: %s\n", e.what());
+        std::printf("E2E ERROR: %s\n", e.what());
+        return 4;
+    }
 }

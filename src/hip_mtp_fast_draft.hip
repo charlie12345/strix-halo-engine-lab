@@ -1,3 +1,4 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include <cstdlib>
 #include <hip/hip_fp16.h>
@@ -19,7 +20,7 @@ template<bool Q4> constexpr unsigned down_row_bytes=inter/32U*block_bytes<Q4>;
 void check(hipError_t e,const char* m) {if(e!=hipSuccess) throw std::runtime_error(std::string(m)+": "+hipGetErrorString(e));}
 __device__ __forceinline__ float wave_sum(float v) {
 #pragma unroll
-    for(unsigned d=16;d;d>>=1U) v+=__shfl_xor(v,static_cast<int>(d),32);
+    for(unsigned d=16;d;d>>=1U) v+=strix::qwen_dpp::xor32(v, d);
     return v;
 }
 __device__ __forceinline__ std::uint16_t to_bf16(float x) {

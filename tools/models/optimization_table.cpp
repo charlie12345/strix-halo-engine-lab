@@ -6,6 +6,7 @@
 #include "glm_rank_defaults.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/qwen_allon.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -21,6 +22,12 @@ void cell(std::ostream& out, std::string_view text) {
         else if (c == '\n' || c == '\r') out << ' ';
         else out << c;
     }
+}
+void optin_row(std::ostream& out, const strix::qwen_allon::Lever& item) {
+    out << "| qwen | " << item.name << " | `" << item.env << "` | " << item.on << " | "
+        << (item.fast ? "fast (qualification in progress)" : "exact") << " | ";
+    cell(out, item.receipt ? item.receipt : "");
+    out << " |\n";
 }
 void row(std::ostream& out, std::string_view engine, const strix::profile::DefaultItem& item) {
     out << "| " << engine << " | ";
@@ -46,6 +53,12 @@ std::string table() {
     for (const auto& item : strix::glm::rank_defaults::env_items()) row(out, "glm-pair", item);
     for (const auto& item : strix::minimax::defaults::items()) row(out, "minimax-pair", item);
     for (const auto& item : strix::qpf2k::defaults) row(out, "qwen", item);
+    out << "\n## Opt-in levers (not defaults)\n\n"
+           "Levers that are not part of the shipped defaults. `STRIX_QWEN_ALLON=1` (or `exact`) switches on every exact row of\n"
+           "this section for Qwen, `STRIX_QWEN_ALLON=fast` also the FAST rows. An explicit per-lever value wins, and\n"
+           "`STRIX_BASELINE=1` vetoes the profile. With `STRIX_QWEN_ALLON` unset nothing changes.\n\n"
+           "| engine | switch | environment | value | class | receipt |\n|---|---|---|---|---|---|\n";
+    for (const auto& item : strix::qwen_allon::levers) optin_row(out, item);
     return out.str();
 }
 } // namespace

@@ -1,4 +1,11 @@
     const auto* up_rows = static_cast<const unsigned char*>(up) + feature * kRowBytes;
+    __shared__ float inverse[Recompute ? R * S : 1U];
+    float norm_weight[S]{};
+    if constexpr (Recompute) {
+        qpf2k_hc_load_inverse<R, 128U>(rows, inverse, row0);
+#pragma unroll
+        for (unsigned s = 0; s < S; ++s) norm_weight[s] = rows.recompute_norm[s * hidden + feature];
+    }
     using ConstantFloat = const __attribute__((address_space(4))) float;
     using GlobalFloat = const __attribute__((address_space(1))) float;
     auto* low_t = reinterpret_cast<ConstantFloat*>(reinterpret_cast<std::uintptr_t>(rows.low_t + low0));
@@ -114,21 +121,31 @@
         for (unsigned t = 0; t < R; ++t) {
             if (row0 + t >= rows.count) break;
             float mixed = 0.0F;
-            const auto* normalized = wide_row(rows.normalized, rows.normalized_stride, row0 + t);
 #pragma unroll
             for (unsigned s = 0; s < S; ++s)
-                mixed += normalized[static_cast<std::uint64_t>(s) * hidden + feature] * sigmoid(g[4U * t + s]);
+                mixed += qpf2k_hc_normalized<Recompute>(rows, row0 + t, s * hidden + feature,
+                    Recompute ? inverse[t * S + s] : 0.0F, norm_weight[s]) * sigmoid(g[4U * t + s]);
             store_activation(&wide_row(static_cast<Storage*>(rows.output), rows.output_stride, row0 + t)[feature],
                 mixed / static_cast<float>(S));
         }
     } else {
         // Rows past the end load the last row (never used); the valid rows are a prefix, as with the base's break.
-        float nv[P][S];
-        const auto nload = [&](unsigned t, float (&d)[S]) {
+        using NormLane = std::conditional_t<Recompute, std::uint16_t, float>;
+        NormLane nv[P][S];
+        const auto nload = [&](unsigned t, NormLane (&d)[S]) {
             const unsigned r = row0 + t < rows.count ? row0 + t : rows.count - 1U;
-            auto* normalized = reinterpret_cast<GlobalFloat*>(reinterpret_cast<std::uintptr_t>(wide_row(rows.normalized, rows.normalized_stride, r)));
 #pragma unroll
-            for (unsigned s = 0; s < S; ++s) d[s] = normalized[static_cast<std::uint64_t>(s) * hidden + feature];
+            for (unsigned s = 0; s < S; ++s) {
+                if constexpr (Recompute) {
+                    const auto* raw = reinterpret_cast<const __attribute__((address_space(1))) std::uint16_t*>(
+                        reinterpret_cast<std::uintptr_t>(wide_row(rows.recompute_input, rows.recompute_stride, r)));
+                    d[s] = raw[static_cast<std::uint64_t>(s) * hidden + feature];
+                }
+                else {
+                    auto* normalized = reinterpret_cast<GlobalFloat*>(reinterpret_cast<std::uintptr_t>(wide_row(rows.normalized, rows.normalized_stride, r)));
+                    d[s] = normalized[static_cast<std::uint64_t>(s) * hidden + feature];
+                }
+            }
         };
 #pragma unroll
         for (unsigned t = 0; t < P; ++t) nload(t, nv[t]);
@@ -136,7 +153,14 @@
         for (unsigned t = 0; t < R; ++t) {
             float cur[S];
 #pragma unroll
-            for (unsigned s = 0; s < S; ++s) cur[s] = nv[t % P][s];
+            for (unsigned s = 0; s < S; ++s) {
+                if constexpr (Recompute) {
+                    // As in projection, keep the prefetched slot raw until it
+                    // is consumed; do not wait for a future row to multiply it.
+                    const float value = __uint_as_float(static_cast<unsigned>(nv[t % P][s]) << 16U);
+                    cur[s] = qpf2k_mul(qpf2k_mul(inverse[t * S + s], value), norm_weight[s]);
+                } else cur[s] = nv[t % P][s];
+            }
             if (t + P < R) nload(t + P, nv[t % P]);
             if (row0 + t < rows.count) {
                 float mixed = 0.0F;

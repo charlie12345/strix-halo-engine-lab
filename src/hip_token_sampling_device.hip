@@ -1198,6 +1198,7 @@ std::vector<TokenDecision> HipTokenSamplerDevice::decide(TokenSampler& sampler, 
     auto& i = *impl_;
     require(!rows.empty() && rows.size() <= i.max_rows, "device token sampling row count is invalid");
     const auto& policy = sampler.policy();
+    const bool coupled = sampler.coupled();
     Rows r{};
     for (unsigned k = 0; k < rows.size(); ++k) {
         const auto& row = rows[k];
@@ -1208,7 +1209,8 @@ std::vector<TokenDecision> HipTokenSamplerDevice::decide(TokenSampler& sampler, 
         a.u_plain = u.plain; a.u_accept = u.accept; a.u_residual = u.residual;
         if (row.draft) {
             require(row.draft->position == row.position, "draft position differs from the decided position");
-            i.set_draft(k, *row.draft, a);
+            // Coupled: the device decides the row as without a draft (q is not staged); acceptance is equality below.
+            if (!coupled) i.set_draft(k, *row.draft, a);
         }
     }
     const auto s = static_cast<hipStream_t>(stream);
@@ -1222,12 +1224,20 @@ std::vector<TokenDecision> HipTokenSamplerDevice::decide(TokenSampler& sampler, 
             // No device decision (not expected): the host transform over this row's logits.
             ++i.fallbacks;
             read_hip_logits_row(rows[k].logits, i.vocab, stream, i.host_logits);
+            if (coupled) {
+                out[k] = decide_token_coupled(make_token_distribution(i.host_logits, {}, policy), rows[k].draft, r.row[k].u_plain);
+                continue;
+            }
             const auto draft = rows[k].draft ? std::optional<TokenDraft>(host_token_draft(*rows[k].draft, stream)) : std::nullopt;
             out[k] = decide_token(make_token_distribution(i.host_logits, {}, policy), draft ? &*draft : nullptr,
                 r.row[k].u_plain, r.row[k].u_accept, r.row[k].u_residual);
             continue;
         }
         out[k].token = result.token;
+        if (coupled) {
+            if (rows[k].draft) { out[k].drafted = true; out[k].accepted = result.token == rows[k].draft->token; }
+            continue;
+        }
         out[k].drafted = (result.flags & flag_drafted) != 0U;
         out[k].accepted = (result.flags & flag_accepted) != 0U;
         out[k].residual = (result.flags & flag_residual) != 0U;
@@ -1317,7 +1327,8 @@ void HipTokenDraftSamplerDevice::step(const TokenSampler& sampler, std::uint32_t
     std::uint32_t* slot, void* stream) {
     require(step < impl_->max_steps, "device draft step is invalid");
     impl_->positions[step] = position;
-    impl_->step(sampler.policy(), step, logits, sampler.draft_uniform(position), slot, static_cast<hipStream_t>(stream));
+    // draft_policy(): the policy, or top-k 1 for coupled argmax drafts; draft_uniform(): U(n, plain) when coupled.
+    impl_->step(sampler.draft_policy(), step, logits, sampler.draft_uniform(position), slot, static_cast<hipStream_t>(stream));
 }
 void HipTokenDraftSamplerDevice::finish(TokenSampler& sampler, std::uint32_t steps, std::vector<TokenDraft>& out) {
     require(steps <= impl_->max_steps, "device draft steps exceed the sampler");

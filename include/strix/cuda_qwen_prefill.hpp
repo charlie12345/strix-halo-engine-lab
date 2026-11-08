@@ -1,3 +1,5 @@
+// Exactness comments below describe the default FP32 route target. The explicit
+// BF16 route-storage candidate is a separate, unqualified numerical target.
 // CUDA prefill of Qwen3.8-Flash-Next, bit-identical to the HIP tiled prefill under the single A8 profile
 // (hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1) of a Strix Halo node, for hand-off to that node.
 //
@@ -11,6 +13,8 @@
 
 #include "strix/qwen_prefill_trace.hpp"
 #include "strix/qwen_prefill_schedule.hpp"
+#include "strix/cuda_qwen_route_bf16.hpp"
+#include "strix/cuda_qwen_mtp_diagnostic.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +50,23 @@ struct Config {
     std::string draft_vocab;
     // false: run() keeps the state on the device only (no D2H staging, no pieces): a decode session that never hands off.
     bool export_state = true;
+    // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
+    // false: individual OFF. Baseline/defaults/exact masters always suppress it.
+    std::optional<bool> moe_route_bf16;
+    // Explicit source diagnostic only: does not admit ordinary product MTP.
+    bool diagnostic_bf16_mtp = false;
+};
+
+// Diagnostic snapshot, not the node wire or a portable session/cache format.
+// Same engine instance and target only. Default snapshots invalidate derived pools;
+// the armed MTP diagnostic preserves and checks their actual retained prefixes.
+struct CanonicalState {
+    std::uint64_t target = 0, engine_binding = 0, length = 0;
+    std::vector<std::uint8_t> rows, fixed, held;
+    qwen_mtp_diagnostic::Binding mtp_binding;
+    std::vector<std::uint8_t> mtp_rows; // committed pairs [0,length-1), never provisional tail
+    std::vector<std::vector<float>> pools; // actual retained prefixes, before any repair
+    std::vector<std::uint32_t> pool_valid;
 };
 
 // One finished piece of the node state (host memory owned by the prefill until the next run() starts).
@@ -230,6 +251,14 @@ public:
 
     // Diagnostics for the bitwise gates: the wide residual rows after layer 47 of the last run (BF16 [rows][10240]).
     [[nodiscard]] std::string describe() const;
+    [[nodiscard]] qwen_route::Identity numerical_identity() const;
+    [[nodiscard]] qwen_route::Policy route_storage_policy() const;
+    // No window/chunk in flight. Armed MTP includes committed predictor pairs and
+    // retained pooled bytes; shared draft/window scratch is overwritten before use.
+    // Includes canonical KV/index, GDN matrices,
+    // histories, ngram, held row and length; excludes derived pooled caches.
+    CanonicalState capture_canonical(SessionId session = 0);
+    void restore_canonical(const CanonicalState&, SessionId session = 0);
 
 private:
     struct Impl;

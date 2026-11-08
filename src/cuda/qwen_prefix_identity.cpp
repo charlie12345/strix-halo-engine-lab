@@ -48,6 +48,15 @@ IdentityFields identity_fields(const qwen_prefill::Config& c, std::uint32_t bloc
         }
     };
     put("layout", "qwen-rtx-prefix-v1");
+    // Preserve every OFF key byte. Experimental identities have their own pair
+    // even while candidate cache admission is refused.
+    if (qwen_route::environment(c.moe_route_bf16).enabled) {
+        const auto id = qwen_route::identity(true, true);
+        put("target.prefill", std::string(id.prefill));
+        put("target.decode", std::string(id.decode));
+        put("target.storage", std::string(id.storage));
+        put("target.pair", std::to_string(id.hash));
+    }
     model("model", c.model_gguf);
     model("mtp", c.mtp_sidecar_gguf);
     file("draft_vocab", c.draft_vocab);

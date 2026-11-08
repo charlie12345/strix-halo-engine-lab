@@ -34,6 +34,8 @@ class Cache {
 public:
     Cache(const qwen_prefill::Config& config, const Settings& settings) : settings_(settings), mtp_(!config.mtp_sidecar_gguf.empty()) {
         if (settings_.enabled) {
+            qwen_route::require_composition(qwen_route::environment(config.moe_route_bf16).enabled,
+                qwen_route::Composition::prefix_cache);
             identity_ = identity_key(identity_fields(config, settings_.block));
             PrefixStateCachePolicy policy;
             policy.host_byte_budget = settings_.host_bytes + settings_.vram_bytes;

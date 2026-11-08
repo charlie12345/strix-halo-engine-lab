@@ -6,6 +6,8 @@
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/moe_route_bf16.hpp"
+#include "strix/hip_qwen_moe_prepared.hpp"
+#include "qwen_moe_prepared_fixture.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>
@@ -22,6 +24,8 @@
 #include <type_traits>
 #include <vector>
 #include <fstream>
+#include <limits>
+#include <utility>
 
 namespace {
 namespace a8 = strix::moe_q4k_a8;
@@ -113,7 +117,7 @@ struct Case {
     // crafted: experts get exact counts at the tile boundaries (0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 257,
     // 500 for experts 0..14; the rest share the remaining assignments), filled slot-major so no row repeats an expert;
     // bad_route: one route of row T/3 is out of range (the CSR fails closed).
-    bool crafted = false, bad_route = false, full128 = false;  // full128: every expert count a multiple of 128 (T*K/128 >= experts)
+    bool crafted = false, bad_route = false, full128 = false;  // full128: every expert count a multiple of 128 (including zero)
 };
 void read_file(const char* path, std::uint64_t at, std::uint64_t bytes, void* device) {
     std::ifstream f(path, std::ios::binary);
@@ -130,6 +134,7 @@ struct Fixture {
     a8::Request request;
     Buffer gate, up, down, input, routes, weights, codes, deltas, sums, status, output, clear, dcodes, ddeltas, dsums, rawdots, csr, admission;
     kr::PrefillRows view;
+    kr::DirectBOperands direct;
     explicit Fixture(const Case& cs) : c(cs), admission(1, 4U) {
         check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
         request.enabled = true; request.input = a8::InputKind::bf16;
@@ -167,9 +172,10 @@ struct Fixture {
             const unsigned fixed[15]{0U, 1U, 15U, 16U, 17U, 63U, 64U, 65U, 127U, 128U, 129U, 255U, 256U, 257U, 500U};
             unsigned used = 0;
             if (c.full128) {
-                const unsigned batches = T * K / 128U, two = batches > c.experts ? batches - c.experts : 0U;
+                const unsigned batches = T * K / 128U, per = batches / c.experts, extra = batches % c.experts;
+                if (T * K % 128U) throw std::invalid_argument("full128 needs whole 128-row batches");
                 for (unsigned e = 0; e < c.experts && crafted_seq.size() < static_cast<std::size_t>(T) * K; ++e)
-                    for (unsigned k = 0; k < (e < two ? 256U : 128U); ++k) crafted_seq.push_back(e);
+                    for (unsigned k = 0; k < 128U * (per + (e < extra ? 1U : 0U)); ++k) crafted_seq.push_back(e);
                 used = static_cast<unsigned>(crafted_seq.size());
             } else
             for (unsigned e = 0; e < 15U && e < c.experts; ++e) { for (unsigned k = 0; k < fixed[e] && k < T; ++k) crafted_seq.push_back(e); used += std::min(fixed[e], T); }
@@ -241,7 +247,7 @@ struct Fixture {
     std::vector<const Buffer*> written() const { return {&codes, &deltas, &sums, &status, &output, &clear, &dcodes, &ddeltas, &dsums, &rawdots}; }
     void enqueue(int form, unsigned rows = 0) {
         kr::enqueue_prefill(request, view, rows ? rows : c.rows, H, static_cast<const unsigned char*>(gate.base),
-            static_cast<const unsigned char*>(up.base), c.down_type, static_cast<const unsigned char*>(down.base), stream, form);
+            static_cast<const unsigned char*>(up.base), c.down_type, static_cast<const unsigned char*>(down.base), stream, form, direct);
     }
     // Every written byte of one run over other weights (same rows, routes and views).
     std::vector<std::vector<unsigned char>> run_as(int form, unsigned gate_type, unsigned down_type, const Buffer& g, const Buffer& u,
@@ -282,6 +288,7 @@ struct Fixture {
         return out;
     }
 };
+#include "hip_moe_direct_b_fixture.inc"
 // qpf2k/moe: order-free 64-bit digest of a device buffer (sum over words of mix(index, word)); equal digests of
 // two runs = the same bytes (up to a 2^-64 collision). Reads nothing back but 8 bytes.
 __global__ void digest_kernel(const unsigned* words, std::uint64_t n, unsigned long long* out) {
@@ -401,16 +408,16 @@ struct FixtureTailView {
 __device__ FixtureTailView fixture_tail_view(kr::PrefillRows v, kr::StridedRows<std::uint16_t> output) {
     return {v.routes, v.route_weights, v.status, v.rawdots, v.clear, output};
 }
-template <bool Acc, bool RouteBF16 = false>
+template <bool Acc, bool RouteBF16 = false, bool RouteI8 = false>
 __global__ void candidate_merge_commit_kernel(kr::PrefillRows v, unsigned* header, unsigned hidden, unsigned experts, unsigned top_k,
     kr::StridedRows<std::uint16_t> out16) {
-    moe_prefill_merge_z_body<true, Acc, RouteBF16>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
+    moe_prefill_merge_z_body<true, Acc, RouteBF16, RouteI8>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
         [](auto v, unsigned r) { return fixture_row(v, r); }, v.unsafe);
 }
-template <bool Acc, bool RouteBF16 = false>
+template <bool Acc, bool RouteBF16 = false, bool RouteI8 = false>
 __global__ void candidate_merge_commit_vec4_kernel(kr::PrefillRows v, unsigned* header, unsigned hidden, unsigned experts, unsigned top_k,
     kr::StridedRows<std::uint16_t> out16) {
-    moe_prefill_merge_z_body_vec4<Acc, RouteBF16>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
+    moe_prefill_merge_z_body_vec4<Acc, RouteBF16, RouteI8>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
         [](auto v, unsigned r) { return fixture_row(v, r); }, v.unsafe);
 }
 dim3 vec4_grid(unsigned rows) { return dim3((Fixture::H / 4U + 127U) / 128U, rows); }
@@ -810,18 +817,49 @@ void bench(const Case& c, int reps) {
     (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
 }
 #include "hip_moe_route_bf16_fixture.inc"
+#include "hip_moe_tiers_fixture.inc"
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "test";
-        unsigned pool_rows = mode == "pool16k" ? 16384U : 8192U;
+        if(mode=="direct-b"||mode=="direct-b-timing") {
+            direct_b_fixture(mode=="direct-b-timing",argc>2?std::stoi(argv[2]):15);return 0;
+        }
+        if (mode == "prepared-layout") {
+            namespace qp = strix::qwen_moe_prepared;
+            namespace fixture = qwen_moe_prepared_fixture;
+            for (auto format : {qp::Format::q4_k, qp::Format::q5_k, qp::Format::q5_1}) {
+                const auto spec = fixture::spec(format);
+                const auto source = fixture::source();
+                const auto layout = qp::describe(spec);
+                const auto file = fixture::input(static_cast<std::size_t>(source.file_offset + layout.tensor_bytes));
+                const qp::Read read = [&](std::uint64_t offset, std::span<std::byte> dst) {
+                    if (offset > file.size() || dst.size() > file.size() - offset)
+                        throw std::runtime_error("prepared fixture read outside source");
+                    std::copy_n(file.begin() + static_cast<std::ptrdiff_t>(offset), dst.size(), dst.begin());
+                };
+                const auto tensor = qp::prepare(spec, source, file.size(), read, qp::allocate_hip);
+                std::vector<std::byte> result(static_cast<std::size_t>(layout.tensor_bytes));
+                check(hipMemcpy(result.data(), reinterpret_cast<const void*>(tensor.allocation->address()), result.size(), hipMemcpyDeviceToHost), "prepared layout download");
+                fixture::tensor_oracle(spec, std::span(file).subspan(static_cast<std::size_t>(source.file_offset)), result);
+                std::printf("prepared-layout format=%u version=%u bytes=%llu inverse/header/code coordinates PASS\n",
+                    static_cast<unsigned>(format), layout.version, static_cast<unsigned long long>(layout.tensor_bytes));
+            }
+            return 0;
+        }
+        const bool tiers_mode=mode=="tiers"||mode=="tiersbench"||mode=="tiers-coexist";
+        unsigned pool_rows = mode == "pool16k" || tiers_mode || mode == "tile64" || mode == "tile64time" ? 16384U : 8192U;
         if ((mode == "bench1" || mode == "bench2") && argc > 3)
             pool_rows = static_cast<unsigned>(std::stoul(argv[3]));
         if ((mode == "hdrbench" || mode == "hdrmc" || mode == "mcbench") && argc > 4)
             pool_rows = static_cast<unsigned>(std::stoul(argv[4]));
+        if (tiers_mode) kr::set_prefill_tiers(1);
+        if (mode == "tile64" || mode == "tile64time") {kr::set_prefill_tiers(0);kr::set_prefill_down_lds(0);}
         kr::reserve_prefill_pools(pool_rows);
+        if (tiers_mode) return tiers_tests(argc, argv);
         if (mode == "route-bf16") { route_bf16_tests(); return 0; }
+        if (mode == "route-i8") { route_i8_tests(); return 0; }
         if (mode == "schedule") {
             unsigned cases = 0;
             for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U})
@@ -1459,6 +1497,210 @@ int main(int argc, char** argv) {
             std::printf("xor64: %u comparisons (%u took tune 88, %u certified, %u of them unproven), %u differ/racy/wrong tune/certificate -> %s\n",
                 cases, switched, certified, unproven, failed, failed || !cases || !switched || !certified ? "FAIL" : "PASS");
             return failed || !cases || !switched || !certified ? 1 : 0;
+        }
+        if (mode == "tile64" || mode == "tile64time") {
+            // MoE TILE64 (STRIX_QPF2K_MOE_TILE64): default chain (form 3, ROUTE 14, DA16 1) with today's DA16 tile vs the 64x64
+            // per-wave register tile (full 128-assignment batches; partial batches keep today's tile in a filtered launch).
+            // tile64 [specs...]: byte gate. Every case runs HDR 0/1 x storage FP32 (no certificate), CTRL (certificate, FP32
+            // rawdots) and RB16 (certificate, BF16 route dots), and each of TILE64 gate/up only, down only and both against
+            // today's path. Gate/up bytes (status, intermediates, down_sums, DA16 FP16 image), down bytes (rawdots) and the
+            // rest (A8 views, clear, CSR, certificate word) are compared separately by device digests. The fill buckets
+            // (rows per expert) and full/partial batches of every case are counted; each bucket must be covered.
+            // tile64time <pairs> <spec> [rows...]: 2 warmups, then <pairs> interleaved off/on pairs per T and storage mode,
+            // hipEvent ms per call of the gate/up and the down kernels (medians).
+            const auto parse = [](const std::string& x) {
+                std::vector<std::string> fl; std::size_t at = 0;
+                for (;;) { const std::size_t e = x.find(':', at); fl.push_back(x.substr(at, e == std::string::npos ? std::string::npos : e - at)); if (e == std::string::npos) break; at = e + 1U; }
+                if (fl.size() != 6U) throw std::invalid_argument("layer spec needs 6 fields");
+                return fl;
+            };
+            const auto real_case = [](const char* name, const std::vector<std::string>& fl, unsigned rows) {
+                Case c{name, 512U, rows, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
+                    nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
+                c.gguf = fl[0].c_str();
+                return c;
+            };
+            kr::set_prefill_core2(0); kr::set_prefill_route(14); kr::set_prefill_da16(1); kr::set_prefill_hdr(1);
+            const auto reset = [] { kr::set_prefill_tile64(-1); kr::set_prefill_hdr(-1); kr::set_prefill_core2(-1); kr::set_prefill_route(-1);
+                kr::set_prefill_da16(-1); kr::set_prefill_test_events(nullptr); };
+            const char* const storage_names[3] = {"FP32", "CTRL", "RB16"};
+            // Storage mode 0 FP32: no certificate; 1 CTRL: certificate bound, FP32 rawdots; 2 RB16: certificate, BF16 route dots.
+            const auto set_storage = [](Fixture& f, int storage) {
+                const unsigned zero = 0U; check(hipMemcpy(f.admission.base, &zero, 4U, hipMemcpyHostToDevice), "tile64 admission reset");
+                f.view.unsafe = storage ? static_cast<unsigned*>(f.admission.base) : nullptr;
+                f.view.route_bf16 = storage == 2;
+            };
+            if (mode == "tile64time") {
+                if (argc < 4) throw std::invalid_argument("tile64time <pairs> <layer spec> [rows...]");
+                const int pairs = std::atoi(argv[2]);
+                if (pairs <= 0) throw std::invalid_argument("tile64time: pairs must be positive");
+                const auto fl = parse(argv[3]);
+                std::vector<unsigned> ts;
+                for (int a = 4; a < argc; ++a) ts.push_back(static_cast<unsigned>(std::atoi(argv[a])));
+                if (ts.empty()) ts = {8192U, 16384U};
+                Fixture f(real_case("tile64time", fl, *std::max_element(ts.begin(), ts.end())));
+                hipEvent_t ev[3], c0, c1;
+                for (auto& e : ev) check(hipEventCreate(&e), "event");
+                check(hipEventCreate(&c0), "event"); check(hipEventCreate(&c1), "event");
+                kr::set_prefill_test_events(ev);
+                const auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+                for (const unsigned rows : ts) for (int storage = 0; storage < 3; ++storage) {
+                    set_storage(f, storage);
+                    bool tile64_seen = true;
+                    const auto timed = [&](int on, std::vector<double>* gu, std::vector<double>* dn, std::vector<double>* call) {
+                        kr::set_prefill_tile64(on);
+                        check(hipEventRecord(c0, f.stream), "record");
+                        f.enqueue(3, rows);
+                        check(hipEventRecord(c1, f.stream), "record");
+                        check(hipEventSynchronize(c1), "sync");
+                        if (!kr::prefill_da16_ran()) throw std::runtime_error("tile64time: the DA16 path did not run");
+                        if (on) tile64_seen = tile64_seen && kr::prefill_tile64_ran() && kr::prefill_last_tune() == 82U;
+                        float a = 0.0F, b = 0.0F, c = 0.0F;
+                        check(hipEventElapsedTime(&a, ev[0], ev[1]), "elapsed"); check(hipEventElapsedTime(&b, ev[1], ev[2]), "elapsed");
+                        check(hipEventElapsedTime(&c, c0, c1), "elapsed");
+                        if (gu) { gu->push_back(a); dn->push_back(b); call->push_back(c); }
+                    };
+                    for (int w = 0; w < 2; ++w) { timed(0, nullptr, nullptr, nullptr); timed(1, nullptr, nullptr, nullptr); }
+                    std::vector<double> gu0, dn0, call0, gu1, dn1, call1;
+                    for (int p = 0; p < pairs; ++p) {
+                        if (p % 2 == 0) { timed(0, &gu0, &dn0, &call0); timed(1, &gu1, &dn1, &call1); }
+                        else { timed(1, &gu1, &dn1, &call1); timed(0, &gu0, &dn0, &call0); }
+                    }
+                    const std::string tag = "tile64time T" + std::to_string(rows) + " " + storage_names[storage] + " g" + fl[4] + " d" + fl[5];
+                    std::printf("%s pairs %d warmups 2: gate/up off %.4f on %.4f ms (%+.2f %%); down off %.4f on %.4f ms (%+.2f %%); call off %.4f on %.4f ms%s\n",
+                        tag.c_str(), pairs, med(gu0), med(gu1), 100.0 * (med(gu1) - med(gu0)) / med(gu0), med(dn0), med(dn1),
+                        100.0 * (med(dn1) - med(dn0)) / med(dn0), med(call0), med(call1), tile64_seen ? "" : " (TILE64 NOT TAKEN)");
+                    const auto list = [](const char* what, const std::vector<double>& v) { std::printf("  %s:", what); for (const double x : v) std::printf(" %.4f", x); std::printf("\n"); };
+                    list("gate/up off", gu0); list("gate/up on", gu1); list("down off", dn0); list("down on", dn1);
+                }
+                f.view.unsafe = nullptr; f.view.route_bf16 = false;
+                reset();
+                return 0;
+            }
+            // Digests of one run: [0] gate/up group, [1] down group, [2] the rest; each a vector of per-buffer digests.
+            const auto run_digests = [](Fixture& f, unsigned rows) {
+                const auto bufs = f.written();
+                const std::size_t n = bufs.size() + 2U;
+                unsigned long long* d = nullptr;
+                check(hipMalloc(&d, 8U * n), "tile64 digest alloc");
+                check(hipMemsetAsync(d, 0, 8U * n, f.stream), "tile64 digest clear");
+                for (std::size_t k = 0; k < bufs.size(); ++k)
+                    hipLaunchKernelGGL(digest_kernel, dim3(1024), dim3(256), 0, f.stream, static_cast<const unsigned*>(bufs[k]->base), bufs[k]->bytes / 4U, d + k);
+                hipLaunchKernelGGL(digest_kernel, dim3(256), dim3(256), 0, f.stream, static_cast<const unsigned*>(f.csr.base), f.csr.bytes / 4U, d + bufs.size());
+                const std::uint64_t image_words = static_cast<std::uint64_t>(rows) * Fixture::K * Fixture::I * 2U / 4U;
+                hipLaunchKernelGGL(digest_kernel, dim3(1024), dim3(256), 0, f.stream, static_cast<const unsigned*>(kr::prefill_test_da16_image()), image_words, d + bufs.size() + 1U);
+                std::vector<unsigned long long> all(n);
+                check(hipMemcpyAsync(all.data(), d, 8U * n, hipMemcpyDeviceToHost, f.stream), "tile64 digest read");
+                check(hipStreamSynchronize(f.stream), "tile64 digest");
+                (void)hipFree(d);
+                unsigned admission = 0; check(hipMemcpy(&admission, f.admission.base, 4U, hipMemcpyDeviceToHost), "tile64 admission");
+                // written(): codes deltas sums status intermediates clear down_codes down_deltas down_sums rawdots; then csr, image.
+                std::array<std::vector<unsigned long long>, 3> g;
+                g[0] = {all[3], all[4], all[8], all[bufs.size() + 1U]};
+                g[1] = {all[9]};
+                g[2] = {all[0], all[1], all[2], all[5], all[6], all[7], all[bufs.size()], admission};
+                return g;
+            };
+            const char* const group_names[3] = {"gate/up (status, intermediates, down_sums, DA16 image)", "down (rawdots)", "rest (A8 views, clear, CSR, certificate)"};
+            unsigned cases = 0, failed = 0, tile64_runs = 0, certified = 0, unproven = 0;
+            std::array<unsigned, 7> bucket{};  // experts per fill bucket over the compared cases
+            unsigned full_batches = 0, partial_batches = 0;
+            const unsigned edges[7] = {16U, 32U, 64U, 128U, 256U, 512U, ~0U};
+            const auto count_buckets = [&](Fixture& f, unsigned rows) {
+                const auto rt = f.routes.read();
+                std::vector<unsigned> per(f.c.experts, 0U);
+                for (unsigned t = 0; t < rows; ++t) for (unsigned s = 0; s < Fixture::K; ++s) {
+                    unsigned e = 0; std::memcpy(&e, rt.data() + static_cast<std::size_t>(t) * f.routes.stride + 4U * s, 4U);
+                    if (e < f.c.experts) ++per[e];
+                }
+                for (const unsigned n : per) {
+                    if (!n) continue;
+                    unsigned b = 0; while (n > edges[b]) ++b;
+                    ++bucket[b]; full_batches += n / 128U; partial_batches += n % 128U ? 1U : 0U;
+                }
+            };
+            const auto cmp = [&](Fixture& f, unsigned rows, const std::string& what) {
+                const std::vector<unsigned char> routes = f.weights.read();
+                count_buckets(f, rows);
+                for (int hdr : {0, 1}) for (int storage = 0; storage < 3; ++storage) {
+                    kr::set_prefill_hdr(hdr);
+                    unsigned tune = 0; bool produced = false, ran = false;
+                    const auto run = [&](int on) {
+                        kr::set_prefill_tile64(on);
+                        check(hipMemcpy(f.weights.base, routes.data(), routes.size(), hipMemcpyHostToDevice), "tile64 routes");
+                        set_storage(f, storage);
+                        for (const auto* b : f.written()) b->poison(f.stream);
+                        f.csr.poison(f.stream);
+                        kr::prefill_test_poison_da16(f.stream, rows);
+                        f.enqueue(3, rows);
+                        produced = kr::prefill_certificate_produced();
+                        ran = kr::prefill_tile64_ran();
+                        check(hipStreamSynchronize(f.stream), "tile64 run");
+                        if (!kr::prefill_da16_ran()) throw std::runtime_error("tile64: the DA16 path did not run (" + what + ")");
+                        tune = kr::prefill_last_tune();
+                        return run_digests(f, rows);
+                    };
+                    const std::string tag = what + " rows " + std::to_string(rows) + " hdr " + std::to_string(hdr) + " " + storage_names[storage];
+                    const auto base = run(0);
+                    const bool produced_off = produced;
+                    if (ran) { ++failed; std::printf("  SWITCH %s: TILE64 ran with the override 0\n", tag.c_str()); }
+                    if (run(0) != base) { ++failed; std::printf("  RACY base %s\n", tag.c_str()); continue; }
+                    if (tune != 82U) { ++failed; std::printf("  TUNE %s: %u (the case must take the 128-row tune 82)\n", tag.c_str(), tune); continue; }
+                    // 1 = both kernels, 2 = TILE64 gate/up with today's down, 3 = today's gate/up with the TILE64 down.
+                    for (int on : {2, 3, 1}) {
+                        const auto got = run(on);
+                        ++cases;
+                        const bool want_ran = on != 2 || f.c.gate_type != 13U;
+                        if (ran != want_ran) { ++failed; std::printf("  SWITCH %s on %d: TILE64 ran %d, want %d\n", tag.c_str(), on, ran ? 1 : 0, want_ran ? 1 : 0); }
+                        tile64_runs += ran ? 1U : 0U;
+                        if (produced != produced_off || (storage && !produced)) { ++failed; std::printf("  CERTIFICATE %s on %d: off %d on %d\n", tag.c_str(), on, produced_off ? 1 : 0, produced ? 1 : 0); }
+                        if (storage && produced) { ++certified; unproven += got[2].back() != 0U ? 1U : 0U; }
+                        for (std::size_t k = 0; k < 3U; ++k) if (got[k] != base[k]) {
+                            ++failed;
+                            std::printf("  DIFFER %s on %d (%s): %s\n", tag.c_str(), on, on == 2 ? "TILE64 gate/up" : on == 3 ? "TILE64 down" : "TILE64 both", group_names[k]);
+                        }
+                    }
+                }
+                check(hipMemcpy(f.weights.base, routes.data(), routes.size(), hipMemcpyHostToDevice), "tile64 routes restore");
+                f.view.unsafe = nullptr; f.view.route_bf16 = false;
+            };
+            static std::vector<std::string> keep8; keep8.reserve(128);
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) {
+                const std::string gd = " g" + std::to_string(g) + " d" + std::to_string(d);
+                // Skewed routing (power 1.5) at T8192 and the T5120 prefix: every bucket, full and partial batches.
+                keep8.push_back("tile64 E512 T8192 skew" + gd);
+                { Fixture f({keep8.back().c_str(), 512U, 8192U, g, d, 4U, false, true, false, 0U, 1.5}); for (unsigned rows : {8192U, 5120U}) cmp(f, rows, keep8.back()); }
+                // Crafted counts 0,1,15,16,17,63,64,65,127,128,129,255,256,257,500 (+ the rest: >512 with 32 experts).
+                keep8.push_back("tile64 crafted E32 T2048" + gd);
+                { Case c{keep8.back().c_str(), 32U, 2048U, g, d, 4U, false, false, false}; c.crafted = true; Fixture f(c); cmp(f, 2048U, keep8.back()); }
+                keep8.push_back("tile64 crafted E64 T1024" + gd);
+                { Case c{keep8.back().c_str(), 64U, 1024U, g, d, 4U, false, false, false}; c.crafted = true; Fixture f(c); cmp(f, 1024U, keep8.back()); }
+                // Only full 128-assignment batches (no remainder CTA work).
+                keep8.push_back("tile64 full128 E64 T1024" + gd);
+                { Case c{keep8.back().c_str(), 64U, 1024U, g, d, 4U, false, false, false}; c.crafted = true; c.full128 = true; Fixture f(c); cmp(f, 1024U, keep8.back()); }
+            }
+            for (unsigned d : {7U, 8U}) {
+                // Edge weight scales (flavor 2: non-finite products, certificate unproven) and a NaN input row.
+                keep8.push_back("tile64 E512 T5120 nonfinite g12 d" + std::to_string(d));
+                Fixture f({keep8.back().c_str(), 512U, 5120U, 12U, d, 2U, false, true, true, 0U, 1.5});
+                cmp(f, 5120U, keep8.back());
+            }
+            for (int a = 2; a < argc; ++a) {
+                const auto fl = parse(argv[a]);
+                keep8.push_back("tile64 REAL " + fl[1] + " g" + fl[4] + " d" + fl[5]);
+                Fixture f(real_case(keep8.back().c_str(), fl, 16384U));
+                for (unsigned rows : {16384U, 8192U, 5120U}) cmp(f, rows, keep8.back());
+            }
+            reset();
+            std::printf("tile64 buckets (experts per rows/expert bucket):");
+            const char* const bucket_names[7] = {"1-16", "17-32", "33-64", "65-128", "129-256", "257-512", ">512"};
+            bool covered = partial_batches != 0U && full_batches != 0U;
+            for (unsigned b = 0; b < 7U; ++b) { std::printf(" %s=%u", bucket_names[b], bucket[b]); covered = covered && bucket[b] != 0U; }
+            std::printf("; full batches %u, partial batches %u\n", full_batches, partial_batches);
+            const bool pass = !failed && cases && tile64_runs && certified && covered;
+            std::printf("tile64: %u comparisons (%u with a TILE64 kernel, %u certified, %u of them unproven), %u differ/racy/wrong tune/switch/certificate -> %s\n",
+                cases, tile64_runs, certified, unproven, failed, pass ? "PASS" : "FAIL");
+            return pass ? 0 : 1;
         }
         if (mode == "hdr" || mode == "hdrbench") {
             // MoE header reuse (STRIX_QPF2K_MOE_HDR): default chain (form 3, ROUTE 14, DA16 1) with the base gate/up kernel vs the

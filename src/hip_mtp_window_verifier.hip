@@ -156,6 +156,7 @@ struct HipMtpWindowVerifier::Impl {
     // draft, a rejection, EOS or `n` rows; later rows are never accepted. Spans must outlive the window.
     HipMtpTargetWindowCapture::RowSelection sampled_selection(std::shared_ptr<TokenSampler> sampler,std::uint64_t first,void* stream,
         std::uint32_t rows,std::uint32_t n,std::span<const TokenDraft> drafts,std::span<const std::uint32_t> eos) {
+        sampled_decided=UINT32_MAX;
         return [this,sampler=std::move(sampler),first,stream,rows,n,drafts,eos](
             std::span<const ExecutionBufferAddress> logits,std::span<std::uint32_t> predictions) {
             const auto vocabulary=target->model().vocab_size;
@@ -168,8 +169,10 @@ struct HipMtpWindowVerifier::Impl {
                 if(!device_sampler) device_sampler=std::make_unique<HipTokenSamplerDevice>(static_cast<std::uint32_t>(vocabulary),8U);
                 std::vector<DeviceSampleRow> device_rows(n);
                 for(std::uint32_t r=0;r<n;++r) device_rows[r]={logits[r],first+r,r<drafts.size()?&drafts[r]:nullptr};
-                const auto all=device_sampler->decide(*sampler,device_rows,stream);
+                auto all=device_sampler->decide(*sampler,device_rows,stream);
+                sampler->begin_window();
                 for(std::uint32_t r=0;r<n;++r) {
+                    sampler->force_rejection(all[r],r); // test-only switch; a no-op by default
                     decisions.push_back(all[r]);sampler->count(all[r]);
                     if(!device_rows[r].draft || !all[r].accepted || std::find(eos.begin(),eos.end(),all[r].token)!=eos.end()) break;
                 }
@@ -182,7 +185,14 @@ struct HipMtpWindowVerifier::Impl {
                 std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()-readback,
                 static_cast<std::uint32_t>(decisions.size()));
             for(std::size_t r=0;r<decisions.size();++r) predictions[r]=decisions[r].token;
+            sampled_decided=static_cast<std::uint32_t>(decisions.size());
         };
+    }
+    // Rows the last sampled selection decided; rows after them keep first-max tokens and are never accepted. The
+    // accepted prefix stops there even when a decided row's token equals the next input (a forced rejection).
+    std::uint32_t sampled_decided=UINT32_MAX;
+    void limit_to_sampled_rows(const std::shared_ptr<TokenSampler>& sampler,std::vector<std::uint32_t>& selected) const {
+        if(sampler && sampled_decided<selected.size()) selected.resize(sampled_decided);
     }
     Owner* last=nullptr; // owner of the last prefix window; its stream carries the PLE commit
     // Survival controller (STRIX_MTP_CONTROLLER=survival). An option is an owner and its active rows: with
@@ -667,9 +677,10 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(natives[a].batch));
             std::vector<std::uint32_t> selected;selected.reserve(rows);
             for(std::uint32_t row=0;row<(provisional->selection_prefix()?provisional->selection_prefix()->decided_rows:rows);++row)selected.push_back(provisional->predicted_token(row));
+            i.limit_to_sampled_rows(i.target->token_sampler(),selected);
             // Longest accepted prefix: row a+1's input equals row a's prediction.
             std::uint32_t k=0;
-            while(!q.transaction && k+1U<rows && k<q.candidates.size() && k+1U<q.budget && p.inputs[k+1U]==selected[k] && !is_eos(selected[k])) ++k;
+            while(!q.transaction && k+1U<rows && k<q.candidates.size() && k+1U<q.budget && k+1U<selected.size() && p.inputs[k+1U]==selected[k] && !is_eos(selected[k])) ++k;
             const auto n_keep=q.transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):k+1U;
             if(q.transaction) k=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
             // Prefix owners require one consumed input at row-zero failure.
@@ -1059,9 +1070,10 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
             std::vector<std::uint32_t> selected;selected.reserve(rows);
             for(std::uint32_t row=0;row<(provisional->selection_prefix()?provisional->selection_prefix()->decided_rows:rows);++row)selected.push_back(provisional->predicted_token(row));
+            i.limit_to_sampled_rows(i.target->token_sampler(),selected);
             // Longest accepted prefix: row a+1's input equals row a's prediction.
             std::uint32_t a=0;
-            while(!transaction && !diagnostic && a+1U<active && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
+            while(!transaction && !diagnostic && a+1U<active && a<candidates.size() && a+1U<budget && a+1U<selected.size() && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
             const auto n_keep=transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):a+1U;
             if(transaction) a=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
             host_phase_mark("7a select/accept");
@@ -1112,9 +1124,10 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
             std::vector<std::uint32_t> selected;selected.reserve(rows);
             for(std::uint32_t row=0;row<(provisional->selection_prefix()?provisional->selection_prefix()->decided_rows:rows);++row)selected.push_back(provisional->predicted_token(row));
+            i.limit_to_sampled_rows(i.target->token_sampler(),selected);
             const bool complete=transaction?(selected.size()==rows && provisional->selection_prefix()->accepted_draft_inputs==rows-1U &&
                 std::none_of(inputs.begin(),inputs.end(),is_eos)):
-                assess_mtp_target_window(inputs,selected,pending,budget,eos,vocabulary).accepts_complete_chunk();
+                selected.size()==rows && assess_mtp_target_window(inputs,selected,pending,budget,eos,vocabulary).accepts_complete_chunk();
             if(complete) {
                 if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,session.next_position);
                 out.committed_rows=i.target->accept_verified_window(provisional,initial,session,eos,budget);

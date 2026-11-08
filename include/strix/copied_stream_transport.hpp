@@ -93,7 +93,7 @@ enum class CopiedStreamCleanupStatus { released, pending, failed_retained };
 // GPU DMA, striping or native leases. No numeric conversion is performed.
 class CopiedStreamTransportBackend final : public TransportBackend {
 public:
-    CopiedStreamTransportBackend(DirectStreamControlByteStream&, CopiedStreamConnectionState&,
+    CopiedStreamTransportBackend(DistributedControlByteStream&, CopiedStreamConnectionState&,
                                 CopiedStreamTransportPolicy policy = {});
     ~CopiedStreamTransportBackend() override;
     CopiedStreamTransportBackend(const CopiedStreamTransportBackend&) = delete;
@@ -115,6 +115,8 @@ public:
     // Error cleanup can attach a later quiescence proof without ACK/recovery.
     void attach_cleanup_proof(TransferHandle, std::unique_ptr<CopiedStreamCompletionProof>);
     [[nodiscard]] CopiedStreamCleanupStatus drain_retained();
+    // Permanently invalidates the connection; never attests release.
+    void poison() noexcept;
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] bool retains_buffer() const noexcept;
     [[nodiscard]] std::optional<TransferHandle> retained_handle() const noexcept;
@@ -151,6 +153,12 @@ public:
         DistributedNativeLocalExecutor&, CopiedStreamBoundarySourceProvider&,
         DistributedBoundaryStagingProvider&, AllocationGenerationSource&,
         std::uint64_t maximum_progress_polls = 4096);
+    // Explicit token mode: only completed host-copy boundaries mint retirement.
+    // The owner must retain this transport, its byte channel, connection state,
+    // staging, model and GPU consumers. No GPU-direct capability is asserted.
+    void begin_token_retirement(std::uint64_t binding_identity, std::shared_ptr<const void> actual_owner);
+    void complete_position_dependencies(NativeDistributedPositionCompletion&&);
+    [[nodiscard]] NativeDistributedTokenRetirement retire_token();
     void execute_local_step(const DistributedStepPlacement&) override;
     void execute_remote_step(const DistributedStepPlacement&) override;
     void send_boundary(const DistributedExecutionBoundary&, const DistributedBoundaryTransfer&) override;
@@ -158,6 +166,7 @@ public:
     [[nodiscard]] bool failed() const noexcept { return failed_; }
 private:
     void require_healthy() const;
+    void fail_token() noexcept;
     void validate_boundary(const DistributedExecutionBoundary&, const DistributedBoundaryTransfer&,
                            bool receive, std::uint64_t sequence) const;
     transport::CopiedStreamTransportBackend* transport_;
@@ -172,6 +181,8 @@ private:
     std::uint64_t maximum_polls_;
     std::uint64_t next_send_ = 1, next_receive_ = 1;
     bool failed_ = false;
+    bool dispatched_ = false;
+    std::shared_ptr<CopiedDistributedTokenLedger> token_;
 };
 
 }  // namespace strix

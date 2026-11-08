@@ -45,6 +45,10 @@ struct DistributedControlWireLimits {
 class DistributedControlByteStream {
 public:
     virtual ~DistributedControlByteStream() = default;
+    // Explicit permanent shutdown; legacy streams retain their own close policy.
+    virtual void abort() noexcept {}
+    // Zero means the implementation has not declared a bounded frame contract.
+    [[nodiscard]] virtual std::uint64_t maximum_frame_bytes() const noexcept { return 0; }
     virtual void send(
         std::span<const std::byte> frame) = 0;
     [[nodiscard]] virtual std::vector<std::byte>

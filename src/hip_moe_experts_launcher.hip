@@ -1,8 +1,10 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_projection.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_experts_launcher.hpp"
+#include "strix/hip_qwen_moe_prepared.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/q51_slot_parallel_contract.hpp"
 #include "strix/moe_a8_down_contract.hpp"
@@ -1204,7 +1206,7 @@ __global__ void q51_grouped_virtual256_down_probe_kernel(const float* intermedia
         for(unsigned distance=16;distance>0;distance>>=1U) {
 #pragma unroll
             for(unsigned j=0;j<8;++j) {
-                const auto neighbor=__shfl_down(partial[j],distance,32);
+                const auto neighbor=strix::qwen_dpp::down_tree32(partial[j], distance);
                 if(lane<distance) partial[j]+=neighbor;
             }
         }
@@ -1250,7 +1252,7 @@ __global__ void q51_slot_parallel_dot_kernel(const float* intermediates,
     for(unsigned distance=16;distance>0;distance>>=1U) {
 #pragma unroll
         for(unsigned j=0;j<8;++j) {
-            const auto neighbor=__shfl_down(partial[j],distance,32);
+            const auto neighbor=strix::qwen_dpp::down_tree32(partial[j], distance);
             if(lane<distance) partial[j]+=neighbor;
         }
     }
@@ -2872,6 +2874,16 @@ __global__ void known_moe_prefill_merge_commit_vec4_bf16_kernel(KnownMoePrefillD
     moe_prefill_merge_z_body_vec4<false, true>(view, header, hidden_size, experts, top_k,
         [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
 }
+__global__ void known_moe_prefill_merge_commit_i8_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const unsigned* unsafe) {
+    moe_prefill_merge_z_body<true, false, true, true>(view, header, hidden_size, experts, top_k,
+        [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
+}
+__global__ void known_moe_prefill_merge_commit_vec4_i8_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const unsigned* unsafe) {
+    moe_prefill_merge_z_body_vec4<false, true, true>(view, header, hidden_size, experts, top_k,
+        [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
+}
 template <unsigned CTAs>
 __global__ void known_moe_prefill_finish_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
     std::uint32_t row_count, std::uint32_t hidden, std::uint32_t* record, const unsigned* unsafe) {
@@ -2904,6 +2916,8 @@ unsigned* prefill_admission_word(hipStream_t stream) {
     return static_cast<unsigned*>(ptr);
 }
 struct KnownMoePrefillPrepared {
+    std::shared_ptr<const qwen_moe_prepared::Model> direct_b;
+    moe_q4k_a8::known_rows::DirectBOperands direct;
     moe_q4k_a8::Request request;
     moe_q4k_a8::known_rows::PrefillRows rows;
     KnownMoePrefillDevice device;
@@ -3096,6 +3110,20 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     const auto ptr = [&](std::uint64_t offset) { return reinterpret_cast<unsigned*>(prefill.memory.arena_base + offset); };
     r.csr = {ptr(layout.header), ptr(layout.offsets), ptr(layout.touched), ptr(layout.rows), ptr(layout.slots),
         ptr(layout.batch_experts), ptr(layout.batch_begins)};
+    if (const auto& prepared=first.resources->model_weights->qwen_moe_prepared;
+        prepared && prepared->model_hash==first.resources->model_weights->model_content_identity) {
+        out.direct_b=prepared;
+        namespace qp=qwen_moe_prepared;
+        const qp::Spec spec{qp::Format::q4_k,qp::Role::gate,out.request.shape.experts,out.request.shape.rows,out.request.shape.hidden};
+        if(out.request.gate_type==12U && out.request.up_type==12U) {
+            const auto* g=prepared->find(reinterpret_cast<std::uintptr_t>(out.gate),qp::Role::gate,spec);
+            const auto* u=prepared->find(reinterpret_cast<std::uintptr_t>(out.up),qp::Role::up,spec);
+            if(g&&u) {
+                out.direct.gate=reinterpret_cast<const unsigned char*>(g->allocation->address());
+                out.direct.up=reinterpret_cast<const unsigned char*>(u->allocation->address());
+            }
+        }
+    }
     out.device = {strided.template operator()<const std::uint32_t>(routes), strided.template operator()<const float>(route_weights),
         strided.template operator()<std::uint32_t>(status), strided.template operator()<float>(rawdots),
         strided.template operator()<float>(accumulation), strided.template operator()<std::uint16_t>(output)};
@@ -3108,11 +3136,24 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
     bool committed = false;
     auto rows = p.rows;
     rows.route_bf16 = config.prefill_moe_route_bf16;
+    rows.route_i8 = rows.route_bf16 && strix::moe_route_i8_enabled();
     if (rows.route_bf16 && (!config.prefill_f16wmma || gsq || prefill_merge_commit(gsq)!=1U))
         throw std::invalid_argument("MoE route BF16 requires fast DA16 prefill and MC=1");
     if (prefill_merge_commit(gsq)) rows.unsafe = prefill_admission_word(stream);
-    moe_q4k_a8::known_rows::enqueue_prefill(p.request, rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
-        config.prefill_f16wmma ? 3 : -1);
+    try {
+        moe_q4k_a8::known_rows::enqueue_prefill(p.request, rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
+            config.prefill_f16wmma ? 3 : -1, p.direct);
+        // STRIX_QPF2K_SCHED bit 64: a stage hook the call's path did not reach runs here, before the merge.
+        moe_q4k_a8::known_rows::prefill_stage_reached(3U, stream);
+        if(p.direct_b) {
+            const bool ran=moe_q4k_a8::known_rows::prefill_direct_b_ran();
+            if(ran)++p.direct_b->engaged;else ++p.direct_b->declined;
+            p.direct_b->reason=moe_q4k_a8::known_rows::prefill_direct_b_reason();
+        }
+    } catch (...) {
+        moe_q4k_a8::known_rows::set_prefill_stage_hook(nullptr, nullptr, 0U); // never leave it armed for a later call
+        throw;
+    }
     // qpf2k core2 bit 9 (STRIX_QPF2K_MOE): the down already ran the ordered merge (last arrival); its guards and non-finite
     // flag run here instead (same accumulation, status and header bits).
     if (moe_q4k_a8::known_rows::prefill_fused_merge()) {
@@ -3128,7 +3169,15 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         (void)witness;
         // The fallback choice is device-side and per call. No host fallback count/witness can observe it
         // without a readback; do not add synchronization or claim a host-observed fallback.
-        if (rows.route_bf16) {
+        if (rows.route_i8) {
+            if (prefill_merge_vec4(p.device, config.hidden_size, gsq))
+                hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_i8_kernel, dim3((config.hidden_size / 4U + 127U) / 128U, count), dim3(128), 0,
+                    stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
+            else
+                hipLaunchKernelGGL(known_moe_prefill_merge_commit_i8_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+                    stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
+        }
+        else if (rows.route_bf16) {
             if (prefill_merge_vec4(p.device, config.hidden_size, gsq))
                 hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_bf16_kernel, dim3((config.hidden_size / 4U + 127U) / 128U, count), dim3(128), 0,
                     stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);

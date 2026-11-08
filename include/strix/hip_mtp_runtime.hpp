@@ -7,6 +7,7 @@
 #include "strix/mtp_shared_execution_witness.hpp"
 #include "strix/qualified_mtp_forward_runtime.hpp"
 #include "strix/token_sampling.hpp"
+#include <array>
 #include <functional>
 #include <span>
 #include <vector>
@@ -93,6 +94,14 @@ public:
     // All source pairs after the logical cache frontier, plus the final committed target
     // ticket. Equality of predicted tokens is never cache authority.
     void set_reconciliation_rows(std::span<const HipMtpReplayRow>,const HipMtpTargetHiddenTicket& final_target);
+    // STRIX_MTP_DEVICE_HANDOFF (set by the caller around reconcile_after_target of a cycle that continues): the
+    // reconciliation's teacher cache rows complete with the next draft chain on the same stream instead of a host
+    // fence of their own. Same launches and order; their first-error status is read by that chain's completion,
+    // before any of its drafts is used. A cycle without a chain, and every other owner entry, completes them first.
+    void defer_next_reconcile_completion(bool) noexcept;
+    void settle_deferred();
+    // Deferred completions begun / carried into a draft chain / completed by another entry.
+    [[nodiscard]] std::array<std::uint64_t,3> deferred_completion_counts() const noexcept;
     // Opt-in sync-free draft chain (before the first cycle): every draft row is
     // fed its token from device memory, the draft head (vocabulary subset or
     // full) selects on device into mapped memory, and one completion ends the

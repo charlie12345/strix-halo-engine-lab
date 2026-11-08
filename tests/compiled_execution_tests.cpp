@@ -144,6 +144,22 @@ strix::PersistentState all_state() {
 }  // namespace
 
 int main() {
+    expect(strix::parse_qsa_union_cap("") == 0U && strix::parse_qsa_union_cap("0") == 0U &&
+        strix::parse_qsa_union_cap("1024") == 1024U && strix::parse_qsa_union_cap("4294967295") == UINT32_MAX,
+        "union cap decimal parser and OFF");
+    for (const auto text : {"-1", "+1", "1x", " 1", "4294967296"}) {
+        bool rejected = false;
+        try { (void)strix::parse_qsa_union_cap(text); } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "union cap rejects invalid or overflowing controls");
+    }
+    expect(strix::prefill_identity_name(0U, 0U, 0U) == "fp16-v1" &&
+        strix::prefill_identity_hash(0U, 0U, 0U) == UINT64_C(11531825512229770990) &&
+        strix::prefill_identity_hash(1U, 0U, 0U) == UINT64_C(17162327878354112617), "union cap OFF preserves identity bytes");
+    expect(strix::prefill_identity_name(1U, 0U, 1024U) == "fp16-v1+hcout16+qsauc1024" &&
+        strix::prefill_identity_hash(1U, 0U, 1024U) != strix::prefill_identity_hash(1U, 0U, 0U) &&
+        strix::prefill_identity_hash(1U, 0U, 1024U) != strix::prefill_identity_hash(1U, 0U, 512U), "union cap binds its value into the identity");
+    expect(strix::bind_prefill_option_identity(123U, 1U, 0U, 0U) != strix::bind_prefill_option_identity(123U, 1U, 0U, 1024U),
+        "union cap changes inherited arithmetic/cache identity");
     const auto model =
         strix::ModelContract::qwen38_flash_next();
 

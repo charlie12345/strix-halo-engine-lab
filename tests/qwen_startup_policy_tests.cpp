@@ -17,6 +17,60 @@ int main() try {
     const auto resolve = [&](Options options, Environment env = {}) {
         return initialize_prefill_config({options, env});
     };
+    {
+        namespace pr = qwen::profile;
+        const auto lookup = [](const char*) -> const char* { return nullptr; };
+        const auto fast = pr::resolve(pr::Name::fast, {{},lookup,false});
+        const auto* row = fast.find("qsa_budget");
+        check(row && row->status == pr::Status::provisional && row->value == "1536" &&
+            row->lever->runnable[1] && !row->lever->ready[1] && row->lever->provisional[1], "fast QSA budget runnable but not READY");
+        for (const auto profile : {pr::Name::standard, pr::Name::quality})
+            check(!pr::resolve(profile, {{},lookup,false}).find("qsa_budget"), "other profiles leave budget unset");
+        Environment exported;
+        pr::apply(fast, [&](const char* key, const char* value) { exported[key] = value; return true; });
+        const auto budgeted = resolve(plain, exported);
+        check(budgeted.options.resolved_qsa_prefill_budget == 1536U &&
+            exported.at("STRIX_QWEN_PROFILE_OWNED_qsa_budget") == "fast:provisional:1536", "fast exports budget and provenance");
+        const auto fields = serve::parse_json(effective_config_json(budgeted));
+        check(fields.find("prefill_identity")->as_string() == "fp16-v1+hcout16+qsab1536" &&
+            fields.find("qsa_prefill_budget")->as_int() == 1536, "inspection binds actual budget into identity and witness");
+        check(effective_config_notice(budgeted).find("ranked_slots=1536 local_tail=unchanged decode_verify=unchanged") != std::string::npos,
+            "startup witness states scope");
+        check(prefill_identity_hash(1U,1536U) != prefill_identity_hash(1U,0U) &&
+            prefill_identity_hash(1U,1536U) != prefill_identity_hash(1U,512U), "different budgets have different identity hashes");
+        check(prefill_identity_hash(1U,1536U) == UINT64_C(0xac0991573b76e126), "qualification identity hash pinned");
+        check(bind_prefill_option_identity(42U,1U,1536U) != bind_prefill_option_identity(42U,1U,0U), "compiled arithmetic binds budget");
+        check(effective_config_json(resolve(plain, {{"STRIX_QPF2K_QSA_BUDGET","0"}})).find("qsab") == std::string::npos &&
+            !resolve(plain).options.resolved_qsa_prefill_budget.value(), "zero and unset retain incumbent identity");
+        for (const auto* master : {"--prefill-exact-fp16"})
+            check(resolve(parse({"decoder","model.gguf","1",master}), exported).options.resolved_qsa_prefill_budget == 0U,
+                "exact master disables budget");
+        check(resolve(plain, {{"STRIX_QPF2K_QSA_BUDGET","1536"},{"STRIX_PREFILL_EXACT_FP16","1"}}).options.resolved_qsa_prefill_budget == 0U,
+            "environment exact master disables budget");
+        for (const auto* text : {"-4", "+4", "1x", "4294967296", " 4"}) {
+            bool refused = false;
+            try { (void)resolve(plain, {{"STRIX_QPF2K_QSA_BUDGET",text}}); }
+            catch (const std::invalid_argument&) { refused = true; }
+            check(refused, "malformed budget refused before device work");
+        }
+        check(qsa_prefill_block_topk(512U,4U,0U) == 512U && qsa_prefill_block_topk(512U,4U,1536U) == 384U &&
+            qsa_prefill_block_topk(512U,4U,4096U) == 512U && qsa_prefill_block_topk(256U,8U,1536U) == 192U,
+            "budget caps rather than enlarges selection and follows the model ratio");
+        bool refused = false;
+        try { (void)qsa_prefill_block_topk(512U,4U,1535U); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "budget must divide into complete blocks");
+        check(yarn_environment_refusal({{"STRIX_QPF2K_QSA_BUDGET","0"}},2U).empty() &&
+            !yarn_environment_refusal({{"STRIX_QPF2K_QSA_BUDGET","1536"}},2U).empty(), "YaRN admits only budget restoration");
+        check(parse({"decoder","model.gguf","1","--qsa-budget","1536"}).product_profile.find("qsa_budget")->status == pr::Status::explicit_cli,
+            "CLI budget uses existing profile wiring");
+        const auto off = pr::resolve(pr::Name::fast, {{{"qsa_budget","0"}},lookup,false});
+        check(off.find("qsa_budget")->status == pr::Status::off, "explicit CLI off overrides fast");
+        const auto env_off = pr::resolve(pr::Name::fast, {{},[](const char* key) -> const char* {
+            return std::string_view(key) == "STRIX_QPF2K_QSA_BUDGET" ? "0" : nullptr;
+        },false});
+        check(env_off.find("qsa_budget")->status == pr::Status::off, "explicit environment off overrides fast");
+    }
     for (const auto value : {"8200", "8193", "16383"}) {
         bool refused = false;
         try { (void)parse({"decoder", "model.gguf", "1", "--known-prefix-prefill-rows", value}); }
@@ -164,6 +218,20 @@ int main() try {
         check(!(off.prefill_option_mask & idx), "index off and master dominate opt-in");
     }
     check(resolve(plain, {{"STRIX_PREFILL_INDEX_PROJ_WMMA","0"}}).prefill_option_mask == 1U, "index env off preserves base");
+    const auto score = prefill_option_bit(PrefillOption::index_score_wmma);
+    const Environment score_optin{{"STRIX_PREFILL_INDEX_SCORE_WMMA","1"}};
+    check(resolve(plain, score_optin).prefill_option_mask == (1U | score) && !(kPrefillOptionsReady & score),
+        "score WMMA explicit candidate opt-in");
+    check(prefill_identity_fields(1U | score).find("index_score_wmma") != std::string::npos,
+        "effective identity reports score candidate");
+    for (const auto* flag : {"--prefill-disable=index_score_wmma", "--prefill-exact-fp16"})
+        check(!(resolve(parse({"decoder", "model.gguf", "1",flag}),score_optin).prefill_option_mask & score),
+            "score off and master dominate opt-in");
+    check(resolve(plain, {{"STRIX_PREFILL_INDEX_SCORE_WMMA","0"}}).prefill_option_mask == 1U,
+        "score env off preserves base");
+    check(resolve(plain, {{"STRIX_PREFILL_INDEX_SCORE_WMMA","1"},{"STRIX_PREFILL_EXACT_FP16","1"}}).prefill_option_mask == 0U,
+        "score environment master dominates opt-in");
+    check(index_wmma_unqualified_route(score,kFastPrefillQsa), "score MTP/nested exclusion");
     const auto gdn = prefill_option_bit(PrefillOption::gdn_fp16_chunk);
     check(parse_prefill_option_list("gdn_fp16_chunk") == gdn && !(kPrefillOptionsReady & gdn) && (kPrefillOptionsCandidates & gdn),
         "GDN chunk option recognized as candidate, not READY");
@@ -173,6 +241,22 @@ int main() try {
         "GDN chunk explicit opt-in names its identity");
     for (const auto* flag : {"--prefill-disable=gdn_fp16_chunk", "--prefill-exact-fp16"})
         check(!(resolve(parse({"decoder", "model.gguf", "1",flag}),gdn_optin).prefill_option_mask & gdn), "GDN chunk off and master dominate opt-in");
+    const Environment gdn_v3{{"STRIX_QPF2K_GDN_FP16_CHUNK","3"}};
+    const auto v3 = resolve(plain,gdn_v3);
+    check(v3.prefill_option_mask == (1U | gdn | kPrefillGdnChunkRev3) &&
+        prefill_identity_name(v3.prefill_option_mask) == "fp16-v1+hcout16+gdnchunk16r3" &&
+        prefill_identity_hash(v3.prefill_option_mask) == UINT64_C(0x7df952f79f083ab6) &&
+        prefill_identity_hash(v3.prefill_option_mask) != prefill_identity_hash(gdn_on.prefill_option_mask),
+        "GDN rev 3 has a distinct arithmetic/cache identity with the same resource owner");
+    for (const auto* flag : {"--prefill-disable=gdn_fp16_chunk", "--prefill-exact-fp16"}) {
+        const auto off = resolve(parse({"decoder", "model.gguf", "1",flag}),gdn_v3);
+        check(!(off.prefill_option_mask & (gdn | kPrefillGdnChunkRev3)), "rev 3 off removes route and revision");
+    }
+    check(resolve(plain, {{"STRIX_QPF2K_GDN_FP16_CHUNK","3"},{"STRIX_PREFILL_EXACT_FP16","1"}}).prefill_option_mask == 0U,
+        "environment master removes rev 3 and its discriminator");
+    for (const auto* value : {"0", "2", "30", "invalid"})
+        check(resolve(plain, {{"STRIX_QPF2K_GDN_FP16_CHUNK",value}}).prefill_option_mask == 1U,
+            "GDN unsupported values stay off");
     check(resolve(plain, {{"STRIX_PREFILL_INDEX_PROJ_WMMA","1"},{"STRIX_PREFILL_EXACT_FP16","1"}}).prefill_option_mask == 0U, "env master dominates opt-in");
     check(prefill_identity_fields(index_on.prefill_option_mask).find("index_proj_wmma") != std::string::npos, "effective identity reports candidate");
     check(prefill_identity_hash(1U) == UINT64_C(0xee2cd64684149069) &&
@@ -183,6 +267,9 @@ int main() try {
     { std::ofstream file(config_path); file << "prefill_disable = [\"index_proj_wmma\"]\n"; }
     check(resolve(parse({"decoder", "model.gguf", "1", "--config", config_path.string()}),optin).prefill_option_mask == 1U,
         "index config off dominates environment opt-in");
+    { std::ofstream file(config_path); file << "prefill_disable = [\"index_score_wmma\"]\n"; }
+    check(resolve(parse({"decoder", "model.gguf", "1", "--config", config_path.string()}),score_optin).prefill_option_mask == 1U,
+        "score config off dominates environment opt-in");
     std::filesystem::remove(config_path);
     check(t16k_prompt_threshold == 32768U, "automatic T16384 threshold");
     std::cout << "startup policy tests passed\n";

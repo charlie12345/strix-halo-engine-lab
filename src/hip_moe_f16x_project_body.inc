@@ -62,7 +62,7 @@
         if constexpr((Tune&2048U)==0U)
 #pragma unroll
         for(unsigned j=0;j<AChunks;++j) {
-            // core2: branch-free loads (a row past the batch reads table row 0; staging writes zero for it, as the base), so
+            // Branch-free loads (a row past the batch reads the first table row; staging writes zero for it, as the base), so
             // the wait-count pass can wait for exactly the oldest register stage (a skipped exec-masked load forces
             // vmcnt(0), which drains every younger prefetch).
             if constexpr(Core!=0U)r.a[j]=f16_load(a_src[j]+128U*step);
@@ -183,7 +183,7 @@ if constexpr(BWords>=4U)
             else at(view.output,r)[slot*2U*outputs+out]=hv;
         }
         float m=fabsf(hv);
-        for(int stride=8;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+        for(int stride=8;stride!=0;stride/=2)m=fmaxf(m,strix::qwen_dpp::xor32(m, stride));
         if(live&&i==0U)atomicMax(reinterpret_cast<unsigned*>(at(view.down_sums,r))+slot,__float_as_uint(m));
         if(live&&bad){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}
     }

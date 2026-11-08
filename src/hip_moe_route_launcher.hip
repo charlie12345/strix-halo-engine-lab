@@ -1,3 +1,4 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
@@ -970,9 +971,9 @@ __device__ __forceinline__ void wave_parallel_moe_route_select_row(
             }
 #pragma unroll
             for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U) {
-                const float other = __shfl_xor(best, static_cast<int>(mask), kRouterWave);
-                const auto other_index = __shfl_xor(index, static_cast<int>(mask), kRouterWave);
-                const int other_has = __shfl_xor(static_cast<int>(has), static_cast<int>(mask), kRouterWave);
+                const float other = strix::qwen_dpp::xor32(best, static_cast<int>(mask));
+                const auto other_index = strix::qwen_dpp::xor32(index, static_cast<int>(mask));
+                const int other_has = strix::qwen_dpp::xor32(static_cast<int>(has), static_cast<int>(mask));
                 if (other_has != 0 && (!has || better(other, other_index, best, index))) {
                     has = true; best = other; index = other_index;
                 }
@@ -1067,7 +1068,7 @@ __device__ __forceinline__ void wave_route_select_row(const float* workspace, st
         if (lane + kRouterWave * i < expert_count) maximum = fmaxf(maximum, p[i]);
 #pragma unroll
     for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U)
-        maximum = fmaxf(maximum, __shfl_xor(maximum, static_cast<int>(mask), kRouterWave));
+        maximum = fmaxf(maximum, strix::qwen_dpp::xor32(maximum, static_cast<int>(mask)));
 #pragma unroll
     for (std::uint32_t i = 0; i < kWaveCandidates; ++i)
         if (lane + kRouterWave * i < expert_count) p[i] = expf(p[i] - maximum);
@@ -1115,9 +1116,9 @@ __device__ __forceinline__ void wave_route_select_row(const float* workspace, st
         }
 #pragma unroll
         for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U) {
-            const float other = __shfl_xor(best, static_cast<int>(mask), kRouterWave);
-            const auto other_index = __shfl_xor(index, static_cast<int>(mask), kRouterWave);
-            const int other_has = __shfl_xor(static_cast<int>(has), static_cast<int>(mask), kRouterWave);
+            const float other = strix::qwen_dpp::xor32(best, static_cast<int>(mask));
+            const auto other_index = strix::qwen_dpp::xor32(index, static_cast<int>(mask));
+            const int other_has = strix::qwen_dpp::xor32(static_cast<int>(has), static_cast<int>(mask));
             if (other_has != 0 && (!has || better(other, other_index, best, index))) {
                 has = true; best = other; index = other_index;
             }
@@ -1663,15 +1664,16 @@ void launch_typed(
         return;
     }
     const auto workspace = prepare_parallel_router_workspace(context, config);
+    const auto* bf16 = WeightKind == RouterWeightKind::f32 ? q6p::find(reinterpret_cast<const void*>(weight.address)) : nullptr;
+    const bool half = bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == config.expert_count && bf16->cols == config.hidden_size;
     const bool staged = config.staged_logits && WeightKind == RouterWeightKind::f32 &&
-        staged_router_logits_eligible(config.hidden_size, config.expert_count, 0, weight.address);
+        !half && staged_router_logits_eligible(config.hidden_size, config.expert_count, 0, weight.address);
     if (staged) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_moe_route_logits_kernel<Activation>),
             dim3(256U, context.logical_rows), dim3(256U), 0, hip_execution_stream(),
             reinterpret_cast<const Activation*>(hidden.address), reinterpret_cast<const void*>(weight.address),
             reinterpret_cast<float*>(workspace.address));
-    } else if (const auto* bf16 = WeightKind == RouterWeightKind::f32 ? q6p::find(reinterpret_cast<const void*>(weight.address)) : nullptr;
-               bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == config.expert_count && bf16->cols == config.hidden_size) {
+    } else if (half) {
         // Registered BF16 copy of BF16-exact F32 weights: load_weight<bf16> yields the same coefficients.
         hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<Activation, RouterWeightKind::bf16>),
             dim3((config.expert_count + kRouterExpertsPerBlock - 1U) / kRouterExpertsPerBlock, context.logical_rows),
@@ -2635,7 +2637,13 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
     const auto hidden0=c.resources->view(HipMtpBuffer::hidden0).address;
     // The one-row staged chains (same bits as parallel_moe_route_logits_kernel); STRIX_ROUTER_STAGED=0: off.
     static const bool staged=[]{const char* v=std::getenv("STRIX_ROUTER_STAGED");return !v||v[0]!='0';}();
-    if(staged && h==20U*128U && hidden0%16U==0U && c.tensors->router.runtime->address%16U==0U) {
+    const auto* bf16 = q6p::find(reinterpret_cast<const void*>(c.tensors->router.runtime->address));
+    if (bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == e && bf16->cols == h) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::bf16>),
+            dim3((e+kRouterExpertsPerBlock-1)/kRouterExpertsPerBlock),dim3(kRouterProjectionThreads),0,
+            reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const std::uint16_t*>(hidden0),
+            bf16->base,h,e,workspace);
+    } else if(staged && h==20U*128U && hidden0%16U==0U && c.tensors->router.runtime->address%16U==0U) {
         RouterRowsArgs args{};args.hidden[0]=reinterpret_cast<const void*>(hidden0);args.workspace[0]=workspace;
         static const bool stage_act=[]{const char* v=std::getenv("STRIX_ROUTER_STAGE_ACT");return !v||v[0]!='0';}();   // default ON
         static const bool chunk256=[]{const char* v=std::getenv("STRIX_ROUTER_CHUNK256");return v&&v[0]=='1';}();
@@ -2704,10 +2712,21 @@ void launch_hip_mtp_route_rows(std::span<const MtpNativeContext> contexts,void* 
     }
     const auto stream=reinterpret_cast<hipStream_t>(raw_stream);
     check_hip(hipGetLastError(),"MTP router batch pending HIP error");
+    const auto* bf16 = q6p::find(router);
+    const bool half = bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == e && bf16->cols == h;
     std::uint32_t first=0;const auto count=static_cast<std::uint32_t>(contexts.size());
     const auto group=[&]<std::uint32_t R>() {
         RouterRowsArgs g{};
         for(std::uint32_t r=0;r<R;++r){g.hidden[r]=args.hidden[first+r];g.workspace[r]=args.workspace[first+r];}
+        if (half) {
+            if constexpr (R == 1U)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::bf16>),
+                    dim3((e+kRouterExpertsPerBlock-1)/kRouterExpertsPerBlock),dim3(kRouterProjectionThreads),0,stream,
+                    static_cast<const std::uint16_t*>(g.hidden[0]),bf16->base,h,e,g.workspace[0]);
+            else
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,R,20U,8U,true>),dim3((e+15U)/16U),
+                    dim3(32U*(staged_router_chain_waves<R>()+8U)),0,stream,g,bf16->base,e);
+        } else
         hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,R,20U,8U>),dim3((e+15U)/16U),
             dim3(32U*(staged_router_chain_waves<R>()+8U)),0,stream,g,router,e);
         check_hip(hipGetLastError(),"MTP router batch logits launch");

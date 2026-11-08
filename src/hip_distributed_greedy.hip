@@ -59,7 +59,7 @@ struct HipDistributedGreedyRequest::Impl final : SerialGreedyStepBackend {
         wire=std::make_unique<FramedDistributedGreedyWire>(*channel,request,node);
         sequence=std::make_unique<HipDistributedKnownSequence>(std::move(setup));
     }
-    void fail() noexcept {failed=true;participant->communication_failed();}
+    void fail() noexcept {failed=true;participant->communication_failed();channel->abort();}
     DistributedTokenBinding next_binding(std::uint32_t token) const {
         if(!sequence->completed_inputs()) return participant->current_binding();
         const auto frontier=participant->frontier();

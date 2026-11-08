@@ -2,6 +2,7 @@
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/known_prefill_limits.hpp"
+#include "../src/hip_gdn_identity.hpp"
 
 #include "strix/execution_binding.hpp"
 #include "strix/arithmetic_lineage.hpp"
@@ -210,7 +211,12 @@ KnownFixture make_known_fixture(const strix::ModelContract& model, std::uint32_t
             tensor("ffn_up_exps.weight",{2560,640,512},gate);
             tensor("ffn_down_exps.weight",{640,2560,512},q80 ? 8U : 7U);
         } else if (step.op == strix::SerialOp::gated_delta_net) {
-            binding.kernel_id = "hip.gdn.bf16.h2560.kh16.vh48.d128.r1.c1.scalar.wave8-input-v1.wave8-q8-output-v1.prefetch8.virtual256.q8-input.virtual256.q8-output";
+            strix::HipGdnLauncherConfig gdn;
+            gdn.model = model;
+            gdn.virtual_q8_input_projections = gdn.prefetch_q8_input_projections = true;
+            gdn.wave8_q8_input_projections = gdn.wave8_q8_output_projection = true;
+            gdn.virtual_q8_output_projection = true;
+            binding.kernel_id = strix::hip_gdn_identity::kernel_id({}, gdn);
             tensor("attn_qkv.weight", {2560,10240}, 8);
             tensor("attn_gate.weight", {2560,6144}, 8);
             tensor("ssm_beta.weight", {2560,48}, gate_type);

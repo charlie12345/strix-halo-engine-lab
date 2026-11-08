@@ -1,4 +1,4 @@
-// qwen-gdn-fp16-chunk, numerical revision 2: chunked (C = 32) gated delta rule in WY form on FP16 WMMA operands with
+// qwen-gdn-fp16-chunk, numerical revisions 2/3: chunked (C = 32) gated delta rule in WY form on FP16 WMMA operands with
 // FP32 accumulation, for the GDN prefill on gfx1151. Bit-changing (FAST) identity; the production token recurrence is
 // untouched. The route starts from the raw input-projection rows (conv fused) and ends at the gated-norm output.
 //
@@ -31,9 +31,18 @@
 //   Output: the epilogue receives O FP32 per (row, head) in the gated-norm lane layout (channel p * 32 + lane).
 // Every call finishes its partial chunk; aligned (multiple of 32) call splits are bitwise invariant; results are
 // run-to-run deterministic (fixed reduction orders, no atomics on values).
+// Rev 3 keeps C32 and scan unchanged: prep walks 16-row conv segments and uses exp(G_r)*exp(-G_s) for bounded
+// prefixes [-60,0] (diagonal 1); other intervals keep exp(G_r-G_s). This changes T/P rounding; separately qualify.
 namespace gdn_fp16_chunk {
 constexpr unsigned kC = 32U, kD = 128U, kSQ = 136U, kST = 40U, kMaxGroup = 4U;
 constexpr float kGateFloor = -110.0F;
+// Startup-cached; the fixture and engine use the same specialization selector. Rev 2 stays unchanged.
+inline unsigned revision() {
+    static const unsigned value = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_FP16_CHUNK");
+        return v && v[0] == '3' && v[1] == '\0' ? 3U : 2U; }();
+    return value;
+}
+inline const char* identity() { return revision() == 3U ? "qwen-gdn-fp16-chunk rev 3" : "qwen-gdn-fp16-chunk rev 2"; }
 typedef _Float16 h16x16 __attribute__((ext_vector_type(16)));
 typedef float f32x8 __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
@@ -150,12 +159,17 @@ __device__ __forceinline__ float in_z(const GdnPrefillRows& rows, const Conv& co
     else return rows.z[row * rows.stride + ch];
 }
 // prep: one CTA per (key head, chunk) for its value_heads / key_heads value heads.
-template <bool B16>
+template <bool B16, unsigned ConvRows = 8U, bool FactorDecay = false>
 __global__ __launch_bounds__(256) void prep_kernel(GdnPrefillRows rows, std::uint32_t count, Conv conv,
     std::uint32_t key_heads, std::uint32_t value_heads, float epsilon, Scratch out) {
     __shared__ __attribute__((aligned(16))) unsigned char qk_raw[2U * kC * kSQ * 2U];  // Ks | Qs, then A
     __shared__ float KK[kC][kC + 1U], QK[kC][kC + 1U];
+    static_assert(ConvRows == 8U || ConvRows == 16U);
+    constexpr unsigned ConvJobs = kC / ConvRows;
     __shared__ float Gs[kMaxGroup][kC], Bs[kMaxGroup][kC];
+    // Empty in rev 2 after specialization; no scratch/scan layout change.
+    __shared__ float decay[FactorDecay ? kMaxGroup : 1U][FactorDecay ? kC : 1U];
+    __shared__ float inverse[FactorDecay ? kMaxGroup : 1U][FactorDecay ? kC : 1U];
     static_assert(kMaxGroup * kC * (kC + 1U) * 4U <= sizeof(qk_raw), "A alias");
     auto* Ks = reinterpret_cast<_Float16*>(qk_raw);
     auto* Qs = Ks + kC * kSQ;
@@ -165,10 +179,10 @@ __global__ __launch_bounds__(256) void prep_kernel(GdnPrefillRows rows, std::uin
     const std::uint32_t first = chunk * kC, m = min(kC, count - first), group = value_heads / key_heads;
     const std::uint64_t rows_p = static_cast<std::uint64_t>(n) * kC;
     const float q_scale = rsqrtf(static_cast<float>(kD));
-    // Conv jobs (block, 8-row quarter): block 0 = q, 1 = k, 2 + j = v of value head kh + j * key_heads. A wave walks
-    // its 8 rows with a sliding window (each input row loaded once), lane channels p * 32 + lane.
-    for (unsigned job = wave; job < (2U + group) * 4U; job += 8U) {
-        const unsigned block = job / 4U, r0 = 8U * (job % 4U);
+    // Conv jobs (block, ConvRows-row segment): block 0 = q, 1 = k, 2 + j = v of value head kh + j * key_heads. A wave walks
+    // its rows with a sliding window (each input row loaded once), lane channels p * 32 + lane.
+    for (unsigned job = wave; job < (2U + group) * ConvJobs; job += 8U) {
+        const unsigned block = job / ConvJobs, r0 = ConvRows * (job % ConvJobs);
         const bool is_v = block >= 2U;
         const unsigned h = kh + (block - 2U) * key_heads;
         const std::uint64_t base = (block == 0U ? static_cast<std::uint64_t>(kh)
@@ -187,7 +201,7 @@ __global__ __launch_bounds__(256) void prep_kernel(GdnPrefillRows rows, std::uin
                     : in_qkv<B16>(rows, conv, static_cast<std::uint64_t>(u), ch);
             }
         }
-        for (unsigned rr = 0; rr < 8U; ++rr) {
+        for (unsigned rr = 0; rr < ConvRows; ++rr) {
             const unsigned r = r0 + rr;
             float v[4] = {};
             if (r < m) {
@@ -245,7 +259,13 @@ __global__ __launch_bounds__(256) void prep_kernel(GdnPrefillRows rows, std::uin
         if (lane >= m) g = last;
         Gs[wave][lane] = g;
         Bs[wave][lane] = b;
-        out.ef[(static_cast<std::uint64_t>(h) * n + chunk) * kC + lane] = make_float2(expf(g), expf(last - g));
+        const float eg = expf(g);
+        out.ef[(static_cast<std::uint64_t>(h) * n + chunk) * kC + lane] = make_float2(eg, expf(last - g));
+        if constexpr (FactorDecay) {
+            decay[wave][lane] = eg;
+            // A bounded prefix keeps both factors normal. Reset/tiny/nonfinite chunks use the rev-2 expression.
+            inverse[wave][lane] = last >= -60.0F && last <= 0.0F ? expf(-g) : 0.0F;
+        }
     }
     __syncthreads();
     // KK / QK lower tiles (0,0) (1,0) (1,1): waves 0-2 KK, 3-5 QK.
@@ -264,7 +284,16 @@ __global__ __launch_bounds__(256) void prep_kernel(GdnPrefillRows rows, std::uin
     __syncthreads();
     for (unsigned idx = tid; idx < group * kC * kC; idx += 256U) {
         const unsigned j = idx / (kC * kC), rs = idx % (kC * kC), r = rs / kC, s = rs % kC, h = kh + j * key_heads;
-        const float d = s <= r ? expf(Gs[j][r] - Gs[j][s]) : 0.0F;
+        float d = 0.0F;
+        if (s <= r) {
+            if constexpr (FactorDecay) {
+                // exp(a-b) -> exp(a)*exp(-b): O(C) SFUs instead of O(C^2), with FP32 product rounding.
+                // Check both endpoints too: arbitrary fixture/API gates need not be nonpositive.
+                const bool bounded = Gs[j][kC - 1U] >= -60.0F && Gs[j][kC - 1U] <= 0.0F &&
+                    Gs[j][r] >= -60.0F && Gs[j][r] <= 0.0F && Gs[j][s] >= -60.0F && Gs[j][s] <= 0.0F;
+                d = bounded ? (s == r ? 1.0F : decay[j][r] * inverse[j][s]) : expf(Gs[j][r] - Gs[j][s]);
+            } else d = expf(Gs[j][r] - Gs[j][s]);
+        }
         A[j][r][s] = s < r ? Bs[j][r] * KK[r][s] * d : 0.0F;
         out.tp16[((static_cast<std::uint64_t>(h) * n + chunk) * 2U + 1U) * kC * kC + rs] =
             static_cast<_Float16>(s <= r ? QK[r][s] * d : 0.0F);
@@ -306,7 +335,7 @@ struct RawCore {
 
 // scan: one CTA (8 waves) per value head; wave w owns value columns 16 w .. 16 w + 15 and holds S^T for them
 // (8 tiles, 64 FP32 per lane). Each chunk's operands are staged once in LDS from registers loaded during the previous
-// chunk; v is conv'd here from the raw rows; z (row epilogues) is loaded one chunk ahead.
+// chunk; v is already conv'd in prep; z (row epilogues) is loaded late in the chunk.
 template <GdnRecurrentStorage Storage, bool B16, class Epilogue = RawCore>
 __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void scan_kernel(GdnPrefillRows rows, std::uint32_t count, float* state,
     std::uint32_t key_heads, Conv conv, Scratch in, Epilogue epilogue = {}) {
@@ -512,10 +541,14 @@ __global__ __launch_bounds__(128) void conv_history_kernel(GdnPrefillRows rows, 
 inline void enqueue_gdn_fp16_chunk_prep(const gdn_fp16_chunk::Scratch& scratch, GdnPrefillRows rows, std::uint32_t count,
     gdn_fp16_chunk::Conv conv, std::uint32_t key_heads, std::uint32_t value_heads, float epsilon, hipStream_t stream) {
     const std::uint32_t n = (count + gdn_fp16_chunk::kC - 1U) / gdn_fp16_chunk::kC;
-    if (conv.x16) hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_fp16_chunk::prep_kernel<true>), dim3(key_heads, n), dim3(256), 0, stream, rows,
-        count, conv, key_heads, value_heads, epsilon, scratch);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_fp16_chunk::prep_kernel<false>), dim3(key_heads, n), dim3(256), 0, stream, rows, count,
-        conv, key_heads, value_heads, epsilon, scratch);
+    const auto launch = [&]<bool B16>() {
+        if (gdn_fp16_chunk::revision() == 3U)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_fp16_chunk::prep_kernel<B16, 16U, true>), dim3(key_heads, n), dim3(256), 0,
+                stream, rows, count, conv, key_heads, value_heads, epsilon, scratch);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_fp16_chunk::prep_kernel<B16>), dim3(key_heads, n), dim3(256), 0,
+            stream, rows, count, conv, key_heads, value_heads, epsilon, scratch);
+    };
+    if (conv.x16) launch.template operator()<true>(); else launch.template operator()<false>();
 }
 template <GdnRecurrentStorage Storage, class Epilogue = gdn_fp16_chunk::RawCore>
 void enqueue_gdn_fp16_chunk_scan(const gdn_fp16_chunk::Scratch& scratch, GdnPrefillRows rows, std::uint32_t count, float* state,

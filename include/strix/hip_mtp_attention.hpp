@@ -12,6 +12,17 @@ void preflight_hip_mtp_attention(const MtpNativeContext&);
 void preflight_hip_mtp_cache_rows(const MtpNativeContext&);
 // fast_cache is proposal-only; prompt priming keeps the incumbent Q8 producer.
 void launch_hip_mtp_cache_rows(const MtpNativeContext&,void* stream,bool fast_cache=false);
+// Tiled prompt priming batch: launch_hip_mtp_cache_rows (fast_cache off) for first.position .. +count-1 (count 1..8) of
+// one owner, row t reading its hidden (BF16 [hidden]) from input[t] and writing its index key (F32 [128]), K and V
+// (F32 [512] each) scratch; the KV/raw-index rows and the status word are the owner's. Row t's cache bytes equal the
+// one-row launch at that position, bit for bit; the owner's attention workspace is not written.
+struct HipMtpCacheRowsBatch {
+    const std::uint16_t* input[8]{};
+    float* index_key[8]{};
+    float* key[8]{};
+    float* value[8]{};
+};
+void launch_hip_mtp_cache_rows_batch(const MtpNativeContext& first,const HipMtpCacheRowsBatch& rows,std::uint32_t count,void* stream);
 void launch_hip_mtp_indexer(const MtpNativeContext&,void* stream);
 void launch_hip_mtp_sparse_attention(const MtpNativeContext&,void* stream);
 // Draft-only: same stages with the Q/K/V and output Q8 projections on the

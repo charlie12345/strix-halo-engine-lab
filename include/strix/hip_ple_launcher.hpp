@@ -111,6 +111,14 @@ private:
 };
 
 namespace testing {
+void invalidate_ple_projection_weights();
+// Projection transaction fixture: mode 0 = original, 1 = request panel reuse,
+// -1 = actual cached environment switch. Returns whether complete groups reused
+// the panel. Original batch/lane admissions and narrow row remainders still apply.
+bool enqueue_ple_projection_pair(int mode, const std::uint16_t* input, const void* key_weights,
+    const void* value_weights, std::uint32_t width, std::uint32_t key_outputs, std::uint32_t value_outputs,
+    std::uint32_t rows, std::uint32_t input_stride, float* keys, std::uint32_t key_stride,
+    float* values, std::uint32_t value_stride, void* stream);
 // Raw PLE Q8 projection (generic block-per-row or the wave8 kernel with the same
 // 256-leaf summation tree); width % 32 == 0 for wave8. Bit-exactness fixture only.
 void enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,const void* q8,std::uint32_t input_width,

@@ -28,6 +28,55 @@ bool qpf2k_hc_check() {
     return on;
 }
 
+// Pending the native equality and interleaved transaction timing gate. Once that gate
+// establishes no slowdown, the resolver may enable the default; zero always restores
+// the image. This exact organization does not participate in the numerical identity.
+bool qpf2k_hc_recompute_norm() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRIX_QPF2K_HC_RECOMPUTE_NORM");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+void qpf2k_hc_recompute_witness() {
+    static std::once_flag once;
+    std::call_once(once, [] { std::fprintf(stderr, "HC normalized recompute: ON (byte-identical)\n"); });
+}
+
+// Each (row, stream) inverse is fetched once per CTA, including clamped tail rows.
+// Output3 needs 512 bytes. The matrix kernels use their existing K32/Pitch40
+// staging padding: four FP32 inverses fit exactly in each row's eight spare halves.
+template <unsigned R, unsigned Threads>
+__device__ __forceinline__ void qpf2k_hc_load_inverse(const HyperWideRows& rows, float* inverse, unsigned row0) {
+    for (unsigned i = threadIdx.x; i < R * 4U; i += Threads)
+        inverse[i] = rows.recompute_inverse[4ULL * min(row0 + i / 4U, rows.count - 1U) + i % 4U];
+    __syncthreads();
+}
+
+template <unsigned R, unsigned Threads>
+__device__ __forceinline__ void qpf2k_hc_load_padded_inverse(const HyperWideRows& rows,
+    _Float16* staging, unsigned pitch, unsigned row0) {
+    for (unsigned i = threadIdx.x; i < R * 4U; i += Threads)
+        *reinterpret_cast<float*>(staging + (i / 4U) * pitch + 32U + 2U * (i % 4U)) =
+            rows.recompute_inverse[4ULL * min(row0 + i / 4U, rows.count - 1U) + i % 4U];
+    __syncthreads();
+}
+
+__device__ __forceinline__ float qpf2k_hc_padded_inverse(const _Float16* staging, unsigned pitch, unsigned row, unsigned s) {
+    return *reinterpret_cast<const float*>(staging + row * pitch + 32U + 2U * s);
+}
+
+template <bool Recompute>
+__device__ __forceinline__ float qpf2k_hc_normalized(const HyperWideRows& rows, unsigned row, std::uint64_t index,
+    float inverse, float weight) {
+    if constexpr (Recompute) {
+        const auto* input = wide_row(rows.recompute_input, rows.recompute_stride, row);
+        const float value = __uint_as_float(static_cast<unsigned>(input[index]) << 16U);
+        return qpf2k_mul(qpf2k_mul(inverse, value), weight);
+    } else return wide_row(rows.normalized, rows.normalized_stride, row)[index];
+}
+
 // Check mode: `rows` rows of `bytes` bytes, one `stride` apart, copied to the host after the stream drains.
 std::vector<unsigned char> qpf2k_snapshot_rows(const void* base, std::uint64_t stride, std::uint64_t bytes, std::uint32_t rows,
     hipStream_t stream) {
@@ -317,7 +366,7 @@ const void* qpf2k_hc_up_copy(const void* up, std::uint64_t bytes, std::uint32_t 
     return copy;
 }
 // Shared literal body preserves the default kernel signature and launch; only the banded instances remap CTAs.
-template <typename Storage, unsigned U = 16U, unsigned A = 1U, unsigned P = 8U, unsigned Q = 0U>
+template <typename Storage, unsigned U = 16U, unsigned A = 1U, unsigned P = 8U, unsigned Q = 0U, bool Recompute = false>
 __global__ __launch_bounds__(128) void qpf2k_hc_output3_kernel(HyperWideRows rows, const void* __restrict__ up, std::uint32_t hidden) {
     constexpr unsigned R = 32U, S = kWideStreams, kBlocks = 10U, kRowBytes = kBlocks * 34U, Steps = 2U;
     static_assert(U == 16U || U == 32U);
@@ -333,7 +382,7 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output3_kernel(HyperWideRows row
 
 // LowBand (STRIX_QPF2K_HC_LOWBAND bit 0): the CTA's low values start at its row group's offset in the banded table (rank
 // pitch rows.low_t_pitch = 512); the body's loads are otherwise unchanged.
-template <typename Storage, unsigned Band, bool LowBand = false>
+template <typename Storage, unsigned Band, bool LowBand = false, bool Recompute = false>
 __global__ __launch_bounds__(128) void qpf2k_hc_output3_band_kernel(HyperWideRows rows, const void* __restrict__ up, std::uint32_t hidden) {
     constexpr unsigned U = 16U, A = 1U, P = 8U, Q = 0U;
     constexpr unsigned R = 32U, S = kWideStreams, kBlocks = 10U, kRowBytes = kBlocks * 34U, Steps = 2U;
@@ -362,16 +411,23 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output3_band_kernel(HyperWideRow
 // registers; its 80 VGPRs made the compiler serialize the LDS fragment loads (ds_load pair, lgkmcnt(0), 2 WMMA)
 // (t2c: 3.67 ms vs 2.94 ms).
 // LowMode (STRIX_QPF2K_HC_LOWBAND): bit 0 low_t in 512-row bands, bit 1 no low16 stores; the stored values are unchanged.
-template <unsigned Depth, unsigned LowMode = 0U>
+template <unsigned Depth, unsigned LowMode = 0U, bool Recompute = false>
 __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows rows, const _Float16* __restrict__ pack,
     const float* __restrict__ inject, unsigned streams, _Float16* __restrict__ low16) {
+    static_assert(kHcwPitch == 40U, "recompute inverses occupy the eight K32 padding halves");
     __shared__ __align__(16) _Float16 bs[2][kHcwProjCols * kHcwPitch];
     __shared__ __align__(16) _Float16 as[8][32U * kHcwPitch];
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, cb = blockIdx.x, sub = lane % 8U, rq = lane / 8U;
     const unsigned row0 = blockIdx.y * kHcwProjRows + wave * 32U;
+    if constexpr (Recompute) qpf2k_hc_load_padded_inverse<kHcwProjRows, 256U>(rows, &as[0][0], kHcwPitch, blockIdx.y * kHcwProjRows);
     const float* xq[8];
+    const std::uint16_t* raw[8];
 #pragma unroll
-    for (unsigned q = 0; q < 8U; ++q) xq[q] = wide_row(rows.normalized, rows.normalized_stride, min(row0 + 4U * q + rq, rows.count - 1U)) + 4U * sub;
+    for (unsigned q = 0; q < 8U; ++q) {
+        const unsigned r = min(row0 + 4U * q + rq, rows.count - 1U);
+        if constexpr (Recompute) raw[q] = wide_row(rows.recompute_input, rows.recompute_stride, r) + 4U * sub;
+        else xq[q] = wide_row(rows.normalized, rows.normalized_stride, r) + 4U * sub;
+    }
     unsigned valid = 0U;
 #pragma unroll
     for (unsigned q = 0; q < 8U; ++q) valid |= (row0 + 4U * q + rq < rows.count ? 1U : 0U) << q;
@@ -379,10 +435,13 @@ __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows 
     const float* w = injecting ? inject + static_cast<std::uint64_t>(cb) * kHcwWidth + 4U * sub : inject;
     const auto* bsrc = reinterpret_cast<const uint4*>(pack + static_cast<std::uint64_t>(cb) * kHcwStages * kHcwProjCols * 32U) + threadIdx.x;
     const unsigned bdst = (threadIdx.x / 4U) * kHcwPitch + (threadIdx.x % 4U) * 8U;
-    struct Stage { float4 xa[8]; uint4 bw; float4 c; };
+    struct ImageStage { float4 xa[8]; uint4 bw; float4 c; };
+    struct RecomputeStage { uint2 xa[8]; uint4 bw; float4 c, nw; };
+    using Stage = std::conditional_t<Recompute, RecomputeStage, ImageStage>;
     // Global (not flat) loads: flat loads also count in LGKM, so every LDS fragment wait would drain them.
     typedef float qf4 __attribute__((ext_vector_type(4)));
     typedef unsigned qu4 __attribute__((ext_vector_type(4)));
+    typedef unsigned qu2 __attribute__((ext_vector_type(2)));
     const auto gf4 = [](const void* p) {
         const qf4 v = *reinterpret_cast<const __attribute__((address_space(1))) qf4*>(reinterpret_cast<std::uintptr_t>(p));
         return make_float4(v.x, v.y, v.z, v.w);
@@ -393,8 +452,16 @@ __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows 
         d.bw = make_uint4(b.x, b.y, b.z, b.w);
         // Unconditional loads (a row past the end reads the last row; its WMMA rows and injection are never stored), so
         // the waits before the stores can count the newer stage's loads still in flight.
+        if constexpr (Recompute) d.nw = gf4(rows.recompute_norm + stage * 32U + 4U * sub);
 #pragma unroll
-        for (unsigned q = 0; q < 8U; ++q) d.xa[q] = gf4(xq[q] + stage * 32U);
+        for (unsigned q = 0; q < 8U; ++q) {
+            if constexpr (Recompute) {
+                // Load an ext vector, not the HIP uint2 struct: its operator= does not bind a global-address-space lvalue.
+                const qu2 v = *reinterpret_cast<const __attribute__((address_space(1))) qu2*>(
+                    reinterpret_cast<std::uintptr_t>(raw[q] + stage * 32U));
+                d.xa[q] = make_uint2(v.x, v.y);
+            } else d.xa[q] = gf4(xq[q] + stage * 32U);
+        }
         if (injecting) d.c = gf4(w + stage * 32U);
     };
     hcw_v8f acc[2][4];
@@ -411,11 +478,30 @@ __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows 
     if constexpr (Depth == 2U) load(sb, 1U);
     const auto body = [&](Stage& cur, unsigned stage) {
         const unsigned buffer = stage & 1U;
+        // Normalize only the stage being consumed. The next stage retains raw
+        // BF16/weight loads in registers, so its vmcnt wait is not pulled ahead
+        // of the current stage's WMMA work by the pinned multiply instructions.
+        float4 xa[8];
+#pragma unroll
+        for (unsigned q = 0; q < 8U; ++q) {
+            if constexpr (Recompute) {
+                const float weights[4] = {cur.nw.x, cur.nw.y, cur.nw.z, cur.nw.w};
+                const unsigned words[2] = {cur.xa[q].x, cur.xa[q].y};
+                const float inv = qpf2k_hc_padded_inverse(&as[0][0], kHcwPitch, wave * 32U + 4U * q + rq, stage / (2560U / 32U));
+                float n[4];
+#pragma unroll
+                for (unsigned j = 0; j < 4U; ++j) {
+                    const unsigned b = j % 2U ? words[j / 2U] & 0xffff0000U : words[j / 2U] << 16U;
+                    n[j] = qpf2k_mul(qpf2k_mul(inv, __uint_as_float(b)), weights[j]);
+                }
+                xa[q] = make_float4(n[0], n[1], n[2], n[3]);
+            } else xa[q] = cur.xa[q];
+        }
         *reinterpret_cast<uint4*>(&bs[buffer][bdst]) = cur.bw;
 #pragma unroll
         for (unsigned q = 0; q < 8U; ++q) {
-            _Float16 h[4] = {static_cast<_Float16>(cur.xa[q].x), static_cast<_Float16>(cur.xa[q].y), static_cast<_Float16>(cur.xa[q].z),
-                static_cast<_Float16>(cur.xa[q].w)};
+            _Float16 h[4] = {static_cast<_Float16>(xa[q].x), static_cast<_Float16>(xa[q].y), static_cast<_Float16>(xa[q].z),
+                static_cast<_Float16>(xa[q].w)};
             uint2 word;
             __builtin_memcpy(&word, h, 8U);
             *reinterpret_cast<uint2*>(as[wave] + (4U * q + rq) * kHcwPitch + 4U * sub) = word;
@@ -423,10 +509,10 @@ __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows 
         if (injecting) {
 #pragma unroll
             for (unsigned q = 0; q < 8U; ++q) {
-                injection[q] = fmaf(cur.xa[q].x, cur.c.x, injection[q]);
-                injection[q] = fmaf(cur.xa[q].y, cur.c.y, injection[q]);
-                injection[q] = fmaf(cur.xa[q].z, cur.c.z, injection[q]);
-                injection[q] = fmaf(cur.xa[q].w, cur.c.w, injection[q]);
+                injection[q] = fmaf(xa[q].x, cur.c.x, injection[q]);
+                injection[q] = fmaf(xa[q].y, cur.c.y, injection[q]);
+                injection[q] = fmaf(xa[q].z, cur.c.z, injection[q]);
+                injection[q] = fmaf(xa[q].w, cur.c.w, injection[q]);
             }
         }
         // LDS-scoped barrier (release / acquire on the local address space only): __syncthreads()'s full workgroup fence
@@ -499,6 +585,7 @@ struct Qpf2kInjectNormRows {
     std::uint16_t* combined; std::uint64_t combined_stride;     // combine only
     std::uint16_t* streams; std::uint64_t streams_stride;       // inject output = HC input
     float* normalized; std::uint64_t normalized_stride;
+    float* recompute_inverse = nullptr; // [row][4], written by the existing norm reduction
     const float* norm;  // FP32 norm weights [4][2560] (ggml type 0; other types decline the fold)
     std::uint32_t count, hidden_size;
     float epsilon;
@@ -518,7 +605,7 @@ __device__ __forceinline__ std::uint32_t qpf2k_round_bf16(float value) {
 template <unsigned D> __device__ __forceinline__ float qpf2k_from_lane(float value) {
     return __shfl_down(value, D, 32);
 }
-template <bool Combine>
+template <bool Combine, bool Recompute = false>
 __global__ __launch_bounds__(128) void qpf2k_inject_norm_kernel(Qpf2kInjectNormRows a) {
     constexpr unsigned H = kInjectNormHidden, C = H / 256U;
     const unsigned row = blockIdx.x, s = threadIdx.x / 32U, t = threadIdx.x % 32U;
@@ -592,6 +679,10 @@ __global__ __launch_bounds__(128) void qpf2k_inject_norm_kernel(Qpf2kInjectNormR
     for (unsigned j = 0; j < 2U; ++j) sum[j] = qpf2k_add(sum[j + 2U], sum[j]);
     const float total = __shfl(qpf2k_add(sum[1], sum[0]), 0, 32);
     const float inverse = rsqrtf(total / static_cast<float>(a.hidden_size) + a.epsilon);
+    if constexpr (Recompute) {
+        if (t == 0U) a.recompute_inverse[4ULL * row + s] = inverse;
+        return;
+    }
     const float* weight = a.norm + s * H + 8U * t;
 #pragma unroll
     for (unsigned c = 0; c < C; ++c) {
@@ -604,4 +695,12 @@ __global__ __launch_bounds__(128) void qpf2k_inject_norm_kernel(Qpf2kInjectNormR
         *reinterpret_cast<float4*>(normalized + 256U * c) = make_float4(n[0], n[1], n[2], n[3]);
         *reinterpret_cast<float4*>(normalized + 256U * c + 4U) = make_float4(n[4], n[5], n[6], n[7]);
     }
+}
+
+void qpf2k_launch_inject_norm(const Qpf2kInjectNormRows& a, bool combine, hipStream_t stream) {
+    const auto launch = [&]<bool Recompute>() {
+        if (combine) hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_inject_norm_kernel<true, Recompute>), dim3(a.count), dim3(128U), 0, stream, a);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_inject_norm_kernel<false, Recompute>), dim3(a.count), dim3(128U), 0, stream, a);
+    };
+    if (a.recompute_inverse) launch.template operator()<true>(); else launch.template operator()<false>();
 }

@@ -752,6 +752,16 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serving-cohort-tests)
     add_test(NAME strix-serving-cohort-tests COMMAND strix-serving-cohort-tests)
 
+    add_executable(strix-cohort-step-plan-tests tests/cohort_step_plan_tests.cpp)
+    target_link_libraries(strix-cohort-step-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-cohort-step-plan-tests)
+    add_test(NAME strix-cohort-step-plan-tests COMMAND strix-cohort-step-plan-tests)
+
+    add_executable(strix-cohort-small-plan-tests tests/cohort_small_plan_tests.cpp)
+    target_link_libraries(strix-cohort-small-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-cohort-small-plan-tests)
+    add_test(NAME strix-cohort-small-plan-tests COMMAND strix-cohort-small-plan-tests)
+
     add_executable(strix-http-session-store-tests tests/http_session_store_tests.cpp)
     target_link_libraries(strix-http-session-store-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-http-session-store-tests)

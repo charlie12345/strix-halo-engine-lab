@@ -37,7 +37,7 @@ Véase [prefill HTTP](../../engine/serving/serving.md#default-prompt-prefill). V
 2/4/8, vocabulario de draft): el comando completo está en **[docs/getting-started/engine-reference.md → Línea de comandos](../../getting-started/engine-reference.md#command-line)**
 y en [docs/engine/speculative/mtp-native-cli.md](../../engine/speculative/mtp-native-cli.md). El servidor HTTP, los slots por batch (`--http-batch`) y la
 caché de prefijos están en [docs/engine/serving/serving.md](../../engine/serving/serving.md); varias peticiones en un proceso, en
-[docs/engine/scheduling/multi-request-cohort.md](../../engine/scheduling/multi-request-cohort.md); el muestreo, en
+[docs/engine/scheduling/multi-request-cohort.md](../../engine/scheduling/multi-request-cohort.md) (política automática por ciclo, activada por defecto: 8 peticiones, 69.3 tok/s agregados; 62.9 tok/s antes); el muestreo, en
 [docs/engine/decode/sampled-decoding.md](../../engine/decode/sampled-decoding.md).
 
 La [caché de estado de prefijos](../../engine/serving/prefix-state-cache.md) de Qwen restaura el estado completo de atención/GDN

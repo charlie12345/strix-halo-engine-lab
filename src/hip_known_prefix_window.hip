@@ -1,3 +1,4 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/batch_nested_prefill.hpp"
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
@@ -1542,6 +1543,7 @@ struct HipKnownPrefixWindow::Impl {
     static bool cohort_wide_enabled(const char* family) {
         static const std::string list = [] { const char* v = std::getenv("STRIX_COHORT_WIDE"); return std::string(v ? v : ""); }();
         if (known_window_cohort_feature_off(family)) return false;
+        if (cohort_step_rows()==16U) return true;
         if (list == "all") return true;
         std::size_t at = 0;
         while (at <= list.size()) {
@@ -1566,11 +1568,11 @@ struct HipKnownPrefixWindow::Impl {
         static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
         switch (mode) {
         case KnownWindowStepMode::moe_route_rows:
-            if(!joint) return false;
+            if(!joint && cohort_step_rows()!=16U) return false;
             for(const auto& m:members) if(!m.impl->route_config.wave_topk || m.impl->route_config.hidden_size%64U) return false;
             return cohort_wide_enabled("router");
         case KnownWindowStepMode::hyper_mix_rows:
-            if(!joint) return false;
+            if(!joint && cohort_step_rows()!=16U) return false;
             for(const auto& m:members) {
                 const auto& config=m.impl->hyper_for(m.run->step_rows(i));
                 if(!config.splitk_projection || !config.lane_chain_output) return false;
@@ -1578,7 +1580,7 @@ struct HipKnownPrefixWindow::Impl {
             return cohort_wide_enabled("hyper");
         case KnownWindowStepMode::r2_shared_q8:
         case KnownWindowStepMode::shared_rows:
-            if(!joint) return false;
+            if(!joint && cohort_step_rows()!=16U) return false;
             if(!cohort_shared_expert_enabled() || !cohort_wide_enabled("shared")) return false;
             for(const auto& m:members) if(!m.impl->shared_for(m.run->step_rows(i)).dense_a8_projections) return false;
             return true;
@@ -1821,7 +1823,8 @@ struct HipKnownPrefixWindow::Impl {
             for (const auto& m : members) if (m.impl == primary)
                 throw std::invalid_argument("known-window cohort primary is a member of another chunk");
             const auto& model = *members[0].impl;
-            if (primary->failed || primary->prefill || primary->executing || total != primary->window.logical_rows ||
+            if (primary->failed || primary->prefill || primary->executing || (total != primary->window.logical_rows &&
+                 !(cohort_step_rows()==16U && total==16U && primary->window.logical_rows==8U)) ||
                 primary->scope.stream != stream || primary->serial.execution_identity != model.serial.execution_identity ||
                 primary->window.mode.size() != model.window.mode.size() ||
                 primary->resources.model_manifest != model.resources.model_manifest ||
@@ -1842,7 +1845,7 @@ struct HipKnownPrefixWindow::Impl {
         try {
             for (auto& chunk : chunks) if (chunk.primary) chunk.primary->validate_metadata();
             // A lone member runs its routed union itself, unless the cohort's union runs wide for all rows.
-            const bool wide_union = chunks.size() > 1U && cohort_wide_union(members);
+            const bool wide_union = (chunks.size() > 1U || cohort_step_rows()==16U) && cohort_wide_union(members);
             for (auto& chunk : chunks) for (auto& m : chunk.members) {
                 auto& self = *m.impl;
                 self.cohort_member = chunk.primary != nullptr || wide_union;
@@ -1905,7 +1908,7 @@ struct HipKnownPrefixWindow::Impl {
             for (const auto& chunk : chunks) all_chunked = all_chunked && chunk.primary != nullptr;
             std::map<int, std::uint32_t> own_modes;
             for (std::size_t i = 0; i < steps; ++i) {
-                if (chunks.size() > 1U && cohort_wide_step(i, members, all_chunked)) {
+                if ((chunks.size() > 1U || cohort_step_rows()==16U) && cohort_wide_step(i, members, all_chunked)) {
                     ++wide_count;
                     // Every chunk primary first joins its detached shared expert of an earlier layer, as before
                     // a step of its own.
@@ -1927,7 +1930,11 @@ struct HipKnownPrefixWindow::Impl {
                 for (std::size_t c = 0; c < chunks.size(); ++c) {
                     auto& chunk = chunks[c];
                     auto* primary = chunk.primary;
-                    if (primary && primary->cohort_step_shared(i, chunk.members)) {
+                    // An R8 primary leases metadata/stream only for R16. Wide launchers bind
+                    // member rows; never bind 16 rows into the primary's R8 arena.
+                    std::uint32_t chunk_rows = 0;
+                    for (const auto& member : chunk.members) chunk_rows += member.run->rows();
+                    if (primary && chunk_rows==primary->logical_rows() && primary->cohort_step_shared(i, chunk.members)) {
                         {
                             const HipLaunchScope active(primary->scope);
                             primary_launched[c] = 1;

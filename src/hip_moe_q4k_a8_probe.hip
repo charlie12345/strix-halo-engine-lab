@@ -85,13 +85,13 @@ __global__ void quantize(const void* input, unsigned hidden, signed char* codes,
 // offsets[e]+#{a'<a with expert e}, i.e. rows then slots ascending per expert.
 // Only defined entries are written. Experts <= 512 <= blockDim. The union holds
 // the first `active` rows; batches keep the physical `rows` cap of the kernels (at most 8:
-// cohort unions of 16 / 32 rows run their down in 8-assignment batches). Histogram
+// opt-in 16-row cohorts use 16-assignment batches). Histogram
 // buckets saturate at 8.
-__device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsigned active, unsigned experts, unsigned top_k) {
+__device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsigned active, unsigned experts, unsigned top_k, unsigned batch_cap) {
     const auto& csr=v.csr;
     const unsigned t=threadIdx.x,count=active*top_k;
     __shared__ unsigned expert_of[known_rows::max_assignments],first[known_rows::max_assignments],start[512],scan[3][512],hist[16],failure,duplicates,maximum;
-    const unsigned cap=min(rows,8U);
+    const unsigned cap=min(rows,batch_cap);
     if(t==0){failure=0U;duplicates=0U;maximum=0U;}
     if(t<16U)hist[t]=0U;
     __syncthreads();
@@ -121,7 +121,7 @@ __device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsi
         if(t==experts-1U)csr.offsets[experts]=off+n;
         if(n) {
             csr.touched[touched]=t;atomicAdd(&hist[min(unique,8U)-1U],1U);atomicAdd(&duplicates,n-unique);atomicMax(&maximum,n);
-            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[8U+min(cap,n-b*cap)-1U],1U);}
+            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[8U+min(8U,min(cap,n-b*cap))-1U],1U);}
         }
     }
     __syncthreads();
@@ -139,9 +139,9 @@ __device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsi
 // once by thread 0. CTA `rows` builds the CSR of the first `active` rows concurrently.
 template<bool Bf16>
 __global__ void window_prologue(known_rows::PrologueRows v, unsigned rows, unsigned hidden, unsigned top_k, unsigned experts,
-    unsigned clear_words, unsigned active) {
+    unsigned clear_words, unsigned active, unsigned batch_cap) {
     const unsigned row=blockIdx.x;
-    if(row==rows){build_csr(v,rows,active,experts,top_k);return;}
+    if(row==rows){build_csr(v,rows,active,experts,top_k,batch_cap);return;}
     __shared__ unsigned route_bits;
     if(threadIdx.x==0) route_bits=0;
     for(unsigned i=threadIdx.x;i<clear_words;i+=blockDim.x) v.clear[row][i]=0.0F;
@@ -543,13 +543,13 @@ void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t 
 }
 namespace known_rows {
 void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned count,unsigned clear_words,hipStream_t stream,
-    unsigned active) {
+    unsigned active, unsigned batch_cap) {
     if(!active) active=count;
     if(count==0U||count>known_rows::max_union_rows||count*request.shape.top_k>known_rows::max_assignments||request.shape.experts>512U||active>count)
         throw std::invalid_argument("A8 window prologue geometry is invalid");
     check(hipPeekAtLastError(),"A8 window prologue stale error");
-    if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active);
-    else window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active);
+    if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active,batch_cap);
+    else window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active,batch_cap);
     check(hipGetLastError(),"A8 window prologue enqueue");
 }
 void enqueue_prefill_prologue(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,hipStream_t stream) {

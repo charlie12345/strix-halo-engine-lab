@@ -106,6 +106,10 @@ memoria de GPU por nodo.
 `STRIX_GLM_MAX_ROWS_AUTO=0` restaura el valor fijo 4096; `--baseline` mantiene 1024, y un `--max-rows` explícito mantiene su valor.
 `--print-effective-config` informa del candidato independiente del host y de la política de arranque; stderr informa
 del margen de admisión y del valor final con su origen. Véase el [catálogo](../../optimizations.md#glm-max-rows-auto).
+La admisión de arranque incluye la ruta de prefill y su espacio de trabajo para las filas y el nivel seleccionados, de modo que
+un rank que no los admite se rechaza antes de cargar los pesos. La admisión posterior a la carga usa el mismo
+presupuesto. Las claves de puntuación del indexador se dimensionan por fragmento, no por la capacidad de contexto. stderr informa
+en GiB de los términos de ruta, espacio de trabajo, instalación/staging, seguridad tardía y reserva de arranque.
 
 | Modo | Prompt / contexto | Medido | Build / exactitud |
 |---|---|---:|---|

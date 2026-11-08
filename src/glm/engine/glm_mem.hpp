@@ -141,6 +141,9 @@ struct LoadAdmission {
     std::uint64_t device_free = 0;
     bool recheck = false;
     AllocModel model;
+    // Retained load allocations only: HIP's requested-byte ledger and the
+    // calibrated backing cost for MemAvailable. Temporary load staging is freed.
+    std::uint64_t post_load_device_bytes = 0, post_load_host_bytes = 0;
 };
 
 // From a calibration: `measured` bytes per allocation of `size` (delta of gtt_used over K touched allocations / K).

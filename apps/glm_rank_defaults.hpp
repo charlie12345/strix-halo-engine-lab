@@ -195,10 +195,10 @@ inline bool baseline_requested(const Request& r, const EnvGet& env) {
 }
 
 // Exact chunked prefill is also available with MTP fill for normal self-speculation. Gate and legacy MTP-only modes
-// keep reference prefill; r1b-all, G3/smoke/mem-plan and --idcheck retain their existing exclusions.
-inline std::string resolve_prefill_auto(bool mtp, bool spec, bool g3_only, bool smoke_head, bool mem_plan, bool r1b_all,
+// keep reference prefill; r1b-all, G3/smoke and --idcheck retain their existing exclusions.
+inline std::string resolve_prefill_auto(bool mtp, bool spec, bool g3_only, bool smoke_head, bool /*mem_plan*/, bool r1b_all,
                                         unsigned idcheck, bool reference_gate, bool mtp_spec = false) {
-    return (mtp_spec || (!mtp && !spec)) && !g3_only && !smoke_head && !mem_plan && !r1b_all && idcheck == 0 && !reference_gate ? "gemv" : "ref";
+    return (mtp_spec || (!mtp && !spec)) && !g3_only && !smoke_head && !r1b_all && idcheck == 0 && !reference_gate ? "gemv" : "ref";
 }
 
 struct Value {

@@ -16,6 +16,7 @@
 #include <strix/glm/engine.hpp>
 
 #include <memory>
+#include "glm/prefill/glm_pf_workspace.hpp"
 
 namespace strix::glm::pf {
 
@@ -31,25 +32,28 @@ enum class TierB { wmma, gemv };
 //         with STRIX_GLM_PF_EXACT_MOE=1, TP2 adds exact_moe::workspace_bytes(max_rows)
 //         (GU FP32 + down-input FP16 + output FP32 + 2 H-wide FP16 input transforms
 //         for 9 pairs per token, plus tables; 792849408 / 1585660416 bytes at R=2048 / 4096);
-//   workspace: the largest strix_gemm_pinned (s = 1) workspace of the path's linears; Engine::set_prefill reserves the
+//   workspace: WMMA only, the largest strix_gemm_pinned workspace of the path's linears; zero for GEMV. Engine reserves the
 //         larger of it and every GEMV call's workspace (gemv-mode Tier B, head);
+//         DSA keys use 4 * max_rows * (4096 + 512) bytes, independent of capacity.
+//         Attention probabilities use max_rows * rank_heads * 2304 floats (selected tokens only).
 //   engine_rows: the engine's row buffers sized max(8, Options::max_rows) (allocated/admitted by the load plan).
 //         Includes two H-wide final hidden buffers and, when mtp, nine H-wide MTP scratch equivalents.
 //         pf_mem_budget mirrors must include (2 + (mtp ? 9 : 0)) * RC * H * 4 bytes: 352 MiB at RC=2048 with MTP.
 //         Decode-only logits/argmax and other fixed-size scratch are outside this row-scaled subtotal.
-inline constexpr unsigned kPrefillAllocationBound = 64;
 struct PrefillBudget {
     std::uint64_t path = 0, workspace = 0, engine_rows = 0;
 };
 std::uint64_t admission_margin_bytes();
-PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp = true);
+PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp = true,
+                            TierB tierb = TierB::gemv);
 
 // heads: rank KDA / MLA heads; capacity: DSA positions per slot; max_rows: largest chunk.
 // Fails closed (std::runtime_error, nothing allocated) unless path + workspace + a margin fit both the free device
 // memory (hipMemGetInfo) and the host's MemAvailable (/proc/meminfo; unified memory on gfx1151). Margin:
-// STRIX_GLM_PF_MARGIN_GIB (default 8).
+// STRIX_GLM_PF_MARGIN_GIB (default 1 GiB; see kPrefillSafetyBytes), unless the
+// caller supplies its startup policy margin (rank CLI keeps the OS reserve).
 std::shared_ptr<engine::PrefillPath> make_prefill_path(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity,
-                                                       unsigned max_rows, TierB tierb);
+                                                       unsigned max_rows, TierB tierb, std::uint64_t margin = admission_margin_bytes());
 // TierB from STRIX_GLM_PF_TIERB (gemv | wmma; default gemv, exact).
 TierB tierb_from_env();
 // gemv identity: rows per strix_gemv / MoE-seam call over a chunk, STRIX_GLM_PF_GEMV_BLOCK in 1..8 (default 8). A row's

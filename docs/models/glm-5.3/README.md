@@ -101,6 +101,10 @@ GPU memory per node.
 `STRIX_GLM_MAX_ROWS_AUTO=0` restores fixed 4096; `--baseline` keeps 1024, and explicit `--max-rows` keeps its value.
 `--print-effective-config` reports the host-independent candidate and startup policy; stderr reports
 admission headroom and the final value with its source. See the [catalog](../../optimizations.md#glm-max-rows-auto).
+Startup admission includes the prefill path and its workspace for the selected rows and tier, so a rank
+that cannot fit them refuses before loading weights. Post-load admission uses the same
+budget. Indexer score keys are sized per chunk, not per context capacity. Stderr reports the path,
+workspace, install/staging, late safety and startup reserve terms in GiB.
 
 | Mode | Prompt / context | Measured | Build / exactness |
 |---|---|---:|---|

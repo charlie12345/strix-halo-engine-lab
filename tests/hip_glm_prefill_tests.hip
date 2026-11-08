@@ -431,7 +431,8 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
     std::uint32_t *ptok = poison<std::uint32_t>(static_cast<std::size_t>(NQ) * P::kMaxTokens), *pn = poison<std::uint32_t>(NQ);
     std::uint32_t *ptok2 = poison<std::uint32_t>(static_cast<std::size_t>(NQ) * P::kMaxTokens), *pn2 = poison<std::uint32_t>(NQ);
     float* pwh_in = poison<float>(static_cast<std::size_t>(CMAX) * kIdxHeads);
-    bool sel2_ok = true;
+    auto* bounded_keys = poison<std::uint32_t>(static_cast<std::size_t>(CMAX) * P::kIndexerKeyStride);
+    bool sel2_ok = true, bounded_ok = true;
     float *pqt = poison<float>(static_cast<std::size_t>(CMAX) * 64 * kKvLora), *pe = poison<float>(static_cast<std::size_t>(CMAX) * 64 * P::kEStride);
     float* pob = poison<float>(static_cast<std::size_t>(CMAX) * 64 * kKvLora);
     float* pO[3];
@@ -475,6 +476,18 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
                 for (unsigned r = 0; r < Cq && sel2_ok; ++r)
                     sel2_ok &= std::equal(th.begin() + static_cast<std::size_t>(r) * P::kMaxTokens, th.begin() + static_cast<std::size_t>(r) * P::kMaxTokens + nh[r],
                                           t2.begin() + static_cast<std::size_t>(r) * P::kMaxTokens);
+            }
+            for (unsigned sv : {1U, 2U, 3U}) {
+                hok(hipMemcpy(pwh, pwh_in, static_cast<std::size_t>(Cq) * kIdxHeads * 4, hipMemcpyDeviceToDevice), "bounded wh restore");
+                P::indexer_select_rows_bounded(ps.s, a, dqI + static_cast<std::size_t>(a) * kIdxHeads * kIdxDim, pwh, bounded_keys,
+                                               ptok2 + static_cast<std::size_t>(qa) * P::kMaxTokens, pn2 + qa, Cq, nullptr, sv);
+                const auto bn = down(pn2 + qa, Cq);
+                const auto bt = down(ptok2 + static_cast<std::size_t>(qa) * P::kMaxTokens, static_cast<std::size_t>(Cq) * P::kMaxTokens);
+                bounded_ok &= bn == nh && bits_eq(whh, down(pwh, whh.size()));
+                for (unsigned r = 0; r < Cq && bounded_ok; ++r)
+                    bounded_ok &= std::equal(th.begin() + static_cast<std::size_t>(r) * P::kMaxTokens,
+                                             th.begin() + static_cast<std::size_t>(r) * P::kMaxTokens + nh[r],
+                                             bt.begin() + static_cast<std::size_t>(r) * P::kMaxTokens);
             }
             for (unsigned r = 0; r < Cq; ++r)
                 if (!list_ok(th.data() + static_cast<std::size_t>(r) * P::kMaxTokens, nh[r], a + r)) {
@@ -602,6 +615,8 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
     }
     check(lists, tag + ": token lists + n of rows " + std::to_string(query_from) + ".." + std::to_string(T - 1) + " == decode indexer_select" +
                      (bad_row < T ? " (first bad row " + std::to_string(bad_row) + ")" : std::string()));
+    hok(hipFree(bounded_keys), "bounded keys free");
+    check(bounded_ok, tag + ": bounded windows == full-array token lists, counts and scaled wh, scores 1/2/3");
     check(sel2_ok, tag + ": indexer scores/select 2/1, 3/1, 2/2 == default 3/2 (token lists, counts), keys and scaled wh bitwise, every chunk");
     check(wh_ok && keys_ok && !r_keys.empty(), tag + ": per-row scaled wh + ordered keys (" + std::to_string(r_keys.size()) + " scored rows) == decode");
     if (!rep_rows.empty()) check(inter_ok, tag + ": absorbed q (64 heads) == decode; probabilities + o-bar (heads 0/31/32/63) == host R13, finite");
@@ -1255,6 +1270,20 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
         for (unsigned t = T - 8; t < T; ++t) std::fill_n(qI.begin() + static_cast<std::size_t>(t) * kIdxHeads * kIdxDim, kIdxHeads * kIdxDim, 0.0F);
         dsa_case(fx, "max-P 33000 rows (pooled keys periodic: ties across every 1024-pool block; P up to 8250; last 8 all-tie)", T, chunks, x, lat, qI, g,
                  T - 96, {T - 96, T - 50, T - 9, T - 1});
+        free_all();
+    }
+    {  // One query chunk straddles the bounded score-window boundary, with all equal scores and causal tails.
+        upload_w();
+        constexpr unsigned T = 16416;
+        std::vector<unsigned> chunks(7, 2048);
+        chunks.push_back(2016);
+        chunks.push_back(64);
+        const auto x = rnd(static_cast<std::size_t>(T) * kHidden, g, 0.5F), lat = rnd(static_cast<std::size_t>(T) * kKvLora, g, 1.0F);
+        auto qI = rnd(static_cast<std::size_t>(T) * kIdxHeads * kIdxDim, g, 1.0F);
+        for (unsigned t = T - 64; t < T; ++t)
+            std::fill_n(qI.begin() + static_cast<std::size_t>(t) * kIdxHeads * kIdxDim, kIdxHeads * kIdxDim, 0.0F);
+        dsa_case(fx, "bounded window boundary: all ties, mixed causal pool counts and tails", T, chunks, x, lat, qI, g,
+                 T - 64, {16352, 16382, 16383, 16384, 16415});
         free_all();
     }
     {  // 3) positive C3/C4: a latent that rounds to bf16 +inf, and a gate +inf (C3, and C4 through its pool)

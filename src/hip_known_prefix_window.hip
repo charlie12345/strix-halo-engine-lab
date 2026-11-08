@@ -1,4 +1,8 @@
 #include "strix/cohort_step_plan.hpp"
+#include "strix/qwen_prefill_pair.hpp"
+#include "strix/qwen_prefill_pipe_dump.hpp"
+#include "strix/dist/communicator.hpp"
+#include "strix/qwen_prefill_pipeline.hpp"
 #include "strix/qwen_allon.hpp"
 #include "strix/batch_nested_prefill.hpp"
 #include "strix/hip_known_prefix_window.hpp"
@@ -53,6 +57,8 @@
 // strix-hip-known-prompt-model-qualification, and
 // strix-hip-serving-greedy-model-qualification. Keep startup defaults shared
 // with any future runtime client that pulls this translation unit into its link.
+#include "hip_qwen_prefill_pair_staging.hpp"
+
 namespace {
 const bool qpf2k_default_env = [] {
     strix::qpf2k::initialize_before_main(
@@ -794,6 +800,148 @@ struct HipKnownPrefixWindow::Impl {
     // streams (bit 1), or a MoE combine, the MLP inject and that HC step (bit 2), run as the folded inject + norm kernel
     // and the HC projection / output at the first step; the later steps are then recorded without a launch.
     std::vector<std::size_t> prefill_folded;
+    std::vector<std::byte> pp_seam_bytes;
+    std::vector<std::uint32_t> pp_seam_tokens;
+    std::uint64_t pp_seam_position = 0;
+    bool pp_seam_valid = false;
+    std::optional<std::uint32_t> pp_seam_layer;
+    void pp_seam(bool save, std::uint32_t seam_rows,
+        const std::function<ExecutionDispatchContext(std::uint32_t)>& hc_context,
+        const std::function<ExecutionDispatchContext(std::uint32_t)>& inject_context,
+        std::span<const std::uint32_t> seam_tokens) {
+        if (model.hidden_size != 2560U || model.hc_count != 4U || elementwise_config.activation != HipActivationStorage::bf16)
+            throw std::invalid_argument("layer-split seam requires Qwen 2560 x 4 BF16 geometry");
+        const auto seam_position = hc_context(0).position;
+        const auto seam_size = static_cast<std::size_t>(seam_rows) * qwen_pp::Seam::row_bytes;
+        auto& pair_context = qwen_pp::pipe_context;
+        qwen_pp::PipeFrame* pair_frame = nullptr;
+        if (pair_context.pipe) {
+            if (save != (pair_context.rank == 0U)) throw std::logic_error("pair prefill seam direction mismatch");
+            const auto pair_wait_start = std::chrono::steady_clock::now();
+            pair_frame = &pair_context.pipe->acquire(pair_context.sequence);
+            std::fprintf(stderr, "qwen-pair rank=%u chunk=%llu exposed-seam-wait-ms=%.3f\n", pair_context.rank,
+                static_cast<unsigned long long>(pair_context.sequence),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_wait_start).count());
+            if (save) pair_frame->resize(seam_size);
+            if (!save) {
+                const auto& header = pair_frame->header;
+                if (header[2] != seam_position || header[3] != seam_rows || header[5] != pair_context.identity ||
+                    header[6] != qwen_pp::token_hash(seam_tokens))
+                    throw std::runtime_error("pair prefill seam identity, tokens, position or CRC mismatch");
+                prefill_folded.clear();
+                for (std::size_t marker = 0; marker < static_cast<std::size_t>(header[7]); ++marker) {
+                    const auto index = static_cast<std::size_t>(header[8U + marker]);
+                    if (!prefill || index >= prefill->tile8.mode.size()) throw std::runtime_error("pair prefill folded marker outside plan");
+                    prefill_folded.push_back(index);
+                }
+                pp_seam_valid = true;
+                pp_seam_position = seam_position;
+                pp_seam_layer = hc_context(0).layer;
+                pp_seam_tokens.assign(seam_tokens.begin(), seam_tokens.end());
+            }
+        }
+        if (save) {
+            pp_seam_valid = false;
+            if (!pair_frame) pp_seam_bytes.resize(seam_size);
+            pp_seam_tokens.assign(seam_tokens.begin(), seam_tokens.end());
+            pp_seam_position = seam_position;
+            pp_seam_layer = hc_context(0).layer;
+        } else if (!pp_seam_valid || pp_seam_layer != hc_context(0).layer || (pair_frame ? pair_frame->payload.size() : pp_seam_bytes.size()) != seam_size || pp_seam_position != seam_position ||
+            pp_seam_tokens.size() != seam_tokens.size() || !std::equal(pp_seam_tokens.begin(), pp_seam_tokens.end(), seam_tokens.begin())) {
+            throw std::invalid_argument("layer-split resume requires the same owner's saved tile, tokens and position");
+        }
+        // Fence detached producers before packing a slot. layer-split remains synchronous;
+        // pair prefill copies its immutable snapshot on the separate per-slot stream.
+        check(hipDeviceSynchronize(), "layer-split seam producer fence");
+        const auto seam_stream = hip_execution_stream();
+        for (std::uint32_t seam_row = 0; seam_row < seam_rows; ++seam_row) {
+            const auto hc_dispatch = hc_context(seam_row);
+            const auto inject_dispatch = inject_context(seam_row);
+            if (hc_dispatch.op != SerialOp::attn_hyper_mix)
+                throw std::invalid_argument("PP seam requires an attention HC boundary");
+            const std::array<ExecutionBufferAddress, 3> seam_sources{
+                resolve_dispatch_read(hc_dispatch, 0), resolve_dispatch_write(hc_dispatch, 0),
+                resolve_dispatch_read(inject_dispatch, 2)};
+            const std::array<std::size_t, 3> seam_lengths{
+                qwen_pp::Seam::hc_bytes, qwen_pp::Seam::attention_bytes, qwen_pp::Seam::coefficient_bytes};
+            std::size_t seam_offset = static_cast<std::size_t>(seam_row) * qwen_pp::Seam::row_bytes;
+            for (std::size_t seam_part = 0; seam_part < seam_sources.size(); ++seam_part) {
+                const auto& seam_source = seam_sources[seam_part];
+                if (!seam_source.address || seam_source.bytes < seam_lengths[seam_part])
+                    throw std::invalid_argument("layer-split seam buffer is smaller than its wire component");
+                auto* seam_host = (pair_frame ? pair_frame->payload.data() : pp_seam_bytes.data()) + seam_offset;
+                auto* seam_device = reinterpret_cast<void*>(seam_source.address);
+                if (pair_frame) pair_frame->staging->copy(save, seam_offset, seam_device, seam_lengths[seam_part]);
+                else if (save) check(hipMemcpyAsync(seam_host, seam_device, seam_lengths[seam_part], hipMemcpyDeviceToHost, seam_stream), "layer-split save seam");
+                else check(hipMemcpyAsync(seam_device, seam_host, seam_lengths[seam_part], hipMemcpyHostToDevice, seam_stream), "layer-split load seam");
+                seam_offset += seam_lengths[seam_part];
+            }
+        }
+        if (pair_frame && save) pair_frame->staging->seal(seam_size);
+        else check(hipStreamSynchronize(seam_stream), "layer-split seam transfer fence");
+        const auto seam_payload = pair_frame ? std::span<const std::byte>(pair_frame->payload) : std::span<const std::byte>(pp_seam_bytes);
+        if (qwen_pp::dump_enabled()) {
+            const auto pp_owner = pair_context.pipe ? (pair_context.rank == 0U ? "pair-r0" : "pair-r1") : "split";
+            const auto pp_name = qwen_pp::dump_stem(pp_owner, seam_position, seam_rows) + (save ? "-save" : "-load");
+            if (pair_frame && save) for (std::size_t offset = 0; offset < seam_size; offset += qwen_pp::seam_piece_bytes)
+                pair_frame->staging->await_piece(offset);
+            // Diagnostics own their bytes; never retain a transport staging view.
+            const std::vector<std::byte> pp_dump_bytes(seam_payload.begin(), seam_payload.end());
+            qwen_pp::dump_write(pp_name + ".seam.bin", pp_dump_bytes);
+            std::string pp_metadata = "wire=2 bytes=" + std::to_string(seam_payload.size()) +
+                " fnv1a64=" + std::to_string(qwen_pp::dump_hash(pp_dump_bytes)) + " folded=";
+            for (const auto pp_marker : prefill_folded) pp_metadata += std::to_string(pp_marker) + ",";
+            qwen_pp::dump_text(pp_name + ".txt", pp_metadata + "\n");
+        }
+        if (pair_frame) {
+            if (save) {
+                if (prefill_folded.size() > 32U) throw std::runtime_error("pair prefill folded marker capacity exceeded");
+                auto& header = pair_frame->header;
+                header.fill(0);
+                header[0] = qwen_pp::Seam::magic; header[1] = pair_context.sequence;
+                header[2] = seam_position; header[3] = seam_rows; header[4] = pair_context.cut;
+                header[5] = pair_context.identity; header[6] = qwen_pp::token_hash(seam_tokens);
+                header[7] = prefill_folded.size();
+                for (std::size_t marker = 0; marker < prefill_folded.size(); ++marker)
+                    header[8U + marker] = prefill_folded[marker];
+                header[41] = pair_context.pipe->count();
+            }
+            if (save) pair_context.pipe->release(pair_context.sequence);
+        }
+        pp_seam_valid = save;
+        std::fprintf(stderr, "qwen-split seam=%s rows=%u bytes-per-row=25616 position=%llu\n",
+            save ? "save" : "load", seam_rows, static_cast<unsigned long long>(seam_position));
+    }
+
+    void pp_dump_layer_input(std::size_t pp_step, std::uint32_t pp_rows,
+        const std::function<ExecutionDispatchContext(std::uint32_t)>& pp_context) {
+        check(hipDeviceSynchronize(), "PP stage-B input dump fence");
+        const bool pp_folded = std::find(prefill_folded.begin(), prefill_folded.end(), pp_step) != prefill_folded.end();
+        std::array<std::uint64_t, 3> pp_hashes{14695981039346656037ULL, 14695981039346656037ULL, 14695981039346656037ULL};
+        std::vector<std::byte> pp_scratch(qwen_pp::Seam::hc_bytes);
+        const std::array<std::size_t, 3> pp_lengths{
+            qwen_pp::Seam::hc_bytes, qwen_pp::Seam::attention_bytes, qwen_pp::Seam::coefficient_bytes};
+        for (std::uint32_t pp_row = 0; pp_row < pp_rows; ++pp_row) {
+            const auto pp_dispatch = pp_context(pp_row);
+            for (std::size_t pp_part = 0; pp_part < (pp_folded ? 3U : 1U); ++pp_part) {
+                const auto pp_address = pp_part == 0U ? resolve_dispatch_read(pp_dispatch, 0) :
+                    resolve_dispatch_write(pp_dispatch, pp_part - 1U);
+                if (!pp_address.address || pp_address.bytes < pp_lengths[pp_part])
+                    throw std::invalid_argument("PP input dump buffer too small");
+                check(hipMemcpy(pp_scratch.data(), reinterpret_cast<const void*>(pp_address.address),
+                    pp_lengths[pp_part], hipMemcpyDeviceToHost), "PP stage-B input dump");
+                pp_hashes[pp_part] = qwen_pp::dump_hash(
+                    std::span<const std::byte>(pp_scratch.data(), pp_lengths[pp_part]), pp_hashes[pp_part]);
+            }
+        }
+        const auto pp_first = pp_context(0);
+        const auto pp_name = qwen_pp::dump_stem(qwen_pp::pipe_context.pipe ? "pair-r1" : "split", pp_first.position, pp_rows) +
+            "-layer" + std::to_string(pp_first.layer.value()) + ".txt";
+        std::string pp_record = "fnv1a64 hc=" + std::to_string(pp_hashes[0]) + " folded=" + (pp_folded ? "1" : "0");
+        if (pp_folded) pp_record += " attention=" + std::to_string(pp_hashes[1]) + " coefficients=" + std::to_string(pp_hashes[2]);
+        qwen_pp::dump_text(pp_name, pp_record + "\n");
+    }
+
     bool prefill_fold(std::size_t i, std::span<const ExecutionDispatchContext> rows, const std::function<bool(std::size_t)>& full,
         const std::function<std::vector<ExecutionDispatchContext>(std::size_t)>& contexts_of) {
         if (!prefill_folded.empty() && prefill_folded.front() == i) { prefill_folded.erase(prefill_folded.begin()); return true; }
@@ -2230,7 +2378,38 @@ struct HipKnownPrefixWindow::Impl {
             hooks.static_preflight_memo=&static_preflight_memo;
             hooks.skip_head=skip_head;
             hooks.partial_rows=partial;
-            prefill_folded.clear();
+            const auto pp_native_range = qwen_pp::parse_range(std::getenv("STRIX_QWEN_PF_LAYER_RANGE"),
+                static_cast<std::uint32_t>(model.hidden_layers));
+            if (!pp_native_range.enabled || pp_native_range.begin == 0) {
+                prefill_folded.clear();
+                pp_seam_valid = false;
+            }
+            auto pp_profile_start = std::chrono::steady_clock::time_point{};
+            if (prefill && qwen_pp::pipe_context.pipe && qwen_pp::pipe_profile_enabled()) {
+                hooks.prefill_profile_boundary = [&](std::optional<std::uint32_t> layer, bool begin) {
+                    // Includes detached streams; do not call complete() or publish state here.
+                    check(hipDeviceSynchronize(), "pair prefill layer profile fence");
+                    const auto now = std::chrono::steady_clock::now();
+                    if (begin) { pp_profile_start = now; return; }
+                    const auto& pair = qwen_pp::pipe_context;
+                    const auto name = layer ? std::to_string(*layer) : std::string("lm_head");
+                    std::fprintf(stderr, "qwen-pair-profile {\"kind\":\"layer\",\"rank\":%u,\"chunk\":%llu,\"rows\":%u,\"layer\":\"%s\",\"ms\":%.9f}\n",
+                        pair.rank, static_cast<unsigned long long>(pair.sequence), block_rows, name.c_str(),
+                        std::chrono::duration<double, std::milli>(now - pp_profile_start).count());
+                };
+            }
+            if (prefill && pp_native_range.enabled) {
+                hooks.prefill_seam = [&](bool save, std::uint32_t seam_rows,
+                    const std::function<ExecutionDispatchContext(std::uint32_t)>& hc_context,
+                    const std::function<ExecutionDispatchContext(std::uint32_t)>& inject_context) {
+                    pp_seam(save, seam_rows, hc_context, inject_context, tokens);
+                };
+                if (qwen_pp::dump_enabled() && (!qwen_pp::pipe_context.pipe || qwen_pp::pipe_context.rank == 1U))
+                    hooks.prefill_layer_input = [this](std::size_t pp_step, std::uint32_t pp_rows,
+                        const std::function<ExecutionDispatchContext(std::uint32_t)>& pp_context) {
+                        pp_dump_layer_input(pp_step, pp_rows, pp_context);
+                    };
+            }
             if(prefill&&(hyper_mix_prefill_fold_enabled(false)||hyper_mix_prefill_fold_enabled(true)))
                 hooks.prefill_before_step=[this](std::size_t i,std::span<const ExecutionDispatchContext> rows,
                     const std::function<bool(std::size_t)>& full,const std::function<std::vector<ExecutionDispatchContext>(std::size_t)>& contexts_of) {

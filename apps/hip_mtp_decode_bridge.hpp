@@ -4,6 +4,9 @@
 #include "qwen_yarn_memory.hpp"
 #include "mtp_asset_verification.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
+#include "strix/qwen_prefill_handoff.hpp"
+#include "strix/qwen_prefill_balance.hpp"
+#include "strix/dist/communicator.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -600,6 +603,14 @@ public:
     // for the final block, the adoption of its last row (logits: its terminal logits).
     void finish_block(const Block& block,const std::vector<float>& logits,bool grouped=false,HipKnownPrefixWindow* executed_owner=nullptr) {
         const auto rows=block.rows;
+        if(qwen_pp::pipe_context.pipe && qwen_pp::pipe_context.rank==0U) {
+            // Stage A has no terminal tap/logits. Stage B alone primes the
+            // predictor; rank 0 restores its durable rows after the final ACK.
+            pos_+=rows;
+            if(block.final) phase_=Phase::done;
+            return;
+        }
+        if(qwen_pp::pipe_context.pipe && block.final) pair_logits_=logits;
         if(batch_ && batch_cert_.enabled)
             trace_.push_back({pos_,pos_+rows,rows,block.backend==tiled_.blocks,
                 (executed_owner?executed_owner:block.owner)==tiled_.block_owner.get(),grouped,small_,forced_ladder_,adopted_});
@@ -702,6 +713,15 @@ public:
         }
         report_progress();
     }
+    // Pair prefill may never fall through to full-model serial prompt work.
+    void step_pair() {
+        if(pos_<align_end_ || (phase_!=Phase::blocks && phase_!=Phase::tails))
+            throw std::invalid_argument("pair handoff MTP cannot execute a serial prompt suffix");
+        const auto block=next_block();
+        if(!block || block->rows<16U || block->rows%8U!=0U) throw std::invalid_argument("pair handoff MTP needs legal tiled units and tiled start");
+        run_block(*block);
+    }
+    std::vector<float> take_pair_logits() {return std::move(pair_logits_);}
     // Runs the next unit of the prompt.
     void step(std::uint32_t serial_rows_per_step=UINT32_MAX) {
         for(;;) {
@@ -871,6 +891,7 @@ public:
     void set_request_order(std::uint64_t value) {request_order_=value;}
     void before_writer(hipStream_t stream) const {if(batch_cert_.enabled) PrefixAsyncCapture::before_writer(this,stream);}
 private:
+    std::vector<float> pair_logits_;
     void run_block(const Block& block) {
         check_yarn_memory();
         auto& owner=*block.owner;
@@ -1075,6 +1096,8 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(std::span<const std::uint32
     while(!prompt.done()) prompt.step();
     return prompt.finish(receipt);
 }
+
+#include "hip_qwen_prefill_mtp_handoff.inc"
 
 // Batched decoding of independent requests on the tiled MTP route (--http-batch, cohort requests with the
 // tiled prompt). Every slot owns what a single request owns: target state and session, launch plan, PLE
@@ -3091,6 +3114,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 output<<"}\n";
                 return;
             }
+            if(qwen_pp::pipe_enabled()) {
+                pending=run_pair_tiled_mtp_prompt(options.tokens,model,compiled,parents->tiled,session,*target,*runtime,
+                    qualified,activated,r,dispatcher,tiled_held,tiled_receipt);
+                if(std::getenv("STRIX_QWEN_PF_PIPE_RANK")[0]=='1') return;
+            } else
             pending=run_tiled_mtp_prompt(options.tokens,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
                 r,dispatcher,tiled_held,tiled_receipt);
         } else

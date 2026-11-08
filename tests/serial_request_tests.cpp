@@ -802,6 +802,16 @@ int main() {
         continuation.max_new_tokens = 2;
         continuation.eos_token_id = 6;
 
+        std::vector<std::uint64_t> captured_positions;
+        std::vector<std::vector<float>> captured_logits;
+        continuation.emission_hook = [&](std::uint64_t step, std::uint64_t position,
+            std::uint32_t argmax, std::span<const float> row) {
+            expect(step == captured_positions.size(), "continuation capture emission order");
+            captured_positions.push_back(position);
+            captured_logits.emplace_back(row.begin(), row.end());
+            return argmax;
+        };
+
         const auto result =
             strix::execute_serial_greedy_continuation(
                 continuation,
@@ -810,6 +820,9 @@ int main() {
             result.generated_tokens ==
                 std::vector<std::uint32_t>({4, 6}),
             "continuation samples directly from cached prefix logits");
+        expect(captured_positions == std::vector<std::uint64_t>({2U, 3U}) &&
+            captured_logits == std::vector<std::vector<float>>({initial, backend.outputs.front()}),
+            "continuation hook captures terminal and decode rows at consumed-input positions");
         expect(
             backend.calls ==
                 std::vector<std::pair<std::uint32_t, std::uint64_t>>({

@@ -26,6 +26,8 @@ struct GraphTemplate {
 [[nodiscard]] ModelContract contract_from_description(const model_description::ModelDescription& file);
 [[nodiscard]] ModelContract contract_from_file(const std::string& path);
 [[nodiscard]] GraphTemplate graph_template(const model_description::ModelDescription& file);
+// Same validated cadence for a resolved host contract; no schedule is executed.
+[[nodiscard]] GraphTemplate graph_template(const ModelContract& contract);
 // Every mismatch is collected in one std::invalid_argument, with field names,
 // expected and actual values (including missing/invalid types).
 void assert_matches(const ModelContract& baked, const model_description::ModelDescription& file);

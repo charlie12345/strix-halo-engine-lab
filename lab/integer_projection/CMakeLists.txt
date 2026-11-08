@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/StrixHipArchs.cmake")
 project(strix_integer_projection_lab LANGUAGES CXX)
 option(STRIX_INTEGER_PROJECTION_NATIVE "Build opt-in, unqualified gfx1151 HIP experiment" OFF)
 add_library(integer_projection_reference STATIC
@@ -18,13 +19,13 @@ if(STRIX_INTEGER_PROJECTION_NATIVE)
     add_library(hip_integer_projection STATIC ../../src/hip_integer_projection.hip)
     target_link_libraries(hip_integer_projection PUBLIC integer_projection_reference)
     set_target_properties(hip_integer_projection PROPERTIES HIP_STANDARD 20
-        HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(hip_integer_projection PRIVATE
         -Wall -Wextra -Werror -ffp-contract=off -mno-wavefrontsize64)
     add_executable(integer-projection-native integer_projection.hip)
     target_link_libraries(integer-projection-native PRIVATE hip_integer_projection)
     set_target_properties(integer-projection-native PROPERTIES HIP_STANDARD 20
-        HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(integer-projection-native PRIVATE
         -Wall -Wextra -Werror -ffp-contract=off -mno-wavefrontsize64)
 endif()

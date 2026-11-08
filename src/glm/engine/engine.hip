@@ -18,7 +18,7 @@
 #include "glm/engine/glm_pack.hpp"
 #include "glm/engine/glm_r1b.hpp"
 #include "glm/kernels/glm_dsa.hpp"
-#include "glm/kernels/glm_tier_a.hpp"
+#include "../kernels/glm_norm.hpp"
 #include "glm/load/glm_model_description.hpp"
 #include "glm/moe/glm_moe.hpp"
 #include "glm/prefill/glm_pf_moe.hpp"
@@ -192,10 +192,10 @@ public:
             const auto t = static_cast<unsigned>(c.rows[r].pos);
             if (t >= st.cap) throw std::out_of_range("DSA position beyond the slot capacity");
             c.lin->run(w.q_a, xr, s_->qa, 1, c.stream);
-            D::rmsnorm(s_->qa, w.q_a_norm, D::WType::BF16, kQLora, kEps, s_->qr, 1, c.stream);
+            D::GlmNorm::run(s_->qa, w.q_a_norm, D::WType::BF16, kQLora, kEps, s_->qr, 1, c.stream);
             c.lin->run(w.q_b, s_->qr, s_->q, 1, c.stream);
             c.lin->run(w.kv_a, xr, s_->kva, 1, c.stream);
-            D::rmsnorm(s_->kva, w.kv_a_norm, D::WType::BF16, kKvLora, kEps, s_->lat, 1, c.stream);
+            D::GlmNorm::run(s_->kva, w.kv_a_norm, D::WType::BF16, kKvLora, kEps, s_->lat, 1, c.stream);
             c.lin->run(w.wq_b, s_->qr, s_->qI, 1, c.stream);
             const D::DsaSlot sl{st.latent + static_cast<std::size_t>(slot) * st.cap * kKvLora,
                                 st.ikey + static_cast<std::size_t>(slot) * st.cap * kIdxDim,
@@ -1340,7 +1340,7 @@ struct Engine::Impl {
                                                           hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
                 else glm::pf::hc_pre_rows(h.x, site.fn, site.base, site.scale, F + q * kHc * kHidden,
                                           hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
-                D::rmsnorm(xc + q * kHidden, norm, D::WType::BF16, kHidden, kEps, xn + q * kHidden, h.count, stream);
+                D::GlmNorm::run(xc + q * kHidden, norm, D::WType::BF16, kHidden, kEps, xn + q * kHidden, h.count, stream);
             }
             h.normed = false;
             mark(segHc);
@@ -1511,7 +1511,7 @@ struct Engine::Impl {
             } else {
                 if (pfc) glm::pf::hc_pre_rows(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, hz, mix, xc, R, stream);
                 else hc_pre(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, mix, xc, R);
-                D::rmsnorm(xc, w.in_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
+                D::GlmNorm::run(xc, w.in_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
             }
             mark(segHc);
             if (pfc) {
@@ -1532,7 +1532,7 @@ struct Engine::Impl {
             } else {
                 if (pfc) glm::pf::hc_pre_rows(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, hz, mix, xc, R, stream);
                 else hc_pre(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, mix, xc, R);
-                D::rmsnorm(xc, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
+                D::GlmNorm::run(xc, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
             }
             mark(segHc);
             if (w.moe) {
@@ -1594,7 +1594,7 @@ struct Engine::Impl {
                 if (pending.at(r.slot) > 0) flush(r.slot);
         layers_forward(rows, opt.layers, ForwardKind::Plain);
         D::hc_final(X, hfin, R, stream);
-        D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
+        D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
         lib.run(head, hidden, logits, R, stream);
         D::argmax(logits, vocab_n, vocab0, amv, ami, flag, R, stream);
         check_flag(defer_layer_flag ? "layers / head" : "head");
@@ -1656,7 +1656,7 @@ struct Engine::Impl {
         }
         const unsigned last = static_cast<unsigned>(rows.size() - 1);
         D::hc_final(X + static_cast<std::size_t>(last) * kHc * kHidden, hfin, 1, stream);
-        D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, 1, stream);
+        D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, 1, stream);
         lib.run(head, hidden, logits, 1, stream);
         D::argmax(logits, vocab_n, vocab0, amv, ami, flag, 1, stream);
         check_flag("head");
@@ -1691,7 +1691,7 @@ struct Engine::Impl {
             for (unsigned j = 0; j < R; ++j) rows[j] = Row{slot, tokens[c0 + j], pos0 + c0 + j};
             layers_forward(rows, opt.layers, ForwardKind::Prefill);
             D::hc_final(X, hfin, R, stream);
-            D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
+            D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
             // Like the plain chunked prefill, interior rows run no vocabulary head (trunk or MTP): their ids are
             // discarded and drafts are always verified, so only the final row's head (y0) and the seed drafter
             // below need logits. Per-row vocabulary heads cost ~15 % of the prefill at 8K/32K.
@@ -1776,18 +1776,18 @@ struct Engine::Impl {
         hip_ok(hipMemcpyAsync(pos_d, ps.data(), R * 8, hipMemcpyHostToDevice, stream), "mtp pos");
         const CallCtx c{&lib, rows, slot_d, pos_d, mtp_flag, stream, !pfc, nullptr};
         embed1_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, m_e);
-        D::rmsnorm(m_e, w.enorm, D::WType::BF16, kHidden, kEps, m_en, R, stream);
-        D::rmsnorm(h, w.hnorm, D::WType::BF16, kHidden, kEps, m_hn, R, stream);
+        D::GlmNorm::run(m_e, w.enorm, D::WType::BF16, kHidden, kEps, m_en, R, stream);
+        D::GlmNorm::run(h, w.hnorm, D::WType::BF16, kHidden, kEps, m_hn, R, stream);
         cat2_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(m_en, m_hn, m_cat);
         if (pfc) pf->linear_exact(w.eh_proj, c, m_cat, m_z, 2 * kHidden, kHidden);
         else lib.run(w.eh_proj, m_cat, m_z, R, stream);  // [enorm(e) | hnorm(h)] -> z
-        D::rmsnorm(m_z, w.in_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
+        D::GlmNorm::run(m_z, w.in_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
         if (pfc) pf->dsa(w.dsaw, w.dst, c, xn, part);
         else attn->dsa(w.dsaw, w.dst, c, xn, part);
         xch->reduce(part, R, stream);
         const std::size_t n = static_cast<std::size_t>(R) * kHidden;
         add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_z, part, m_r, n);  // r = z + attn
-        D::rmsnorm(m_r, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
+        D::GlmNorm::run(m_r, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
         if (pfc) {
             glm::pf::dense_rows(xn, w.moew.router, D::WType::F16, kHidden, 0, kExperts, rlog, R, stream);
             D::route(rlog, w.moew.bias, ids, wts, R, stream);
@@ -1809,7 +1809,7 @@ struct Engine::Impl {
         }
         xch->reduce(part, R, stream);
         add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_r, part, m_y, n);  // y = r + MoE
-        D::rmsnorm(m_y, w.head_norm, D::WType::BF16, kHidden, kEps, m_h, R, stream);  // h' = shared_head.norm(y)
+        D::GlmNorm::run(m_y, w.head_norm, D::WType::BF16, kHidden, kEps, m_h, R, stream);  // h' = shared_head.norm(y)
     }
 
     // ---- MTP drafter (MTP arithmetic consensus; design notes section 3)
@@ -1907,7 +1907,7 @@ struct Engine::Impl {
         const auto R = static_cast<unsigned>(rows.size());
         layers_forward(rows, opt.layers, ForwardKind::Verify, &sp);
         D::hc_final(X, hfin, R, stream);
-        D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
+        D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
         lib.run(head, hidden, logits, R, stream);
         D::argmax(logits, vocab_n, vocab0, amv, ami, row_flag, R, stream, 1);
         std::vector<float> v(R);

@@ -14,7 +14,7 @@ if(TARGET strix_gemma4_dflash)
         add_library(strix_gemma4_eagle_device STATIC src/gemma4/eagle/device.hip src/gemma4/eagle/device_session.cpp
             src/gemma4/eagle/mtp/device.hip src/gemma4/eagle/mtp/device_session.cpp)
         target_link_libraries(strix_gemma4_eagle_device PUBLIC strix_gemma4_eagle strix_gemma4_device)
-        set_target_properties(strix_gemma4_eagle_device PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(strix_gemma4_eagle_device PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(strix_gemma4_eagle_device PRIVATE
             $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee;-fno-gpu-flush-denormals-to-zero>)
         set_property(SOURCE src/gemma4/eagle/device.hip src/gemma4/eagle/mtp/device.hip APPEND PROPERTY COMPILE_OPTIONS -fno-rounding-math)

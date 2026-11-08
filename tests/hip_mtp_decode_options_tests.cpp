@@ -345,6 +345,21 @@ void campaign_defaults_contract(){
 }
 
 int main(){try{
+    {
+        Env graph_env("STRIX_PRINT_MODEL_GRAPH",nullptr), plan_env("STRIX_PRINT_EXEC_PLAN",nullptr);
+        const auto plain=parse({"decode","MODEL.gguf","1"});
+        require(!plain.print_model_graph && !plain.print_plan,"inspection remains opt-in");
+        const auto graph=parse({"decode","MODEL.gguf","--print-model-graph"});
+        require(graph.print_model_graph && !graph.print_plan,"model graph inspection without prompt");
+        const auto plan=parse({"decode","MODEL.gguf","--print-plan"});
+        require(plan.print_plan && !plan.print_model_graph,"plan inspection without prompt");
+        Env enabled_graph("STRIX_PRINT_MODEL_GRAPH","1"), enabled_plan("STRIX_PRINT_EXEC_PLAN","1");
+        const auto both=parse({"decode","MODEL.gguf"});
+        require(both.print_model_graph && both.print_plan,"environment inspection switches");
+        Env disabled_graph("STRIX_PRINT_MODEL_GRAPH","0"), disabled_plan("STRIX_PRINT_EXEC_PLAN","0");
+        const auto disabled=parse({"decode","MODEL.gguf","1"});
+        require(!disabled.print_model_graph && !disabled.print_plan,"zero disables environment inspection");
+    }
     for (const auto* profile : {"default", "fast", "quality"}) {
         auto args=request(); args.insert(args.end(), {"--profile",profile,"--allow-pending"});
         const auto product=parse(args);

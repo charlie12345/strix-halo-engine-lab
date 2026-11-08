@@ -224,10 +224,15 @@ void assert_matches(const ModelContract& baked, const ModelDescription& file) {
     Checks check; (void)read_contract(file, check, &baked); check.finish();
 }
 GraphTemplate graph_template(const ModelDescription& file) {
-    GraphTemplate out{contract_from_description(file), {}};
+    const auto contract = contract_from_description(file);
     // This compiled adapter admits only the existing fixed template. No input
     // file may drive an unbounded graph allocation or substitute a new schedule.
     assert_matches(ModelContract::qwen38_flash_next(), file);
+    return graph_template(contract);
+}
+GraphTemplate graph_template(const ModelContract& contract) {
+    if (const auto error = contract.validate(); !error.empty()) throw std::invalid_argument(error);
+    GraphTemplate out{contract, {}};
     for (std::uint64_t i = 0; i < out.contract.hidden_layers; ++i) {
         const bool qsa = (i + 1) % out.contract.full_attention_interval == 0;
         const bool ple = i + 1 == out.contract.ple_layer_1based;

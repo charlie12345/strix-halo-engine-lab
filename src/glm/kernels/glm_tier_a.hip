@@ -1,7 +1,8 @@
 // GLM-5.3-Flash Tier A device kernels, batch 1 (see glm_tier_a.hpp). Every kernel follows the operation order of the
 // host emulation (src/glm/host/glm_host.cpp): R1 ascending fmaf chains, R2 lane-strided partials + LDS halving tree,
 // separate multiply/add elsewhere. Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
-#include "glm/kernels/glm_tier_a.hpp"
+#include "glm_norm.hpp"
+#include "../../ops/norm/norm_device.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -51,17 +52,16 @@ __global__ void dense_kernel(const float* x, const void* w, WType wt, unsigned i
 }
 
 // ---------------------------------------------------------------- R2/R3 rmsnorm
-template <unsigned L>
-__global__ void rmsnorm_kernel(const float* x, const void* w, WType wt, unsigned n, float eps, float* y) {
-    __shared__ float s[L];
-    const float* xr = x + static_cast<std::size_t>(blockIdx.x) * n;
-    float* yr = y + static_cast<std::size_t>(blockIdx.x) * n;
-    float a = 0.0F;
-    for (unsigned i = threadIdx.x; i < n; i += L) a = __builtin_fmaf(xr[i], xr[i], a);
-    const float ss = lds_tree<L>(s, a);
-    const float r = inv_sqrt(ss / static_cast<float>(n) + eps);
-    for (unsigned i = threadIdx.x; i < n; i += L) yr[i] = w ? (xr[i] * r) * wload(w, wt, i) : xr[i] * r;
-}
+struct GlmNormDeviceTraits : GlmNormTraits {
+    template <unsigned L>
+    __device__ __forceinline__ static float reduce(float* s, float part) {
+        return lds_tree<L>(s, part);
+    }
+    __device__ __forceinline__ static float inv_sqrt(float x) { return strix::glm::inv_sqrt(x); }
+    __device__ __forceinline__ static float load(const void* w, WType wt, std::size_t i) {
+        return wload(w, wt, i);
+    }
+};
 
 // ---------------------------------------------------------------- mHC
 __global__ __launch_bounds__(256) void hc_pre_kernel(const float* X, const float* fn, const float* base,
@@ -312,10 +312,10 @@ void dense(const float* x, const void* w, WType wt, unsigned in, unsigned o0, un
     ok(hipGetLastError(), "glm dense");
 }
 void rmsnorm(const float* x, const void* w, WType wt, unsigned n, float eps, float* y, unsigned rows, hipStream_t s) {
-    if (norm_lanes(n) == 256)
-        rmsnorm_kernel<256><<<rows, 256, 0, s>>>(x, w, wt, n, eps, y);
+    if (GlmNorm::lanes(n) == 256)
+        ops::norm::rmsnorm_kernel<GlmNormDeviceTraits, 256><<<rows, 256, 0, s>>>(x, w, wt, n, eps, y);
     else
-        rmsnorm_kernel<128><<<rows, 128, 0, s>>>(x, w, wt, n, eps, y);
+        ops::norm::rmsnorm_kernel<GlmNormDeviceTraits, 128><<<rows, 128, 0, s>>>(x, w, wt, n, eps, y);
     ok(hipGetLastError(), "glm rmsnorm");
 }
 void hc_pre(const float* X, const float* fn, const float* base, const float* scale, float* F, float* mix, float* xc,

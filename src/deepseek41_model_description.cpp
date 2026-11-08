@@ -1,4 +1,5 @@
 #include "strix/deepseek41_model_description.hpp"
+#include "model_graph/deepseek41_adapter.hpp"
 
 #include <cmath>
 #include <iomanip>
@@ -162,6 +163,11 @@ std::string json_of(const std::vector<Field>& entries, const ModelDescription* d
 }  // namespace
 
 std::string model_description_config_json(const Config& config) { return json_of(fields(config)); }
+
+model_graph::ModelGraph graph_from_model_description(
+    const ModelDescription& description, const Config& expected) {
+    return model_graph_from_config(config_from_model_description(description, expected));
+}
 
 std::string describe_model_toml(const Config& config) {
     // Reuse all existing semantic checks, including source-layer graph checks.

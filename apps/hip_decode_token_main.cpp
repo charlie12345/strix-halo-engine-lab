@@ -1,9 +1,11 @@
 #include "strix/startup_markers.hpp"
+#include "strix/device_profile.hpp"
 #include "strix/mtp_cost_table_session.hpp"
 #include "http_slot_capacity.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "qwen_prefill_plan.hpp"
 #include "qwen_model_description_hook.hpp"
+#include "../src/model_graph/qwen_adapter.hpp"
 #include "qwen_yarn_registered_admission.hpp"
 #include "ple_resident_fallback.hpp"
 #include "qwen_http_memory.hpp"
@@ -1185,6 +1187,7 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
 static int run_decode_entry(
     int argc,
     char** argv, strix::decode_cli::MtpBundleSetupRetry bundle_retry = {}) try {
+    if (strix::print_device_profile_if_requested(argc, argv)) return 0;
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
@@ -1193,6 +1196,8 @@ static int run_decode_entry(
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
             "  --baseline / STRIX_BASELINE=1 (historical resolution, controlled defaults off)\n"
             "  --print-effective-config (deterministic host JSON; exits before HIP setup)\n"
+            "  --print-model-graph | --print-plan (host description only; no device work)\n"
+            "  --print-device-profile / STRIX_PRINT_DEVICE_PROFILE=1 (HIP probe JSON; exits without model/peer setup)\n"
             "  --mtp-bundle FILE (YaRN MTP pins/policy/budgets; otherwise discover MODEL.gguf.mtp-bundle.json)\n"
             "  --print-cache-family (resolved qualification identity; hashes assets, no inference)\n"
             "  --prefill-numerical-profile dense-a8|fast-prefill-f16wmma-v1 (automatic tiled default: FP16)\n"
@@ -1261,6 +1266,19 @@ static int run_decode_entry(
         parse_options(
             argc,
             argv, true);
+    if (options.print_model_graph || options.print_plan) {
+        auto described_model = strix::ModelContract::qwen38_flash_next();
+        described_model.attention_kv_storage = options.attention_kv_storage;
+        const auto weights = strix::gguf::read_file(options.model_path);
+        strix::qwen_description::refuse_unless_described(described_model, weights);
+        const auto graph = strix::qwen_description::model_graph_from_contract(described_model);
+        const auto source = strix::build_serial_decode_execution_plan(described_model);
+        const auto plan = strix::qwen_description::common_decode_plan(source, graph);
+        strix::qwen_description::validate_decode_projection(described_model, source, graph, plan);
+        if (options.print_model_graph) std::cout << strix::model_graph::canonical(graph) << '\n';
+        if (options.print_plan) std::cout << strix::model_graph::dump(plan);
+        return 0;
+    }
     // Parsing has loaded --prompt-ids (text uint32 IDs) and positional IDs.
     // Gate the process environment before preflight, model setup or cached readers.
     // In particular, do this before eager exec: inherited levers are no longer

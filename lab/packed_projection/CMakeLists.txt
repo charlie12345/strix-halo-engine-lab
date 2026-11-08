@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/StrixHipArchs.cmake")
 
 project(strix_packed_projection_lab LANGUAGES CXX HIP)
 
@@ -13,7 +14,7 @@ function(configure_projection_target target source wave_size)
     set_target_properties(${target} PROPERTIES
         HIP_STANDARD 20
         HIP_STANDARD_REQUIRED ON
-        HIP_ARCHITECTURES gfx1151
+        HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}"
     )
     target_compile_definitions(${target} PRIVATE STRIX_WAVE_SIZE=${wave_size})
     target_compile_options(

@@ -45,7 +45,10 @@
 // Memory (engine, glm_mem.hpp): the load is planned and admitted before the first weight (fails closed with every term
 // named); STRIX_GLM_MEMTRACE=FILE writes one memory line per second; the watchdog (STRIX_GLM_WATCHDOG=0 off) aborts the
 // rank with exit code 86 near the OOM line.
+// --print-model-graph / STRIX_PRINT_MODEL_GRAPH=1: validated description dump; exits before device work.
 #include "glm_rank_defaults.hpp"
+#include "../src/glm/load/glm_model_description.hpp"
+#include "strix/device_profile.hpp"
 #include "glm_rank_startup.hpp"
 #include "glm_rank_transport.hpp"
 
@@ -80,6 +83,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -112,8 +116,10 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed run still leaves every printed line in its log
     std::setvbuf(stderr, nullptr, _IONBF, 0);  // unbuffered (the C default, made explicit): progress and errors land at once
     try {
+        if (strix::print_device_profile_if_requested(argc, argv)) return 0;
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [modes] [--identity r1|r1b|r1b-all] [--idcheck N --prompt T.u32]\n"
+                                 "--print-device-profile / STRIX_PRINT_DEVICE_PROFILE=1: HIP probe JSON, then exit (no model/peer)\n"
                                  "identity: r1 throughout; r1b (default) R1 prompts/R1b generation; "
                                  "r1b-all throughout (reference prefill)\n", argv[0]);
             return 2;
@@ -134,7 +140,7 @@ int main(int argc, char** argv) {
         std::string logits_out;
         unsigned g3_layers = 6, decode_n = 0, batch_r = 0, batch_steps = 0, spec_k = 0, spec_run = 0, g4_rmax = 0, tf_score = 0;
         std::vector<unsigned> pattern;
-        bool mem_plan = false, profile = false, tf_check = false, print_config = false;
+        bool mem_plan = false, profile = false, tf_check = false, print_config = false, print_graph = false;
         std::string xch_kind = "comm";  // comm = CommExchange (Communicator) | xfer = XferExchange
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
@@ -217,7 +223,13 @@ int main(int argc, char** argv) {
             else if (a == "--state-in") state_in = next();
             else if (a == "--baseline") {}  // resolved by rank_defaults (old path of every default-on item)
             else if (a == "--print-effective-config") print_config = true;
+            else if (a == "--print-model-graph") print_graph = true;
             else throw std::invalid_argument("unknown option " + a);
+        }
+        const char* graph_env = std::getenv("STRIX_PRINT_MODEL_GRAPH");
+        if (print_graph || (graph_env != nullptr && std::string_view(graph_env) == "1")) {
+            std::fputs(strix::glm::model::print_model_graph(opt.model_dir).c_str(), stdout);
+            return 0;  // inspection only: no resolver effects, device, peer or execution
         }
         if (mtp_prefill != "ref" && mtp_prefill != "chunked")
             throw std::invalid_argument("--mtp-prefill must be ref or chunked");

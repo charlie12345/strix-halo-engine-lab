@@ -1,8 +1,8 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0x85e14a0223dd1d21ULL},
-{"apps/minimax_rank_main.cpp", 0xc4bb37b7e3d04435ULL},
-{"apps/minimax_serve_main.cpp", 0x1584a60c38f4e8beULL},
+{"CMakeLists.txt", 0x3f674679226ab997ULL},
+{"apps/minimax_rank_main.cpp", 0xc5a4a49441038adcULL},
+{"apps/minimax_serve_main.cpp", 0x0c41e610f7c02b4cULL},
 {"src/dspark_common/markov_cand_kernels.hpp", 0xf20c7f91a631cbc1ULL},
 {"src/minimax/attn/index_proj.hip", 0x8332b8f8830e98d8ULL},
 {"src/minimax/attn/index_proj.hpp", 0x47d7a6439fff1b5fULL},

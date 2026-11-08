@@ -1,3 +1,4 @@
+#include "strix/hip_arch_caps.hpp"
 // Indexer q/k input projections of a prefill group (included by hip_indexed_attention_launcher.hip; needs
 // bf16_to_float, round_bf16, QsaRowsInputViews and qsa_rows_matrix).
 //
@@ -191,7 +192,7 @@ __global__ __launch_bounds__(W * 32U) void rows_batch_kernel(const QsaRowsInputV
 // Match project_rows_dense_f16_wmma_kernel / dense_f16_pair exactly:
 // A lane l reads row l%16, B reads column l%16, both with all 16 K values
 // replicated in lanes l and l+16. D[e] = (row 2*e+l/16, column l%16).
-#if defined(__gfx1151__)
+#if STRIX_HAS_WMMA_BF16_W32
 using index_bf16x16 = unsigned short __attribute__((ext_vector_type(16)));
 __device__ __forceinline__ index_bf16x16 index_wmma_fragment(const std::uint16_t* row) {
     // Use the verified two-uint4 load convention. The 80-byte LDS row pitch
@@ -212,7 +213,7 @@ __device__ __forceinline__ void rows_wmma_body(
     const QsaRowsInputViews<64U>* groups, std::uint32_t width,
     std::uint16_t* operands = nullptr, float* steps = nullptr,
     unsigned trace_row = 0U, unsigned trace_column = 4U) {
-#if defined(__gfx1151__)
+#if STRIX_HAS_WMMA_BF16_W32
     using f32x8 = float __attribute__((ext_vector_type(8)));
     // Two raw BF16 K32 slabs per operand, padded to a 40-element row.
     __shared__ __align__(32) std::uint16_t a[2][64][40];

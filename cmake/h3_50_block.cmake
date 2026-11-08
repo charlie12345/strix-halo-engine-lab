@@ -33,7 +33,7 @@ if(STRIX_ENABLE_HIP_RUNTIME AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/h3/block
         strix_h3_gemm_device_target(strix_h3_block_hip)
     endif()
     target_include_directories(strix_h3_block_hip PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
-    set_target_properties(strix_h3_block_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+    set_target_properties(strix_h3_block_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(strix_h3_block_hip PUBLIC $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee;-fno-gpu-flush-denormals-to-zero>)
     if(BUILD_TESTING)
         add_executable(strix-h3-block-gpu-tests tests/h3/block/gpu_tests.cpp)

@@ -1,3 +1,4 @@
+#include "strix/hip_arch_caps.hpp"
 #include "strix/hip_integer_projection.hpp"
 #include <hip/hip_runtime.h>
 #include <array>
@@ -43,8 +44,8 @@ __global__ void project_kernel(const std::uint8_t* activations,const double* act
     const std::int32_t* sums,const std::uint8_t* weights,const double* weight_scales,
     double* output,std::int32_t* integer_groups,unsigned* error,
     std::uint32_t rows,std::uint32_t columns,std::uint32_t k) {
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
-#error This experimental fragment ABI is only built for gfx1151.
+#if defined(__HIP_DEVICE_COMPILE__) && !STRIX_HAS_RDNA35_WMMA
+#error This experimental fragment ABI requires RDNA 3.5 IU4/IU8 WMMA builtins.
 #endif
     const unsigned lane=threadIdx.x; // exactly one Wave32 per workgroup
     const std::uint32_t input_row=blockIdx.y*16U+lane%16U;

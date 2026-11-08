@@ -2,7 +2,7 @@
 // GLM-5.3-Flash Tier A device kernels, batch 1 (design notes sections 1-2): each launcher reproduces the
 // host emulation in src/glm/host/glm_host.cpp bit for bit given the same inputs (gate K). All pointers are device
 // pointers; rows are contiguous; `flag` is the device non-finite flag (checkpoints C1/C2/C5), ORed, never cleared here.
-#include "glm/common/glm_math.hpp"
+#include "../common/glm_math.hpp"
 
 #include <hip/hip_runtime.h>
 

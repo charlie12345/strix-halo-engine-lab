@@ -1,6 +1,7 @@
 #include "strix/ds41_dspark_vocab.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/deepseek41_describe.hpp"
+#include "../src/model_graph/deepseek41_adapter.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/ds41_engram_tp.hpp"
@@ -25,6 +26,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -114,6 +116,7 @@ struct Args {
     std::string routes_seqs;  // --routes-seqs: teacher-forced sequences whose routes go to --routes (no prompt run)
     unsigned connect_timeout = 60;  // seconds for opening the transport (a dead USB4 link blocks open())
     bool describe = false;
+    bool print_plan = false;
     std::string role, stage_listen, stage_token_file, import_state, export_state;
     std::string session_save, session_load, session_id = "gate", session_suffix;
     std::uint64_t session_bytes = 0;
@@ -2156,6 +2159,7 @@ int main(int argc, char** argv) try {
             }
         }
         else if (s == "--describe-json") a.describe = true;
+        else if (s == "--print-plan") a.print_plan = true;
         else if (s == "--role") a.role = next();
         else if (s == "--first-layer") a.first_layer = static_cast<std::uint32_t>(std::stoul(next()));
         else if (s == "--stage-listen") a.stage_listen = next();
@@ -2228,6 +2232,19 @@ int main(int argc, char** argv) try {
         if (a.model.empty()) throw std::invalid_argument("hash-only requires MODEL");
         (void)rank_session_compat(a, a.rank);
         return 0;  // CPU only: before transport, DeviceForward and drafter construction.
+    }
+    const char* const print_plan_env = std::getenv("STRIX_PRINT_EXEC_PLAN");
+    if (a.print_plan || (print_plan_env != nullptr && std::strcmp(print_plan_env, "1") == 0)) {
+        if (a.model.empty()) throw std::invalid_argument("--print-plan requires MODEL.gguf");
+        if (a.transport == "single") throw std::invalid_argument("common plan inspection requires a TP2 rank view");
+        const auto model = strix::deepseek41::validate_target(strix::deepseek41::read_file(a.model));
+        const auto graph = strix::deepseek41::model_graph_from_config(model.config);
+        const auto native_plan = strix::deepseek41::build_decode_plan(
+            model, a.first_layer, a.layers, a.first_layer == 0U, a.role != "pipeline-record");
+        const auto common_plan = strix::deepseek41::common_decode_plan(native_plan, graph, a.rank);
+        // Adapter validation checks graph identity, layers, rank owners, state and buffers.
+        std::printf("%s%s", strix::model_graph::dump(graph).c_str(), strix::model_graph::dump(common_plan).c_str());
+        if (a.print_plan) return 0;  // host-only; env inspection continues the existing execution
     }
     strix::LoaderCapture loader_capture(a.session_bytes || !a.session_save.empty() || !a.session_load.empty());
     if (a.session_validate_only && a.session_load.empty())

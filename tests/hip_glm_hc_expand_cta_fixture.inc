@@ -110,7 +110,7 @@ void test_hc_expand_cta(std::mt19937& g, bool timing) {
                                     hok(hipEventRecord(start, nullptr), "CTA start");
                                     for (unsigned rep = 0; rep < repeats; ++rep) run(cta_rows, true);
                                     hok(hipEventRecord(stop, nullptr), "CTA stop");
-                                    times[cta_rows - 1].push_back(ms_between(start, stop) / repeats);
+                                    times[cta_rows - 1].push_back(ms_between(start, stop) / static_cast<float>(repeats));
                                 }
                             for (auto& t : times) std::sort(t.begin(), t.end());
                             const float a = (times[0][3] + times[0][4]) * 0.5F, b = (times[1][3] + times[1][4]) * 0.5F;

@@ -3093,7 +3093,7 @@ void hc_expand_norm_rows_cta(unsigned cta_rows, unsigned hoist, const float* X, 
     if (hoist > 2) throw std::invalid_argument("hc expand hoist must be 0, 1 or 2");
     if (rows == 0) return;
     if (cta_rows == 1 && hoist == 0 && y1 == nullptr) {
-        hc_expand_norm_rows_kernel<<<rows, 256, 0, s>>>(X, mix, y, Xo, rr, flag);
+        hc_expand_norm_rows_kernel<false, 0><<<rows, 256, 0, s>>>(X, mix, y, nullptr, Xo, rr, flag);
         ok(hipGetLastError(), "glm pf hc_expand_norm_rows original control");
         return;
     }
@@ -3109,9 +3109,9 @@ void hc_expand_norm_rows_cta(unsigned cta_rows, unsigned hoist, const float* X, 
 
 bool hc_expand_cta_resources() {
     hipFuncAttributes original{};
-    ok(hipFuncGetAttributes(&original, reinterpret_cast<const void*>(hc_expand_norm_rows_kernel)), "hc expand original attributes");
+    ok(hipFuncGetAttributes(&original, reinterpret_cast<const void*>(hc_expand_norm_rows_kernel<false, 0>)), "hc expand original attributes");
     int blocks = 0;
-    ok(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, hc_expand_norm_rows_kernel, 256, 0), "hc expand original occupancy");
+    ok(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, hc_expand_norm_rows_kernel<false, 0>, 256, 0), "hc expand original occupancy");
     std::printf("hc-expand-resources original threads=256 regs=%d lds=%zu local=%zu max_threads=%d blocks_per_cu=%d\n",
                 original.numRegs, original.sharedSizeBytes, original.localSizeBytes, original.maxThreadsPerBlock, blocks);
     bool pass = original.maxThreadsPerBlock >= 256 && blocks > 0 && original.localSizeBytes == 0;

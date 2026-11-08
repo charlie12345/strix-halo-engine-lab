@@ -110,7 +110,7 @@ inline const std::vector<EnvItem>& env_items() {
         {"pf-hc-hoist", "STRIX_GLM_PF_HC_HOIST", "1", "0",
          "Measurement: the fused mHC expand issues its loads (y, or y0 + y1 with the partial sum on load) ahead of its 16 dependent steps, bitwise on the device stress set (47 checks, 0 failures) (=0 keeps the loads inside each step)", false, true},
         {"pf-hc-expand-rows", "STRIX_GLM_PF_HC_EXPAND_ROWS", "2", "1",
-         "Measurement: fused mHC expand + norm runs two rows per block (also on the TP2 pair-sum path), same per-row operation order, logits bitwise on the pair; 8K TTFT 13.671 -> 13.611 s (-0.44 %) (=1 restores one row per block)", false, true},
+         "Measurement: fused mHC expand + norm runs two rows per block (also on the TP2 pair-sum path), same per-row operation order, logits bitwise on the pair; 8K TTFT 13.671 -> 13.611 s (-0.44 %) (=1 restores one row per block)", true, true},
     };
     return items;
 }

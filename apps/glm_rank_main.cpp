@@ -368,6 +368,7 @@ int main(int argc, char** argv) {
         };
         const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
         std::uint64_t prefill_margin = 0;
+        std::uint64_t prefill_first_forward = 0;
         const auto lr = eng.load([&](const ge::mem::LoadAdmission& admission) {
             namespace pf = strix::glm::pf;
             namespace mem = strix::glm::engine::mem;
@@ -375,7 +376,7 @@ int main(int argc, char** argv) {
             prefill_margin = std::max(pf::admission_margin_bytes(), admission.margins.ram);
             if (rd::max_rows_auto(eff)) prefill_margin = std::max(prefill_margin, rd::kMaxRowsSafetyBytes);
             if (rd::max_rows_auto(eff)) {
-                const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, rd::kAutoMaxRows, opt.mtp, pf_tier);
+                const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
                 const auto comm_bytes = opt.world > 1 && !admission.recheck
                     ? std::uint64_t{rd::kAutoMaxRows} * (3 * 4096 * 4 + 16) + 16384 : 0;
                 rd::select_max_rows(eff, [&] {
@@ -406,25 +407,34 @@ int main(int argc, char** argv) {
                 if (comm) comm->resize_bytes(std::size_t{opt.max_rows} * 4096 * sizeof(float) + 4096);
             }
             std::fprintf(stderr, "rank %u max-rows=%u (%s)\n", opt.rank, opt.max_rows, eff.max_rows.source.c_str());
+            return opt.max_rows;
+        }, [&](const ge::mem::LoadAdmission& admission) {
+            namespace pf = strix::glm::pf;
+            namespace mem = strix::glm::engine::mem;
+            prefill_first_forward = admission.first_forward_reserve;
             // The recheck sees actual communication pools and the replanned row
             // count; the provisional auto callback still has the 8192-row plan.
             // Explicit sizes and --mem-plan also admit before the first weight.
             if (prefill_mode != "ref" && (!opt.auto_rows || admission.recheck)) {
-                const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows, opt.mtp, pf_tier);
+                const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows, opt.mtp, pf_tier, admission.kv_shard);
                 const auto comm_bytes = opt.world > 1 && !admission.recheck
                     ? std::uint64_t{opt.max_rows} * (3 * 4096 * 4 + 16) + 16384 : 0;
                 pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
-                std::fprintf(stderr, "rank %u prefill admission: path %.3f GiB, workspace %.3f GiB, install/staging %.3f GiB, late safety %.3f GiB, startup reserve %.3f GiB\n",
+                std::fprintf(stderr, "rank %u prefill admission: path %.3f GiB, workspace %.3f GiB, install/staging %.3f GiB, late safety %.3f GiB, first-forward reserve %.3f GiB, layout %s%s\n",
                              opt.rank, mem::gib(b.path), mem::gib(b.workspace), mem::gib(admission.prefill_install),
-                             mem::gib(prefill_margin), mem::gib(prefill_margin));
+                             mem::gib(prefill_margin), mem::gib(prefill_first_forward),
+                             admission.kv_shard ? "sharded" : "replicated", admission.candidate ? " (candidate)" : "");
             }
-            if (pf_before_load && !mem_plan && (!opt.auto_rows || admission.recheck)) {
+            if (!admission.candidate && pf_before_load && !mem_plan && (!opt.auto_rows || admission.recheck)) {
                 eng.set_prefill(pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
-                                                      pf_tier, prefill_margin));
+                                                      pf_tier, prefill_margin, admission.kv_shard, prefill_first_forward));
                 std::printf("rank %u prefill %s set before load\n", opt.rank, prefill_mode.c_str());
             }
-            return opt.max_rows;
         });
+        eff.kv_shard = eng.kv_shard_enabled();
+        if (eff.kv_shard_auto || eff.kv_shard)
+            std::printf("rank %u kv-shard effective=%u identity=%s\n", opt.rank, eff.kv_shard ? 1U : 0U,
+                        eff.kv_shard ? strix::glm::kvshard::numerical_identity : "replicated");
         const auto load_identity = eng.identity_mode();
         std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) identity %s decode-xch %s%s%s%s%s", opt.rank, lr.seconds,
                     lr.gib_read, lr.device_gib, opt.layers, opt.mtp ? 1 : 0, ge::identity_mode_name(load_identity),
@@ -450,11 +460,11 @@ int main(int argc, char** argv) {
         if (prefill_mode != "ref" && !pf_before_load) {  // chunked prefill, installed after the load so its admission check sees real free memory
             namespace pf = strix::glm::pf;
             const unsigned heads = 64 / opt.world;
-            const auto b = pf::prefill_budget(heads, heads, opt.capacity, opt.max_rows, opt.mtp, pf_tier);
+            const auto b = pf::prefill_budget(heads, heads, opt.capacity, opt.max_rows, opt.mtp, pf_tier, eff.kv_shard);
             std::shared_ptr<ge::PrefillPath> path;
             try {
                 path = pf::make_prefill_path(heads, heads, opt.capacity, opt.max_rows,
-                                             pf_tier, prefill_margin);
+                                             pf_tier, prefill_margin, eff.kv_shard, prefill_first_forward);
             } catch (const std::exception& e) {
                 // world 2: the ranks must run the same prefill (chunk vs row exchanges pair up), so no per-rank fallback
                 if (prefill_requested != "auto" || opt.world != 1) throw;

@@ -6,6 +6,9 @@
 // descriptors are built on the device from CallCtx::slot_d / pos_d (no host copies). STRIX_GLM_ATTN=ref keeps DefaultAttn.
 #include "glm/engine/glm_fast_attn.hpp"
 #include "glm/engine/glm_r1b.hpp"
+#include "glm/engine/glm_kvshard.hpp"
+#include "glm/engine/glm_kvshard_dump.hpp"
+#include <cstdlib>
 
 #include "glm/attn/glm_attn_fast.hpp"
 #include "glm/attn/glm_attn_tierb.hpp"
@@ -44,6 +47,7 @@ class FastAttn final : public AttnPath {
 public:
     FastAttn(unsigned kda_heads, unsigned mla_heads, std::uint64_t cap)
         : Hk_(kda_heads), Hm_(mla_heads), C_(kda_heads * kKdaDim), cap_(cap), kstride_(static_cast<unsigned>(cap / kKpool)) {
+        if (const char* directory = std::getenv("STRIX_GLM_KVSHARD_DUMP")) dump_directory_ = directory;
         constexpr std::size_t R = F::kMaxRows;
         qkv3_ = dalloc<float>(3 * R * C_);
         qkv_ = dalloc<float>(R * 3 * C_);
@@ -127,7 +131,12 @@ public:
 
     void dsa(const DsaLayerWeights& w, DsaState& st, const CallCtx& c, const float* x, float* y) override {
         if (w.heads != Hm_ || st.cap != cap_) throw std::invalid_argument("fast attention: DSA heads / capacity");
+        if (st.shard != nullptr && (c.rows.size() != 1 || c.spec != nullptr || Hm_ != 32))
+            throw std::invalid_argument("kvshard: single-row TP2 plain decode required");
         if (w.kv_a.raw.output != kKvLora || w.q_a.raw.output != kQLora) throw std::invalid_argument("fast attention: q_a / kv_a width");
+        // The existing filename contract describes committed slot-0 decode only.
+        const bool dumping = !dump_directory_.empty() && c.rows.size() == 1 &&
+                             c.rows[0].slot == 0 && c.spec == nullptr;
         const D::IndexerDev iw{w.wk, w.gate, w.weights_proj, w.k_norm_w, w.k_norm_b, w.ape};
         for (std::size_t r0 = 0; r0 < c.rows.size(); r0 += F::kMaxRows) {
             const auto n = static_cast<unsigned>(std::min<std::size_t>(F::kMaxRows, c.rows.size() - r0));
@@ -158,22 +167,47 @@ public:
                                        {w.weights_proj, xr, wraw_, kIdxHeads, kHidden, kHidden, kIdxHeads}};
             F::dense_f16(j3, 3, n, c.stream);
             dsa_rows_kernel<<<1, F::kMaxRows, 0, c.stream>>>(c.slot_d + r0, c.pos_d + r0, st.latent, st.ikey, st.igate, st.pooled,
-                                                              static_cast<unsigned>(st.cap), slots_, tpos_, n);
+                                                              static_cast<unsigned>(st.shard ? kvshard::storage_tokens(st.cap) : st.cap), slots_, tpos_, n);
             hip_ok(hipGetLastError(), "dsa rows");
             const F::DsaRows d{slots_, tpos_, n};
-            if (c.spec) F::dsa_store(d, lat_, key_, gt_, iw, hist_, c.spec->row_flag + r0, c.stream, 1);  // C3/C4 per row
+            if (st.shard) st.shard->append(st, c, d, lat_, key_, gt_, iw, hist_);
+            else if (c.spec) F::dsa_store(d, lat_, key_, gt_, iw, hist_, c.spec->row_flag + r0, c.stream, 1);  // C3/C4 per row
             else F::dsa_store(d, lat_, key_, gt_, iw, hist_, c.flag, c.stream);
             // At most kIdxPools visible pools in every row: indexer_select takes them all and never reads the keys or the
             // histogram, so their computation is skipped (no cache writes happen there).
-            if (p_bound > kIdxPools) F::indexer_score(d, qI_, wraw_, keys_, kstride_, hist_, p_bound, c.stream, c.spec != nullptr);
+            if (st.shard) st.shard->prepare(st, c, d, qI_, wraw_, keys_, kstride_, hist_, q_, w.kv_b, mw_, p_bound > kIdxPools || dumping);
+            else if (p_bound > kIdxPools || dumping) {
+                F::indexer_score(d, qI_, wraw_, keys_, kstride_, hist_, p_bound, c.stream, c.spec != nullptr);
+            }
             F::indexer_select(d, keys_, kstride_, hist_, tok_, ntok_, c.stream);
-            F::mla_attention(d, tok_, ntok_, q_, w.kv_b, Hm_, mw_, o_, c.stream, static_cast<unsigned>(std::min<std::uint64_t>(t_vis, 1U << 30)));
+            if (st.shard) st.shard->attention(st, c, d, tok_, ntok_, q_, w.kv_b, mw_, o_);
+            else F::mla_attention(d, tok_, ntok_, q_, w.kv_b, Hm_, mw_, o_, c.stream, static_cast<unsigned>(std::min<std::uint64_t>(t_vis, 1U << 30)));
+            if (dumping) dump_decode(st, c);
             if (raw(w.o)) TB::dsa_o(mat(w.o), o_, Hm_ * kMlaDim, n, y + r0 * kHidden, kHidden, tb_ws_, c.stream);
             else c.lin->run(w.o, o_, y + r0 * kHidden, n, c.stream);
         }
     }
 
 private:
+    // Observe production selection and the local MLA output before w.o. No device writes.
+    void dump_decode(const DsaState& st, const CallCtx& c) const {
+        std::uint32_t count = 0;
+        hip_ok(hipMemcpyAsync(&count, ntok_, sizeof(count), hipMemcpyDeviceToHost, c.stream), "DSA dump count");
+        hip_ok(hipStreamSynchronize(c.stream), "DSA dump count wait");
+        if (count > F::kTokStride) throw std::runtime_error("kvshard: invalid debug selection size");
+        const auto position = c.rows[0].pos;
+        std::vector<std::uint32_t> selected(count), scores(static_cast<std::size_t>((position + 1) / kKpool));
+        std::array<float, 16> output{};
+        if (!selected.empty())
+            hip_ok(hipMemcpyAsync(selected.data(), tok_, selected.size() * sizeof(std::uint32_t), hipMemcpyDeviceToHost, c.stream), "DSA dump IDs");
+        if (!scores.empty())
+            hip_ok(hipMemcpyAsync(scores.data(), keys_, scores.size() * sizeof(std::uint32_t), hipMemcpyDeviceToHost, c.stream), "DSA dump keys");
+        hip_ok(hipMemcpyAsync(output.data(), o_, sizeof(output), hipMemcpyDeviceToHost, c.stream), "DSA dump output");
+        hip_ok(hipStreamSynchronize(c.stream), "DSA dump wait");
+        kvshard::write_decode_dump(dump_directory_, st.dump_rank, st.dump_epoch, st.shard_layer, position, selected, scores);
+        kvshard::write_attention_dump(dump_directory_, st.dump_rank, st.dump_epoch, st.shard_layer, position, output);
+    }
+
     // Speculative verify (design notes section 1): R consecutive rows of ONE slot through dev::kda_verify (deferred
     // replay of the slot's pending rows from set cur, new rows' raw qkv / prep outputs into set 1 - cur). With
     // SpecRows::seg (Engine::verify_multi) the windows of several slots: the projections run batched over all rows (row
@@ -260,6 +294,7 @@ private:
         else c.lin->run(w.o, ky_, y, n, c.stream);
     }
 
+    std::string dump_directory_;
     unsigned Hk_, Hm_, C_;
     std::uint64_t cap_;
     unsigned kstride_;

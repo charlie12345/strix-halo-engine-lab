@@ -255,6 +255,48 @@ void test_silent_peer() {
     expect(ms < 1500.0, "the deadline is honoured (" + std::to_string(ms) + " ms)");
     std::cout << "silent peer: failed after " << ms << " ms: " << message << '\n';
 }
+void test_small_ordered() {
+    // Cross the former eager limit and the opt-in cap, with partial I/O and a
+    // peer delayed beyond the spin budget. Also preserve eager=0's worker route.
+    for (const char* mode : {"0", "1"}) for (const char* eager : {"65536", "0"}) {
+        ::setenv("STRIX_XPORT_SMALL_SPIN", mode, 1);
+        ::setenv("STRIX_DIST_USB4_EAGER", eager, 1);
+        auto pair = make_pair(2, 0, std::chrono::milliseconds(5000), true, 4096);
+        ::unsetenv("STRIX_DIST_USB4_EAGER");
+        ::unsetenv("STRIX_XPORT_SMALL_SPIN");
+        for (const std::size_t bytes : {std::size_t{64}, std::size_t{73848}, std::size_t{131192},
+                                      std::size_t{262144}, std::size_t{262145}}) {
+            std::vector<std::byte> a(bytes, std::byte{0x35}), b(bytes, std::byte{0x7a}), x(bytes), y(bytes);
+            std::exception_ptr error;
+            std::thread peer([&] {
+                try {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    pair.b->exchange(b, y);
+                } catch (...) { error = std::current_exception(); }
+            });
+            std::exception_ptr local_error;
+            try { pair.a->exchange(a, x); } catch (...) { local_error = std::current_exception(); }
+            peer.join();
+            if (local_error) std::rethrow_exception(local_error);
+            if (error) std::rethrow_exception(error);
+            expect(x == b && y == a, "ordered small exchange preserves every byte across eager/cap boundaries");
+        }
+    }
+    ::setenv("STRIX_XPORT_SMALL_SPIN", "1", 1);
+    auto silent = make_pair(2, 0, std::chrono::milliseconds(100), true, 4096);
+    auto cancelled = make_pair(2, 0, std::chrono::milliseconds(5000), true, 4096);
+    ::unsetenv("STRIX_XPORT_SMALL_SPIN");
+    std::vector<std::byte> tx(73848), rx(tx.size());
+    std::string error;
+    try { silent.a->exchange(tx, rx); } catch (const std::exception& e) { error = e.what(); }
+    expect(error.find("no progress") != std::string::npos, "ordered small spin falls back to the progress deadline");
+    error.clear();
+    std::thread blocked([&] { try { cancelled.a->exchange(tx, rx); } catch (const std::exception& e) { error = e.what(); } });
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    cancelled.a->abort("ordered small cancellation");
+    blocked.join();
+    expect(error.find("ordered small cancellation") != std::string::npos, "ordered small exchange retains cancellation");
+}
 // exchange_overlapped (STRIX_DIST_CRC_DEFER's TX CRC during the wire): the hook runs exactly once per exchange on the
 // calling thread, on the eager path and on the stream threads' path, and the bytes are the same as exchange().
 void test_on_wire() {
@@ -303,6 +345,7 @@ int main() try {
     test_on_wire();
     test_peer_failure();
     test_silent_peer();
+    test_small_ordered();
     if (failures == 0) std::cout << "dist transport tests passed\n";
     return failures == 0 ? 0 : 1;
 } catch (const std::exception& error) {

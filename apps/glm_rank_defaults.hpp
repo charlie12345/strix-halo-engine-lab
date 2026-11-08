@@ -10,6 +10,7 @@
 #pragma once
 
 #include "glm_model_facts.hpp"
+#include "glm/engine/glm_kvshard_layout.hpp"
 #include "strix/engine_profile.hpp"
 
 #include <cstdint>
@@ -208,6 +209,7 @@ struct Value {
 
 struct Effective {
     bool baseline = false;
+    bool kv_shard = false, kv_shard_auto = false;
     Value identity, prefill_requested, mtp, mtp_spec, spec, decode_xch, max_rows;
     ModelFacts head;
     bool mtp_spec_candidate = false;
@@ -274,6 +276,17 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         e.env[it.env] = {v.value, v.source == Source::env || v.source == Source::cli ? "explicit" :
                                 v.source == Source::baseline ? "baseline" : "default"};
     }
+    const std::string shard_policy = env("STRIX_GLM_KV_SHARD") ? env("STRIX_GLM_KV_SHARD") : "0";
+    if (shard_policy != "0" && shard_policy != "1" && shard_policy != "auto")
+        throw std::invalid_argument("STRIX_GLM_KV_SHARD must be 0, 1 or auto");
+    e.kv_shard = shard_policy == "1";
+    e.kv_shard_auto = shard_policy == "auto";
+    if (e.kv_shard || e.kv_shard_auto) {
+        if (e.mtp.value != "0" || e.spec.value != "0" || e.prefill == "ref" || r.xch == "xfer")
+            throw std::invalid_argument("STRIX_GLM_KV_SHARD: draft requires --mtp 0 --mtp-spec 0 --spec 0, chunked prefill and internal transport");
+        if (e.kv_shard && e.decode_xch.source != "explicit")
+            e.decode_xch = {"xfer", "kv-shard-draft"};  // device 11-08: Xfer TP is faster under sharding (8K 41.8 vs 43.9 ms/token with comm)
+    }
     return e;
 }
 
@@ -309,6 +322,8 @@ inline std::string print(const Effective& e) {
     auto line = [&](const std::string& k, const Value& v) { s += "effective " + k + "=" + v.value + " (" + v.source + ")\n"; };
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
     line("identity", e.identity);
+    if (e.kv_shard_auto) s += "effective kv-shard-policy=auto (pending calibrated load + unified prefill admission and rank vote)\n";
+    if (e.kv_shard) s += std::string("effective kv-shard=") + kvshard::numerical_identity + " (draft; owned pools; bounded temporary prefill)\n";
     line("mtp", e.mtp);
     line("mtp-spec", e.mtp_spec);
     line("spec", e.spec);

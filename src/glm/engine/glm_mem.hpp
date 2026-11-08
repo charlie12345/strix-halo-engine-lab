@@ -144,6 +144,9 @@ struct LoadAdmission {
     // Retained load allocations only: HIP's requested-byte ledger and the
     // calibrated backing cost for MemAvailable. Temporary load staging is freed.
     std::uint64_t post_load_device_bytes = 0, post_load_host_bytes = 0;
+    bool kv_shard = false;
+    bool candidate = false;  // admission only; never install a path while voting
+    std::uint64_t first_forward_reserve = 0;
 };
 
 // From a calibration: `measured` bytes per allocation of `size` (delta of gtt_used over K touched allocations / K).

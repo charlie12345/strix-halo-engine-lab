@@ -7,6 +7,7 @@
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/prefill/glm_pf_workspace.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
+#include <functional>
 
 namespace strix::glm::pf {
 
@@ -27,7 +28,8 @@ void set_kda_scan_version(unsigned v);
 // Cache writes for rows t0 .. t0 + C - 1 (latent [C][512] normed, key / gate [C][128] = the R1 wk / gate outputs of
 // the rows) and every pool completed by them (R12). C3/C4 -> flag.
 void dsa_append_rows(const dev::DsaSlot& slot, unsigned t0, const float* latent, const float* key, const float* gate,
-                     const dev::IndexerDev& w, unsigned* flag, unsigned C, hipStream_t s);
+                     const dev::IndexerDev& w, unsigned* flag, unsigned C, hipStream_t s,
+                     bool kv_shard = false, unsigned rank = 0);
 
 // Canonical token lists of rows t0 .. t0 + C - 1 (section 1.4): tokens [C][2051], n [C].
 //   qI [C][32 * 128] (wq_b outputs), wh [C][32] = R1 weights_proj outputs, unscaled on entry. Only when some row of the
@@ -38,7 +40,8 @@ void indexer_select_rows(const dev::DsaSlot& slot, unsigned t0, const float* qI,
 // Capacity-independent workspace: keys [C][kIndexerKeyStride]. Same canonical
 // list, with stable top-512 carried across fixed pool windows; no submit allocation.
 void indexer_select_rows_bounded(const dev::DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,
-                                 std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s, unsigned score_v = 0);
+                                 std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s, unsigned score_v = 0,
+                                 const std::function<const float*(unsigned, unsigned)>& pool_window = {});
 // Explicit versions for bitwise gates and paired timing: scores 1/2/3 (same keys), select 1/2 (same lists). The default
 // entry point runs scores 3 + select 2; STRIX_GLM_PF_IDX=2 / STRIX_GLM_PF_SELECT=1 restore the previous ones.
 void indexer_select_rows_versions(const dev::DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,

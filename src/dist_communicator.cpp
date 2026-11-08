@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include "xport/small_progress.hpp"
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -201,11 +202,18 @@ private:
     void run() {
         std::uint64_t seen = 0;
         while (true) {
-            const auto spin_end = std::chrono::steady_clock::now() +
-                std::chrono::microseconds(idle_spin_us_.load(std::memory_order_relaxed));
-            while (posted_.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_acquire) &&
-                   std::chrono::steady_clock::now() < spin_end)
-                cpu_relax();
+            if (small_spin_) {
+                const auto spin_budget = std::chrono::microseconds(idle_spin_us_.load(std::memory_order_relaxed));
+                xport::spin_small_mailbox([&] {
+                    return posted_.load(std::memory_order_acquire) != seen || stop_.load(std::memory_order_acquire);
+                }, [] { cpu_relax(); }, std::min(spin_budget, xport::SmallProgress::mailbox_spin));
+            } else {
+                const auto spin_end = std::chrono::steady_clock::now() +
+                    std::chrono::microseconds(idle_spin_us_.load(std::memory_order_relaxed));
+                while (posted_.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_acquire) &&
+                       std::chrono::steady_clock::now() < spin_end)
+                    cpu_relax();
+            }
             if (posted_.load(std::memory_order_acquire) == seen) {
                 std::unique_lock lock(mutex_);
                 wake_.wait(lock, [&] { return stop_.load(std::memory_order_acquire) || posted_.load(std::memory_order_acquire) != seen; });
@@ -223,6 +231,7 @@ private:
     std::atomic<std::uint64_t> posted_{0}, finished_{0};
     std::atomic<bool> stop_{false};
     std::atomic<std::int64_t> idle_spin_us_{worker_spin().count()};
+    const bool small_spin_ = xport::SmallProgress::parse(std::getenv("STRIX_XPORT_SMALL_SPIN"));
     std::thread thread_;
 };
 
@@ -311,6 +320,7 @@ public:
             return result;
         };
         try {
+            small_spin_ = xport::SmallProgress::parse(std::getenv("STRIX_XPORT_SMALL_SPIN"));
             const auto write_cpus = cpus("STRIX_DIST_USB4_WRITE_CPUS");
             const auto read_cpus = cpus("STRIX_DIST_USB4_READ_CPUS");
             for (std::size_t i = 0; i < fds_.size(); ++i) {
@@ -337,11 +347,11 @@ public:
     void receive(std::span<std::byte> message) override { run(nullptr, &message); }
     void exchange(std::span<const std::byte> out, std::span<std::byte> in) override {
         if (out.size() != in.size()) fail("usb4 exchange: both directions carry the same size");
-        run(&out, &in);
+        run(&out, &in, nullptr, nullptr, small_spin_ && xport::SmallProgress::eligible(out.size()));
     }
     void exchange_overlapped(std::span<const std::byte> out, std::span<std::byte> in, void (*on_wire)(void*), void* context) override {
         if (out.size() != in.size()) fail("usb4 exchange: both directions carry the same size");
-        run(&out, &in, on_wire, context);
+        run(&out, &in, on_wire, context, small_spin_ && xport::SmallProgress::eligible(out.size()));
     }
     // Both ranks the same table (the pairing carries rank 0's in its plan).
     void set_stream_table(const std::array<std::pair<std::size_t, std::size_t>, 4>& table) { table_ = table; }
@@ -486,7 +496,7 @@ private:
     // on_wire (if any) runs once, in the first pass after which every write is handed to the driver (the reads then wait
     // for the peer), or at the end.
     void eager(const std::span<const std::byte>* out, const std::span<std::byte>* in, std::size_t used, void (*on_wire)(void*) = nullptr,
-               void* context = nullptr) {
+               void* context = nullptr, bool small_ordered = false) {
         std::array<std::span<const std::byte>, 8> wpart{};
         std::array<std::span<std::byte>, 8> rpart{};
         std::array<std::size_t, 8> wdone{}, rdone{};
@@ -508,6 +518,9 @@ private:
             }
         }
         auto deadline = std::chrono::steady_clock::now() + timeout_;
+        // One spin budget per exchange, never renewed by partial reads/writes.
+        const auto spin_deadline = small_ordered ? std::chrono::steady_clock::now() + xport::SmallProgress::wire_spin
+                                                : std::chrono::steady_clock::time_point{};
         std::array<pollfd, 16> fds{};
         std::array<std::size_t, 16> stream{};
         while (open) {
@@ -557,6 +570,7 @@ private:
                 fail_stream(k, std::string(wdone[k] < wpart[k].size() ? "write" : "read") + ": no progress within " + std::to_string(timeout_.count()) + " ms");
             }
             if (spin_) { cpu_relax(); continue; }
+            if (small_ordered && now < spin_deadline) { cpu_relax(); continue; }
             std::size_t n = 0;
             for (std::size_t k = 0; k < used; ++k) {
                 const short events = static_cast<short>((wdone[k] < wpart[k].size() ? POLLOUT : 0) | (rdone[k] < rpart[k].size() ? POLLIN : 0));
@@ -583,20 +597,23 @@ private:
         aborted_.store(true, std::memory_order_release);
         fail(text);
     }
-    void run(const std::span<const std::byte>* out, const std::span<std::byte>* in, void (*on_wire)(void*) = nullptr, void* context = nullptr) {
+    void run(const std::span<const std::byte>* out, const std::span<std::byte>* in, void (*on_wire)(void*) = nullptr,
+             void* context = nullptr, bool small_ordered = false) {
         if (poisoned_.load(std::memory_order_acquire)) {
             std::lock_guard lock(root_mutex_);
             fail("usb4 host transport: unusable after an earlier stream failure (" + (poison_.empty() ? root_ : poison_) + ")");
         }
         const std::size_t size = out ? out->size() : in->size();
         const std::size_t used = streams_for(size);
-        if (size <= eager_) {
+        // An explicit eager=0 still disables eager dispatch. Only the ordered
+        // opt-in admits the slightly larger single-token attention frames here.
+        if (size <= eager_ || (small_ordered && eager_ != 0)) {
             if (traffic_) {
                 ++eager_messages_;
                 eager_bytes_ += size;
             }
             try {
-                eager(out, in, used, on_wire, context);
+                eager(out, in, used, on_wire, context, small_ordered);
                 return;
             } catch (...) {
                 if (!aborted_.load(std::memory_order_acquire)) throw;
@@ -669,6 +686,7 @@ private:
     std::size_t min_part_ = 0, eager_ = 0;
     std::array<std::pair<std::size_t, std::size_t>, 4> table_{}; // (message bytes up to, streams), STRIX_DIST_USB4_STREAMS
     std::chrono::milliseconds timeout_;
+    bool small_spin_ = false;
     const bool spin_ = [] { const char* v = std::getenv("STRIX_DIST_USB4_SPIN"); return v && v[0] == '1'; }();
     std::atomic<bool> aborted_{false};
     std::atomic<bool> poisoned_{false};
@@ -2164,6 +2182,12 @@ Communicator::~Communicator() {
     if (pre_copy_) (void)hipEventDestroy(pre_copy_);
     if (h2d_done_) (void)hipEventDestroy(h2d_done_);
     if (trace_) std::fclose(trace_);
+}
+
+void Communicator::release_transport(hipStream_t stream) {
+    quiesce(stream);
+    drain_tail();
+    check(hipStreamSynchronize(stream), "communicator transport handoff");
 }
 
 void Communicator::quiesce(hipStream_t stream) {

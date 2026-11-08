@@ -3,6 +3,8 @@
 // host loop it reproduces and how the lanes map onto the declared reduction (R1 chains, R2 halving trees).
 // Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 #include "glm/attn/glm_attn_fast.hpp"
+#include "glm/attn/glm_dsa_policy.hpp"
+#include "glm/common/glm_dsa_pool.hpp"
 #include "glm/kernels/glm_tree.hpp"
 
 #include <algorithm>
@@ -782,17 +784,8 @@ __global__ __launch_bounds__(128) void dsa_pool_kernel(DsaRows d, dev::IndexerDe
     const unsigned t = d.tpos[r];
     if ((t + 1) % kKpool == 0) {
         const unsigned t0 = t + 1 - kKpool;
-        float l4[kKpool], kk[kKpool], e[kKpool], p[kKpool];
-        for (unsigned j = 0; j < kKpool; ++j) {
-            l4[j] = bf16_to_float(sl.igate[static_cast<std::size_t>(t0 + j) * kIdxDim + i]) + w.ape[j * kIdxDim + i];
-            kk[j] = bf16_to_float(sl.ikey[static_cast<std::size_t>(t0 + j) * kIdxDim + i]);
-        }
-        float m = l4[0];
-        for (unsigned j = 1; j < kKpool; ++j) m = l4[j] > m ? l4[j] : m;
-        for (unsigned j = 0; j < kKpool; ++j) e[j] = declared_exp(l4[j] - m);
-        const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-        for (unsigned j = 0; j < kKpool; ++j) p[j] = e[j] / sum;
-        const float K = ((p[0] * kk[0] + p[1] * kk[1]) + p[2] * kk[2]) + p[3] * kk[3];
+        const auto offset = static_cast<std::size_t>(t0) * kIdxDim;
+        const float K = dsa_pool_channel(sl.ikey + offset, sl.igate + offset, w.ape, i);
         if (!is_finite(K)) atomicOr(flag, 1U);
         sl.pooled[static_cast<std::size_t>(t / kKpool) * kIdxDim + i] = K;
     }
@@ -1173,8 +1166,10 @@ __global__ __launch_bounds__(128) void mla_absorb_kernel(const float* q, const s
 // l-ascending); qt of the 16 heads in LDS (broadcast reads). Per-head max over the block -> atomicMax of the ordered key
 // (a max is exact in any order).
 constexpr unsigned kScHeads = 16, kScThreads = 64;
+template <class Policy = DsaAttentionPolicy<false>, class... Context>
 __global__ __launch_bounds__(kScThreads) void mla_scores_lane_kernel(DsaRows d, const std::uint32_t* tokens, const std::uint32_t* n,
-                                                                const float* qt, unsigned H, float* sc, std::uint32_t* mkey) {
+                                                                const float* qt, unsigned H, float* sc, std::uint32_t* mkey,
+                                                                Context... context) {
     __shared__ float4 qs[kScHeads * kKvLora / 4];
     const unsigned r = blockIdx.z, hg = blockIdx.y * kScHeads, l = threadIdx.x;
     const unsigned nr = n[r], t = blockIdx.x * kScThreads + l;
@@ -1184,7 +1179,7 @@ __global__ __launch_bounds__(kScThreads) void mla_scores_lane_kernel(DsaRows d, 
     __syncthreads();
     const bool valid = t < nr;
     const std::uint32_t pos = tokens[static_cast<std::size_t>(r) * kTokStride + (valid ? t : 0)];
-    const uint4* lat = reinterpret_cast<const uint4*>(d.slots[r].latent + static_cast<std::size_t>(pos) * kKvLora);
+    const uint4* lat = reinterpret_cast<const uint4*>(d.slots[r].latent + static_cast<std::size_t>(Policy::address(pos, context...)) * kKvLora);
     float acc[kScHeads];
 #pragma unroll
     for (unsigned hh = 0; hh < kScHeads; ++hh) acc[hh] = 0.0F;
@@ -1206,7 +1201,11 @@ __global__ __launch_bounds__(kScThreads) void mla_scores_lane_kernel(DsaRows d, 
     }
 #pragma unroll
     for (unsigned hh = 0; hh < kScHeads; ++hh) {
-        const float v = acc[hh] * kMlaScale;
+        float v = acc[hh] * kMlaScale;
+        if constexpr (Policy::partial) {
+            if (valid && Policy::owns(pos, context...) && !is_finite(v)) (atomicOr(context.flag, 1U), ...);
+            if (!Policy::owns(pos, context...)) v = -__builtin_huge_valf();
+        }
         if (valid) sc[(static_cast<std::size_t>(r) * H + hg + hh) * kTokStride + t] = v;
         float m = valid ? v : -__builtin_huge_valf();
 #pragma unroll
@@ -1222,8 +1221,10 @@ __global__ __launch_bounds__(kScThreads) void mla_scores_lane_kernel(DsaRows d, 
 // each chain l-ascending as above. The 64 latent rows are streamed through LDS in 128-dim chunks by the whole block
 // (4 x 16 B per thread, rows padded to 17 x 16 B: conflict-free b128 reads); qt of the 16 heads in LDS.
 constexpr unsigned kSsTok = 64, kSsL = 128, kSsPad = kSsL / 8 + 1;
+template <class Policy = DsaAttentionPolicy<false>, class... Context>
 __global__ __launch_bounds__(256) void mla_scores_staged_kernel(DsaRows d, const std::uint32_t* tokens, const std::uint32_t* n,
-                                                                const float* qt, unsigned H, float* sc, std::uint32_t* mkey) {
+                                                                const float* qt, unsigned H, float* sc, std::uint32_t* mkey,
+                                                                Context... context) {
     __shared__ float4 qs[kScHeads * kKvLora / 4];
     __shared__ u32x4 lt[kSsTok][kSsPad];
     const unsigned r = blockIdx.z, hg = blockIdx.y * kScHeads, tau = threadIdx.x, t0 = blockIdx.x * kSsTok;
@@ -1238,7 +1239,7 @@ __global__ __launch_bounds__(256) void mla_scores_staged_kernel(DsaRows d, const
 #pragma unroll
     for (unsigned k = 0; k < 4; ++k) {
         const unsigned tt = t0 + (tau + 256 * k) / 16;
-        lrow[k] = latent + static_cast<std::size_t>(tok[tt < nr ? tt : 0]) * kKvLora + ((tau + 256 * k) % 16) * 8;
+        lrow[k] = latent + static_cast<std::size_t>(Policy::address(tok[tt < nr ? tt : 0], context...)) * kKvLora + ((tau + 256 * k) % 16) * 8;
     }
     const unsigned t = tau % kSsTok, hq = (tau / kSsTok) * 4;
     float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
@@ -1272,7 +1273,12 @@ __global__ __launch_bounds__(256) void mla_scores_staged_kernel(DsaRows d, const
     const bool valid = t0 + t < nr;
 #pragma unroll
     for (unsigned hh = 0; hh < 4; ++hh) {
-        const float v = acc[hh] * kMlaScale;
+        float v = acc[hh] * kMlaScale;
+        if constexpr (Policy::partial) {
+            const bool owned = Policy::owns(tok[valid ? t0 + t : 0], context...);
+            if (valid && owned && !is_finite(v)) (atomicOr(context.flag, 1U), ...);
+            if (!owned) v = -__builtin_huge_valf();
+        }
         if (valid) sc[(static_cast<std::size_t>(r) * H + hg + hq + hh) * kTokStride + t0 + t] = v;
         float m = valid ? v : -__builtin_huge_valf();
 #pragma unroll
@@ -1286,11 +1292,15 @@ __global__ __launch_bounds__(256) void mla_scores_staged_kernel(DsaRows d, const
 
 // softmax: host e_t = declared_exp(s_t - m); sum = tree_sum<256> (lane j: a = +0; a = a + e_t, t = j, j + 256, ...);
 // p_t = e_t / sum. One block of 256 lanes per (head, row).
+template <class Policy = DsaAttentionPolicy<false>, class... Context>
 __global__ __launch_bounds__(256) void mla_softmax_kernel(const std::uint32_t* n, const float* sc, const std::uint32_t* mkey,
-                                                          unsigned H, float* p) {
+                                                          unsigned H, float* p, Context... context) {
     __shared__ float s[256];
     const unsigned h = blockIdx.x, r = blockIdx.y, j = threadIdx.x, nr = n[r];
-    const float m = key_to_float(mkey[r * H + h]);
+    float m = key_to_float(mkey[r * H + h]);
+    if constexpr (Policy::partial) {
+        if (nr == 0) m = -__builtin_huge_valf();
+    }
     const float* sr = sc + (static_cast<std::size_t>(r) * H + h) * kTokStride;
     float* pr = p + (static_cast<std::size_t>(r) * H + h) * kTokStride;
     constexpr unsigned kPer = (kMaxTok + 255) / 256;
@@ -1299,14 +1309,22 @@ __global__ __launch_bounds__(256) void mla_softmax_kernel(const std::uint32_t* n
 #pragma unroll
     for (unsigned mm = 0; mm < kPer; ++mm) {
         const unsigned t = j + 256 * mm;
-        e[mm] = t < nr ? declared_exp(sr[t] - m) : 0.0F;
+        e[mm] = t < nr ? Policy::weight(sr[t], m) : 0.0F;
         if (t < nr) a = a + e[mm];
     }
     const float sum = lds_tree<256>(s, a);
+    if constexpr (Policy::partial) {
+        if (j == 0) {
+            const std::size_t offset = (static_cast<std::size_t>(r) * H + h) * (kKvLora + 2);
+            ((context.output[offset] = m), ...);
+            ((context.output[offset + 1] = sum), ...);
+            if (!is_finite(sum)) (atomicOr(context.flag, 1U), ...);
+        }
+    }
 #pragma unroll
     for (unsigned mm = 0; mm < kPer; ++mm) {
         const unsigned t = j + 256 * mm;
-        if (t < nr) pr[t] = e[mm] / sum;
+        if (t < nr) pr[t] = Policy::probability(e[mm], sum);
     }
 }
 
@@ -1314,9 +1332,9 @@ __global__ __launch_bounds__(256) void mla_softmax_kernel(const std::uint32_t* n
 // Block = 256 lanes j = threadIdx x HG heads x D latent dims (64 accumulators per lane; default 4 x 16). Tree:
 // levels 128, 64, 32 across waves through LDS, levels 16 .. 1 inside wave 0 with shuffles (lane j + off -> lane j).
 constexpr unsigned kPvHeads = 4, kPvDims = 16, kPvAcc = kPvHeads * kPvDims;
-template <unsigned HG, unsigned D>
+template <unsigned HG, unsigned D, class Policy = DsaAttentionPolicy<false>, class... Context>
 __global__ __launch_bounds__(256) void mla_pv_kernel_t(DsaRows d, const std::uint32_t* tokens, const std::uint32_t* n,
-                                                     const float* p, unsigned H, float* ob) {
+                                                     const float* p, unsigned H, float* ob, Context... context) {
     static_assert(HG * D == kPvAcc && (D == 16 || D == 8 || D == 4));
     __shared__ float buf[kPvAcc][128];
     const unsigned l0 = blockIdx.x * D, hg = blockIdx.y * HG, r = blockIdx.z, j = threadIdx.x;
@@ -1330,16 +1348,16 @@ __global__ __launch_bounds__(256) void mla_pv_kernel_t(DsaRows d, const std::uin
 #pragma unroll
     for (unsigned mm = 0; mm < kPer; ++mm) {
         const unsigned t = j + 256 * mm;
-        if (t < nr) {
+        if (t < nr && Policy::owns(tok[t], context...)) {
             float c[D];
             if constexpr (D == 4) {
-                const uint2 v = *reinterpret_cast<const uint2*>(lat + static_cast<std::size_t>(tok[t]) * kKvLora + l0);
+                const uint2 v = *reinterpret_cast<const uint2*>(lat + static_cast<std::size_t>(Policy::address(tok[t], context...)) * kKvLora + l0);
                 c[0] = __builtin_bit_cast(float, v.x << 16U);
                 c[1] = __builtin_bit_cast(float, v.x & 0xffff0000U);
                 c[2] = __builtin_bit_cast(float, v.y << 16U);
                 c[3] = __builtin_bit_cast(float, v.y & 0xffff0000U);
             } else {
-                const uint4* lv = reinterpret_cast<const uint4*>(lat + static_cast<std::size_t>(tok[t]) * kKvLora + l0);
+                const uint4* lv = reinterpret_cast<const uint4*>(lat + static_cast<std::size_t>(Policy::address(tok[t], context...)) * kKvLora + l0);
                 unpack_bf16x8(lv[0], c);
                 if constexpr (D == 16) unpack_bf16x8(lv[1], c + 8);
             }
@@ -1371,8 +1389,12 @@ __global__ __launch_bounds__(256) void mla_pv_kernel_t(DsaRows d, const std::uin
 #pragma unroll
             for (unsigned hh = 0; hh < HG; ++hh)
 #pragma unroll
-                for (unsigned li = 0; li < D; ++li)
-                    ob[(static_cast<std::size_t>(r) * H + hg + hh) * kKvLora + l0 + li] = acc[hh * D + li];
+                for (unsigned li = 0; li < D; ++li) {
+                    if constexpr (Policy::partial) {
+                        if (!is_finite(acc[hh * D + li])) (atomicOr(context.flag, 1U), ...);
+                    }
+                    ob[Policy::output_index(static_cast<std::size_t>(r) * H + hg + hh, l0 + li)] = acc[hh * D + li];
+                }
     }
 }
 
@@ -1796,45 +1818,71 @@ void mla_absorb(const float* q, const std::uint16_t* kv_b, unsigned heads, float
     by_rows<AbsorbGo>(rows, q, kv_b, heads, qt, mkey, s);
     ok(hipGetLastError(), "glm fast mla_absorb");
 }
-void mla_scores(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt, unsigned heads,
-                float* sc, std::uint32_t* mkey, hipStream_t s, unsigned max_tokens) {
+template <class Policy, class... Context>
+void mla_scores_policy(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt, unsigned heads,
+                       float* sc, std::uint32_t* mkey, hipStream_t s, unsigned max_tokens, Context... context) {
     check_rows(d.rows);
     check_heads(heads);
     if (!scores_staged(max_tokens, d.rows))
-        mla_scores_lane_kernel<<<dim3((kMaxTok + kScThreads - 1) / kScThreads, heads / kScHeads, d.rows), kScThreads, 0, s>>>(
-            d, tokens, n, qt, heads, sc, mkey);
+        mla_scores_lane_kernel<Policy><<<dim3((kMaxTok + kScThreads - 1) / kScThreads, heads / kScHeads, d.rows), kScThreads, 0, s>>>(
+            d, tokens, n, qt, heads, sc, mkey, context...);
     else
-        mla_scores_staged_kernel<<<dim3((kMaxTok + kSsTok - 1) / kSsTok, heads / kScHeads, d.rows), 256, 0, s>>>(d, tokens, n, qt, heads,
-                                                                                                            sc, mkey);
+        mla_scores_staged_kernel<Policy><<<dim3((kMaxTok + kSsTok - 1) / kSsTok, heads / kScHeads, d.rows), 256, 0, s>>>(d, tokens, n, qt, heads,
+                                                                                                            sc, mkey, context...);
     ok(hipGetLastError(), "glm fast mla_scores");
+}
+void mla_scores(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt, unsigned heads,
+                float* sc, std::uint32_t* mkey, hipStream_t s, unsigned max_tokens) {
+    mla_scores_policy<DsaAttentionPolicy<false>>(d, tokens, n, qt, heads, sc, mkey, s, max_tokens);
 }
 void mla_softmax(const std::uint32_t* n, const float* sc, const std::uint32_t* mkey, unsigned heads, float* p,
                  unsigned rows, hipStream_t s) {
     check_rows(rows);
     check_heads(heads);
-    mla_softmax_kernel<<<dim3(heads, rows), 256, 0, s>>>(n, sc, mkey, heads, p);
+    mla_softmax_kernel<><<<dim3(heads, rows), 256, 0, s>>>(n, sc, mkey, heads, p);
     ok(hipGetLastError(), "glm fast mla_softmax");
 }
 void set_mla_pv_variant(unsigned v) {
     if (v > 2) throw std::invalid_argument("set_mla_pv_variant: 0, 1 or 2");
     g_mla_pv_variant.store(static_cast<int>(v));
 }
-void mla_pv(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* p, unsigned heads,
-            float* ob, hipStream_t s) {
+template <class Policy, class... Context>
+void mla_pv_policy(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* p, unsigned heads,
+                   float* ob, hipStream_t s, Context... context) {
     check_rows(d.rows);
     check_heads(heads);
     switch (mla_pv_variant()) {
     case 1:
-        mla_pv_kernel_t<8, 8><<<dim3(kKvLora / 8, heads / 8, d.rows), 256, 0, s>>>(d, tokens, n, p, heads, ob);
+        mla_pv_kernel_t<8, 8, Policy><<<dim3(kKvLora / 8, heads / 8, d.rows), 256, 0, s>>>(d, tokens, n, p, heads, ob, context...);
         break;
     case 2:
-        mla_pv_kernel_t<16, 4><<<dim3(kKvLora / 4, heads / 16, d.rows), 256, 0, s>>>(d, tokens, n, p, heads, ob);
+        mla_pv_kernel_t<16, 4, Policy><<<dim3(kKvLora / 4, heads / 16, d.rows), 256, 0, s>>>(d, tokens, n, p, heads, ob, context...);
         break;
     default:
-        mla_pv_kernel_t<kPvHeads, kPvDims><<<dim3(kKvLora / kPvDims, heads / kPvHeads, d.rows), 256, 0, s>>>(d, tokens, n, p, heads, ob);
+        mla_pv_kernel_t<kPvHeads, kPvDims, Policy><<<dim3(kKvLora / kPvDims, heads / kPvHeads, d.rows), 256, 0, s>>>(d, tokens, n, p, heads, ob, context...);
         break;
     }
     ok(hipGetLastError(), "glm fast mla_pv");
+}
+void mla_pv(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* p, unsigned heads,
+            float* ob, hipStream_t s) {
+    mla_pv_policy<DsaAttentionPolicy<false>>(d, tokens, n, p, heads, ob, s);
+}
+void mla_partial(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt,
+                 unsigned heads, const MlaWork& w, float* partial, unsigned rank, unsigned* flag, hipStream_t s,
+                 unsigned max_tokens) {
+    check_rows(d.rows);
+    check_heads(heads);
+    if (rank > 1) throw std::invalid_argument("mla_partial: rank must be 0 or 1");
+    using Policy = DsaAttentionPolicy<true>;
+    const DsaPartialContext context{rank, partial, flag};
+    // Each query pass needs its own maxima, including the received query pass.
+    ok(hipMemsetAsync(w.mkey, 0, static_cast<std::size_t>(d.rows) * heads * sizeof(std::uint32_t), s),
+       "glm partial maxima clear");
+    mla_scores_policy<Policy>(d, tokens, n, qt, heads, w.sc, w.mkey, s, max_tokens, context);
+    mla_softmax_kernel<Policy><<<dim3(heads, d.rows), 256, 0, s>>>(n, w.sc, w.mkey, heads, w.p, context);
+    ok(hipGetLastError(), "glm partial softmax");
+    mla_pv_policy<Policy>(d, tokens, n, w.p, heads, partial, s, context);
 }
 void mla_out(const float* ob, const std::uint16_t* kv_b, unsigned heads, float* o, unsigned rows, hipStream_t s) {
     check_heads(heads);

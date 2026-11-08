@@ -1,6 +1,8 @@
 // Host-only migration checks. GLM keeps its legacy --profile timing flag;
 // product-profile admission below exercises the common resolver independently.
 #include "glm_rank_receipt.hpp"
+#include "glm/engine/glm_kvshard_exchange.hpp"
+#include "glm/engine/glm_mem.hpp"
 
 #include <cstdio>
 #include <map>
@@ -210,7 +212,91 @@ void test_partial_receipt() {
 }
 }  // namespace
 
+void test_kv_shard_draft() {
+    rd::Request request{};
+    request.decode = true;
+    request.mtp = false;
+    request.mtp_spec = false;
+    request.prefill = "gemv";
+    const Env absent, off{{"STRIX_GLM_KV_SHARD", "0"}}, on{{"STRIX_GLM_KV_SHARD", "1"}};
+    const auto original = rd::resolve(request, lookup(absent));
+    const auto disabled = rd::resolve(request, lookup(off));
+    const auto sharded = rd::resolve(request, lookup(on));
+    CHECK(rd::print(original) == rd::print(disabled));
+    CHECK(rd::host_receipt(original).json() == rd::host_receipt(disabled).json());
+    CHECK(!original.kv_shard && sharded.kv_shard);
+    CHECK(sharded.decode_xch.value == "xfer" && sharded.decode_xch.source == "kv-shard-draft");
+    CHECK(rd::print(sharded).find(strix::glm::kvshard::numerical_identity) != std::string::npos);
+    const auto shard_receipt = rd::host_receipt(sharded);
+    CHECK(shard_receipt.identity.reduction_plan ==
+          sharded.identity.value + ";" + strix::glm::kvshard::numerical_identity);
+    CHECK(shard_receipt.identity.state_format.find("layout=474c4d4b56533033") != std::string::npos);
+    CHECK(shard_receipt.identity.prefill_lineage.find("layout 474c4d4b56533033") != std::string::npos);
+    auto legacy_identity = shard_receipt.identity;
+    legacy_identity.reduction_plan = sharded.identity.value + ";glm-dsa-kvshard-rank01-fp32-v2-declaredexp-FAST";
+    CHECK(legacy_identity.id() != shard_receipt.identity.id());
+    for (const std::string route : {"comm", "xfer"}) {
+        auto explicit_request = request;
+        explicit_request.decode_xch = route;
+        const auto explicit_route = rd::resolve(explicit_request, lookup(on));
+        CHECK(explicit_route.decode_xch.value == route && explicit_route.decode_xch.source == "explicit");
+    }
+    const Env explicit_xfer{{"STRIX_GLM_KV_SHARD", "1"}, {"STRIX_GLM_DECODE_XCH", "xfer"}};
+    CHECK(rd::resolve(request, lookup(explicit_xfer)).decode_xch.value == "xfer");
+    CHECK(rd::host_receipt(sharded).identity.id() != rd::host_receipt(original).identity.id());
+    CHECK(!rd::host_receipt(sharded).identity.state_format.empty());
+    request.mtp = true;
+    bool rejected = false;
+    try { (void)rd::resolve(request, lookup(on)); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+}
+
+void test_kv_shard_speed_contract() {
+    namespace k = strix::glm::kvshard;
+    namespace mem = strix::glm::engine::mem;
+    static_assert(k::prepare_bytes(0) == 65592);
+    static_assert(k::prepare_bytes(8192 / 4) == 73784);
+    CHECK(k::decode_capacity(65536) == 131128); // larger than eight TP rows
+    static_assert(k::partial_bytes == 65848);
+    CHECK(k::decode_capacity(0) >= k::partial_bytes);
+    const auto header = k::decode_header(9, 4, 65535, false, 16384);
+    CHECK(header.epoch == 9 && header.position == 65535 && header.pools == 16384 && header.phase == 2);
+
+    // A synthetic memory-plan boundary, not a device capacity claim: the
+    // replicated cache crosses RAM headroom; its owned-pool plan still fits.
+    mem::Snapshot s;
+    s.meminfo_ok = s.cma_free_ok = s.zoneinfo_ok = true;
+    s.mem_available = 10 * mem::kGiB;
+    const mem::Margins margins{mem::kGiB, mem::kGiB};
+    auto fits = [&](std::uint64_t context, bool shard) {
+        const auto tokens = shard ? k::storage_tokens(context) : context;
+        return mem::fits({{"resident weights and work", 8 * mem::kGiB, 0},
+                          {"DSA history", tokens * 4096, 0}}, s, margins);
+    };
+    CHECK(!k::auto_shard(fits(8192, false), fits(8192, false)));
+    CHECK(!k::auto_shard(fits(65536, false), fits(65536, false)));
+    CHECK(fits(262144, false)); // exactly at the budget is admitted
+    CHECK(k::auto_shard(fits(262152, false), fits(262152, false)));
+    CHECK(fits(262152, true));
+    CHECK(k::auto_shard(true, false) && k::auto_shard(false, true));
+    s.meminfo_ok = false;
+    CHECK(!fits(8192, false)); // unavailable telemetry cannot establish a fit
+
+    rd::Request r;
+    r.decode = true; r.mtp = false; r.mtp_spec = false; r.prefill = "gemv";
+    const Env automatic{{"STRIX_GLM_KV_SHARD", "auto"}};
+    const auto e = rd::resolve(r, lookup(automatic));
+    CHECK(e.kv_shard_auto && !e.kv_shard);
+    CHECK(rd::print(e).find("pending calibrated load + unified prefill admission") != std::string::npos);
+    const Env invalid{{"STRIX_GLM_KV_SHARD", "typo"}};
+    bool rejected = false;
+    try { (void)rd::resolve(r, lookup(invalid)); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+}
+
 int main() {
+    test_kv_shard_draft();
+    test_kv_shard_speed_contract();
     test_common_default_rows();
     test_glm_exports_and_precedence();
     test_common_profile_admission();

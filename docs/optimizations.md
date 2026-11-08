@@ -3318,6 +3318,40 @@ producer overwrites it, so the copies overlap compute. Compute and scratch stay 
 
 ## GLM
 
+### KV cache sharding and shared transport progress
+
+GLM token sharding is a qualified FAST memory profile for one request on a two-node pair. It
+stores each node's own token blocks, preserves global top-k selection through exchanged score
+keys, and merges the FP32 attention partials in fixed rank order. Because this changes summation
+order, its declared numerical identity differs from the default bitwise exact replicated profile.
+`STRIX_GLM_KV_SHARD=auto` is the default: startup selects sharding only when replicated-state
+admission fails and sharded admission succeeds. `=1` forces sharding; `=0` forces replication.
+The current scope requires `STRIX_GLM_PF_PIPELINE=1`, one request, chunked prefill and no MTP
+or speculation. See the [KV storage and GLM token sharding guide](engine/kv-sharding.md) for
+engine layout comparisons, measured capacity and timing, startup verification and limits.
+
+`STRIX_XPORT_SMALL_SPIN=1` independently opts into shared small-message progress for TP2
+engines. USB4 full-duplex exchanges up to 256 KiB including trailers use caller-thread eager
+progress, with a fixed 100 microsecond spin budget before ordinary polling. `STRIX_DIST_USB4_EAGER=0`
+still disables eager dispatch; one-way and larger exchanges retain their route. Worker mailbox
+polling amortizes clock reads over at most 64 pauses, caps idle spin at 3 ms, and retains the
+existing sleep handshake, deadlines, cancellation, CRC and receive-lifetime fences. Existing
+unbounded `STRIX_DIST_USB4_SPIN=1` is a separate control; leave it off when measuring this budget.
+Unset or `STRIX_XPORT_SMALL_SPIN=0` restores the previous progress policy after restart.
+This scheduling draft has host checks; native compiler, bitwise decode and complete-workload
+timing gates remain pending for GLM and DeepSeek. No speed gain is qualified.
+
+`STRIX_XPORT_SMALL_SPIN=1` independently opts into shared small-message progress for TP2
+engines. USB4 full-duplex exchanges up to 256 KiB including trailers use caller-thread eager
+progress, with a fixed 100 microsecond spin budget before ordinary polling. `STRIX_DIST_USB4_EAGER=0`
+still disables eager dispatch; one-way and larger exchanges retain their route. Worker mailbox
+polling amortizes clock reads over at most 64 pauses, caps idle spin at 3 ms, and retains the
+existing sleep handshake, deadlines, cancellation, CRC and receive-lifetime fences. Existing
+unbounded `STRIX_DIST_USB4_SPIN=1` is a separate control; leave it off when measuring this budget.
+Unset or `STRIX_XPORT_SMALL_SPIN=0` restores the previous progress policy after restart.
+This scheduling draft has host checks; native compiler, bitwise decode and complete-workload
+timing gates remain pending for GLM and DeepSeek. No speed gain is qualified.
+
 ```sh
 strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --prompt PROMPT.u32 --decode 64
 ```

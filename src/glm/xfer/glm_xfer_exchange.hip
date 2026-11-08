@@ -92,7 +92,7 @@ Exchanger& XferExchange::ensure(hipStream_t s) {
     if (xf_ == nullptr) {
         Options o;
         o.rank = rank_;
-        o.capacity = GlmSchedule::row_bytes(max_rows_);
+        o.capacity = std::max(GlmSchedule::row_bytes(max_rows_), attention_bytes_);
         o.stream = s;
         o.from_env();
         xf_ = std::make_unique<Exchanger>(*transport_, o);

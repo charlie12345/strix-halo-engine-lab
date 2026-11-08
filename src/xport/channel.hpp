@@ -69,6 +69,7 @@ struct ChannelOptions {
     int crc_cpu = -1;
     std::uint64_t test_corrupt_sequence = 0;  // tests only (STRIX_GLMX_TEST_CORRUPT): flip one received byte of this sequence
     unsigned idle_spin_us = 3000;        // progress thread: spin this long without a job before sleeping
+    bool small_spin = false;            // shared opt-in ordered small-message progress
     std::chrono::milliseconds timeout{120000};
     // Reads the STRIX_GLMX_* variables over these values.
     void from_env();

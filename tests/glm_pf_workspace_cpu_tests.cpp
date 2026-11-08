@@ -1,4 +1,5 @@
 #include "glm/prefill/glm_pf_load_admission.hpp"
+#include "glm/engine/glm_kvshard_exchange.hpp"
 #include "glm_rank_defaults.hpp"
 
 #include <cstdlib>
@@ -29,6 +30,7 @@ struct Admission {
     mem::Margins margins{0, 0};
     std::uint64_t prefill_install = 0, device_free = 0;
     std::uint64_t post_load_device_bytes = 0, post_load_host_bytes = 0;
+    std::uint64_t first_forward_reserve = 0;
     PhysicalModel model;
 };
 }
@@ -119,6 +121,106 @@ int main() {
             ++cases;
         }
     }
-    std::cout << "PASS: workspace/admission boundaries and " << cases << " ordered top-k cases\n";
+    // Boundary fixture anchored at an admitted replicated 1.45M, not a device
+    // measurement. Both candidate layouts use the very same post-load oracle.
+    namespace ks = strix::glm::kvshard;
+    constexpr std::uint64_t cache_slope = 11 * ks::bytes_per_token;
+    constexpr std::uint64_t forward = mem::kGiB / 2;
+    constexpr std::uint64_t fixed = path + workspace + margin + forward;
+    constexpr std::uint64_t available = fixed + 1450000 * cache_slope;
+    for (const std::uint64_t capacity : {1190000ULL, 1450000ULL, 1600000ULL, 2000000ULL, 2850000ULL, 3000000ULL}) {
+        const auto fits_layout = [&](bool shard) {
+            const auto cache = (shard ? ks::storage_tokens(capacity) : capacity) * cache_slope;
+            Admission candidate;
+            candidate.first_forward_reserve = forward;
+            candidate.device_free = available;
+            candidate.snapshot.meminfo_ok = true;
+            candidate.snapshot.cma_free_ok = candidate.snapshot.zoneinfo_ok = true;
+            candidate.snapshot.mem_available = available + 2 * mem::kGiB;
+            candidate.post_load_device_bytes = cache;
+            candidate.post_load_host_bytes = cache;
+            const auto temporary = shard ? pf::kKvShardPrefillTemporaryBytes : 0;
+            const bool startup = !refused([&] {
+                pf::admit_prefill_load(candidate, path, workspace + temporary, margin, 0);
+            });
+            const bool loaded = !refused([&] {
+                pf::admit_prefill_bytes(path, workspace + temporary, margin + forward,
+                                        available > cache ? available - cache : 0,
+                                        available + 2 * mem::kGiB > cache ? available + 2 * mem::kGiB - cache : 0);
+            });
+            check(startup == loaded);
+            if (!shard && capacity == 1600000) {
+                check(mem::fits({{"cache", cache, 0}, {"first forward", forward, 0}},
+                                candidate.snapshot, {margin, margin}, candidate.device_free));
+                check(!startup);  // regression: a fitting load plan is insufficient
+            }
+            return startup;
+        };
+        const bool replicated = fits_layout(false), sharded = fits_layout(true);
+        const auto selected = ks::prefill_layout(replicated, replicated, sharded, sharded);
+        const auto expected = capacity <= 1450000 ? ks::PrefillLayout::replicated :
+            capacity <= 2850000 ? ks::PrefillLayout::sharded : ks::PrefillLayout::refuse;
+        check(selected == expected);
+        std::cout << "auto capacity " << capacity << ": replicated=" << replicated << " sharded=" << sharded
+                  << " selected=" << (selected == ks::PrefillLayout::replicated ? "replicated" :
+                                      selected == ks::PrefillLayout::sharded ? "sharded" : "refuse") << " PASS\n";
+    }
+    // Host ownership oracle: append deliberately awkward chunks, retain a
+    // partial pool on its owner, and reconstruct bounded windows without ever
+    // consuming the poisoned padding of the other partition.
+    constexpr unsigned total = 2 * pf::kIndexerPoolWindow * 4 + 12;
+    const auto storage = static_cast<std::size_t>(ks::storage_tokens(total));
+    constexpr std::uint32_t poison = 0xdeadbeefU;
+    std::array<std::vector<std::uint32_t>, 2> cache{std::vector<std::uint32_t>(storage, poison),
+                                                  std::vector<std::uint32_t>(storage, poison)};
+    std::array<std::vector<std::uint32_t>, 2> pools{std::vector<std::uint32_t>(storage / 4, poison),
+                                                  std::vector<std::uint32_t>(storage / 4, poison)};
+    unsigned frontier = 0;
+    for (const unsigned chunk : {1U, 2U, 4U, 4094U, 8193U, total}) {
+        const unsigned end = std::min(total, frontier + chunk);
+        for (unsigned token = frontier; token < end; ++token)
+            cache[ks::owner(token)][static_cast<std::size_t>(ks::local_token(token))] = token;
+        for (unsigned pool = frontier / 4; pool < end / 4; ++pool) {
+            const unsigned owner = pool % 2;
+            const auto local = static_cast<std::size_t>(pool / 2);
+            std::uint32_t ordered = 0;
+            for (unsigned j = 0; j < 4; ++j) {
+                const auto token = cache[owner][local * 4 + j];
+                check(token == pool * 4 + j);  // includes prior chunk's carry
+                ordered = ordered * 33U + token;
+            }
+            pools[owner][local] = ordered;
+        }
+        frontier = end;
+    }
+    check(frontier == total);
+    unsigned windows = 0;
+    for (unsigned begin = 0; begin < total / 4; begin += pf::kIndexerPoolWindow) {
+        const unsigned end = std::min(total / 4, begin + pf::kIndexerPoolWindow);
+        std::vector<std::uint32_t> window(end - begin);
+        for (unsigned pool = begin; pool < end; ++pool) {
+            window[pool - begin] = pools[pool % 2][pool / 2];
+            std::uint32_t expected = 0;
+            for (unsigned j = 0; j < 4; ++j) expected = expected * 33U + pool * 4 + j;
+            check(window[pool - begin] == expected);
+        }
+        check(window.size() <= pf::kIndexerPoolWindow);
+        ++windows;
+    }
+    check(windows == 3);
+    // Selected-token ordinals preserve canonical order and original cache bits
+    // at owner transitions, the 4096-pool boundary and an incomplete row tail.
+    for (const unsigned token : {0U, 3U, 4U, 7U, 8U, 16383U, 16384U, total - 1})
+        check(cache[ks::owner(token)][static_cast<std::size_t>(ks::local_token(token))] == token);
+    std::cout << "PASS: kv-shard ownership/carry, three bounded windows and selected gather oracle\n";
+    // Neither a remote refusal nor a local refusal may be hidden by the peer.
+    for (unsigned mask = 0; mask < 16; ++mask) {
+        const bool r0 = (mask & 1U) != 0, r1 = (mask & 2U) != 0;
+        const bool s0 = (mask & 4U) != 0, s1 = (mask & 8U) != 0;
+        const auto expected = r0 && r1 ? ks::PrefillLayout::replicated :
+            s0 && s1 ? ks::PrefillLayout::sharded : ks::PrefillLayout::refuse;
+        check(ks::prefill_layout(r0, r1, s0, s1) == expected);
+    }
+    std::cout << "PASS: workspace/admission boundaries, 16 two-rank votes and " << cases << " ordered top-k cases\n";
     return EXIT_SUCCESS;
 }

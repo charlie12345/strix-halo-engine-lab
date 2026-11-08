@@ -102,12 +102,19 @@ struct KdaState {  // one KDA layer, all slots
     float* rep_scr = nullptr;
     float* rep_beta = nullptr;
 };
+class KvShard;
 struct DsaState {  // one DSA layer, all slots: capacity positions per slot (arithmetic contract 1.4)
     std::uint16_t* latent = nullptr;  // [slots][cap][512] bf16
     std::uint16_t* ikey = nullptr;    // [slots][cap][128] bf16
     std::uint16_t* igate = nullptr;   // [slots][cap][128] bf16
     float* pooled = nullptr;          // [slots][cap / 4][128] fp32
     std::uint64_t cap = 0;
+    // KV sharding: cap remains global; allocation/slot stride is rounded half-capacity.
+    // Null preserves the original layout and arithmetic.
+    KvShard* shard = nullptr;
+    unsigned shard_layer = 0;
+    unsigned dump_rank = 0;  // diagnostic naming only, in both storage modes
+    std::uint64_t dump_epoch = 0;
 };
 
 // One call row: a sequence slot, the token at `pos`, and its position. Rows of one slot in one call must have
@@ -313,7 +320,10 @@ public:
     // Optional startup selector runs after calibration/planning, before load admission or weight/row allocation.
     // Receives the calibrated load terms and headroom; may reduce max_rows, causing a fresh plan.
     // The caller must coordinate the result across ranks. Comm row buffers grow only after selection.
-    LoadReport load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows = {});
+    // Row negotiation precedes layout votes. admit_prefill must be read-only
+    // for candidate admissions; the final call may install a pre-load path.
+    LoadReport load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows = {},
+                    const std::function<void(const mem::LoadAdmission&)>& admit_prefill = {});
     // Positions [pos0, pos0 + n) of `slot`; returns the greedy next token after the last row (both ranks).
     // Default kR1b runs all prompt forwards in R1, restoring R1b on return or exception.
     // kR1bAll requires the reference path and runs prompts in R1b; kR1 uses R1 throughout.
@@ -346,6 +356,7 @@ public:
     void set_exchange(std::shared_ptr<Exchange> p);
     [[nodiscard]] std::shared_ptr<Exchange> exchange() const;  // installed fallback, independent of the last forward
     [[nodiscard]] bool decode_xfer_enabled() const;
+    [[nodiscard]] bool kv_shard_enabled() const;
     [[nodiscard]] unsigned prefill_pipeline() const;
     void set_prefill(std::shared_ptr<PrefillPath> p);
     // Bytes the installed MoE seam would still allocate lazily (sum of warm_bytes over the loaded MoE layers); 0 after

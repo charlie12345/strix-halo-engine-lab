@@ -285,7 +285,7 @@ public:
         }
         if (st.shard) {
             st.shard->prefill_rows(w, st, c,
-                {lat_, key_, gate_, qI_, q_, wh_, qt_, e_, ob_, o_, keys_, tok_, ntok_}, margin_);
+                {lat_, key_, gate_, qI_, q_, wh_, qt_, e_, ob_, o_, keys_, tok_, ntok_, device_bytes(Hk_, Hm_, cap_, Rmax_, tb_)}, margin_);
         } else {
             dsa_append_rows(sl, t0, lat_, key_, gate_, iw, c.flag, R, c.stream);
             indexer_select_rows_bounded(sl, t0, qI_, wh_, keys_, tok_, ntok_, R, c.stream);

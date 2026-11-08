@@ -209,6 +209,7 @@ struct KvShard::Impl {
     std::uint64_t epoch = 0;
     Wire wire; // prefill only; decode uses the attention Channel.
     std::shared_ptr<xfer::XferExchange> exchange;
+    bool budget_line_printed = false;
     float *peer_query = nullptr, *own_partial = nullptr, *peer_partial = nullptr;
     explicit Impl(dist::Communicator& communicator, unsigned rank_value)
         : rank(rank_value), comm(communicator), wire(communicator) {
@@ -426,9 +427,19 @@ void KvShard::prefill_rows(const DsaLayerWeights& weights, const DsaState& state
     }
     // Both ranks choose identical geometry from the same fail-closed admission.
     // The startup 64 MiB charge stays unchanged even when there is no extra spare.
-    const auto spare = Lib::admit(pf::kKvShardPrefillTemporaryBytes, margin, "kvshard prefill budget");
+    std::uint64_t device_free = 0, mem_available = 0;
+    const auto spare = Lib::admit(pf::kKvShardPrefillTemporaryBytes, margin, "kvshard prefill budget", &device_free, &mem_available);
     const auto budget = impl_->wire.prefill_budget(std::min(spare, pf::kKvShardPrefillMaximumBytes),
                                                   impl_->epoch, state.shard_layer, start);
+    if (!impl_->budget_line_printed) {
+        std::printf("rank %u kv-budget layout=sharded dsa_layer_kv_bytes=%llu pf_path=%llu pf_window_budget=%llu device_free=%llu mem_available=%llu margin=%llu\n",
+            impl_->rank, static_cast<unsigned long long>(K::storage_tokens(state.cap) * kvshard::bytes_per_token),
+            static_cast<unsigned long long>(work.path_bytes), static_cast<unsigned long long>(budget),
+            static_cast<unsigned long long>(device_free), static_cast<unsigned long long>(mem_available),
+            static_cast<unsigned long long>(margin));
+        std::fflush(stdout);
+        impl_->budget_line_printed = true;
+    }
     const auto limits = pf::kvshard_prefill_limits(budget, std::min(state.cap, start + count), count, pf::kMaxTokens);
     const std::size_t latent_elements = static_cast<std::size_t>(limits.latents) * kKvLora;
     const std::size_t token_elements = static_cast<std::size_t>(limits.rows) * pf::kMaxTokens;

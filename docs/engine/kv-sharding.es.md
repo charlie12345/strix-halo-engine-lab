@@ -53,7 +53,10 @@ Cada rango imprime la decisión de admisión del inicio y la organización efect
 
 ```text
 rank R kv-shard effective=1 identity=glm-dsa-kvshard-rank01-fp32-v3-declaredexp-owned-tree256-fma-rankmerge-FAST
+rank R kv-budget layout=sharded dsa_layer_kv_bytes=<bytes> pf_path=<bytes> pf_window_budget=<bytes> device_free=<bytes> mem_available=<bytes> margin=<bytes>
 ```
+
+En el prefill dividido, la línea de presupuesto aparece después del primer intercambio del presupuesto de ventana, cuando se conocen los valores de memoria disponible admitidos por ambos rangos. Las ejecuciones replicadas muestran `layout=replicated` y `pf_window_budget=0` con los valores de admisión de carga. `dsa_layer_kv_bytes` es la reserva de caché latente DSA de una capa de atención dispersa en ese rango; `pf_window_budget` es el presupuesto compartido de ventana de prefill, como máximo 2 GiB.
 
 Para la ejecución replicada, la identidad efectiva es `replicated`. El recibo de ejecución también incluye la identidad numérica. Conserve la salida de inicio y el recibo junto con el prompt, el contexto y la configuración de la ejecución.
 
@@ -68,3 +71,4 @@ Para el diagnóstico por capa, asigne `STRIX_GLM_KVSHARD_DUMP` a un directorio d
 - En este par, las mediciones de decode y prefill a 8K son más lentas con la división. Prefiera la organización exacta replicada cuando admita la solicitud y necesite identidad bit a bit con el valor predeterminado.
 - El alcance calificado actual es una solicitud, prefill por pipeline y ausencia de MTP o especulación. No deduzca de estas cifras el rendimiento con varias solicitudes, especulación, otro hardware o prefill por encima de 64K.
 - La selección automática es una decisión de admisión, no una heurística de velocidad. Si ninguna organización supera la admisión de inicio, se rechaza la solicitud en vez de superar silenciosamente la capacidad admitida.
+- Las sesiones guardadas registran la organización de KV. Una sesión solo se restaura en un motor con la misma organización, rango y capacidad de contexto; de lo contrario, se rechaza la restauración. Con `STRIX_GLM_KV_SHARD=auto`, la organización depende de la memoria libre, así que establezca explícitamente `1` o `0` cuando las sesiones deban trasladarse entre ejecuciones.

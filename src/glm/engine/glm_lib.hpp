@@ -280,7 +280,8 @@ public:
     // Refuses unless `bytes` + margin fit both hipMemGetInfo free and MemAvailable (unreadable MemAvailable refuses).
     // Return the same checked spare for opportunistic temporary sizing. Existing
     // fixed-size callers ignore it; no second, less conservative memory source.
-    static std::uint64_t admit(std::uint64_t bytes, std::uint64_t margin, const char* what) {
+    static std::uint64_t admit(std::uint64_t bytes, std::uint64_t margin, const char* what,
+                               std::uint64_t* device_free_out = nullptr, std::uint64_t* mem_available_out = nullptr) {
         std::size_t dev_free = 0, dev_total = 0;
         hip_ok(hipMemGetInfo(&dev_free, &dev_total), "mem info");
         std::uint64_t host_avail = 0;
@@ -300,6 +301,8 @@ public:
             throw std::runtime_error(std::string(what) + ": refusing " + std::to_string(bytes >> 20) + " MiB (+ margin " + std::to_string(margin >> 20) +
                                      " MiB): device free " + std::to_string(dev_free >> 20) + " MiB, MemAvailable " +
                                      std::to_string(host_avail >> 20) + " MiB");
+        if (device_free_out) *device_free_out = dev_free;
+        if (mem_available_out) *mem_available_out = host_avail;
         return std::min<std::uint64_t>(dev_free, host_avail) - margin;
     }
     // Fails closed: refuses unless the new buffer + margin fit both hipMemGetInfo free and the host's MemAvailable

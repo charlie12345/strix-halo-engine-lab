@@ -53,7 +53,10 @@ Each rank prints the startup admission decision and effective layout. For an aut
 
 ```text
 rank R kv-shard effective=1 identity=glm-dsa-kvshard-rank01-fp32-v3-declaredexp-owned-tree256-fma-rankmerge-FAST
+rank R kv-budget layout=sharded dsa_layer_kv_bytes=<bytes> pf_path=<bytes> pf_window_budget=<bytes> device_free=<bytes> mem_available=<bytes> margin=<bytes>
 ```
+
+For sharded prefill, the budget line appears after the first prefill-window budget exchange, when both ranks' admitted spare-memory values are known. Replicated runs report `layout=replicated` and `pf_window_budget=0` with the load admission values. `dsa_layer_kv_bytes` is the DSA latent-cache allocation of one sparse-attention layer on that rank; `pf_window_budget` is the shared prefill window budget, at most 2 GiB.
 
 For replicated execution, the effective identity is `replicated`. The execution receipt also includes the numerical identity. Keep the startup output and receipt with the run's prompt/context and settings.
 
@@ -68,3 +71,4 @@ For per-layer diagnosis, set `STRIX_GLM_KVSHARD_DUMP` to an output directory bef
 - The measured 8K decode and prefill timings are slower with sharding on this pair. Prefer the replicated exact layout when it admits the request and bitwise identity with the default is required.
 - The current qualified scope is one request, pipeline prefill, and no MTP or speculation. Do not infer multi-request, speculative, other-hardware or beyond-64K prefill performance from the measurements above.
 - Automatic selection is an admission decision, not a speed heuristic. If neither layout passes startup admission, the request is refused rather than silently run beyond the admitted capacity.
+- Session saves record the KV layout. A save restores only into an engine with the same layout, rank and context capacity; otherwise restore is refused. With `STRIX_GLM_KV_SHARD=auto` the layout depends on free memory, so set it to `1` or `0` explicitly when saves must move between runs.

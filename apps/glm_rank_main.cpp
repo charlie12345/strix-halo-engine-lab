@@ -369,11 +369,14 @@ int main(int argc, char** argv) {
         const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
         std::uint64_t prefill_margin = 0;
         std::uint64_t prefill_first_forward = 0;
+        std::uint64_t admitted_prefill_path = 0, admitted_device_free = 0, admitted_mem_available = 0;
         const auto lr = eng.load([&](const ge::mem::LoadAdmission& admission) {
             namespace pf = strix::glm::pf;
             namespace mem = strix::glm::engine::mem;
             // Keep the existing 8 GiB OS/peer/runtime headroom, now at both checks.
             prefill_margin = std::max(pf::admission_margin_bytes(), admission.margins.ram);
+            admitted_device_free = admission.device_free;
+            admitted_mem_available = admission.snapshot.mem_available;
             if (rd::max_rows_auto(eff)) prefill_margin = std::max(prefill_margin, rd::kMaxRowsSafetyBytes);
             if (rd::max_rows_auto(eff)) {
                 const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
@@ -417,6 +420,7 @@ int main(int argc, char** argv) {
             // Explicit sizes and --mem-plan also admit before the first weight.
             if (prefill_mode != "ref" && (!opt.auto_rows || admission.recheck)) {
                 const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows, opt.mtp, pf_tier, admission.kv_shard);
+                admitted_prefill_path = b.path;
                 const auto comm_bytes = opt.world > 1 && !admission.recheck
                     ? std::uint64_t{opt.max_rows} * (3 * 4096 * 4 + 16) + 16384 : 0;
                 pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
@@ -435,6 +439,13 @@ int main(int argc, char** argv) {
         if (eff.kv_shard_auto || eff.kv_shard)
             std::printf("rank %u kv-shard effective=%u identity=%s\n", opt.rank, eff.kv_shard ? 1U : 0U,
                         eff.kv_shard ? strix::glm::kvshard::numerical_identity : "replicated");
+        if (!eff.kv_shard) {
+            const auto kv_bytes = opt.capacity * strix::glm::kvshard::bytes_per_token;
+            std::printf("rank %u kv-budget layout=replicated dsa_layer_kv_bytes=%llu pf_path=%llu pf_window_budget=0 device_free=%llu mem_available=%llu margin=%llu\n",
+                opt.rank, static_cast<unsigned long long>(kv_bytes), static_cast<unsigned long long>(admitted_prefill_path),
+                static_cast<unsigned long long>(admitted_device_free), static_cast<unsigned long long>(admitted_mem_available),
+                static_cast<unsigned long long>(prefill_margin));
+        }
         const auto load_identity = eng.identity_mode();
         std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) identity %s decode-xch %s%s%s%s%s", opt.rank, lr.seconds,
                     lr.gib_read, lr.device_gib, opt.layers, opt.mtp ? 1 : 0, ge::identity_mode_name(load_identity),

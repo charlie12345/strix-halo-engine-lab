@@ -28,6 +28,7 @@ public:
         const float *latent, *key, *gate, *index_query, *query;
         float *weights, *qt, *scores, *obar, *output;
         std::uint32_t *keys, *tokens, *counts;
+        std::uint64_t path_bytes;
     };
     void prefill_rows(const DsaLayerWeights&, const DsaState&, const CallCtx&,
                       const PrefillWork&, std::uint64_t margin);

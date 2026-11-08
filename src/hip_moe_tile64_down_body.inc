@@ -49,16 +49,16 @@
                 const unsigned c[8]{static_cast<unsigned>(b0.x),static_cast<unsigned>(b0.y),static_cast<unsigned>(b0.z),static_cast<unsigned>(b0.w),
                     static_cast<unsigned>(b1.x),static_cast<unsigned>(b1.y),static_cast<unsigned>(b1.z),static_cast<unsigned>(b1.w)};
                 // Q5_1: d*q + m, q <= 31.
-                if((Tune&64U)!=0U&&__all(f16_q51_exact(r.b[k].head.x))) {
+                if((Tune&64U)!=0U&&__all(QwenKDecodeOps::f16_q51_exact(r.b[k].head.x))) {
 #pragma unroll
                     for(unsigned q=0;q<8U;q+=2U) {
-                        const uint2 x=f16_affine_u8_fast(c[q],d*16777216.0F,m),y=f16_affine_u8_fast(c[q+1U],d*16777216.0F,m);
+                        const uint2 x=QwenKDecodeOps::f16_affine_u8_fast(c[q],d*16777216.0F,m),y=QwenKDecodeOps::f16_affine_u8_fast(c[q+1U],d*16777216.0F,m);
                         cv.b[k][q/2U]={x.x,x.y,y.x,y.y};
                     }
                 } else {
 #pragma unroll
                     for(unsigned q=0;q<8U;q+=2U) {
-                        const uint2 x=f16_affine_u8(c[q],d,m),y=f16_affine_u8(c[q+1U],d,m);
+                        const uint2 x=QwenKDecodeOps::f16_affine_u8(c[q],d,m),y=QwenKDecodeOps::f16_affine_u8(c[q+1U],d,m);
                         cv.b[k][q/2U]={x.x,x.y,y.x,y.y};
                     }
                 }

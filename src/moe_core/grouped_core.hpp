@@ -1,4 +1,5 @@
 #pragma once
+#include "grouped_policy.hpp"
 #include "exl3_trellis.hpp"
 
 namespace strix::moe_core {
@@ -22,7 +23,7 @@ struct Accum {
 
 // No launch policy lives here: adapters retain their kernel signatures and row policy.
 template <template <int> class WeightDecode, class ExpertLayout, class InputTransform, class Epilogue>
-struct GroupedCore {
+struct GroupedCore : GroupedPrefillPolicy<> {
     using Input = InputTransform;
     using Output = Epilogue;
 

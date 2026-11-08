@@ -137,7 +137,7 @@ __device__ __forceinline__ void moe_tile64_project_body(const unsigned char* gat
         const float a1=d*static_cast<float>(factor(rh,g1,false)),b1=-(dm*static_cast<float>(factor(rh,g1,true)));
         // a = d*sc, b = -dmin*m with sc, m <= 63 and q <= 15 (Q4_K) or 31 (Q5_K): checked once per superblock (the
         // steps 4s..4s+3 convert in order and share the header).
-        if constexpr((Tune&64U)!=0U)if(p==0U)fast_block=__all(f16_affine_exact(rh.x&65535U,63U*(Q5K?31U:15U),rh.x>>16U,63U));
+        if constexpr((Tune&64U)!=0U)if(p==0U)fast_block=__all(QwenKDecodeOps::f16_affine_exact(rh.x&65535U,63U*(Q5K?31U:15U),rh.x>>16U,63U));
         const bool fast=(Tune&64U)!=0U&&fast_block;
         unsigned q[BWords],qh[BWords];
         if constexpr(BWords>=4U) {
@@ -155,11 +155,11 @@ __device__ __forceinline__ void moe_tile64_project_body(const unsigned char* gat
                 l1|=((qh[k+1U]>>g0)&0x01010101U)<<4U;u1|=((qh[k+1U]>>g1)&0x01010101U)<<4U;
             }
             if(fast) {
-                const uint2 x0=f16_affine_u8_fast(l0,a0*16777216.0F,b0),x1=f16_affine_u8_fast(l1,a0*16777216.0F,b0);
-                const uint2 y0=f16_affine_u8_fast(u0,a1*16777216.0F,b1),y1=f16_affine_u8_fast(u1,a1*16777216.0F,b1);
+                const uint2 x0=QwenKDecodeOps::f16_affine_u8_fast(l0,a0*16777216.0F,b0),x1=QwenKDecodeOps::f16_affine_u8_fast(l1,a0*16777216.0F,b0);
+                const uint2 y0=QwenKDecodeOps::f16_affine_u8_fast(u0,a1*16777216.0F,b1),y1=QwenKDecodeOps::f16_affine_u8_fast(u1,a1*16777216.0F,b1);
                 cv.b[k]={x0.x,x0.y,x1.x,x1.y};cv.b[k+1U]={y0.x,y0.y,y1.x,y1.y};
             } else {
-                const uint2 x0=f16_affine_u8(l0,a0,b0),x1=f16_affine_u8(l1,a0,b0),y0=f16_affine_u8(u0,a1,b1),y1=f16_affine_u8(u1,a1,b1);
+                const uint2 x0=QwenKDecodeOps::f16_affine_u8(l0,a0,b0),x1=QwenKDecodeOps::f16_affine_u8(l1,a0,b0),y0=QwenKDecodeOps::f16_affine_u8(u0,a1,b1),y1=QwenKDecodeOps::f16_affine_u8(u1,a1,b1);
                 cv.b[k]={x0.x,x0.y,x1.x,x1.y};cv.b[k+1U]={y0.x,y0.y,y1.x,y1.y};
             }
         }

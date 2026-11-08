@@ -1,10 +1,35 @@
 #pragma once
 
 #include "../../moe_core/exl3_trellis.hpp"
+#include "../../moe_core/decode_schedule.hpp"
+#include "mmx_moe.hpp"
 
 namespace strix::minimax::moe::opt {
 
 template <int Bits> using WeightDecode = strix::moe_core::Exl3Trellis<Bits>;
+
+// C1's Args, LDS vector and device operations stay private to the translation
+// unit. This contract supplies the shared Decode family with MiniMax geometry;
+// inherited operations preserve the existing EXL3 K chains and publication ABI.
+template <class ArgsT, class WideV4T, class DeviceOps>
+struct MinimaxTraits : DeviceOps {
+    using Args = ArgsT;
+    using Dispatch = strix::minimax::moe::opt::Dispatch;
+    using ExpertSlices = strix::minimax::moe::opt::ExpertSlices;
+    using Exl3 = strix::minimax::moe::opt::Exl3;
+    using WideV4 = WideV4T;
+    using SlotInfo = Dispatch;  // Only the GLM overloads use a separate slot record.
+    static constexpr auto kHidden = strix::minimax::moe::opt::kHidden;
+    static constexpr auto kInter = strix::minimax::moe::opt::kInter;
+    static constexpr auto kSharedSlot = strix::minimax::moe::opt::kSharedSlot;
+    static constexpr auto kTopE = strix::minimax::moe::opt::kTopE;
+    static constexpr unsigned kGateSplits = strix::moe_core::vector_splits(kHidden, kInter);
+    static constexpr unsigned kDownSplits = strix::moe_core::vector_splits(kInter, kHidden);
+    static constexpr unsigned kSplitCh = 384;
+    using Schedule = strix::moe_core::DecodeSchedule<kGateSplits, kDownSplits, kSplitCh, 4U>;
+    static_assert(kGateSplits == 16 && kDownSplits == 4);
+    static_assert(kGateSplits * kSplitCh == kHidden && kDownSplits * kSplitCh == kInter);
+};
 
 struct ExpertLayout {
     // Expert-major packed streams; gate/up work items are consecutive, separate matrices.

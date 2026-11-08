@@ -1,6 +1,6 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0x0b728e1ca0f2cf5bULL},
+{"CMakeLists.txt", 0x85e14a0223dd1d21ULL},
 {"apps/minimax_rank_main.cpp", 0xc4bb37b7e3d04435ULL},
 {"apps/minimax_serve_main.cpp", 0x1584a60c38f4e8beULL},
 {"src/dspark_common/markov_cand_kernels.hpp", 0xf20c7f91a631cbc1ULL},
@@ -37,7 +37,7 @@
 {"src/minimax/engine/mm_pack.cpp", 0xbc1d7d94ce76263bULL},
 {"src/minimax/engine/prefill_timeline.hpp", 0x0ec15245e90e2d9dULL},
 {"src/minimax/engine/route_identity.hpp", 0xd9d985e58cd364bcULL},
-{"src/minimax/moe/mmx_moe.hip", 0x442d0c485152513eULL},
+{"src/minimax/moe/mmx_moe.hip", 0x3edc2c4c4ce08874ULL},
 {"src/minimax/moe/mmx_moe.hpp", 0x05698ea07b619950ULL},
 {"src/minimax/moe/mmx_prefill.hip", 0x712295b3a312a509ULL},
 {"src/minimax/moe/mmx_prefill.hpp", 0xf24f2acf1f4ec7b2ULL},
@@ -92,6 +92,6 @@
 {"src/minimax/session/runtime.hpp", 0x0325df45ea3cdfe1ULL},
 {"src/minimax/session/session_cache.cpp", 0x6555534b36923235ULL},
 {"src/minimax/model_description.cpp", 0x7f83cbd84d35894bULL},
-{"src/minimax/moe/mmx_moe_traits.hpp", 0x4cf6b2ed2b9bb30dULL},
+{"src/minimax/moe/mmx_moe_traits.hpp", 0xa8062d98dfe8b5f9ULL},
 {"src/moe_core/exl3_trellis.hpp", 0x55abe5a54fd01bbdULL},
-{"src/moe_core/grouped_core.hpp", 0xb9c1c1a8fbf46cf8ULL},
+{"src/moe_core/grouped_core.hpp", 0x2aa6e6de29d869f0ULL},

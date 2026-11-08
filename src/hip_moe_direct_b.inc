@@ -10,14 +10,14 @@ __device__ __forceinline__ f16x16 direct_b_decode(uint4 q,unsigned half,float a,
             // Put adjacent low/high nibbles directly into FP16 subnormal pairs.
             // Four permutations per word instead of interleaving bytes first.
             const float a2=a*16777216.0F;
-            decoded={f16_mix_pair(a2,__builtin_amdgcn_perm(odd,even,0x0c040c00U),b),
-                f16_mix_pair(a2,__builtin_amdgcn_perm(odd,even,0x0c050c01U),b),
-                f16_mix_pair(a2,__builtin_amdgcn_perm(odd,even,0x0c060c02U),b),
-                f16_mix_pair(a2,__builtin_amdgcn_perm(odd,even,0x0c070c03U),b)};
+            decoded={QwenKDecodeOps::f16_mix_pair(a2,__builtin_amdgcn_perm(odd,even,0x0c040c00U),b),
+                QwenKDecodeOps::f16_mix_pair(a2,__builtin_amdgcn_perm(odd,even,0x0c050c01U),b),
+                QwenKDecodeOps::f16_mix_pair(a2,__builtin_amdgcn_perm(odd,even,0x0c060c02U),b),
+                QwenKDecodeOps::f16_mix_pair(a2,__builtin_amdgcn_perm(odd,even,0x0c070c03U),b)};
         } else {
             const unsigned c0=__builtin_amdgcn_perm(odd,even,0x05010400U);
             const unsigned c1=__builtin_amdgcn_perm(odd,even,0x07030602U);
-            const uint2 lo=f16_affine_u8(c0,a,b),hi=f16_affine_u8(c1,a,b);
+            const uint2 lo=QwenKDecodeOps::f16_affine_u8(c0,a,b),hi=QwenKDecodeOps::f16_affine_u8(c1,a,b);
             decoded={lo.x,lo.y,hi.x,hi.y};
         }
         __builtin_memcpy(reinterpret_cast<char*>(&local)+16U*w,&decoded,16U);
@@ -129,7 +129,7 @@ __device__ __forceinline__ void project_prefill_direct_b_body(const unsigned cha
         }
         const uint4 head=r.head;
         if(step%4U==0U) {
-            if constexpr((Tune&64U)!=0U)fast_block=__all(f16_affine_exact(head.x&65535U,63U*15U,head.x>>16U,63U));
+            if constexpr((Tune&64U)!=0U)fast_block=__all(QwenKDecodeOps::f16_affine_exact(head.x&65535U,63U*15U,head.x>>16U,63U));
         }
         const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(head.x&65535U)));
         const float dm=__half2float(__ushort_as_half(static_cast<unsigned short>(head.x>>16U)));

@@ -5,6 +5,7 @@
 // placement differs (row-parallel kernels; the KDA recurrence stays token-sequential inside a register scan).
 // Tier B (EXL3 linears) is not here; under identity glm-pf-wmma-v1 it is strix_gemm (deviation D10).
 #include "glm/kernels/glm_dsa.hpp"
+#include "glm/prefill/glm_pf_workspace.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
 
 namespace strix::glm::pf {
@@ -34,6 +35,10 @@ void dsa_append_rows(const dev::DsaSlot& slot, unsigned t0, const float* latent,
 //   keys: workspace [C][kpool_cap] uint32 with kpool_cap >= (t0 + C) / 4.
 void indexer_select_rows(const dev::DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,
                          unsigned kpool_cap, std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s);
+// Capacity-independent workspace: keys [C][kIndexerKeyStride]. Same canonical
+// list, with stable top-512 carried across fixed pool windows; no submit allocation.
+void indexer_select_rows_bounded(const dev::DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,
+                                 std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s, unsigned score_v = 0);
 // Explicit versions for bitwise gates and paired timing: scores 1/2/3 (same keys), select 1/2 (same lists). The default
 // entry point runs scores 3 + select 2; STRIX_GLM_PF_IDX=2 / STRIX_GLM_PF_SELECT=1 restore the previous ones.
 void indexer_select_rows_versions(const dev::DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,

@@ -129,7 +129,7 @@ public:
         key_ = own_.alloc<float>(R * kIdxDim);
         gate_ = own_.alloc<float>(R * kIdxDim);
         wh_ = own_.alloc<float>(R * kIdxHeads);
-        keys_ = own_.alloc<std::uint32_t>(R * (cap_ / kKpool));
+        keys_ = own_.alloc<std::uint32_t>(R * kIndexerKeyStride);
         tok_ = own_.alloc<std::uint32_t>(R * kMaxTokens);
         ntok_ = own_.alloc<std::uint32_t>(R);
         qt_ = own_.alloc<float>(R * Hm_ * kKvLora);
@@ -178,15 +178,14 @@ public:
         if (own_.bytes != device_bytes(Hk_, Hm_, cap_, Rmax_, tb_) || own_.ptrs.size() > kPrefillAllocationBound)
             throw std::logic_error("glm pf path: allocation tally differs from prefill_budget (update both)");
     }
-    // Exact bytes the constructor allocates (checked there against its own tally). The admission budget passes the
-    // default (gemv, the larger: it adds the exact MoE workspace the wmma identity never allocates).
-    static std::uint64_t device_bytes(unsigned Hk, unsigned Hm, std::uint64_t cap, unsigned Rmax, TierB tb = TierB::gemv) {
+    // Exact bytes the constructor allocates, also used by both admission checks.
+    static std::uint64_t device_bytes(unsigned Hk, unsigned Hm, std::uint64_t /*cap*/, unsigned Rmax, TierB tb = TierB::gemv) {
         const std::uint64_t R = Rmax, C = std::uint64_t{Hk} * kKdaDim, I = std::uint64_t{kExpertI} * Hk / kKdaHeads;
         const std::uint64_t f = 3 * C + 3 * C + 2 * C + Hk + 2 * kKdaDim + std::uint64_t{Hk} * 4 * kKdaDim + Hk +
                                 std::max<std::uint64_t>(C, std::uint64_t{Hm} * kMlaDim) + C + 2 * kQLora + std::uint64_t{Hm} * kMlaDim +
                                 2 * kKvLora + std::uint64_t{kIdxHeads} * kIdxDim + 2 * kIdxDim + kIdxHeads + std::uint64_t{Hm} * kKvLora +
                                 std::uint64_t{Hm} * kEStride + std::uint64_t{Hm} * kKvLora + kHidden;
-        std::uint64_t b = R * f * 4 + R * (cap / kKpool) * 4 + R * kMaxTokens * 4 + R * 4;
+        std::uint64_t b = R * f * 4 + indexer_workspace_bytes(Rmax) + R * kMaxTokens * 4 + R * 4;
         b += prefill_moe_workspace_bound(Rmax);
         b += exact_workspace_bytes(Hk, Hm, Rmax);
         // pf_mem_budget mirror: optional TP2 exact MoE adds workspace_bytes(Rmax),
@@ -283,7 +282,7 @@ public:
             dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
         }
         dsa_append_rows(sl, t0, lat_, key_, gate_, iw, c.flag, R, c.stream);
-        indexer_select_rows(sl, t0, qI_, wh_, keys_, static_cast<unsigned>(cap_ / kKpool), tok_, ntok_, R, c.stream);
+        indexer_select_rows_bounded(sl, t0, qI_, wh_, keys_, tok_, ntok_, R, c.stream);
         mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream);
         linear(c, w.o, o_, y, R, H * kMlaDim, kHidden);
     }
@@ -568,11 +567,11 @@ unsigned gemv_block() {
     return b;
 }
 
-PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp) {
+PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp, TierB tierb) {
     check_geometry(kda_heads, mla_heads, capacity, max_rows);
     PrefillBudget b;
-    b.path = GlmPfPath::device_bytes(kda_heads, mla_heads, capacity, max_rows);
-    b.workspace = GlmPfPath::workspace_bytes(kda_heads, mla_heads, max_rows);
+    b.path = GlmPfPath::device_bytes(kda_heads, mla_heads, capacity, max_rows, tierb);
+    b.workspace = tierb == TierB::wmma ? GlmPfPath::workspace_bytes(kda_heads, mla_heads, max_rows) : 0;
     const std::uint64_t RC = std::max(8U, max_rows);
     b.engine_rows = RC * ((3ULL * kHc * kHidden + 2ULL * kHcMix + (5ULL + (mtp ? 9ULL : 0ULL)) * kHidden + kExperts + kTopE) * 4 + (kTopE + 2) * 4 + 8);
     return b;
@@ -589,9 +588,9 @@ std::uint64_t mem_available_bytes() {  // /proc/meminfo MemAvailable; refuses wh
     throw std::runtime_error("glm pf path: cannot read MemAvailable from /proc/meminfo (refusing to allocate unchecked)");
 }
 }  // namespace
-std::uint64_t admission_margin_bytes() {  // STRIX_GLM_PF_MARGIN_GIB: finite, 0 .. 1024 GiB; default 8
+std::uint64_t admission_margin_bytes() {  // STRIX_GLM_PF_MARGIN_GIB: finite, 0 .. 1024 GiB; default 1
     const char* m = std::getenv("STRIX_GLM_PF_MARGIN_GIB");
-    if (m == nullptr) return std::uint64_t{8} << 30;
+    if (m == nullptr) return kPrefillSafetyBytes;
     char* end = nullptr;
     const double g = std::strtod(m, &end);
     if (end == m || *end != '\0' || !std::isfinite(g) || g < 0 || g > 1024)
@@ -600,21 +599,12 @@ std::uint64_t admission_margin_bytes() {  // STRIX_GLM_PF_MARGIN_GIB: finite, 0 
 }
 
 std::shared_ptr<engine::PrefillPath> make_prefill_path(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows,
-                                                       TierB tierb) {
-    const PrefillBudget b = prefill_budget(kda_heads, mla_heads, capacity, max_rows);  // validates the geometry
-    const std::uint64_t need = b.path + (tierb == TierB::wmma ? b.workspace : 0);
-    const std::uint64_t margin = admission_margin_bytes();
+                                                       TierB tierb, std::uint64_t margin) {
+    const PrefillBudget b = prefill_budget(kda_heads, mla_heads, capacity, max_rows, true, tierb);  // validates the geometry
     std::size_t dev_free = 0, dev_total = 0;
     ok(hipMemGetInfo(&dev_free, &dev_total), "mem info");
     const std::uint64_t host_avail = mem_available_bytes();
-    if (dev_free < need + margin || host_avail < need + margin) {
-        const auto gib = [](std::uint64_t v) { return static_cast<double>(v) / static_cast<double>(std::uint64_t{1} << 30); };
-        std::ostringstream os;
-        os << "glm pf path: refusing to allocate " << gib(need) << " GiB (path " << gib(b.path) << " + workspace " << gib(b.workspace)
-           << ") + margin " << gib(margin) << " GiB: device free " << gib(dev_free) << " GiB, host MemAvailable " << gib(host_avail)
-           << " GiB (lower max_rows / capacity)";
-        throw std::runtime_error(os.str());
-    }
+    admit_prefill_bytes(b.path, b.workspace, margin, dev_free, host_avail);
     auto path = std::make_shared<GlmPfPath>(kda_heads, mla_heads, capacity, max_rows, tierb);
     path->margin_ = margin;
     return path;

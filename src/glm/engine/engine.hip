@@ -1010,7 +1010,8 @@ struct Engine::Impl {
         auto select_rows = [&](bool recheck) {
             std::size_t dev_free = 0, dev_total = 0;
             hip_ok(hipMemGetInfo(&dev_free, &dev_total), "row admission mem info");
-            const unsigned rows = select_max_rows({load_terms(), probe.read(), margins, prefill_install, dev_free, recheck, amodel});
+            const unsigned rows = select_max_rows({load_terms(), probe.read(), margins, prefill_install, dev_free, recheck, amodel,
+                                                   plan.logical, plan.physical(amodel)});
             if (rows == 0 || rows > opt.max_rows) throw std::invalid_argument("load row selector must reduce max_rows within 1..max_rows");
             if (rows != opt.max_rows) {
                 opt.max_rows = rows;

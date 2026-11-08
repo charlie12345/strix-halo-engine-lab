@@ -180,7 +180,7 @@ void test_item_off_switches() {
     CHECK(resolve(cat(plain, {"--spec", "1"}), {}).prefill == "ref");
     CHECK(resolve(cat(plain, {"--idcheck", "32"}), {}).prefill == "ref");
     CHECK(resolve(cat(plain, {"--aba", "96"}), {}).prefill == "ref");
-    CHECK(resolve(cat(kDeploy, {"--mem-plan"}), {}).prefill == "ref");
+    CHECK(resolve(cat(kDeploy, {"--mem-plan"}), {}).prefill == "gemv");
     CHECK(resolve(cat(kDeploy, {"--g3", "t.u32", "--layers", "6"}), {}).prefill == "ref");
     CHECK(resolve(plain, {{"STRIX_GLM_SMOKE_HEAD", "1"}}).prefill == "ref");
 }

@@ -1,12 +1,15 @@
 #include "glm_model_description.hpp"
 
-#include "glm/rtxpf/import/glm_dims.hpp"
+#include "../rtxpf/import/glm_dims.hpp"
+#include "glm_rank_plan_graph.hpp"
 #include "strix/serve/json.hpp"
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 
@@ -232,4 +235,120 @@ void validate_model_directory(const std::string& directory) {
     check_directory(directory, false);
 }
 void validate_model_directory_complete(const std::string& directory) { check_directory(directory, true); }
+namespace {
+namespace mg = model_graph;
+std::uint64_t dimension(const Description& d, const char* key) {
+    // Called only after validate_description: type, presence and sign are checked.
+    return static_cast<std::uint64_t>(std::get<std::int64_t>(d.find(key)->data));
+}
+mg::LayerDesc graph_layer(const Description& d, unsigned id, bool mtp) {
+    mg::LayerDesc layer;
+    layer.id = id;
+    // The adapter has validated the complete declared cadence before applying it.
+    layer.attention = !mtp && id % 4 != 3 ? mg::AttentionFamily::kda : mg::AttentionFamily::compressed_indexed;
+    layer.norms = {{"rms", "arithmetic.rms_eps", mg::NormPlacement::pre_attention},
+                   {"rms", "arithmetic.rms_eps", mg::NormPlacement::pre_mlp}};
+    if (id < dimension(d, "moe.first_layer")) {
+        layer.mlps = {{mg::MlpKind::dense, dimension(d, "dims.intermediate"), 0, 0}};
+    } else {
+        layer.mlps = {{mg::MlpKind::moe, dimension(d, "moe.intermediate"), dimension(d, "moe.experts"), dimension(d, "moe.top_k")},
+                      {mg::MlpKind::shared_expert, dimension(d, "moe.intermediate"), dimension(d, "moe.shared"), 1}};
+    }
+    layer.tensors = {{"attention.projections", "source-linear", {"dims.hidden", "attention-width"}, ""},
+                     {"mlp.projections", "source-linear", {"dims.hidden", "intermediate"}, "expert-partitionable"}};
+    if (!mtp) {
+        layer.hyper_connection = mg::HyperConnectionDesc{mg::HyperConnectionKind::mhc,
+            dimension(d, "extras.hyper_connections.rank"), dimension(d, "extras.hyper_connections.iterations")};
+        layer.tensors.push_back({"residual.streams", "fp32", {"extras.hyper_connections.rank", "dims.hidden"}, ""});
+    } else {
+        layer.tensors.push_back({"draft.embedding_hidden_projection", "source-linear", {"2*dims.hidden", "dims.hidden"}, ""});
+        layer.norms.push_back({"rms", "arithmetic.rms_eps", mg::NormPlacement::input});
+        layer.norms.push_back({"rms", "arithmetic.rms_eps", mg::NormPlacement::output});
+    }
+    if (layer.attention == mg::AttentionFamily::kda) {
+        layer.states = {{{"attention.recurrent", "engine-state", {"attention.kda.heads", "attention.kda.head_dim", "attention.kda.head_dim"}, ""}, "sequence"},
+                        {{"attention.convolution", "engine-state", {"3*attention.kda.qkv", "attention.kda.conv_kernel-1"}, ""}, "sequence"}};
+    } else {
+        layer.states = {{{"attention.latent_history", "engine-state", {"context", "attention.mla.kv_lora"}, ""}, "sequence"},
+                        {{"attention.indexed_pool", "engine-state", {"context/attention.select.pool", "attention.select.head_dim"}, ""}, "sequence"},
+                        {{"attention.position", "engine-state", {"1"}, ""}, "sequence"}};
+    }
+    return layer;
+}
+}  // namespace
+
+model_graph::ModelGraph build_model_graph(const Description& d) {
+    validate_description(d);
+    mg::ModelGraph graph;
+    graph.model = std::get<std::string>(d.find("name")->data);
+    graph.semantic_version = std::get<std::string>(d.find("graph.adapter")->data);
+    for (const char* field : {"schema", "attention.kind", "graph.attention_pattern", "graph.ffn_pattern"})
+        graph.semantics[field] = std::get<std::string>(d.find(field)->data);
+    for (const auto& entry : dimensions) graph.dimensions[entry.field] = dimension(d, entry.field);
+    for (const auto& entry : scalars) {
+        std::ostringstream value;
+        value.imbue(std::locale::classic());
+        value.precision(17);
+        value << std::get<double>(d.find(entry.field)->data);
+        graph.semantics[entry.field] = value.str();
+    }
+    graph.semantics["embedding_head"] = "separate weights; vocabulary partitionable; no deployment placement";
+    graph.inputs = {{"token_ids", "u32", {"tokens"}, ""}};
+    graph.outputs = {{"logits", "fp32", {"tokens", "dims.vocab"}, "vocabulary-partitionable"}};
+    graph.tensors = {{"embedding", "source-weight", {"dims.vocab", "dims.hidden"}, "vocabulary-partitionable"},
+                     {"head", "source-linear", {"dims.hidden", "dims.vocab"}, "vocabulary-partitionable"}};
+    for (unsigned id = 0; id < dimension(d, "dims.layers"); ++id) {
+        graph.layers.push_back(graph_layer(d, id, false));
+        const auto endpoint = "layer." + std::to_string(id);
+        graph.edges.push_back({id == 0 ? "embedding" : "layer." + std::to_string(id - 1) + ".output",
+                               endpoint + ".input", mg::EdgeKind::data});
+        graph.edges.push_back({endpoint + ".input", endpoint + ".output", mg::EdgeKind::hyper_connection});
+    }
+    graph.edges.push_back({"input.token_ids", "embedding", mg::EdgeKind::data});
+    graph.edges.push_back({"layer." + std::to_string(graph.layers.back().id) + ".output", "head", mg::EdgeKind::data});
+    graph.edges.push_back({"head", "output.logits", mg::EdgeKind::data});
+    graph.attachments.push_back({mg::AttachmentKind::mtp, "mtp", "trunk.output",
+        {graph_layer(d, static_cast<unsigned>(dimension(d, "extras.mtp.layer")), true)}});
+    mg::validate(graph);
+    return graph;
+}
+
+std::string print_model_graph(const std::string& directory) {
+    // No opt-out: inspection must never describe an unvalidated source contract.
+    check_directory(directory, false);
+    const std::filesystem::path root(directory);
+    // The description may live in the repository instead of next to the weights: STRIX_GLM_MODEL_DESCRIPTION names it.
+    const char* described = std::getenv("STRIX_GLM_MODEL_DESCRIPTION");
+    const auto description = described && *described ? std::filesystem::path(described) : root / "glm-5.3-flash.toml";
+    const auto graph = build_model_graph(model_description::load(description.string()));
+    const auto index = serve::parse_json_unique(read(root / "model.safetensors.index.json"));
+    const auto* weights = index.find("weight_map");
+    if (!weights || !weights->is_object()) throw std::runtime_error("GLM model graph: missing index weight_map");
+    std::vector<std::string> names;
+    for (const auto& [key, value] : weights->as_object()) {
+        (void)value;
+        names.push_back(key);
+    }
+    // MTP tensors ship in mtp.safetensors, outside the trunk index: add its tensor names from the file header.
+    const auto mtp = root / "mtp.safetensors";
+    if (std::filesystem::exists(mtp)) {
+        std::ifstream in(mtp, std::ios::binary);
+        unsigned char size_bytes[8] = {};
+        if (!in.read(reinterpret_cast<char*>(size_bytes), 8)) throw std::runtime_error("GLM model graph: cannot read mtp.safetensors header size");
+        std::uint64_t header_size = 0;
+        for (int i = 7; i >= 0; --i) header_size = (header_size << 8U) | size_bytes[i];
+        if (header_size == 0 || header_size > (std::uint64_t{64} << 20U)) throw std::runtime_error("GLM model graph: implausible mtp.safetensors header size");
+        std::string header(static_cast<std::size_t>(header_size), '\0');
+        if (!in.read(header.data(), static_cast<std::streamsize>(header_size))) throw std::runtime_error("GLM model graph: truncated mtp.safetensors header");
+        const auto tensors = serve::parse_json_unique(header);
+        if (!tensors.is_object()) throw std::runtime_error("GLM model graph: mtp.safetensors header is not an object");
+        for (const auto& [key, value] : tensors.as_object()) {
+            (void)value;
+            if (key != "__metadata__") names.push_back(key);
+        }
+    }
+    load::check_rank_plan_graph(graph, names);
+    return mg::dump(graph);
+}
+
 }  // namespace strix::glm::model

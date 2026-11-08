@@ -44,7 +44,7 @@ endif()
 if(STRIX_ENABLE_HIP_RUNTIME)
     add_library(strix_h3_te_gpu STATIC src/h3/te/te_gpu.hip)
     set_target_properties(strix_h3_te_gpu PROPERTIES
-        HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
+        HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_compile_options(strix_h3_te_gpu PRIVATE
         -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
     target_link_libraries(strix_h3_te_gpu PUBLIC strix_h3_te_pack strix_hip_runtime)

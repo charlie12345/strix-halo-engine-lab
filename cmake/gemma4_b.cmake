@@ -225,7 +225,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         message(STATUS "Gemma4 device graph and gates await the manifest/host-reference package")
     endif()
     foreach(t IN LISTS gemma4_b_hip_targets)
-        set_target_properties(${t} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(${t} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee;-fno-gpu-flush-denormals-to-zero>)
         # The shared host interface requests dynamic rounding modes. Device arithmetic is fixed RNE;
         # dynamic modes are unsupported by this ISA. Preserve all strict/no-contraction options.

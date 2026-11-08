@@ -41,6 +41,7 @@
 #include "minimax/serve/minimax_observe.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
 #include "strix/minimax/engine.hpp"
+#include "../src/minimax/model_graph.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/serve/minimax_dspark_policy.hpp"
 #include <filesystem>
@@ -747,7 +748,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s MODEL_DIR --rank R --transport T [--port P] [--bind ADDR] [--slots S] [--capacity C] "
                              "[--max-rows R] [--model-id ID] [--max-tokens N] [--dspark-mode off|auto|on] [--dspark DIR [--dspark-exl3 DIR]] [--admin] "
-                             "[--resume-check P.u32[,...]]\n", argv[0]);
+                             "[--resume-check P.u32[,...]] [--print-model-graph] [--print-plan]\n", argv[0]);
         return 2;
     }
     try {
@@ -771,6 +772,8 @@ int main(int argc, char** argv) {
         std::uint32_t max_tokens = 4096, check_tokens = 256, check_child_layers = ~0U;
         bool admin = false, check_only = false;
         std::string dspark_mode_value, dspark_prior_value;
+        bool print_graph = strix::minimax::graph::requested("STRIX_PRINT_MODEL_GRAPH");
+        bool print_plan = strix::minimax::graph::requested("STRIX_PRINT_EXEC_PLAN");
         const auto dspark_inflight = ds::parse_inflight(std::getenv("STRIX_MM_SERVE_DSPARK_INFLIGHT"));
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
@@ -778,7 +781,9 @@ int main(int argc, char** argv) {
                 if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
                 return argv[++i];
             };
-            if (a == "--rank") opt.rank = static_cast<std::uint32_t>(std::stoul(next()));
+            if (a == "--print-model-graph") print_graph = true;
+            else if (a == "--print-plan") print_plan = true;
+            else if (a == "--rank") opt.rank = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--transport") transport_spec = next();
             else if (a == "--port") port = static_cast<std::uint16_t>(std::stoul(next()));
             else if (a == "--bind") bind = next();
@@ -822,6 +827,8 @@ int main(int argc, char** argv) {
                     dspark_dir = opt.model_dir + "/dspark";
                     break;
                 }
+        const strix::minimax::graph::Attachments graph_attachments{!dspark_dir.empty(), !dspark_exl3.empty(), 0};
+        if (strix::minimax::graph::inspect_or_check(opt.model_dir, opt.rank, graph_attachments, print_graph, print_plan)) return 0;
         const strix::minimax::defaults::Lookup lookup = [](const char* key) { return std::getenv(key); };
         strix::minimax::defaults::Cli cli; cli.app = "serve"; cli.transport = transport_spec; cli.slots = opt.slots; cli.capacity = opt.capacity; cli.max_rows = opt.max_rows;
         strix::minimax::defaults::SessionConfig session_config;

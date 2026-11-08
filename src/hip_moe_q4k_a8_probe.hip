@@ -1,4 +1,5 @@
 #include "strix/hip_qwen_dpp_reduce.hpp"
+#include "strix/hip_arch_caps.hpp"
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/hip_moe_a8_down.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
@@ -13,8 +14,8 @@
 #pragma clang fp contract(off)
 #include "strix/hip_gsq_a8_groups.hpp"
 #if defined(__HIP_DEVICE_COMPILE__)
-#if !defined(__gfx1151__)
-#error "Experimental Q4K A8 probe admits gfx1151 only"
+#if !STRIX_HAS_SUDOT4
+#error "Experimental Q4K A8 probe requires native signed-A unsigned-B dot4"
 #endif
 #if !__has_builtin(__builtin_amdgcn_sudot4)
 #error "No native signed-A unsigned-B dot4 support"

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/model_description.hpp"
+#include "../../model_graph/model_graph.hpp"
 
 #include <string>
 #include <string_view>
@@ -31,5 +32,10 @@ void validate_model_directory(const std::string& directory);
 // Tools: config.json is required and complete.
 void validate_model_directory_complete(const std::string& directory);
 [[nodiscard]] bool description_check_enabled();
+
+// Opt-in description tooling only. build_model_graph always validates its input;
+// inspection requires the deployed TOML and index, even if admission checks are off.
+[[nodiscard]] model_graph::ModelGraph build_model_graph(const model_description::ModelDescription& description);
+[[nodiscard]] std::string print_model_graph(const std::string& directory);
 
 }  // namespace strix::glm::model

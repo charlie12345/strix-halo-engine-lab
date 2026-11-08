@@ -2,6 +2,7 @@
 
 #include "strix/deepseek41_model.hpp"
 #include "strix/model_description.hpp"
+#include "../../src/model_graph/model_graph.hpp"
 
 #include <string>
 
@@ -15,6 +16,9 @@ namespace strix::deepseek41 {
 // Reports all contract mismatches together, then reuses parse_config_json's semantic
 // checks. This is deliberately not connected to any inference entry point.
 [[nodiscard]] Config config_from_model_description(
+    const model_description::ModelDescription& description, const Config& expected);
+
+[[nodiscard]] model_graph::ModelGraph graph_from_model_description(
     const model_description::ModelDescription& description, const Config& expected);
 
 // Lossless Config serialization in the existing embedded-config JSON shape.

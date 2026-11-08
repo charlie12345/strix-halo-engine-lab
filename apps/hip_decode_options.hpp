@@ -252,6 +252,7 @@ struct Options {
     bool baseline = false;
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
+    bool print_model_graph = false, print_plan = false;
     bool print_cache_family = false;
     strix::RotaryDescriptor rotary = strix::RotaryDescriptor::native();
     bool prefill_exact_fp16 = false;
@@ -1899,6 +1900,8 @@ inline Options parse_options(
     }
 
     Options options;
+    if (const char* value = std::getenv("STRIX_PRINT_MODEL_GRAPH")) options.print_model_graph = std::string_view(value) == "1";
+    if (const char* value = std::getenv("STRIX_PRINT_EXEC_PLAN")) options.print_plan = std::string_view(value) == "1";
     if (bundle_path!="serial-retry") options.mtp_bundle_path=std::move(bundle_path);
     if (!options.mtp_bundle_path.empty()) options.yarn_decode_source=options.mtp_bundle_path;
     else if (yarn_bundle_serial_retry || (std::getenv("STRIX_QWEN_YARN_MTP") &&
@@ -1970,6 +1973,8 @@ inline Options parse_options(
             continue;
         }
         if (argument == "--print-cache-family") { options.print_cache_family = true; continue; }
+        if (argument == "--print-model-graph") { options.print_model_graph = true; continue; }
+        if (argument == "--print-plan") { options.print_plan = true; continue; }
         if (argument == "--print-effective-config") { options.print_effective_config = true; continue; }
         if (argument == "--known-prefix-window=0" || argument == "--known-prefix-full-rows=0" ||
             argument == "--known-prefix-expert-union=0" || argument == "--known-window-router-rows=0" ||
@@ -3222,7 +3227,7 @@ inline Options parse_options(
 
     // Baseline keeps the same semantic validators as historical argv resolution.
     validate_model_copy_cli(options);
-    if (options.tokens.empty() && options.serving_prefix_files.empty() &&
+    if (!options.print_model_graph && !options.print_plan && options.tokens.empty() && options.serving_prefix_files.empty() &&
         options.reference_path.empty()) {
         throw std::invalid_argument(
             "at least one token id or --reference is required");

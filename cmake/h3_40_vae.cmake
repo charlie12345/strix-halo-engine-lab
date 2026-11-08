@@ -61,7 +61,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         set_tests_properties(strix-h3-audio-gpu-qualify PROPERTIES TIMEOUT 470 LABELS "h3;gpu;qualification")
     endif()
     foreach(target ${strix_h3_vae_hip_targets})
-        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
+        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_compile_options(${target} PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
             -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     endforeach()

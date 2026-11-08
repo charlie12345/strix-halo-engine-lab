@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/StrixHipArchs.cmake")
 
 project(strix_uma_residency_lab LANGUAGES CXX)
 
@@ -22,6 +23,6 @@ if(STRIX_UMA_ENABLE_HIP)
     set_target_properties(strix-uma-hip PROPERTIES
         HIP_STANDARD 20
         HIP_STANDARD_REQUIRED ON
-        HIP_ARCHITECTURES gfx1151
+        HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}"
     )
 endif()

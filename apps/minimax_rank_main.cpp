@@ -57,6 +57,7 @@
 //                                                     sender (its TTFT clock); repeated COUNT times (one connection each)
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/minimax/engine.hpp"
+#include "../src/minimax/model_graph.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/bp_codec.hpp"
@@ -1689,7 +1690,7 @@ int main(int argc, char** argv) {
     // Defaults-on resolver before anything reads a switch; --print-effective-config prints the resolved configuration.
     if (strix::minimax::defaults::print_or_apply("rank", argc, argv)) return 0;
     if (argc < 5) {
-        std::fprintf(stderr, "usage: %s MODEL_DIR RANK TRANSPORT OUT_DIR [options]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s MODEL_DIR RANK TRANSPORT OUT_DIR [options] [--print-model-graph] [--print-plan]\n", argv[0]);
         return 2;
     }
     try {
@@ -1711,13 +1712,17 @@ int main(int argc, char** argv) {
         std::vector<std::string> session_hash_files;
         std::string dspark_dir = std::string(argv[1]) + "/dspark", dspark_exl3;
         std::vector<std::string> dspark_heads;
+        bool print_graph = strix::minimax::graph::requested("STRIX_PRINT_MODEL_GRAPH");
+        bool print_plan = strix::minimax::graph::requested("STRIX_PRINT_EXEC_PLAN");
         for (int i = 5; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
                 if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
                 return argv[++i];
             };
-            if (a == "--gate") gate_dir = next();
+            if (a == "--print-model-graph") print_graph = true;
+            else if (a == "--print-plan") print_plan = true;
+            else if (a == "--gate") gate_dir = next();
             else if (a == "--gate-layers") gate_layers = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--gold") gold_dir = next();
             else if (a == "--tf") tf_dir = next();
@@ -1747,6 +1752,10 @@ int main(int argc, char** argv) {
             else if (strix::minimax::session::parse_option(session_options,a,next)) {}
             else throw std::invalid_argument("unknown option " + a);
         }
+        const strix::minimax::graph::Attachments graph_attachments{
+            !specs.empty() || session_options.draft || !dspark_heads.empty() || !dspark_exl3.empty(),
+            !dspark_exl3.empty(), static_cast<std::uint32_t>(dspark_heads.size())};
+        if (strix::minimax::graph::inspect_or_check(opt.model_dir, opt.rank, graph_attachments, print_graph, print_plan)) return 0;
         if(!session_options.save.empty() && !session_options.load.empty()) throw std::invalid_argument("choose session save or load");
         if (session_hash_only) {
             // CPU only: no transport, HIP runtime query, engine or drafter.

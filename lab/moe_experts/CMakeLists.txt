@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/StrixHipArchs.cmake")
 
 project(strix_moe_experts_lab LANGUAGES CXX HIP)
 
@@ -10,7 +11,7 @@ set_target_properties(strix-moe-experts PROPERTIES
     CXX_STANDARD_REQUIRED ON
     HIP_STANDARD 20
     HIP_STANDARD_REQUIRED ON
-    HIP_ARCHITECTURES gfx1151
+    HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}"
 )
 target_link_libraries(strix-moe-experts PRIVATE hip::host)
 

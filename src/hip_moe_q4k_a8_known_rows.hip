@@ -1,5 +1,6 @@
 #include "strix/cohort_step_plan.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
+#include "strix/hip_arch_caps.hpp"
 #include "moe_core/grouped_policy.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
@@ -23,8 +24,8 @@
 #pragma clang fp contract(off)
 #include "strix/hip_gsq_a8_groups.hpp"
 #if defined(__HIP_DEVICE_COMPILE__)
-#if !defined(__gfx1151__) || !__has_builtin(__builtin_amdgcn_sudot4)
-#error "A8 CSR gate/up requires gfx1151 signed-A unsigned-B dot4"
+#if !STRIX_HAS_RDNA35_WMMA || !STRIX_HAS_SUDOT4
+#error "A8 CSR gate/up requires RDNA 3.5 packed WMMA and signed-A unsigned-B dot4"
 #endif
 #endif
 

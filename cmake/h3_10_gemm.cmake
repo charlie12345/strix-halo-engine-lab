@@ -3,7 +3,7 @@
 #   strix_h3_gemm_device  device API (api.hpp / kernels.hpp, header-only HIP): carries the HIP runtime, include dirs and
 #                         the qualified device compile contract (wave32, no fast math, no fp contraction, correctly
 #                         rounded fp32 division/sqrt, IEEE denormals). Consumers also call
-#                         strix_h3_gemm_device_target(<target>) to set HIP_STANDARD 20 and HIP_ARCHITECTURES gfx1151.
+#                         strix_h3_gemm_device_target(<target>) to set HIP_STANDARD 20 and HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}".
 # Tests: strix-h3-gemm-ref-tests (CPU, always), strix-h3-gemm-gpu-tests and strix-h3-gemm-link-check (HIP).
 # Qualification in ctest: -DSTRIX_H3_QUALIFY=ON with STRIX_H3_GEMM_DUMPS_DIR, STRIX_H3_QUANT_SET_DIR (CPU) and, for the GPU
 # qualification (also needs STRIX_H3_GPU_CTEST=ON), STRIX_H3_CKPT; missing paths are a configure error (skips never pass).
@@ -40,7 +40,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_compile_options(strix_h3_gemm_device INTERFACE
         $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fno-fast-math;-ffp-contract=off;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee;-fno-gpu-flush-denormals-to-zero>)
     function(strix_h3_gemm_device_target target)
-        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(${target} PRIVATE strix_h3_gemm_device)
     endfunction()
 

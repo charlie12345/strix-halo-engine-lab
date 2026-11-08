@@ -14,6 +14,17 @@ en sí: [dos nodos por USB4](../../pair.es.md).
 
 ## Ejecución: el par
 
+La división de GLM por tokens es un perfil FAST de memoria calificado. El valor predeterminado
+`STRIX_GLM_KV_SHARD=auto` selecciona la división solo si falla la admisión de inicio del estado
+replicado; `=1` fuerza la división y `=0` fuerza la replicación. Exige una solicitud,
+`STRIX_GLM_PF_PIPELINE=1`, prefill por chunks y ausencia de MTP o especulación. FAST cambia el
+orden de suma, por lo que no es bit a bit igual al perfil exacto replicado predeterminado.
+Consulte la [guía de almacenamiento KV y división por tokens](../../engine/kv-sharding.es.md)
+para conocer la organización, los límites de contexto y tiempos medidos, la verificación y los
+costes. El experimento de transporte independiente `STRIX_XPORT_SMALL_SPIN=1` activa progreso
+acotado para mensajes pequeños; sin definir o con `0`, restaura el progreso anterior tras reiniciar.
+Véanse los [contratos de funciones](../../optimizations.md#kv-cache-sharding-and-shared-transport-progress).
+
 Ejecute una vez por nodo con `R` establecido en 0 o 1 y el mismo prompt tokenizado en ambos:
 
 ```sh

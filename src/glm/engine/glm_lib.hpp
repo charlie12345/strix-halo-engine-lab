@@ -278,7 +278,9 @@ public:
     // Prefill identity glm-pf-wmma-v1 (design notes section 1.1): strix_gemm_pinned with a caller-pinned
     // K split; the WMMA path for every rows >= 1. Needs a strix-trellis with STRIX_TRELLIS_HAS_GEMM_PINNED.
     // Refuses unless `bytes` + margin fit both hipMemGetInfo free and MemAvailable (unreadable MemAvailable refuses).
-    static void admit(std::uint64_t bytes, std::uint64_t margin, const char* what) {
+    // Return the same checked spare for opportunistic temporary sizing. Existing
+    // fixed-size callers ignore it; no second, less conservative memory source.
+    static std::uint64_t admit(std::uint64_t bytes, std::uint64_t margin, const char* what) {
         std::size_t dev_free = 0, dev_total = 0;
         hip_ok(hipMemGetInfo(&dev_free, &dev_total), "mem info");
         std::uint64_t host_avail = 0;
@@ -298,6 +300,7 @@ public:
             throw std::runtime_error(std::string(what) + ": refusing " + std::to_string(bytes >> 20) + " MiB (+ margin " + std::to_string(margin >> 20) +
                                      " MiB): device free " + std::to_string(dev_free >> 20) + " MiB, MemAvailable " +
                                      std::to_string(host_avail >> 20) + " MiB");
+        return std::min<std::uint64_t>(dev_free, host_avail) - margin;
     }
     // Fails closed: refuses unless the new buffer + margin fit both hipMemGetInfo free and the host's MemAvailable
     // (unified memory on gfx1151) while the current buffer still exists (the transient peak); MemAvailable unreadable

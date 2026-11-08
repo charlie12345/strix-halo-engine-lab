@@ -35,6 +35,7 @@ enum class TierB { wmma, gemv };
 //   workspace: WMMA only, the largest strix_gemm_pinned workspace of the path's linears; zero for GEMV. Engine reserves the
 //         larger of it and every GEMV call's workspace (gemv-mode Tier B, head);
 //         DSA keys use 4 * max_rows * (4096 + 512) bytes, independent of capacity.
+//         Sharded layouts also reserve kKvShardPrefillTemporaryBytes for bounded redistribution.
 //         Attention probabilities use max_rows * rank_heads * 2304 floats (selected tokens only).
 //   engine_rows: the engine's row buffers sized max(8, Options::max_rows) (allocated/admitted by the load plan).
 //         Includes two H-wide final hidden buffers and, when mtp, nine H-wide MTP scratch equivalents.
@@ -45,15 +46,18 @@ struct PrefillBudget {
 };
 std::uint64_t admission_margin_bytes();
 PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp = true,
-                            TierB tierb = TierB::gemv);
+                            TierB tierb = TierB::gemv, bool kv_shard = false);
 
 // heads: rank KDA / MLA heads; capacity: DSA positions per slot; max_rows: largest chunk.
 // Fails closed (std::runtime_error, nothing allocated) unless path + workspace + a margin fit both the free device
 // memory (hipMemGetInfo) and the host's MemAvailable (/proc/meminfo; unified memory on gfx1151). Margin:
 // STRIX_GLM_PF_MARGIN_GIB (default 1 GiB; see kPrefillSafetyBytes), unless the
 // caller supplies its startup policy margin (rank CLI keeps the OS reserve).
+// first_forward_reserve adds the identical policy headroom used by startup;
+// kv_shard reserves bounded redistribution scratch, never a full cache copy.
 std::shared_ptr<engine::PrefillPath> make_prefill_path(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity,
-                                                       unsigned max_rows, TierB tierb, std::uint64_t margin = admission_margin_bytes());
+                                                       unsigned max_rows, TierB tierb, std::uint64_t margin = admission_margin_bytes(),
+                                                       bool kv_shard = false, std::uint64_t first_forward_reserve = 0);
 // TierB from STRIX_GLM_PF_TIERB (gemv | wmma; default gemv, exact).
 TierB tierb_from_env();
 // gemv identity: rows per strix_gemv / MoE-seam call over a chunk, STRIX_GLM_PF_GEMV_BLOCK in 1..8 (default 8). A row's

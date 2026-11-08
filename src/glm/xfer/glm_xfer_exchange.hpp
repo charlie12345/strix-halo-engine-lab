@@ -46,6 +46,13 @@ public:
     void complete();
     void complete(hipStream_t) override { complete(); }
     [[nodiscard]] const Exchanger* exchanger() const noexcept { return xf_.get(); }
+    // Attention shares this owner with Xfer TP. With communicator TP, callers
+    // must retire that owner before entry and complete() + sync before exit.
+    Exchanger& attention_channel(hipStream_t s) { return ensure(s); }
+    void reserve_attention_bytes(std::size_t bytes) {
+        if (xf_ != nullptr) throw std::logic_error("glm xfer: capacity already fixed");
+        attention_bytes_ = bytes;
+    }
 
 private:
     void boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flags,
@@ -56,6 +63,7 @@ private:
     dist::Transport* transport_ = nullptr;
     std::uint32_t rank_ = 0;
     unsigned max_rows_ = 0;
+    std::size_t attention_bytes_ = 0;
     std::unique_ptr<Exchanger> xf_;
     std::uint64_t step_ = 0, layer_ = 0;
     float* bracket_ = nullptr;  // [max_rows][4][4096], allocated on first boundary()

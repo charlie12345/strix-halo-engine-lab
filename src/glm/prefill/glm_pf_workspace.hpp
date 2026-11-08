@@ -12,6 +12,12 @@ inline constexpr unsigned kIndexerPoolWindow = 4096;
 inline constexpr unsigned kIndexerRetainedPools = 512;
 inline constexpr unsigned kIndexerKeyStride = kIndexerPoolWindow + kIndexerRetainedPools;
 inline constexpr unsigned kPrefillAllocationBound = 64;
+// Target, not a ceiling: the byte-admitted planner can pack more rows.
+inline constexpr unsigned kKvShardPrefillRows = 128;
+// Startup reserves the minimum only. Extra temporary bytes are opportunistic,
+// rank-min admitted after pool scratch is retired; never charge them to capacity.
+inline constexpr std::uint64_t kKvShardPrefillTemporaryBytes = std::uint64_t{64} << 20;
+inline constexpr std::uint64_t kKvShardPrefillMaximumBytes = std::uint64_t{2} << 30;
 constexpr std::uint64_t indexer_workspace_bytes(unsigned rows) {
     return std::uint64_t{rows} * kIndexerKeyStride * sizeof(std::uint32_t);
 }

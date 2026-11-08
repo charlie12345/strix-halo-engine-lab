@@ -7,7 +7,7 @@
 namespace strix::glm::rank_defaults {
 
 inline strix::profile::NumericalIdentity numerical_identity(const Effective& e) {
-    strix::profile::NumericalIdentity identity;
+    strix::profile::NumericalIdentity identity{};
     // Keep the declared arithmetic separate from the selected R1/R1b mode.
     // R1b is not an assertion of R1 bit equality. See glm_math.hpp and the
     // rank app's R1 prompt / R1b generation contract.
@@ -16,6 +16,12 @@ inline strix::profile::NumericalIdentity numerical_identity(const Effective& e) 
                                    "R2 lane-strided fmaf partials with pairwise halving tree";
     identity.reduction_plan = e.identity.value;
     identity.prefill_lineage = e.prefill;
+    if (e.kv_shard) {
+        identity.state_format = "glm-dsa-owned-blocks-v1;layout=474c4d4b56533033;block=4;pool-parity;rank/capacity/frontier-bound";
+        identity.reduction_plan += std::string(";") + kvshard::numerical_identity;
+        identity.arithmetic_contract += "; DSA: global score keys and existing selection; FP32 owned-token m/l/a; declared_exp; lane-strided sum/PV with tree256 and FMA; unnormalized per-rank weights; rank0 then rank1 rescale with separate products/adds and final division before value projection";
+        identity.prefill_lineage += "; full attention then block-parity compaction; layout 474c4d4b56533033; block 4";
+    }
     return identity;
 }
 

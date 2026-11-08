@@ -322,9 +322,12 @@ __global__ __launch_bounds__(128) void kda_out_rows_kernel(KdaDev k, const float
 // ---------------------------------------------------------------- DSA append
 // dsa_store_kernel without the pooling (row-parallel: the pool reads other rows), position t0 + r.
 __global__ __launch_bounds__(128) void dsa_store_rows_kernel(DsaSlot sl, unsigned t0, const float* latent, IndexerDev w,
-                                                             const float* key, const float* gs, unsigned* flag) {
+                                                             const float* key, const float* gs, unsigned* flag,
+                                                             bool kv_shard, unsigned rank) {
     __shared__ float s[128];
-    const unsigned r = blockIdx.x, i = threadIdx.x, t = t0 + r;
+    const unsigned r = blockIdx.x, i = threadIdx.x, global = t0 + r;
+    if (kv_shard && (global / kKpool) % 2 != rank) return;
+    const unsigned t = kv_shard ? (global / (2 * kKpool)) * kKpool + global % kKpool : global;
     const float k = key[static_cast<std::size_t>(r) * kIdxDim + i];
     const float mu = lds_tree<128>(s, 0.0F + k) / static_cast<float>(kIdxDim);
     const float d = k - mu;
@@ -342,8 +345,11 @@ __global__ __launch_bounds__(128) void dsa_store_rows_kernel(DsaSlot sl, unsigne
     }
 }
 // R12 for pools p0 + blockIdx.x (channel = lane), = the pooling branch of dsa_store_kernel.
-__global__ __launch_bounds__(128) void dsa_pool_kernel(DsaSlot sl, unsigned p0, IndexerDev w, unsigned* flag) {
-    const unsigned p = p0 + blockIdx.x, i = threadIdx.x, t0 = p * kKpool;
+__global__ __launch_bounds__(128) void dsa_pool_kernel(DsaSlot sl, unsigned p0, IndexerDev w, unsigned* flag,
+                                                    bool kv_shard, unsigned rank) {
+    const unsigned global = p0 + blockIdx.x;
+    if (kv_shard && global % 2 != rank) return;
+    const unsigned p = kv_shard ? global / 2 : global, i = threadIdx.x, t0 = p * kKpool;
     float l4[kKpool], kv[kKpool], e[kKpool], pr[kKpool];
     for (unsigned j = 0; j < kKpool; ++j) {
         l4[j] = bf16_to_float(sl.igate[static_cast<std::size_t>(t0 + j) * kIdxDim + i]) + w.ape[j * kIdxDim + i];
@@ -368,7 +374,7 @@ __global__ void scale_kernel(float* v, unsigned n, float c) {
 // in LDS. Per (row, pool) = idx_score_kernel's chain. Rows with P_t <= 512 select every pool and need no scores.
 constexpr unsigned kScoreRows = 16;
 __global__ __launch_bounds__(128) void idx_score_rows_kernel(const float* pooled, unsigned t0, unsigned C, const float* qI,
-                                                             const float* wh, std::uint32_t* keys, unsigned cap, unsigned pool_begin) {
+                                                             const float* wh, std::uint32_t* keys, unsigned cap, unsigned pool_begin, unsigned pool_base = 0) {
     __shared__ float q[kIdxHeads * kIdxDim];
     __shared__ float w[kIdxHeads];
     const unsigned p = pool_begin + blockIdx.x * 128 + threadIdx.x, r0 = blockIdx.y * kScoreRows;
@@ -377,7 +383,7 @@ __global__ __launch_bounds__(128) void idx_score_rows_kernel(const float* pooled
     float K[kIdxDim];
     const bool have = p < Pmax;
 #pragma unroll
-    for (unsigned i = 0; i < kIdxDim; ++i) K[i] = have ? pooled[static_cast<std::size_t>(p) * kIdxDim + i] : 0.0F;
+    for (unsigned i = 0; i < kIdxDim; ++i) K[i] = have ? pooled[static_cast<std::size_t>(p - pool_base) * kIdxDim + i] : 0.0F;
     for (unsigned r = r0; r < r0 + kScoreRows && r < C; ++r) {
         const unsigned P = (t0 + r + 1) / kKpool;
         if (P <= kIdxPools) continue;  // uniform per block
@@ -405,7 +411,7 @@ __global__ __launch_bounds__(128) void idx_score_rows_kernel(const float* pooled
 // staged in LDS. Same bits as the v1 kernel; rows with P_t <= 512 and pools p >= P_t are skipped as there.
 constexpr unsigned kIs2Pools = 64, kIs2Rows = 4, kIs2K = 32, kIs2RH = kIs2Rows * kIdxHeads;  // 128 (row, head) pairs
 __global__ __launch_bounds__(256) void idx_score_rows_v2_kernel(const float* pooled, unsigned t0, unsigned C, const float* qI,
-                                                                const float* wh, std::uint32_t* keys, unsigned cap, unsigned pool_begin) {
+                                                                const float* wh, std::uint32_t* keys, unsigned cap, unsigned pool_begin, unsigned pool_base = 0) {
     __shared__ alignas(16) float ks[kIs2K][kIs2Pools];  // 8 KB
     __shared__ alignas(16) float qs[kIs2K][kIs2RH];     // 16 KB
     __shared__ float dots[kIs2RH][kIs2Pools + 1];        // 33 KB (+1 column against bank conflicts)
@@ -425,7 +431,7 @@ __global__ __launch_bounds__(256) void idx_score_rows_v2_kernel(const float* poo
         for (unsigned x = tid; x < (kIs2K / 4) * kIs2Pools; x += 256) {  // lanes walk pools: conflict-free stores
             const unsigned pp = x % kIs2Pools, i4 = x / kIs2Pools;
             float4 v{0.0F, 0.0F, 0.0F, 0.0F};
-            if (p0 + pp < Pmax) v = *reinterpret_cast<const float4*>(pooled + static_cast<std::size_t>(p0 + pp) * kIdxDim + k0 + 4 * i4);
+            if (p0 + pp < Pmax) v = *reinterpret_cast<const float4*>(pooled + static_cast<std::size_t>(p0 + pp - pool_base) * kIdxDim + k0 + 4 * i4);
             ks[4 * i4 + 0][pp] = v.x;
             ks[4 * i4 + 1][pp] = v.y;
             ks[4 * i4 + 2][pp] = v.z;
@@ -480,7 +486,7 @@ __global__ __launch_bounds__(256) void idx_score_rows_v2_kernel(const float* poo
 // head, pool) the dot chain over i ascending from +0 and per (row, pool) the head chain are v2's: same keys.
 constexpr unsigned kIs3Rows = 8, kIs3Pools = 64, kIs3Pad = kIdxDim + 4, kIs3L = 16;
 __global__ __launch_bounds__(32 * kIs3Rows) void idx_score_rows_v3_kernel(const float* pooled, unsigned t0, unsigned C, const float* qI,
-                                                                         const float* wh, std::uint32_t* keys, unsigned cap, unsigned pool_begin) {
+                                                                         const float* wh, std::uint32_t* keys, unsigned cap, unsigned pool_begin, unsigned pool_base = 0) {
     __shared__ alignas(16) float ks[kIs3Pools][kIs3Pad];  // 33 KB
     const unsigned p0 = pool_begin + blockIdx.x * kIs3Pools, r0 = blockIdx.y * kIs3Rows, tid = threadIdx.x, lane = tid % 32;
     const unsigned rlast = (r0 + kIs3Rows < C ? r0 + kIs3Rows : C) - 1;
@@ -489,7 +495,7 @@ __global__ __launch_bounds__(32 * kIs3Rows) void idx_score_rows_v3_kernel(const 
     for (unsigned x = tid; x < kIs3Pools * (kIdxDim / 4); x += 32 * kIs3Rows) {
         const unsigned pp = x / (kIdxDim / 4), i4 = x % (kIdxDim / 4);
         float4 v{0.0F, 0.0F, 0.0F, 0.0F};
-        if (p0 + pp < Pmax) v = *reinterpret_cast<const float4*>(pooled + static_cast<std::size_t>(p0 + pp) * kIdxDim + 4 * i4);
+        if (p0 + pp < Pmax) v = *reinterpret_cast<const float4*>(pooled + static_cast<std::size_t>(p0 + pp - pool_base) * kIdxDim + 4 * i4);
         *reinterpret_cast<float4*>(&ks[pp][4 * i4]) = v;
     }
     __syncthreads();
@@ -2744,13 +2750,13 @@ void kda_prefill(const KdaDev& k, const float* qkv, const float* f, const float*
 }
 
 void dsa_append_rows(const DsaSlot& slot, unsigned t0, const float* latent, const float* key, const float* gate,
-                     const IndexerDev& w, unsigned* flag, unsigned C, hipStream_t s) {
+                     const IndexerDev& w, unsigned* flag, unsigned C, hipStream_t s, bool kv_shard, unsigned rank) {
     if (C == 0) return;
-    dsa_store_rows_kernel<<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag);
+    dsa_store_rows_kernel<<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag, kv_shard, rank);
     ok(hipGetLastError(), "glm pf dsa_store_rows");
     const unsigned p_lo = t0 / kKpool, p_hi = (t0 + C) / kKpool;
     if (p_hi > p_lo) {
-        dsa_pool_kernel<<<p_hi - p_lo, 128, 0, s>>>(slot, p_lo, w, flag);
+        dsa_pool_kernel<<<p_hi - p_lo, 128, 0, s>>>(slot, p_lo, w, flag, kv_shard, rank);
         ok(hipGetLastError(), "glm pf dsa_pool");
     }
 }
@@ -2770,7 +2776,8 @@ void indexer_select_rows(const DsaSlot& slot, unsigned t0, const float* qI, floa
 
 
 void indexer_select_rows_bounded(const DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,
-                                 std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s, unsigned score_v) {
+                                 std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s, unsigned score_v,
+                                 const std::function<const float*(unsigned, unsigned)>& pool_window) {
     static_assert(kIdxPools == kIndexerRetainedPools);
     if (C == 0) return;
     const unsigned Pmax = (t0 + C) / kKpool;
@@ -2779,7 +2786,9 @@ void indexer_select_rows_bounded(const DsaSlot& slot, unsigned t0, const float* 
     if (Pmax <= kIndexerPoolWindow) {
         // Keep the existing single-window kernels and selector controls; the
         // fixed arena is already large enough for every score of these rows.
-        indexer_select_rows_versions(slot, t0, qI, wh, keys, kIndexerKeyStride, tokens, n, C, s, score_v, select_version());
+        DsaSlot window = slot;
+        if (pool_window && Pmax > kIdxPools) window.pooled = const_cast<float*>(pool_window(0, Pmax));
+        indexer_select_rows_versions(window, t0, qI, wh, keys, kIndexerKeyStride, tokens, n, C, s, score_v, select_version());
         return;
     }
     idx_mark(0, s);
@@ -2793,16 +2802,18 @@ void indexer_select_rows_bounded(const DsaSlot& slot, unsigned t0, const float* 
         const unsigned begin = w * kIndexerPoolWindow;
         const unsigned pools = std::min(kIndexerPoolWindow, Pmax - begin);
         if (Pmax > kIdxPools) {
+            const float* pooled = pool_window ? pool_window(begin, pools) : slot.pooled;
+            const unsigned base = pool_window ? begin : 0U;
             auto* out = keys + kIdxPools;
             if (score_v == 1)
                 idx_score_rows_kernel<<<dim3((pools + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
-                    slot.pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin);
+                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base);
             else if (score_v == 3)
                 idx_score_rows_v3_kernel<<<dim3((pools + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
-                    slot.pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin);
+                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base);
             else
                 idx_score_rows_v2_kernel<<<dim3((pools + kIs2Pools - 1) / kIs2Pools, (C + kIs2Rows - 1) / kIs2Rows), 256, 0, s>>>(
-                    slot.pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin);
+                    pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base);
             ok(hipGetLastError(), "glm pf bounded scores");
         }
         idx_merge_window_kernel<<<C, 1024, 0, s>>>(keys, kIndexerKeyStride, t0, begin, w + 1 == windows, tokens, n);

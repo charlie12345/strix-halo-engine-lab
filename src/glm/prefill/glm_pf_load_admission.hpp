@@ -7,7 +7,7 @@ namespace strix::glm::pf {
 
 // Project the same two quantities make_prefill_path reads after loading:
 // hipMemGetInfo free and MemAvailable, after retained weights/state/pools.
-// Load-only staging, forward reserves and GTT limits belong to the load guard;
+// Load-only staging and GTT limits belong to the load guard;
 // install_prefill separately admits its prepared experts and replacement scratch.
 template<class Admission>
 inline void admit_prefill_load(const Admission& a, std::uint64_t path,
@@ -19,6 +19,11 @@ inline void admit_prefill_load(const Admission& a, std::uint64_t path,
     take(device, communication_growth);
     take(host, a.post_load_host_bytes);
     take(host, a.model.physical(communication_growth));
+    // Preserve the same first-use headroom when projecting the post-load check.
+    // This is a policy margin, not an allocation: make_prefill_path charges the
+    // identical byte count against both availability readers.
+    take(device, a.first_forward_reserve);
+    take(host, a.first_forward_reserve);
     admit_prefill_bytes(path, workspace, margin, device, host);
 }
 

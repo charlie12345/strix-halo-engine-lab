@@ -8,6 +8,7 @@
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/prefill/glm_prefill.hpp"
+#include "glm/engine/glm_kvshard.hpp"
 
 #include <strix_trellis.h>
 
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -281,9 +283,14 @@ public:
             const DenseProj px[3] = {{w.wk, 0, kIdxDim, key_}, {w.gate, 0, kIdxDim, gate_}, {w.weights_proj, 0, kIdxHeads, wh_}};
             dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
         }
-        dsa_append_rows(sl, t0, lat_, key_, gate_, iw, c.flag, R, c.stream);
-        indexer_select_rows_bounded(sl, t0, qI_, wh_, keys_, tok_, ntok_, R, c.stream);
-        mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream);
+        if (st.shard) {
+            st.shard->prefill_rows(w, st, c,
+                {lat_, key_, gate_, qI_, q_, wh_, qt_, e_, ob_, o_, keys_, tok_, ntok_}, margin_);
+        } else {
+            dsa_append_rows(sl, t0, lat_, key_, gate_, iw, c.flag, R, c.stream);
+            indexer_select_rows_bounded(sl, t0, qI_, wh_, keys_, tok_, ntok_, R, c.stream);
+            mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream);
+        }
         linear(c, w.o, o_, y, R, H * kMlaDim, kHidden);
     }
 
@@ -567,11 +574,12 @@ unsigned gemv_block() {
     return b;
 }
 
-PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp, TierB tierb) {
+PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp, TierB tierb, bool kv_shard) {
     check_geometry(kda_heads, mla_heads, capacity, max_rows);
     PrefillBudget b;
     b.path = GlmPfPath::device_bytes(kda_heads, mla_heads, capacity, max_rows, tierb);
     b.workspace = tierb == TierB::wmma ? GlmPfPath::workspace_bytes(kda_heads, mla_heads, max_rows) : 0;
+    if (kv_shard) b.workspace += kKvShardPrefillTemporaryBytes;
     const std::uint64_t RC = std::max(8U, max_rows);
     b.engine_rows = RC * ((3ULL * kHc * kHidden + 2ULL * kHcMix + (5ULL + (mtp ? 9ULL : 0ULL)) * kHidden + kExperts + kTopE) * 4 + (kTopE + 2) * 4 + 8);
     return b;
@@ -599,8 +607,11 @@ std::uint64_t admission_margin_bytes() {  // STRIX_GLM_PF_MARGIN_GIB: finite, 0 
 }
 
 std::shared_ptr<engine::PrefillPath> make_prefill_path(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows,
-                                                       TierB tierb, std::uint64_t margin) {
-    const PrefillBudget b = prefill_budget(kda_heads, mla_heads, capacity, max_rows, true, tierb);  // validates the geometry
+                                                       TierB tierb, std::uint64_t margin, bool kv_shard, std::uint64_t first_forward_reserve) {
+    const PrefillBudget b = prefill_budget(kda_heads, mla_heads, capacity, max_rows, true, tierb, kv_shard);  // validates the geometry
+    if (first_forward_reserve > std::numeric_limits<std::uint64_t>::max() - margin)
+        throw std::runtime_error("glm pf path: admission margin overflow");
+    margin += first_forward_reserve;
     std::size_t dev_free = 0, dev_total = 0;
     ok(hipMemGetInfo(&dev_free, &dev_total), "mem info");
     const std::uint64_t host_avail = mem_available_bytes();

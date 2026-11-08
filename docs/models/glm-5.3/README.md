@@ -13,6 +13,16 @@ read and what "exact" covers: [methodology](../../methodology.md). Build instruc
 
 ## Run: the pair
 
+Optional GLM token sharding is a qualified FAST memory profile. `STRIX_GLM_KV_SHARD=auto`
+is the default and selects sharding only when replicated-state startup admission fails;
+`=1` forces sharding and `=0` forces replication. It requires one request,
+`STRIX_GLM_PF_PIPELINE=1`, chunked prefill and no MTP or speculation. FAST sharding changes
+the summation order, so it is not bitwise equal to the default replicated exact profile.
+See the [KV storage and token-sharding guide](../../engine/kv-sharding.md) for the layout,
+measured context limits, timings, verification steps and trade-offs. The independent transport
+experiment `STRIX_XPORT_SMALL_SPIN=1` enables bounded small-message progress; unset or `0`
+restores prior progress after restart. See [feature contracts](../../optimizations.md#kv-cache-sharding-and-shared-transport-progress).
+
 Run once per node with `R` set to 0 or 1 and the same tokenized prompt on both:
 
 ```sh

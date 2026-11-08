@@ -289,6 +289,9 @@ public:
     // GPU-direct: consumes a receive posted early for a guessed next exchange (DeviceExchange::quiesce), so that the
     // session can stay idle. Both ranks at the same point, between exchanges; nothing to do on the host path.
     void quiesce(hipStream_t stream);
+    // Relinquish a borrowed transport to another progress owner between complete
+    // exchanges: retire deferred validation, direct receives and device readers.
+    void release_transport(hipStream_t stream);
     // Opt-in small host path, STRIX_DIST_STAGED_READY_BYTES=1..1048576 (0: unavailable).
     // One stream must outlive the communicator. Kernels write/read the coherent
     // views in place and call publish_staged_block. No HIP calls in start/finish/

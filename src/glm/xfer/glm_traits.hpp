@@ -22,7 +22,8 @@ struct GlmSchedule {
     static constexpr std::size_t kArgmaxBytes = 8;
 };
 
-enum class Kind : std::uint32_t { attn_sum = 1, ffn_sum = 2, argmax = 3, control = 4, gather = 5, test = 15 };
+enum class Kind : std::uint32_t { attn_sum = 1, ffn_sum = 2, argmax = 3, control = 4, gather = 5,
+                                shard_prepare = 6, shard_partial = 7, test = 15 };
 struct Tag {
     Kind kind = Kind::test;
     std::uint32_t layer = 0;

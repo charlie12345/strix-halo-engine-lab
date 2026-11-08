@@ -1,9 +1,10 @@
 #pragma once
 // GLM-5.3-Flash attention decode path, optimized schedule (design notes).
-// Every launcher here produces the SAME BITS as the Tier A host emulation (src/glm/host/glm_host.cpp) and the
+// Replicated launchers produce the SAME BITS as the Tier A host emulation (src/glm/host/glm_host.cpp) and the
 // batch-1/2 device kernels (src/glm/kernels/*) given the same inputs: the per-op orders R1, R2, R4, R5, R8-R13 of
 // design notes are unchanged; only the schedule differs (which lane holds which partial, LDS staging, R rows
-// sharing one weight read, fused launches). Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
+// sharing one weight read, fused launches). Owned-token partials use a separate FAST identity (see mla_partial).
+// Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 // Layouts are the engine's (unchanged): KDA state [slot][head][k][v] fp32, conv state [slot][3 * C][3] fp32, DSA caches
 // as glm_dsa.hpp DsaSlot. All pointers are device pointers. Rows = independent sequence slots unless stated.
 #include "glm/kernels/glm_dsa.hpp"
@@ -134,6 +135,12 @@ void mla_softmax(const std::uint32_t* n, const float* sc, const std::uint32_t* m
                  unsigned rows, hipStream_t s);
 void mla_pv(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* p, unsigned heads,
             float* ob, hipStream_t s);
+// Shared tuned score/softmax/PV family, with owned-block addressing and an
+// unnormalised [m,l,a[512]] epilogue. qt may be the local or received absorbed
+// query. Reuses sc/p/mkey, never overwrites w.qt; calls are stream ordered.
+void mla_partial(const DsaRows& d, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt,
+                 unsigned heads, const MlaWork& w, float* partial, unsigned rank, unsigned* flag, hipStream_t s,
+                 unsigned max_tokens = 0);
 void mla_out(const float* ob, const std::uint16_t* kv_b, unsigned heads, float* o, unsigned rows, hipStream_t s);
 
 }  // namespace strix::glm::fast

@@ -1,3 +1,5 @@
+#include <limits>
+#include <array>
 #include "xport/channel.hpp"
 #include "xport/communicator_backend.hpp"
 #include "glm/xfer/glm_traits.hpp"
@@ -17,6 +19,8 @@
 #include "glm/engine/glm_lib.hpp"
 #include "glm/engine/glm_pack.hpp"
 #include "glm/engine/glm_r1b.hpp"
+#include "glm/engine/glm_kvshard.hpp"
+#include "glm/engine/glm_kvshard_exchange.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "../kernels/glm_norm.hpp"
 #include "glm/load/glm_model_description.hpp"
@@ -640,6 +644,8 @@ struct Engine::Impl {
     // route log (identity comparisons): ids [kLayers][8] of row 0 of the last forward, device; off by default.
     bool route_log = false;
     unsigned cur_layer = 0;
+    std::unique_ptr<KvShard> kv_shard;
+    bool kv_shard_auto = false;
     std::uint32_t* route_log_d = nullptr;
     bool load_test = false;
     // speculative verify (Options::spec): per-row / replay flags, per-slot pending rows + current replay set
@@ -660,12 +666,26 @@ struct Engine::Impl {
     mem::Snapshot base;
 
     Impl(Options o, dist::Communicator* c) : opt(std::move(o)), comm(c), pack(opt.model_dir), lib(pack, opt.raw_linears) {
+        const char* shard_env = std::getenv("STRIX_GLM_KV_SHARD");
+        const std::string shard_policy = shard_env == nullptr ? "0" : shard_env;
+        if (shard_policy != "0" && shard_policy != "1" && shard_policy != "auto")
+            throw std::invalid_argument("STRIX_GLM_KV_SHARD must be 0, 1 or auto");
+        kv_shard_auto = shard_policy == "auto";
+        const bool shard_requested = shard_policy == "1";
+        if (shard_requested || kv_shard_auto) {
+            if (opt.world != 2 || opt.rank > 1 || opt.slots != 1 || opt.spec || opt.mtp ||
+                opt.external_exchange || c == nullptr || opt.pf_pipeline != 1)
+                throw std::invalid_argument("STRIX_GLM_KV_SHARD: draft TP2 plain decode only; requires communicator, one slot, MTP/spec OFF, pipeline 1");
+            (void)kvshard::storage_tokens(opt.capacity);
+            if (shard_requested) kv_shard = std::make_unique<KvShard>(*c, opt.rank);
+        }
         if (const char* v = std::getenv("STRIX_GLM_PF_PIPELINE"); v != nullptr) {
             const std::string value(v);
             if (value != "1" && value != "2") throw std::invalid_argument("STRIX_GLM_PF_PIPELINE must be 1 or 2");
             opt.pf_pipeline = value == "2" ? 2U : 1U;
         }
         if (opt.pf_pipeline != 1 && opt.pf_pipeline != 2) throw std::invalid_argument("pf_pipeline must be 1 or 2");
+        if ((kv_shard || kv_shard_auto) && opt.pf_pipeline != 1) throw std::invalid_argument("kvshard: prefill pipeline 1 required");
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("world must be 1 or 2");
         // STRIX_GLM_LOAD_TEST=1: one rank's slice loaded without a peer (load timing only; any forward throws).
         load_test = opt.world == 2 && comm == nullptr && std::getenv("STRIX_GLM_LOAD_TEST") != nullptr &&
@@ -690,6 +710,8 @@ struct Engine::Impl {
         vocab_n = kVocab / opt.world;
         vocab0 = opt.rank * vocab_n;
         const char* attn_env = std::getenv("STRIX_GLM_ATTN");
+        if ((kv_shard || kv_shard_auto) && attn_env != nullptr && std::string(attn_env) == "ref")
+            throw std::invalid_argument("kvshard: fast attention seam required");
         if (attn_env != nullptr && std::string(attn_env) == "ref") attn = std::make_shared<DefaultAttn>(scr);
         else attn = fast_attention(kda_heads, mla_heads, opt.capacity);
         moe = moe_fast ? fast_moe() : std::make_shared<DefaultMoe>(scr);
@@ -702,9 +724,19 @@ struct Engine::Impl {
             if (kind != "comm" && kind != "xfer") throw std::invalid_argument("STRIX_GLM_DECODE_XCH must be comm or xfer");
             opt.decode_xfer = kind == "xfer";
         }
+        // Attention can borrow an idle Channel while TP uses the communicator.
         if (opt.world == 2 && comm != nullptr && !opt.external_exchange && opt.decode_xfer)
             decode_xch = std::make_shared<xfer::XferExchange>(comm->transport(), opt.rank, 8U);
+        if (kv_shard) bind_shard_exchange();
         pf = reference_prefill();
+    }
+
+    void bind_shard_exchange() {
+        auto shared = opt.decode_xfer ? std::dynamic_pointer_cast<xfer::XferExchange>(decode_xch)
+                                     : std::make_shared<xfer::XferExchange>(comm->transport(), opt.rank, 8U);
+        if (!shared) throw std::logic_error("kvshard: attention Channel required");
+        shared->reserve_attention_bytes(kvshard::decode_capacity(opt.capacity));
+        kv_shard->bind_exchange(std::move(shared), opt.decode_xfer);
     }
 
     // Never share transport progress between implementations. complete() joins Xfer jobs and seals any deferred
@@ -761,8 +793,9 @@ struct Engine::Impl {
                               "indexer.k_norm.bias", "kv_b_proj.weight"})
             if (lib.dtype(a + n) != "F16") throw std::runtime_error(std::string("expected F16: ") + a + n);
         if (lib.dtype(a + "indexer.index_kpool_compress_ape") != "F32") throw std::runtime_error("ape must be F32");
-        const std::size_t S = opt.slots, cap = opt.capacity;
-        w.dst.cap = cap;
+        const std::size_t S = opt.slots, cap = static_cast<std::size_t>(kv_shard ? kvshard::storage_tokens(opt.capacity) : opt.capacity);
+        w.dst.cap = opt.capacity;
+        w.dst.shard = kv_shard.get();
         w.dst.latent = lib.state<std::uint16_t>(S * cap * kKvLora);
         w.dst.ikey = lib.state<std::uint16_t>(S * cap * kIdxDim);
         w.dst.igate = lib.state<std::uint16_t>(S * cap * kIdxDim);
@@ -842,6 +875,8 @@ struct Engine::Impl {
             }
         } else {
             load_dsa(w, a);
+            w.dst.shard_layer = l;
+            w.dst.dump_rank = opt.rank;
         }
         if (w.moe) {
             load_moe(w, p + "mlp.");
@@ -945,9 +980,10 @@ struct Engine::Impl {
         }
     }
 
-    LoadReport load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows) {
+    LoadReport load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows,
+                    const std::function<void(const mem::LoadAdmission&)>& admit_prefill) {
         try {
-            return load_checked(select_max_rows);
+            return load_checked(select_max_rows, admit_prefill);
         } catch (const std::exception& e) {  // printed before the unwinding (HIP teardown can stall)
             std::fprintf(stderr, "load: rank %u FAILED: %s\n", opt.rank, e.what());
             if (monitor) monitor->phase("failed");
@@ -955,12 +991,23 @@ struct Engine::Impl {
         }
     }
 
-    LoadReport load_checked(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows) {
+    LoadReport load_checked(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows,
+                            const std::function<void(const mem::LoadAdmission&)>& admit_prefill) {
         model::validate_model_directory(opt.model_dir);
         load_identity = identity;
         const auto t0 = Clock::now();
         start_monitor();
         hip_ok(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+        if (opt.world == 2 && comm != nullptr && !opt.external_exchange && !load_test) {
+            // All policies participate, so mismatched auto/explicit peers fail
+            // before only one rank can enter the memory-plan vote.
+            const std::uint32_t policy = kv_shard_auto ? 2U : kv_shard ? 1U : 0U;
+            std::uint32_t peer_policy = 0;
+            comm->exchange_host({reinterpret_cast<const std::byte*>(&policy), sizeof(policy)},
+                                {reinterpret_cast<std::byte*>(&peer_policy), sizeof(peer_policy)},
+                                {static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0xFFFFFFFDU, 0});
+            if (peer_policy != policy) throw std::runtime_error("kvshard: rank policy mismatch (0/1/auto)");
+        }
         // STRIX_GLM_SMOKE_HEAD=1 (test only): the head on a truncated stack, allowed only for a synthetic model
         // (tools/glm/make_synth_model.py writes "synthetic": true into the index metadata); refused for any other model.
         if (const char* e = std::getenv("STRIX_GLM_SMOKE_HEAD"); e != nullptr && std::string(e) == "1" && opt.layers != kLayers) {
@@ -1011,7 +1058,7 @@ struct Engine::Impl {
             std::size_t dev_free = 0, dev_total = 0;
             hip_ok(hipMemGetInfo(&dev_free, &dev_total), "row admission mem info");
             const unsigned rows = select_max_rows({load_terms(), probe.read(), margins, prefill_install, dev_free, recheck, amodel,
-                                                   plan.logical, plan.physical(amodel)});
+                                                   plan.logical, plan.physical(amodel), kv_shard != nullptr, false, fwd_reserve()});
             if (rows == 0 || rows > opt.max_rows) throw std::invalid_argument("load row selector must reduce max_rows within 1..max_rows");
             if (rows != opt.max_rows) {
                 opt.max_rows = rows;
@@ -1019,12 +1066,62 @@ struct Engine::Impl {
             }
             if (auto* cx = dynamic_cast<CommExchange*>(fallback_xch.get())) cx->resize_rows(std::max(8U, rows));
         };
+        auto prefill_admission = [&](bool candidate) {
+            std::size_t dev_free = 0, dev_total = 0;
+            hip_ok(hipMemGetInfo(&dev_free, &dev_total), "prefill layout mem info");
+            return mem::LoadAdmission{load_terms(), probe.read(), margins, prefill_install, dev_free,
+                                      opt.auto_rows, amodel, plan.logical, plan.physical(amodel),
+                                      kv_shard != nullptr, candidate, fwd_reserve()};
+        };
         if (select_max_rows) {
             select_rows(false);
             // Only negotiated auto peers enter this second round. It sees actual communication allocations,
             // so an admission refusal at the larger size becomes a shared fallback before the first weight.
             if (opt.auto_rows) select_rows(true);
         }
+        if (kv_shard_auto) {
+            // Both ranks test the load guard AND the same prefill owner check
+            // that will run after load, at the negotiated chunk-row count.
+            struct Vote { std::uint32_t fits = 0; std::array<char, 768> reason{}; };
+            auto vote = [&](unsigned phase) {
+                std::array<Vote, 2> votes{};
+                try {
+                    const auto a = prefill_admission(true);
+                    if (!mem::fits(a.terms, a.snapshot, a.margins, a.device_free))
+                        throw std::runtime_error("load plan / first-forward reserve exceeds RAM, GTT or device headroom");
+                    if (!admit_prefill) throw std::runtime_error("unified prefill admission callback required");
+                    admit_prefill(a);
+                    votes[0].fits = 1;
+                    std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "admitted");
+                } catch (const std::runtime_error& e) {
+                    std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "%s", e.what());
+                }
+                comm->exchange_host({reinterpret_cast<const std::byte*>(&votes[0]), sizeof(Vote)},
+                                    {reinterpret_cast<std::byte*>(&votes[1]), sizeof(Vote)},
+                                    {static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0xFFFFFFFEU, phase});
+                if (votes[1].fits > 1U || votes[1].reason.back() != '\0')
+                    throw std::runtime_error("kvshard: invalid auto admission vote");
+                return votes;
+            };
+            const auto replicated = vote(0);
+            const bool enabled = kvshard::auto_shard(replicated[0].fits != 0, replicated[1].fits != 0);
+            if (enabled) {
+                kv_shard = std::make_unique<KvShard>(*comm, opt.rank);
+                bind_shard_exchange();
+                make_plan();
+                const auto sharded = vote(1);
+                if (kvshard::prefill_layout(replicated[0].fits != 0, replicated[1].fits != 0,
+                                            sharded[0].fits != 0, sharded[1].fits != 0) == kvshard::PrefillLayout::refuse)
+                    throw std::runtime_error(std::string("kvshard auto: neither layout admitted; replicated local: ") +
+                        replicated[0].reason.data() + "; peer: " + replicated[1].reason.data() +
+                        "; sharded local: " + sharded[0].reason.data() + "; peer: " + sharded[1].reason.data());
+            }
+            std::fprintf(stderr, "kvshard auto: context=%llu effective=%u reason=%s; replicated local: %s; peer: %s\n",
+                         static_cast<unsigned long long>(opt.capacity), enabled ? 1U : 0U,
+                         enabled ? "replicated-prefill-or-load-refused-sharded-admitted" : "replicated-prefill-and-load-admitted",
+                         replicated[0].reason.data(), replicated[1].reason.data());
+        }
+        if (admit_prefill) admit_prefill(prefill_admission(false));
         const std::uint64_t stage = mem::round_up(std::max<std::uint64_t>(plan.stage_max, 1), 2 * mem::kMiB);
         lib.set_stage_bytes(stage);
         const std::uint64_t phys = plan.physical(amodel);
@@ -1352,6 +1449,7 @@ struct Engine::Impl {
             const CallCtx c = context(h);
             const float* x = xn + static_cast<std::size_t>(h.offset) * kHidden;
             if (w.kda) pf->kda(w.kdaw, w.kst, c, x, partial(h));
+            else if (kv_shard) kv_shard->prefill(*pf, w.dsaw, w.dst, c, x, partial(h));
             else pf->dsa(w.dsaw, w.dst, c, x, partial(h));
             mark(w.kda ? segKda : segDsa);
         };
@@ -1517,6 +1615,7 @@ struct Engine::Impl {
             mark(segHc);
             if (pfc) {
                 if (w.kda) pf->kda(w.kdaw, w.kst, c, xn, part);
+                else if (kv_shard) kv_shard->prefill(*pf, w.dsaw, w.dst, c, xn, part);
                 else pf->dsa(w.dsaw, w.dst, c, xn, part);
             } else if (w.kda) {
                 attn->kda(w.kdaw, w.kst, c, xn, part);
@@ -1586,6 +1685,8 @@ struct Engine::Impl {
     }
 
     std::vector<std::uint32_t> step(std::span<const Row> rows) {
+        if (kv_shard && (rows.size() != 1 || rows[0].slot != 0))
+            throw std::invalid_argument("kvshard: one committed decode row in slot zero required");
         if (load_test) throw std::logic_error("STRIX_GLM_LOAD_TEST: load only");
         if (rows.empty() || rows.size() > 8) throw std::invalid_argument("step: 1..8 rows");
         if (opt.layers != kLayers && !smoke_head) throw std::logic_error("step needs all 45 layers (G3 uses gate_residual)");
@@ -1734,13 +1835,18 @@ struct Engine::Impl {
     }
 
     void reset(std::uint32_t slot) {
+        for (const LayerW& w : layers)
+            if (!w.kda && w.dst.dump_epoch == std::numeric_limits<std::uint64_t>::max())
+                throw std::overflow_error("kvshard: dump epoch exhausted");
+        if (kv_shard) kv_shard->reset();
         for (LayerW& w : layers) {
             if (w.kda) {
                 const std::size_t s = static_cast<std::size_t>(kda_heads) * kKdaDim * kKdaDim, c = 3ULL * kda_heads * kKdaDim * 3;
                 hip_ok(hipMemsetAsync(w.kst.S + slot * s, 0, s * 4, stream), "reset S");
                 hip_ok(hipMemsetAsync(w.kst.conv + slot * c, 0, c * 4, stream), "reset conv");
             } else {
-                const std::size_t cap = w.dst.cap;
+                ++w.dst.dump_epoch;
+                const std::size_t cap = static_cast<std::size_t>(w.dst.shard ? kvshard::storage_tokens(w.dst.cap) : w.dst.cap);
                 hip_ok(hipMemsetAsync(w.dst.latent + slot * cap * kKvLora, 0, cap * kKvLora * 2, stream), "reset latent");
                 hip_ok(hipMemsetAsync(w.dst.ikey + slot * cap * kIdxDim, 0, cap * kIdxDim * 2, stream), "reset key");
                 hip_ok(hipMemsetAsync(w.dst.igate + slot * cap * kIdxDim, 0, cap * kIdxDim * 2, stream), "reset gate");
@@ -1963,6 +2069,7 @@ struct Engine::Impl {
 
     std::vector<std::uint8_t> state_bytes(std::uint32_t slot, std::uint64_t frontier = ~std::uint64_t{0}) {
         std::vector<std::uint8_t> out;
+        if (kv_shard) out.resize(sizeof(kvshard::SnapshotKey));
         auto grab = [&](const void* p, std::size_t bytes) {
             const std::size_t o = out.size();
             out.resize(o + bytes);
@@ -1974,20 +2081,36 @@ struct Engine::Impl {
                 grab(w.kst.S + slot * s, s * 4);
                 grab(w.kst.conv + slot * c, c * 4);
             } else {
-                const std::size_t cap = w.dst.cap, n = std::min<std::uint64_t>(cap, frontier);
+                const std::size_t cap = static_cast<std::size_t>(w.dst.shard ? kvshard::storage_tokens(w.dst.cap) : w.dst.cap);
+                const auto global_n = std::min<std::uint64_t>(w.dst.cap, frontier);
+                const std::size_t n = static_cast<std::size_t>(w.dst.shard ? kvshard::owned_prefix(global_n, opt.rank) : global_n);
                 grab(w.dst.latent + slot * cap * kKvLora, n * kKvLora * 2);
                 grab(w.dst.ikey + slot * cap * kIdxDim, n * kIdxDim * 2);
                 grab(w.dst.igate + slot * cap * kIdxDim, n * kIdxDim * 2);
                 grab(w.dst.pooled + slot * (cap / kKpool) * kIdxDim, (n / kKpool) * kIdxDim * 4);
             }
         }
+        if (kv_shard) {
+            const auto key = kvshard::snapshot_key(opt.capacity, opt.rank, std::min(opt.capacity, frontier), out.size() - sizeof(kvshard::SnapshotKey));
+            std::memcpy(out.data(), key.data(), sizeof(key));
+        }
         return out;
     }
 
     void restore_state(std::uint32_t slot, std::span<const std::uint8_t> in, std::uint64_t frontier) {
         if (slot >= opt.slots) throw std::out_of_range("restore_state: slot");
+        if (kv_shard) {
+            const auto global_n = std::min(opt.capacity, frontier);
+            const auto n = kvshard::owned_prefix(global_n, opt.rank);
+            std::uint64_t bytes = 0;
+            for (const LayerW& w : layers) {
+                if (w.kda) bytes += static_cast<std::uint64_t>(kda_heads) * kKdaDim * kKdaDim * 4 + 3ULL * kda_heads * kKdaDim * 3 * 4;
+                else bytes += n * (kKvLora + 2 * kIdxDim) * 2 + (n / kKpool) * kIdxDim * 4;
+            }
+            kvshard::validate_snapshot(in.data(), in.size(), true, kvshard::snapshot_key(opt.capacity, opt.rank, global_n, bytes));
+        } else kvshard::validate_snapshot(in.data(), in.size(), false);
         reset(slot);
-        std::size_t o = 0;
+        std::size_t o = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
         auto put = [&](void* p, std::size_t bytes) {
             if (o + bytes > in.size()) throw std::invalid_argument("restore_state: state shorter than this engine's layout");
             hip_ok(hipMemcpy(p, in.data() + o, bytes, hipMemcpyHostToDevice), "restore");
@@ -1999,7 +2122,9 @@ struct Engine::Impl {
                 put(w.kst.S + slot * s, s * 4);
                 put(w.kst.conv + slot * c, c * 4);
             } else {
-                const std::size_t cap = w.dst.cap, n = std::min<std::uint64_t>(cap, frontier);
+                const std::size_t cap = static_cast<std::size_t>(w.dst.shard ? kvshard::storage_tokens(w.dst.cap) : w.dst.cap);
+                const auto global_n = std::min<std::uint64_t>(w.dst.cap, frontier);
+                const std::size_t n = static_cast<std::size_t>(w.dst.shard ? kvshard::owned_prefix(global_n, opt.rank) : global_n);
                 put(w.dst.latent + slot * cap * kKvLora, n * kKvLora * 2);
                 put(w.dst.ikey + slot * cap * kIdxDim, n * kIdxDim * 2);
                 put(w.dst.igate + slot * cap * kIdxDim, n * kIdxDim * 2);
@@ -2012,7 +2137,10 @@ struct Engine::Impl {
 
 Engine::Engine(Options options, dist::Communicator* comm) : impl_(std::make_unique<Impl>(std::move(options), comm)) {}
 Engine::~Engine() = default;
-LoadReport Engine::load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows) { return impl_->load(select_max_rows); }
+LoadReport Engine::load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows,
+                        const std::function<void(const mem::LoadAdmission&)>& admit_prefill) {
+    return impl_->load(select_max_rows, admit_prefill);
+}
 std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
     // Cover every forward issued by either path, including prompt-time MTP work.
     struct PromptIdentityScope {
@@ -2031,6 +2159,7 @@ std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t>
         }
     } scope(impl_->r1b, impl_->identity == IdentityMode::kR1b);
     if (!impl_->reference_prefill_installed()) return impl_->prefill_chunked(slot, tokens, pos0);
+    if (impl_->kv_shard) throw std::logic_error("kvshard: install the bounded chunked prefill path");
     // Reference identity (arithmetic contract 6.2): prefill = decode, one row at a time; returns the greedy token after the last.
     std::uint32_t next = 0;
     for (std::size_t i = 0; i < tokens.size(); ++i) {
@@ -2059,7 +2188,10 @@ Engine::MtpPrefillOut Engine::prefill_mtp(std::uint32_t slot, std::span<const st
 }
 std::vector<std::uint32_t> Engine::step(std::span<const Row> rows) { return impl_->step(rows); }
 void Engine::reset(std::uint32_t slot) { impl_->reset(slot); }
-void Engine::set_attn(std::shared_ptr<AttnPath> p) { impl_->attn = std::move(p); }
+void Engine::set_attn(std::shared_ptr<AttnPath> p) {
+    if (impl_->kv_shard) throw std::logic_error("kvshard: replacing the attention seam is not admitted");
+    impl_->attn = std::move(p);
+}
 void Engine::set_null_flip(int layer, std::uint64_t pos, unsigned elem) {
     if (layer >= 0 && (layer >= static_cast<int>(impl_->layers.size()) || elem >= kHidden)) throw std::invalid_argument("null flip: layer / elem");
     impl_->null_layer = layer;
@@ -2111,6 +2243,7 @@ void Engine::set_exchange(std::shared_ptr<Exchange> p) {
 }
 std::shared_ptr<Exchange> Engine::exchange() const { return impl_->fallback_xch; }
 bool Engine::decode_xfer_enabled() const { return impl_->decode_xch != nullptr; }
+bool Engine::kv_shard_enabled() const { return impl_->kv_shard != nullptr; }
 unsigned Engine::prefill_pipeline() const { return impl_->opt.pf_pipeline; }
 void Engine::set_prefill(std::shared_ptr<PrefillPath> p) {
     // Before load() the path is only stored; load() installs it once the weights exist (Impl::install_prefill).

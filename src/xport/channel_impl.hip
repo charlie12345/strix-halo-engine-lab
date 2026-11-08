@@ -2,6 +2,7 @@
 #include "channel.hpp"
 #include "channel_device.hpp"
 #include "wire.hpp"
+#include "small_progress.hpp"
 
 #include <immintrin.h>
 #include <pthread.h>
@@ -162,6 +163,9 @@ private:
 
 template<class Traits>
 void ChannelOptions<Traits>::from_env() {
+    if (const char* v = std::getenv("STRIX_XPORT_SMALL_SPIN"); v != nullptr && *v != '\0') {
+        small_spin = SmallProgress::parse(v);
+    }
     depth = static_cast<unsigned>(env_u64((std::string(Traits::kEnvironment) + "DEPTH").c_str(), depth));
     if (const char* v = std::getenv((std::string(Traits::kEnvironment) + "PUBLISH").c_str()); v != nullptr && *v != '\0') {
         const std::string s(v);
@@ -470,9 +474,20 @@ void Channel<Traits>::run() {
         while (!stop_.load(std::memory_order_relaxed)) {
             const std::uint64_t d = done_.load(std::memory_order_relaxed);
             if (d < posted_.load(std::memory_order_acquire)) {
-                process(jobs_[d % kQueue]);
+                const auto& job = jobs_[d % kQueue];
+                // Capture before publishing done_: the producer may then reuse this slot.
+                const bool small = options_.small_spin && !job.seal &&
+                    SmallProgress::eligible(job.bytes + sizeof(typename Traits::Trailer));
+                process(job);
                 done_.store(d + 1, std::memory_order_release);
                 last = Clock::now();
+                if (small) {
+                    spin_small_mailbox([&] {
+                        return stop_.load(std::memory_order_relaxed) ||
+                            done_.load(std::memory_order_relaxed) < posted_.load(std::memory_order_acquire);
+                    }, [] { _mm_pause(); }, std::min(idle, SmallProgress::mailbox_spin));
+                    last = Clock::now() - idle; // budget exhausted, or a job is already in the mailbox
+                }
                 continue;
             }
             if (Clock::now() - last < idle) {

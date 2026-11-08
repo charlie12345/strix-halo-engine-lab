@@ -106,6 +106,12 @@ __device__ __forceinline__ T xor32(T value, unsigned distance) {
 #endif
     return __shfl_xor(value, static_cast<int>(distance), 32);
 }
+
+// Loop counters are usually int: forward them without a sign-conversion warning at every caller.
+template <class T>
+__device__ __forceinline__ T xor32(T value, int distance) {
+    return xor32(value, static_cast<unsigned>(distance));
+}
 template <class T>
 __device__ __forceinline__ T down_tree32(T value, unsigned distance) {
 #if STRIX_DPP_REDUCE && defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1151__)

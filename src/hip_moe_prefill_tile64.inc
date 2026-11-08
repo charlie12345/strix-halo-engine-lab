@@ -93,7 +93,7 @@ __device__ __forceinline__ void moe_tile64_project_body(const unsigned char* gat
         if constexpr((Tune&2048U)==0U)
 #pragma unroll
         for(unsigned j=0;j<AChunks;++j) {
-            // core2: branch-free loads (a row past the batch reads table row 0; staging writes zero for it, as the base), so
+            // Branch-free loads (a row past the batch reads the first table row; staging writes zero for it, as the base), so
             // the wait-count pass can wait for exactly the oldest register stage (a skipped exec-masked load forces
             // vmcnt(0), which drains every younger prefetch).
             if constexpr(Core!=0U)r.a[j]=f16_load(a_src[j]+128U*step);

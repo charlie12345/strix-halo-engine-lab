@@ -13,7 +13,8 @@
 // Compile with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 #include "glm/prefill/glm_pf_moe.hpp"
 
-#include "glm/common/glm_math.hpp"
+#include "glm/prefill/glm_moe_traits.hpp"
+#include "moe_core/one_split_prefill.hpp"
 
 #include <hip/hip_fp16.h>
 
@@ -27,218 +28,14 @@ namespace strix::glm::pf {
 
 namespace {
 
-constexpr unsigned kE = kMoeExperts, kTop = kMoeTop, kH = kMoeHidden, kI = kMoeInter;
-constexpr unsigned kHB = kH / 128, kIB = kI / 128;  // 32, 8
-
-using Half16 = _Float16 __attribute__((ext_vector_type(16)));
-using Float8 = float __attribute__((ext_vector_type(8)));
-
-// ---------------------------------------------------------------- library pieces (verbatim arithmetic)
-// hadamard.hpp:9-14 materialize_fp32: RN32 boundary before a later RN16 conversion.
-__device__ __forceinline__ float materialize(float v) {
-    asm volatile("" : "+v"(v));
-    return v;
-}
-// hadamard.hpp:18-37 hadamard128 (values held as lane + 32 j).
-__device__ __forceinline__ void hadamard128(float (&v)[4], unsigned lane) {
-#pragma unroll
-    for (int stride = 1; stride < 32; stride *= 2) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float peer = __shfl_xor(v[j], stride, 32);
-            v[j] = (lane & static_cast<unsigned>(stride)) ? peer - v[j] : v[j] + peer;
-        }
-    }
-#pragma unroll
-    for (int stride = 1; stride < 4; stride *= 2) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            if (!(j & stride)) {
-                const float l = v[j], r = v[j + stride];
-                v[j] = l + r;
-                v[j + stride] = l - r;
-            }
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = materialize(v[j] * 0x1.6a09e6p-4F);
-}
-__device__ __forceinline__ float half_bits(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
-
-// trellis_device.hpp:8-15 codebook_value(state, 2) (mul1).
-__device__ __forceinline__ float codebook_mul1(std::uint32_t state) {
-    const std::uint32_t product = state * 0x83dcd12dU;
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-    return __half2float(__float2half_rn(fmaf(static_cast<float>(1024 + sum), __half2float(__ushort_as_half(0x1eee)),
-                                             __half2float(__ushort_as_half(0xc931)))));
-}
-
-// Core v2 (STRIX_GLM_PF_MOE_CORE=2) form of codebook_mul1: the same integers and the same fma / RN16; float(1024 + sum)
-// for sum <= 1020 is the bit pattern 0x44800000 | sum << 13 (no cvt; checked exhaustively for all sums 0..1020).
-__device__ __forceinline__ float codebook_mul1_v2(std::uint32_t state) {
-    const std::uint32_t product = state * 0x83dcd12dU;
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-    return __half2float(__float2half_rn(fmaf(__uint_as_float(0x44800000U | (sum << 13)), __half2float(__ushort_as_half(0x1eee)),
-                                             __half2float(__ushort_as_half(0xc931)))));
-}
-template <typename T>
-using Glob = const __attribute__((address_space(1))) T*;  // global address space: global_load, not flat
-
-// ---------------------------------------------------------------- grouped WMMA core (mmx_prefill_core.hpp v3/v4)
-// Normalized window of the v3 core: every lane funnel-shifts its kNL trellis words once per k-tile so that state r of
-// its column is alignbit(N[g(r) - 1], N[g(r)], shift(r)) with compile-time g / shift. Equal to WaveTile::state +
-// the wmma_core q layout for Bits 1..8 (design notes, 4.1 M checks).
-template <int Bits>
-struct Norm {
-    static constexpr int kWords = Bits * 8;
-    static constexpr int kNL = ((47 + 27 * Bits) >> 5) + 2;
-    static constexpr int delta(int r) { return 8 * ((r & 7) >> 1) + (r & 1) + 2 * (r >> 3); }
-    static constexpr int e(int r) { return 48 + delta(r) * Bits; }
-    static constexpr int g(int r) { return (e(r) - 1) >> 5; }
-    static constexpr unsigned shift(int r) { return static_cast<unsigned>((32 - (e(r) & 31)) & 31); }
-};
-
-__device__ __forceinline__ Half16 as_half16(const std::uint32_t (&f)[8]) {
-    Half16 out;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        out[2 * i] = __builtin_bit_cast(_Float16, static_cast<std::uint16_t>(f[i] & 0xffffU));
-        out[2 * i + 1] = __builtin_bit_cast(_Float16, static_cast<std::uint16_t>(f[i] >> 16));
-    }
-    return out;
-}
-
-// One grouped work item: one expert matrix over its group's rows.
-struct Item {
-    const std::uint32_t* trellis;
-    const _Float16* x;  // tile-major transformed rows of the group: [rows/16 padded][K/16][16][16]
-    float* part;        // [rows][N] fp32 WMMA results (one split)
-    unsigned rows, cta_begin, gy, pad;
-};
-
-// CTA = 4 waves = 8 tile columns = 128 outputs x MT row tiles of 16. Wave w owns tiles 2p, 2p + 1 (p = 4 bx + w):
-// lanes 0-15 decode column lane of tile 2p, lanes 16-31 column lane - 16 of tile 2p + 1; v_permlanex16 hands each
-// half the other's column so both B fragments (lane = column, k = 0..15) are complete without LDS.
-// V2 (core v2, same bits): codebook_mul1_v2, global-address-space loads and the k loop unrolled by 2 (no ln -> lc
-// register rotation). PF (core v3 = V2 with PF 4): the trellis words of k-tile t + PF are loaded while tile t is
-// computed (a register ring of PF tiles, compile-time slots), so more weight bytes are in flight (k12: the weight
-// stream was serialized with the WMMAs). Only load timing changes.
-template <int Bits, int MT, int K, int N, bool V2, int PF = 1>
-__device__ __forceinline__ void item_core(const Item& it, unsigned bx, unsigned by) {
-    using NW = Norm<Bits>;
-    constexpr int tiles_n = N / 16, tiles_k = K / 16;
-    const int lane = static_cast<int>(threadIdx.x & 31U), wave = static_cast<int>(threadIdx.x >> 5U);
-    const int c = lane & 15;
-    const bool upper = lane >= 16;
-    const int rows = static_cast<int>(it.rows);
-    const int tile_pair = static_cast<int>(bx) * 4 + wave;
-    const int my_tile = 2 * tile_pair + (upper ? 1 : 0);
-    const int first_row = static_cast<int>(by) * MT * 16;
-    const int base = 32 * (c & 7) + 4 * (c >> 3);
-    const int S = (base + 1) * Bits - 16 + 256 * Bits - 32;
-    const int d = S & 31, wb = (S >> 5) - (d == 0 ? 1 : 0);
-    const unsigned sh = static_cast<unsigned>((32 - d) & 31);
-    int loff[NW::kNL];
-#pragma unroll
-    for (int i = 0; i < NW::kNL; ++i) loff[i] = my_tile * NW::kWords + (wb + i) % NW::kWords;
-    constexpr std::size_t k_stride = static_cast<std::size_t>(tiles_n) * NW::kWords;
-    // A: the lane's 32 bytes (row first_row + 16 m + c) in k tile 0 of its row tile; null past the group's rows.
-    const _Float16* xr[MT];
-#pragma unroll
-    for (int m = 0; m < MT; ++m) {
-        const int row = first_row + 16 * m + c;
-        const _Float16* p = it.x + (static_cast<std::size_t>(first_row / 16 + m) * static_cast<std::size_t>(tiles_k)) * 256 +
-                            static_cast<std::size_t>(c) * 16;
-        // V2: rows past the group read row tile 0 of this CTA instead of zeros (no branch). A WMMA output row depends
-        // only on its own A row and those rows are never stored, so every stored value keeps its bits.
-        xr[m] = row < rows ? p : V2 ? it.x + static_cast<std::size_t>(first_row / 16) * static_cast<std::size_t>(tiles_k) * 256 : nullptr;
-    }
-    Float8 acc0[MT] = {}, acc1[MT] = {};
-    static_assert(PF == 1 || V2, "prefetch ring only on the v2 path");
-    static_assert(tiles_k % (2 * PF) == 0, "k loop unrolled by 2 (PF 1) or by PF");
-    auto tword = [&](int tile, int i) -> std::uint32_t {
-        const std::uint32_t* kb = it.trellis + static_cast<std::size_t>(tile) * k_stride;  // uniform
-        return V2 ? ((Glob<std::uint32_t>)kb)[loff[i]] : kb[loff[i]];
-    };
-    std::uint32_t ring[PF][NW::kNL];
-#pragma unroll
-    for (int q = 0; q < PF; ++q)
-#pragma unroll
-        for (int i = 0; i < NW::kNL; ++i) ring[q][i] = tword(q, i);
-    constexpr int kUnroll = V2 && PF == 1 ? 2 : 1;
-#pragma unroll kUnroll
-    for (int tk0 = 0; tk0 < tiles_k; tk0 += PF) {
-#pragma unroll
-     for (int q = 0; q < PF; ++q) {
-        const int tile_k = tk0 + q;
-        std::uint32_t lc[NW::kNL];
-#pragma unroll
-        for (int i = 0; i < NW::kNL; ++i) lc[i] = ring[q][i];
-        if (tile_k + PF < tiles_k) {
-#pragma unroll
-            for (int i = 0; i < NW::kNL; ++i) ring[q][i] = tword(tile_k + PF, i);
-        }
-        std::uint32_t nrm[NW::kNL - 1];
-#pragma unroll
-        for (int i = 0; i < NW::kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(lc[i], lc[i + 1], sh);
-        std::uint32_t mine[8];
-#pragma unroll
-        for (int r = 0; r < 16; r += 2) {
-            std::uint16_t v[2];
-#pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                const int rr = r + i;
-                const std::uint32_t state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
-                v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(V2 ? codebook_mul1_v2(state) : codebook_mul1(state)));
-            }
-            mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
-        }
-        std::uint32_t other[8], f0[8], f1[8];
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            other[i] = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
-            f0[i] = upper ? other[i] : mine[i];
-            f1[i] = upper ? mine[i] : other[i];
-        }
-        const Half16 b0 = as_half16(f0), b1 = as_half16(f1);
-        constexpr int G = MT < 4 ? MT : 4;  // A fragments in groups of <= 4 row tiles (VGPR budget at MT = 8)
-#pragma unroll
-        for (int g = 0; g < MT; g += G) {
-            Half16 a[G];
-#pragma unroll
-            for (int i = 0; i < G; ++i) {
-                const int m = g + i;
-                if constexpr (V2) {
-                    a[i] = *((Glob<Half16>)__builtin_assume_aligned(xr[m] + static_cast<std::size_t>(tile_k) * 256, 32));
-                } else if (xr[m] != nullptr) {  // 32 bytes, 32-byte aligned (512-byte tiles, 256-byte aligned regions)
-                    const auto* src = static_cast<const _Float16*>(__builtin_assume_aligned(xr[m] + static_cast<std::size_t>(tile_k) * 256, 32));
-                    __builtin_memcpy(&a[i], src, sizeof(Half16));
-                } else {
-                    a[i] = Half16{};
-                }
-            }
-#pragma unroll
-            for (int i = 0; i < G; ++i) {
-                acc0[g + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b0, acc0[g + i]);
-                acc1[g + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b1, acc1[g + i]);
-            }
-        }
-     }
-    }
-    // acc[m][j] -> row first_row + 16 m + 2 j + lane / 16, column tile * 16 + lane % 16 (wmma_core store layout).
-    const int col0 = (2 * tile_pair) * 16 + c, col1 = col0 + 16;
-#pragma unroll
-    for (int m = 0; m < MT; ++m) {
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int row = first_row + 16 * m + 2 * j + (lane >> 4);
-            if (row < rows) {
-                float* dst = it.part + static_cast<std::size_t>(row) * N;
-                dst[col0] = acc0[m][j];
-                dst[col1] = acc1[m][j];
-            }
-        }
-    }
-}
+using Traits = MoeTraits;
+using Core = strix::moe_core::OneSplitPrefill<Traits>;
+using Item = Traits::Item;
+using GroupDev = Traits::GroupDev;
+using Tables = Traits::Tables;
+constexpr unsigned kE = Traits::kE, kTop = Traits::kTop, kH = Traits::kH, kI = Traits::kI;
+constexpr unsigned kHB = Traits::kHB, kIB = Traits::kIB;
+constexpr unsigned kG3Blocks = Traits::kG3Blocks;
 
 template <int Bits, int MT, int K, int N, bool V2, int PF>
 __global__ __launch_bounds__(128) void grouped_kernel(const Item* items, unsigned count) {
@@ -253,172 +50,27 @@ __global__ __launch_bounds__(128) void grouped_kernel(const Item* items, unsigne
     const unsigned local = blockIdx.x - it.cta_begin;
     // MT 8 at PF 4 spills (256 VGPR + scratch): ring of 2 there for Bits <= 4, 1 above (Bits 5/6 spill even at 2)
     constexpr int kPF = MT == 8 && PF > 1 ? (Bits <= 4 ? 2 : 1) : PF;
-    item_core<Bits, MT, K, N, V2, kPF>(it, local % gx, local / gx);
+    Core::item_core<Bits, MT, K, N, V2, kPF>(it, local % gx, local / gx);
 }
 
 // Row-tile class of a group with `rows` rows: MT in {1, 2, 4, 8} (index 0..3).
 unsigned mt_class(unsigned rows) { return rows <= 16 ? 0U : rows <= 32 ? 1U : rows <= 64 ? 2U : 3U; }
 
-// ---------------------------------------------------------------- tables and element-wise stages
-struct GroupDev {  // one routed expert of the chunk
-    MoeExpert w;
-    unsigned n, pair_begin, tbegin, pad;  // tbegin: first row in the tile-major layout (multiple of 16)
-};
-struct Tables {
-    const GroupDev* groups;
-    const std::uint32_t* tile_group;  // [tpairs / 16] group of each 16-row tile (gather v3)
-    const std::uint32_t* pair_row;    // [P] token of the pair
-    const std::uint32_t* pair_group;  // [P]
-    const std::uint32_t* tok_pair;    // [T][8] pair of route (t, k)
-    const float* tok_w;               // [T][8]
-    _Float16* xt;                     // [2][tpairs][4096] tile-major (gate, up)
-    _Float16* at;                     // [tpairs][1024] tile-major
-    float* part_g;                    // [P][1024]
-    float* part_u;                    // [P][1024]
-    float* part_d;                    // [P][4096]
-    unsigned pairs, rows, tpairs, pad;
-};
 
-// Tile-major position of padded row R, column ch of a K-wide matrix: [R/16][ch/16][R%16][ch%16].
-__device__ __forceinline__ std::size_t tiled_at(unsigned R, unsigned ch, unsigned K) {
-    return ((static_cast<std::size_t>(R >> 4U) * (K >> 4U) + (ch >> 4U)) << 8U) + ((R & 15U) << 4U) + (ch & 15U);
-}
-
-// One wave per (pair, matrix, 128-block): input_transform of the pair's token row with that matrix's suh.
 __global__ __launch_bounds__(256) void gather_transform_kernel(const float* x, Tables t) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * 2 * kHB) return;
-    const unsigned p = q / (2 * kHB), rem = q % (2 * kHB), m = rem / kHB, b = rem % kHB;
-    const GroupDev& g = t.groups[t.pair_group[p]];
-    const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    const float* xr = x + static_cast<std::size_t>(t.pair_row[p]) * kH;
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = materialize(xr[c] * half_bits(suh[c]));
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    hadamard128(v, lane);
-    _Float16* out = t.xt + static_cast<std::size_t>(m) * t.tpairs * kH;
-    const unsigned R = g.tbegin + (p - g.pair_begin);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) out[tiled_at(R, b * 128U + lane + 32U * static_cast<unsigned>(j), kH)] = static_cast<_Float16>(v[j]);
+    Core::gather_transform_kernel(x, t);
 }
 
-// Gather v3 (STRIX_GLM_PF_MOE_GATHER=3, same bits): CTA = one 16-row tile of the tile-major layout x one matrix x 8
-// consecutive 128-blocks. The tile's group comes from a host-built table (one load; gather v2's per-CTA binary search
-// over GroupDev made it 2.1x slower, k13). Per block, each wave transforms 2 of the tile's rows exactly as
-// gather_transform_kernel does into LDS; the CTA then writes the block's 8 consecutive 16 x 16 tiles (4 KB) with one
-// 16-byte store per thread. Rows of the tile past the group are written as +0 (never read for a stored output).
-constexpr unsigned kG3Pitch = 136, kG3Blocks = 8;  // halves per LDS row (rows 4 banks apart); 128-blocks per CTA
 __global__ __launch_bounds__(256) void gather_transform_v3_kernel(const float* x, Tables t) {
-    __shared__ alignas(16) _Float16 sv[16][kG3Pitch];
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U, tile = blockIdx.x, m = blockIdx.y, R0 = 16U * tile;
-    const GroupDev& g = t.groups[t.tile_group[tile]];
-    const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    const float* xr[2];
-    bool live[2];
-#pragma unroll
-    for (unsigned h = 0; h < 2; ++h) {
-        const unsigned local = R0 + wave + 8U * h - g.tbegin;
-        live[h] = local < g.n;
-        xr[h] = live[h] ? x + static_cast<std::size_t>(t.pair_row[g.pair_begin + local]) * kH : x;
-    }
-    const unsigned ct = threadIdx.x / 32U, w = threadIdx.x % 32U, r = w / 2U, c0 = 16U * ct + 8U * (w % 2U);
-    for (unsigned bi = 0; bi < kG3Blocks; ++bi) {
-        const unsigned b = blockIdx.z * kG3Blocks + bi;
-#pragma unroll
-        for (unsigned h = 0; h < 2; ++h) {
-            float v[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-            if (live[h]) {  // uniform per wave
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
-                    const float scaled = materialize(xr[h][c] * half_bits(suh[c]));
-                    v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-                }
-                hadamard128(v, lane);
-            }
-#pragma unroll
-            for (int j = 0; j < 4; ++j) sv[wave + 8U * h][lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
-        }
-        __syncthreads();
-        _Float16* out = t.xt + static_cast<std::size_t>(m) * t.tpairs * kH + tiled_at(R0, b * 128U, kH) + 256U * ct + 8U * w;
-        *reinterpret_cast<uint4*>(out) = *reinterpret_cast<const uint4*>(&sv[r][c0]);
-        __syncthreads();  // sv reused by the next block
-    }
+    Core::gather_transform_v3_kernel(x, t);
 }
 
-// output_transform of one 128-block of one row with one split: v = +0 + p; H128; * svh.
-__device__ __forceinline__ void finish_block(const float* row, unsigned b, const std::uint16_t* svh, unsigned lane, float (&v)[4]) {
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = 0.0F;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] += row[b * 128 + lane + 32U * static_cast<unsigned>(j)];
-    hadamard128(v, lane);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = v[j] * half_bits(svh[b * 128 + lane + 32U * static_cast<unsigned>(j)]);
-}
-
-// R15 (glm_tier_a.hip swiglu_kernel): gg = min(g, 10); uu = clamp(u, -10, 10); a = silu(gg) * uu.
-__device__ __forceinline__ float swiglu_r15(float g, float u) {
-    const float gg = g > kClamp ? kClamp : g;
-    const float uu = u > kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
-    return silu(gg) * uu;
-}
-
-// One wave per (pair, 128-block of I): gate / up output transforms, R15, down input transform, tile-major store.
 __global__ __launch_bounds__(256) void finish_kernel(Tables t) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * kIB) return;
-    const unsigned p = q / kIB, b = q % kIB;
-    const GroupDev& g = t.groups[t.pair_group[p]];
-    float gv[4], uv[4];
-    finish_block(t.part_g + static_cast<std::size_t>(p) * kI, b, g.w.gate.svh, lane, gv);
-    finish_block(t.part_u + static_cast<std::size_t>(p) * kI, b, g.w.up.svh, lane, uv);
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = b * 128 + lane + 32U * static_cast<unsigned>(j);
-        const float act = swiglu_r15(gv[j], uv[j]);
-        const float scaled = materialize(act * half_bits(g.w.down.suh[c]));
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    hadamard128(v, lane);
-    const unsigned R = g.tbegin + (p - g.pair_begin);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) t.at[tiled_at(R, b * 128 + lane + 32U * static_cast<unsigned>(j), kI)] = static_cast<_Float16>(v[j]);
+    Core::finish_kernel(t);
 }
 
-// One wave per (token, 128-block of H): down output transform of the token's 8 routes in route order, R16, + shared.
 __global__ __launch_bounds__(256) void combine_kernel(Tables t, const float* shared, float* out, float* eo) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.rows * kHB) return;
-    const unsigned tok = q / kHB, b = q % kHB;
-    float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-    for (unsigned k = 0; k < kTop; ++k) {
-        const unsigned p = t.tok_pair[tok * kTop + k];
-        const GroupDev& g = t.groups[t.pair_group[p]];
-        float v[4];
-        finish_block(t.part_d + static_cast<std::size_t>(p) * kH, b, g.w.down.svh, lane, v);
-        if (eo != nullptr) {
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                eo[(static_cast<std::size_t>(tok) * kTop + k) * kH + b * 128 + lane + 32U * static_cast<unsigned>(j)] = v[j];
-        }
-        const float w = t.tok_w[tok * kTop + k];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] = __builtin_fmaf(w, v[j], acc[j]);
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const std::size_t i = static_cast<std::size_t>(tok) * kH + b * 128 + lane + 32U * static_cast<unsigned>(j);
-        out[i] = acc[j] + shared[i];
-    }
+    Core::combine_kernel(t, shared, out, eo);
 }
 
 // ---------------------------------------------------------------- host side
@@ -431,7 +83,7 @@ void ok(hipError_t e, const char* what) {
 }
 
 constexpr std::size_t align256(std::size_t v) { return (v + 255) & ~std::size_t{255}; }
-bool bits_ok(unsigned b) { return b >= 3 && b <= 6; }
+bool bits_ok(unsigned b) { return Traits::accepts_bits(b); }
 
 struct Plan {
     std::vector<GroupDev> groups;

@@ -1,3 +1,4 @@
+#include "moe_core/decode.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 decode MoE and dense EXL3 linears (identity and launch structure: mmx_moe.hpp).
 #include "minimax/moe/mmx_moe.hpp"
@@ -903,93 +904,80 @@ __device__ __forceinline__ void publish_gu_ready(const Args& a, unsigned slot, u
 // One gate/up CTA of slot `slot` (rows: the slot's call rows, or 0..nrows-1 for the shared expert).
 // ready != 0: the pipelined launch; each finished block is published with that epoch.
 // Wide: cg indexes 16-column groups (2 output blocks per CTA) and the wide core runs (rowbuf: 4 x 8 x Bits uint4).
+struct DecodeTraits {
+    using Schedule = strix::moe_core::DecodeSchedule<strix::minimax::moe::opt::kGateSplits, strix::minimax::moe::opt::kDownSplits, strix::minimax::moe::opt::kSplitCh, 4U>;
+    using Args = strix::minimax::moe::opt::Args;
+    using Dispatch = strix::minimax::moe::opt::Dispatch;
+    using ExpertSlices = strix::minimax::moe::opt::ExpertSlices;
+    using Exl3 = strix::minimax::moe::opt::Exl3;
+    using WideV4 = strix::minimax::moe::opt::WideV4;
+    using SlotInfo = strix::minimax::moe::opt::Dispatch;
+    static constexpr auto kGateSplits = strix::minimax::moe::opt::kGateSplits;
+    static constexpr auto kDownSplits = strix::minimax::moe::opt::kDownSplits;
+    static constexpr auto kHidden = strix::minimax::moe::opt::kHidden;
+    static constexpr auto kInter = strix::minimax::moe::opt::kInter;
+    static constexpr auto kSharedSlot = strix::minimax::moe::opt::kSharedSlot;
+    static constexpr auto kSplitCh = strix::minimax::moe::opt::kSplitCh;
+    static constexpr auto kTopE = strix::minimax::moe::opt::kTopE;
+    template <class... T> static __device__ __forceinline__ decltype(auto) last_arrival(T&&... values) {
+        return strix::minimax::moe::opt::last_arrival(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) load_agent(T&&... values) {
+        return strix::minimax::moe::opt::load_agent(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) swiglu(T&&... values) {
+        return strix::minimax::moe::opt::swiglu(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) map_slot(T&&... values) {
+        return strix::minimax::moe::opt::map_slot(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) slot_slices(T&&... values) {
+        return strix::minimax::moe::opt::slot_slices(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) publish_gu_ready(T&&... values) {
+        return strix::minimax::moe::opt::publish_gu_ready(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) lean_publish(T&&... values) {
+        return strix::minimax::moe::opt::lean_publish(static_cast<T&&>(values)...);
+    }
+    template <auto A, class... T> static __device__ __forceinline__ decltype(auto) split16_rows(T&&... values) {
+        return strix::minimax::moe::opt::split16_rows<A>(static_cast<T&&>(values)...);
+    }
+    template <auto A, auto B, auto C, class... T> static __device__ __forceinline__ decltype(auto) split4_rows(T&&... values) {
+        return strix::minimax::moe::opt::split4_rows<A, B, C>(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) singleton3_core(T&&... values) {
+        return strix::minimax::moe::opt::singleton3_core(static_cast<T&&>(values)...);
+    }
+    template <auto A, class... T> static __device__ __forceinline__ decltype(auto) single_stream_for(T&&... values) {
+        return strix::minimax::moe::opt::single_stream_for<A>(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) transform_block_at(T&&... values) {
+        return d::transform_block_at(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) hadamard128(T&&... values) {
+        return d::hadamard128(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) half_bits(T&&... values) {
+        return d::half_bits(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) materialize(T&&... values) {
+        return d::materialize(static_cast<T&&>(values)...);
+    }
+};
+using DecodeCore = strix::moe_core::Decode<DecodeTraits>;
+
 template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false>
 __device__ void gate_up4_body(const Args& a, const Dispatch* dp, const ExpertSlices& E, unsigned slot, unsigned nrows,
                               unsigned first, unsigned cg, unsigned split, unsigned m, _Float16* xs, WideV4* rowbuf = nullptr,
                               bool single = false, std::uint32_t ready = 0) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const Exl3& w = m == 0 ? E.gate : E.up;
-    for (unsigned job = wave; job < nrows * 3; job += W) {  // input transform of the split's 3 H128 blocks per row
-        const unsigned lr = job / 3, b = job % 3;
-        const unsigned row = slot == kSharedSlot ? lr : dp->row[slot][lr];
-        d::transform_block_at(a.y + static_cast<std::size_t>(row) * kHidden, w.suh, xs + lr * kSplitCh, split * kSplitCh + b * 128U,
-                              b * 128U, lane);
-    }
-    __syncthreads();
-    auto finish = [&](unsigned block) {
-    for (unsigned r = wave; r < nrows; r += W) {
-        float g[4], u[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) g[j] = u[j] = 0.0F;
-        for (unsigned sp = 0; sp < kGateSplits; ++sp) {
-            const float* pg = a.part_gu(first + r, 0, sp) + block * 128 + lane;
-            const float* pu = a.part_gu(first + r, 1, sp) + block * 128 + lane;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                g[j] += load_agent(pg + 32 * j);
-                u[j] += load_agent(pu + 32 * j);
-            }
-        }
-        d::hadamard128(g, lane);
-        d::hadamard128(u, lane);
-        float v[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const unsigned i = block * 128 + lane + 32U * static_cast<unsigned>(j);
-            const float act = swiglu(g[j] * d::half_bits(E.gate.svh[i]), u[j] * d::half_bits(E.up.svh[i]));
-            const float scaled = d::materialize(act * d::half_bits(E.down.suh[i]));
-            v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-        }
-        d::hadamard128(v, lane);
-        _Float16* out = a.at(first + r);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) out[block * 128 + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
-    }
-    };
-    if constexpr (Wide) {
-        const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
-        split16_rows<MaxR>(w, kInter, kHidden / 16, kGateSplits, col0, split, xs, nrows, wave, lane, rowbuf,
-                           a.part_gu(first, m, split), std::size_t{2} * 16 * kInter);
-#pragma unroll
-        for (unsigned h = 0; h < 2; ++h)
-            if (last_arrival(a.gu4_counter(slot, cg * 2U + h), 2 * kGateSplits)) {
-                finish(cg * 2U + h);
-                if (ready != 0) publish_gu_ready(a, slot, cg * 2U + h, ready);
-            }
-    } else {
-        const unsigned col = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * static_cast<unsigned>(W) + wave)));
-        if constexpr (Single) {
-            if (single && w.bits == 3) {
-                if (a.single_reader_counts != nullptr && threadIdx.x == 0) atomicAdd(a.single_reader_counts, 1U);
-                singleton3_core(w, kInter, col, split, xs, lane, a.part_gu(first, m, split));
-            }
-            else split4_rows<MaxR, Depth, DepthBig>(w, kInter, kHidden / 16, kGateSplits, col, split, xs, nrows, lane,
-                                                     a.part_gu(first, m, split), std::size_t{2} * 16 * kInter);
-        } else split4_rows<MaxR, Depth, DepthBig>(w, kInter, kHidden / 16, kGateSplits, col, split, xs, nrows, lane,
-                                                 a.part_gu(first, m, split), std::size_t{2} * 16 * kInter);
-        const unsigned block = cg * W / 8;
-        if (last_arrival(a.gu4_counter(slot, block), (8 / W) * 2 * kGateSplits)) {
-            finish(block);
-            if (ready != 0) publish_gu_ready(a, slot, block, ready);
-        }
-    }
+    DecodeCore::gate_up4_body<MaxR, Depth, W, DepthBig, Wide, Single>(a, dp, E, slot, nrows, first, cg, split, m, xs, rowbuf, single, ready);
 }
 
 template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared, bool Wide = false, bool Single = false>
 __device__ __forceinline__ void gate_up4_cta(const Args& a, unsigned bxr, unsigned by, unsigned bz, _Float16* xs, WideV4* rowbuf,
                                              std::uint32_t ready = 0) {
-    const Dispatch* dp = a.disp();
-    constexpr unsigned groups = Wide ? kInter / 256U : kInter / (16U * W);
-    // Former grid separated a slot's gate/up CTAs by an entire z plane spanning all slots. Pair the two
-    // matrices per tile to reduce partial/counter lifetime; CTA counts and split arithmetic stay unchanged.
-    const unsigned bx = a.interleave_gu ? bxr / 2U : bxr;
-    const unsigned m = a.interleave_gu ? bxr % 2U : bz;
-    unsigned slot;
-    if (!map_slot(dp, by, slot)) return;
-    if (SkipShared && slot == kSharedSlot) return;  // done by the router + shared launch
-    gate_up4_body<MaxR, Depth, W, DepthBig, Wide, Single>(a, dp, slot_slices(a, dp, slot), slot, dp->nrows[slot], dp->first[slot],
-                                                       bx % groups, bx / groups, m, xs, rowbuf,
-                                                       Single && single_stream_for<Depth>(a, dp, slot), ready);
+    DecodeCore::gate_up4_cta<MaxR, Depth, W, DepthBig, SkipShared, Wide, Single>(a, bxr, by, bz, xs, rowbuf, ready);
 }
 template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared, bool Wide = false, bool Single = false>
 __global__ __launch_bounds__(32 * W) void gate_up4_kernel(Args a) {
@@ -1059,36 +1047,7 @@ __global__ __launch_bounds__(128) void router_shared_kernel(Args a) {
 // H128/scales, ascending-expert fmaf and shared add. Each wave owns complete rows of one output tile.
 template <int W>
 __device__ __forceinline__ void down4_combine(const Args& a, const Dispatch* dp, unsigned block) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    // Finish every slot's block, then the G4 combine per row: acc = 0; fmaf over its experts in ascending id; + shared.
-    const unsigned rows = dp->rows;
-    auto finish = [&](unsigned pair, const std::uint16_t* svh, float (&v)[4]) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) v[j] = 0.0F;
-        for (unsigned sp = 0; sp < kDownSplits; ++sp) {
-            const float* pp = a.part_dn(pair, sp) + block * 128 + lane;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) v[j] += load_agent(pp + 32 * j);
-        }
-        d::hadamard128(v, lane);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) v[j] = v[j] * d::half_bits(svh[block * 128 + lane + 32U * static_cast<unsigned>(j)]);
-    };
-    for (unsigned r = wave; r < rows; r += W) {
-        float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-        for (unsigned k = 0; k < kTopE; ++k) {
-            float v[4];
-            finish(dp->row_pair[r][k], a.experts[dp->row_expert[r][k]].down.svh, v);
-            const float wk = dp->row_weight[r][k];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) acc[j] = __builtin_fmaf(wk, v[j], acc[j]);
-        }
-        float v[4];
-        finish(dp->first[kSharedSlot] + r, a.shared.down.svh, v);
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            a.out[static_cast<std::size_t>(r) * kHidden + block * 128 + lane + 32U * static_cast<unsigned>(j)] = acc[j] + v[j];
-    }
+    DecodeCore::down4_combine<W>(a, dp, block);
 }
 
 __global__ __launch_bounds__(128) void down4_combine_kernel(Args a) {
@@ -1099,63 +1058,7 @@ __global__ __launch_bounds__(128) void down4_combine_kernel(Args a) {
 template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false>
 __device__ __forceinline__ void down4_cta(const Args& a, unsigned bx, unsigned by, _Float16* xs, WideV4* rowbuf,
                                           std::uint32_t ready = 0) {
-    const Dispatch* dp = a.disp();
-    unsigned slot;
-    if (!map_slot(dp, by, slot)) return;
-    constexpr unsigned groups = Wide ? kHidden / 256U : kHidden / (16U * W);
-    const unsigned cg = bx % groups, split = bx / groups;
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const Exl3& w = slot_slices(a, dp, slot).down;
-    const unsigned nrows = dp->nrows[slot], first = dp->first[slot];
-    if (ready != 0 && slot != kSharedSlot) {  // the split's 384 inputs = gate/up blocks 3 split .. 3 split + 2 of this slot
-        if (threadIdx.x == 0)
-            for (unsigned b = 0; b < kSplitCh / 128; ++b) {
-                const std::uint32_t* f = a.gu_ready(slot, split * (kSplitCh / 128) + b);
-                for (unsigned spin = 0; __hip_atomic_load(f, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != ready; ++spin) {
-                    if (spin == (1U << 26)) __builtin_trap();  // a producer never finished: fault instead of hanging
-                    __builtin_amdgcn_s_sleep(1);
-                }
-            }
-        __syncthreads();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    }
-    for (unsigned q = threadIdx.x; q < nrows * (kSplitCh / 2); q += 32U * W) {  // the split's transformed channels
-        const unsigned lr = q / (kSplitCh / 2), c = q % (kSplitCh / 2);
-        reinterpret_cast<std::uint32_t*>(xs)[lr * (kSplitCh / 2) + c] =
-            reinterpret_cast<const std::uint32_t*>(a.at(first + lr) + split * kSplitCh)[c];
-    }
-    __syncthreads();
-    if constexpr (Wide) {
-        const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
-        split16_rows<MaxR>(w, kHidden, kInter / 16, kDownSplits, col0, split, xs, nrows, wave, lane, rowbuf,
-                           a.part_dn(first, split), std::size_t{4} * kHidden);
-        if constexpr (!PartialOnly) {
-#pragma unroll
-            for (unsigned h = 0; h < 2; ++h)
-                if (last_arrival(a.dn4_counter(cg * 2U + h), (dp->count + 1) * kDownSplits)) {
-                    down4_combine<W>(a, dp, cg * 2U + h);
-                    lean_publish(a.pub, a.pub.tiles);
-                }
-        }
-    } else {
-        const unsigned col = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * static_cast<unsigned>(W) + wave)));
-        if constexpr (Single) {
-            if (single_stream_for<Depth>(a, dp, slot) && w.bits == 3) {
-                if (a.single_reader_counts != nullptr && threadIdx.x == 0) atomicAdd(a.single_reader_counts + 1, 1U);
-                singleton3_core(w, kHidden, col, split, xs, lane, a.part_dn(first, split));
-            }
-            else split4_rows<MaxR, Depth, DepthBig>(w, kHidden, kInter / 16, kDownSplits, col, split, xs, nrows, lane,
-                                                     a.part_dn(first, split), std::size_t{4} * kHidden);
-        } else split4_rows<MaxR, Depth, DepthBig>(w, kHidden, kInter / 16, kDownSplits, col, split, xs, nrows, lane,
-                                                 a.part_dn(first, split), std::size_t{4} * kHidden);
-        if constexpr (!PartialOnly) {
-            const unsigned block = cg * W / 8;
-            if (last_arrival(a.dn4_counter(block), (dp->count + 1) * (8 / W) * kDownSplits)) {
-                down4_combine<W>(a, dp, block);
-                lean_publish(a.pub, a.pub.tiles);
-            }
-        }
-    }
+    DecodeCore::down4_cta<MaxR, Depth, W, DepthBig, Wide, Single, PartialOnly>(a, bx, by, xs, rowbuf, ready);
 }
 template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false>
 __global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
@@ -1174,30 +1077,7 @@ __global__ __launch_bounds__(32 * W) void moe_pipe4_kernel(Args a, unsigned gu_x
     __shared__ _Float16 xs[MaxR * kSplitCh];
     __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
     __shared__ unsigned s_ticket;
-    if (threadIdx.x == 0) {
-        const unsigned t = atomicAdd(a.pipe_ticket(), 1U);
-        if (t + 1U == gridDim.x) __hip_atomic_store(a.pipe_ticket(), 0U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        s_ticket = t;
-    }
-    __syncthreads();
-    const std::uint32_t epoch = *a.pipe_epoch();
-    unsigned t = s_ticket;
-    if constexpr (SharedFirst) {
-        if (t < dn_x) {
-            down4_cta<MaxR, Depth, W, DepthBig, Wide, Single>(a, t, a.disp()->count, xs, rowbuf, epoch);
-            return;
-        }
-        t -= dn_x;
-    }
-    const unsigned gu_n = gu_x * slots * gu_z;
-    if (t < gu_n) {
-        gate_up4_cta<MaxR, Depth, W, DepthBig, true, Wide, Single>(a, t % gu_x, (t / gu_x) % slots, t / (gu_x * slots), xs, rowbuf,
-                                                                  epoch);
-        return;
-    }
-    t -= gu_n;
-    if (SharedFirst && t / dn_x == a.disp()->count) return;  // shared down already ran first
-    down4_cta<MaxR, Depth, W, DepthBig, Wide, Single>(a, t % dn_x, t / dn_x, xs, rowbuf, epoch);
+    DecodeCore::pipe4<MaxR, Depth, W, DepthBig, Wide, Single, SharedFirst>(a, gu_x, gu_z, slots, dn_x, xs, rowbuf, s_ticket);
 }
 
 Args make_args(const MoeView& v) {

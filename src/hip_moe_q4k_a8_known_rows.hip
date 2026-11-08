@@ -394,8 +394,8 @@ __global__ __launch_bounds__(256) void project_window_split(const unsigned char*
         }
 #pragma unroll
         for(unsigned a=0;a<G;++a)if(group+a<count) {
-            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a],2);
-            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a],4);
+            acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+            acc[a]=acc[a]+__shfl_xor(acc[a],4,32);
             if(c==0U)tile[m][group+a][out%32U]=acc[a];
         }
         }
@@ -427,13 +427,13 @@ __global__ __launch_bounds__(256) void project_window_split(const unsigned char*
                     const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
                     if(bad!=0){view.output[r][at]=g;if(lane==0)atomicOr(view.status[r],projection_nonfinite);continue;}
                     float x=fabsf(hv);
-                    for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
+                    for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
                     const bool tiny=x>0.0F && x<0x1p-119F;
                     const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
                     const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
                     const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
                     int sum=code;
-                    for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
+                    for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
                     view.output[r][at]=hv;
                     view.down_codes[r][slot*outputs+feature]=static_cast<signed char>(code);
                     if(lane==0){view.down_deltas[r][slot*(outputs/32U)+blockIdx.x]=delta;view.down_sums[r][slot*(outputs/32U)+blockIdx.x]=sum;}

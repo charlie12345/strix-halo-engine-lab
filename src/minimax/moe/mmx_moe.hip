@@ -1,4 +1,5 @@
-#include "moe_core/decode.hpp"
+#include "../../moe_core/decode.hpp"
+#include "mmx_moe_traits.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 decode MoE and dense EXL3 linears (identity and launch structure: mmx_moe.hpp).
 #include "minimax/moe/mmx_moe.hpp"
@@ -904,21 +905,7 @@ __device__ __forceinline__ void publish_gu_ready(const Args& a, unsigned slot, u
 // One gate/up CTA of slot `slot` (rows: the slot's call rows, or 0..nrows-1 for the shared expert).
 // ready != 0: the pipelined launch; each finished block is published with that epoch.
 // Wide: cg indexes 16-column groups (2 output blocks per CTA) and the wide core runs (rowbuf: 4 x 8 x Bits uint4).
-struct DecodeTraits {
-    using Schedule = strix::moe_core::DecodeSchedule<strix::minimax::moe::opt::kGateSplits, strix::minimax::moe::opt::kDownSplits, strix::minimax::moe::opt::kSplitCh, 4U>;
-    using Args = strix::minimax::moe::opt::Args;
-    using Dispatch = strix::minimax::moe::opt::Dispatch;
-    using ExpertSlices = strix::minimax::moe::opt::ExpertSlices;
-    using Exl3 = strix::minimax::moe::opt::Exl3;
-    using WideV4 = strix::minimax::moe::opt::WideV4;
-    using SlotInfo = strix::minimax::moe::opt::Dispatch;
-    static constexpr auto kGateSplits = strix::minimax::moe::opt::kGateSplits;
-    static constexpr auto kDownSplits = strix::minimax::moe::opt::kDownSplits;
-    static constexpr auto kHidden = strix::minimax::moe::opt::kHidden;
-    static constexpr auto kInter = strix::minimax::moe::opt::kInter;
-    static constexpr auto kSharedSlot = strix::minimax::moe::opt::kSharedSlot;
-    static constexpr auto kSplitCh = strix::minimax::moe::opt::kSplitCh;
-    static constexpr auto kTopE = strix::minimax::moe::opt::kTopE;
+struct MinimaxDecodeOps {
     template <class... T> static __device__ __forceinline__ decltype(auto) last_arrival(T&&... values) {
         return strix::minimax::moe::opt::last_arrival(static_cast<T&&>(values)...);
     }
@@ -965,6 +952,9 @@ struct DecodeTraits {
         return d::materialize(static_cast<T&&>(values)...);
     }
 };
+using DecodeTraits = MinimaxTraits<Args, WideV4, MinimaxDecodeOps>;
+static_assert(DecodeTraits::kGateSplits == kGateSplits && DecodeTraits::kDownSplits == kDownSplits);
+static_assert(DecodeTraits::kSplitCh == kSplitCh);
 using DecodeCore = strix::moe_core::Decode<DecodeTraits>;
 
 template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false>

@@ -47,6 +47,8 @@ void source_coverage() {
     found.insert("CMakeLists.txt");  // build-time arithmetic/addressing switches
     for (const auto& entry : fs::recursive_directory_iterator(root / "src/minimax"))
         if (entry.is_regular_file()) found.insert(entry.path().lexically_relative(root).generic_string());
+    for (const auto& entry : fs::directory_iterator(root / "src/moe_core"))  // shared MiniMax device core
+        if (entry.is_regular_file()) found.insert(entry.path().lexically_relative(root).generic_string());
     for (const auto& entry : fs::directory_iterator(root / "src/dspark_common"))  // kernels shared with the MiniMax drafter
         if (entry.is_regular_file()) found.insert(entry.path().lexically_relative(root).generic_string());
     for (const auto& entry : fs::directory_iterator(root / "apps"))

@@ -1,3 +1,4 @@
+#include "moe_core/decode.hpp"
 // GLM-5.3-Flash decode MoE (identity and launch structure: glm_moe.hpp).
 #include "glm/moe/glm_moe.hpp"
 
@@ -404,6 +405,56 @@ __device__ __forceinline__ Exl3 slot_matrix(const Args& a, const SlotInfo& si, u
     return m == 0 ? e->gate : (m == 1 ? e->up : e->down);
 }
 
+struct DecodeTraits {
+    using Schedule = strix::moe_core::DecodeSchedule<strix::glm::moe::kGateSplits, strix::glm::moe::kDownSplits, strix::glm::moe::kSplitCh, 4U>;
+    using Args = strix::glm::moe::Args;
+    using Dispatch = strix::glm::moe::SlotInfo;
+    using ExpertSlices = strix::glm::moe::ExpertSlices;
+    using Exl3 = strix::glm::moe::Exl3;
+    using WideV4 = strix::glm::moe::WideV4;
+    using SlotInfo = strix::glm::moe::SlotInfo;
+    static constexpr auto kGateSplits = strix::glm::moe::kGateSplits;
+    [[maybe_unused]] static constexpr auto kDownSplits = strix::glm::moe::kDownSplits;
+    static constexpr auto kHidden = strix::glm::moe::kHidden;
+    static constexpr auto kInter = strix::glm::moe::kInter;
+    static constexpr auto kSplitCh = strix::glm::moe::kSplitCh;
+    static constexpr auto kGateKps = strix::glm::moe::kGateKps;
+    static constexpr auto kDownKps = strix::glm::moe::kDownKps;
+    static constexpr auto kDownKt = strix::glm::moe::kDownKt;
+    static constexpr auto kTopE = strix::glm::moe::kTopE;
+    template <class... T> static __device__ __forceinline__ decltype(auto) last_arrival(T&&... values) {
+        return strix::glm::moe::last_arrival(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) load_agent(T&&... values) {
+        return strix::glm::moe::load_agent(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) swiglu(T&&... values) {
+        return strix::glm::moe::swiglu(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) slot_matrix(T&&... values) {
+        return strix::glm::moe::slot_matrix(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) slot_info(T&&... values) {
+        return strix::glm::moe::slot_info(static_cast<T&&>(values)...);
+    }
+    template <auto A, auto B, auto C, auto D, class... T> static __device__ __forceinline__ decltype(auto) wide_rows(T&&... values) {
+        return strix::glm::moe::wide_rows<A, B, C, D>(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) transform_block_at(T&&... values) {
+        return d::transform_block_at(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) hadamard128(T&&... values) {
+        return d::hadamard128(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) half_bits(T&&... values) {
+        return d::half_bits(static_cast<T&&>(values)...);
+    }
+    template <class... T> static __device__ __forceinline__ decltype(auto) materialize(T&&... values) {
+        return d::materialize(static_cast<T&&>(values)...);
+    }
+};
+using DecodeCore = strix::moe_core::Decode<DecodeTraits>;
+
 // ---------------------------------------------------------------- gate + up (+ R15 + down input transform)
 // CTA = 4 waves x 4 columns (2 output blocks) of matrix m over SG library splits starting at split sg * SG.
 template <int MaxR, unsigned SG, bool Pipe> constexpr std::size_t kGuSmem = std::size_t{MaxR} * SG * kSplitCh * 2 + 4 * kRowbufStride<Pipe> * 16;
@@ -697,6 +748,40 @@ __global__ __launch_bounds__(128) void down_kernel(Args a) {
     }
 }
 
+template <int MaxR, unsigned SG, unsigned FirstSlot, bool Pipe>
+__global__ __launch_bounds__(128) void core_gate_up_kernel(Args a) {
+    __shared__ alignas(16) unsigned char smem[kGuSmem<MaxR, SG, Pipe>];
+    __shared__ SlotInfo si;
+    __shared__ std::uint32_t ids[kMaxRows * kTopE], mask[kMaskWords];
+    const unsigned slot = blockIdx.y + FirstSlot;
+    slot_info(a, slot, true, si, ids, mask);
+    if (!si.active) return;
+    DecodeCore::gate_up4_body<MaxR, SG, Pipe>(a, si, slot, blockIdx.x % kGuGroups, blockIdx.x / kGuGroups, blockIdx.z, smem);
+}
+
+template <int MaxR, bool Pipe>
+__global__ __launch_bounds__(128) void core_down_kernel(Args a) {
+    __shared__ _Float16 xs[MaxR * kInter];
+    __shared__ WideV4 rowbuf[4 * kRowbufStride<Pipe>];
+    __shared__ float fin[MaxR * 256];
+    __shared__ SlotInfo si;
+    __shared__ std::uint32_t ids[kMaxRows * kTopE], mask[kMaskWords], pairs[kMaxRows * kTopE];
+    DecodeCore::down4_cta<MaxR, Pipe>(a, xs, rowbuf, fin, si, ids, mask, pairs);
+}
+
+template <int MaxR, unsigned SG, bool Pipe>
+__global__ __launch_bounds__(128) void core_router_shared_kernel(Args a) {
+    __shared__ alignas(16) unsigned char smem[kRsSmem<MaxR, SG, Pipe>];
+    __shared__ SlotInfo si;
+    if (blockIdx.x < kRouterCtas) {
+        router_cta(a, smem);
+        return;
+    }
+    const unsigned local = blockIdx.x - kRouterCtas, per_m = kGuGroups * (kGateSplits / SG);
+    slot_info(a, 0, false, si, nullptr, nullptr);
+    DecodeCore::gate_up4_body<MaxR, SG, Pipe>(a, si, 0, (local % per_m) % kGuGroups, (local % per_m) / kGuGroups, local / per_m, smem);
+}
+
 Args make_args(const MoeView& v, bool router) {
     if (v.rows < 1 || v.rows > kMaxRows) throw std::invalid_argument("glm moe: rows must be 1..8");
     if (v.y == nullptr || v.ids == nullptr || v.weights == nullptr || v.experts == nullptr || v.out == nullptr ||
@@ -735,6 +820,27 @@ unsigned routed_slots(unsigned rows) { return rows * kTopE < kExperts ? rows * k
 template <int MaxR, unsigned SG, bool Pipe>
 void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks) {
     const unsigned routed = routed_slots(a.rows);
+    static const bool core_enabled = [] {
+        const char* value = std::getenv("STRIX_GLM_MOE_CORE");
+        return value != nullptr && std::string(value) == "1";
+    }();
+    if constexpr (MaxR == 1) {
+        if (core_enabled) {
+            if (router) {
+                core_router_shared_kernel<MaxR, SG, Pipe><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
+                check_launch("router_shared");
+                if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
+                core_gate_up_kernel<MaxR, SG, 1, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed, 2), 128, 0, stream>>>(a);
+            } else {
+                core_gate_up_kernel<MaxR, SG, 0, Pipe><<<dim3(kGuGroups * (kGateSplits / SG), routed + 1, 2), 128, 0, stream>>>(a);
+            }
+            check_launch("core_gate_up");
+            if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
+            core_down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
+            check_launch("core_down");
+            return;
+        }
+    }
     if (router) {
         router_shared_kernel<MaxR, SG, Pipe><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
         check_launch("router_shared");

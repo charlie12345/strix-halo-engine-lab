@@ -28,7 +28,7 @@ namespace {
 namespace d = dev;
 
 constexpr unsigned kHB = kHidden / 128, kIB = kInter / 128;  // 48, 12
-constexpr float kAlpha = 1.702F, kLimit = 7.0F;
+
 
 // ---------------------------------------------------------------- library WMMA core pieces (gemm.hip, trellis_device.hpp)
 __device__ __forceinline__ float codebook_mul1(std::uint32_t state) {
@@ -184,7 +184,7 @@ __global__ __launch_bounds__(256) void gather_transform_kernel(const float* y, T
     const unsigned p = q / (2 * kHB), rem = q % (2 * kHB), m = rem / kHB, b = rem % kHB;
     const PGroup& g = t.groups[t.pair_group[p]];
     const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    d::transform_block(y + static_cast<std::size_t>(t.pair_row[p]) * kHidden, suh,
+    InputTransform::input_block(y + static_cast<std::size_t>(t.pair_row[p]) * kHidden, suh,
                        t.xt + (static_cast<std::size_t>(m) * t.pairs + p) * kHidden, b * 128U, lane);
 }
 
@@ -201,10 +201,10 @@ __global__ __launch_bounds__(256) void gather_transform_tiled_kernel(const float
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = d::materialize(x[c] * d::half_bits(suh[c]));
+        const float scaled = InputTransform::scale(x[c], suh[c]);
         v[j] = static_cast<float>(static_cast<_Float16>(scaled));
     }
-    d::hadamard128(v, lane);
+    InputTransform::h128(v, lane);
     _Float16* out = t.xt + static_cast<std::size_t>(m) * t.tpairs * kHidden;
     const unsigned R = g.tbegin + (p - g.pair_begin);
 #pragma unroll
@@ -235,10 +235,10 @@ __global__ __launch_bounds__(256) void gather_transform_token_kernel(const float
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
-                const float scaled = d::materialize(xv[j] * d::half_bits(suh[c]));
+                const float scaled = InputTransform::scale(xv[j], suh[c]);
                 v[j] = static_cast<float>(static_cast<_Float16>(scaled));
             }
-            d::hadamard128(v, lane);
+            InputTransform::h128(v, lane);
             _Float16* out = t.xt + static_cast<std::size_t>(m) * t.tpairs * kHidden;
 #pragma unroll
             for (int j = 0; j < 4; ++j) out[tiled_at(R, b * 128U + lane + 32U * static_cast<unsigned>(j), kHidden)] = static_cast<_Float16>(v[j]);
@@ -246,24 +246,18 @@ __global__ __launch_bounds__(256) void gather_transform_token_kernel(const float
     }
 }
 
-__device__ __forceinline__ float swiglu(float g, float u) {  // tests/minimax_gate_common.hpp swiglu_kernel
-    const float gg = g < kLimit ? g : kLimit;
-    const float uu = u < -kLimit ? -kLimit : (u > kLimit ? kLimit : u);
-    return gg * (1.0F / (1.0F + expf(-kAlpha * gg))) * (uu + 1.0F);
-}
+
 
 // output_transform of one 128-block of one row from split partials [splits][rows][output].
+
+
+__device__ __forceinline__ float swiglu(float g, float u) {
+    return Epilogue::swiglu(g, u);
+}
+
 __device__ __forceinline__ void finish_block(const float* part, unsigned splits, unsigned rows, unsigned row, unsigned output,
                                              unsigned b, const std::uint16_t* svh, unsigned lane, float (&v)[4]) {
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = 0.0F;
-    for (unsigned s = 0; s < splits; ++s)
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            v[j] += part[(static_cast<std::size_t>(s) * rows + row) * output + b * 128 + lane + 32U * static_cast<unsigned>(j)];
-    d::hadamard128(v, lane);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = v[j] * d::half_bits(svh[b * 128 + lane + 32U * static_cast<unsigned>(j)]);
+    return Epilogue::finish_block(part, splits, rows, row, output, b, svh, lane, v);
 }
 
 __global__ __launch_bounds__(256) void gate_up_finish_kernel(Tables t) {
@@ -281,10 +275,10 @@ __global__ __launch_bounds__(256) void gate_up_finish_kernel(Tables t) {
     for (int j = 0; j < 4; ++j) {
         const unsigned c = b * 128 + lane + 32U * static_cast<unsigned>(j);
         const float act = swiglu(gv[j], uv[j]);
-        const float scaled = d::materialize(act * d::half_bits(g.w.down.suh[c]));
+        const float scaled = InputTransform::scale(act, g.w.down.suh[c]);
         v[j] = static_cast<float>(static_cast<_Float16>(scaled));
     }
-    d::hadamard128(v, lane);
+    InputTransform::h128(v, lane);
     _Float16* out = t.at + static_cast<std::size_t>(p) * kInter;
 #pragma unroll
     for (int j = 0; j < 4; ++j) out[b * 128 + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
@@ -299,7 +293,7 @@ __device__ __forceinline__ void gate_up_tiled_store(Tables t, const PGroup& g, u
     for (int j = 0; j < 4; ++j) {
         const unsigned c = b * 128 + lane + 32U * static_cast<unsigned>(j);
         const float act = swiglu(gv[j], uv[j]);
-        const float scaled = d::materialize(act * d::half_bits(g.w.down.suh[c]));
+        const float scaled = InputTransform::scale(act, g.w.down.suh[c]);
         v[j] = static_cast<float>(static_cast<_Float16>(scaled));
         if (debug != nullptr) {
             const std::size_t idx = static_cast<std::size_t>(p) * kInter + c;
@@ -310,7 +304,7 @@ __device__ __forceinline__ void gate_up_tiled_store(Tables t, const PGroup& g, u
             debug[3 * stride + idx] = v[j];
         }
     }
-    d::hadamard128(v, lane);
+    InputTransform::h128(v, lane);
     const unsigned R = g.tbegin + i;
 #pragma unroll
     for (int j = 0; j < 4; ++j) t.at[tiled_at(R, b * 128 + lane + 32U * static_cast<unsigned>(j), kInter)] = static_cast<_Float16>(v[j]);
@@ -339,12 +333,12 @@ __global__ __launch_bounds__(256) void gate_up_fused_kernel(const pfk::Item* ite
     unsigned lo = 0, hi = count;
     while (hi - lo > 1) {
         const unsigned mid = (lo + hi) / 2;
-        if (items[2 * mid].cta_begin <= blockIdx.x) lo = mid;
+        if (items[ExpertLayout::kGateUpInterleave * mid].cta_begin <= blockIdx.x) lo = mid;
         else hi = mid;
     }
-    const pfk::Item gate = items[2 * lo];
+    const pfk::Item gate = items[ExpertLayout::kGateUpInterleave * lo];
     const unsigned matrix = threadIdx.x >> 7U;
-    const pfk::Item it = items[2 * lo + matrix];
+    const pfk::Item it = items[ExpertLayout::kGateUpInterleave * lo + matrix];
     const unsigned local = blockIdx.x - gate.cta_begin;
     const unsigned bx = local % gate.gx, by = local / gate.gx;
     // Only wave-local control flow differs for mixed gate/up bit widths. All waves
@@ -411,14 +405,14 @@ __global__ __launch_bounds__(256) void down_combine_kernel(Tables t, float* out)
         finish_block(t.part + g.part_dn, g.s_dn, g.n, p - g.pair_begin, kHidden, b, g.w.down.svh, lane, v);
         const float w = t.tok_w[tok * kTopE + k];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] = __builtin_fmaf(w, v[j], acc[j]);
+        for (int j = 0; j < 4; ++j) acc[j] = Epilogue::router_accumulate(w, v[j], acc[j]);
     }
     const PGroup& sg = t.groups[t.shared_group];
     float v[4];
     finish_block(t.part + sg.part_dn, sg.s_dn, sg.n, tok, kHidden, b, sg.w.down.svh, lane, v);
 #pragma unroll
     for (int j = 0; j < 4; ++j)
-        out[static_cast<std::size_t>(tok) * kHidden + b * 128 + lane + 32U * static_cast<unsigned>(j)] = acc[j] + v[j];
+        out[static_cast<std::size_t>(tok) * kHidden + b * 128 + lane + 32U * static_cast<unsigned>(j)] = Epilogue::shared_add(acc[j], v[j]);
 }
 
 // Dense prefill linears on the v4 core (enqueue_prefill_dense): the library input transform, row-major x -> tile-major
@@ -448,10 +442,10 @@ __global__ __launch_bounds__(256) void dense_transform_kernel(const float* x, De
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
-            const float scaled = d::materialize(xv[j] * d::half_bits(a.suh[m][c]));
+            const float scaled = InputTransform::scale(xv[j], a.suh[m][c]);
             v[j] = static_cast<float>(static_cast<_Float16>(scaled));
         }
-        d::hadamard128(v, lane);
+        InputTransform::h128(v, lane);
 #pragma unroll
         for (int j = 0; j < 4; ++j)
             a.xt[m][tiled_at(row, b * 128U + lane + 32U * static_cast<unsigned>(j), a.k)] = static_cast<_Float16>(v[j]);

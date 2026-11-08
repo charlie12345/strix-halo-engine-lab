@@ -21,6 +21,7 @@ function(profile_host_test target)
 endfunction()
 
 profile_host_test(strix-engine-profile-common-tests "${STRIX_ROOT}/tests/engine_profile_common_tests.cpp")
+profile_host_test(strix-qwen-allon-tests "${STRIX_ROOT}/tests/qwen_allon_tests.cpp")
 profile_host_test(strix-glm5-rank-defaults-common-cpu-tests "${STRIX_ROOT}/tests/glm_rank_defaults_common_cpu_tests.cpp")
 
 set(ARG_TEST_ARGS "${STRIX_ROOT}/tests/fixtures/minimax_production_receipt.txt")

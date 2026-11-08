@@ -1101,6 +1101,36 @@ void launch_hip_mtp_embedding_rows(std::span<const MtpNativeContext> contexts,st
     }
     check_hip(hipGetLastError(),"MTP embedding batch launch");
 }
+void launch_hip_mtp_embedding_rows_to(const MtpNativeContext& c,std::span<const std::uint32_t> tokens,
+    std::span<std::uint16_t* const> outputs,void* stream) {
+    if(tokens.empty() || tokens.size()>8U || outputs.size()!=tokens.size() || !stream)
+        throw std::invalid_argument("MTP embedding row batch is invalid");
+    MtpEmbeddingRows rows{};
+    for(std::size_t t=0;t<tokens.size();++t) {
+        preflight_hip_mtp_embedding(c,tokens[t]);
+        if(!outputs[t]) throw std::invalid_argument("MTP embedding row batch output is missing");
+        rows.token[t]=nullptr;rows.value[t]=tokens[t];rows.output[t]=outputs[t];
+    }
+    mtp_native::stream(c,stream);
+    check_hip(hipGetLastError(),"MTP embedding row batch pending HIP error");
+    auto launch=[&]<EmbeddingWeightKind Kind>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_embedding_rows_kernel<std::uint16_t,Kind>),
+            dim3((static_cast<std::uint32_t>(c.model->hidden_size)+kThreads-1)/kThreads,static_cast<unsigned>(tokens.size())),
+            dim3(kThreads),0,reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const void*>(c.tensors->embedding.runtime->address),
+            static_cast<std::uint32_t>(c.model->hidden_size),static_cast<std::uint32_t>(c.model->vocab_size),rows);
+    };
+    switch(weight_kind(c.tensors->embedding.manifest->ggml_type)) {
+    case EmbeddingWeightKind::f32:launch.template operator()<EmbeddingWeightKind::f32>();break;
+    case EmbeddingWeightKind::f16:launch.template operator()<EmbeddingWeightKind::f16>();break;
+    case EmbeddingWeightKind::bf16:launch.template operator()<EmbeddingWeightKind::bf16>();break;
+    case EmbeddingWeightKind::q8_0:launch.template operator()<EmbeddingWeightKind::q8_0>();break;
+    case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
+#define STRIX_GGML_KIND_CASE(KIND, type) case EmbeddingWeightKind::KIND:launch.template operator()<EmbeddingWeightKind::KIND>();break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
+    }
+    check_hip(hipGetLastError(),"MTP embedding row batch launch");
+}
 void launch_hip_mtp_embedding_device(const MtpNativeContext& c,const std::uint32_t* token,void* stream) {
     if(!token) throw std::invalid_argument("MTP device-token embedding requires a token word");
     preflight_hip_mtp_embedding(c,0U);mtp_native::stream(c,stream);

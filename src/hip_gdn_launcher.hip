@@ -1,10 +1,13 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/hip_gdn_decode_fuse.hpp"
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+#include "hip_gdn_identity.hpp"
 #include "strix/qpersist.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/known_window_cohort.hpp"
@@ -53,10 +56,6 @@ namespace {
 constexpr std::uint32_t kProjectionThreads = 256;
 constexpr std::uint32_t kRecurrentThreads = 128;
 constexpr std::uint32_t kValueTile = 32;
-constexpr std::uint64_t kLauncherTag =
-    0x47444e4c41554e32ULL;
-constexpr std::uint64_t fnv_offset =
-    14695981039346656037ULL;
 constexpr std::uint64_t fnv_prime =
     1099511628211ULL;
 
@@ -165,19 +164,6 @@ void hash_u64(
         hash ^= (value >> shift) & 0xffULL;
         hash *= fnv_prime;
     }
-}
-
-void hash_float(
-    std::uint64_t& hash,
-    float value) noexcept {
-    std::uint32_t bits = 0;
-    static_assert(
-        sizeof(bits) == sizeof(value));
-    std::memcpy(
-        &bits,
-        &value,
-        sizeof(bits));
-    hash_u64(hash, bits);
 }
 
 void check_hip(
@@ -687,7 +673,7 @@ void project_virtual_q8_bf16_to_fp32_kernel(
     for (unsigned distance = 16; distance > 0; distance /= 2) {
 #pragma unroll
         for (unsigned local = 0; local < 8; ++local) {
-            const auto partner = __shfl_down(partial[local], distance, 32);
+            const auto partner = strix::qwen_dpp::down_tree32(partial[local], distance);
             if (lane < distance) partial[local] += partner;
         }
     }
@@ -737,7 +723,7 @@ void project_prefetch8_q8_bf16_to_fp32_kernel(
     for (unsigned distance = 16; distance > 0; distance /= 2) {
 #pragma unroll
         for (unsigned local = 0; local < 8; ++local) {
-            const auto partner = __shfl_down(partial[local], distance, 32);
+            const auto partner = strix::qwen_dpp::down_tree32(partial[local], distance);
             if (lane < distance) partial[local] += partner;
         }
     }
@@ -785,7 +771,7 @@ void project_prefetch8_wave8_q8_bf16_to_fp32_kernel(
     for (unsigned distance = 16; distance > 0; distance /= 2) {
 #pragma unroll
         for (unsigned local = 0; local < 8; ++local) {
-            const auto partner = __shfl_down(partial[local], distance, 32);
+            const auto partner = strix::qwen_dpp::down_tree32(partial[local], distance);
             if (lane < distance) partial[local] += partner;
         }
     }
@@ -874,7 +860,7 @@ void project_virtual_q8_fp32_to_bf16_kernel(
     for(unsigned distance=16;distance>0;distance/=2) {
 #pragma unroll
         for(unsigned local=0;local<8;++local) {
-            const auto partner=__shfl_down(partial[local],distance,32);
+            const auto partner=strix::qwen_dpp::down_tree32(partial[local], distance);
             if(lane<distance) partial[local]+=partner;
         }
     }
@@ -1182,23 +1168,9 @@ struct GdnOutputTiledSite {
     }
 };
 
-__global__ void conv_update_kernel(
-    float* qkv,
-    std::uint16_t* conv_state,
-    const void* conv_weights,
-    SmallWeightKind weight_kind_value,
-    std::uint32_t channels,
-    std::uint32_t kernel_size, std::uint32_t* graph_status) {
-    if (graph_status != nullptr && *graph_status != 0) return;
-    const auto channel =
-        static_cast<std::uint32_t>(
-            blockIdx.x) *
-            blockDim.x +
-        threadIdx.x;
-    if (channel >= channels) {
-        return;
-    }
-
+__device__ __forceinline__ void conv_update_body(
+    float* qkv, std::uint16_t* conv_state, const void* conv_weights,
+    SmallWeightKind weight_kind_value, std::uint32_t kernel_size, std::uint32_t channel) {
     auto* state =
         conv_state +
         static_cast<std::uint64_t>(
@@ -1239,6 +1211,26 @@ __global__ void conv_update_kernel(
             silu);
 }
 
+__global__ void conv_update_kernel(
+    float* qkv,
+    std::uint16_t* conv_state,
+    const void* conv_weights,
+    SmallWeightKind weight_kind_value,
+    std::uint32_t channels,
+    std::uint32_t kernel_size, std::uint32_t* graph_status) {
+    if (graph_status != nullptr && *graph_status != 0) return;
+    const auto channel =
+        static_cast<std::uint32_t>(
+            blockIdx.x) *
+            blockDim.x +
+        threadIdx.x;
+    if (channel >= channels) {
+        return;
+    }
+
+    conv_update_body(qkv, conv_state, conv_weights, weight_kind_value, kernel_size, channel);
+}
+
 __device__ float softplus(
     float value) {
     if (value > 20.0F) {
@@ -1251,23 +1243,9 @@ __device__ float softplus(
         expf(value));
 }
 
-__global__ void transform_beta_gate_kernel(
-    float* beta,
-    float* gate,
-    const void* dt,
-    SmallWeightKind dt_kind,
-    const void* a,
-    SmallWeightKind a_kind,
-    std::uint32_t heads) {
-    const auto head =
-        static_cast<std::uint32_t>(
-            blockIdx.x) *
-            blockDim.x +
-        threadIdx.x;
-    if (head >= heads) {
-        return;
-    }
-
+__device__ __forceinline__ void transform_beta_gate_body(
+    float* beta, float* gate, const void* dt, SmallWeightKind dt_kind,
+    const void* a, SmallWeightKind a_kind, std::uint32_t head) {
     beta[head] =
         round_bf16(
             1.0F /
@@ -1289,20 +1267,29 @@ __global__ void transform_beta_gate_kernel(
             biased);
 }
 
-__global__ void normalize_qk_kernel(
-    float* qkv,
-    std::uint32_t key_heads,
-    std::uint32_t head_dim,
-    float epsilon, std::uint32_t* graph_status) {
-    __shared__ unsigned graph_reject;
-    if (graph_status != nullptr) {
-        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
-        __syncthreads();
-        if (graph_reject) return;
-    }
-    const auto block =
+__global__ void transform_beta_gate_kernel(
+    float* beta,
+    float* gate,
+    const void* dt,
+    SmallWeightKind dt_kind,
+    const void* a,
+    SmallWeightKind a_kind,
+    std::uint32_t heads) {
+    const auto head =
         static_cast<std::uint32_t>(
-            blockIdx.x);
+            blockIdx.x) *
+            blockDim.x +
+        threadIdx.x;
+    if (head >= heads) {
+        return;
+    }
+
+    transform_beta_gate_body(beta, gate, dt, dt_kind, a, a_kind, head);
+}
+
+__device__ __forceinline__ void normalize_qk_body(
+    float* qkv, std::uint32_t key_heads, std::uint32_t head_dim,
+    float epsilon, std::uint32_t* graph_status, std::uint32_t block, float* scratch) {
     const bool is_key =
         block >= key_heads;
     const auto head =
@@ -1314,7 +1301,6 @@ __global__ void normalize_qk_kernel(
         return;
     }
 
-    __shared__ float scratch[kRecurrentThreads];
 
     const auto base =
         (is_key
@@ -1368,6 +1354,23 @@ __global__ void normalize_qk_kernel(
         inverse *
         q_scale;
 }
+
+__global__ void normalize_qk_kernel(
+    float* qkv,
+    std::uint32_t key_heads,
+    std::uint32_t head_dim,
+    float epsilon, std::uint32_t* graph_status) {
+    __shared__ unsigned graph_reject;
+    if (graph_status != nullptr) {
+        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
+        __syncthreads();
+        if (graph_reject) return;
+    }
+    __shared__ float scratch[kRecurrentThreads];
+    normalize_qk_body(qkv, key_heads, head_dim, epsilon, graph_status, blockIdx.x, scratch);
+}
+
+#include "hip_gdn_decode_fuse.inc"
 
 __global__ __launch_bounds__(kRecurrentThreads)
 void recurrent_step_kernel(
@@ -2372,7 +2375,7 @@ __device__ __forceinline__ void gdn_window_scatter(float* sums, unsigned lane) {
     for (unsigned c = 0; c < Count / 2U; ++c) {
         const bool upper = (lane & Distance) != 0U;
         const float local = sums[2U * c + (upper ? 1U : 0U)];
-        const float peer = __shfl_xor(sums[2U * c + (upper ? 0U : 1U)], Distance);
+        const float peer = strix::qwen_dpp::xor32<Distance>(sums[2U * c + (upper ? 0U : 1U)]);
         // Always add the lower-key subtree first, including in upper lanes.
         sums[c] = upper ? gdn_window_add(peer, local) : gdn_window_add(local, peer);
     }
@@ -3211,6 +3214,31 @@ struct GdnEmitTarget {
 void record_gdn_kernel(GdnKernelLedger* ledger, const void* function, dim3 grid, dim3 block) {
     if (ledger) ledger->push_back({function, grid, block, 0});
 }
+// Returns whether Q/K normalization also ran. Guarded graphs deliberately keep
+// its status-publishing grid separate; beta/gate remains unconditional as before.
+bool enqueue_decode_prepare(const HipGdnDecodeFuseFixture& v,
+    SmallWeightKind conv_kind, SmallWeightKind dt_kind, SmallWeightKind a_kind,
+    unsigned head_dim, hipStream_t stream, std::uint32_t* status, GdnKernelLedger* ledger) {
+    if (!status && head_dim == kRecurrentThreads) {
+        const dim3 grid(2U * v.key_heads + v.value_heads), block(kRecurrentThreads);
+        record_gdn_kernel(ledger, reinterpret_cast<const void*>(decode_prepare_kernel), grid, block);
+        hipLaunchKernelGGL(decode_prepare_kernel, grid, block, 0, stream,
+            v.qkv, v.conv_state, v.conv, conv_kind, v.beta, v.gate, v.dt, dt_kind, v.a, a_kind,
+            v.key_heads, v.value_heads, head_dim, v.kernel, v.qk_epsilon);
+        check_hip(hipGetLastError(), "HIP GDN fused decode preparation launch");
+        return true;
+    }
+    const unsigned channels = (2U * v.key_heads + v.value_heads) * head_dim;
+    const dim3 grid((channels + kRecurrentThreads - 1U) / kRecurrentThreads +
+        (v.value_heads + kRecurrentThreads - 1U) / kRecurrentThreads), block(kRecurrentThreads);
+    record_gdn_kernel(ledger, reinterpret_cast<const void*>(decode_conv_gate_kernel), grid, block);
+    hipLaunchKernelGGL(decode_conv_gate_kernel, grid, block, 0, stream,
+        v.qkv, v.conv_state, v.conv, conv_kind, v.beta, v.gate, v.dt, dt_kind, v.a, a_kind,
+        channels, v.value_heads, v.kernel, status);
+    check_hip(hipGetLastError(), "HIP GDN fused decode convolution/gate launch");
+    return false;
+}
+
 bool gdn_q6_r1_registered(const RuntimeTensorBinding& weights, std::uint32_t width, std::uint32_t outputs) {
     const auto* q6 = q6p::find(reinterpret_cast<const void*>(weights.address));
     return q6 && q6->kind == q6p::Kind::q6p32 && q6->rows == outputs && q6->cols == width;
@@ -4228,81 +4256,99 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
             static_cast<std::uint64_t>(conv_width) + value_width + value_heads * 2ULL, target.graph_status);
         check_hip(hipGetLastError(), "HIP GDN finite projection validation");
     }
-    const auto conv_blocks =
-        (conv_width +
-         kProjectionThreads - 1U) /
-        kProjectionThreads;
-    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(conv_update_kernel),
-        dim3(conv_blocks), dim3(kProjectionThreads));
-    hipLaunchKernelGGL(
-        conv_update_kernel,
-        dim3(conv_blocks),
-        dim3(kProjectionThreads),
-        0,
-        target.stream,
-        workspace.qkv,
-        reinterpret_cast<
-            std::uint16_t*>(
-                conv_state.address),
-        reinterpret_cast<const void*>(
-            tensors.conv.runtime->
-                address),
-        small_weight_kind(
-            tensors.conv.manifest->
-                ggml_type),
-        conv_width,
-        kernel, target.graph_status);
-    check_hip(
-        hipGetLastError(),
-        "HIP GDN causal convolution launch");
+    const bool decode_fuse = qpf2k::decode_fuse_enabled();
+    bool normalized = false;
+    if (decode_fuse) {
+        HipGdnDecodeFuseFixture v{};
+        v.qkv = workspace.qkv; v.beta = workspace.beta; v.gate = workspace.gate;
+        v.conv_state = reinterpret_cast<std::uint16_t*>(conv_state.address);
+        v.conv = reinterpret_cast<const void*>(tensors.conv.runtime->address);
+        v.dt = reinterpret_cast<const void*>(tensors.dt.runtime->address);
+        v.a = reinterpret_cast<const void*>(tensors.a.runtime->address);
+        v.key_heads = key_heads; v.value_heads = value_heads; v.kernel = kernel;
+        v.qk_epsilon = config.model.gdn_qk_l2_epsilon;
+        normalized = enqueue_decode_prepare(v, small_weight_kind(tensors.conv.manifest->ggml_type),
+            small_weight_kind(tensors.dt.manifest->ggml_type), small_weight_kind(tensors.a.manifest->ggml_type),
+            head_dim, target.stream, target.graph_status, target.ledger);
+    } else {
+        const auto conv_blocks =
+            (conv_width +
+             kProjectionThreads - 1U) /
+            kProjectionThreads;
+        record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(conv_update_kernel),
+            dim3(conv_blocks), dim3(kProjectionThreads));
+        hipLaunchKernelGGL(
+            conv_update_kernel,
+            dim3(conv_blocks),
+            dim3(kProjectionThreads),
+            0,
+            target.stream,
+            workspace.qkv,
+            reinterpret_cast<
+                std::uint16_t*>(
+                    conv_state.address),
+            reinterpret_cast<const void*>(
+                tensors.conv.runtime->
+                    address),
+            small_weight_kind(
+                tensors.conv.manifest->
+                    ggml_type),
+            conv_width,
+            kernel, target.graph_status);
+        check_hip(
+            hipGetLastError(),
+            "HIP GDN causal convolution launch");
 
-    const auto parameter_blocks =
-        (value_heads +
-         kProjectionThreads - 1U) /
-        kProjectionThreads;
-    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(transform_beta_gate_kernel),
-        dim3(parameter_blocks), dim3(kProjectionThreads));
-    hipLaunchKernelGGL(
-        transform_beta_gate_kernel,
-        dim3(parameter_blocks),
-        dim3(kProjectionThreads),
-        0,
-        target.stream,
-        workspace.beta,
-        workspace.gate,
-        reinterpret_cast<const void*>(
-            tensors.dt.runtime->
-                address),
-        small_weight_kind(
-            tensors.dt.manifest->
-                ggml_type),
-        reinterpret_cast<const void*>(
-            tensors.a.runtime->
-                address),
-        small_weight_kind(
-            tensors.a.manifest->
-                ggml_type),
-        value_heads);
-    check_hip(
-        hipGetLastError(),
-        "HIP GDN beta/gate transform launch");
+        const auto parameter_blocks =
+            (value_heads +
+             kProjectionThreads - 1U) /
+            kProjectionThreads;
+        record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(transform_beta_gate_kernel),
+            dim3(parameter_blocks), dim3(kProjectionThreads));
+        hipLaunchKernelGGL(
+            transform_beta_gate_kernel,
+            dim3(parameter_blocks),
+            dim3(kProjectionThreads),
+            0,
+            target.stream,
+            workspace.beta,
+            workspace.gate,
+            reinterpret_cast<const void*>(
+                tensors.dt.runtime->
+                    address),
+            small_weight_kind(
+                tensors.dt.manifest->
+                    ggml_type),
+            reinterpret_cast<const void*>(
+                tensors.a.runtime->
+                    address),
+            small_weight_kind(
+                tensors.a.manifest->
+                    ggml_type),
+            value_heads);
+        check_hip(
+            hipGetLastError(),
+            "HIP GDN beta/gate transform launch");
 
-    record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(normalize_qk_kernel),
-        dim3(key_heads * 2U), dim3(kRecurrentThreads));
-    hipLaunchKernelGGL(
-        normalize_qk_kernel,
-        dim3(key_heads * 2U),
-        dim3(kRecurrentThreads),
-        0,
-        target.stream,
-        workspace.qkv,
-        key_heads,
-        head_dim,
-        config.model.
-            gdn_qk_l2_epsilon, target.graph_status);
-    check_hip(
-        hipGetLastError(),
-        "HIP GDN q/k normalization launch");
+    }
+    if (!normalized) {
+        record_gdn_kernel(target.ledger, reinterpret_cast<const void*>(normalize_qk_kernel),
+            dim3(key_heads * 2U), dim3(kRecurrentThreads));
+        hipLaunchKernelGGL(
+            normalize_qk_kernel,
+            dim3(key_heads * 2U),
+            dim3(kRecurrentThreads),
+            0,
+            target.stream,
+            workspace.qkv,
+            key_heads,
+            head_dim,
+            config.model.
+                gdn_qk_l2_epsilon, target.graph_status);
+        check_hip(
+            hipGetLastError(),
+            "HIP GDN q/k normalization launch");
+    }
 
     if (target.graph_status != nullptr) {
         hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0,
@@ -4416,103 +4462,8 @@ bool has_gdn_recurrent_layout_marker(std::string_view id) noexcept {
         id.find(".lds-transposed-v1") != std::string_view::npos;
 }
 
-std::string kernel_id(
-    const ExecutionBindingRequest& request,
-    const HipGdnLauncherConfig& config) {
-    return
-        "hip.gdn.bf16.h" +
-        std::to_string(
-            config.model.hidden_size) +
-        ".kh" +
-        std::to_string(
-            config.model.gdn_key_heads) +
-        ".vh" +
-        std::to_string(
-            config.model.gdn_value_heads) +
-        ".d" +
-        std::to_string(
-            config.model.gdn_key_head_dim) +
-        ".r" +
-        std::to_string(
-            request.logical_rows) +
-        ".c" +
-        std::to_string(
-            request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
-        std::string(gdn_recurrent_layout_marker(config.recurrent_layout)) +
-        std::string(gdn_recurrent_storage_marker(config.recurrent_storage)) +
-        (config.wave8_q8_input_projections ? std::string(q8_projection_organization::gdn_wave8_marker) : "") +
-        (config.wave8_q8_output_projection ? std::string(q8_projection_organization::gdn_output_wave8_marker) : "") +
-        (config.dense_a8_projections ? std::string(q8_projection_organization::dense_a8_marker) : "") +
-        (config.dense_trellis_projections ? ".trellis-g1-fp32-s4-v1" : "") +
-        (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
-        (config.virtual_q8_input_projections ? ".virtual256.q8-input" : "") +
-        (config.virtual_q8_output_projection ? ".virtual256.q8-output" : "");
-}
-
-std::uint64_t implementation_identity(
-    const HipGdnLauncherConfig& config) noexcept {
-    std::uint64_t hash =
-        fnv_offset;
-    hash_u64(hash, kLauncherTag);
-    hash_u64(hash, config.enable_device_graph_inputs);
-    hash_u64(hash, config.model.max_position_embeddings);
-    hash_u64(
-        hash,
-        config.model.hidden_size);
-    hash_u64(
-        hash,
-        config.model.gdn_key_heads);
-    hash_u64(
-        hash,
-        config.model.gdn_key_head_dim);
-    hash_u64(
-        hash,
-        config.model.gdn_value_heads);
-    hash_u64(
-        hash,
-        config.model.gdn_value_head_dim);
-    hash_u64(
-        hash,
-        config.model.gdn_conv_kernel);
-    hash_float(
-        hash,
-        config.model.rms_norm_epsilon);
-    hash_float(
-        hash,
-        config.model.gdn_qk_l2_epsilon);
-    hash_u64(
-        hash,
-        config.model.gdn_output_gate_sigmoid
-            ? 1ULL
-            : 0ULL);
-    hash_u64(
-        hash,
-        config.model.gdn_qk_l2norm
-            ? 1ULL
-            : 0ULL);
-    hash_u64(
-        hash,
-        config.model.gdn_conv_silu
-            ? 1ULL
-            : 0ULL);
-    if (config.virtual_q8_input_projections) hash_u64(hash, 0x47444e5138563235ULL);
-    if (config.virtual_q8_output_projection) hash_u64(hash, 0x47444e514f555431ULL);
-    if (config.prefetch_q8_input_projections) hash_u64(hash, 0x47444e5138504631ULL);
-    if (config.wave8_q8_input_projections) hash_u64(hash, 0x47444e5138574156ULL);
-    if (config.wave8_q8_output_projection) hash_u64(hash, 0x47444e514f573831ULL);
-    if (config.dense_a8_projections) hash_u64(hash, 0x47444e4441385631ULL); // GDNDA8V1
-    if (config.dense_trellis_projections) hash_u64(hash, 0x544c473146503453ULL); // TLG1FP4S
-    if (config.recurrent_layout != HipGdnRecurrentLayout::baseline) {
-        hash_u64(hash, 0x47444e4c44533031ULL); // GDN LDS organization version 1.
-        hash_u64(hash, static_cast<std::uint32_t>(config.recurrent_layout));
-    }
-    if (config.recurrent_storage != GdnRecurrentStorage::key_value) {
-        hash_u64(hash, 0x47444e53544f5231ULL);
-        hash_u64(hash, static_cast<std::uint32_t>(config.recurrent_storage));
-    }
-    return hash;
-}
-
+using hip_gdn_identity::kernel_id;
+using hip_gdn_identity::implementation_identity;
 
 // R2 consumes the same complete pure host admission as the R1 factory.
 using GdnKnownWindowRow = PreparedGdnLaunch;
@@ -5082,8 +5033,8 @@ unsigned qpf2k_gdn_parts() {
     }();
     return qpf2k::suppressed(qpf2k::Item::gdn) ? 0U : parts;
 }
-// STRIX_QPF2K_GDN_FP16_CHUNK=1 (default OFF; FAST, bit-changing; prefill option gdn_fp16_chunk, identity tag gdnchunk16):
-// numerical revision qwen-gdn-fp16-chunk rev 2 (hip_gdn_fp16_chunk.inc) replaces conv + recurrence + gated norm of the
+// STRIX_QPF2K_GDN_FP16_CHUNK=1 (rev 2), =3 (rev 3), default OFF; FAST, option gdn_fp16_chunk.
+// numerical revisions qwen-gdn-fp16-chunk rev 2/3 (hip_gdn_fp16_chunk.inc) replaces conv + recurrence + gated norm of the
 // prefill row route with the chunked WMMA route. STRIX_PREFILL_EXACT_FP16=1 / --prefill-disable gdn_fp16_chunk turn it
 // off; ignored under the baseline, for GSQ checkpoints and in the GDN check modes (they compare exact routes); shapes it
 // cannot take keep the exact route.
@@ -5097,8 +5048,8 @@ bool gdn_fp16_chunk_enabled(const GdnKnownWindowRow& first, const GdnPrefillRows
     const bool fits = gdn_fp16_chunk_supported(first.head_dim, first.key_heads, first.value_heads, rows);
     static std::once_flag once;
     std::call_once(once, [&] {
-        std::fprintf(stderr, fits ? "GDN FAST lever qwen-gdn-fp16-chunk rev 2: ON (bit-changing; STRIX_QPF2K_GDN_FP16_CHUNK=0 is exact)\n"
-                                  : "GDN FAST lever qwen-gdn-fp16-chunk rev 2: requested, shape not supported -> exact recurrence\n");
+        std::fprintf(stderr, fits ? "GDN FAST lever %s: ON (bit-changing; STRIX_QPF2K_GDN_FP16_CHUNK=0 is exact)\n"
+                                  : "GDN FAST lever %s: requested, shape not supported -> exact recurrence\n", gdn_fp16_chunk::identity());
     });
     return fits;
 }
@@ -5584,7 +5535,12 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                 first.key_heads, first.value_heads, config.model.gdn_qk_l2_epsilon, stream, epilogue, x16, x16_width, first.conv_width);
         else launch_gdn_fp16_chunk_conv_fast<GdnRecurrentStorage::key_value>(strided, count, matrix, conv_state, conv_w, conv_kind,
             first.key_heads, first.value_heads, config.model.gdn_qk_l2_epsilon, stream, epilogue, x16, x16_width, first.conv_width);
-        qpf2k_gdn_witness(x16 ? (epilogue.core16 ? "recurrence qwen-gdn-fp16-chunk rev 2 (BF16 rows, conv prep + staged scan + norm/CORE16)"
+        if (gdn_fp16_chunk::revision() == 3U)
+            qpf2k_gdn_witness(x16 ? (epilogue.core16 ? "recurrence qwen-gdn-fp16-chunk rev 3 (BF16 rows, factored prep + staged scan + norm/CORE16)"
+                                                   : "recurrence qwen-gdn-fp16-chunk rev 3 (BF16 rows, factored prep + staged scan + norm)")
+                                : (epilogue.core16 ? "recurrence qwen-gdn-fp16-chunk rev 3 (factored prep + staged scan + norm/CORE16)"
+                                                   : "recurrence qwen-gdn-fp16-chunk rev 3 (factored prep + staged scan + norm)"), count);
+        else qpf2k_gdn_witness(x16 ? (epilogue.core16 ? "recurrence qwen-gdn-fp16-chunk rev 2 (BF16 rows, conv prep + staged scan + norm/CORE16)"
                                                  : "recurrence qwen-gdn-fp16-chunk rev 2 (BF16 rows, conv prep + staged scan + norm)")
                               : (epilogue.core16 ? "recurrence qwen-gdn-fp16-chunk rev 2 (conv prep + staged scan + norm/CORE16)"
                                                  : "recurrence qwen-gdn-fp16-chunk rev 2 (conv prep + staged scan + norm)"), count);
@@ -7207,12 +7163,17 @@ const void* wave8_island_input_symbol(std::uint32_t ggml_type) {
     }
     throw std::invalid_argument("GDN island input projection type is unsupported");
 }
+unsigned gdn_island_node_count(const HipGdnLauncherConfig& config) {
+    if (!qpf2k::decode_fuse_enabled()) return 10U;
+    return config.model.gdn_key_head_dim == kRecurrentThreads ? 8U : 9U;
+}
 void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger,
     const PreparedGdnLaunch& prepared, const HipGdnLauncherConfig& config) {
-    if (ledger.size() != 10) throw std::runtime_error("GDN island emitter must record ten kernel nodes");
+    const unsigned expected_nodes = gdn_island_node_count(config);
+    if (ledger.size() != expected_nodes) throw std::runtime_error("GDN island emitter node count differs from resolved organization");
     std::size_t count = 0;
     check_hip(hipGraphGetNodes(graph, nullptr, &count), "GDN island node count");
-    if (count != ledger.size()) throw std::runtime_error("GDN island must capture exactly ten nodes");
+    if (count != ledger.size()) throw std::runtime_error("GDN island capture differs from resolved node count");
     std::vector<hipGraphNode_t> nodes(count);
     check_hip(hipGraphGetNodes(graph, nodes.data(), &count), "GDN island node inventory");
     if (count != ledger.size()) throw std::runtime_error("GDN island node inventory changed");
@@ -7263,9 +7224,13 @@ void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger,
             throw std::runtime_error("GDN island kernel node differs from the emitter ledger");
         if (config.wave8_q8_input_projections && config.wave8_q8_output_projection &&
             ((ordinal < 4U && parameters.func != projection_symbols[ordinal]) ||
-             (ordinal == 9U && parameters.func != projection_symbols[4])))
+             (ordinal == expected_nodes - 1U && parameters.func != projection_symbols[4])))
             throw std::runtime_error("GDN island captured projection symbol differs from its admitted wave8 organization");
-        if (ordinal == 7U && parameters.func != recurrent_symbol)
+        if (ordinal == 4U && expected_nodes != 10U && parameters.func !=
+            (expected_nodes == 8U ? reinterpret_cast<const void*>(decode_prepare_kernel) :
+                reinterpret_cast<const void*>(decode_conv_gate_kernel)))
+            throw std::runtime_error("GDN island preparation symbol differs from resolved fusion");
+        if (ordinal == expected_nodes - 3U && parameters.func != recurrent_symbol)
             throw std::runtime_error("GDN island recurrent symbol differs from its admitted layout");
         used[selected] = true; previous = nodes[selected];
         ++ordinal;
@@ -7395,11 +7360,11 @@ struct HipGdnIslands::Impl {
             if (count == std::numeric_limits<std::uint32_t>::max()) throw std::overflow_error("GDN island count overflow");
             ++count;
         }
-        if (!count || count > budget.max_islands || count > budget.max_kernel_nodes / 10U)
+        if (!count || count > budget.max_islands || count > budget.max_kernel_nodes / gdn_island_node_count(config))
             throw std::invalid_argument("GDN island count exceeds explicit setup admission");
         steps.resize(compiled.execution.steps.size());
         observed.organization_identity = island_organization_identity(config);
-        observed.islands = count; observed.kernel_nodes = count * 10U;
+        observed.islands = count; observed.kernel_nodes = count * gdn_island_node_count(config);
         const auto& scratch = *resources->scratch;
         const auto& state = *resources->session_state_memory;
         device_range({scratch.arena_base, scratch.arena_bytes, scratch.allocation_generation});
@@ -7664,15 +7629,7 @@ register_for_compiled_execution(
             if (*binding.kernel_id != kernel_id(request, config_))
                 throw std::invalid_argument("HIP GDN selected kernel disagrees with recurrent LDS configuration");
         }
-        constexpr std::string_view output_suffix=".virtual256.q8-output";
-        if(selected_id.ends_with(output_suffix)!=config_.virtual_q8_output_projection)
-            throw std::invalid_argument("HIP GDN selected kernel disagrees with virtual Q8 output configuration");
-        if(config_.virtual_q8_output_projection) selected_id.remove_suffix(output_suffix.size());
-        if (selected_id.ends_with(".virtual256.q8-input") !=
-            config_.virtual_q8_input_projections)
-            throw std::invalid_argument("HIP GDN selected kernel disagrees with virtual Q8 configuration");
-        if (selected_id.ends_with(".prefetch8.virtual256.q8-input") != config_.prefetch_q8_input_projections)
-            throw std::invalid_argument("HIP GDN selected kernel disagrees with prefetch Q8 configuration");
+        hip_gdn_identity::validate_projection_id(selected_id, config_);
         if (config_.wave8_q8_input_projections || config_.wave8_q8_output_projection ||
             selected_id.find(q8_projection_organization::gdn_wave8_marker) != std::string::npos ||
             selected_id.find(q8_projection_organization::gdn_output_wave8_marker) != std::string::npos) {
@@ -7778,5 +7735,36 @@ void enqueue(Shape shape, const Bindings& bindings, Layout layout, hipStream_t s
 }
 } // namespace gdn_recurrent_layout_diagnostic
 #endif
+
+void hip_gdn_decode_fuse_fixture(const HipGdnDecodeFuseFixture& v, bool fuse,
+    std::uint32_t* status, void* stream_ptr) {
+    const auto stream = static_cast<hipStream_t>(stream_ptr);
+    const auto kind = small_weight_kind(v.small_type);
+    constexpr unsigned d = kRecurrentThreads;
+    const unsigned channels = (2U * v.key_heads + v.value_heads) * d;
+    if (status) hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
+        v.qkv, channels + v.value_heads * d + v.value_heads * 2ULL, status);
+    bool normalized = false;
+    if (fuse) normalized = enqueue_decode_prepare(v, kind, kind, kind, d, stream, status, nullptr);
+    else {
+        hipLaunchKernelGGL(conv_update_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.kernel, status);
+        hipLaunchKernelGGL(transform_beta_gate_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, v.beta, v.gate, v.dt, kind, v.a, kind, v.value_heads);
+    }
+    if (!normalized) hipLaunchKernelGGL(normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
+        v.qkv, v.key_heads, d, v.qk_epsilon, status);
+    // These are the same guarded grid boundaries used by emit_gdn_sequence.
+    // qkv|z|beta|gate must be one contiguous image, as in the R1 workspace.
+    if (status) hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
+        v.qkv, channels + v.value_heads * d + v.value_heads * 2ULL, status);
+    hipLaunchKernelGGL(recurrent_step_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+        v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, status);
+    if (status) hipLaunchKernelGGL(validate_gdn_graph_values, dim3(32), dim3(kProjectionThreads), 0, stream,
+        v.core, v.value_heads * d, status);
+    hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
+        v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon, status);
+    check_hip(hipGetLastError(), "HIP GDN decode fusion fixture launch");
+}
 
 }  // namespace strix

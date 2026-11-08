@@ -1,6 +1,7 @@
 // Standalone exact PLE batch gate. Build command is in tests/ple_batch_build.sh.
 #include "../src/hip_q8_rows_gemv.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/ple_projection_tile.hpp"
 #include <cstdio>
 #include <vector>
 #include <string>

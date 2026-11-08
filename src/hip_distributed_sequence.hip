@@ -146,6 +146,87 @@ public:
         return result;
     }
 };
+// Actual synchronous HIP boundary copies, preserving canonical payload order.
+// No numerical conversion and no borrowed host buffer escapes a fenced copy.
+class HipCopiedBoundary final : public CopiedStreamBoundarySourceProvider,
+    public DistributedBoundaryStagingProvider {
+    std::shared_ptr<SequenceMemory> memory_;
+    AllocationGenerationSource& generations_;
+    HipLaunchContext scope_;
+    HipSetupQuiescenceGuard guard_;
+    bool consumed_=false;
+    std::vector<ExecutionBufferAddress> views(const DistributedExecutionBoundary& b) {
+        require_sequence(same_boundary(b,memory_->boundary),"copied boundary differs from canonical model cut");
+        auto v=memory_->current_buffers();std::uint64_t total=0;
+        require_sequence(v.size()==b.payloads.size(),"copied cut payload count differs");
+        for(std::size_t i=0;i<v.size();++i) {
+            require_sequence(v[i].use==b.payloads[i] && v[i].address && v[i].allocation_generation &&
+                v[i].bytes && v[i].bytes<=UINTPTR_MAX-v[i].address && total<=b.payload_bytes &&
+                v[i].bytes<=b.payload_bytes-total,"copied cut view order, generation or extent differs");
+            total+=v[i].bytes;
+        }
+        require_sequence(total==b.payload_bytes,"copied cut views do not cover the full boundary");return v;
+    }
+public:
+    HipCopiedBoundary(std::shared_ptr<SequenceMemory> memory,AllocationGenerationSource& generations,HipLaunchContext scope)
+        :memory_(std::move(memory)),generations_(generations),scope_(scope) {}
+    transport::CopiedStreamPreparedSource stage_outbound_owned(const DistributedExecutionBoundary& b,
+        const DistributedBoundaryTransfer& t) override {
+        require_sequence(memory_->node==b.source_node && t.descriptor.byte_length==b.payload_bytes,
+            "copied producer is not the actual source stage");
+        auto v=views(b);auto allocation=std::make_shared<transport::CopiedStreamHostBuffer>(b.payload_bytes,generations_);
+        const auto view=allocation->view();
+        guard_.run([&] {std::size_t offset=0;
+            for(const auto& x:v) {
+                if(hipMemcpyAsync(allocation->writable_bytes().data()+offset,reinterpret_cast<const void*>(x.address),
+                    static_cast<std::size_t>(x.bytes),hipMemcpyDeviceToHost,scope_.stream)!=hipSuccess)
+                    throw std::runtime_error("copied boundary D2H failed");
+                offset+=static_cast<std::size_t>(x.bytes);
+            }
+            if(hipStreamSynchronize(scope_.stream)!=hipSuccess) throw std::runtime_error("copied D2H fence failed");
+        });
+        auto proof=transport::make_copied_stream_synchronous_proof(
+            {t.descriptor,view,transport::CopiedStreamCompletionScope::producer_released});
+        return {{std::move(allocation),view},std::move(proof)};
+    }
+    transport::TransportBufferView stage_outbound(const DistributedExecutionBoundary&,const DistributedBoundaryTransfer&) override {
+        throw std::logic_error("copied HIP producer requires owned staging");
+    }
+    transport::TransportBufferView stage_inbound(const DistributedExecutionBoundary&,const DistributedBoundaryTransfer&) override {
+        throw std::logic_error("copied transport owns inbound host staging");
+    }
+    void consume_inbound(const DistributedExecutionBoundary& b,const transport::TransportBufferView& view) override {
+        require_sequence(memory_->node==b.destination_node && !consumed_ &&
+            view.domain==transport::TransportMemoryDomain::host_pageable &&
+            transport::validate_transport_send_buffer(view,b.payload_bytes) && view.bytes==b.payload_bytes,
+            "copied consumer view is foreign, repeated or incomplete");
+        auto v=views(b);
+        guard_.run([&] {std::size_t offset=0;
+            for(const auto& x:v) {
+                if(hipMemcpyAsync(reinterpret_cast<void*>(x.address),reinterpret_cast<const std::byte*>(view.address)+offset,
+                    static_cast<std::size_t>(x.bytes),hipMemcpyHostToDevice,scope_.stream)!=hipSuccess)
+                    throw std::runtime_error("copied boundary H2D failed");
+                offset+=static_cast<std::size_t>(x.bytes);
+            }
+            if(hipStreamSynchronize(scope_.stream)!=hipSuccess) throw std::runtime_error("copied H2D fence failed");
+        });consumed_=true;
+    }
+    std::unique_ptr<DistributedInboundCompletion> finish_inbound(const DistributedExecutionBoundary& b,
+        const DistributedBoundaryTransfer&) override {
+        require_sequence(same_boundary(b,memory_->boundary),"copied consumer completion has foreign boundary");
+        require_sequence(consumed_,"copied consumer did not finish its actual H2D copy");
+        return cleanup_inbound(b,{});
+    }
+    std::unique_ptr<DistributedInboundCompletion> cleanup_inbound(const DistributedExecutionBoundary& b,
+        const DistributedBoundaryTransfer&) override {
+        require_sequence(same_boundary(b,memory_->boundary),"copied cleanup has foreign boundary");
+        guard_.recover_or_fail_stop();
+        class Done final : public DistributedInboundCompletion {
+            DistributedInboundCompletionStatus poll() override {return DistributedInboundCompletionStatus::complete;}
+        };
+        return std::make_unique<Done>();
+    }
+};
 struct SuffixControl final : DistributedNativeControlPlane {
     const DistributedPlacementPlan& plan;
     DistributedControlReceiver& receiver;
@@ -203,7 +284,11 @@ struct HipDistributedKnownSequence::Impl {
     };
     struct Token {
         std::shared_ptr<SequenceMemory> memory;
-        std::shared_ptr<DirectGpuBoundaryStaging> staging;
+        std::shared_ptr<DistributedBoundaryStagingProvider> staging;
+        std::shared_ptr<HipCopiedBoundary> copied_staging;
+        std::unique_ptr<CopiedStreamDistributedBackend> copied_backend;
+        DistributedExecutionBackend* execution=nullptr;
+        DistributedPlacementPlan local_plan;
         std::unique_ptr<FramedDistributedControlWire> framed;
         std::unique_ptr<SequencedDistributedNativeControlPlane> coordinator;
         std::unique_ptr<DistributedControlReceiver> receiver;
@@ -218,7 +303,7 @@ struct HipDistributedKnownSequence::Impl {
             HipDistributedSequenceTransport transport;
             std::shared_ptr<const void> model;
             std::shared_ptr<SequenceMemory> memory;
-            std::shared_ptr<DirectGpuBoundaryStaging> staging;
+            std::shared_ptr<DistributedBoundaryStagingProvider> staging;
             std::shared_ptr<Local> local;
         };
         std::shared_ptr<Pins> pins;
@@ -315,6 +400,15 @@ struct HipDistributedKnownSequence::Impl {
         require_sequence(setup.model.vocab_size<=UINT64_MAX/sizeof(float) && terminal.bytes==setup.model.vocab_size*sizeof(float),
             "sequence terminal allocation does not contain exactly one full FP32 row");
         const auto& t=setup.transport;
+        if(t.copied) {
+            const auto& c=t.copied->connection();
+            require_sequence(t.actual_owner && t.copied_generations && !t.link && !t.gpu && !t.receive && !t.scheduler &&
+                !t.copied->failed() && !t.copied->retains_buffer() && c.local_node==setup.local_node &&
+                c.peer_node==1U-setup.local_node && c.physical_epoch==binding.connection_epoch && c.link_index==0U &&
+                t.step_control && t.token_control && t.step_control.get()!=t.token_control.get() &&
+                boundary.payload_bytes<=t.copied->capabilities().maximum_payload_bytes,
+                "sequence host-copy route lacks exact owners, epoch, peer, capacity or independent controls");
+        } else {
         require_sequence(t.actual_owner && t.link && t.link->active() && t.gpu && t.receive && t.scheduler &&
             t.step_control && t.token_control && t.step_control.get()!=t.token_control.get() &&
             t.link->lease().link_index==0U && t.scheduler->links().size()==1U,
@@ -325,6 +419,7 @@ struct HipDistributedKnownSequence::Impl {
             profile.inbound.health==transport::LinkHealth::qualified &&
             profile.outbound.id==t.link->lease().physical_link_id && profile.inbound.id==profile.outbound.id,
             "sequence scheduler lacks the current qualified physical link");
+        }
         require_sequence(setup.scope.stream && setup.scope.stream!=hipStreamLegacy && setup.scope.stream!=hipStreamPerThread &&
             !setup.scope.graph_capture && !current_hip_launch_context(),"sequence requires its own eager HIP scope");
         initial_generation=binding.generation;
@@ -347,8 +442,20 @@ struct HipDistributedKnownSequence::Impl {
         failed=true;
         setup.participant->communication_failed();
         guard.recover_or_fail_stop(); // Local work only; not an external DMA proof.
+        if(setup.transport.copied) {
+            setup.transport.copied->poison();
+            setup.transport.step_control->abort();setup.transport.token_control->abort();
+            transport_live=true; // drain the host-copy owner even before first dispatch
+        }
         if(transport_live) {
-            try {setup.transport.link->close();transport_live=false;}
+            try {
+                if(setup.transport.copied) {
+                    setup.transport.copied->poison();
+                    if(setup.transport.copied->drain_retained()!=transport::CopiedStreamCleanupStatus::released)
+                        std::terminate(); // Unknown consumer lifetime: no owner unwinding.
+                } else setup.transport.link->close();
+                transport_live=false;
+            }
             catch(...) {std::terminate();} // No release proof: do not unwind DMA owners.
         }
     }
@@ -382,7 +489,10 @@ struct HipDistributedKnownSequence::Impl {
         token->memory=std::make_shared<SequenceMemory>();
         auto& memory=*token->memory;memory.owner=setup.actual_model_owner;memory.participant=setup.participant;
         memory.serial=setup.serial;memory.resources=setup.resources;memory.boundary=boundary;memory.node=setup.local_node;
-        if(setup.layer_boundary_position_dependencies)
+        if(setup.transport.copied) {
+            token->copied_staging=std::make_shared<HipCopiedBoundary>(token->memory,*setup.transport.copied_generations,setup.scope);
+            token->staging=token->copied_staging;
+        } else if(setup.layer_boundary_position_dependencies)
             token->staging=std::make_shared<DirectGpuBoundaryStaging>(setup.canonical_plan,request,setup.transport.link->lease(),
                 token->memory,setup.transport.gpu,setup.transport.receive,setup.local_node,boundary.boundary_id,
                 NativeDistributedPositionDependencyPolicy::materialized_input_position_v1);
@@ -399,12 +509,25 @@ struct HipDistributedKnownSequence::Impl {
             token->server=std::make_unique<DistributedControlServer>(*setup.transport.step_control,*token->receiver);
             control=token->suffix.get();
         }
+        token->pins=std::make_shared<Token::Pins>(Token::Pins{setup.transport,setup.actual_model_owner,token->memory,token->staging,local});
+        if(setup.transport.copied) {
+            token->local_plan=setup.canonical_plan;token->local_plan.local_node=setup.local_node;
+            for(auto& step:token->local_plan.steps) step.remote=step.node!=setup.local_node;
+            if(!token->receiver) token->receiver=std::make_unique<DistributedControlReceiver>(
+                setup.canonical_plan,request,setup.local_node,*local);
+            token->copied_backend=std::make_unique<CopiedStreamDistributedBackend>(*setup.transport.copied,
+                token->local_plan,request,*control,*token->receiver,*local,*token->copied_staging,*token->staging,
+                *setup.transport.copied_generations);
+            token->copied_backend->begin_token_retirement(setup.participant->binding_identity(),token->pins);
+            token->execution=token->copied_backend.get();
+            active=std::move(token);transport_live=true;return;
+        }
         token->links[0]=setup.transport.link.get();
         token->backend=std::make_unique<NativeDistributedBackend>(token->links,*control,*local,*token->staging);
-        token->pins=std::make_shared<Token::Pins>(Token::Pins{setup.transport,setup.actual_model_owner,token->memory,token->staging,local});
         token->backend->begin_token_retirement(setup.canonical_plan,request,setup.local_node,
             setup.participant->binding_identity(),token->pins,setup.layer_boundary_position_dependencies?
                 NativeDistributedPositionDependencyPolicy::materialized_input_position_v1:NativeDistributedPositionDependencyPolicy::reject);
+        token->execution=token->backend.get();
         active=std::move(token);
         transport_live=true;
     }
@@ -436,18 +559,25 @@ struct HipDistributedKnownSequence::Impl {
             // Creating producer staging is intentionally AFTER finish_local.
             adapters(local);
             const auto& b=setup.participant->current_binding();
-            auto transfer=plan_distributed_boundary_transfer(setup.canonical_plan,boundary,*setup.transport.scheduler,
+            DistributedBoundaryTransfer transfer;
+            if(setup.transport.copied) {
+                transfer.descriptor=make_distributed_boundary_descriptor(setup.canonical_plan,boundary,
+                    b.connection_epoch,b.request_id,b.generation,1U,b.boundary_dtype_id);
+                transfer.flow=classify_distributed_boundary_flow(setup.canonical_plan,boundary);
+                transfer.link_plan.kind=transport::PlanKind::single_link;
+                transfer.link_plan.slices={{0U,0U,boundary.payload_bytes}};
+            } else transfer=plan_distributed_boundary_transfer(setup.canonical_plan,boundary,*setup.transport.scheduler,
                 b.connection_epoch,b.request_id,b.generation,1U,b.boundary_dtype_id);
             require_sequence(transfer.link_plan.kind==transport::PlanKind::single_link && transfer.link_plan.slices.size()==1U,
                 "sequence has no qualified single-link boundary plan");
-            active->backend->send_boundary(boundary,transfer);
+            active->execution->send_boundary(boundary,transfer);
             for(std::uint32_t step=cut+1U;step<=last;++step)
-                active->backend->execute_remote_step(setup.canonical_plan.steps[step]);
+                active->execution->execute_remote_step(setup.canonical_plan.steps[step]);
         } else {
             adapters(local);
             require_sequence(active->server->serve_one()==DistributedControlServerEvent::boundary_transfer,
                 "sequence suffix requires boundary metadata before any remote step");
-            (void)active->backend->receive_boundary(boundary);
+            (void)active->execution->receive_boundary(boundary);
             local->inbound_complete=true;
             for(std::uint32_t step=cut+1U;step<=last;++step)
                 require_sequence(active->server->serve_one()==DistributedControlServerEvent::remote_step,
@@ -461,9 +591,13 @@ struct HipDistributedKnownSequence::Impl {
         const auto committed=setup.participant->committed_frontier();
         require_sequence(committed.has_value() && setup.participant->frontier().has_value(),
             "sequence cannot publish without both committed ACKs and typed frontier");
-        if(position_dependencies)
-            active->backend->complete_position_dependencies(setup.participant->mint_position_dependency_completion());
-        retirement.emplace(active->backend->retire_token());
+        if(position_dependencies) {
+            auto proof=setup.participant->mint_position_dependency_completion();
+            if(active->copied_backend) active->copied_backend->complete_position_dependencies(std::move(proof));
+            else active->backend->complete_position_dependencies(std::move(proof));
+        }
+        if(active->copied_backend) retirement.emplace(active->copied_backend->retire_token());
+        else retirement.emplace(active->backend->retire_token());
         row.commit=*committed; // Only after real transport retirement.
         expected_binding_identity=setup.participant->binding_identity();
         ++completed;

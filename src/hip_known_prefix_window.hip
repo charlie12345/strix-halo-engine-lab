@@ -1,4 +1,5 @@
 #include "strix/cohort_step_plan.hpp"
+#include "strix/qwen_allon.hpp"
 #include "strix/batch_nested_prefill.hpp"
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
@@ -8,6 +9,9 @@
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/hip_ple_launcher.hpp"
+#if defined(STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME)
+#include "strix/hip_moe_q4k_a8_known_rows.hpp"
+#endif
 
 #include "strix/deferred_moe_status.hpp"
 #include "strix/hip_hyper_mix_launcher.hpp"
@@ -54,6 +58,18 @@ const bool qpf2k_default_env = [] {
     strix::qpf2k::initialize_before_main(
         [](const char* name) { return std::getenv(name); },
         [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+    // STRIX_QWEN_ALLON (include/strix/qwen_allon.hpp): fills the opt-in levers that are still unset. Unset = no effect.
+    const auto get = [](const char* name) { return std::getenv(name); };
+    if (strix::qwen_allon::mode(get) == strix::qwen_allon::Mode::invalid) {
+        std::fprintf(stderr, "STRIX_QWEN_ALLON must be 0, 1, exact or fast\n");
+        std::exit(2);
+    }
+    if (strix::qwen_allon::mode(get) != strix::qwen_allon::Mode::off) {
+        const unsigned set = strix::qwen_allon::apply(get,
+            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+        std::fprintf(stderr, "qwen allon: mode=%s, %u lever variables set (explicit values win)\n",
+            strix::qwen_allon::mode_name(strix::qwen_allon::mode(get)), set);
+    }
     return true;
 }();
 } // namespace
@@ -485,6 +501,21 @@ struct HipKnownPrefixWindow::Impl {
         d->forked.assign(2U * layers, nullptr); d->joined.assign(2U * layers, nullptr); d->pending.assign(layers, 0U);
         // STRIX_QPF2K_SCHED bit 32 (tiled prefill owners only): the side stream at the lowest priority, so the detached
         // shared expert fills what the routed kernels leave instead of competing with them (same kernels and bits).
+        // STRIX_QPF2K_SIDE_CUS=N (tiled prefill owners, 1 <= N < CU count): the side stream's queue may only use the last N
+        // compute units, so the detached shared expert does not take the whole device from the routed kernels beside it
+        // (placement only: same kernels, launches and bits).
+        const unsigned side_cus = [] { const char* e = std::getenv("STRIX_QPF2K_SIDE_CUS"); return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 0)) : 0U; }();
+        int cus = 0, device = 0;
+        if (prefill && side_cus) {
+            check(hipGetDevice(&device), "known prefill device");
+            check(hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, device), "known prefill CU count");
+        }
+        if (prefill && side_cus && side_cus < static_cast<unsigned>(cus)) {
+            std::vector<std::uint32_t> mask((static_cast<unsigned>(cus) + 31U) / 32U, 0U);
+            for (unsigned cu = static_cast<unsigned>(cus) - side_cus; cu < static_cast<unsigned>(cus); ++cu) mask[cu / 32U] |= 1U << (cu % 32U);
+            check(hipExtStreamCreateWithCUMask(&d->side, static_cast<std::uint32_t>(mask.size()), mask.data()), "create known prefill CU-masked shared stream");
+            std::fprintf(stderr, "qpf2k sched side stream CU mask: last %u of %d CUs\n", side_cus, cus);
+        } else
         if (prefill && (prefill_schedule() & 32U)) {
             int least = 0, greatest = 0;
             check(hipDeviceGetStreamPriorityRange(&least, &greatest), "known prefill stream priority range");
@@ -542,9 +573,14 @@ struct HipKnownPrefixWindow::Impl {
     bool prefill_schedule_step(std::size_t i, std::span<const ExecutionDispatchContext> rows) {
         const auto& step = serial.execution.steps[i];
         if (prefill_join_due) throw std::logic_error("known prefill detached step was not observed before the next step");
+        settle_late_shared();
         if (!prefill || !step.layer || *step.layer >= model.hidden_layers) return false;
         const auto layer = *step.layer;
-        if ((prefill_schedule() & 1U) && !rows.empty() && step.op == SerialOp::shared_expert &&
+        // Bit 64 (late fork): the shared step only records its rows here; the layer's routed step enqueues it at its
+        // stage hook (see late_fork_enabled). A step observer reads the shared step's output right after it: bit-1 fork then.
+        const bool late = late_fork_enabled() && !prefill_observed;
+        // Detached with bit 1 or bit 64; late only with bit 64 and no step observer.
+        if ((prefill_schedule() & 65U) && !rows.empty() && step.op == SerialOp::shared_expert &&
             prefill->tile8.r2_variant[i] == KnownWindowR2Variant::shared_q8_virtual256_r8_v1) {
             auto& d = detach_state();
             if (d.pending[layer]) throw std::logic_error("known prefill shared expert detached twice before its combine");
@@ -561,6 +597,16 @@ struct HipKnownPrefixWindow::Impl {
                 d.prefill_workspace_bytes = need;
             }
             const auto e = layer + d.parity * d.pending.size();
+            if (late) {
+                if (late_shared_due) throw std::logic_error("known prefill late shared expert recorded twice");
+                late_shared_rows.assign(rows.begin(), rows.end());
+                late_shared_event = e;
+                late_shared_layer = layer;
+                late_shared_due = true;
+                d.pending[layer] = 1U;
+                ++prefill_detached_shared;
+                return true;
+            }
             check(hipEventRecord(d.forked[e], scope.stream), "record known prefill shared fork");
             check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known prefill shared stream");
             shared_expert_known_prefill_rows_launch_detached(rows, shared_for(rows.first(8U)), d.side,
@@ -573,10 +619,74 @@ struct HipKnownPrefixWindow::Impl {
             ++prefill_detached_shared;
             return true;
         }
+        if (late_shared_due) {
+#if defined(STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME)
+            // The layer's routed step: its enqueue forks the shared expert after the chosen stage (stage 3 at the latest).
+            if (step.op == SerialOp::moe_experts && layer == late_shared_layer) {
+                moe_q4k_a8::known_rows::set_prefill_stage_hook(&Impl::late_shared_hook, this, late_fork_stage());
+                late_shared_due = false;
+                late_shared_pending = true;
+                return false;
+            }
+#endif
+            // Any other step first (or no stage hook in this build): fork here, before it.
+            launch_late_shared(scope.stream);
+            ++prefill_late_fallback;
+        }
         // Every step after the fork other than the routed experts (the MoE combine first) runs after the shared expert.
         if (step.op != SerialOp::moe_experts) join_all_shared();
         return false;
     }
+    // STRIX_QPF2K_SCHED bit 64 (tiled prefill only; the bit-1 side stream, detached launch, workspace and join): the
+    // full-T shared expert is enqueued on the side stream from inside the layer's routed enqueue, right after its stage
+    // STRIX_QPF2K_SIDE_FORK (1 = CSR, 2 = gate/up [default], 3 = before the merge), so it runs beside the memory-bound
+    // routed down + merge instead of the WMMA-bound gate/up. Only the enqueue time differs from bit 1.
+    bool late_fork_enabled() const { return (prefill_schedule() & 64U) != 0U; }
+    static unsigned late_fork_stage() {
+        static const unsigned v = [] { const char* e = std::getenv("STRIX_QPF2K_SIDE_FORK");
+            const auto n = e ? std::strtoul(e, nullptr, 0) : 2UL; return n >= 1UL && n <= 3UL ? static_cast<unsigned>(n) : 2U; }();
+        return v;
+    }
+    static void late_shared_hook(void* user, hipStream_t stream) {
+        auto& self = *static_cast<Impl*>(user);
+        if (!self.late_shared_pending) throw std::logic_error("known prefill late shared hook fired without a pending step");
+        if (stream != self.scope.stream) throw std::logic_error("known prefill late shared hook on a foreign stream");
+        self.late_shared_pending = false;
+        self.launch_late_shared(stream);
+    }
+    void launch_late_shared(hipStream_t stream) {
+        auto& d = *shared_detach;
+        const auto e = late_shared_event;
+        const std::span<const ExecutionDispatchContext> rows(late_shared_rows);
+        late_shared_due = false;
+        check(hipEventRecord(d.forked[e], stream), "record known prefill late shared fork");
+        check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known prefill late shared stream");
+        shared_expert_known_prefill_rows_launch_detached(rows, shared_for(rows.first(8U)), d.side,
+            reinterpret_cast<std::uintptr_t>(d.prefill_workspace), d.prefill_workspace_bytes);
+        check(hipEventRecord(d.joined[e], d.side), "record known prefill late shared join");
+        late_shared_rows.clear();
+        ++prefill_late_launched;
+    }
+    // After the routed step that armed the stage hook: every routed prefill enqueue fires it (stage 3 at the latest), so
+    // an unfired hook means the routed step took a path this mode is not qualified for: fail closed.
+    void settle_late_shared() {
+        if (!late_shared_pending) return;
+        reset_late_shared();
+        throw std::logic_error("known prefill late shared expert: the routed step did not reach its stage hook");
+    }
+    // Drops late-fork state of a call that did not finish (an exception between record and fire).
+    void reset_late_shared() {
+#if defined(STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME)
+        if (late_shared_pending) moe_q4k_a8::known_rows::set_prefill_stage_hook(nullptr, nullptr, 0U);
+#endif
+        late_shared_due = late_shared_pending = false;
+        late_shared_rows.clear();
+    }
+    std::vector<ExecutionDispatchContext> late_shared_rows;
+    std::size_t late_shared_event = 0;
+    std::uint32_t late_shared_layer = 0;
+    bool late_shared_due = false, late_shared_pending = false;
+    std::uint64_t prefill_late_launched = 0, prefill_late_fallback = 0;
     void join_all_shared() {
         if (!shared_detach) return;
         for (std::uint32_t l = 0; l < shared_detach->pending.size(); ++l) join_shared(l);
@@ -2136,20 +2246,25 @@ struct HipKnownPrefixWindow::Impl {
                 // STRIX_QPF2K_SCHED: prefill schedule hook. A step observer (MTP tap copies, step dumps) of a detached step
                 // runs on the side stream before that step's join is recorded (prefill_observe).
                 if(prefill_schedule()) {
-                    prefill_observed=static_cast<bool>(hooks.after_step);prefill_join_due=0U;
+                    prefill_observed=static_cast<bool>(hooks.after_step);prefill_join_due=0U;reset_late_shared();
                     const auto detached_before=prefill_detached_shared;
+                    const auto late_before=prefill_late_launched,fallback_before=prefill_late_fallback;
                     const auto deferred_before=deferred_blocks,checked_before=deferred_checked;
                     hooks.prefill_step=[this](std::size_t i,std::span<const ExecutionDispatchContext> rows){return prefill_schedule_step(i,rows);};
                     if(prefill_observed)
                         hooks.after_step=[this,inner=hooks.after_step](std::size_t i,const std::function<ExecutionDispatchContext(std::uint32_t)>& row){
                             prefill_observe(i,row,inner);};
-                    hooks.complete=[&,inner=hooks.complete,detached_before,deferred_before,checked_before]{
+                    hooks.complete=[&,inner=hooks.complete,detached_before,deferred_before,checked_before,late_before,fallback_before]{
                         if(prefill_join_due) throw std::logic_error("known prefill detached step left without its join");
+                        settle_late_shared();
+                        if(late_shared_due){launch_late_shared(scope.stream);++prefill_late_fallback;}
                         join_all_shared();inner();
                         // Execution witness (STRIX_QPF2K_SCHED): detached shared-expert steps of this block.
                         // S2: whether this block was deferred, deferred blocks checked in its completion, still pending.
-                        std::fprintf(stderr,"qpf2k sched block rows %u detached_shared %llu deferred %llu checked %llu pending %d\n",block_rows,
+                        std::fprintf(stderr,"qpf2k sched block rows %u detached_shared %llu late %llu fallback %llu deferred %llu checked %llu pending %d\n",block_rows,
                             static_cast<unsigned long long>(prefill_detached_shared-detached_before),
+                            static_cast<unsigned long long>(prefill_late_launched-late_before),
+                            static_cast<unsigned long long>(prefill_late_fallback-fallback_before),
                             static_cast<unsigned long long>(deferred_blocks-deferred_before),
                             static_cast<unsigned long long>(deferred_checked-checked_before),deferred_pending>=0?1:0);
                     };
@@ -2173,9 +2288,11 @@ struct HipKnownPrefixWindow::Impl {
             lap("after");
             return result;
         } catch(const KnownPrefillCancelled&) {
+            reset_late_shared(); // STRIX_QPF2K_SCHED bit 64: no armed stage hook of this owner survives the call
             defer_current=false;partial_current=false;prefill_service={};prefill_observer={};prefill_observes={};
             last_union_observation.reset();throw;
         } catch (...) {
+            reset_late_shared();
             if(capture)capture->abort();
             if(actual_window_committed){session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;}
             failed = true;

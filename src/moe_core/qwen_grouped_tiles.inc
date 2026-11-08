@@ -150,7 +150,7 @@ __global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* 
         if(live)at(view.output,r)[slot*2U*outputs+out]=hv;
         // Largest |h| of the wave's 16 outputs of this row (the lanes of one half hold one row).
         float m=fabsf(hv);
-        for(int stride=8;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+        for(int stride=8;stride!=0;stride/=2)m=fmaxf(m,strix::qwen_dpp::xor32(m, stride));
         if(live&&i==0U)atomicMax(reinterpret_cast<unsigned*>(at(view.down_sums,r))+slot,__float_as_uint(m));
         if(live&&bad){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}
     }

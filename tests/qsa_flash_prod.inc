@@ -8,6 +8,7 @@
 // Pool/store kernels are shared directly with src/hip_qsa_prefill_stages.inc.
 // The remaining production reference code below is copied verbatim from src/hip_indexed_attention_launcher.hip
 // (0998a0e5); hip_qsa_fast_prefill.inc and hip_qsa_prefill_flash.inc are included from src/.
+// Selection helpers additionally mirror the production union-cap score-preservation control (default false).
 #include "strix/qpf2k_defaults.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -80,7 +81,7 @@ __device__ __forceinline__ std::uint32_t select_scan(std::uint32_t value, std::u
     return value;
 }
 __device__ void select_blocks_parallel_body(float* block_scores, std::uint32_t num_blocks, std::uint32_t select_blocks,
-    std::uint32_t compress_ratio, std::uint32_t visible_tokens, std::uint32_t* selected, GraphSelectionArguments dynamic) {
+    std::uint32_t compress_ratio, std::uint32_t visible_tokens, std::uint32_t* selected, GraphSelectionArguments dynamic, bool preserve_scores = false) {
     const auto tid = static_cast<std::uint32_t>(threadIdx.x);
     if (dynamic.position.position != nullptr) {
         if (!graph_visible(dynamic, visible_tokens)) return;
@@ -147,13 +148,13 @@ __device__ void select_blocks_parallel_body(float* block_scores, std::uint32_t n
                 const auto block = first + j, slot = zeros + g + min(e, need);
                 for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
                     selected[slot * compress_ratio + offset] = block * compress_ratio + offset;
-                block_scores[block] = -INFINITY;
+                if (!preserve_scores) block_scores[block] = -INFINITY;
             }
             g += kind[j] == 1U; e += kind[j] == 2U;
         }
         greater_before += tile >> 16U; equal_before += tile & 0xffffU;
     }
-    if (zeros && tid == 0) block_scores[0] = -INFINITY;
+    if (zeros && tid == 0 && !preserve_scores) block_scores[0] = -INFINITY;
     const auto complete_tokens = num_blocks * compress_ratio, selected_complete = select_blocks * compress_ratio;
     for (auto token = complete_tokens + tid; token < visible_tokens; token += kSelectThreads)
         selected[selected_complete + token - complete_tokens] = token;
@@ -167,6 +168,7 @@ template <unsigned Rows> struct QsaRowsSelectViews {
     float* block_scores[Rows];
     std::uint32_t* selected[Rows];
     std::uint32_t visible[Rows];
+    bool preserve_scores = false;
 };
 template <unsigned Rows>
 __global__ __launch_bounds__(kSelectThreads) void select_rows_kernel(QsaRowsSelectViews<Rows> views, std::uint32_t compress_ratio, std::uint32_t block_topk) {
@@ -178,7 +180,7 @@ __global__ __launch_bounds__(kSelectThreads) void select_rows_kernel(QsaRowsSele
         return;
     }
     select_blocks_parallel_body(views.block_scores[r], complete, block_topk, compress_ratio, visible,
-        views.selected[r], GraphSelectionArguments{});
+        views.selected[r], GraphSelectionArguments{}, views.preserve_scores);
 }
 #include "../src/hip_qsa_scatter.inc"
 #include "../src/hip_qsa_prefill_stages.inc"
@@ -201,6 +203,7 @@ __device__ __forceinline__ unsigned qsa_rows_matrix(const QsaRowsInputViews<Rows
 #include "../src/hip_qsa_pooled_score.inc"
 // ---- end verbatim ----
 #include "../src/hip_qsa_fast_prefill.inc"
+#include "../src/hip_qsa_fast_prefill_kv_pair.inc"
 #include "../src/hip_qsa_fast_prefill_pipe.inc"
 #include "../src/hip_qsa_fast_prefill_share.inc"
 #include "../src/hip_qsa_fast_prefill_shadow.inc"

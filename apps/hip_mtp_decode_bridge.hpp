@@ -1,5 +1,6 @@
 #include "strix/startup_markers.hpp"
 #pragma once
+#include "rtx_state_import_routes.hpp"
 #include "qwen_yarn_memory.hpp"
 #include "mtp_asset_verification.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
@@ -265,7 +266,16 @@ inline std::string mtp_sampling_receipt(const MtpCliOptions& m,const TokenSample
        <<",\"min_p\":"<<p.min_p<<",\"seed\":"<<p.seed<<",\"policy_identity\":"<<token_sampling_policy_identity(p)
        <<",\"speculation\":"<<(m.sample_speculation?"true":"false")<<",\"schedule\":\""<<(m.sample_timing_schedule?"adaptive-timed":"fixed")
        <<"\",\"drafts\":"<<s.drafts<<",\"plain_decisions\":"<<s.plain<<",\"accepted_drafts\":"<<s.accepted
-       <<",\"rejected_drafts\":"<<s.rejected<<"}";
+       <<",\"rejected_drafts\":"<<s.rejected;
+    // Only non-default choices are listed, so default receipts are unchanged.
+    if(sampler->coupled()) out<<",\"acceptance\":\"coupled\",\"argmax_draft_below\":"<<sampler->options().argmax_draft_below;
+    if(sampler->options().request_identity!=1U) out<<",\"request_identity\":"<<sampler->options().request_identity;
+    if(const auto row=sampler->options().force_reject_row;row!=TokenSamplerOptions::forced_rejection_off) {
+        out<<",\"forced_rejection\":\"";
+        if(row==TokenSamplerOptions::forced_rejection_rotate) out<<"rotate"; else out<<row;
+        out<<"\",\"forced_rejections\":"<<s.forced;
+    }
+    out<<"}";
     return out.str();
 }
 using MtpDecodeWindowFactory=std::function<std::shared_ptr<HipMtpWindowVerifier>(std::shared_ptr<HipMtpTargetHidden>)>;
@@ -1489,13 +1499,16 @@ private:
         const auto budget = [](const Slot& s) {
             return static_cast<std::uint32_t>(std::min<std::uint64_t>(s.request.max_tokens - s.result.generated_tokens, UINT32_MAX));
         };
+        // Sampled requests with --mtp-sample-speculation off propose no drafts (as on the single route): their chain
+        // has no draft sampler, so drafting would give candidates without draft distributions.
+        const auto depth = [&m](const Slot& s) { return s.request.sampler && !m.sample_speculation ? 0U : m.candidate_depth; };
         ++stats_.steps;
         if (live.size() == 1U) {
             auto& s = *live.front();
             ++stats_.solo_steps;
             try {
                 auto transaction=s.request.constraint?s.request.constraint->window_transaction():nullptr;
-                apply(s, s.greedy->cycle(s.pending, m.candidate_depth, budget(s), s.request.stop_tokens,transaction.get()));
+                apply(s, s.greedy->cycle(s.pending, depth(s), budget(s), s.request.stop_tokens,transaction.get()));
             } catch(const serve::ConstraintError& e) {
                 if(s.session->health==SerialSessionHealth::poisoned || (s.window && s.window->failed()))throw;
                 constraint_failed(s,e);
@@ -1509,7 +1522,7 @@ private:
         for (auto* s : live) {
             const auto slot=std::find_if(slots_.begin(),slots_.end(),[&](const auto& p){return p.get()==s;})-slots_.begin();
             transactions.push_back(s->request.constraint?s->request.constraint->window_transaction():nullptr);
-            members.push_back({s->greedy.get(), &s->pending, m.candidate_depth, budget(*s), s->request.stop_tokens,
+            members.push_back({s->greedy.get(), &s->pending, depth(*s), budget(*s), s->request.stop_tokens,
                 static_cast<std::uint32_t>(slot),transactions.back().get()});
         }
         static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
@@ -1614,7 +1627,8 @@ private:
         if ((pair.fast_components & kFastPrefillHc) && prefill_option_enabled(PrefillOption::hc_output_wmma))
             return "hc-output-wmma-unqualified";
         if (index_wmma_unqualified_route(prefill_options_active(), pair.fast_components))
-            return "index-proj-wmma-unqualified";
+            return prefill_option_enabled(PrefillOption::index_score_wmma) ?
+                "index-score-wmma-unqualified" : "index-proj-wmma-unqualified";
         const bool qualified=numerical_profile_dense_a8(pair.prefill) && !numerical_profile_dense_trellis(pair.prefill) &&
             !numerical_profile_dense_trellis(pair.decode) && pair.fast_components==0U;
         const auto recipe=s.prefill->nested_recipe(nest_rows_,qualified && !s.parents->tiled.blocks->gsq_model());
@@ -2516,6 +2530,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     if(parents->tiled.cache && parents->tiled.cache->has_store())
                         options.state_cache_stats->publish(prefix_snapshot(parents->tiled.cache->store()));
                 });
+
+            if (!options.rtx_state_import_file.empty())
+                stage_rtx_state_import_file(*parents->tiled.rtx_import, options.rtx_state_import_file, options.tokens, 4U << 20U, options.rtx_state_import_position);
 
             std::uint64_t served=0;
                 const MtpServeRunner ordinary_request=[&](const MtpServeRequest& q) {

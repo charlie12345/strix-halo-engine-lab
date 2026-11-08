@@ -2,9 +2,12 @@
 #include "qwen_yarn_memory.hpp"
 
 #include "strix/compact_stage_images.hpp"
+#include "strix/qwen_router_bf16.hpp"
+#include "strix/qwen_allon.hpp"
 #include "hip_decode_options.hpp"
 #include "known_prefill_reservation.hpp"
 #include "qwen_moe_route_bf16.hpp"
+#include "qwen_moe_direct_b.hpp"
 #include "http_slot_capacity.hpp"
 #include "qwen_prefill_external_memory.hpp"
 #include "strix/known_prefix_prefill.hpp"
@@ -118,6 +121,7 @@ struct EffectiveConfig {
     bool gsq_owner = false;
     std::map<std::string, std::uint64_t> host_compilation;
     std::map<std::string, std::uint64_t> admission;
+    QwenRouterBf16Reservation router_bf16_reservation;
     RotaryIdentity rotary_identity;
 };
 // Inspection knows resolved arithmetic, not an executed workload or its assets.
@@ -165,15 +169,15 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST",
             "STRIX_PREFILL_EXACT_FP16", "STRIX_QPF2K_T16K", "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
             "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
-            "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC", "STRIX_QSA_CACHE_ONLY",
+            "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC", "STRIX_QSA_CACHE_ONLY", "STRIX_QWEN_ROUTER_BF16", "STRIX_Q6P",
             "STRIX_QPF2K_GDN_CHUNK16", "STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS", "STRIX_QPF2K_GDN_COOP_LAUNCH",
-            "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE",
+            "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE", "STRIX_QWEN_DECODE_FUSE",
             "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE", "STRIX_PREFIX_FAIR_RECLAIM_IDLE",
             "STRIX_SERVE_PREFILL", "STRIX_PLE_WARM", "STRIX_PLE_SERVE_RESERVE", "STRIX_PLE_REWARM", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
-            "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL"})
+            "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
     for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
@@ -247,6 +251,20 @@ inline void account_http_registered_target(PrefillRequirements& result,const Opt
 inline std::uint64_t prefill_checked_multiply(std::uint64_t a, std::uint64_t b) {
     if (b && a > UINT64_MAX / b) throw std::overflow_error("prefill reservation overflow");
     return a * b;
+}
+inline void account_qwen_router_bf16(PrefillRequirements& result, const ModelManifest& manifest,
+    bool enabled, bool named_owners) {
+    const auto router = qwen_router_bf16_reservation(manifest, enabled);
+    result.runtime_payload = prefill_checked_add(result.runtime_payload,
+        prefill_checked_add(router.device_bytes, router.setup_host_bytes));
+    result.device_base = prefill_checked_add(result.device_base, router.device_bytes);
+    if (named_owners) {
+        result.owners["qwen_router_bf16"] = router.device_bytes;
+        result.owners["qwen_router_bf16_setup_staging"] = router.setup_host_bytes;
+        result.owner_phases["qwen_router_bf16_setup_staging"] = 1U; // setup only
+    }
+    result.organization["qwen_router_bf16_reserved_bytes"] = router.device_bytes;
+    result.organization["qwen_router_bf16_setup_host_bytes"] = router.setup_host_bytes;
 }
 struct PrefillNativePools {
     std::uint64_t host = 0, device = 0, mapped = 0;
@@ -355,6 +373,11 @@ inline std::optional<ple_reclaim::Config> prefill_reclaim_config(const Options& 
         }
         ple_reclaim::Config config;
         config.page = *page;
+        // HTTP imports retain their existing prompt-wide, nonrolling contract.
+        if (!options.http_serve && !options.rtx_state_import_file.empty()) {
+            if (!options.rtx_state_import_position || options.rtx_state_import_position >= options.tokens.size()) return {};
+            config.prompt_begin = options.rtx_state_import_position;
+        }
         config.table_offset = table->absolute_offset;
         config.table_rows = table->dimensions[1];
         config.stored_row_bytes = table->ggml_type == 20U ? table->dimensions[0] / 32U * 18U : table->dimensions[0] * 2U;
@@ -405,16 +428,22 @@ inline std::uint64_t prefill_rolling_owner_bytes(const Options& options, const M
     const ModelManifest& manifest, const Environment& environment, std::optional<std::uint64_t> page) {
     const auto config = prefill_reclaim_config(options,model,manifest,environment,page);
     return config && config->rolling_positions ? ple_reclaim::planned_owner_bytes(*config,
-        build_ple_hash_contract(model).head_count,options.tokens.size()) : 0U;
+        build_ple_hash_contract(model).head_count,options.tokens.size() - config->prompt_begin) : 0U;
 }
 // Shared CPU preflight for execution and HTTP --print-effective-config. Capacity
 // requiring actual device allocations is resolved later and remains provisional.
 inline void validate_effective_startup(const EffectiveConfig& config) {
     require_effective_prefill_execution(config);
     validate_http_serve(config.options);
+    if (!config.options.rtx_state_import_file.empty() &&
+        (!config.options.known_prefix_window || !config.options.known_prefix_prefill_rows))
+        throw std::invalid_argument("--rtx-state-import-file requires tiled CLI prefill");
     validate_prefix_state_cache(config.options);
 }
 inline void validate_effective_options(const Options& o, const ModelContract& model) {
+    if (o.resolved_qsa_prefill_budget.value_or(0U) && (!model.indexer_compress_ratio ||
+        *o.resolved_qsa_prefill_budget % model.indexer_compress_ratio))
+        throw std::invalid_argument("STRIX_QPF2K_QSA_BUDGET must be a multiple of the indexer compression ratio");
     validate_resolved_mtp_cli(o);
     validate_resolved_prefix_roundtrip(o);
     validate_resolved_q8_projection_organization(o);
@@ -461,6 +490,11 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     EffectiveConfig result;
     result.options = request.options;
     result.environment = request.environment;
+    qwen_allon::gate_long_prompt(result.options.tokens.size(),
+        [&](const char* name) -> const char* {
+            const auto it = result.environment.find(name);
+            return it == result.environment.end() ? nullptr : it->second.c_str();
+        }, [&](const char* name, const char* value) { result.environment[name] = value; });
     const bool exact_defaults = !request.options.baseline && !env_is(request.environment, "STRIX_BASELINE", "1") &&
         !(request.environment.contains("STRIX_QPF2K_DEFAULTS") && request.environment.at("STRIX_QPF2K_DEFAULTS").starts_with('0'));
     if (!exact_defaults) result.environment["STRIX_QPF2K_COMPACT_IMAGES"] = "0";
@@ -470,6 +504,7 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     };
     result.options.early_setup = exact_defaults && request.options.early_setup && enabled("STRIX_QPF2K_EARLY_SETUP");
     result.options.eager_code_load = exact_defaults && request.options.eager_code_load && enabled("STRIX_EAGER_CODE_LOAD");
+    result.options.qwen_router_bf16 = exact_defaults && env_is(result.environment, "STRIX_QWEN_ROUTER_BF16", "1") && enabled("STRIX_Q6P");
     if (result.options.eager_code_load && !result.environment.contains("HIP_ENABLE_DEFERRED_LOADING"))
         result.environment["HIP_ENABLE_DEFERRED_LOADING"] = "0";
     result.prefill_option_mask = resolve_prefill_options([&](const char* name) -> const char* {
@@ -481,11 +516,18 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     if (result.options.mtp.enabled && (!result.options.mtp_bundle_path.empty() ||
         (result.options.rotary.mode() == RotaryMode::yarn && !result.options.prefill_numerical_profile))) {
         const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
-            prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk);
+            prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+            prefill_option_bit(PrefillOption::index_score_wmma) |
+            (result.prefill_option_mask & kPrefillGdnChunkRev3);
         result.options.prefill_disabled |= excluded;
         result.prefill_option_mask &= ~excluded;
     }
     result.options.resolved_prefill_option_mask = result.prefill_option_mask;
+    const auto budget = result.environment.find("STRIX_QPF2K_QSA_BUDGET");
+    const auto master = result.environment.find("STRIX_PREFILL_EXACT_FP16");
+    result.options.resolved_qsa_prefill_budget = result.options.prefill_exact_fp16 ||
+        (master != result.environment.end() && master->second.starts_with('1')) ? 0U :
+        parse_qsa_prefill_budget(budget == result.environment.end() ? "" : budget->second);
     return result;
 }
 #include "qwen_yarn_admission.inc"
@@ -558,6 +600,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         !env_is(request.environment, "STRIX_BASELINE", "1"))
         return resolve_yarn_config(request, model, info, manifest, verified_content, capabilities, memory);
     auto result = initialize_prefill_config(request);
+    result.router_bf16_reservation = qwen_router_bf16_reservation(manifest, result.options.qwen_router_bf16);
     result.options.ple_rolling_explicit_opt_in=env_is(request.environment,"STRIX_PLE_ROLLING","1");
     result.options.qsa_mtp_pool_explicit_opt_in=env_is(request.environment,"STRIX_QSA_MTP_POOL","1");
     result.gsq_owner = qpf2k::has_gsq_gate(manifest);
@@ -1440,6 +1483,18 @@ inline void finalize_cache_family(Options& o, CacheRunner runner, std::uint32_t 
         a.source="off";
     }
 }
+// Prepared direct-B planes (device allocations) plus their setup staging. The aggregate runtime payload carries them for the
+// native admission; the YaRN estimate sums its named owners instead, so the planes are named there and charged to GTT like the
+// router weight copy.
+inline void charge_moe_direct_b(PrefillRequirements& r, const MoeDirectBPolicy& p) {
+    if(!p.effective) return;
+    const auto extra=prefill_checked_add(p.bytes,396288U);
+    r.runtime_payload=prefill_checked_add(r.runtime_payload,extra);
+    if(!r.owners.empty()) {
+        r.owners["qwen_moe_direct_b"]=extra;
+        r.device_base=prefill_checked_add(r.device_base,extra);
+    }
+}
 inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
@@ -1451,7 +1506,14 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
         if (!qwen::profile::metadata_environment(key)) proposed.environment[key] = value;
         return true;
     });
-    auto result=resolve_prefill_effective_config(proposed,model,info,manifest,content,capabilities,memory);
+    auto charged_memory=memory;
+    if(memory.estimate && env_is(proposed.environment,"STRIX_QPF2K_MOE_DIRECT_B","1"))charged_memory.estimate=[&](const Options& options) {
+        auto r=memory.estimate(options);
+        const auto p=moe_direct_b_policy(options,proposed.environment,manifest,capabilities.fp16_operands);
+        charge_moe_direct_b(r,p);
+        return r;
+    };
+    auto result=resolve_prefill_effective_config(proposed,model,info,manifest,content,capabilities,charged_memory);
     resolve_serve_prefill(result,model,content,capabilities,memory);
     resolve_session_defaults(result.options,model,request.environment,memory.available);
     resolve_prefix_defaults(result.options,model,request.environment,memory.available);
@@ -1487,6 +1549,11 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
             result.environment.erase(std::string(entry.lever->env));
         }
     } else if (!route_error.empty()) result.error = std::move(route_error);
+    const auto direct=moe_direct_b_policy(o,result.environment,manifest,capabilities.fp16_operands);
+    o.prefill_moe_direct_b_requested=direct.requested;
+    o.prefill_moe_direct_b=direct.effective;
+    o.prefill_moe_direct_b_reason=direct.reason;
+    o.prefill_moe_direct_b_bytes=direct.effective?direct.bytes:0;
     if (!result.error.empty()) result.admitted = false;
     if (o.http_serve && !o.baseline && o.prefix_cache && o.prefix_cache_host_bytes &&
         !o.prefix_cache_block_rows_explicit && o.known_prefix_prefill_rows >= 1024 &&
@@ -1633,7 +1700,7 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, b
 #endif
     return result;
 }
-inline std::string effective_config_notice(const EffectiveConfig& config) {
+inline std::string effective_config_route_notice(const EffectiveConfig& config) {
     if (!config.options.suppressed_yarn_request.empty())
         return "Qwen baseline: suppressed YaRN request (" + config.options.suppressed_yarn_request + "); rotary=native\n";
     if (config.options.rotary.mode() == RotaryMode::yarn && config.admitted)
@@ -1669,6 +1736,13 @@ inline std::string effective_config_notice(const EffectiveConfig& config) {
         return "Qwen MTP route: STRIX_DISPATCH_FUSE=1 (automatic; STRIX_DISPATCH_FUSE=0 keeps the separate window launches)\n";
     if (config.reason == "baseline" || config.reason == "explicit-route") return {};
     return "Qwen auto-prefill declined: " + config.reason + "; using serial prefill\n";
+}
+inline std::string effective_config_notice(const EffectiveConfig& config) {
+    const auto budget = config.options.resolved_qsa_prefill_budget.value_or(0U);
+    const auto witness = budget ? "Qwen prefill QSA budget: ranked_slots=" + std::to_string(budget) +
+        " local_tail=unchanged decode_verify=unchanged identity=" +
+        prefill_identity_name(config.prefill_option_mask, budget) + "; qualification=in-progress\n" : std::string{};
+    return witness + effective_config_route_notice(config);
 }
 inline std::vector<std::string> effective_prefill_argv(const Options& o) {
     std::vector<std::string> args{"--context", std::to_string(o.context_tokens)};
@@ -1861,7 +1935,12 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     }
     if (!o.baseline) out << "\"prefix_cache\":" << prefix.dump() << ",";
     out << "\"cache_policy\":" << cache_activation_json(o).dump() << ",";
-    out << prefill_identity_fields(config.prefill_option_mask) << ",";
+    // STRIX_QWEN_ALLON composition profile (include/strix/qwen_allon.hpp); absent unless the switch is set.
+    if (const auto allon = qwen_allon::json([&](const char* name) -> const char* {
+            const auto it = config.environment.find(name);
+            return it == config.environment.end() ? std::getenv(name) : it->second.c_str();
+        }, o.tokens.size()); !allon.empty()) out << "\"allon\":" << allon << ",";
+    out << prefill_identity_fields(config.prefill_option_mask, o.resolved_qsa_prefill_budget.value_or(0U)) << ",";
     out << "\"session_cache\":" << session.dump() << ",\"http_slots\":{";
     out << "\"mode\":\"" << (o.http_batch_explicit ? (o.http_batch_cap ? "cap" : "single") : "auto")
         << "\",\"cap\":" << o.http_batch_cap << ",\"slots\":";
@@ -1884,6 +1963,8 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
             config.environment.at("STRIX_BATCH_PROMPT_SMALL").starts_with('1')) ? "true" : "false")
         << ",\"decode_profile\":\"" << numerical_profile_name(o.numerical_profile)
         << "\",\"prefill_profile\":\"" << numerical_profile_name(numerical_profile_pair(o).prefill) << "\",\"numerical_profile_pair_identity\":" << numerical_profile_pair_identity(numerical_profile_pair(o))
+        << (o.prefill_moe_direct_b_requested ? ",\"prefill_moe_direct_b\":"+moe_direct_b_json(true,o.prefill_moe_direct_b,
+            o.prefill_moe_direct_b_reason,o.prefill_moe_direct_b_bytes) : std::string{})
         << ",\"prefill_moe_route_bf16\":" << (o.prefill_moe_route_bf16 ? "true" : "false")
         << ",\"prefill_storage_identity\":" << ((numerical_profile_pair(o).fast_components & kFastPrefillMoe) ?
             serve::Json(moe_prefill_storage_name(o.prefill_moe_route_bf16)).dump() : "null")
@@ -1958,6 +2039,10 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     const auto select_off = pool_off ? pool_off : qpf2k::long_context_item_suppression("STRIX_QSA_DECODE_SELECT", config.gsq_owner);
     const auto bf16_off = pool_off ? pool_off : qpf2k::long_context_item_suppression("STRIX_QSA_DECODE_POOL_BF16", config.gsq_owner);
     out << "},\"long_context_items\":{";
+    item("STRIX_QWEN_DECODE_FUSE", qpf2k::decode_fuse_suppression([&](const char* name) -> const char* {
+        const auto it = config.environment.find(name);
+        return it == config.environment.end() ? nullptr : it->second.c_str();
+    }, o.baseline, config.gsq_owner), true);
     item("STRIX_QSA_UNION_MERGE", qpf2k::long_context_item_suppression("STRIX_QSA_UNION_MERGE", config.gsq_owner), true);
     item("STRIX_QSA_SCORE_ROWS64", qpf2k::long_context_item_suppression("STRIX_QSA_SCORE_ROWS64", config.gsq_owner), true);
     item("STRIX_QSA_DECODE_POOL", pool_off, true);
@@ -1983,6 +2068,16 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     }, o.baseline || env_is(config.environment, "STRIX_BASELINE", "1"), config.gsq_owner);
     out << ",\"compact_stage_images_requested\":" << (compact_stage_images_requested(config.environment.contains("STRIX_QPF2K_COMPACT_IMAGES") ?
         config.environment.at("STRIX_QPF2K_COMPACT_IMAGES").c_str() : nullptr) ? "true" : "false");
+    out << ",\"qwen_router_bf16\":{\"enabled\":" << (o.qwen_router_bf16 ? "true" : "false")
+        << ",\"source\":\"" << (o.baseline || env_is(config.environment,"STRIX_BASELINE","1") ? "baseline" :
+            config.environment.contains("STRIX_QWEN_ROUTER_BF16") ? "explicit" : "default")
+        << "\",\"reason\":\"" << (o.baseline || env_is(config.environment,"STRIX_BASELINE","1") ? "baseline" :
+            env_is(config.environment,"STRIX_QPF2K_DEFAULTS","0") ? "organization-defaults-off" :
+            env_is(config.environment,"STRIX_Q6P","0") ? "registry-disabled" :
+            !o.qwen_router_bf16 ? "explicit-off" : "per-tensor-bit-check")
+        << "\",\"reserved_device_bytes\":" << config.router_bf16_reservation.device_bytes
+        << ",\"setup_host_bytes\":" << config.router_bf16_reservation.setup_host_bytes
+        << ",\"qualification\":\"per-tensor-bit-check\",\"phase\":\"pending-model-load\"}";
     out << ",\"hc_lowband_policy\":" << (config.environment.contains("STRIX_QPF2K_HC_LOWBAND") ?
         std::strtoul(config.environment.at("STRIX_QPF2K_HC_LOWBAND").c_str(), nullptr, 0) : 0U);
     out << ",\"hc_lowband_route\":\"exact-fp16-output-only\"";

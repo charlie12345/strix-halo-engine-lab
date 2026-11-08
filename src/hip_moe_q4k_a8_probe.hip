@@ -1,3 +1,4 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/hip_moe_a8_down.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
@@ -56,14 +57,14 @@ __device__ unsigned quantize_row(const void* input, unsigned hidden, signed char
         else x=static_cast<const float*>(input)[i];
         if(!isfinite(x)) {atomicOr(&bad,nonfinite_activation);x=0.0F;}
         float a=fabsf(x);
-        for(int stride=16;stride!=0;stride/=2) a=fmaxf(a,__shfl_xor(a,stride,32));
+        for(int stride=16;stride!=0;stride/=2) a=fmaxf(a,strix::qwen_dpp::xor32(a, stride));
         float delta=a==0.0F?1.0F:divide_rne(a,127.0F);
         if(!(delta>0.0F) || !isfinite(delta)) {atomicOr(&bad,invalid_delta);delta=1.0F;}
         const float rounded=rintf(divide_rne(x,delta));
         const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
         local_codes[i]=static_cast<signed char>(code);
         int sum=code;
-        for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+        for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
         if(lane==0) {local_deltas[group]=delta;local_sums[group]=sum;}
     }
     __syncthreads();
@@ -217,7 +218,7 @@ __global__ void project(const unsigned char* gate,const unsigned char* up,const 
         constexpr unsigned mask=0x0f0f0f0fU;
         int r0=dot(a0.x,q.x&mask,0);r0=dot(a0.y,q.y&mask,r0);r0=dot(a0.z,q.z&mask,r0);r0=dot(a0.w,q.w&mask,r0);
         int r1=dot(a1.x,(q.x>>4U)&mask,0);r1=dot(a1.y,(q.y>>4U)&mask,r1);r1=dot(a1.z,(q.z>>4U)&mask,r1);r1=dot(a1.w,(q.w>>4U)&mask,r1);
-        r0+=__shfl_xor(r0,1,32);r1+=__shfl_xor(r1,1,32);
+        r0+=strix::qwen_dpp::xor32(r0, 1);r1+=strix::qwen_dpp::xor32(r1, 1);
         const unsigned g0=2U*p,g1=g0+1U;
         const int i0=static_cast<int>(factor(hd,g0,false))*r0,i1=static_cast<int>(factor(hd,g1,false))*r1;
         const int j0=static_cast<int>(factor(hd,g0,true))*local_sums[block*8U+g0];
@@ -230,8 +231,8 @@ __global__ void project(const unsigned char* gate,const unsigned char* up,const 
         acc=acc+paired;
     }
     // Only c0 is observable. c0 receives exactly ((p0+p1)+(p2+p3)).
-    acc=acc+__shfl_xor(acc,2,32);
-    acc=acc+__shfl_xor(acc,4,32);
+    acc=acc+strix::qwen_dpp::xor32(acc, 2);
+    acc=acc+strix::qwen_dpp::xor32(acc, 4);
     if(c==0) output[(slot*2U+which)*rows+row]=acc;
 }
 // Distinct unsigned-five-bit format; incumbent Q4K symbol/body above stays literal.
@@ -272,7 +273,7 @@ __global__ void project_q5k(const unsigned char* gate,const unsigned char* up,co
             ((q.w>>4U)&mask)|(((qh.w>>g1)&0x01010101U)<<4U)};
         int r0=dot(a0.x,q0.x,0);r0=dot(a0.y,q0.y,r0);r0=dot(a0.z,q0.z,r0);r0=dot(a0.w,q0.w,r0);
         int r1=dot(a1.x,q1.x,0);r1=dot(a1.y,q1.y,r1);r1=dot(a1.z,q1.z,r1);r1=dot(a1.w,q1.w,r1);
-        r0+=__shfl_xor(r0,1,32);r1+=__shfl_xor(r1,1,32);
+        r0+=strix::qwen_dpp::xor32(r0, 1);r1+=strix::qwen_dpp::xor32(r1, 1);
         const int i0=static_cast<int>(factor(hd,g0,false))*r0,i1=static_cast<int>(factor(hd,g1,false))*r1;
         const int j0=static_cast<int>(factor(hd,g0,true))*local_sums[block*8U+g0];
         const int j1=static_cast<int>(factor(hd,g1,true))*local_sums[block*8U+g1];
@@ -284,8 +285,8 @@ __global__ void project_q5k(const unsigned char* gate,const unsigned char* up,co
         acc=acc+paired;
     }
     // Only c0 is observable. c0 receives exactly ((p0+p1)+(p2+p3)).
-    acc=acc+__shfl_xor(acc,2,32);
-    acc=acc+__shfl_xor(acc,4,32);
+    acc=acc+strix::qwen_dpp::xor32(acc, 2);
+    acc=acc+strix::qwen_dpp::xor32(acc, 4);
     if(c==0) output[(slot*2U+which)*rows+row]=acc;
 }
 // GSQ-RCO Q2_0 gate/up (q20_numerical_identity): 8 lanes per output row, lane c owns the A8 groups
@@ -331,9 +332,9 @@ __global__ void project_q20(const unsigned char* gate,const unsigned char* up,co
             local_sums[g],local_deltas[g]);
         acc=acc+value;
     }
-    acc=acc+__shfl_xor(acc,1,32);
-    acc=acc+__shfl_xor(acc,2,32);
-    acc=acc+__shfl_xor(acc,4,32);
+    acc=acc+strix::qwen_dpp::xor32(acc, 1);
+    acc=acc+strix::qwen_dpp::xor32(acc, 2);
+    acc=acc+strix::qwen_dpp::xor32(acc, 4);
     if(c==0) output[(slot*2U+which)*rows+row]=acc;
 }
 // GSQ IQ gate/up (gsq_a8_groups.hpp): project_q20 lanes/tree with signed int8 group weights.
@@ -359,9 +360,9 @@ __global__ void project_iq(const unsigned char* gate,const unsigned char* up,con
         const float value=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(local_codes+g*32U),local_deltas[g]);
         acc=acc+value;
     }
-    acc=acc+__shfl_xor(acc,1,32);
-    acc=acc+__shfl_xor(acc,2,32);
-    acc=acc+__shfl_xor(acc,4,32);
+    acc=acc+strix::qwen_dpp::xor32(acc, 1);
+    acc=acc+strix::qwen_dpp::xor32(acc, 2);
+    acc=acc+strix::qwen_dpp::xor32(acc, 4);
     if(c==0) output[(slot*2U+which)*rows+row]=acc;
 }
 // Two independent projection DAGs consume the same staged activation values.
@@ -373,7 +374,7 @@ __device__ __forceinline__ float paired_shared(const unsigned char* packed,int4 
     constexpr unsigned mask=0x0f0f0f0fU;
     int r0=dot(a0.x,q.x&mask,0);r0=dot(a0.y,q.y&mask,r0);r0=dot(a0.z,q.z&mask,r0);r0=dot(a0.w,q.w&mask,r0);
     int r1=dot(a1.x,(q.x>>4U)&mask,0);r1=dot(a1.y,(q.y>>4U)&mask,r1);r1=dot(a1.z,(q.z>>4U)&mask,r1);r1=dot(a1.w,(q.w>>4U)&mask,r1);
-    r0+=__shfl_xor(r0,1,32);r1+=__shfl_xor(r1,1,32);
+    r0+=strix::qwen_dpp::xor32(r0, 1);r1+=strix::qwen_dpp::xor32(r1, 1);
     const unsigned g0=2U*p,g1=g0+1U;
     const int i0=static_cast<int>(factor(hd,g0,false))*r0,i1=static_cast<int>(factor(hd,g1,false))*r1;
     const int j0=static_cast<int>(factor(hd,g0,true))*s0;
@@ -412,8 +413,8 @@ __global__ void project_shared_gate_up(const unsigned char* gate,const unsigned 
         const float paired_up=paired_shared(up_weights+block*144U,a0,a1,s0,s1,e0,e1,c,p);
         acc_up=acc_up+paired_up;
     }
-    acc_gate=acc_gate+__shfl_xor(acc_gate,2,32);acc_gate=acc_gate+__shfl_xor(acc_gate,4,32);
-    acc_up=acc_up+__shfl_xor(acc_up,2,32);acc_up=acc_up+__shfl_xor(acc_up,4,32);
+    acc_gate=acc_gate+strix::qwen_dpp::xor32(acc_gate, 2);acc_gate=acc_gate+strix::qwen_dpp::xor32(acc_gate, 4);
+    acc_up=acc_up+strix::qwen_dpp::xor32(acc_up, 2);acc_up=acc_up+strix::qwen_dpp::xor32(acc_up, 4);
     if(c==0) {output[(slot*2U+0U)*rows+row]=acc_gate;output[(slot*2U+1U)*rows+row]=acc_up;}
 }
 __global__ void division_receipt(const unsigned* a,const unsigned* b,unsigned* output,unsigned count) {
@@ -591,13 +592,13 @@ __global__ void down_activation_quantize(float* intermediates,const unsigned* ro
     const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(h)));
     if(bad!=0) {if(lane==0) down_error(status,aggregate,down_nonfinite_activation);return;}
     float a=fabsf(h);
-    for(int stride=16;stride!=0;stride/=2) a=fmaxf(a,__shfl_xor(a,stride,32));
+    for(int stride=16;stride!=0;stride/=2) a=fmaxf(a,strix::qwen_dpp::xor32(a, stride));
     const bool tiny=a>0.0F && a<0x1p-119F;
     const float delta=a==0.0F || tiny?1.0F:divide_rne(a,127.0F);
     const float rounded=tiny?0.0F:rintf(divide_rne(h,delta));
     const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
     int sum=code;
-    for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+    for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
     intermediates[at]=h;
     codes[slot*width+group*32U+lane]=static_cast<signed char>(code);
     if(lane==0) {deltas[slot*(width/32U)+group]=delta;sums[slot*(width/32U)+group]=sum;}
@@ -656,8 +657,8 @@ __global__ void down_rawdots(const unsigned char* weights,const unsigned* routes
         const float contribution=deltas[slot*groups+group]*combined;
         acc=acc+contribution;
     }
-    acc=acc+__shfl_xor(acc,1,32);
-    acc=acc+__shfl_xor(acc,2,32);
+    acc=acc+strix::qwen_dpp::xor32(acc, 1);
+    acc=acc+strix::qwen_dpp::xor32(acc, 2);
     if(owner==0) rawdots[slot*hidden+row]=acc;
 }
 // Q2_0 down (q20_a8_down_numerical_identity): down_rawdots lanes and tree, group g = half g%2 of block
@@ -678,8 +679,8 @@ __global__ void down_rawdots_q20(const unsigned char* weights,const unsigned* ro
             reinterpret_cast<const int*>(codes+slot*width+group*32U),sums[slot*groups+group],deltas[slot*groups+group]);
         acc=acc+contribution;
     }
-    acc=acc+__shfl_xor(acc,1,32);
-    acc=acc+__shfl_xor(acc,2,32);
+    acc=acc+strix::qwen_dpp::xor32(acc, 1);
+    acc=acc+strix::qwen_dpp::xor32(acc, 2);
     if(owner==0) rawdots[slot*hidden+row]=acc;
 }
 // GSQ IQ4_NL down: down_rawdots lanes and tree, contribution delta * (d * float(I)).
@@ -701,8 +702,8 @@ __global__ void down_rawdots_iq(const unsigned char* weights,const unsigned* rou
             deltas[slot*groups+group]);
         acc=acc+contribution;
     }
-    acc=acc+__shfl_xor(acc,1,32);
-    acc=acc+__shfl_xor(acc,2,32);
+    acc=acc+strix::qwen_dpp::xor32(acc, 1);
+    acc=acc+strix::qwen_dpp::xor32(acc, 2);
     if(owner==0) rawdots[slot*hidden+row]=acc;
 }
 void down_admit(const DownRequest& request,const DownBindings& b,hipStream_t stream) {

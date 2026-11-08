@@ -40,6 +40,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -152,6 +153,8 @@ template <class T> T* dev_zero(std::uint64_t count, const char* what) {
 // the engine (Prefill::Impl) holds the weights and the shared activation/window scratch.
 struct SessionState {
     SessionId id = 0;
+    std::uint64_t target_identity = 0;
+    std::uint64_t diagnostic_generation = 0;
     std::vector<std::uint16_t*> kv, raw_index;  // per QSA ordinal: [max_positions][1024] / [max_positions][128]
     std::vector<float*> pooled;                 // per QSA ordinal: pooled index keys [max_blocks][128] (cached across calls)
     std::uint32_t pooled_valid[12] = {};
@@ -293,6 +296,8 @@ struct BlockFields {
 
 struct Prefill::Impl : BlockFields {
     Config cfg;
+    qwen_route::Policy route_policy;
+    std::uint64_t snapshot_binding = qwen_route::new_engine_binding();
     cudaStream_t copy_stream = nullptr;                    // release_by_layer: per-layer D2H
     cudaStream_t side_stream = nullptr;                    // decode: the shared expert beside the routed MoE
     cudaEvent_t side_fork = nullptr, side_join = nullptr;
@@ -422,7 +427,7 @@ struct Prefill::Impl : BlockFields {
         ck(cudaStreamSynchronize(stream), "state copy producer");
         return state_copy.stream;
     }
-    void copy_rows(SessionState& s, std::uint64_t first, std::uint64_t count, void* data, bool importing);
+    void copy_rows(SessionState& s, std::uint64_t first, std::uint64_t count, void* data, bool importing, bool target_only = false);
     void copy_fixed(SessionState& s, void* data, bool importing);
 
     void upload_model();
@@ -696,7 +701,12 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     moe_dcodes = dev_zero<std::int8_t>(R * kTopK * 640, "moe down codes");
     moe_ddeltas = dev_zero<float>(R * kTopK * 640 / 32, "moe down deltas");
     moe_dsums = dev_zero<std::int32_t>(R * kTopK * 640 / 32, "moe down sums");
+    if (route_policy.enabled) {
+        const auto storage = qwen_route::layout(cap, true);
+        moe_raw = reinterpret_cast<float*>(dev_zero<std::uint16_t>(storage.bytes / 2U, "moe BF16 raw dots"));
+    } else {
     moe_raw = dev_zero<float>(R * kTopK * kHidden, "moe raw dots");
+    }
     if (native_experts) moe_inter = dev_zero<float>(R * kTopK * 2 * 640, "moe native h");
     const auto sz = moe::csr_sizes(cap);
     csr.summary = dev_zero<std::uint32_t>(32, "csr");
@@ -748,7 +758,7 @@ void Prefill::Impl::allocate() {
     const std::uint64_t P = cfg.max_positions;
     host_bytes = P * (12ULL * 2048 + 12ULL * 256 + 2048 + 256) + 36 * gdn::kMatrixFloats * 4 + 36 * gdn::kConvStateHalfs * 2 +
                  10240ULL * 9 * 2 + 16 + kWide * 2;
-    ck(cudaMallocHost(&host, host_bytes), "pinned export staging");
+    if (cfg.export_state) ck(cudaMallocHost(&host, host_bytes), "pinned export staging");  // device-only runs need none
 }
 
 // The per-session device state (same buffers and sizes the single-session engine allocated).
@@ -789,6 +799,8 @@ SessionState& Prefill::Impl::new_session() {
         for (void* p : s->allocations) cudaFree(p);
         throw;
     }
+    s->target_identity = qwen_route::identity(route_policy.enabled, route_policy.enabled).hash;
+    if (cfg.diagnostic_bf16_mtp) s->diagnostic_generation = qwen_route::new_engine_binding();
     auto& ref = *s;
     sessions.emplace(ref.id, std::move(s));
     return ref;
@@ -801,12 +813,25 @@ void Prefill::Impl::drop_graph(std::map<GraphKey, StepGraph>::iterator it) {
 }
 
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
-    if (strix::moe_route_bf16_environment_requested(std::getenv("STRIX_QPF2K_MOE_ROUTE_BF16"),
-        std::getenv("STRIX_BASELINE"), std::getenv("STRIX_QPF2K_DEFAULTS")))
-        throw std::invalid_argument("MoE route BF16 candidate declined: CUDA writer/reader unsupported");
     auto& m = *impl_;
+    m.route_policy = qwen_route::environment(config.moe_route_bf16);
     m.cfg = config;
+    m.cfg.moe_route_bf16 = m.route_policy.enabled; // freeze before device work
+    const auto* diagnostic_graphs = std::getenv("STRIX_QRTX_GRAPHS");
+    qwen_mtp_diagnostic::admission(config.diagnostic_bf16_mtp, m.route_policy.enabled,
+        config.decode, config.export_state, !config.mtp_sidecar_gguf.empty(),
+        !(diagnostic_graphs && diagnostic_graphs[0] == '0'));
+    if (m.route_policy.enabled) {
+        if (config.export_state) qwen_route::require_composition(true, qwen_route::Composition::node_handoff);
+        if ((!config.mtp_sidecar_gguf.empty() || !config.draft_vocab.empty()) && !config.diagnostic_bf16_mtp)
+            qwen_route::require_composition(true, qwen_route::Composition::mtp_sidecar);
+        const auto* graphs = std::getenv("STRIX_QRTX_GRAPHS");
+        if (config.decode && !(graphs && graphs[0] == '0'))
+            qwen_route::require_composition(true, qwen_route::Composition::graphs);
+    }
     validate_blocks(config.block_schedule);
+    if (m.route_policy.enabled)
+        (void)qwen_route::layout(round_up(*std::max_element(config.block_schedule.begin(), config.block_schedule.end()), 16U), true);
     (void)plan_blocks(1, config.block_schedule, config.tail_large, config.final_block_rows);
     ck(cudaSetDevice(config.device), "set device");
     // Priorities change only which ready blocks the GPU schedules first, never what a kernel computes: the engine and
@@ -846,6 +871,8 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     }
     const auto t0 = Clock::now();
     m.upload_model();
+    if (m.native_experts) qwen_route::require_composition(m.route_policy.enabled,
+        qwen_route::Composition::other_weight_pack);
     m.upload_ple();
     m.upload_mtp();
     m.allocate();
@@ -865,17 +892,43 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
                   "\"transcoded_tensors\":%u,\"native_experts\":%s}",
                   static_cast<double>(m.w.bytes) / 1e9, std::chrono::duration<double>(Clock::now() - t0).count(), m.cap,
                   config.max_positions, m.transcoded, m.native_experts ? "true" : "false");
-    m.describe = buf;
+    m.describe = buf; // OFF receipt remains the original byte sequence.
+    if (m.route_policy.enabled) {
+        const auto id = numerical_identity();
+        char identity_hash[17];
+        std::snprintf(identity_hash, sizeof(identity_hash), "%016llx", static_cast<unsigned long long>(id.hash));
+        m.describe.pop_back();
+        m.describe += ",\"moe_route_storage\":\"" + std::string(id.storage) +
+            "\",\"prefill_identity\":\"" + std::string(id.prefill) +
+            "\",\"decode_identity\":\"" + std::string(id.decode) +
+            "\",\"target_identity\":\"" + identity_hash + "\",\"qualification\":\"unqualified\"" +
+            ",\"rawdot_row_bytes\":" + std::to_string(qwen_route::row_bytes(true)) +
+            ",\"rawdot_capacity_bytes\":" + std::to_string(qwen_route::layout(m.cap, true).bytes) + "}";
+    }
 }
 
 Prefill::~Prefill() = default;
 
-std::string Prefill::describe() const { return impl_->describe; }
+std::string Prefill::describe() const {
+    if (!impl_->cfg.diagnostic_bf16_mtp) return impl_->describe;
+    auto out=impl_->describe;out.pop_back();
+    return out + ",\"diagnostic_bf16_mtp\":\"unqualified\",\"drafter_identity\":\"cuda-qwen-mtp-q8-production-v1\",\"sidecar_binding\":\"engine-local-path-and-vocab\",\"target_weight_bytes\":" + std::to_string(impl_->w.bytes) +
+        ",\"sidecar_weight_bytes\":" + std::to_string(impl_->mw.bytes) + ",\"single_weight_owner\":true}";
+}
+
+qwen_route::Identity Prefill::numerical_identity() const {
+    return qwen_route::identity(impl_->route_policy.enabled, impl_->route_policy.enabled);
+}
+qwen_route::Policy Prefill::route_storage_policy() const { return impl_->route_policy; }
 
 void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint32_t pad) {
     NvtxScope nv;
     std::uint32_t rows = 0;  // all rows of the block
-    for (std::uint32_t i = 0; i < count; ++i) rows += seg[i].rows;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (seg[i].s->target_identity != qwen_route::identity(route_policy.enabled, route_policy.enabled).hash)
+            throw std::logic_error("Qwen session target identity mismatch");
+        rows += seg[i].rows;
+    }
     if (pad > rows) ck(cudaMemsetAsync(ids, 0, std::uint64_t{pad} * 4, stream), "ids clear");
     for (std::uint32_t i = 0; i < count; ++i)
         ck(cudaMemcpyAsync(ids + seg[i].offset, seg[i].tokens, std::uint64_t{seg[i].rows} * 4, cudaMemcpyHostToDevice, stream), "ids");
@@ -1068,7 +1121,9 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mr.down_codes = {moe_dcodes, kTopK * 640};
         mr.down_deltas = {moe_ddeltas, kTopK * 640 / 32 * 4};
         mr.down_sums = {moe_dsums, kTopK * 640 / 32 * 4};
-        mr.rawdots = {moe_raw, kTopK * kHidden * 4};
+        mr.route_bf16 = route_policy.enabled;
+        mr.rawdot_capacity = route_policy.enabled ? qwen_route::layout(cap, true).bytes : 0U;
+        mr.rawdots = {moe_raw, qwen_route::row_bytes(route_policy.enabled)};
         mr.output = {routed_out, kHidden * 2};
         mr.csr = csr;
         moe::Weights ew;
@@ -1436,6 +1491,8 @@ void Prefill::Impl::commit_one(SessionState& s, std::uint32_t keep) {
         ck(cudaMemcpyAsync(s.held, tap + (off + keep - 1) * kWide, wb, cudaMemcpyDeviceToDevice, stream), "held");
     }
     s.length = s.window_position + keep;
+    if (cfg.diagnostic_bf16_mtp)
+        for (auto& v : s.pooled_valid) v = std::min(v, static_cast<std::uint32_t>(s.length / 4));
 }
 
 // keep == 0: the window never happened for this session (exact undo): GDN S0 is still current (the window wrote the other
@@ -1451,6 +1508,8 @@ void Prefill::Impl::undo_one(SessionState& s) {
     if (s.window_position > 0)
         s.mtp_pooled_valid = std::min<std::uint32_t>(s.mtp_pooled_valid, static_cast<std::uint32_t>((s.window_position - 1) / 4));
     s.length = s.window_position;
+    if (cfg.diagnostic_bf16_mtp)
+        for (auto& v : s.pooled_valid) v = std::min(v, static_cast<std::uint32_t>(s.length / 4));
 }
 
 // A session whose state can no longer be trusted (failure mid-window): it needs a new prefill (verify rejects length 0).
@@ -1555,6 +1614,8 @@ StepResult Prefill::verify(const std::uint32_t* tokens, std::uint32_t rows, std:
 
 std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& cohort, bool want_logits) {
     auto& m = *impl_;
+    if (cohort.size() > 1U) qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::cohort);
+    if (m.use_graphs) qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::graphs);
     if (!m.cfg.decode) throw std::logic_error("step() needs Config::decode");
     if (m.cohort_open) throw std::logic_error("verify() with an open window: commit() first");
     if (cohort.empty()) throw std::invalid_argument("verify_cohort: empty cohort");
@@ -1752,6 +1813,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
 
 SessionId Prefill::create_session() {
     auto& m = *impl_;
+    qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::cohort);
     if (!m.cfg.decode) throw std::logic_error("create_session() needs Config::decode");
     return m.new_session().id;
 }
@@ -1786,7 +1848,7 @@ std::uint64_t Prefill::fixed_bytes() const {
     return 36ULL * gdn::kMatrixFloats * sizeof(float) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2 + 8;
 }
 
-void Prefill::Impl::copy_rows(SessionState& s, std::uint64_t first, std::uint64_t count, void* data, bool importing) {
+void Prefill::Impl::copy_rows(SessionState& s, std::uint64_t first, std::uint64_t count, void* data, bool importing, bool target_only) {
     auto* cursor = static_cast<std::uint8_t*>(data);
     const auto copy = [&](std::uint16_t* dev, std::uint64_t width) {
         const auto bytes = count * width;
@@ -1797,7 +1859,7 @@ void Prefill::Impl::copy_rows(SessionState& s, std::uint64_t first, std::uint64_
     };
     for (auto* kv : s.kv) copy(kv, 2048);
     for (auto* index : s.raw_index) copy(index, 256);
-    if (mtp) { copy(s.mtp_kv, 2048); copy(s.mtp_index, 256); }
+    if (mtp && !target_only) { copy(s.mtp_kv, 2048); copy(s.mtp_index, 256); }
 }
 
 void Prefill::Impl::copy_fixed(SessionState& s, void* data, bool importing) {
@@ -1826,6 +1888,7 @@ void Prefill::export_fixed(SessionId session, void* dst) {
 void Prefill::export_segments(SessionId session, const std::vector<RowSegment>& segments, void* fixed_dst) {
     auto& m = *impl_;
     auto& s = m.session(session);
+    qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::prefix_cache);
     for (const auto& seg : segments)
         if (!seg.data || seg.first > s.length || seg.count > s.length - seg.first)
             throw std::invalid_argument("prefix export rows range");
@@ -1841,6 +1904,7 @@ void Prefill::export_segments(SessionId session, const std::vector<RowSegment>& 
 void Prefill::import_state(SessionId session, std::uint64_t length, const std::vector<RowSegment>& segments, const void* fixed) {
     auto& m = *impl_;
     auto& s = m.session(session);
+    qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::untagged_state_import);
     if (!fixed || length == 0 || length >= m.cfg.max_positions) throw std::invalid_argument("prefix import length/fixed");
     std::uint64_t end = 0;
     for (const auto& seg : segments) {
@@ -1861,14 +1925,113 @@ void Prefill::import_state(SessionId session, std::uint64_t length, const std::v
     s.length = length;
 }
 
-void Prefill::set_graphs(bool on) { impl_->use_graphs = on; }
+CanonicalState Prefill::capture_canonical(SessionId session) {
+    auto& m = *impl_;
+    auto& s = m.session(session);
+    if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
+    if (!s.length || s.length >= m.cfg.max_positions) throw std::invalid_argument("canonical snapshot length");
+    CanonicalState out;
+    out.target = numerical_identity().hash;
+    out.engine_binding = m.snapshot_binding;
+    out.length = s.length;
+    const auto canonical_width = m.cfg.diagnostic_bf16_mtp ? 12ULL * 2304 : row_bytes();
+    const auto bytes = qwen_route::checked_extent(s.length, canonical_width, canonical_width);
+    if (bytes > std::numeric_limits<std::size_t>::max()) throw std::overflow_error("canonical snapshot size");
+    out.rows.resize(static_cast<std::size_t>(bytes));
+    out.fixed.resize(static_cast<std::size_t>(fixed_bytes()));
+    if (s.held) out.held.resize(kWide * 2U);
+    const auto stream = m.state_copy_stream(s); // also rejects an open window/chunk
+    try {
+        m.copy_rows(s, 0, s.length, out.rows.data(), false, m.cfg.diagnostic_bf16_mtp);
+        if (m.cfg.diagnostic_bf16_mtp) {
+            out.mtp_binding = {out.target,m.snapshot_binding,s.diagnostic_generation,m.cfg.max_positions,
+                qwen_route::hash_part(qwen_route::hash_part(0xcbf29ce484222325ULL,m.cfg.mtp_sidecar_gguf),m.cfg.draft_vocab),1};
+            const auto live = s.length - 1;
+            out.mtp_rows.resize(static_cast<std::size_t>(live * 2304));
+            if (live) {
+                ck(cudaMemcpyAsync(out.mtp_rows.data(),s.mtp_kv,live*2048,cudaMemcpyDeviceToHost,stream),"canonical mtp kv");
+                ck(cudaMemcpyAsync(out.mtp_rows.data()+live*2048,s.mtp_index,live*256,cudaMemcpyDeviceToHost,stream),"canonical mtp index");
+            }
+            for (unsigned i=0;i<13;++i) {
+                const auto valid=i<12?s.pooled_valid[i]:s.mtp_pooled_valid;
+                const auto bound=i<12?s.length/4:live/4;
+                if (valid>bound) throw std::logic_error("canonical dirty pooled prefix extent");
+                out.pool_valid.push_back(valid);
+                out.pools.emplace_back(static_cast<std::size_t>(valid)*128);
+                if (valid) ck(cudaMemcpyAsync(out.pools.back().data(),i<12?s.pooled[i]:s.mtp_pooled,
+                    std::uint64_t{valid}*128*4,cudaMemcpyDeviceToHost,stream),"canonical retained pool");
+            }
+        }
+        m.copy_fixed(s, out.fixed.data(), false);
+        if (s.held) ck(cudaMemcpyAsync(out.held.data(), s.held, out.held.size(),
+                                      cudaMemcpyDeviceToHost, stream), "canonical held export");
+        ck(cudaStreamSynchronize(stream), "canonical export");
+    } catch (...) { cudaStreamSynchronize(stream); throw; }
+    return out;
+}
+
+void Prefill::restore_canonical(const CanonicalState& state, SessionId session) {
+    auto& m = *impl_;
+    auto& s = m.session(session);
+    if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
+    if (!state.length || state.length >= m.cfg.max_positions) throw std::invalid_argument("canonical snapshot length");
+    if (m.cfg.diagnostic_bf16_mtp) {
+        const qwen_mtp_diagnostic::Binding expected{numerical_identity().hash,m.snapshot_binding,s.diagnostic_generation,m.cfg.max_positions,
+            qwen_route::hash_part(qwen_route::hash_part(0xcbf29ce484222325ULL,m.cfg.mtp_sidecar_gguf),m.cfg.draft_vocab),1};
+        qwen_mtp_diagnostic::binding(state.mtp_binding,expected);
+        if (!state.length || state.mtp_rows.size()!=(state.length-1)*2304 || state.pools.size()!=13 || state.pool_valid.size()!=13)
+            throw std::invalid_argument("canonical MTP extent");
+        for (unsigned i=0;i<13;++i)
+            if (state.pool_valid[i]>(i<12?state.length:state.length-1)/4 || state.pools[i].size()!=std::uint64_t{state.pool_valid[i]}*128)
+                throw std::invalid_argument("canonical pooled extent");
+    }
+    const auto canonical_width = m.cfg.diagnostic_bf16_mtp ? 12ULL * 2304 : row_bytes();
+    qwen_route::validate_snapshot(state.target, numerical_identity().hash,
+        state.engine_binding, m.snapshot_binding,
+        state.length, m.cfg.max_positions, state.rows.size(), canonical_width,
+        state.fixed.size(), fixed_bytes(), state.held.size(), s.held ? kWide * 2U : 0U);
+    const auto stream = m.state_copy_stream(s);
+    s.length = 0;
+    try {
+        m.copy_rows(s, 0, state.length, const_cast<std::uint8_t*>(state.rows.data()), true, m.cfg.diagnostic_bf16_mtp);
+        if (m.cfg.diagnostic_bf16_mtp) {
+            const auto live=state.length-1;
+            if (live) {
+                ck(cudaMemcpyAsync(s.mtp_kv,state.mtp_rows.data(),live*2048,cudaMemcpyHostToDevice,stream),"restore mtp kv");
+                ck(cudaMemcpyAsync(s.mtp_index,state.mtp_rows.data()+live*2048,live*256,cudaMemcpyHostToDevice,stream),"restore mtp index");
+            }
+            // Retain and replay the observed prefix; no recomputation can hide corruption.
+            for (unsigned i=0;i<13;++i) if (state.pool_valid[i])
+                ck(cudaMemcpyAsync(i<12?s.pooled[i]:s.mtp_pooled,state.pools[i].data(),
+                    std::uint64_t{state.pool_valid[i]}*128*4,cudaMemcpyHostToDevice,stream),"restore retained pool");
+        }
+        m.copy_fixed(s, const_cast<std::uint8_t*>(state.fixed.data()), true);
+        if (s.held) ck(cudaMemcpyAsync(s.held, state.held.data(), state.held.size(),
+                                      cudaMemcpyHostToDevice, stream), "canonical held import");
+        ck(cudaStreamSynchronize(stream), "canonical import");
+    } catch (...) { cudaStreamSynchronize(stream); throw; }
+    for (auto& valid : s.pooled_valid) valid = 0;
+    s.mtp_pooled_valid = 0;
+    if (m.cfg.diagnostic_bf16_mtp) {
+        for (unsigned i=0;i<12;++i) s.pooled_valid[i]=state.pool_valid[i];
+        s.mtp_pooled_valid=state.pool_valid[12];
+    }
+    s.length = state.length;
+}
+
+void Prefill::set_graphs(bool on) {
+    if (on) qwen_route::require_composition(impl_->route_policy.enabled, qwen_route::Composition::graphs);
+    impl_->use_graphs = on;
+}
 
 void Prefill::set_multiseg(bool on) {
+    if (on) qwen_route::require_composition(impl_->route_policy.enabled, qwen_route::Composition::multisegment);
     if (impl_->cohort_open) throw std::logic_error("set_multiseg() with an open window");
     impl_->multiseg = on;
 }
 
 void Prefill::set_graph_table(bool on) {
+    if (on) qwen_route::require_composition(impl_->route_policy.enabled, qwen_route::Composition::graphs);
     if (impl_->cohort_open) throw std::logic_error("set_graph_table() with an open window");
     impl_->graph_table = on;
 }
@@ -1975,6 +2138,7 @@ void Prefill::Impl::free_block(BlockFields& b) noexcept {
 
 void Prefill::enable_prefill_overlap(std::uint32_t max_rows) {
     auto& m = *impl_;
+    qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::overlap);
     if (!m.cfg.decode || m.cfg.export_state) throw std::logic_error("prefill overlap needs a decode engine with export_state = false");
     if (m.cohort_open || m.window || m.table_mode || m.qsa_cut || m.after_layer)
         throw std::logic_error("enable_prefill_overlap() inside a decode window");
@@ -2077,8 +2241,12 @@ Draft Prefill::draft(std::uint32_t pending, std::uint32_t depth, float min_proba
 }
 
 Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t depth, float min_probability) {
+    if (!impl_->cfg.diagnostic_bf16_mtp)
+        qwen_route::require_composition(impl_->route_policy.enabled, qwen_route::Composition::mtp_sidecar);
     auto& m = *impl_;
     auto& S = m.session(session);
+    if (m.cfg.diagnostic_bf16_mtp && (pending >= hc::kVocab || !std::isfinite(min_probability) || min_probability < 0 || min_probability > 1))
+        throw std::invalid_argument("MTP diagnostic pending/probability");
     if (S.prefilling) throw std::logic_error("draft() on a session with a prefill chunk in flight");
     if (!S.held) throw std::logic_error("draft() needs Config::decode and an MTP sidecar");
     if (m.cohort_open) throw std::logic_error("draft() with an open window");
@@ -2178,6 +2346,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
 }
 
 std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& requests) {
+    qwen_route::require_composition(impl_->route_policy.enabled, qwen_route::Composition::mtp_sidecar);
     auto& m = *impl_;
     if (m.cohort_open) throw std::logic_error("draft() with an open window");
     std::vector<Draft> out(requests.size());

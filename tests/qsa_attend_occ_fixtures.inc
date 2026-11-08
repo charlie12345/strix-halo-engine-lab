@@ -13,7 +13,9 @@ struct OccCase {
     unsigned pattern = 0U, padding = 0U, numeric = 0U, prefix = 0U, total = 3U * 64U;
     Sel sel = Sel::small;
     bool timing = false, candidate = true;
+    bool kv_pair = false; // single-image paired loader; direct fixture bypasses launcher resource admission
     bool depth_boundary = false; // tile union sizes 0, 1, 4, 5, 8, 9, 12, 13: 0..4 chunks
+    bool union_noop = false; // nonbinding cap + diagnostic reads must preserve complete attention bytes
 };
 static const char* sel_name(Sel s) {
     return s == Sel::overlap ? "overlap" : s == Sel::disjoint ? "disjoint" : s == Sel::equal ? "equal" : "small";
@@ -40,6 +42,12 @@ __global__ void occ_guard_kernel(const unsigned char* a, const unsigned char* b,
         if (row == total || in_row >= data * sizeof(float)) local += a[i] != 0xA5U || b[i] != 0xA5U;
     }
     if (local) atomicAdd(mismatches, local);
+}
+// Capture specializes away in all production instantiations. Keep a default-body oracle at G=3.
+__global__ __launch_bounds__(320) void occ_state_reference_kernel(const qsa_fast::Views<64U>* groups,
+    const std::uint16_t* kv, unsigned union_at) {
+    const unsigned bx = blockIdx.x, tile = bx % 16U, y = bx / 16U % 2U, g = bx / 32U;
+    qsa_fast::attend_body<64U, 4U, 3U, 3U, false, true>(groups[g], kv, 2U, 24U, union_at, 1U, 0U, tile, y);
 }
 static void run_occ_case(const OccCase& c, hipStream_t s) {
     constexpr unsigned Rows = 64U, Heads = 24U, KV = 2U, Dim = 256U, TopK = 512U;
@@ -239,8 +247,11 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
     }
     auto* dk = dalloc<std::uint16_t>(kv.size()); auto* dq = dalloc<float>(qg.size());
     auto* ds = dalloc<std::uint32_t>(selections.size());
-    auto* scratch = dalloc<float>(static_cast<std::size_t>(total / 4U) * scratch_stride);
+    const auto scratch_words = static_cast<std::size_t>(c.kv_pair ? total : total / 4U) * scratch_stride;
+    auto* scratch = dalloc<float>(scratch_words);
     auto* dmis = dalloc<unsigned>(1U);
+    auto* union_stats = c.union_noop ? dalloc<qsa_fast::UnionStats>(1U) : nullptr;
+    if (union_stats) check(hipMemset(union_stats, 0, sizeof(*union_stats)), "union noop stats reset");
     check(hipMemset(dmis, 0, sizeof(unsigned)), "occ mismatch counter");
     constexpr unsigned Pitch = Heads * Dim + 32U;
     const std::size_t output_size = static_cast<std::size_t>(total + 1U) * Pitch;
@@ -253,7 +264,7 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
         auto& v = views[r / Rows]; const unsigned row = r % Rows;
         v.q_gate[row] = dq + static_cast<std::size_t>(r) * Heads * Dim * 2U;
         v.selected[row] = ds + static_cast<std::size_t>(r) * maxsel;
-        v.scratch[row] = scratch + static_cast<std::size_t>(r / 4U) * scratch_stride;
+        v.scratch[row] = scratch + static_cast<std::size_t>(c.kv_pair ? r : r / 4U) * scratch_stride;
         v.count[row] = counts[r]; v.visible[row] = visible[r];
     }
     // Exercise mapped descriptors and event-protected reuse beyond both ring slots.
@@ -279,6 +290,10 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
         return intact;
     };
     bool equal = true;
+    std::vector<unsigned char> states[2], captured;
+    if (c.kv_pair && !timing) {
+        states[0].resize(scratch_words * sizeof(float)); states[1].resize(states[0].size()); captured.resize(a.size());
+    }
     for (unsigned pass = 0U; pass < passes; ++pass) {
         // AB, BA order alternates to reduce thermal/order bias.
         for (unsigned order = 0U; order < 2U; ++order) {
@@ -294,10 +309,31 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
             }
             // Clear output and guards for every descriptor generation, outside timing.
             check(hipMemsetAsync(which ? ob : oa, 0xA5, output_size * sizeof(float), s), "occ generation poison");
+            if (c.kv_pair && !timing) {
+                // Compare pre-epilogue state and the entire poisoned scratch, including unions and unused space.
+                check(hipMemsetAsync(scratch, 0xA5, scratch_words * sizeof(float), s), "pair state poison");
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, 4U>), dim3(ng * 16U), dim3(256), 0, s, ring[slot], union_at);
+                if (which && c.candidate)
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kv_pair_kernel<Rows, true>), dim3(ng * 8U * KV), dim3(512), 0, s,
+                        ring[slot], dk, KV, Heads, union_at, KV);
+                else
+                    hipLaunchKernelGGL(occ_state_reference_kernel, dim3(ng * 16U * KV), dim3(320), 0, s, ring[slot], dk, union_at);
+                check(hipGetLastError(), "pair state launch"); check(hipStreamSynchronize(s), "pair state sync");
+                check(hipMemcpy(states[which].data(), scratch, states[which].size(), hipMemcpyDeviceToHost), "pair online state bytes");
+                check(hipMemcpy(captured.data(), which ? ob : oa, captured.size(), hipMemcpyDeviceToHost), "pair captured output");
+                check(hipMemsetAsync(which ? ob : oa, 0xA5, output_size * sizeof(float), s), "pair uninstrumented poison");
+            }
             check(hipEventRecord(begin, s), "occ time start");
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, 4U>), dim3(ng * 16U), dim3(256), 0, s, ring[slot], union_at);
+            if (which && c.union_noop)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, 4U, true, true>), dim3(ng * 16U), dim3(256), 0, s,
+                    ring[slot], union_at, UINT32_MAX, union_stats);
+            else
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<Rows, 4U>), dim3(ng * 16U), dim3(256), 0, s, ring[slot], union_at);
             check(hipEventRecord(mid, s), "occ time union");
-            if (which && c.candidate)
+            if (which && c.candidate && c.kv_pair)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kv_pair_kernel<Rows>), dim3(ng * 8U * KV), dim3(512), 0, s,
+                    ring[slot], dk, KV, Heads, union_at, KV);
+            else if (which && c.candidate)
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<Rows, 4U, 3U>), dim3(ng * 16U * KV), dim3(320), 0, s,
                     ring[slot], dk, KV, Heads, union_at, KV);
             else
@@ -314,6 +350,7 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
                 auto& result = which ? b : a;
                 check(hipMemcpy(result.data(), which ? ob : oa, result.size(), hipMemcpyDeviceToHost), "occ generation result");
                 expect(check_guards(result), which ? "occ comparison generation guards" : "occ reference generation guards");
+                if (c.kv_pair) expect(result == captured, "pair state instrumentation preserves output bytes");
             }
         }
         if (timing) { // both generations of this pass, byte for byte, after the timed intervals
@@ -324,7 +361,7 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
                 reinterpret_cast<const unsigned char*>(oa), reinterpret_cast<const unsigned char*>(ob),
                 total, Pitch, Heads * Dim, dmis);
             check(hipGetLastError(), "occ guard launch");
-        } else equal = equal && a == b;
+        } else equal = equal && a == b && (!c.kv_pair || states[0] == states[1]);
     }
     check(hipStreamSynchronize(s), "occ comparison sync");
     unsigned mismatches = 0U;
@@ -349,7 +386,7 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
             "mismatch_vectors_or_guard_bytes %u nan_outputs %zu\n",
             sel_name(c.sel), prefix, total, dense_rows, sparse_rows, min_shared == ~0U ? 0U : min_shared, max_shared, overlap,
             padded_tiles, seeds[0].size(), seeds[1].size(), seeds[2].size(), seeds[3].size(), c.numeric,
-            timing ? "timing" : "exact", c.candidate ? "A=production B=occ-D3" : "A/A production", equal ? "PASS" : "FAIL",
+            timing ? "timing" : "exact", c.candidate ? (c.kv_pair ? "A=production B=kv-pair" : "A=production B=occ-D3") : "A/A production", equal ? "PASS" : "FAIL",
             elapsed[0] / k, elapsed[1] / k, attend[0] / k, attend[1] / k, median(samples[0]), median(samples[1]),
             spread(samples[0]), spread(samples[1]), mismatches, nan_outputs);
         if (c.numeric == 1U) {
@@ -361,9 +398,13 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
         }
     } else
         std::printf("occ pattern %u padding %u numeric %u prefix %u rows %u %s: %s union+attend %.3f / %.3f ms\n",
-            c.pattern, c.padding, c.numeric, prefix, total, c.candidate ? "A=production B=occ-D3" : "A/A production",
+            c.pattern, c.padding, c.numeric, prefix, total, c.candidate ? (c.kv_pair ? "A=production B=kv-pair" : "A=production B=occ-D3") : "A/A production",
             equal ? "PASS" : "FAIL", elapsed[0] / k, elapsed[1] / k);
-    expect(equal, "occ complete output bytes including guards");
+    expect(equal, c.kv_pair ? "pair complete output/state/scratch bytes including guards" : "occ complete output bytes including guards");
+    if (union_stats) {
+        expect(equal, "union nonbinding cap / stats preserve attention bytes");
+        check(hipFree(union_stats), "union noop stats free");
+    }
     for (unsigned i = 0U; i < 2U; ++i) { check(hipEventDestroy(done[i]), "occ event free"); check(hipHostFree(ring[i]), "occ ring free"); }
     check(hipEventDestroy(begin), "occ timer free"); check(hipEventDestroy(mid), "occ timer free"); check(hipEventDestroy(end), "occ timer free");
     for (void* p : {static_cast<void*>(dk), static_cast<void*>(dq), static_cast<void*>(ds), static_cast<void*>(scratch),
@@ -371,7 +412,7 @@ static void run_occ_case(const OccCase& c, hipStream_t s) {
 }
 
 // Occupancy candidate: production attend vs attend_order_occ_kernel, complete output bytes (exact) and ABBA attend times.
-static int run_occ_fixtures(hipStream_t s, bool timing) {
+static int run_occ_fixtures(hipStream_t s, bool timing, bool kv_pair = false) {
     int device = 0;
     hipDeviceProp_t props{};
     check(hipGetDevice(&device), "occ device");
@@ -384,29 +425,34 @@ static int run_occ_fixtures(hipStream_t s, bool timing) {
     }
     hipFuncAttributes prod{}, occ{};
     check(hipFuncGetAttributes(&prod, reinterpret_cast<const void*>(&qsa_fast::attend_order_kernel<64U, 4U, 3U>)), "production attributes");
-    const void* occ_fn = reinterpret_cast<const void*>(&qsa_fast::attend_order_occ_kernel<64U, 4U, 3U>);
+    const void* occ_fn = kv_pair ? reinterpret_cast<const void*>(&qsa_fast::attend_order_kv_pair_kernel<64U>) :
+        reinterpret_cast<const void*>(&qsa_fast::attend_order_occ_kernel<64U, 4U, 3U>);
     check(hipFuncGetAttributes(&occ, occ_fn), "occ attributes");
     int resident_prod = 0, resident_occ = 0;
     check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&resident_prod,
         reinterpret_cast<const void*>(&qsa_fast::attend_order_kernel<64U, 4U, 3U>), 320, 0U), "production occupancy");
-    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&resident_occ, occ_fn, 320, 0U), "occ occupancy");
+    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&resident_occ, occ_fn, kv_pair ? 512 : 320, 0U), "occ occupancy");
     std::printf("occ D%u resources production LDS %zu registers %d local %zu resident %d | occ LDS %zu registers %d local %zu resident %d\n",
         3U, prod.sharedSizeBytes, prod.numRegs, prod.localSizeBytes, resident_prod, occ.sharedSizeBytes, occ.numRegs, occ.localSizeBytes,
         resident_occ);
+    if (kv_pair) std::printf("kv-pair admission %s; direct tests run even when launcher would decline\n",
+        occ.localSizeBytes == 0U && occ.sharedSizeBytes <= 48U * 1024U && resident_prod > 0 &&
+            resident_occ >= resident_prod ? "PASS" : "DECLINE");
+    const auto run_case = [&](OccCase item) { item.kv_pair = kv_pair; run_occ_case(item, s); };
     OccCase c;
     if (timing) {
         c.total = 8192U; c.timing = true;
-        c.sel = Sel::overlap; c.candidate = false; c.prefix = 24576U; run_occ_case(c, s);
+        c.sel = Sel::overlap; c.candidate = false; c.prefix = 24576U; run_case(c);
         c.candidate = true;
-        for (unsigned prefix : {0U, 8192U, 16384U, 24576U, 122880U, 253952U}) { c.prefix = prefix; c.sel = Sel::overlap; run_occ_case(c, s); }
-        for (Sel sel : {Sel::disjoint, Sel::equal}) { c.prefix = 24576U; c.sel = sel; run_occ_case(c, s); }
-        c.sel = Sel::overlap; c.candidate = false; c.prefix = 122880U; run_occ_case(c, s);
+        for (unsigned prefix : {0U, 8192U, 16384U, 24576U, 122880U, 253952U}) { c.prefix = prefix; c.sel = Sel::overlap; run_case(c); }
+        for (Sel sel : {Sel::disjoint, Sel::equal}) { c.prefix = 24576U; c.sel = sel; run_case(c); }
+        c.sel = Sel::overlap; c.candidate = false; c.prefix = 122880U; run_case(c);
     } else {
         for (unsigned pattern = 0U; pattern < 6U; ++pattern)
             for (unsigned padding = 0U; padding < 4U; ++padding)
                 for (unsigned numeric = 0U; numeric < 9U; ++numeric) {
                     c.pattern = pattern; c.padding = padding; c.numeric = numeric;
-                    run_occ_case(c, s);
+                    run_case(c);
                 }
         // The original 216 small cases above use three groups. Repeat every class with one group.
         c.total = 64U;
@@ -414,17 +460,19 @@ static int run_occ_fixtures(hipStream_t s, bool timing) {
             for (unsigned padding = 0U; padding < 4U; ++padding)
                 for (unsigned numeric = 0U; numeric < 9U; ++numeric) {
                     c.pattern = pattern; c.padding = padding; c.numeric = numeric;
-                    run_occ_case(c, s);
+                    run_case(c);
                 }
         for (unsigned total : {64U, 192U}) for (unsigned numeric : {0U, 5U}) {
             c = OccCase{}; c.total = total; c.numeric = numeric; c.depth_boundary = true;
-            run_occ_case(c, s);
+            run_case(c);
+            c.union_noop = true; c.candidate = false;
+            run_case(c);
         }
         // Original 24 late cases: causal tails, dense/sparse transition and exceptional seeds.
         c = OccCase{}; c.total = 128U;
         for (unsigned prefix : {2042U, 32642U, 130946U, 262014U})
             for (Sel sel : {Sel::overlap, Sel::disjoint, Sel::equal})
-                for (unsigned numeric : {0U, 1U}) { c.prefix = prefix; c.sel = sel; c.numeric = numeric; run_occ_case(c, s); }
+                for (unsigned numeric : {0U, 1U}) { c.prefix = prefix; c.sel = sel; c.numeric = numeric; run_case(c); }
     }
     return failures ? 1 : 0;
 }
@@ -434,6 +482,8 @@ static int run_occ_fixtures(hipStream_t s, bool timing) {
 static void run_occ_smoke(hipStream_t s) {
     for (unsigned numeric : {0U, 5U}) {
         OccCase c; c.total = 64U; c.numeric = numeric; c.depth_boundary = true;
+        run_occ_case(c, s);
+        c.union_noop = true; c.candidate = false;
         run_occ_case(c, s);
     }
 }

@@ -1,5 +1,7 @@
 # Optimizations
 
+Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
+
 ## Qwen product profiles
 
 `--profile default|fast|quality` selects the Qwen product policy for decode,
@@ -162,6 +164,7 @@ The READY mask contains `hc_output_wmma`. The implemented candidate `index_proj_
 |---|---|---|---|---|---|
 | `hc_output_wmma` (on) | HC output: FP16 low values and Q8 coefficients, WMMA accumulation in ascending K16 order, same sigmoid and stream mix | Passed a pre-declared confirmation held-out set | yes | `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path. | `--prefill-disable hc_output_wmma` / `prefill_disable = ["hc_output_wmma"]` / server-level only / `STRIX_PREFILL_HC_OUTPUT_WMMA=0` |
 | `index_proj_wmma` (off; candidate, outside READY) | BF16 indexer q/k WMMA with independent K16 panels and ordered FP32 panel addition; tag `idxproj16` | Pending local qualification | yes | Compiler, native execution, model fidelity and complete-workload gates pending | Opt in: `STRIX_PREFILL_INDEX_PROJ_WMMA=1`; off: `STRIX_PREFILL_INDEX_PROJ_WMMA=0`, `--prefill-disable index_proj_wmma`, config `prefill_disable = ["index_proj_wmma"]`; master exact switch also disables |
+| `index_score_wmma` (off; candidate, outside READY) | FAST prefill BF16 query/pool dot products, independent K16 panels with FP32 addition, per-head ReLU, unchanged selector; tag `idxscore16` | Pending local qualification | yes | Compiler, native execution, model fidelity and complete-workload gates pending; [fixture contract](engine/prefill/index-score-wmma.md) | Opt in: `STRIX_PREFILL_INDEX_SCORE_WMMA=1`; off: `STRIX_PREFILL_INDEX_SCORE_WMMA=0`, `--prefill-disable index_score_wmma`, config `prefill_disable = ["index_score_wmma"]`; master exact switch also disables |
 
 The prefill identity hash is FNV-1a 64 of the identity name. The enabled-set tag is not
 executed-path evidence: OUT16 requires the fast HC component, the qualified wide shape
@@ -686,6 +689,21 @@ Apply the measured 255 bitmask for overlap, row loops, headless work and persist
 - **Off switch:** STRIX_PREFILL_PIPE=0
 - **Measured gain:** No isolated measurement
 
+<a id="qwen-mtp-prime-rows"></a>
+
+### Batched MTP predictor priming
+
+**Engine:** `qwen`. **Control:** `STRIX_MTP_PRIME_ROWS`. **Default:** OFF (opt-in with `STRIX_MTP_PRIME_ROWS=1`).
+
+The tiled MTP prompt primes the predictor cache for each finished block in batches of up to 8 rows per launch instead of one row at a time: token embedding, draft input fusion, draft attention HC mix, index-key/K/V projections, key norm/RoPE and the validated cache publish. Every row keeps the one-row kernels' arithmetic; rows read the target hidden in place and the last row of each call keeps the one-row path.
+
+- **Preconditions:** MTP route with a tiled prompt and the production draft chain (non-exact draft, Q4 input-projection copy, HC rows kernels on and persistent HC off, 16-byte aligned HC workspace). Other configurations keep the one-row loop.
+- **Automatic selection:** Only with `STRIX_MTP_PRIME_ROWS=1`. If the 8-row scratch cannot be allocated, the one-row loop runs.
+- **Fallback notice:** None; the one-row loop is the fallback.
+- **Exactness evidence:** Same binary, 262,144-token prompt: end-of-prompt state digest (target state, predictor KV/index rows, held row), terminal FP32 logits digest, generation lineage digest, generated tokens and MTP acceptance counters equal with the switch on and off. Rows are published in order, so a failing row stops the later ones as before.
+- **Off switch:** unset STRIX_MTP_PRIME_ROWS (default off)
+- **Measured gain:** MTP-route prompt at 262,144 tokens (YaRN f2, T8192, one node): 210.9–213.2 → 202.8–203.8 s, −8.1 to −10.0 s in three pairs; decode unchanged.
+
 <a id="qwen-qsa-attend-batch"></a>
 
 ### QSA attend batching
@@ -935,6 +953,35 @@ Build the attend union by merging per-row selections instead of the range form; 
 - **Measured gain:** union kernel -46 % at 75K blocks, -73 % at 262K blocks
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
 
+### Qwen exact BF16 router weights
+
+`STRIX_QWEN_ROUTER_BF16=1` is an opt-in (default off; part of `STRIX_QWEN_ALLON`). At model load, every coefficient of each
+F32 `ffn_gate_inp.weight` must have zero low 16 bits. This preserves signed zeros,
+infinities and representable NaN payloads; any failing coefficient leaves that
+entire tensor on F32. The immutable F32 tensor remains resident and unchanged.
+An exact device BF16 copy is registered with the existing dense-copy registry;
+an already registered, verified pack copy is reused. The existing FP32 chains,
+comparison and tie order remain unchanged. Top-k selection remains a separate
+launch: a last-block ticket would need cross-block publication, per-launch reset
+and graph/concurrent-stream qualification before its cost and correctness could
+be established.
+
+Admission reserves two bytes per candidate coefficient in UMA and GTT, independently
+of CLI, HTTP slots, MTP and YaRN extent (including 1M). At 512 experts, width 2560
+and 48 layers, that is 125,829,120 bytes (120 MiB), plus one 65,536-byte host upload
+buffer during setup. The pre-device census conservatively includes tensors later
+declined or reused from a pack; actual owner inventory records only newly allocated
+copies, with pack backing charged once. These bytes never receive F32 reclaim credit.
+Inspection reports `qwen_router_bf16` policy and pending per-tensor validation;
+run receipts report allocated bytes, copied, skipped and reused tensors.
+
+Unsetting `STRIX_QWEN_ROUTER_BF16` restores F32 routing after restart, including routers
+supplied by a dense pack. Baseline, `STRIX_QPF2K_DEFAULTS=0` and `STRIX_Q6P=0` also
+disable this policy. CPU checks cover exactness, resolver policy and admission;
+`strix-hip-qwen-router-bf16-tests` compares complete logits, selected IDs/weights
+and untouched arena bytes at R=1/2/4/8, including ties and nonfinite coefficients.
+Device and complete-workload gates remain to be run; no measured speed gain is claimed.
+
 <a id="qwen-qsa-decode-pool"></a>
 
 ### QSA persistent pooled decode keys
@@ -997,6 +1044,72 @@ Four exact changes to the one-row (plain, non-MTP) decode step, each with its ow
 - **Off switch:** STRIX_QSA_DECODE_ATTN_V2=0, STRIX_QSA_DECODE_VALUE_V2=0, STRIX_QSA_DECODE_FUSED_MAXIMA=0, STRIX_MOE_R1_GLUE_FUSE=0
 - **Measured gain:** plain decode, prose prompt, 256 tokens, ON vs all four switches off, interleaved ABAB on one node: 1K 43.95 -> 41.59 ms/step (-5.4 %), 32K 46.75 -> 43.92 ms/step (-6.1 %), 262K (explicit YaRN factor 2, default prefill, 128 tokens) 49.46 -> 45.91 ms/step (-7.2 %, 20.2 -> 21.8 tok/s); tokens identical in every pair
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip), [pooled scorer](../src/hip_qsa_pooled_score.inc), [MoE experts launcher](../src/hip_moe_experts_launcher.hip), [A8 probe](../src/hip_moe_q4k_a8_probe.hip)
+
+<a id="qwen-decode-fuse"></a>
+
+### Qwen R1 GDN preparation fusion / Fusión de preparación GDN R1
+
+**Control:** `STRIX_QWEN_DECODE_FUSE`. **Default:** OFF (opt-in with `STRIX_QWEN_DECODE_FUSE=1`; part of `STRIX_QWEN_ALLON`). **OFF:** unset it.
+Restart after changing the switch. `--baseline`, `STRIX_BASELINE=1`, `STRIX_QPF2K_DEFAULTS=0`
+and GSQ owners disable it. `--print-effective-config` reports the resolved switch and suppression
+reason in `long_context_items`; the requested environment retains its provenance.
+
+For single-row GDN with 128-dimensional heads, one CTA owns each Q, K or V convolution head.
+It uses the same device bodies as the OFF sequence: channel convolution/history update, beta/gate
+transformation and the original 128-leaf Q/K normalization tree. No reduction order or BF16 rounding
+boundary changes. Recurrent tiles retain their original kernel, grid and state layout. They need
+complete shared Q/K heads from other CTAs; gated RMSNorm needs every output tile of its head.
+These two grid barriers remain. Guarded graphs also keep normalization separate so that a failing
+head cannot suppress another CTA's convolution/history update. Their convolution and beta/gate
+still share a launch with their original rejection behavior. GDN islands validate the resolved
+8-node ledger (10 with OFF); guarded device-position graphs retain their existing validation nodes.
+
+Fusion is recorded only in the GDN launcher implementation identity, which is hashed into the
+compiled launch plan and island organization identity. Selected GDN kernel IDs keep their existing
+projection suffixes and known-window recognition in both arms. Kernel-plan, numerical execution
+and saved-state/cache compatibility identities retain the same arithmetic contract; the ON/OFF
+launch plan identities differ. Host identity tests cover both environments without device work.
+
+Static counts for the 36 GDN layers: **72 launches removed per step** for unguarded R1 and GDN
+islands (five core launches become three), **36** for guarded R1 (five become four). This excludes
+projections, validation and QSA: `norm_rope` belongs to QSA, outside this GDN dependency chain.
+The named `project_bf16_to_fp32` and `linear_to_float` kernels already compute projections and
+write `round_bf16(sum)` directly into FP32 destinations; there is no separate conversion launch
+to fold away. The MoE prologue additionally owns the expert workspace, quantizer and deferred-error
+bindings; its tail consumes completed expert down projections. Merging those cross-operator
+owners into router selection is outside this preparation change. The existing two-launch MoE
+glue and all R2–R8/prefill bodies remain as before.
+
+**Qualification:** compile-only implementation; native equality and complete-workload gates remain
+pending. No measured gain is claimed. `strix-hip-gdn-decode-fuse-tests` compares device ON/OFF
+workspace/core and convolution/recurrent bytes across shapes, F32/F16/BF16 small weights, carried
+states, first/long position labels, graph replay and rejected nonfinite inputs. Rejected temporary
+workspaces are excluded; persistent state and rejection status are compared. The post-projection
+body itself has no position input. The full-model gate compares complete token IDs, consumed
+frontier and all seven exported state allocations at 1K/32K, in eager and island routes.
+State export excludes automatic generation organization, so the island arm pins the complete D1
+and virtual/prefetch projection contract in both visits:
+
+```sh
+python3 tests/qwen_decode_fuse_gate.py --binary build/strix-hip-decode-token --model MODEL.gguf \
+  --prompt-1k prompts/1k.ids --prompt-32k prompts/32k.ids --output ../private-decode-fuse-gate
+```
+
+**Español.** Desactivado por defecto (opción `STRIX_QWEN_DECODE_FUSE=1`, parte de `STRIX_QWEN_ALLON`); sin ella se mantiene la secuencia anterior tras
+reiniciar. Baseline, `STRIX_QPF2K_DEFAULTS=0` y modelos GSQ también lo desactivan. La inspección
+informa del valor efectivo y del motivo de desactivación. En R1 de dimensión 128 se fusionan
+convolución, transformación beta/gate y normalización Q/K con los mismos cuerpos de dispositivo,
+orden de operaciones y redondeo BF16. Se conservan las barreras de rejilla antes de la recurrencia
+y de RMSNorm: sus consumidores necesitan resultados de otros bloques. Los grafos con estado de
+error mantienen además la normalización separada para preservar los rechazos y el historial de
+convolución. Las islas verifican ocho nodos, o diez con OFF. Se eliminan estáticamente 72 lanzamientos
+por paso en R1 sin guardas/islas, o 36 con guardas, para 36 capas GDN; no es una medida de velocidad.
+`norm_rope` es de QSA. Las proyecciones citadas ya escriben BF16 redondeado dentro de FP32 y no
+necesitan otra conversión. Router, MoE, R2–R8 y prefill conservan sus cuerpos. Solo se ha compilado;
+faltan igualdad nativa y carga completa. El fixture compara bytes de salida y estado, pesos pequeños
+en tres formatos, estados acumulados, grafos y guardas no finitas. El comando anterior comprueba
+los tokens completos y los siete estados exportados a 1K/32K; sus ejecuciones de validación no
+establecen rendimiento.
 
 <a id="qwen-qsa-mtp-pool"></a>
 
@@ -4108,6 +4221,18 @@ Weights, activations and route weights retain their existing arithmetic.
   covers both down formats, all three tunes, scalar/vector tails, top-k ten, padded tails, RNE ties, subnormals,
   infinities, NaNs, OFF byte equality and both merge/commit branches.
 
+## HC normalized recompute candidate
+
+`STRIX_QPF2K_HC_RECOMPUTE_NORM=1` removes FP32 normalized image stores at
+eligible qpf2k HC sites, using the exact inverse already computed in the existing
+producer. Consumers reconstruct values through the same two pinned multiplies.
+Folds, prefetched projection, OUT16 and output3/lowband remain eligible; no launch
+is added. Numerical identity is unchanged. OFF: `=0`; restart. The default remains
+OFF until native equality and interleaved timing establish that ON is not slower.
+Unsupported sites retain the image. At T16384 the net reduction in materialized
+stores is 639.75 MiB/site; allocation reservations are unchanged. No speed claim.
+See [admission, lifetime, resources and the native ticket](engine/prefill/hc-normalized-recompute.md).
+
 ## HC low-band layout
 
 **Default ON (mode 3)** through decoder qpf2k defaults.
@@ -4190,3 +4315,138 @@ consumption. The previous path re-gathered the tail inline; both copy the same
 bytes. Every staged row ID, including row 0, remains checked before acceptance.
 Recorded native local-CI results and open, nonblocking gates are listed
 in [bundle qualification](engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+
+<a id="qwen-moe-compressed-planes"></a>
+
+### MoE prepared Q4_K direct-B candidate
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_DIRECT_B=1`.
+**Default:** OFF. **Status:** exact candidate; native execution and complete-workload
+qualification pending. No measured speedup is claimed.
+
+The host selector admits paired local Q4_K routed gate/up tensors for full-row
+fast FP16 CLI prefill at T4096/T8192, effective tunes 80/82/88, core=0 and SMALL=0.
+DA16 retains its existing last-arrival conversion and down kernels. Q5_K gate/up,
+Q5_1 down, mixed or missing pairs, non-covered prompt tails, other schedules,
+MTP, HTTP, caches, sessions, rotary extensions and the BF16 route-dot candidate
+retain their existing execution. Invalid switch values decline by name. When requested,
+inspection reports requested/effective/reason, prepared bytes and layout version without
+performing device work. Execution receipts report actual engaged/declined calls;
+these are host launch witnesses, including capture entries, rather than GPU completions.
+
+Setup uses the loader's verified model hash and retained original source snapshot.
+Only admitted tensors receive one final packed allocation each, through bounded
+slabs; source snapshots are checked before and after setup. Prepared owners live
+with the model binding. Original weights remain available to decode and fallback
+readers. The additional packed allocation bytes and bounded staging are charged
+in prefill admission; no context or slot reduction finances this candidate.
+
+Units are ordered `[expert][output/16][K/256]`. Version 1 preserves these byte maps:
+
+| Format | Unit byte map (half-open offsets) | Unit bytes | Repack staging ceiling |
+|---|---|---|---|
+| Q4_K | headers `[0,256)`, low-code planes `[256,2304)` | 2304 | 297216 |
+| Q5_K | headers `[0,256)`, high plane `[256,768)`, low-code planes `[768,2816)` | 2816 | 363264 |
+| Q5_1 | K32 headers `[0,512)`, high planes `[512,1024)`, low-code planes `[1024,3072)` | 3072 | 396288 |
+
+The Q5 formats retain preparation APIs but have no direct-B consumer. Each of eight
+low-code planes covers a natural K32 group, with adjacent codes in low/high nibbles.
+Headers and high bits are preserved. Asset SHA-256 includes layout version, verified
+full model hash, tensor index/offset, format, role and geometry; paths and pointers
+are excluded. Failed setup destroys unpublished allocations.
+
+A CTA covers 128 gate/up outputs and 64 or 128 CSR assignments. At tunes 80/88,
+eight waves each own a paired output16 tile and four row16 accumulator pairs.
+Tune 82 uses sixteen waves, with separate gate and up waves each owning an
+output16 tile and eight row16 accumulators. Each decoded B fragment still serves
+the entire batch of up to 128 rows. Two compressed K64 register
+slots provide one K64 of lookahead and retain the superblock header. The certified
+fast path constructs FP16 subnormal pairs directly from adjacent low/high nibbles,
+using eight byte permutations per K16 plane. At tunes 80/88, `permlanex16`
+exchanges replicate gate/up operands. At tune 82, the two lane halves decode
+different adjacent K16 planes of the same matrix, then `permlanex16` exchanges
+replicate both FP16 fragments. Each pair needs one decode instruction sequence;
+the two planes execute in ascending K order. After accumulation, its up waves pass
+two row16 tiles at a time through the same 16 KiB used for A staging; gate waves
+retain the fused epilogue. Eight CTA barriers protect this reuse for a full batch,
+without increasing LDS. DPP row-XOR reductions preserve the maxima sequence.
+Compiler barriers keep each A fragment beside its WMMA calls.
+Each output retains ascending four K16 WMMA calls per
+K64 step, zero accumulator initialization and the incumbent unscale, SiLU `expf`,
+status writes, maxima reduction order and atomic updates. The existing affine
+certificate selects the existing fast conversion; rejected blocks use the existing
+FP32-FMA then FP16 conversion.
+There is no integer WMMA or split-K.
+
+Compiler inspection on CPU for gfx1151 with AMD Clang 22, strict repository arithmetic
+flags and linked device libraries reports:
+
+| Effective tune | Threads | Direct-B VGPR, plain / DA16 | LDS bytes, plain / DA16 | Compiler waves/SIMD | Scratch/spills |
+|---|---|---|---|---|---|
+| 80 or 88 | 256 | 147 / 147 | 8960 / 9220 | 9 | 0 |
+| 82 | 512 | 141 / 141 | 17920 / 18436 | 10 | 0 |
+
+The production DA16 header-reuse gate/up kernel uses 163/143/184 VGPR and
+47108/57348/41988 LDS bytes for tunes 80/82/88 respectively, with compiler
+occupancy bounds of 4/8/6 waves per SIMD and zero scratch.
+Runtime admission requires at most 160 VGPR, 20000 LDS bytes and zero scratch.
+Compiler occupancy is a resource bound. Splitting tune 82 halves each thread's
+accumulator storage and halves its A staging trips. Adjacent-plane sharing halves
+the wave's decode sequences while adding lossless register exchanges. The expected
+benefit is lower decode instruction pressure with small accumulator sets; the costs
+are the exchanges, duplicate compressed loads, repeated A operand reads and the
+epilogue rendezvous. Each decoded fragment retains full batch-128 reuse.
+Native occupancy, byte gates and latency for the revised tune 82 remain pending;
+resource reductions do not establish a speedup. OFF preserves existing loading and launches.
+
+CPU tests cover inverse bytes, independent header/code oracles, all lane/K-plane
+code-word coordinates, asset identities, paired tensor selection and policy declines.
+The native `direct-b` fixture compares every output byte, status and maximum against
+the incumbent at T4096/T8192, with randomized/adversarial weights, certificate pass
+and fail blocks, signed zero, subnormals, ties, masked rows and CSR tails, with and
+without DA16. Its fragment oracle checks both gate/up and adjacent-plane exchanges,
+including the first-mismatch coordinates under a deliberate nibble fault. The
+adjacent-plane native gates remain pending. Full model token,
+logit/state and complete-workload gates remain required before qualification.
+
+Build the CPU fixtures with `cmake --build BUILD --target strix-qwen-moe-prepared-tests
+strix-qwen-effective-config-tests`. For native fixtures configure HIP, testing,
+`STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE=ON` and `STRIX_HIP_ARCHITECTURES=gfx1151`, then:
+
+```sh
+cmake --build BUILD_HIP --target strix-hip-moe-wmma-prefill-tests
+BUILD_HIP/strix-hip-moe-wmma-prefill-tests prepared-layout
+BUILD_HIP/strix-hip-moe-wmma-prefill-tests direct-b
+BUILD_HIP/strix-hip-moe-wmma-prefill-tests direct-b-timing 15
+```
+
+Timing byte-checks the production `project_prefill_f16x_da16_mg` specialization
+against direct-B at the resolved tune, including every output/status/maxima/CSR
+byte and the complete DA16 image. Both timed kernels include last-CTA completion.
+Arrival counters and maxima are reset before each launch, outside the interval.
+Timing reports old/new/new/old interleaved medians, excluding setup, prologue,
+down and merge. Report load-time repacking separately
+and measure the complete routed layer before drawing a production conclusion.
+`STRIX_INTPREFILL_RESOURCES=1` prints runtime resource/occupancy queries for execution.
+Unset the direct-B variable or use `0` to turn the candidate off.
+
+Implementation: [kernel](../src/hip_moe_direct_b.inc),
+[prepared layout and identity](../src/qwen_moe_prepared.cpp),
+[HIP setup owner](../src/hip_qwen_moe_prepared.cpp),
+[host policy](../apps/qwen_moe_direct_b.hpp),
+[native fixtures](../tests/hip_moe_direct_b_fixture.inc).
+
+<a id="qwen-all-on-composition-profile"></a>
+
+### Qwen all-on composition profile
+
+**Engine:** `qwen`. **Control:** `STRIX_QWEN_ALLON`. **Default:** OFF.
+
+`STRIX_QWEN_ALLON=1` (or `exact`) fills every exact opt-in lever of the generated table
+(`engine/optimization-table.md`, section "Opt-in levers") that is still unset; `STRIX_QWEN_ALLON=fast` also fills
+the FAST levers. An explicit per-lever value wins, `STRIX_BASELINE=1` vetoes the profile, and any other value of the
+switch stops the process at start. The levers keep their own admission and decline notices, so the profile never forces
+a route a lever does not admit. TILE64 (instead of the tier split), tier mode 2 (instead of mode 1), the SCHED bit 64 side
+fork, the union cap and the build-time DPP reductions replace or depend on other choices and are separate arms.
+`--print-effective-config` ends the prefill block with an `allon` object (mode, one entry per lever with its resolved value
+and class). Test plan and lever census: [all-on guide](models/qwen3.8/allon.md).

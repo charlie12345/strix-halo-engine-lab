@@ -87,6 +87,11 @@
     const unsigned cols[2]{32U*cg,32U*cg+16U};
     f32x8 acc[4][2]={};
     f16_pipeline<Tune,Regs>(steps,fetch,stage,[&](unsigned){f16_step_rows(sb[0],rbase,mb,cols,i,acc);});
+#ifdef STRIX_DA16_LDS_EPILOGUE
+    if constexpr(STRIX_DA16_LDS_EPILOGUE) {
+#include "hip_moe_da16_lds_epilogue.inc"
+    } else {
+#endif
 #ifdef STRIX_DA16_CERTIFICATE
     bool unsafe=false; // starts after K: no accumulator live-range extension into the pipeline
 #endif
@@ -100,8 +105,15 @@
         float* out=at(view.rawdots,row_of(a));
         const auto dot_index=slot_of(a)*hidden+tile*Columns+32U*cg+i;
 #ifdef STRIX_DA16_CERTIFICATE
-        const float d0=moe_route_store<RouteBF16>(out,dot_index,acc[mi][0][e]*unscale);
-        const float d1=moe_route_store<RouteBF16>(out,dot_index+16U,acc[mi][1][e]*unscale);
+        float d0,d1;
+        if constexpr(RouteI8) {
+            const auto stored=moe_route_i8_store_pair(out,dot_index-i,i,32U,hidden,route_top_k,
+                acc[mi][0][e]*unscale,acc[mi][1][e]*unscale);
+            d0=stored.x;d1=stored.y;
+        } else {
+            d0=moe_route_store<RouteBF16>(out,dot_index,acc[mi][0][e]*unscale);
+            d1=moe_route_store<RouteBF16>(out,dot_index+16U,acc[mi][1][e]*unscale);
+        }
         unsafe|=(__float_as_uint(d0)&0x7fffffffU)>=0x7b800000U;
         unsafe|=(__float_as_uint(d1)&0x7fffffffU)>=0x7b800000U;
 #else
@@ -111,4 +123,7 @@
 #ifdef STRIX_DA16_CERTIFICATE
     const unsigned bad=static_cast<unsigned>(__ballot(unsafe));
     if(bad&&lane==0U)atomicOr(view.unsafe,1U);
+#endif
+#ifdef STRIX_DA16_LDS_EPILOGUE
+    }
 #endif

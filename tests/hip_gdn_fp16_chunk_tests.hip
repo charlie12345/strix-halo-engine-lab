@@ -1,4 +1,4 @@
-// qwen-gdn-fp16-chunk revision 2: the chunked route from raw projection rows (conv + L2 + chunk prep + staged scan +
+// qwen-gdn-fp16-chunk revisions 2/3: the chunked route from raw projection rows (conv + L2 + chunk prep + staged scan +
 // gated-norm epilogue) against an FP64 token recurrence (raw core, normed output, final state, conv history), run-to-run
 // determinism, aligned split == monolithic, every tail length, resets / tiny decays, both state layouts, and --time
 // (T 8192, 48 value heads, 16 key heads: prep / scan / total).
@@ -302,12 +302,12 @@ void expect_true(bool ok, const std::string& what) {
 }
 struct Err { double maxrel = 0.0, rel_l2 = 0.0; bool finite = true; };
 Err compare(const std::vector<double>& ref, const float* got, std::size_t n, std::size_t pitch_ref, std::size_t pitch_got,
-    std::size_t rows, std::size_t width) {
+    std::size_t rows, std::size_t width, std::size_t offset_ref = 0U) {
     double maxref = 0.0, maxerr = 0.0, e2 = 0.0, r2 = 0.0;
     bool finite = true;
     for (std::size_t r = 0; r < rows; ++r)
         for (std::size_t i = 0; i < width; ++i) {
-            const double a = ref[r * pitch_ref + i], b = got[r * pitch_got + i];
+            const double a = ref[offset_ref + r * pitch_ref + i], b = got[r * pitch_got + i];
             finite &= std::isfinite(b);
             maxref = std::max(maxref, std::fabs(a));
             maxerr = std::max(maxerr, std::fabs(a - b));
@@ -319,6 +319,12 @@ Err compare(const std::vector<double>& ref, const float* got, std::size_t n, std
 
 // Screen: raw core / normed rows / state relL2 and max-abs relative error against FP64.
 constexpr double kRelL2 = 3e-3, kMaxRel = 2e-2;
+Err worst_out, worst_state, worst_head;
+void collect(Err& worst, const Err& e) {
+    worst.rel_l2 = std::max(worst.rel_l2, e.rel_l2);
+    worst.maxrel = std::max(worst.maxrel, e.maxrel);
+    worst.finite &= e.finite;
+}
 void case_screen(const std::string& name, const Problem& p) {
     const Expect e = expect(p);
     for (const bool normed : {false, true}) {
@@ -328,8 +334,18 @@ void case_screen(const std::string& name, const Problem& p) {
         const auto& ref = normed ? e.norm : e.core;
         const Err out = compare(ref, o.rows.data() + p.g.core, 0, p.g.vw, p.g.stride, p.count, p.g.vw);
         const Err st = compare(e.state, o.state.data(), 0, 0, 0, 1, o.state.size());
+        collect(worst_out, out); collect(worst_state, st);
+        Err head_error;
+        for (std::uint32_t h = 0; h < p.g.vh; ++h) {
+            const std::size_t off = std::size_t{h} * kD * kD;
+            const Err he = compare(e.state, o.state.data() + off, 0, 0, 0, 1, kD * kD, off);
+            collect(head_error, he);
+            expect_true(he.finite && he.rel_l2 <= kRelL2 && he.maxrel <= kMaxRel, name + " per-head state screen");
+        }
+        collect(worst_head, head_error);
         std::printf("%-34s %s out relL2 %.2e max %.2e | state relL2 %.2e max %.2e\n", name.c_str(), normed ? "norm" : "core",
             out.rel_l2, out.maxrel, st.rel_l2, st.maxrel);
+        std::printf("  worst head state relL2 %.2e max %.2e\n", head_error.rel_l2, head_error.maxrel);
         expect_true(out.finite && st.finite, name + " finite");
         expect_true(out.rel_l2 <= kRelL2 && out.maxrel <= kMaxRel, name + " output screen");
         expect_true(st.rel_l2 <= kRelL2 && st.maxrel <= kMaxRel, name + " state screen");
@@ -367,6 +383,43 @@ void case_b16(const std::string& name, const Problem& p, std::uint32_t split) {
     const auto same = [](const auto& x, const auto& y) { return std::memcmp(x.data(), y.data(), x.size() * sizeof(x[0])) == 0; };
     expect_true(same(oa.rows, ob.rows) && same(oa.state, ob.state) && same(oa.history, ob.history), name + " BF16 rows == FP32 rows");
     std::printf("%-34s BF16-row route == FP32-row route checked\n", name.c_str());
+}
+
+// Geometry changes must preserve convolution operands and metadata exactly; only T/P may change in rev 3.
+void case_prep(const std::string& name, const Problem& p, bool b16, bool fallback = false) {
+    Device d(p);
+    if (b16) d.make_x16(p);
+    using namespace gdn_fp16_chunk;
+    const auto bytes = scratch_bytes(p.count, p.g.kh, p.g.vh);
+    void* old_base = nullptr;
+    void* new_base = nullptr;
+    ck(hipMalloc(&old_base, bytes), "old prep"); ck(hipMalloc(&new_base, bytes), "new prep");
+    const auto old = scratch_view(old_base, p.count, p.g.kh, p.g.vh);
+    const auto next = scratch_view(new_base, p.count, p.g.kh, p.g.vh);
+    const Conv conv{d.history, d.weights, SmallWeightKind::f32, d.x16, p.g.conv + p.g.vw, p.g.conv};
+    const unsigned n = (p.count + kC - 1U) / kC;
+    const auto reference = [&]<bool B16>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prep_kernel<B16>), dim3(p.g.kh, n), dim3(256), 0, nullptr,
+            d.view, p.count, conv, p.g.kh, p.g.vh, kEps, old);
+    };
+    if (b16) reference.template operator()<true>(); else reference.template operator()<false>();
+    enqueue_gdn_fp16_chunk_prep(next, d.view, p.count, conv, p.g.kh, p.g.vh, kEps, nullptr);
+    ck(hipDeviceSynchronize(), "prep comparison");
+    const auto same = [&](const void* a, const void* b, std::size_t size) {
+        std::vector<unsigned char> x(size), y(size);
+        ck(hipMemcpy(x.data(), a, size, hipMemcpyDeviceToHost), "old prep down");
+        ck(hipMemcpy(y.data(), b, size, hipMemcpyDeviceToHost), "new prep down");
+        return x == y;
+    };
+    const std::size_t rows_p = std::size_t{n} * kC;
+    expect_true(same(old.q16, next.q16, 2U * p.g.kh * rows_p * gdn_fp16_chunk::kD), name + " Q16 exact");
+    expect_true(same(old.k16, next.k16, 2U * p.g.kh * rows_p * gdn_fp16_chunk::kD), name + " K16 exact");
+    expect_true(same(old.v16, next.v16, 2U * p.g.vh * rows_p * gdn_fp16_chunk::kD), name + " v16 exact");
+    expect_true(same(old.ef, next.ef, 8U * p.g.vh * rows_p), name + " decay metadata exact");
+    if (fallback || revision() == 2U)
+        expect_true(same(old.tp16, next.tp16, 4U * p.g.vh * rows_p * kC), name + " fallback/rev2 T/P exact");
+    ck(hipFree(old_base), "old prep free"); ck(hipFree(new_base), "new prep free");
+    std::printf("%-34s conv operands + metadata exact\n", name.c_str());
 }
 
 int time_main() {
@@ -423,6 +476,8 @@ int main(int argc, char** argv) {
         return 77;
     }
     try {
+        std::printf("%s (STRIX_QPF2K_GDN_FP16_CHUNK=%s)\n", gdn_fp16_chunk::identity(),
+            std::getenv("STRIX_QPF2K_GDN_FP16_CHUNK") ? std::getenv("STRIX_QPF2K_GDN_FP16_CHUNK") : "unset");
         if (argc > 1 && std::string(argv[1]) == "--time") return time_main();
         for (const std::uint32_t t : {1U, 3U, 31U, 32U, 33U, 64U, 100U, 257U})
             case_screen("len " + std::to_string(t) + " 4/12 vk", make_problem(t, 4U, 12U, true, 11U + t));
@@ -438,10 +493,47 @@ int main(int argc, char** argv) {
         case_bitwise("bitwise 16/48 kv", make_problem(300U, 16U, 48U, false, 22U), 128U);
         case_b16("b16 16/48 vk", make_problem(333U, 16U, 48U, true, 23U), 160U);
         case_b16("b16 4/12 kv", make_problem(97U, 4U, 12U, false, 24U), 64U);
+        for (const bool vk : {false, true}) {
+            const std::string layout = vk ? " vk" : " kv";
+            for (const float scale : {0x1p-12F, 0x1p12F}) {
+                auto p = make_problem(97U, 2U, 6U, vk, 81U);
+                for (auto& value : p.state) value *= scale;
+                const auto name = "scaled " + std::to_string(scale) + layout;
+                case_screen(name, p);
+                case_bitwise(name, p, 32U);
+                case_b16(name, p, 64U);
+            }
+            auto slow = make_problem(129U, 2U, 6U, vk, 82U);
+            for (std::uint32_t r = 0; r < slow.count; ++r)
+                for (std::uint32_t h = 0; h < slow.g.vh; ++h)
+                    slow.rows[std::size_t{r} * slow.g.stride + slow.g.gate + h] = -1e-7F;
+            case_screen("near-unit decay" + layout, slow);
+            for (const auto split : {32U, 64U, 96U, 128U})
+                case_bitwise("boundary" + layout, slow, split);
+            const auto resets = make_problem(129U, 2U, 6U, vk, 83U, {31U, 32U, 63U, 64U}, {0U, 30U, 65U, 128U});
+            case_screen("reset/tiny boundary" + layout, resets);
+            case_bitwise("reset/tiny boundary" + layout, resets, 64U);
+            case_b16("reset/tiny boundary" + layout, resets, 32U);
+            for (std::uint32_t tail = 1U; tail < 32U; ++tail)
+                case_screen("small tail " + std::to_string(tail) + layout, make_problem(32U + tail, 1U, 1U, vk, 200U + tail));
+        }
+        auto fallback = make_problem(64U, 1U, 4U, true, 94U);
+        for (std::uint32_t r = 0; r < fallback.count; ++r)
+            for (std::uint32_t h = 0; h < fallback.g.vh; ++h)
+                fallback.rows[std::size_t{r} * fallback.g.stride + fallback.g.gate + h] = -30.0F;
+        case_prep("tiny-decay fallback", fallback, false, true);
+        case_prep("tiny-decay fallback b16", fallback, true, true);
+        for (const auto vh : {1U, 2U, 3U, 4U})
+            for (const auto t : {1U, 15U, 16U, 17U, 31U, 32U, 33U, 65U})
+                for (const bool b16 : {false, true})
+                    case_prep("prep " + std::to_string(t) + "/" + std::to_string(vh) + (b16 ? " b16" : " f32"),
+                        make_problem(t, 1U, vh, true, 90U + t), b16);
     } catch (const std::exception& error) {
         std::printf("error: %s\n", error.what());
         return 1;
     }
+    std::printf("screen maxima: output relL2 %.6e max %.6e | state relL2 %.6e max %.6e | head relL2 %.6e max %.6e\n",
+        worst_out.rel_l2, worst_out.maxrel, worst_state.rel_l2, worst_state.maxrel, worst_head.rel_l2, worst_head.maxrel);
     std::printf(failures ? "FAILED %d\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }

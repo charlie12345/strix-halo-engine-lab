@@ -204,3 +204,212 @@ void route_bf16_tests() {
     kr::set_prefill_core2(-1);kr::set_prefill_route(-1);kr::set_prefill_da16(-1);kr::set_prefill_small(-1);kr::set_prefill_xor64(-1);
     std::printf("route BF16: %u down/merge and edge cases passed; native model qualification still required\n",cases);
 }
+
+
+// Independent double-precision RNE oracle; no dependency on the device exponent or code helpers.
+int route_i8_round(double x) {
+    const double a=std::abs(x),lo=std::floor(a),fraction=a-lo;
+    const int n=static_cast<int>(lo);
+    const int rounded=n+((fraction>0.5||(fraction==0.5&&(n&1)))?1:0);
+    return x<0.0?-rounded:rounded;
+}
+struct RouteI8Reference {
+    std::vector<unsigned char> storage,widened;
+    std::vector<double> bounds;
+};
+RouteI8Reference route_i8_reference(const std::vector<unsigned char>& raw,std::uint64_t stride,unsigned rows,unsigned hidden,unsigned top_k) {
+    RouteI8Reference ref{std::vector<unsigned char>(raw.size(),0xa5U),raw,
+        std::vector<double>(static_cast<std::size_t>(rows)*hidden*top_k)};
+    const std::uint64_t n=static_cast<std::uint64_t>(hidden)*top_k,groups=(hidden+31U)/32U;
+    const auto exponent_at=(n+1U)/2U*2U,fallback_at=exponent_at+2U*groups*top_k;
+    route_fixture_require(fallback_at+2U*n<=4U*n,"I8 fallback does not fit reserved FP32 row");
+    for(unsigned r=0;r<rows;++r)for(unsigned slot=0;slot<top_k;++slot)for(unsigned g=0;g<groups;++g) {
+        const unsigned live=std::min(32U,hidden-32U*g);
+        double peak=0.0;bool exceptional=false;
+        for(unsigned c=0;c<live;++c) {
+            const auto index=static_cast<std::uint64_t>(slot)*hidden+32U*g+c;
+            const float dot=route_fixture_at<float>(raw,r*stride+4U*index);
+            exceptional|=!std::isfinite(dot);peak=std::max(peak,std::abs(static_cast<double>(dot)));
+        }
+        int e=0;
+        if(!exceptional&&peak!=0.0) {
+            e=std::ilogb(peak)-7;
+            while(route_i8_round(std::ldexp(peak,-e))>127)++e;
+            exceptional=e < -126 || e > 120;
+        }
+        const auto stored_e=static_cast<std::int16_t>(exceptional?-32768:e);
+        std::memcpy(ref.storage.data()+r*stride+exponent_at+2U*(slot*groups+g),&stored_e,2U);
+        for(unsigned c=0;c<live;++c) {
+            const auto index=static_cast<std::uint64_t>(slot)*hidden+32U*g+c,at=r*stride+4U*index;
+            const float dot=route_fixture_at<float>(raw,at);float reconstructed;
+            if(exceptional) {
+                const auto bits=route_bf16_reference(dot);
+                std::memcpy(ref.storage.data()+r*stride+fallback_at+2U*index,&bits,2U);
+                reconstructed=route_bf16_widen(bits);
+            } else {
+                const int rounded=route_i8_round(std::ldexp(static_cast<double>(dot),-e));
+                route_fixture_require(rounded>=-127&&rounded<=127,"I8 oracle saturation");
+                const auto code=static_cast<std::int8_t>(rounded);
+                std::memcpy(ref.storage.data()+r*stride+index,&code,1U);
+                reconstructed=std::ldexp(static_cast<float>(code),e);
+                const double bound=std::ldexp(1.0,e-1);
+                route_fixture_require(std::abs(static_cast<double>(reconstructed)-dot)<=bound,"I8 per-group half-step bound");
+                ref.bounds[static_cast<std::size_t>(r*n+index)]=bound;
+            }
+            // Exceptional groups retain the BF16 boundary, including its separate finite rounding error.
+            if(exceptional&&std::isfinite(dot)&&std::isfinite(reconstructed))
+                ref.bounds[static_cast<std::size_t>(r*n+index)]=std::abs(static_cast<double>(reconstructed)-dot);
+            std::memcpy(ref.widened.data()+at,&reconstructed,4U);
+        }
+    }
+    return ref;
+}
+
+// Same half-wave ownership as the down epilogue, including inactive channels in partial groups.
+__global__ void route_i8_edge_store(kr::PrefillRows v,const float* input,unsigned hidden,unsigned top_k) {
+    const unsigned groups=(hidden+31U)/32U,group=blockIdx.x*2U+(threadIdx.x>>4U),lane16=threadIdx.x&15U;
+    if(group>=groups*top_k)return;
+    const unsigned slot=group/groups,column=(group%groups)*32U,live=min(32U,hidden-column);
+    const std::uint64_t first=static_cast<std::uint64_t>(slot)*hidden+column;
+    const auto* source=fixture_row(kr::StridedRows<const float>{input,v.rawdots.stride},blockIdx.y);
+    const auto stored=moe_route_i8_store_pair(fixture_row(v.rawdots,blockIdx.y),first,lane16,live,hidden,top_k,
+        lane16<live?source[first+lane16]:0.0F,lane16+16U<live?source[first+lane16+16U]:0.0F);
+    const bool unsafe=(__float_as_uint(stored.x)&0x7fffffffU)>=0x7b800000U||(__float_as_uint(stored.y)&0x7fffffffU)>=0x7b800000U;
+    if(__ballot(unsafe)&&threadIdx.x==0U)atomicOr(v.unsafe,1U);
+}
+template<bool Vec4>
+__global__ void route_i8_edge_load(kr::PrefillRows v,float* output,unsigned hidden,unsigned top_k) {
+    const auto index=(static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x)*(Vec4?4U:1U);
+    if(index>=static_cast<std::uint64_t>(hidden)*top_k)return;
+    auto* destination=fixture_row(kr::StridedRows<float>{output,v.rawdots.stride},blockIdx.y);
+    if constexpr(Vec4)*reinterpret_cast<float4*>(destination+index)=moe_route_i8_load4(fixture_row(v.rawdots,blockIdx.y),index,hidden,top_k);
+    else destination[index]=moe_route_load<true,true>(fixture_row(v.rawdots,blockIdx.y),index,hidden,top_k);
+}
+
+// Check the real-arithmetic dot perturbation bound separately from the ordered FP32 FMA oracle.
+void route_i8_merge_checks(kr::PrefillRows v,const RouteI8Reference& ref,const std::vector<unsigned char>& original,
+    const std::vector<unsigned char>& weights,unsigned rows,unsigned hidden,unsigned experts,unsigned top_k,hipStream_t stream) {
+    Buffer output(rows,2U*hidden),record(1,sizeof(strix::DeferredMoeFirstError));
+    for(bool vec:{false,true})for(unsigned tail:{0U,1U,2U}) {
+        if(vec&&hidden%4U)continue;
+        const unsigned unsafe=tail==2U?1U:0U;
+        check(hipMemcpyAsync(v.unsafe,&unsafe,4U,hipMemcpyHostToDevice,stream),"I8 merge admission");
+        output.poison(stream);record.poison(stream);
+        const auto launch=[&]<bool Acc>() {
+            if(vec)hipLaunchKernelGGL(HIP_KERNEL_NAME(candidate_merge_commit_vec4_kernel<Acc,true,true>),
+                dim3((hidden/4U+127U)/128U,rows),dim3(128),0,stream,v,v.csr.summary,hidden,experts,top_k,output.rows<std::uint16_t>());
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(candidate_merge_commit_kernel<Acc,true,true>),
+                dim3((hidden+255U)/256U,rows),dim3(256),0,stream,v,v.csr.summary,hidden,experts,top_k,output.rows<std::uint16_t>());
+        };
+        if(tail==0U)launch.template operator()<false>();else launch.template operator()<true>();
+        hipLaunchKernelGGL(candidate_finish_kernel,dim3(32),dim3(256),0,stream,v,v.csr.summary,rows,hidden,
+            output.rows<std::uint16_t>(),static_cast<unsigned*>(record.base));
+        check(hipGetLastError(),"I8 merge/finish launch");check(hipStreamSynchronize(stream),"I8 merge/finish");
+        const auto actual=output.read();
+        std::vector<unsigned char> accumulation(static_cast<std::size_t>(rows*v.clear.stride));
+        check(hipMemcpy(accumulation.data(),v.clear.base,accumulation.size(),hipMemcpyDeviceToHost),"I8 accumulation");
+        unsigned header=0;check(hipMemcpy(&header,v.csr.summary,4U,hipMemcpyDeviceToHost),"I8 merge header");
+        route_fixture_require(header==0U,"I8 finite merge failed");
+        for(unsigned r=0;r<rows;++r)for(unsigned c=0;c<hidden;++c) {
+            float sum=0.0F;double exact=0.0,quantized=0.0,bound=0.0,scale=0.0;
+            for(unsigned slot=0;slot<top_k;++slot) {
+                const auto index=static_cast<std::uint64_t>(slot)*hidden+c,at=r*v.rawdots.stride+4U*index;
+                const float dot=route_fixture_at<float>(ref.widened,at),w=route_fixture_at<float>(weights,r*v.route_weights.stride+4ULL*slot);
+                sum=std::fma(w,dot,sum);
+                exact+=static_cast<double>(w)*route_fixture_at<float>(original,at);
+                quantized+=static_cast<double>(w)*dot;
+                bound+=std::abs(static_cast<double>(w))*ref.bounds[static_cast<std::size_t>((static_cast<std::uint64_t>(r)*top_k*hidden)+index)];
+                scale+=std::abs(static_cast<double>(w))*(std::abs(static_cast<double>(dot))+std::abs(static_cast<double>(route_fixture_at<float>(original,at))));
+            }
+            route_fixture_require(std::abs(quantized-exact)<=bound+scale*0x1p-48,"I8 weighted merge perturbation bound");
+            route_fixture_require(route_fixture_at<std::uint16_t>(actual,r*output.stride+2ULL*c)==route_bf16_reference(sum),"I8 slot-ordered FMA output");
+            if(tail!=0U)route_fixture_require(route_fixture_at<unsigned>(accumulation,r*v.clear.stride+4ULL*c)==std::bit_cast<unsigned>(sum),"I8 slot-ordered FMA accumulation");
+        }
+    }
+}
+
+void route_i8_tests() {
+    route_fixture_require(strix::moe_route_i8_enabled(),"route-i8 requires STRIX_PREFILL_MOE_ROUTE_I8=1 (default OFF)");
+    route_fixture_require(strix::moe_prefill_storage_name(true)=="fp16-v1+moeroute16+moeroutei8"&&
+        strix::moe_prefill_storage_identity(true,true)!=strix::moe_prefill_storage_identity(true,false)&&
+        strix::moe_prefill_storage_identity(false,true)==strix::moe_prefill_storage_identity(false,false),"I8 storage identity binding");
+    unsigned cases=0;
+    for(unsigned hidden:{2U,3U,17U,31U,32U,33U,63U,64U,65U,68U,97U})for(unsigned top_k:{1U,3U,10U})for(unsigned flavor=0;flavor<10U;++flavor) {
+        constexpr unsigned Rows=2U;
+        Buffer input(Rows,4ULL*hidden*top_k),raw(Rows,4ULL*hidden*top_k),decoded(Rows,4ULL*hidden*top_k),unsafe(1,4U);
+        std::vector<unsigned char> source(static_cast<std::size_t>(input.bytes),0xa5U);
+        for(unsigned r=0;r<Rows;++r)for(unsigned s=0;s<top_k;++s)for(unsigned c=0;c<hidden;++c) {
+            const float ties[8]{0.5F,-0.5F,1.5F,-1.5F,2.5F,-2.5F,127.49F,-127.49F};
+            float dot=ties[(c+s+r)%8U];
+            if(flavor==0U)dot=(c&1U)?-0.0F:0.0F;
+            if(flavor==2U)dot=c%32U==0U?127.5F:dot;
+            if(flavor==3U)dot=std::bit_cast<float>(1U+(c%32U));
+            if(flavor==4U&&c==0U)dot=std::bit_cast<float>(0x7f7fffffU);
+            if(flavor==5U&&c==0U)dot=std::bit_cast<float>((s&1U)?0xff800000U:0x7f800000U);
+            if(flavor==6U&&c==0U)dot=std::bit_cast<float>((s&1U)?0xff800001U:0x7f800001U);
+            if(flavor==7U)dot=std::ldexp(dot,-120);
+            if(flavor==8U)dot=std::ldexp(dot,120);
+            if(flavor==9U&&c%32U==0U)dot=std::nextafter(127.5F,0.0F);
+            std::memcpy(source.data()+r*input.stride+4ULL*(s*hidden+c),&dot,4U);
+        }
+        const auto ref=route_i8_reference(source,input.stride,Rows,hidden,top_k);
+        check(hipMemcpy(input.base,source.data(),source.size(),hipMemcpyHostToDevice),"I8 edge upload");
+        raw.poison(nullptr);decoded.poison(nullptr);check(hipMemset(unsafe.base,0,4U),"I8 edge proof clear");
+        kr::PrefillRows v{};v.rawdots=raw.rows<float>();v.unsafe=static_cast<unsigned*>(unsafe.base);
+        hipLaunchKernelGGL(route_i8_edge_store,dim3((((hidden+31U)/32U)*top_k+1U)/2U,Rows),dim3(32),0,nullptr,
+            v,static_cast<const float*>(input.base),hidden,top_k);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(route_i8_edge_load<false>),dim3((hidden*top_k+255U)/256U,Rows),dim3(256),0,nullptr,
+            v,static_cast<float*>(decoded.base),hidden,top_k);
+        check(hipGetLastError(),"I8 edge launch");check(hipStreamSynchronize(nullptr),"I8 edge completion");
+        route_fixture_require(raw.read()==ref.storage,"I8 edge codes/exponents/fallback or poisoned tail mismatch");
+        route_fixture_require(decoded.read()==ref.widened,"I8 edge FP32 reconstruction mismatch");
+        if(hidden%4U==0U) {
+            decoded.poison(nullptr);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(route_i8_edge_load<true>),dim3((hidden*top_k/4U+255U)/256U,Rows),dim3(256),0,nullptr,
+                v,static_cast<float*>(decoded.base),hidden,top_k);
+            check(hipGetLastError(),"I8 edge vec4 launch");check(hipStreamSynchronize(nullptr),"I8 edge vec4 completion");
+            route_fixture_require(decoded.read()==ref.widened,"I8 edge vector reconstruction mismatch");
+        }
+        unsigned expected_unsafe=0;
+        for(unsigned r=0;r<Rows;++r)for(unsigned i=0;i<hidden*top_k;++i)
+            expected_unsafe|=(route_fixture_at<unsigned>(ref.widened,r*input.stride+4ULL*i)&0x7fffffffU)>=0x7b800000U?1U:0U;
+        route_fixture_require(route_fixture_at<unsigned>(unsafe.read(),0)==expected_unsafe,"I8 stored-dot certificate mismatch");
+        if(flavor==0U||flavor==1U||flavor==2U||flavor==7U||flavor==9U) {
+            Buffer routes(Rows,4U*top_k),weights(Rows,4U*top_k),status(Rows,4U),header(1,96U),acc(Rows,4U*hidden);
+            std::vector<unsigned char> route_bytes(static_cast<std::size_t>(routes.bytes),0U),weight_bytes(static_cast<std::size_t>(weights.bytes),0U);
+            for(unsigned r=0;r<Rows;++r)for(unsigned slot=0;slot<top_k;++slot) {
+                const float weight=slot%3U==0U?0.0F:slot%2U?-0.25F:0.75F;
+                std::memcpy(route_bytes.data()+r*routes.stride+4ULL*slot,&slot,4U);
+                std::memcpy(weight_bytes.data()+r*weights.stride+4ULL*slot,&weight,4U);
+            }
+            check(hipMemcpy(routes.base,route_bytes.data(),route_bytes.size(),hipMemcpyHostToDevice),"I8 synthetic routes");
+            check(hipMemcpy(weights.base,weight_bytes.data(),weight_bytes.size(),hipMemcpyHostToDevice),"I8 synthetic weights");
+            check(hipMemset(status.base,0,static_cast<std::size_t>(status.bytes)),"I8 synthetic statuses");
+            check(hipMemset(header.base,0,static_cast<std::size_t>(header.bytes)),"I8 synthetic header");
+            v.routes=routes.rows<const unsigned>();v.route_weights=weights.rows<const float>();v.status=status.rows<unsigned>();
+            v.clear=acc.rows<float>();v.csr.summary=static_cast<unsigned*>(header.base);
+            route_i8_merge_checks(v,ref,source,weight_bytes,Rows,hidden,16U,top_k,nullptr);
+        }
+        ++cases;
+    }
+    route_fixture_require(strix::moe_route_i8_layout(1U,1U).bytes>4U,"I8 tiny arena must decline");
+    kr::set_prefill_core2(0);kr::set_prefill_route(14);kr::set_prefill_da16(1);kr::set_prefill_small(0);kr::set_prefill_xor64(1);
+    for(unsigned rows:{48U,208U,3072U})for(unsigned gate:{12U,13U})for(unsigned down:{7U,8U}) {
+        const unsigned experts=rows==3072U?512U:16U;
+        Fixture f({"route I8",experts,rows,gate,down,4U,true,true,false});
+        f.view.unsafe=static_cast<unsigned*>(f.admission.base);
+        const auto fp32=f.run(3);
+        f.view.route_bf16=true;const auto bf16=f.run(3);
+        f.view.route_i8=true;const auto compact=f.run(3); // compiled resource gate runs before device work
+        route_fixture_require(kr::prefill_certificate_produced()&&kr::prefill_da16_ran(),"I8 DA16 certificate missing");
+        const auto ref=route_i8_reference(fp32[9],f.rawdots.stride,rows,Fixture::H,Fixture::K);
+        route_fixture_require(compact[9]==ref.storage,"I8 DA16 bytes differ from independent quantizer");
+        for(unsigned i=0;i<compact.size();++i)if(i!=9U)route_fixture_require(compact[i]==bf16[i],"I8 changed non-route producer bytes");
+        route_i8_merge_checks(f.view,ref,fp32[9],f.weights.read(),rows,Fixture::H,experts,Fixture::K,f.stream);
+        f.view.route_i8=false;
+        route_fixture_require(f.run(3)==bf16,"I8 OFF did not restore route BF16 bytes");
+        ++cases;
+    }
+    kr::set_prefill_core2(-1);kr::set_prefill_route(-1);kr::set_prefill_da16(-1);kr::set_prefill_small(-1);kr::set_prefill_xor64(-1);
+    std::printf("route I8: %u storage/DA16 cases plus scalar/vector MC/unsafe merge arms passed; model qualification still required\n",cases);
+}

@@ -31,6 +31,8 @@ template <unsigned Rows> struct Views {
     std::uint32_t count[Rows];
     std::uint32_t visible[Rows];
     bool compact_output = false;
+    const float* block_scores[Rows]{}; // cap only: valid until the score-ring lease ends
+    std::uint32_t score_blocks[Rows]{}; // dense rows were not scored; their score ties at -inf
     __device__ __forceinline__ RoundedStageImage image(unsigned r) const { return {output[r], compact_output}; }
 };
 // Floats of a row's scratch the fast path needs (union_at + union) for TR-row tiles.
@@ -97,6 +99,150 @@ constexpr unsigned kMergeCap = 2052U;
 constexpr unsigned kMergeMinBlocks = 6U * kRangeBlocks;
 template <unsigned TR> constexpr bool kMergeFits = TR <= 4U;
 template <unsigned TR> constexpr unsigned kUnionLdsWords = kMergeFits<TR> && TR * kMergeCap > kRangeBlocks ? TR * kMergeCap : kRangeBlocks;
+
+constexpr unsigned kUnionStatsBins = 16U * kMergeCap + 1U;
+struct UnionStatsResult {
+    unsigned long long rows = 0, tiles = 0, per_row_blocks = 0, blocks = 0, chunks = 0, padded = 0;
+    unsigned p50 = 0, p90 = 0, maximum = 0;
+};
+struct UnionStats { UnionStatsResult result; unsigned histogram[kUnionStatsBins]; };
+// Only diagnostic storage is written. Quantiles are nearest ranks of unpadded tile sizes.
+template <unsigned TR>
+__device__ void union_stats_add(const std::uint32_t* header, UnionStats* stats) {
+    const auto* pairs = reinterpret_cast<const uint2*>(header + 4U + TR);
+    unsigned n = header[0];
+    while (n && !pairs[n - 1U].y) --n;
+    unsigned memberships = 0U;
+    for (unsigned i = 0; i < n; ++i) memberships += static_cast<unsigned>(__popc(pairs[i].y));
+    atomicAdd(&stats->result.rows, static_cast<unsigned long long>(TR));
+    atomicAdd(&stats->result.tiles, 1ULL);
+    atomicAdd(&stats->result.per_row_blocks, static_cast<unsigned long long>(memberships));
+    atomicAdd(&stats->result.blocks, static_cast<unsigned long long>(n));
+    atomicAdd(&stats->result.chunks, static_cast<unsigned long long>(header[0] / 4U));
+    atomicAdd(&stats->result.padded, static_cast<unsigned long long>(header[0] - n));
+    atomicMax(&stats->result.maximum, n);
+    atomicAdd(&stats->histogram[min(n, kUnionStatsBins - 1U)], 1U);
+}
+[[maybe_unused]] __global__ void union_stats_finish_kernel(UnionStats* stats, UnionStatsResult* out) {
+    if (threadIdx.x) return;
+    auto result = stats->result;
+    const auto half = (result.tiles + 1ULL) / 2ULL, nine = (9ULL * result.tiles + 9ULL) / 10ULL;
+    unsigned long long sum = 0ULL;
+    for (unsigned i = 0; i < kUnionStatsBins; ++i) {
+        const auto before = sum;
+        sum += stats->histogram[i];
+        if (before < half && sum >= half) result.p50 = i;
+        if (before < nine && sum >= nine) result.p90 = i;
+    }
+    *out = result;
+}
+
+// NaNs rank as -inf, signed zeros tie. This key is only an indexer ranking, never attention arithmetic.
+__device__ __forceinline__ unsigned union_score_key(float score) {
+    if (isnan(score)) score = -INFINITY;
+    unsigned bits = __float_as_uint(score);
+    if (!(bits & 0x7fffffffU)) bits = 0U;
+    return bits & 0x80000000U ? ~bits : bits | 0x80000000U;
+}
+template <unsigned Rows, unsigned TR>
+__device__ unsigned union_block_score(const Views<Rows>& v, unsigned r0, uint2 pair) {
+    unsigned best = union_score_key(-INFINITY);
+    for (unsigned r = 0; r < TR; ++r)
+        if ((pair.y & (1U << r)) && pair.x < v.score_blocks[r0 + r])
+            best = max(best, union_score_key(v.block_scores[r0 + r][pair.x]));
+    return best;
+}
+__device__ __forceinline__ unsigned union_rank_byte(uint2 pair, unsigned score, unsigned pass, unsigned rows) {
+    if (!pass) return rows - static_cast<unsigned>(__popc(pair.y & 0xffffU));
+    if (pass < 5U) return (~score >> (8U * (4U - pass))) & 255U;
+    return (pair.x >> (8U * (8U - pass))) & 255U;
+}
+// Four-row production tiles only. Reuse the union builder's LDS; no additional launch or allocation.
+// Mandatory entries can exceed the requested cap. Nine radix bytes choose a total order in O(9*N).
+// For fixed finite Q/K/V in real arithmetic, dropped softmax mass p gives ||delta O|| <= 2*p*max||V||.
+// Rechunking also changes rounding; this is neither a floating-point error bound nor model qualification.
+template <unsigned Rows, unsigned TR>
+__device__ void union_cap_body(const Views<Rows>& v, unsigned r0, std::uint32_t* header,
+    unsigned cap, unsigned* scores, unsigned* waves) {
+    static_assert(TR == 4U);
+    constexpr unsigned Keep = 1U << 31U, Candidate = 1U << 30U;
+    __shared__ unsigned n, remaining, bucket, mandatory;
+    __shared__ unsigned row_keep[TR], histogram[256];
+    const unsigned t = threadIdx.x;
+    auto* pairs = reinterpret_cast<uint2*>(header + 4U + TR);
+    __syncthreads();
+    if (!t) { n = header[0]; while (n && !pairs[n - 1U].y) --n; }
+    __syncthreads();
+    if (!cap || n <= cap) return; // preserve every byte, including the old padding and header
+    if (t < TR) {
+        unsigned best = 0U, at = n;
+        for (unsigned i = 0; i < n; ++i) {
+            const auto pair = pairs[i];
+            if (!(pair.y & (1U << t)) || pair.x * 4U >= v.visible[r0 + t]) continue;
+            const unsigned key = pair.x < v.score_blocks[r0 + t] ?
+                union_score_key(v.block_scores[r0 + t][pair.x]) : union_score_key(-INFINITY);
+            if (at == n || key > best) { best = key; at = i; } // ascending IDs break ties
+        }
+        row_keep[t] = at;
+    }
+    if (!t) mandatory = 0U;
+    __syncthreads();
+    for (unsigned i = t; i < n; i += 256U) {
+        auto pair = pairs[i];
+        scores[i] = union_block_score<Rows, TR>(v, r0, pair);
+        bool keep = false;
+        for (unsigned r = 0; r < TR; ++r) {
+            keep = keep || row_keep[r] == i;
+            keep = keep || ((pair.y & (1U << r)) && v.visible[r0 + r] && pair.x == (v.visible[r0 + r] - 1U) / 4U);
+            keep = keep || (!pair.x && header[4U + r]); // packed token-0..3 multiplicities
+        }
+        pair.y |= keep ? Keep : Candidate;
+        pairs[i] = pair;
+        if (keep) atomicAdd(&mandatory, 1U);
+    }
+    __syncthreads();
+    if (!t) remaining = cap > mandatory ? cap - mandatory : 0U;
+    __syncthreads();
+    for (unsigned pass = 0; pass < 9U && remaining; ++pass) {
+        histogram[t] = 0U;
+        __syncthreads();
+        for (unsigned i = t; i < n; i += 256U) {
+            const auto pair = pairs[i];
+            if (pair.y & Candidate) atomicAdd(&histogram[union_rank_byte(pair, scores[i], pass, TR)], 1U);
+        }
+        __syncthreads();
+        if (!t) {
+            bucket = 0U;
+            while (bucket < 255U && remaining > histogram[bucket]) remaining -= histogram[bucket++];
+        }
+        __syncthreads();
+        for (unsigned i = t; i < n; i += 256U) {
+            auto pair = pairs[i];
+            if (!(pair.y & Candidate)) continue;
+            const auto byte = union_rank_byte(pair, scores[i], pass, TR);
+            if (byte < bucket || (pass == 8U && byte == bucket)) pair.y = (pair.y & ~Candidate) | Keep;
+            else if (byte > bucket) pair.y &= ~Candidate;
+            pairs[i] = pair;
+        }
+        __syncthreads();
+    }
+    unsigned written = 0U;
+    for (unsigned base = 0; base < n; base += 256U) {
+        const unsigned i = base + t;
+        const auto pair = i < n ? pairs[i] : make_uint2(0U, 0U);
+        __syncthreads(); // all reads precede the in-place ascending compaction
+        const unsigned keep = (pair.y & Keep) ? 1U : 0U;
+        unsigned total;
+        const auto at = block_exclusive(keep, waves, total);
+        if (keep) pairs[written + at] = make_uint2(pair.x, pair.y & 0xffffU);
+        written += total;
+        __syncthreads();
+    }
+    const unsigned padded = (written + 3U) / 4U * 4U;
+    for (unsigned i = written + t; i < header[0]; i += 256U) pairs[i] = make_uint2(0U, 0U);
+    __syncthreads();
+    if (!t) header[0] = padded;
+}
 template <unsigned Rows, unsigned TR>
 __device__ __forceinline__ bool union_merge(const Views<Rows>& v, unsigned r0, unsigned blocks, std::uint32_t* lists,
     std::uint16_t* pre, std::uint32_t* weight, std::uint32_t* waves, uint2* pairs, unsigned& written) {
@@ -168,9 +314,10 @@ __device__ __forceinline__ bool union_merge(const Views<Rows>& v, unsigned r0, u
 }
 
 // tile: the TR-row tile of the group (blockIdx.x of union_kernel / attend_kernel).
-template <unsigned Rows, unsigned TR, bool Merge = true>
-__device__ __forceinline__ void union_body(const Views<Rows>& v, std::uint32_t union_at, unsigned tile) {
-    __shared__ std::uint32_t mask[kUnionLdsWords<TR>]; // the range form's block masks, or the merge form's block lists
+template <unsigned Rows, unsigned TR, bool Merge = true, bool Capped = false>
+__device__ __forceinline__ void union_body(const Views<Rows>& v, std::uint32_t union_at, unsigned tile,
+    unsigned cap = 0U, UnionStats* stats = nullptr) {
+    __shared__ std::uint32_t mask[Capped ? TR * kMergeCap : kUnionLdsWords<TR>]; // cap reuses this for score keys
     __shared__ std::uint16_t merge_prefix[Merge && kMergeFits<TR> ? TR * (kMergeCap + 1U) : 1U];
     __shared__ std::uint32_t weight[TR * 4U];
     __shared__ std::uint32_t waves[8];
@@ -214,16 +361,23 @@ __device__ __forceinline__ void union_body(const Views<Rows>& v, std::uint32_t u
         for (unsigned k = 0; k < 4U; ++k) packed |= min(weight[t * 4U + k], 255U) << (8U * k);
         header[4U + t] = packed;
     }
+    if (stats) {
+        __syncthreads();
+        if (!t) union_stats_add<TR>(header, stats); // original union, before any FAST removal
+    }
+    if constexpr (Capped) union_cap_body<Rows, TR>(v, r0, header, cap, mask, waves);
 }
 
-template <unsigned Rows, unsigned TR, bool Merge = true>
-__global__ __launch_bounds__(256) void union_kernel(Views<Rows> v, std::uint32_t union_at) {
-    union_body<Rows, TR, Merge>(v, union_at, blockIdx.x);
+template <unsigned Rows, unsigned TR, bool Merge = true, bool Capped = false>
+__global__ __launch_bounds__(256) void union_kernel(Views<Rows> v, std::uint32_t union_at,
+    unsigned cap = 0U, UnionStats* stats = nullptr) {
+    union_body<Rows, TR, Merge, Capped>(v, union_at, blockIdx.x, cap, stats);
 }
 // Several groups of one call in one launch (STRIX_QSA_ATTEND_BATCH): block x = group * (Rows / TR) + tile.
-template <unsigned Rows, unsigned TR, bool Merge = true>
-__global__ __launch_bounds__(256) void union_multi_kernel(const Views<Rows>* groups, std::uint32_t union_at) {
-    union_body<Rows, TR, Merge>(groups[blockIdx.x / (Rows / TR)], union_at, blockIdx.x % (Rows / TR));
+template <unsigned Rows, unsigned TR, bool Merge = true, bool Capped = false>
+__global__ __launch_bounds__(256) void union_multi_kernel(const Views<Rows>* groups, std::uint32_t union_at,
+    unsigned cap = 0U, UnionStats* stats = nullptr) {
+    union_body<Rows, TR, Merge, Capped>(groups[blockIdx.x / (Rows / TR)], union_at, blockIdx.x % (Rows / TR), cap, stats);
 }
 
 // One workgroup: G column groups of 16 query columns, each run by a pair of compute waves that split the 256
@@ -251,7 +405,7 @@ __device__ __forceinline__ u32x2 load8(const void* p) {
 __device__ __forceinline__ float load_scale(const void* p) {
     return *reinterpret_cast<const __attribute__((address_space(1))) float*>(reinterpret_cast<std::uintptr_t>(p));
 }
-template <unsigned Rows, unsigned TR, unsigned G, unsigned D, bool Int8>
+template <unsigned Rows, unsigned TR, unsigned G, unsigned D, bool Int8, bool Capture = false>
 __device__ __forceinline__ void attend_body(const Views<Rows>& v, const std::uint16_t* kv, std::uint32_t kv_heads,
     std::uint32_t heads, std::uint32_t union_at, std::uint32_t splits, std::uint32_t debug, unsigned tile, unsigned yb) {
     constexpr unsigned HPW = 16U / TR, HG = G * HPW, Loaders = 128U, Compute = 2U * G;
@@ -512,6 +666,14 @@ __device__ __forceinline__ void attend_body(const Views<Rows>& v, const std::uin
             acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, pb, acc[n]);
         }
         lds_barrier();
+    }
+    if constexpr (Capture) { // fixture-only final online state, before the lossy output rounding
+        float* state = v.scratch[r] + static_cast<std::uint64_t>(head) * kPartial;
+        if (fh == 0U && half == 0U) { state[0] = m_run; state[1] = l_run; }
+#pragma unroll
+        for (unsigned n = 0; n < 8U; ++n)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) state[2U + fh * (kDim / 2U) + 16U * n + 2U * e + half] = acc[n][e];
     }
     if (splits == 1U) {
         // One slice: combine_kernel's arithmetic for one split, in place.

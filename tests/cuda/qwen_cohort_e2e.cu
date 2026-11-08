@@ -418,6 +418,7 @@ int main(int argc, char** argv) {
         o.want_logits = true;  // max_positions 0: the engine's
         o.draft_batch = draft_batch;
         if (budget) o.budget = budget;
+        o.wide_rule = 0;  // the wide arms cover the 9..16-row windows themselves (the rule would keep them at 8)
         std::vector<std::uint32_t> produced(S, 0), live(S);
         for (std::uint32_t i = 0; i < S; ++i) live[i] = i;
         std::uint32_t diff = 0, failed = 0, steps = 0, retried = 0;

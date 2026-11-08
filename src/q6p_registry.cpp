@@ -37,6 +37,13 @@ void register_tensor(const void* original_address, const Tensor& tensor) {
     r.tensors[original_address] = tensor;
 }
 
+void unregister_tensor(const void* original_address, const unsigned char* copy_address) noexcept {
+    auto& r = registry();
+    const std::unique_lock lock(r.mutex);
+    const auto it = r.tensors.find(original_address);
+    if (it != r.tensors.end() && it->second.base == copy_address) r.tensors.erase(it);
+}
+
 void clear() noexcept {
     auto& r = registry();
     const std::unique_lock lock(r.mutex);

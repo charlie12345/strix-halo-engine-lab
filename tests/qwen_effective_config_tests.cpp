@@ -1112,6 +1112,160 @@ void yarn_owner_inventory_regression(RequestedOptions request, const gguf::FileI
               << " spare=" << *memory.total-admitted.admission.at("required_bytes") << '\n';
 }
 
+// Levers that the YaRN route admits after an audit of their rotary sites (docs/models/qwen3.8/allon.md). The Linux
+// YaRN route collects every inherited STRIX_ variable, so a lever missing from the classification table refuses by name.
+void yarn_lever_admission_tests(const gguf::FileInfo& info, const ModelManifest& manifest) {
+    (void)info; (void)manifest;
+    for (const char* value : {"0", "1", "exact", "fast"})
+        expect(yarn_environment_refusal({{"STRIX_QWEN_ALLON", value}}, 2).empty(),
+            "YaRN admits the composition profile switch; its levers are classified one by one");
+    expect(!yarn_environment_refusal({{"STRIX_QWEN_ALLON", "2"}}, 2).empty(), "YaRN profile switch values stay bounded");
+    {
+        // The whole composition profile against the YaRN classification: the exact profile is admitted as exported; the FAST profile
+        // names the two levers that stay refused (attention budget, one-byte route storage) and runs once they are set off.
+        Environment exact_profile{{"STRIX_QWEN_ALLON", "1"}}, fast_profile{{"STRIX_QWEN_ALLON", "fast"}};
+        for (const auto& lever : qwen_allon::levers) {
+            if (!lever.fast) exact_profile[lever.env] = lever.on;
+            fast_profile[lever.env] = lever.on;
+        }
+        expect(yarn_environment_refusal(exact_profile, 2).empty() && yarn_environment_refusal(exact_profile, 4).empty(),
+            "YaRN admits every variable the exact composition profile exports");
+        expect(yarn_environment_refusal(fast_profile, 2) == "YaRN execution environment not supported: "
+            "STRIX_PREFILL_MOE_ROUTE_I8 (accepts 0), STRIX_QPF2K_QSA_BUDGET (accepts 0)",
+            "YaRN names the two FAST levers of the profile it refuses");
+        fast_profile["STRIX_QPF2K_QSA_BUDGET"] = "0";
+        fast_profile["STRIX_PREFILL_MOE_ROUTE_I8"] = "0";
+        expect(yarn_environment_refusal(fast_profile, 2).empty(), "YaRN admits the FAST profile with the two refused levers set off");
+    }
+    for (const char* value : {"0", "1"})
+        expect(yarn_environment_refusal({{"STRIX_MTP_DEVICE_HANDOFF", value}}, 2).empty(), "YaRN classifies the MTP device handoff switch");
+    expect(!yarn_environment_refusal({{"STRIX_MTP_DEVICE_HANDOFF", "2"}}, 2).empty(), "YaRN device handoff values stay bounded");
+    {
+        Options plain, mtp;
+        mtp.mtp.enabled = true;
+        const Environment on{{"STRIX_MTP_DEVICE_HANDOFF", "1"}}, off{{"STRIX_MTP_DEVICE_HANDOFF", "0"}};
+        expect(yarn_mtp_environment_refusal(plain, on).empty() && yarn_mtp_environment_refusal(mtp, off).empty() &&
+            yarn_mtp_environment_refusal(mtp, Environment{}).empty(), "YaRN device handoff is inert off MTP and admitted off");
+        expect(yarn_mtp_environment_refusal(mtp, on).find("STRIX_MTP_DEVICE_HANDOFF=1") != std::string::npos,
+            "YaRN MTP refuses the unaudited device handoff by name");
+    }
+    {
+        // STRIX_QPF2K_T16K=1 on plain YaRN prefill: T16384 first with the native fallback to T8192, budgets taken from the plan.
+        auto model = ModelContract::qwen38_flash_next(); model.qwen_rotary_table = mock_rotary(2);
+        RequestedOptions request;
+        request.options = parse({"decoder","MODEL","1","--rope-yarn","2","--context","300000","--generate","32"});
+        request.options.tokens.resize(20000U,1U);
+        auto memory = ample_memory(); memory.total = 124U*gib_bytes;
+        std::vector<std::uint32_t> tried;
+        bool refuse_t16k = false;
+        const auto base_estimate = memory.estimate;
+        memory.estimate = [&](const Options& o) {
+            tried.push_back(o.known_prefix_prefill_rows);
+            if (refuse_t16k && o.known_prefix_prefill_rows == 16384U) throw std::runtime_error("insufficient-memory");
+            auto required = base_estimate(o);
+            required.workspace = static_cast<std::uint64_t>(o.known_prefix_prefill_rows) * (gib_bytes / 2048U);
+            required.tails = required.workspace / 8U;
+            return required;
+        };
+        const auto resolve = [&](const RequestedOptions& r) {
+            tried.clear();
+            return resolve_effective_config(r, model, info, manifest, validated_model_content_identity, {true,true,true}, memory);
+        };
+        const auto off = resolve(request);
+        expect(off.admitted && off.options.known_prefix_prefill_rows == 8192U && tried.front() == 8192U,
+            "YaRN keeps T8192 first by default");
+        auto on = request; on.environment["STRIX_QPF2K_T16K"] = "1";
+        const auto got = resolve(on);
+        expect(got.admitted && got.options.known_prefix_prefill_rows == 16384U && tried.front() == 16384U,
+            "YaRN STRIX_QPF2K_T16K=1 tries T16384 first");
+        expect(got.options.known_prefill_workspace_budget == 16384U * (gib_bytes / 2048U) + 16384U * (gib_bytes / 2048U) / 8U &&
+            got.options.known_prefill_metadata_budget == 512U * 1024U * 1024U, "YaRN T16384 budgets are the planned workspace and metadata");
+        expect(off.options.known_prefill_workspace_budget == 8U * gib_bytes && off.options.known_prefill_metadata_budget == gib_bytes,
+            "YaRN T8192 keeps its static budgets");
+        refuse_t16k = true;
+        const auto fell = resolve(on);
+        expect(fell.admitted && fell.options.known_prefix_prefill_rows == 8192U && fell.tile_fallback.find("T16384") == 0U &&
+            fell.options.known_prefill_workspace_budget == 8U * gib_bytes, "YaRN T16384 falls back to T8192 with its reason");
+        refuse_t16k = false;
+        auto zero = request; zero.environment["STRIX_QPF2K_T16K"] = "0";
+        expect(resolve(zero).options.known_prefix_prefill_rows == 8192U, "YaRN T16K=0 keeps T8192");
+        auto small = on; small.options.tokens.resize(16383U, 1U);
+        expect(resolve(small).options.known_prefix_prefill_rows == 8192U, "YaRN below 16384 tokens keeps T8192");
+    }
+    {
+        // Direct-B prepared planes on plain YaRN prefill: the policy admits it, the YaRN memory estimate (the sum of its named
+        // owners) names the planes, and the MTP verifier route stays declined.
+        Options o = parse({"decoder","MODEL","1","--rope-yarn","2","--context","300000","--generate","32"});
+        o.prefill_numerical_profile = DecodeNumericalProfile::fast_prefill_f16wmma_v1;
+        o.known_prefix_window = o.known_prefix_full_rows = o.known_prefix_expert_union = true;
+        o.known_prefix_prefill_rows = 8192;
+        ModelManifest direct;
+        ManifestTensor gate; gate.name = "blk.0.ffn_gate_exps.weight"; gate.ggml_type = 12; gate.dimensions = {2560, 640, 512};
+        gate.byte_size = qwen_moe_prepared::describe({qwen_moe_prepared::Format::q4_k, qwen_moe_prepared::Role::gate, 512, 640, 2560}).tensor_bytes;
+        auto up = gate; up.name = "blk.0.ffn_up_exps.weight";
+        direct.tensors = {gate, up};
+        const Environment on{{"STRIX_QPF2K_MOE_DIRECT_B","1"}};
+        const auto policy = moe_direct_b_policy(o, on, direct, true);
+        expect(o.rotary.mode() == RotaryMode::yarn && policy.requested && policy.effective && policy.bytes == 2U * gate.byte_size,
+            "YaRN plain prefill admits the direct B planes");
+        auto mtp = o; mtp.mtp.enabled = true;
+        expect(!moe_direct_b_policy(mtp, on, direct, true).effective, "YaRN MTP stays out of direct B");
+        auto serve = o; serve.http_serve = true;
+        expect(!moe_direct_b_policy(serve, on, direct, true).effective, "YaRN serving stays out of direct B");
+        auto small = o; small.known_prefix_prefill_rows = 2048;
+        expect(!moe_direct_b_policy(small, on, direct, true).effective, "YaRN T2048 fallback leaves direct B");
+        const auto planes = policy.bytes + 396288U;
+        PrefillRequirements named{70U*gib_bytes, 8U*gib_bytes, gib_bytes, 2U*gib_bytes, gib_bytes/2U, gib_bytes/8U, 0U, 9U*gib_bytes};
+        named.owners = {{"model_backing", named.model_backing}, {"runtime_payload", named.runtime_payload}};
+        const auto before = named;
+        charge_moe_direct_b(named, policy);
+        expect(named.owners.at("qwen_moe_direct_b") == planes && named.runtime_payload == before.runtime_payload + planes &&
+            named.device_base == before.device_base + planes && named.owners.at("runtime_payload") == before.owners.at("runtime_payload"),
+            "YaRN estimate names the direct B planes once and charges GTT");
+        PrefillRequirements aggregate = before; aggregate.owners.clear();
+        charge_moe_direct_b(aggregate, policy);
+        expect(aggregate.runtime_payload == before.runtime_payload + planes && aggregate.owners.empty() &&
+            aggregate.device_base == before.device_base, "native aggregate estimate keeps its direct B charge");
+        auto declined = before; charge_moe_direct_b(declined, moe_direct_b_policy(mtp, on, direct, true));
+        expect(declined.runtime_payload == before.runtime_payload && declined.owners == before.owners, "declined policy charges nothing");
+        for (const char* value : {"0", "1"})
+            expect(yarn_environment_refusal({{"STRIX_QPF2K_MOE_DIRECT_B", value}}, 2).empty(), "YaRN admits the direct B switch");
+        expect(!yarn_environment_refusal({{"STRIX_QPF2K_MOE_DIRECT_B", "2"}}, 2).empty(), "YaRN direct B values stay bounded");
+    }
+    for (const char* name : {"STRIX_PREFILL_MOE_ROUTE_I8", "STRIX_QPF2K_QSA_UNION_CAP", "STRIX_QPF2K_QSA_UNION_STATS"}) {
+        expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN admits the OFF arm of an unqualified lever");
+        expect(yarn_environment_refusal({{name, "1"}}, 2) == std::string("YaRN execution environment not supported: ") + name + " (accepts 0)",
+            "YaRN refuses the ON arm of an unqualified lever by name");
+    }
+    for (const char* value : {"0", "1"})
+        expect(yarn_environment_refusal({{"STRIX_PROMPT_BATCH_AUTO", value}}, 2).empty(), "YaRN admits the serving prompt-group switch (inert: HTTP is refused)");
+    expect(!yarn_environment_refusal({{"STRIX_PROMPT_BATCH_AUTO", "2"}}, 2).empty(), "YaRN the serving prompt-group switch (inert: HTTP is refused) values stay bounded");
+    for (const char* value : {"rejection", "coupled"})
+        expect(yarn_environment_refusal({{"STRIX_MTP_SAMPLED_ACCEPT", value}}, 2).empty(), "YaRN admits the sampled MTP acceptance mode (inert: sampling is refused)");
+    expect(!yarn_environment_refusal({{"STRIX_MTP_SAMPLED_ACCEPT", "fast"}}, 2).empty(), "YaRN the sampled MTP acceptance mode (inert: sampling is refused) values stay bounded");
+    for (const char* value : {"0", "1"})
+        expect(yarn_environment_refusal({{"STRIX_QSA_FAST_KV_PAIR", value}}, 2).empty(), "YaRN admits the QSA KV pair loader");
+    expect(!yarn_environment_refusal({{"STRIX_QSA_FAST_KV_PAIR", "2"}}, 2).empty(), "YaRN the QSA KV pair loader values stay bounded");
+    for (const char* value : {"0", "1"})
+        expect(yarn_environment_refusal({{"STRIX_QPF2K_MOE_TILE64", value}}, 2).empty(), "YaRN admits the MoE 64x64 tile");
+    expect(!yarn_environment_refusal({{"STRIX_QPF2K_MOE_TILE64", "2"}}, 2).empty(), "YaRN the MoE 64x64 tile values stay bounded");
+    for (const char* value : {"0", "1"})
+        expect(yarn_environment_refusal({{"STRIX_QPF2K_MOE_DOWN_LDS_EPI", value}}, 2).empty(), "YaRN admits the MoE down LDS epilogue");
+    expect(!yarn_environment_refusal({{"STRIX_QPF2K_MOE_DOWN_LDS_EPI", "2"}}, 2).empty(), "YaRN the MoE down LDS epilogue values stay bounded");
+    for (const char* value : {"0", "1", "2"})
+        expect(yarn_environment_refusal({{"STRIX_QPF2K_MOE_TIERS", value}}, 2).empty(), "YaRN admits the MoE narrow tiers");
+    expect(!yarn_environment_refusal({{"STRIX_QPF2K_MOE_TIERS", "3"}}, 2).empty(), "YaRN the MoE narrow tiers values stay bounded");
+    for (const char* value : {"0", "1"})
+        expect(yarn_environment_refusal({{"STRIX_QPF2K_HC_OUT16_INVERSE_REUSE", value}}, 2).empty(), "YaRN admits the HC inverse reuse");
+    expect(!yarn_environment_refusal({{"STRIX_QPF2K_HC_OUT16_INVERSE_REUSE", "2"}}, 2).empty(), "YaRN the HC inverse reuse values stay bounded");
+    for (const char* value : {"0", "1"})
+        expect(yarn_environment_refusal({{"STRIX_QPF2K_HC_RECOMPUTE_NORM", value}}, 2).empty(), "YaRN admits the HC normalized recompute");
+    expect(!yarn_environment_refusal({{"STRIX_QPF2K_HC_RECOMPUTE_NORM", "2"}}, 2).empty(), "YaRN the HC normalized recompute values stay bounded");
+    for (const char* value : {"0", "1"})
+        expect(yarn_environment_refusal({{"STRIX_QPF2K_PLE_TILE", value}}, 2).empty(), "YaRN admits the PLE shared input panel");
+    expect(!yarn_environment_refusal({{"STRIX_QPF2K_PLE_TILE", "2"}}, 2).empty(), "YaRN PLE panel values stay bounded");
+}
+
 void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manifest) {
     for (const auto factor : {0U,2U,4U}) {
         auto model = ModelContract::qwen38_flash_next();
@@ -2875,6 +3029,39 @@ void prefill_identity_equivalence_tests() {
 }
 
 int main(int argc, char** arguments) {
+    {
+        const auto island_gate = parse({"decoder", "MODEL", "1", "--context", "33280", "--unqualified-context",
+            "--generate", "256", "--optimization-profile", "manual", "--gdn-islands", "--deferred-moe-status",
+            "--virtual-q8-gdn-input", "--prefetch-q8-gdn-input", "--virtual-q8-gdn-output"});
+        validate_resolved_gdn_islands(island_gate);
+        expect(island_gate.gdn_islands && island_gate.context_tokens == 33280,
+            "native fusion gate pins the complete island contract and long-context acknowledgement");
+    }
+    {
+        EffectiveConfig c;
+        const auto reported = [&] { return effective_config_json(c); };
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"opt-in-not-requested\"}") != std::string::npos,
+            "R1 decode fusion is an opt-in and reports it off by default");
+        c.environment["STRIX_QWEN_DECODE_FUSE"] = "0";
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"opt-in-not-requested\"}") != std::string::npos,
+            "R1 decode fusion reports its OFF from the snapshot");
+        c.environment["STRIX_QWEN_DECODE_FUSE"] = "1";
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":true,\"suppression\":null}") != std::string::npos,
+            "R1 decode fusion reports the opt-in ON");
+        c.environment["STRIX_QWEN_DECODE_FUSE"] = "1";
+        for (const auto* name : {"STRIX_BASELINE", "STRIX_QPF2K_DEFAULTS"}) {
+            c.environment[name] = std::string_view(name) == "STRIX_BASELINE" ? "1" : "0";
+            expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false") != std::string::npos,
+                "baseline and defaults-off override explicit fusion ON");
+            c.environment.erase(name);
+        }
+        c.gsq_owner = true;
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"gsq\"}") != std::string::npos,
+            "GSQ declines decode fusion");
+        c.gsq_owner = false; c.options.baseline = true;
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"baseline\"}") != std::string::npos,
+            "CLI baseline declines decode fusion");
+    }
     resident_fallback_tests();
     mtp_reservation_arithmetic_tests();
     prefill_identity_plumbing_tests();
@@ -2926,6 +3113,7 @@ int main(int argc, char** arguments) {
         return failures ? 1 : 0;
     }
     yarn_admission_tests(info,manifest);
+    yarn_lever_admission_tests(info,manifest);
     const PrefillCapabilities capabilities{true,true,true};
     auto memory = ample_memory();
     const auto fixture_requirements = memory.estimate;
@@ -2973,7 +3161,8 @@ int main(int argc, char** arguments) {
                 expect(moe_prefill_storage_name(got.options.prefill_moe_route_bf16) ==
                     std::string_view(enabled ? "fp16-v1+moeroute16" : "fp16-v1") &&
                     got.options.product_profile.qualification() == (enabled ? (allow ?
-                        "qualification in progress: moe_route_bf16; unqualified: gdn_fp16_chunk" : "qualification in progress: moe_route_bf16")
+                        "qualification in progress: qsa_budget,moe_route_bf16; unqualified: gdn_fp16_chunk" :
+                        "qualification in progress: qsa_budget,moe_route_bf16")
                         : "qualified"),
                     "product receipt and actual storage identity agree");
                 const auto pair = numerical_profile_pair(got.options);
@@ -2994,7 +3183,8 @@ int main(int argc, char** arguments) {
                     expect(prefill_arithmetic_identity(pair, off.prefill_option_mask, false) != composed,
                         "HC restriction changes composed arithmetic identity independently of BF16 storage");
                     const auto report = serve::parse_json(effective_config_json(off));
-                    expect(report.find("prefill_identity")->as_string() == (master || !gdn ? "fp16-v1" : "fp16-v1+gdnchunk16") &&
+                    expect(report.find("prefill_identity")->as_string() == (master ? "fp16-v1" :
+                        std::string(gdn ? "fp16-v1+gdnchunk16" : "fp16-v1") + (enabled ? "+qsab1536" : "")) &&
                         report.find("prefill_moe_route_bf16")->as_bool() == enabled,
                         "inspection reports independent HC and BF16 controls");
                 }
@@ -3125,7 +3315,7 @@ int main(int argc, char** arguments) {
             const auto reason = got.options.prefill_moe_route_bf16_reason;
             expect(row && row->status == qwen::profile::Status::pending && row->value == "0" &&
                 row->reason == reason && !reason.empty() && reason != "off" &&
-                got.options.product_profile.qualification() == "qualified",
+                got.options.product_profile.qualification() == "qualification in progress: qsa_budget",
                 "declined row reports builtin, pending and the storage decline reason");
             Environment exported;
             qwen::profile::apply(got.options.product_profile, [&](const char* key, const char* value) {
@@ -5320,6 +5510,52 @@ int main(int argc, char** arguments) {
             prefix->find("inflight_reason")->as_string()=="off-switch","effective config reports joining OFF source");
         auto capture=batch;capture.prefix_batch_cert=2;
         expect(prefix_cache_inflight_state(capture).reason=="batch-cert-not-strict-l0","capture-only cert does not arm joining");
+    }
+    {
+        Options o;o.prefill_numerical_profile=DecodeNumericalProfile::fast_prefill_f16wmma_v1;
+        o.known_prefix_window=o.known_prefix_full_rows=o.known_prefix_expert_union=true;
+        o.known_prefix_prefill_rows=4096;
+        ModelManifest m;ManifestTensor g;g.name="blk.0.ffn_gate_exps.weight";g.ggml_type=12;g.dimensions={2560,640,512};
+        g.byte_size=qwen_moe_prepared::describe({qwen_moe_prepared::Format::q4_k,qwen_moe_prepared::Role::gate,512,640,2560}).tensor_bytes;
+        auto u=g;u.name="blk.0.ffn_up_exps.weight";m.tensors={g,u};
+        const auto off=moe_direct_b_policy(o,Environment{},m,true);
+        expect(!off.requested&&!off.effective&&off.reason=="off"&&off.bytes==0,"direct B default is OFF");
+        EffectiveConfig off_config;
+        const auto off_json=serve::parse_json(effective_config_json(off_config));
+        const auto* off_state=off_json.find("prefill_moe_direct_b");
+        expect(!off_state,"direct B OFF preserves inspection bytes");
+        const Environment on{{"STRIX_QPF2K_MOE_DIRECT_B","1"}};
+        const auto selected=moe_direct_b_policy(o,on,m,true);
+        expect(selected.requested&&selected.effective&&selected.bytes==2*g.byte_size,"direct B paired Q4_K production admission");
+        const auto identity=numerical_profile_pair_identity(numerical_profile_pair(o));
+        for(unsigned mutation=0;mutation<17;++mutation) {
+            auto bad=o;auto env=on;auto manifest_copy=m;bool hip=true;
+            if(mutation==0)env.clear();
+            if(mutation==1)env["STRIX_QPF2K_MOE_DIRECT_B"]="01";
+            if(mutation==2)bad.baseline=true;
+            if(mutation==3)hip=false;
+            if(mutation==4)bad.known_prefix_prefill_rows=4088;
+            if(mutation==5)bad.mtp.enabled=true;
+            if(mutation==6)bad.http_serve=true;
+            if(mutation==7)env["STRIX_QPF2K_MOE"]="1";
+            if(mutation==8)manifest_copy.tensors[1].ggml_type=13;
+            if(mutation==9)bad.prefill_moe_route_bf16=true;
+            if(mutation==10)bad.mtp.supplied=true;
+            if(mutation==11)bad.serving_concurrency=2;
+            if(mutation==12)bad.serving_prefill_rows=4096;
+            if(mutation==13)bad.prefix_cache_roundtrip=true;
+            if(mutation==14)bad.session_tiled_suffix=true;
+            if(mutation==15)bad.session_live_control=true;
+            if(mutation==16)env["STRIX_QPF2K_MOE_SMALL"]="1";
+            expect(!moe_direct_b_policy(bad,env,manifest_copy,hip).effective,"direct B decline guard");
+        }
+        o.prefill_moe_direct_b=true;o.prefill_moe_direct_b_requested=true;o.prefill_moe_direct_b_bytes=selected.bytes;
+        expect(identity==numerical_profile_pair_identity(numerical_profile_pair(o)),"direct B preserves numerical identity");
+        EffectiveConfig c;c.options=o;
+        const auto j=serve::parse_json(effective_config_json(c));
+        const auto* state=j.find("prefill_moe_direct_b");
+        expect(state&&state->find("requested")->as_bool()&&state->find("effective")->as_bool()&&
+            state->find("layout_version")->dump()=="1","direct B inspection engagement fields");
     }
 
     t16k_admission_tests(request,model,info,manifest,capabilities);

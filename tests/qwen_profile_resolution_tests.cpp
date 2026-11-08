@@ -182,7 +182,7 @@ void config_matrix() {
     }
     for (const auto& args : std::vector<std::vector<std::string>>{
             {"--profile"},{"--profile","turbo"},{"--profile","fast","--profile=default"},
-            {"--qsa-budget","1536"},{"--output-head-profile","fp16-output-head"}}) {
+            {"--output-head-profile","fp16-output-head"}}) {
         auto argv=std::vector<std::string>{"decoder","model.gguf","1"}; argv.insert(argv.end(),args.begin(),args.end());
         try { (void)options(argv); check(false,"invalid CLI must refuse"); }
         catch (const std::invalid_argument& e) { fixture("parser-refusal",e.what()); }

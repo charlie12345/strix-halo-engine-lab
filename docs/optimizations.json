@@ -1,6 +1,17 @@
 [
   {
     "engine": "qwen",
+    "name": "HC normalized recompute candidate",
+    "flag_or_env": "STRIX_QPF2K_HC_RECOMPUTE_NORM",
+    "default": "OFF pending native equality and not-slower timing; opt in with =1",
+    "exact": "Same pinned two-multiply expression and numerical identity; compiler, native byte equality, model and complete-workload gates pending.",
+    "gain": "Avoids 640 MiB of FP32 image stores at T16384, adds 0.25 MiB of inverse stores; arena reservation unchanged. No measured speed claim.",
+    "preconditions": "Uniform BF16 H2560/S4/rank320 fast prefill, FP32 norm weights, prefetched qpf2k projection and OUT16 or 32-row output3. Existing folds and lowband remain eligible; unsupported sites retain the image. Restart.",
+    "off_switch": "STRIX_QPF2K_HC_RECOMPUTE_NORM=0",
+    "doc_anchor": "docs/optimizations.md#hc-normalized-recompute-candidate"
+  },
+  {
+    "engine": "qwen",
     "name": "PLE staged-gather acceptance fix",
     "flag_or_env": "Unconditional bug fix",
     "default": "ON",
@@ -42,6 +53,17 @@
     "preconditions": "Fast indexer supported gfx1151 wave32 q/k layout; unsupported layouts retain exact arithmetic; MTP and nested excluded; server-level only.",
     "off_switch": "STRIX_PREFILL_INDEX_PROJ_WMMA=0 / --prefill-disable index_proj_wmma / prefill_disable = [\"index_proj_wmma\"]; master exact switch",
     "doc_anchor": "docs/optimizations.md#bit-changing-prefill-options"
+  },
+  {
+    "engine": "qwen",
+    "name": "Indexer score BF16 WMMA candidate",
+    "flag_or_env": "STRIX_PREFILL_INDEX_SCORE_WMMA; --prefill-disable index_score_wmma; config prefill_disable",
+    "default": "OFF; opt in with STRIX_PREFILL_INDEX_SCORE_WMMA=1",
+    "exact": "Bit-changing idxscore16; outside READY pending compiler, native execution, model fidelity and complete-workload gates.",
+    "gain": "Pending qualification; no measured saving.",
+    "preconditions": "Ordinary FAST prefill mode 0, gfx1151 wave32, BF16 KV, four 128-feature index heads, pooled keys, aligned 16/32/64-row groups; MTP and nested excluded; server-level only.",
+    "off_switch": "STRIX_PREFILL_INDEX_SCORE_WMMA=0 / --prefill-disable index_score_wmma / prefill_disable = [\"index_score_wmma\"]; master exact switch",
+    "doc_anchor": "docs/engine/prefill/index-score-wmma.md"
   },
   {
     "engine": "qwen",
@@ -544,6 +566,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Batched MTP predictor priming",
+    "flag_or_env": "STRIX_MTP_PRIME_ROWS",
+    "default": "OFF (opt-in: STRIX_MTP_PRIME_ROWS=1)",
+    "exact": "Same binary at 262,144 tokens: end-of-prompt state digest (target state, predictor rows, held row), terminal FP32 logits digest, tokens and MTP acceptance counters equal on and off.",
+    "gain": "MTP-route prompt at 262,144 tokens (YaRN f2, T8192): 210.9-213.2 -> 202.8-203.8 s, -8.1 to -10.0 s in three pairs; decode unchanged.",
+    "preconditions": "MTP route with a tiled prompt and the production draft chain; other configurations keep the one-row loop.",
+    "off_switch": "unset STRIX_MTP_PRIME_ROWS",
+    "doc_anchor": "docs/optimizations.md#qwen-mtp-prime-rows"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA attend batching",
     "flag_or_env": "STRIX_QSA_ATTEND_BATCH",
     "default": "1",
@@ -783,6 +816,17 @@
     "preconditions": "Eager plain one-row decode on the CLI serial route; see the doc section for per-item shape and route conditions.",
     "off_switch": "STRIX_MOE_R1_GLUE_FUSE=0",
     "doc_anchor": "docs/optimizations.md#qwen-plain-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "R1 GDN preparation fusion",
+    "flag_or_env": "STRIX_QWEN_DECODE_FUSE",
+    "default": "OFF (opt-in: STRIX_QWEN_DECODE_FUSE=1)",
+    "exact": "Same device bodies and reduction order; compile-only. Native ON/OFF byte fixtures and complete token/seven-state 1K/32K gate pending.",
+    "gain": "No measured gain claimed; static removal 72 launches/step for unguarded R1/islands, 36 for guarded R1, across 36 GDN layers.",
+    "preconditions": "R1 GDN; normalization shares the preparation CTA only for unguarded head_dim 128. Guarded paths retain normalization and validation barriers. Recurrent tiles and gated RMSNorm stay separate. R2-R8 and prefill bodies unchanged.",
+    "off_switch": "unset STRIX_QWEN_DECODE_FUSE (restart)",
+    "doc_anchor": "docs/optimizations.md#qwen-decode-fuse"
   },
   {
     "engine": "qwen",
@@ -2645,6 +2689,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Exact BF16 router weights",
+    "flag_or_env": "STRIX_QWEN_ROUTER_BF16",
+    "default": "OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1)",
+    "exact": "Every F32 coefficient must have zero low 16 bits; preserve signed zero and representable NaN/Inf bits, otherwise retain F32 for that tensor. Device and complete-workload gates pending.",
+    "gain": "No measured gain claimed",
+    "preconditions": "F32 MoE router matrix; immutable F32 backing retained. Shared copy admission on CLI, HTTP, MTP and YaRN; reuse verified registered pack copies.",
+    "off_switch": "unset STRIX_QWEN_ROUTER_BF16",
+    "doc_anchor": "docs/optimizations.md#qwen-exact-bf16-router-weights"
+  },
+  {
+    "engine": "qwen",
     "name": "Router selection",
     "flag_or_env": "STRIX_PREFILL_ROUTER_SELECT",
     "default": "ON",
@@ -2875,5 +2930,27 @@
     "preconditions": "Full-row known-prefix fast FP16 MoE on native or YaRN long-context plain CLI routes, Q4_K/Q5_K gate/up, Q5_1/Q8_0 DA16 certificate down, effective tunes 80/82/88 including XOR rows, ROUTE=14, MC=1; default vector and MERGE_VEC=0 scalar merge/commit, including unsafe fallback. No added rotary site or YaRN rotary identity change; YaRN model-fidelity and complete-workload qualification pending. Other writers/readers, GSQ, core/G3/P1, SMALL, MTP, nested/serving, cache/session and CUDA decline. Logical dot row bytes halve; allocation and arena pitch remain FP32-sized.",
     "off_switch": "Any environment value starting with 0; --prefill-moe-route-bf16 off; --baseline; STRIX_BASELINE=1; STRIX_QPF2K_DEFAULTS=0.",
     "doc_anchor": "docs/optimizations.md#qwen-moe-route-bf16"
+  },
+  {
+    "engine": "qwen",
+    "name": "MoE prepared Q4_K direct-B candidate",
+    "flag_or_env": "STRIX_QPF2K_MOE_DIRECT_B=1",
+    "default": "OFF; explicit candidate only",
+    "exact": "Exact candidate: lossless versioned Q4_K prepared operands; existing affine certificate and existing fallback conversion, identical FP16 A/B and per-output ascending WMMA chains, incumbent epilogue/status/maxima and DA16 completion. Native byte gates and complete-workload qualification pending.",
+    "gain": "Not measured. T4096/T8192 timing byte-checks production DA16 header reuse against direct-B, including completion and the complete down image, before old/new/new/old median timing. Setup and complete routed-layer measurements remain required.",
+    "preconditions": "Paired local Q4_K gate/up, full-row fast FP16 CLI prefill T4096/T8192, effective tunes 80/82/88, core=0, SMALL=0; original decode/fallback assets retained. 128-output tile, two compressed K64 register slots with one K64 lookahead, full-batch decoded-fragment reuse, fused nibble half-pairs and DPP maxima. Tunes 80/88 use 256 threads and paired gate/up waves with permlanex16 B exchange. Tune 82 uses 512 threads and separate gate/up waves; half-wave replicas decode different adjacent K16 planes, exchange decoded FP16 fragments and execute them in ascending K order. Its epilogue rendezvous reuses A storage. Expected decode savings with small accumulator sets trade against register exchanges, duplicate compressed loads, repeated A operand reads and epilogue barriers; native verification pending. At most 160 VGPR, 20000 LDS bytes, zero scratch. CPU AMD Clang 22 gfx1151 resource inspection: 147/141 VGPR and 9/10 compiler waves/SIMD for tunes 80 or 88/82, 8960-18436 LDS bytes, no spills. Prepared asset identity includes layout version and verified model hash; additional packed allocations are charged in admission. Q5 formats, missing/mixed pairs, other shapes/routes/schedules decline. No native execution or speedup claim.",
+    "off_switch": "Unset or 0 preserves original loading and launches. Inspection and execution receipts report requested/effective/reason; receipts include actual host launch counts.",
+    "doc_anchor": "docs/optimizations.md#qwen-moe-compressed-planes"
+  },
+  {
+    "engine": "qwen",
+    "name": "All-on composition profile",
+    "flag_or_env": "STRIX_QWEN_ALLON",
+    "default": "OFF (opt-in: STRIX_QWEN_ALLON=1 | exact | fast)",
+    "exact": "=1 / exact switches on only the exact opt-in levers of the table in docs/engine/optimization-table.md (each one keeps its own exactness evidence); =fast adds the FAST levers, which change bits and are marked qualification in progress. Unset changes nothing.",
+    "gain": "No composite gain is claimed: the levers are measured one at a time and the composition is the subject of the all-on test plan (docs/models/qwen3.8/allon.md).",
+    "preconditions": "Each lever keeps its own admission (route, shape, model assets, MTP/HTTP exclusions) and declines by itself with its own notice; an explicit per-lever value wins; STRIX_BASELINE=1 vetoes the profile.",
+    "off_switch": "unset STRIX_QWEN_ALLON (or 0)",
+    "doc_anchor": "docs/optimizations.md#qwen-all-on-composition-profile"
   }
 ]

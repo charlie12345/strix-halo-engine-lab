@@ -274,6 +274,19 @@ prefill identity measured **19.13 s / 1,713 tok/s at 32K**, **81.08 s at 131,072
 Digests match that identity's reference at 32K/64K/128K/262K; this is not dense-A8 serial bit equality
 or a new long-context model-fidelity qualification. See the [catalog](../../optimizations.md#qwen-tiled).
 
+**Exact BF16 router weights.** `STRIX_QWEN_ROUTER_BF16=1` is an opt-in (default off; part of `STRIX_QWEN_ALLON`): model load checks
+every F32 router coefficient's low 16 bits before registering an exact BF16 device
+copy. A failing tensor keeps F32; signed zeros, infinities and representable NaN
+payloads retain their bits. The original F32 backing stays unchanged. Admission
+charges 120 MiB for 48 routers of 512 × 2560 coefficients plus 64 KiB setup staging
+across CLI, HTTP, MTP and YaRN through 1M. Existing pack copies are reused and actual
+inventory charges each backing once. Inspection reports policy; run receipts report
+copies, declines and reuse. unsetting `STRIX_QWEN_ROUTER_BF16` restores F32 after restart;
+baseline, `STRIX_QPF2K_DEFAULTS=0` and `STRIX_Q6P=0` also disable it. Selection keeps
+its separate launch and comparison/tie order. Device and complete-workload gates
+remain pending; no measured gain is claimed. See the
+[storage contract](../../optimizations.md#qwen-exact-bf16-router-weights).
+
 Exact MTP draft attention and the router defaults are enabled in the public Qwen line.
 Batched MTP drafting remains opt-in. The HTTP server sizes its request slots from memory (`--http-batch N` caps, `0` = one at a time), serves decoding requests at layer boundaries inside long prompt blocks (`STRIX_BATCH_SERVICE_MS=250`), runs short prompts first and nests them into a paused long prompt (`STRIX_BATCH_NEST_ROWS=2048`), and cancels at those boundaries; every request keeps the token IDs and committed state it has alone. A prompt group takes at most 4 blocks unless every slot is busy and a request waits (`STRIX_PROMPT_BATCH_AUTO=0` turns this off): an 8 x 1024 burst's first-token p50 drops 21 % and a 16 x 1024 burst's 15 %, makespan within noise, tokens identical ([prompt groups](../../engine/prefill/prompt-batch.md)). With a 32K prompt arriving among three decoding streams (default command) the p90 decode gap went from 14.3 s to 0.54 s and a short request's first token from 42-52 s to 2.3-3.8 s ([serving](../../engine/serving/serving.md#batched-decoding)).
 
@@ -293,6 +306,12 @@ values as BF16 rows). It is bit-changing, default OFF; `--profile fast` lists it
 qualification (`--allow-pending` runs it, stamped `unqualified`). Same build, plain CLI, interleaved pairs: 4K
 **2.42 → 2.36 s (−2.6 %)**, 32K **19.61 → 18.81 s (−4.1 %)**, 262K **177.9 → 170.0 s (−4.5 %, 1,471 → 1,539 tok/s; one pair)**; the first generated tokens match the
 exact route. Unset or `=0` is the exact route. See the [catalog](../../optimizations.md#qwen-gdn-chunk).
+
+`STRIX_QPF2K_GDN_FP16_CHUNK=3` selects the separate draft identity `qwen-gdn-fp16-chunk rev 3`
+(`gdnchunk16r3` in arithmetic/cache identities): longer convolution segments and bounded row-factor decay in prep,
+with the same C32 FP32 scan/state. Rev 2 remains `=1`; unset/`=0` preserves the exact route. Native operator error,
+model fidelity and complete-workload timing are pending; no rev-3 gain is claimed. See the
+[revision-3 contract and fixture commands](../../engine/kernels/gdn-fp16-chunk.md#revision-3-draft).
 
 GSQ below is a separate speed-over-quality profile.
 

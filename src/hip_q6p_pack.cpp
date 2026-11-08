@@ -3,6 +3,7 @@
 #include "strix/gguf_reader.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/qwen_router_bf16.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -61,7 +62,8 @@ Q6pPackHeader read_q6p_pack_header(const std::filesystem::path& path) {
 HipQ6pPack::~HipQ6pPack() { q6p::clear(); }
 
 std::shared_ptr<const HipQ6pPack> load_hip_q6p_pack(const std::filesystem::path& path, const MappedModelFile& target,
-    const ModelManifest& target_manifest, const ModelRuntimeBinding& target_binding, AllocationGenerationSource& generations) {
+    const ModelManifest& target_manifest, const ModelRuntimeBinding& target_binding, AllocationGenerationSource& generations,
+    bool router_bf16) {
     const auto info = gguf::read_file(path);
     if (metadata_string(info, "strix.q6p.format") != "Q6P32-v1")
         throw std::invalid_argument("dense Q6P32 pack has an unknown format");
@@ -123,6 +125,7 @@ std::shared_ptr<const HipQ6pPack> load_hip_q6p_pack(const std::filesystem::path&
 
     q6p::clear();
     for (const auto& c : copies) {
+        if (!router_bf16 && c.kind == q6p::Kind::bf16 && qwen_router_bf16_candidate(target_manifest.tensors[c.target])) continue;
         q6p::register_tensor(reinterpret_cast<const void*>(target_binding.tensors[c.target].address),
             {reinterpret_cast<const unsigned char*>(binding.tensors[c.pack].address), static_cast<std::uint32_t>(c.rows),
                 static_cast<std::uint32_t>(c.cols), c.kind});

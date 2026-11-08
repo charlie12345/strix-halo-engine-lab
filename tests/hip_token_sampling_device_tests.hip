@@ -121,11 +121,90 @@ int main(int argc, char** argv) try {
         catch (const std::invalid_argument&) { rejected = true; }
         require(rejected, "device sampling accepted a non-finite logit");
     }
+    // Coupled acceptance through HipTokenSamplerDevice: windows of drafted rows (drafts equal to the target row or
+    // drawn from a perturbed row) decided on the device equal the host coupled sampler row by row. Draft steps with
+    // the first-max draft transform (top-k 1, coupled below the argmax gate) give the first-max entry.
+    unsigned coupled_rows = 0, coupled_accepted = 0;
+    std::uint64_t coupled_forced = 0;
+    {
+        constexpr std::uint32_t vocab = 151936U, window = 4U;
+        HipTokenSamplerDevice device(vocab, 8U);
+        float* rows_device = nullptr;
+        require(hipMalloc(reinterpret_cast<void**>(&rows_device), 4ULL * vocab * window) == hipSuccess, "coupled logits allocation");
+        hipStream_t stream = nullptr;
+        require(hipStreamCreate(&stream) == hipSuccess, "coupled stream");
+        TokenSamplerOptions coupled;
+        coupled.acceptance = SampledAcceptance::coupled;
+        for (unsigned c = 0; c < std::max(8U, cases / 8U); ++c) {
+            auto policy = policies[c % std::size(policies)];
+            policy.seed = 77U + c;
+            TokenSampler host(policy, coupled), on_device(policy, coupled);
+            std::vector<std::vector<float>> logits(window);
+            std::vector<TokenDraft> drafts(window);
+            std::vector<DeviceSampleRow> rows(window);
+            for (std::uint32_t r = 0; r < window; ++r) {
+                logits[r] = make_logits(rng, vocab, c % 2U ? 2.0F : 3.5F);
+                require(hipMemcpy(rows_device + static_cast<std::size_t>(r) * vocab, logits[r].data(), 4ULL * vocab,
+                    hipMemcpyHostToDevice) == hipSuccess, "coupled logits upload");
+                const std::uint64_t position = 1000U + 17U * c + r;
+                auto draft_row = logits[r];
+                if ((r + c) % 2U) { std::normal_distribution<float> noise(0.0F, 0.8F); for (auto& v : draft_row) v += noise(rng); }
+                drafts[r] = host.draft(draft_row, {}, position);
+                ExecutionBufferAddress address{};
+                address.address = reinterpret_cast<std::uintptr_t>(rows_device + static_cast<std::size_t>(r) * vocab);
+                address.bytes = 4ULL * vocab;
+                rows[r] = {address, position, r + 1U < window ? &drafts[r] : nullptr};
+            }
+            const auto decisions = device.decide(on_device, rows, stream);
+            for (std::uint32_t r = 0; r < window; ++r) {
+                const auto expected = host.decide(logits[r], rows[r].position, rows[r].draft);
+                require(decisions[r].token == expected.token && decisions[r].drafted == expected.drafted &&
+                        decisions[r].accepted == expected.accepted && !decisions[r].residual,
+                    "coupled device decision differs from the host in case " + std::to_string(c) + " row " + std::to_string(r));
+                ++coupled_rows; coupled_accepted += expected.accepted;
+            }
+            // Forced rejection (test-only switch) on device decisions, applied as the window verifier does
+            // (begin_window, then force_rejection per row before the stopping rule), equals host decide_rows.
+            auto forced = coupled;
+            forced.force_reject_row = c % 3U == 2U ? TokenSamplerOptions::forced_rejection_rotate : c % 3U;
+            TokenSampler forced_host(policy, forced), forced_device(policy, forced);
+            const std::span<const TokenDraft> window_drafts(drafts.data(), window - 1U);
+            const auto host_rows = forced_host.decide_rows(window, rows[0].position, window_drafts, {},
+                [&](std::uint32_t r) { return std::span<const float>(logits[r]); });
+            auto device_rows = device.decide(forced_device, rows, stream);
+            forced_device.begin_window();
+            std::vector<TokenDecision> device_kept;
+            for (std::uint32_t r = 0; r < window; ++r) {
+                forced_device.force_rejection(device_rows[r], r);
+                device_kept.push_back(device_rows[r]);
+                forced_device.count(device_rows[r]);
+                if (!rows[r].draft || !device_rows[r].accepted) break;
+            }
+            require(device_kept.size() == host_rows.size(), "forced device window length differs from the host in case " + std::to_string(c));
+            for (std::size_t r = 0; r < host_rows.size(); ++r)
+                require(device_kept[r].token == host_rows[r].token && device_kept[r].accepted == host_rows[r].accepted &&
+                        device_kept[r].forced == host_rows[r].forced,
+                    "forced device decision differs from the host in case " + std::to_string(c) + " row " + std::to_string(r));
+            require(forced_device.stats().forced == forced_host.stats().forced, "forced rejection counts differ");
+            coupled_forced += forced_host.stats().forced;
+        }
+        require(device.host_fallbacks() == 0U, "coupled rows had no device decision");
+        (void)hipStreamDestroy(stream);
+        (void)hipFree(rows_device);
+        for (unsigned c = 0; c < 16U; ++c) {
+            TokenSamplingPolicy policy = policies[c % std::size(policies)];
+            policy.top_k = 1U;
+            const auto logits = make_logits(rng, 4099U, 2.0F);
+            const auto first = static_cast<std::uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+            require(hip_draft_for_testing(logits, {}, policy, uniform(rng)).token == first, "top-k 1 device draft is not the first max");
+        }
+    }
     std::cout << "device sampling-v1: " << decided << " decisions equal the host (" << drafted << " drafted, " << device_q
               << " with the draft distribution in device memory, " << accepted << " accepted, " << residual << " residual, "
               << fallbacks << " without a device decision); " << draft_steps
               << " device draft steps equal the host (token and support; max relative probability difference "
-              << max_relative << ")\n";
+              << max_relative << "); " << coupled_rows << " coupled device rows equal the host (" << coupled_accepted
+              << " drafts accepted; " << coupled_forced << " forced rejections equal the host)\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "device sampling test failed: " << error.what() << '\n';

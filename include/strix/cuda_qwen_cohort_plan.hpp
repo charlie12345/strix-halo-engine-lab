@@ -83,4 +83,42 @@ inline std::uint32_t window_of(std::uint32_t index, std::uint32_t sessions, std:
     return 0;
 }
 
+// Window budget of one step when a budget above 8 rows is allowed (STRIX_QRTX_WINDOW_ROWS > 8): the marginal rule. A
+// window of 9..16 rows costs a different kernel form than one of <= 8 rows, so the wider budget is taken only when its
+// expected tokens per millisecond beat the 8-row packing by `min_gain`. Expected tokens of a session with r rows:
+// 1 + p + p^2 + ... + p^(r-1) (p: acceptance per draft position). Cost of a window of r rows: decode-shaped
+// a_ms + b_ms * r up to 8 rows; wide_ms for 9..16 rows (padded to 16). Defaults from c12a (bench-w8 / bench-w16):
+// a 10.5, b 2.81 (13.3 ms at 1 row .. 33.0 at 8), wide 62 (59-69 ms measured), p 0.65 (C8 w16: 0.56 accepted of
+// 0.86 drafts per session). With these the rule never widens (C8: 8 / 33 = 0.24 vs 13.2 / 62 = 0.21 tokens/ms), and at
+// C2 / C4 the 8-row windows already hold the drafts that pay.
+struct WideModel {
+    double a_ms = 10.5, b_ms = 2.81, wide_ms = 62.0, accept = 0.65, min_gain = 0.02;
+};
+inline double expected_tokens(std::uint32_t rows, double p) {
+    double t = 0, q = 1;
+    for (std::uint32_t k = 0; k < rows; ++k) { t += q; q *= p; }
+    return t;
+}
+inline double window_ms(std::uint32_t rows, const WideModel& m) {
+    return rows <= kWindowRows ? m.a_ms + m.b_ms * rows : m.wide_ms;
+}
+// tokens per ms of a step of `sessions` sessions (each wanting 1 + depth rows, depth capped as the step caps it)
+inline double step_rate(std::uint32_t sessions, std::uint32_t depth, DepthPolicy policy, std::uint32_t budget, const WideModel& m) {
+    std::vector<std::uint32_t> want(sessions);
+    for (std::uint32_t i = 0; i < sessions; ++i) want[i] = 1U + (depth ? draft_depth_cap(window_of(i, sessions, budget), depth, policy, budget) : 0U);
+    double tokens = 0, ms = 0;
+    for (const auto& w : pack(want, budget)) {
+        for (const auto& e : w.entries) tokens += expected_tokens(e.rows, m.accept);
+        ms += window_ms(w.rows, m);
+    }
+    return ms > 0 ? tokens / ms : 0;
+}
+inline std::uint32_t choose_budget(std::uint32_t sessions, std::uint32_t depth, DepthPolicy policy, std::uint32_t budget,
+                                   const WideModel& m = {}) {
+    if (budget <= kWindowRows || sessions == 0 || depth == 0) return std::min(budget, kWindowRows);
+    const double narrow = step_rate(sessions, depth, policy, kWindowRows, m);
+    const double wide = step_rate(sessions, depth, policy, budget, m);
+    return wide > narrow * (1.0 + m.min_gain) ? budget : kWindowRows;
+}
+
 }  // namespace strix::cuda::qwen_cohort

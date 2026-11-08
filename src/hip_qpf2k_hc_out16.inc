@@ -12,7 +12,7 @@ bool qpf2k_hc_out16() {
     return strix::prefill_option_enabled(strix::PrefillOption::hc_output_wmma) && qpf2k_hc_mask() != 0U;
 }
 
-template <typename Storage>
+template <typename Storage, bool Recompute = false>
 __global__ __launch_bounds__(128) void qpf2k_hc_out16_kernel(HyperWideRows rows, const unsigned char* __restrict__ up,
     const _Float16* __restrict__ low16, unsigned hidden) {
     constexpr unsigned Pitch = 40U, Band = 16U;
@@ -23,8 +23,14 @@ __global__ __launch_bounds__(128) void qpf2k_hc_out16_kernel(HyperWideRows rows,
     const unsigned base = cta / (Band * features) * Band, count = min(Band, groups - base), local = cta - base * features;
     const unsigned row0 = (base + local % count) * 32U, fb = local / count;
     const unsigned feature0 = fb * 128U + wave * 32U + lane % 16U;
+    if constexpr (Recompute) qpf2k_hc_load_padded_inverse<32U, 128U>(rows, as, Pitch, row0);
     float mixed[2][2][8]{};
     for (unsigned s = 0; s < 4U; ++s) {
+        float norm_weight[2]{};
+        if constexpr (Recompute) {
+#pragma unroll
+            for (unsigned c = 0; c < 2U; ++c) norm_weight[c] = rows.recompute_norm[s * hidden + feature0 + c * 16U];
+        }
         hcw_v8f acc[2][2]{};
         // Each thread decodes one feature's Q8 block. Prefetch next K32 before
         // consuming this stage's LDS fragments; all global bytes remain read-only.
@@ -73,8 +79,11 @@ __global__ __launch_bounds__(128) void qpf2k_hc_out16_kernel(HyperWideRows rows,
 #pragma unroll
                 for (unsigned e = 0; e < 8U; ++e) {
                     const unsigned r = row0 + t * 16U + 2U * e + lane / 16U;
-                    const auto* normalized = wide_row(rows.normalized, rows.normalized_stride, r < rows.count ? r : 0U);
-                    const float nv = normalized[static_cast<std::uint64_t>(s) * hidden + feature0 + c * 16U];
+                    const unsigned index = s * hidden + feature0 + c * 16U;
+                    const float nv = qpf2k_hc_normalized<Recompute>(rows,
+                        r < rows.count ? r : (Recompute ? rows.count - 1U : 0U), index,
+                        Recompute ? qpf2k_hc_padded_inverse(as, Pitch, t * 16U + 2U * e + lane / 16U, s) : 0.0F,
+                        norm_weight[c]);
                     mixed[t][c][e] += nv * sigmoid(acc[t][c][e]);
                 }
     }

@@ -253,8 +253,8 @@ DistributedSequenceQualificationResult qualify_sequence_inputs(HipDistributedSeq
         if(fault==1U) {++bad.canonical_plan.boundaries[data_index].destination_step;reason="last prefix step";}
         if(fault==2U) {++bad.canonical_plan.plan_identity;reason="canonical placement metadata";}
         if(fault==3U) {bad.local_node=2U;reason="bounded actual model";}
-        if(fault==4U) {bad.transport.step_control=bad.transport.token_control;reason="distinct bounded kind5";}
-        if(fault==5U) {bad.transport.actual_owner.reset();reason="real one-link transport";}
+        if(fault==4U) {bad.transport.step_control=bad.transport.token_control;reason=setup.transport.copied?"host-copy route lacks":"distinct bounded kind5";}
+        if(fault==5U) {bad.transport.actual_owner.reset();reason=setup.transport.copied?"host-copy route lacks":"real one-link transport";}
         if(fault==6U) {bad.local_node^=1U;reason="participant and model";}
         if(setup.stage_owner && (fault==2U || fault==3U || fault==6U)) reason="immutable actual owner";
         bool rejected=false;

@@ -16,6 +16,8 @@
 #include "strix/compiled_execution.hpp"
 #include "strix/teacher_logit_spool.hpp"
 #include "strix/hip_q6p_pack.hpp"
+#include "strix/hip_qwen_router_bf16.hpp"
+#include "strix/qwen_router_bf16.hpp"
 #include "strix/hip_dense_trellis_pack.hpp"
 #include "strix/q6p_registry.hpp"
 #include "strix/execution_resources.hpp"
@@ -39,6 +41,7 @@
 #include "strix/offline_compile_provenance.hpp"
 #include "offline_tuning_build_context.hpp"
 #include "strix/hip_model_residency.hpp"
+#include "strix/hip_qwen_moe_prepared.hpp"
 #include "strix/linux_uma_observation.hpp"
 #include "strix/hip_event_queue_trace.hpp"
 #include "strix/hip_runtime_allocator.hpp"
@@ -1235,6 +1238,7 @@ static int run_decode_entry(
             "  --prefix-cache-staging-bytes N (0: one T-block plus fixed state; STRIX_PREFIX_CACHE_STAGING_BYTES)\n"
             "  --prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N]\n"
             "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
+            "  --rtx-state-import-file NAME.json (fresh CLI prefix import; NAME.bin beside it, --prompt-ids is full prompt)\n"
             "  --http-serve [--http-bind ADDR] [--http-port N] [--http-model-id NAME] [--http-api-key-file FILE]\n"
             "      [--http-sampling greedy|reject] [--http-default-max-tokens N] [--http-max-queue N] [--http-max-connections N]\n"
             "      (OpenAI/Anthropic-compatible HTTP server on the tiled MTP route; the prompt is the calibration prompt)\n"
@@ -1257,6 +1261,34 @@ static int run_decode_entry(
         parse_options(
             argc,
             argv, true);
+    // Parsing has loaded --prompt-ids (text uint32 IDs) and positional IDs.
+    // Gate the process environment before preflight, model setup or cached readers.
+    // In particular, do this before eager exec: inherited levers are no longer
+    // recorded as profile-injected by static initialization in the new image.
+    const bool allon_active = strix::qwen_allon::mode(
+        [](const char* name) { return std::getenv(name); }) != strix::qwen_allon::Mode::off;
+    std::string allon_gate_off;
+    if (allon_active) {
+        strix::qwen_allon::gate_long_prompt(options.tokens.size(),
+            [](const char* name) { return std::getenv(name); },
+            [&](const char* name, const char* value) {
+                if (::setenv(name, value, 1) != 0)
+                    throw std::runtime_error("qwen allon long-prompt gate: setenv failed");
+            });
+        // Include inherited OFF values after eager exec; report the actual state.
+        for (const auto& lever : strix::qwen_allon::levers) {
+            const char* value = std::getenv(lever.env);
+            if (strix::qwen_allon::long_prompt_declined(lever.env, options.tokens.size()) &&
+                value && std::string_view(value) == "0") {
+                if (!allon_gate_off.empty()) allon_gate_off += ", ";
+                allon_gate_off += lever.env;
+            }
+        }
+    }
+    if (!options.rtx_state_import_file.empty()) {
+        const auto metadata = strix::decode_cli::read_rtx_state_import_metadata(options.rtx_state_import_file, options.tokens);
+        options.rtx_state_import_position = strix::decode_cli::parse_rtx_state_begin(metadata).position;
+    }
     bundle_retry.selected=options.mtp.enabled && !options.mtp_bundle_path.empty();
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     options.mtp_cli_phase_retirement=false;
@@ -1281,6 +1313,9 @@ static int run_decode_entry(
         std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
             std::strerror(errno));
     }
+    if (allon_active)
+        std::fprintf(stderr, "qwen allon long-prompt gate: rows=%zu, off: %s\n",
+            options.tokens.size(), allon_gate_off.empty() ? "none" : allon_gate_off.c_str());
     strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled);
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(
         options.print_effective_config || options.print_cache_family || strix::decode_cli::yarn_bundle_serial_retry);
@@ -1652,8 +1687,7 @@ static int run_decode_entry(
     strix::qpf2k::undo_pre_injected([](const char* name) { ::unsetenv(name); });
     strix::qpf2k::baseline = options.baseline;
     for (const auto& [name, value] : effective.environment) {
-        const bool controlled = options.baseline;
-        if (!std::getenv(name.c_str()) || controlled) ::setenv(name.c_str(), value.c_str(), 1);
+        if (!std::getenv(name.c_str()) || options.baseline) ::setenv(name.c_str(), value.c_str(), 1);
     }
     strix::qpf2k::defaulted_items = 0U;
     for (const auto& entry : strix::qpf2k::defaults) {
@@ -2414,14 +2448,60 @@ static int run_decode_entry(
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
+    if(options.prefill_moe_direct_b)model_residency.prepare_qwen_moe_direct_b(mapped,manifest);
+    const auto direct_b_completed_receipt=[&]() {
+        if(!options.prefill_moe_direct_b_requested)return std::string{};
+        const auto& p=model_residency.binding().qwen_moe_prepared;
+        auto assets=strix::serve::Json::array();
+        if(p)for(const auto& e:p->entries)assets.as_array().emplace_back(strix::model_content_identity_hex(e.tensor.identity));
+        return "  \"prefill_moe_direct_b_assets\":"+assets.dump()+",\n"+
+            "  \"prefill_moe_direct_b\":"+strix::decode_cli::moe_direct_b_json(options.prefill_moe_direct_b_requested,
+            p&&p->engaged!=0,p?p->reason:std::string_view(options.prefill_moe_direct_b_reason),options.prefill_moe_direct_b_bytes)+",\n"+
+            "  \"prefill_moe_direct_b_engaged_calls\":"+std::to_string(p?p->engaged:0U)+",\n"+
+            "  \"prefill_moe_direct_b_declined_calls\":"+std::to_string(p?p->declined:0U)+",\n";
+    };
+
     std::shared_ptr<const strix::HipQ6pPack> dense_q6p_pack;
     if (!options.dense_q6p_pack_path.empty()) {
         dense_q6p_pack = strix::load_hip_q6p_pack(options.dense_q6p_pack_path, mapped, manifest,
-            model_residency.binding(), generations);
+            model_residency.binding(), generations, options.qwen_router_bf16);
         std::cerr << "dense Q6P32 pack: " << dense_q6p_pack->q6p_tensors << " Q6P32 + " << dense_q6p_pack->bf16_tensors
                   << " BF16 tensors, " << dense_q6p_pack->q6p_bytes << " bytes replace " << dense_q6p_pack->replaced_bytes
                   << (strix::q6p::kernels_enabled() ? "" : " (STRIX_Q6P=0: not read)") << '\n';
     }
+    const auto router_reservation = strix::qwen_router_bf16_reservation(manifest, options.qwen_router_bf16);
+    auto shared_model_inventory = model_residency.owner_inventory(model_owner, mapped_owner);
+    if (dense_q6p_pack) {
+        const auto pack_inventory = dense_q6p_pack->residency->owner_inventory(dense_q6p_pack->residency, dense_q6p_pack->mapped);
+        auto views = shared_model_inventory.pinned_views;
+        views.insert(views.end(), pack_inventory.pinned_views.begin(), pack_inventory.pinned_views.end());
+        shared_model_inventory = strix::build_uma_owner_inventory(views);
+    }
+    // Check additional shared storage before allocation on CLI, HTTP and YaRN.
+    // Never credit or overwrite the immutable F32 backing.
+    (void)strix::plan_uma_reservation_growth(shared_model_inventory, router_reservation.device_bytes,
+        router_reservation.setup_host_bytes, {options.model_retained_budget, options.model_setup_peak_budget});
+    if (router_reservation.device_bytes) {
+        strix::decode_cli::PrefillCapabilities caps;
+        const auto free = strix::decode_cli::observe_prefill_memory(caps);
+        if ((free.available && router_reservation.device_bytes + router_reservation.setup_host_bytes > *free.available) ||
+            (free.gtt_limit && free.gtt_used && (*free.gtt_used > *free.gtt_limit ||
+                router_reservation.device_bytes > *free.gtt_limit - *free.gtt_used)))
+            throw std::runtime_error("Qwen router BF16 shared storage exceeds available UMA/GTT");
+    }
+    const auto router_bf16_owner = strix::load_hip_qwen_router_bf16(mapped, manifest,
+        model_residency.binding(), options.qwen_router_bf16);
+    {
+        const auto inventory = router_bf16_owner->owner_inventory(router_bf16_owner);
+        auto views = shared_model_inventory.pinned_views;
+        views.insert(views.end(), inventory.pinned_views.begin(), inventory.pinned_views.end());
+        shared_model_inventory = strix::build_uma_owner_inventory(views);
+    }
+    optimization_profile_receipt += "  \"qwen_router_bf16_enabled\":" + std::string(options.qwen_router_bf16 ? "true" : "false") + ",\n" +
+        "  \"qwen_router_bf16_bytes\":" + std::to_string(router_bf16_owner->bytes) + ",\n" +
+        "  \"qwen_router_bf16_tensors\":" + std::to_string(router_bf16_owner->copies.size()) + ",\n" +
+        "  \"qwen_router_bf16_skipped\":" + std::to_string(router_bf16_owner->skipped) + ",\n" +
+        "  \"qwen_router_bf16_reused\":" + std::to_string(router_bf16_owner->reused) + ",\n";
     std::shared_ptr<const strix::HipDenseTrellisPack> dense_trellis_pack;
     std::string dense_trellis_configuration_receipt;
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
@@ -2468,7 +2548,7 @@ static int run_decode_entry(
     // pinned in the optional inventory; this is virtual backing, not RSS/PFN evidence.
     std::optional<strix::UmaOwnerInventory> model_owner_inventory;
     if (options.execution_inventory || options.known_prefix_prefill_rows)
-        model_owner_inventory.emplace(model_residency.owner_inventory(model_owner, mapped_owner));
+        model_owner_inventory.emplace(shared_model_inventory);
     std::shared_ptr<strix::ple_reclaim::Prefetcher> ple_reclaimer;
     if (ple_reclaim_requested) {
         const auto rolling_h = strix::decode_cli::ple_rolling_prompt_supported(options) && strix::ctx_exact_memory_enabled("STRIX_PLE_ROLLING") ? strix::ple_reclaim::rolling_positions(std::getenv("STRIX_PLE_ROLLING"),
@@ -2533,6 +2613,8 @@ static int run_decode_entry(
             const char* decode_bytes = std::getenv("STRIX_PLE_RECLAIM_DECODE_BYTES");
             config.decode_allowance_bytes = strix::ple_reclaim::decode_allowance(config.rolling_positions ? 0U : options.generate_tokens, config.rolling_positions ? 1U : lookups_per_token,
                 contract.head_count, page, decode_bytes ? std::strtoull(decode_bytes, nullptr, 10) : 0U);
+            if (!options.http_serve && !options.rtx_state_import_file.empty())
+                config.prompt_begin = options.rtx_state_import_position;
             config.ahead_rows = 2U * options.known_prefix_prefill_rows;
             if (config.rolling_positions)
                 config.critical_rows = options.known_prefix_prefill_rows;
@@ -2734,7 +2816,7 @@ static int run_decode_entry(
         }
         const auto cohort_reservation = options.serving_tensor_cohort_rows == 1 ? 0U :
             strix::HipServingCohort::requested_reservation_bytes(options.serving_tensor_cohort_rows);
-        const auto shared_bytes = checked_add(checked_add(checked_add(checked_add(model_residency.reservation().retained_reserved_bytes,
+        const auto shared_bytes = checked_add(checked_add(checked_add(checked_add(shared_model_inventory.reservation_upper_bound_bytes,
             options.serving_headroom), prefix_cache_reservation), cohort_reservation),
             serving_prefill?serving_prefill->metadata_payload_bytes:0U);
         if (shared_bytes > options.serving_memory_budget)
@@ -5193,6 +5275,21 @@ static int run_decode_entry(
         }
 
         auto* session_registry = prefix_state ? prefix_state.get() : rtx_state_session.get();
+        if (!options.rtx_state_import_file.empty()) {
+            if (!session_registry) throw std::logic_error("CLI import state registry missing");
+            strix::decode_cli::RtxStateImportFacts facts;
+            for (const auto& step : compiled.execution.steps) {
+                const auto written = static_cast<std::uint32_t>(step.writes_state);
+                facts.valid_union = facts.valid_union | step.writes_state;
+                for (std::size_t f = 0; f < facts.generations_per_row.size(); ++f)
+                    if (written & (1U << f)) ++facts.generations_per_row[f];
+            }
+            facts.model_content = model_residency.binding().model_content_identity;
+            session_registry->set_rtx_facts(facts);
+            auto imports = std::make_shared<strix::RtxStateImportRegistry>(strix::decode_cli::hip_pinned_prefix_buffer, 1, 0);
+            session_registry->enable_rtx_import(imports, session);
+            strix::decode_cli::stage_rtx_state_import_file(*imports, options.rtx_state_import_file, options.tokens, 4U << 20U, options.rtx_state_import_position);
+        }
         strix::SessionCompatibility session_compatibility;
         std::vector<std::uint32_t> session_history;
         std::optional<std::uint32_t> session_pending;
@@ -5262,7 +5359,7 @@ static int run_decode_entry(
             std::size_t i = 0;
             const auto rows = options.known_prefix_prefill_rows;
             const auto suffix_plan = strix::plan_session_suffix(session.next_position, inputs.size(), rows,
-                options.session_tiled_suffix && static_cast<bool>(known_prefill_plan));
+                (options.session_tiled_suffix || !options.rtx_state_import_file.empty()) && static_cast<bool>(known_prefill_plan));
             const bool tiled = suffix_plan.tiled;
             const auto alignment = suffix_plan.serial_rows;
             const auto serial = static_cast<std::size_t>(alignment);
@@ -5534,6 +5631,12 @@ static int run_decode_entry(
                     original_work_device->recover_or_fail_stop();
                     throw;
                 }
+            }
+            if (!options.rtx_state_import_file.empty()) {
+                const auto restored = session_registry->begin_request(session, options.tokens);
+                if (!restored) throw std::runtime_error("CLI import was not restored");
+                return run_session_suffix(std::span<const std::uint32_t>(options.tokens).subspan(
+                    static_cast<std::size_t>(restored)));
             }
             if (!known_prefix_backend) return options.gpu_greedy_token
                 ? strix::execute_serial_greedy_token_request(request, *generation_backend)
@@ -6004,6 +6107,7 @@ static int run_decode_entry(
                 << "  \"prefill_lm_heads_omitted\":" << output_dispatcher->omitted_heads() << ",\n"
                 << "  \"generation_output_timing_scope\":\"full-output-steps-producer-through-selection-and-readback\",\n";
         }
+        std::cout << direct_b_completed_receipt();
         emit_q4k_a8_receipt();
         emit_q4k_a8_counts();
         std::cout << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get());
@@ -6117,6 +6221,7 @@ static int run_decode_entry(
     }
 
     std::cout << '{' << '\n' << optimization_profile_receipt << dense_trellis_completed_receipt() << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+    std::cout << direct_b_completed_receipt();
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

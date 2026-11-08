@@ -1,4 +1,4 @@
-# GDN FP16 chunked prefill: `qwen-gdn-fp16-chunk`, revision 2
+# GDN FP16 chunked prefill: `qwen-gdn-fp16-chunk`, revisions 2 and 3
 
 Status: FAST (bit-changing) engine item, default OFF. `STRIX_QPF2K_GDN_FP16_CHUNK=1` replaces the conv, the recurrence
 and the gated norm of the GDN prefill row route with a chunked route on FP16 WMMA operands with FP32 accumulation.
@@ -67,3 +67,53 @@ core, normed output and final state:
 - bitwise run-to-run equality and aligned split invariance.
 
 **`--time`** reports the median prep, scan + norm, raw scan and total at T = 8192 with 48/16 heads.
+
+## Revision 3 draft
+
+`STRIX_QPF2K_GDN_FP16_CHUNK=3` selects **qwen-gdn-fp16-chunk rev 3**. It is default OFF and remains a FAST draft:
+compiler, native operator, fidelity and complete-workload gates are pending. `=1` retains revision 2; unset/`=0`
+retains the exact route. The existing master/individual OFF, baseline, GSQ, shape and check-mode guards apply.
+Restart after changing the switch. The stderr identity and recurrence witness name revision 3; arithmetic identity
+uses `gdnchunk16r3` instead of `gdnchunk16`, including the compiled/state/cache hash. The same GDN option owns its
+unchanged persistent allocation; the extra mask bit is a revision discriminator, not a separately enabled option.
+
+Only preparation changes. `prep_kernel<B16,ConvRows,FactorDecay>` uses 16-row convolution segments instead of 8,
+reusing weights and the three-row halo for longer. Every row retains its four-tap expression, BF16 boundaries,
+L2 tree and Q16/K16/v16 values. It still fuses all q/k/v convolution with WY preparation. Gate projections and
+transforms remain on their existing route; they are not recomputed in prep. Scan geometry stays C32 with eight
+waves, FP32 state/accumulators and the same epilogue. No larger chunk or compensated scan is introduced.
+
+For finite prefix endpoints and final prefix in `[-60,0]`, off-diagonal decay becomes
+`D_rs = expf(G_r) * expf(-G_s)`; the diagonal stays exactly 1. Other intervals retain `expf(G_r-G_s)`.
+Two row factors replace a triangular matrix of exponentials; factors and products remain normal and finite in
+this bounded range. This is algebraically the same decay, with different FP32 rounding and subsequent FP16 T/P
+boundaries. If each exponential has relative error at most E, the factor product's relative error against the
+real exponential of the stored prefixes is at most `(1+E)^2*(1+2^-24)-1`; native E must be established on the
+qualification toolchain. This local bound does not prove the recurrence/output screen or model fidelity.
+
+Conv history remains exact. The fixed operation order and unchanged C32 call-relative boundaries preserve
+run-to-run determinism and aligned-split invariance within this revision. Arbitrary partial-chunk splits still
+change the numerical partition. Neither revision is bit-identical to the production token recurrence.
+
+The existing fixture additionally checks both layouts, all small-tail classes, states scaled by `2^-12` and
+`2^12`, near-unit decay, reset/tiny-decay boundaries and splits at 32/64/96/128. Preparation checks cover both
+input representations, head groups 1..4, lengths 1/15/16/17/31/32/33/65, exact Q/K/v and decay metadata, and exact
+T/P restoration for fallback chunks. It prints pooled and worst-per-head state errors and a final maxima line;
+the existing relL2 `3e-3` and normalized-max `2e-2` bands are unchanged. No rev-3 measured figures are available.
+
+On a qualified HIP node, build the existing target and run separate processes (startup-cached selector):
+
+```sh
+cmake --build build --target strix-hip-gdn-fp16-chunk-tests strix-qwen-startup-policy-tests -j8
+./build/strix-qwen-startup-policy-tests
+for revision in 0 1 3; do
+  STRIX_QPF2K_GDN_FP16_CHUNK=$revision ./build/strix-hip-gdn-fp16-chunk-tests || exit $?
+done
+STRIX_QPF2K_GDN_FP16_CHUNK=1 ./build/strix-hip-gdn-fp16-chunk-tests --time
+STRIX_QPF2K_GDN_FP16_CHUNK=3 ./build/strix-hip-gdn-fp16-chunk-tests --time
+```
+
+The operator fixture calls the chunk route directly, so `=0` exercises its retained rev-2 implementation; engine
+OFF restoration requires complete output/state comparison on the production entry point. Inspect prep VGPR/LDS
+and spill counts before timing: longer conv segments may reduce parallelism, and extra row-factor LDS/branches
+may outweigh reduced SFU work. There is no speed claim until native interleaved complete-workload timing passes.

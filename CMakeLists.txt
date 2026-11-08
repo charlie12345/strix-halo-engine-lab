@@ -192,6 +192,7 @@ add_library(strix_core STATIC
     src/integer_projection_execution.cpp
     src/integer_projection_runtime.cpp
     src/host_upload.cpp
+    src/qwen_moe_prepared.cpp
     src/compiled_execution.cpp
     src/copied_stream_transport.cpp
     src/direct_transport_gpu_export.cpp
@@ -849,7 +850,20 @@ if(BUILD_TESTING)
     target_link_libraries(strix-qwen-startup-policy-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-qwen-startup-policy-tests)
     add_test(NAME strix-qwen-startup-policy-tests COMMAND strix-qwen-startup-policy-tests)
+    add_executable(strix-qsa-index-score-host-tests tests/qsa_index_score_host_tests.cpp)
+    target_include_directories(strix-qsa-index-score-host-tests PRIVATE include)
+    target_compile_features(strix-qsa-index-score-host-tests PRIVATE cxx_std_20)
+    if(NOT MSVC)
+        target_compile_options(strix-qsa-index-score-host-tests PRIVATE -ffp-contract=off)
+    endif()
+    strix_target_warnings(strix-qsa-index-score-host-tests)
+    add_test(NAME strix-qsa-index-score-host-tests COMMAND strix-qsa-index-score-host-tests)
     add_executable(strix-qwen-effective-config-tests tests/qwen_effective_config_tests.cpp)
+    add_executable(strix-qwen-router-bf16-tests tests/qwen_router_bf16_tests.cpp)
+    target_link_libraries(strix-qwen-router-bf16-tests PRIVATE strix_core strix_serve)
+    strix_target_warnings(strix-qwen-router-bf16-tests)
+    add_test(NAME strix-qwen-router-bf16-tests COMMAND strix-qwen-router-bf16-tests)
+    set_tests_properties(strix-qwen-router-bf16-tests PROPERTIES LABELS "cpu")
     add_executable(strix-qwen-mtp-bundle-tests tests/qwen_mtp_bundle_tests.cpp)
     target_link_libraries(strix-qwen-mtp-bundle-tests PRIVATE strix_core)
     strix_target_warnings(strix-qwen-mtp-bundle-tests)
@@ -871,6 +885,10 @@ if(BUILD_TESTING)
     target_include_directories(strix-qpf2k-defaults-tests PRIVATE apps)
     target_link_libraries(strix-qpf2k-defaults-tests PRIVATE strix_core)
     strix_target_warnings(strix-qpf2k-defaults-tests)
+    add_executable(strix-qwen-allon-tests tests/qwen_allon_tests.cpp)
+    target_link_libraries(strix-qwen-allon-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qwen-allon-tests)
+    add_test(NAME strix-qwen-allon-tests COMMAND strix-qwen-allon-tests)
     add_test(NAME strix-qpf2k-defaults-tests COMMAND strix-qpf2k-defaults-tests)
     add_test(NAME strix-qpf2k-readers-gsq-first COMMAND strix-qpf2k-defaults-tests --gsq-first)
     add_test(NAME strix-qpf2k-readers-ordinary-first COMMAND strix-qpf2k-defaults-tests --ordinary-first)
@@ -1081,6 +1099,14 @@ if(BUILD_TESTING)
     target_link_libraries(strix-graph-operator-control-tests PRIVATE strix_core)
     strix_target_warnings(strix-graph-operator-control-tests)
     add_test(NAME strix-graph-operator-control-tests COMMAND strix-graph-operator-control-tests)
+    add_executable(strix-copied-model-retirement-tests tests/copied_model_retirement_tests.cpp)
+    target_link_libraries(strix-copied-model-retirement-tests PRIVATE strix_core)
+    strix_target_warnings(strix-copied-model-retirement-tests)
+    add_test(NAME strix-copied-model-retirement-tests COMMAND strix-copied-model-retirement-tests)
+    add_executable(strix-copied-host-channel-tests tests/copied_host_channel_tests.cpp)
+    target_link_libraries(strix-copied-host-channel-tests PRIVATE strix_core)
+    strix_target_warnings(strix-copied-host-channel-tests)
+    add_test(NAME strix-copied-host-channel-tests COMMAND strix-copied-host-channel-tests)
     add_executable(strix-copied-stream-transport-tests tests/copied_stream_transport_tests.cpp)
     target_link_libraries(strix-copied-stream-transport-tests PRIVATE strix_core)
     strix_target_warnings(strix-copied-stream-transport-tests)
@@ -1126,6 +1152,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-host-upload-tests PRIVATE strix_core)
     strix_target_warnings(strix-host-upload-tests)
     add_test(NAME strix-host-upload-tests COMMAND strix-host-upload-tests)
+
+    add_executable(strix-qwen-moe-prepared-tests tests/qwen_moe_prepared_tests.cpp)
+    target_link_libraries(strix-qwen-moe-prepared-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qwen-moe-prepared-tests)
+    add_test(NAME strix-qwen-moe-prepared-tests COMMAND strix-qwen-moe-prepared-tests)
     add_executable(strix-graph-eligibility-tests tests/graph_eligibility_tests.cpp)
     target_link_libraries(strix-graph-eligibility-tests PRIVATE strix_core)
     strix_target_warnings(strix-graph-eligibility-tests)
@@ -1680,6 +1711,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-token-sampling-tests)
     add_test(NAME strix-token-sampling-tests COMMAND strix-token-sampling-tests)
 
+    add_executable(strix-token-sampling-coupled-tests tests/token_sampling_coupled_tests.cpp)
+    target_link_libraries(strix-token-sampling-coupled-tests PRIVATE strix_core)
+    strix_target_warnings(strix-token-sampling-coupled-tests)
+    add_test(NAME strix-token-sampling-coupled-tests COMMAND strix-token-sampling-coupled-tests)
+
     add_executable(strix-speculation-rng-tests tests/speculation_rng_tests.cpp)
     target_link_libraries(strix-speculation-rng-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-rng-tests)
@@ -1913,6 +1949,16 @@ if(BUILD_TESTING)
     add_test(NAME strix-compiled-speculative-verify-compact-images-off-tests COMMAND strix-compiled-speculative-verify-tests)
     set_tests_properties(strix-compiled-speculative-verify-compact-images-off-tests PROPERTIES ENVIRONMENT "STRIX_QPF2K_COMPACT_IMAGES=0")
 
+    add_executable(strix-hip-gdn-identity-tests tests/hip_gdn_identity_tests.cpp)
+    target_link_libraries(strix-hip-gdn-identity-tests PRIVATE strix_core)
+    strix_target_warnings(strix-hip-gdn-identity-tests)
+    foreach(fuse IN ITEMS 0 1)
+        add_test(NAME strix-hip-gdn-identity-fuse-${fuse}-tests COMMAND strix-hip-gdn-identity-tests ${fuse})
+        add_test(NAME strix-compiled-speculative-verify-fuse-${fuse}-tests COMMAND strix-compiled-speculative-verify-tests)
+        set_tests_properties(strix-hip-gdn-identity-fuse-${fuse}-tests strix-compiled-speculative-verify-fuse-${fuse}-tests
+            PROPERTIES LABELS "cpu" ENVIRONMENT "STRIX_QWEN_DECODE_FUSE=${fuse};STRIX_BASELINE=0;STRIX_QPF2K_DEFAULTS=1")
+    endforeach()
+
     add_executable(strix-speculative-verify-runtime-tests tests/speculative_verify_runtime_tests.cpp)
     target_link_libraries(strix-speculative-verify-runtime-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculative-verify-runtime-tests)
@@ -1927,8 +1973,12 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/session_gate_tests.py)
         add_test(NAME strix-ds41-pair-setup-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/ds41_pair_setup_tests.py)
+        add_test(NAME strix-sampled-coupled-gate-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/sampled_coupled_gate_tests.py)
         add_test(NAME strix-qwen-prefill-public-controls-gate-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/qwen_prefill_public_controls_gate_tests.py)
+        add_test(NAME strix-qwen-decode-fuse-gate-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/qwen_decode_fuse_gate_tests.py)
         add_test(NAME strix-ctest-evidence-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ctest_evidence_tests.py)
         add_test(NAME strix-queue-trace-evidence-tests
@@ -1973,6 +2023,7 @@ endif()
 # One list of AMD GPU targets for every HIP target (a successor arch is added here, e.g. "gfx1151;gfx1160"; the
 # runtime gates still decide which kernel sets a qualified arch may run).
 set(STRIX_HIP_ARCHITECTURES "gfx1151" CACHE STRING "AMD GPU targets (HIP_ARCHITECTURES) of every HIP target")
+option(STRIX_DPP_REDUCE "Use exact DPP exchanges in guarded Qwen reductions (build-time lever, off unless requested)" OFF)
 
 if(STRIX_ENABLE_HIP_RUNTIME)
     enable_language(HIP)
@@ -2000,9 +2051,45 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     # the runtime library belongs to. Put the toolkit headers first for every HIP translation unit.
     add_compile_options("$<$<COMPILE_LANGUAGE:HIP>:SHELL:-isystem ${STRIX_HIP_INCLUDE_DIR}>")
 
+    if(BUILD_TESTING)
+        # Some HIP SDKs reject RDNA wave64 at preprocessing time. Test that
+        # fallback only when the installed SDK supports building it.
+        include(CMakePushCheckState)
+        include(CheckSourceCompiles)
+        cmake_push_check_state(RESET)
+        set(CMAKE_REQUIRED_FLAGS "-mwavefrontsize64")
+        check_source_compiles(HIP "#include <hip/hip_runtime.h>
+int main() { return 0; }"
+            STRIX_HIP_SUPPORTS_WAVE64)
+        cmake_pop_check_state()
+        set(qwen_dpp_test_waves 32)
+        if(STRIX_HIP_SUPPORTS_WAVE64)
+            list(APPEND qwen_dpp_test_waves 64)
+        endif()
+        foreach(wave IN LISTS qwen_dpp_test_waves)
+            set(target strix-hip-qwen-dpp-reduce-wave${wave}-tests)
+            add_executable(${target} tests/hip_qwen_dpp_reduce_tests.hip)
+            target_include_directories(${target} PRIVATE include "${STRIX_HIP_INCLUDE_DIR}")
+            target_link_libraries(${target} PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON
+                HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
+            target_compile_definitions(${target} PRIVATE STRIX_DPP_REDUCE=$<BOOL:${STRIX_DPP_REDUCE}>)
+            target_compile_options(${target} PRIVATE -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+            if(wave EQUAL 32)
+                target_compile_options(${target} PRIVATE -mno-wavefrontsize64)
+            else()
+                target_compile_options(${target} PRIVATE -mwavefrontsize64)
+            endif()
+            strix_target_warnings(${target})
+            add_test(NAME ${target} COMMAND ${target})
+            set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;qwen;exactness")
+        endforeach()
+    endif()
+
     if(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
         # Only these isolated arithmetic TUs receive the strict experimental flags.
         add_library(strix_q4k_a8_hip_probe STATIC src/hip_moe_q4k_a8_probe.hip src/hip_moe_q4k_a8_known_rows.hip)
+        target_compile_definitions(strix_q4k_a8_hip_probe PUBLIC STRIX_DPP_REDUCE=$<BOOL:${STRIX_DPP_REDUCE}>)
         target_link_libraries(strix_q4k_a8_hip_probe PUBLIC strix_q4k_a8_contract "${STRIX_HIP_RUNTIME_LIBRARY}")
         foreach(target strix_q4k_a8_hip_probe)
             target_include_directories(${target} PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
@@ -2025,15 +2112,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             strix_target_warnings(strix-hip-moe-a8-down-tests)
             add_test(NAME strix-hip-moe-a8-down-tests COMMAND strix-hip-moe-a8-down-tests)
             add_executable(strix-hip-moe-wmma-prefill-tests tests/hip_moe_wmma_prefill_tests.hip)
-            target_link_libraries(strix-hip-moe-wmma-prefill-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core)
+            target_link_libraries(strix-hip-moe-wmma-prefill-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
             set_target_properties(strix-hip-moe-wmma-prefill-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
             target_compile_options(strix-hip-moe-wmma-prefill-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-wmma-prefill-tests)
             add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
             add_test(NAME strix-hip-moe-route-bf16-tests COMMAND strix-hip-moe-wmma-prefill-tests route-bf16)
             add_test(NAME strix-hip-moe-prefill-pool16k-tests COMMAND strix-hip-moe-wmma-prefill-tests pool16k)
+            add_test(NAME strix-hip-moe-prepared-layout-tests COMMAND strix-hip-moe-wmma-prefill-tests prepared-layout)
+            add_test(NAME strix-hip-moe-direct-b-tests COMMAND strix-hip-moe-wmma-prefill-tests direct-b)
             add_test(NAME strix-hip-moe-prefill-schedule-tests COMMAND strix-hip-moe-wmma-prefill-tests schedule)
             add_test(NAME strix-hip-moe-prefill-gsq-tests COMMAND strix-hip-moe-wmma-prefill-tests gsq)
+            add_test(NAME strix-hip-moe-prefill-tile64-tests COMMAND strix-hip-moe-wmma-prefill-tests tile64)
             add_executable(strix-hip-q4k-a8-probe-tests tests/hip_moe_q4k_a8_probe_tests.hip $<TARGET_OBJECTS:strix_q4k_a8_dot4_compile_probe>)
             target_link_libraries(strix-hip-q4k-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_core)
             set_target_properties(strix-hip-q4k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
@@ -2057,7 +2147,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
     add_library(strix_hip_runtime STATIC
         src/hip_host_upload_backend.cpp
+        src/hip_qwen_moe_prepared.cpp
         src/hip_q6p_pack.cpp
+        src/hip_qwen_router_bf16.cpp
         src/hip_dense_trellis_pack.cpp
         src/hip_runtime_allocator.cpp
         src/hip_sampled_target_logits_reader.cpp
@@ -2122,6 +2214,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PUBLIC STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS=1)
     endif()
     target_compile_features(strix_hip_runtime PUBLIC cxx_std_20)
+    target_compile_definitions(strix_hip_runtime PUBLIC STRIX_DPP_REDUCE=$<BOOL:${STRIX_DPP_REDUCE}>)
     # Host-side redirects only: SDK declarations are included before macros;
     # kernels are never counted as submits by this observer.
     target_compile_options(strix_hip_runtime PRIVATE
@@ -2435,6 +2528,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-hc-wide-rows-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-hc-wide-rows-tests)
         add_test(NAME strix-hip-hc-wide-rows-tests COMMAND strix-hip-hc-wide-rows-tests)
+        add_test(NAME strix-hip-hc-recompute-norm-tests COMMAND strix-hip-hc-wide-rows-tests --recompute-norm)
+        set_tests_properties(strix-hip-hc-recompute-norm-tests PROPERTIES
+            ENVIRONMENT "STRIX_QPF2K_HC_CHECK=0;STRIX_QPF2K_HC_UPCOPY=0;STRIX_HC_WIDE2_OUTPUT_ROWS=32")
         add_test(NAME strix-hip-hc-out16-tests COMMAND strix-hip-hc-wide-rows-tests)
         set_tests_properties(strix-hip-hc-out16-tests PROPERTIES ENVIRONMENT "STRIX_PREFILL_EXACT_FP16=0;STRIX_PREFILL_HC_OUTPUT_WMMA=1;STRIX_HCW_OUTPUT=1;STRIX_HC_OUT16_FIXTURES_ONLY=1;STRIX_QPF2K_HC=1;STRIX_QPF2K_HC_LOWBAND=3")
         add_executable(strix-hip-parallel-hyper-projection-tests tests/hip_parallel_hyper_projection_tests.hip)
@@ -2758,6 +2854,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-known-window-tests)
         add_test(NAME strix-hip-known-window-tests COMMAND strix-hip-known-window-tests)
+        add_test(NAME strix-hip-qwen-router-bf16-tests COMMAND strix-hip-known-window-tests --router-bf16)
+        set_tests_properties(strix-hip-qwen-router-bf16-tests PROPERTIES LABELS "gpu" RUN_SERIAL TRUE
+            ENVIRONMENT "STRIX_Q6P=1;STRIX_QWEN_ROUTER_BF16=1")
         add_executable(strix-hip-token-sampling-device-tests tests/hip_token_sampling_device_tests.hip)
         set_target_properties(strix-hip-token-sampling-device-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
@@ -2986,6 +3085,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_target_warnings(strix-hip-qsa-index-batch-tests)
         add_test(NAME strix-hip-qsa-index-batch-tests COMMAND strix-hip-qsa-index-batch-tests 7)
         set_tests_properties(strix-hip-qsa-index-batch-tests PROPERTIES ENVIRONMENT "STRIX_QSA_INDEX_ROWS=1;STRIX_QPF2K_INDEX_BATCH=1;STRIX_PREFILL_INDEX_PROJ_WMMA=1;STRIX_PREFILL_EXACT_FP16=0")
+        add_executable(strix-hip-qsa-index-score-wmma-tests tests/qsa_index_score_wmma.hip)
+        target_include_directories(strix-hip-qsa-index-score-wmma-tests PRIVATE include)
+        set_target_properties(strix-hip-qsa-index-score-wmma-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
+        target_compile_options(strix-hip-qsa-index-score-wmma-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-qsa-index-score-wmma-tests)
+        add_test(NAME strix-hip-qsa-index-score-wmma-tests COMMAND strix-hip-qsa-index-score-wmma-tests)
+        set_tests_properties(strix-hip-qsa-index-score-wmma-tests PROPERTIES ENVIRONMENT "STRIX_QPF2K_SCORE_ROWS=auto")
 
         add_executable(strix-hip-qsa-output-projection-tests tests/hip_qsa_output_projection_tests.hip)
         target_compile_definitions(strix-hip-qsa-output-projection-tests PRIVATE STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC=1)
@@ -3016,6 +3122,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             NAME strix-hip-gdn-launcher-tests
             COMMAND strix-hip-gdn-launcher-tests
         )
+
+        add_executable(strix-hip-gdn-decode-fuse-tests tests/hip_gdn_decode_fuse_tests.hip)
+        target_link_libraries(strix-hip-gdn-decode-fuse-tests PRIVATE strix_hip_runtime)
+        set_target_properties(strix-hip-gdn-decode-fuse-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")
+        strix_target_warnings(strix-hip-gdn-decode-fuse-tests)
+        add_test(NAME strix-hip-gdn-decode-fuse-tests COMMAND strix-hip-gdn-decode-fuse-tests)
+        set_tests_properties(strix-hip-gdn-decode-fuse-tests PROPERTIES LABELS "gpu;exactness")
 
         add_test(NAME strix-hip-gdn-virtual-q8-f32-fallback-tests
             COMMAND strix-hip-gdn-launcher-tests 128 fallback)

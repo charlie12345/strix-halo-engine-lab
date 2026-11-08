@@ -19,6 +19,8 @@
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/hip_qwen_router_bf16.hpp"
+#include "strix/qwen_router_bf16.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/session_state_memory.hpp"
 
@@ -33,6 +35,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <chrono>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -2590,6 +2594,76 @@ void router_rows_family() {
     }
     std::cout << "router rows 2/4/8 x F32/BF16/Q8_0 x staged/wave/ranked/sorted equal serial bytes; BF16 copies equal F32\n";
 }
+// Dedicated Q-09 fixture: exercise the model-load owner, exactness fallback,
+// reuse/retirement and the actual serial/window launchers. Compare the WHOLE
+// arena, including every logit, selected ID/weight and untouched byte.
+void router_bf16_family() {
+    struct SourceFile {
+        std::filesystem::path path = std::filesystem::temp_directory_path() /
+            ("strix-router-bf16-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        ~SourceFile() { std::error_code ec; std::filesystem::remove(path, ec); }
+        void put(std::span<const unsigned char> bytes) const {
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            if (!out) throw std::runtime_error("router fixture source write failed");
+        }
+    };
+    for (const auto rows : {1U, 2U, 4U, 8U}) for (const bool normalize : {false, true})
+        for (const bool special : {false, true}) {
+            RowsStepFixture f(std::max(2U, rows));
+            std::vector<std::uint32_t> bits(2560U * 512U);
+            for (std::size_t i = 0; i < bits.size(); ++i) {
+                const auto expert = i / 2560U, feature = i % 2560U;
+                // Identical experts cross block boundaries to test top-k ties.
+                const auto source = expert == 300U ? 7U : expert == 12U ? 11U : expert;
+                const auto v = static_cast<float>(static_cast<int>((feature * 13U + source * 29U) % 61U) - 30) / 1024.0F;
+                bits[i] = static_cast<std::uint32_t>(bf16(v)) << 16U;
+            }
+            if (special) {
+                constexpr std::uint32_t edge[]{0U,0x80000000U,0x00010000U,0x80010000U,
+                    0x7f800000U,0xff800000U,0x7fc10000U,0xffc30000U,0x7f810000U};
+                for (std::size_t i = 0; i < std::size(edge); ++i) bits[i * 2560U + 17U] = edge[i];
+            }
+            const auto source = bytes_of(bits);
+            write(f.router, source);
+            SourceFile file; file.put(source);
+            AllocationGenerationSource generations;
+            auto mapped = MappedModelFile::open_read_only(file.path, "router-fixture", generations);
+            auto config = router_config(f, true, false, true); config.normalize_selected = normalize;
+            const auto launcher = make_hip_moe_route_launcher("hip.moe_route.test.parallel", &config);
+            auto contexts = f.contexts(f.step(SerialOp::moe_route, 0U), launcher.key); contexts.resize(rows);
+            const auto launch = [&] {
+                if (rows == 1U) launcher.function(contexts.front(), launcher.user_data);
+                else moe_route_known_window_rows_launch(contexts, config);
+            };
+            const auto reference = f.run(launch, f.seed);
+            const auto off = load_hip_qwen_router_bf16(mapped, f.manifest, f.runtime, false);
+            require(off->bytes == 0U && !q6p::registered(reinterpret_cast<const void*>(f.router.address)), "OFF registered a copy");
+            auto copy = load_hip_qwen_router_bf16(mapped, f.manifest, f.runtime, true);
+            require(copy->copies.size() == 1U && copy->bytes == source.size() / 2U, "load did not register exact router");
+            const auto hits = q6p::hits();
+            require(f.run(launch, f.seed) == reference && q6p::hits() > hits, "BF16 logits/IDs/weights differ or copy unused");
+            require(f.run(launch, f.seed) == reference, "BF16 router repeat differs");
+            const auto reused = load_hip_qwen_router_bf16(mapped, f.manifest, f.runtime, true);
+            require(reused->reused == 1U && reused->bytes == 0U, "registered router was duplicated");
+            require(read(f.router) == source, "BF16 registration mutated F32");
+            auto inventory = copy->owner_inventory(copy);
+            require(inventory.known_allocated_storage_bytes == source.size() / 2U, "copy inventory charge");
+            copy.reset();
+            require(q6p::registered(reinterpret_cast<const void*>(f.router.address)), "inventory failed to pin copy");
+            inventory = {};
+            require(!q6p::registered(reinterpret_cast<const void*>(f.router.address)), "copy registration survived owner");
+            require(f.run(launch, f.seed) == reference, "retired owner did not restore F32");
+            // Last-coefficient failure: no prefix-only acceptance or partial copy.
+            bits.back() |= 1U;
+            SourceFile bad_file; bad_file.put(bytes_of(bits));
+            auto bad_map = MappedModelFile::open_read_only(bad_file.path, "router-inexact-fixture", generations);
+            const auto declined = load_hip_qwen_router_bf16(bad_map, f.manifest, f.runtime, true);
+            require(declined->skipped == 1U && declined->bytes == 0U &&
+                !q6p::registered(reinterpret_cast<const void*>(f.router.address)), "inexact router was registered");
+        }
+    std::cout << "router BF16 load/retire and R1/2/4/8 logits + IDs/weights bitwise checks passed\n";
+}
 void elementwise_rows_family() {
     for (const auto rows : {2U, 4U, 8U}) {
         RowsStepFixture f(rows);
@@ -2695,6 +2769,7 @@ void rows_bench() {
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (argc > 1 && std::string_view(argv[1]) == "--router-bf16") { router_bf16_family(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--qsa-pool-lifecycle") { qsa_pool_idle_owner(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--qsa-pool-tests") {
         for (bool prefetch : {false, true}) for (bool bf16_indexer : {false, true})

@@ -82,3 +82,39 @@ target_link_libraries(qwen_prefix_cache_e2e PRIVATE strix_qwen_cuda strix_qwen_p
 if(MSVC)
     target_compile_options(qwen_prefix_cache_e2e PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
+
+# Explicit unqualified same-pack storage candidate. The operator target uses
+# the actual production CUDA down/merge implementations from strix_qwen_cuda.
+add_executable(qwen_route_bf16_operator tests/cuda/qwen_moe_tests.cu)
+target_include_directories(qwen_route_bf16_operator PRIVATE tests/cuda)
+target_link_libraries(qwen_route_bf16_operator PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_route_bf16_operator PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+add_executable(qwen_route_bf16_e2e tests/cuda/qwen_route_bf16_e2e.cu)
+target_link_libraries(qwen_route_bf16_e2e PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_route_bf16_e2e PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    foreach(target qwen_route_bf16_operator qwen_route_bf16_e2e)
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+    endforeach()
+else()
+    # Existing Qwen sources use the Windows spelling of 64-bit stdio.
+    # POSIX aliases preserve the byte offsets and do not alter GPU arithmetic.
+    target_compile_definitions(strix_qwen_cuda PUBLIC _fseeki64=fseeko _ftelli64=ftello)
+    foreach(target qwen_route_bf16_operator qwen_route_bf16_e2e)
+        target_compile_options(${target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
+    endforeach()
+endif()
+
+# Armed diagnostic: actual production Q8 proposer, BF16 target and verification.
+add_executable(qwen_bf16_mtp_e2e tests/cuda/qwen_bf16_mtp_e2e.cu)
+target_link_libraries(qwen_bf16_mtp_e2e PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_bf16_mtp_e2e PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(qwen_bf16_mtp_e2e PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+else()
+    target_compile_options(qwen_bf16_mtp_e2e PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
+endif()

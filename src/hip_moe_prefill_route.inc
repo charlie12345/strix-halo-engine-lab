@@ -137,7 +137,7 @@ __global__ __launch_bounds__(256) void f16_prefill_prologue_v2(PrefillRows v,uns
     const auto fold=[&](unsigned w){m=fmaxf(m,fabsf(__uint_as_float(w<<16U)));m=fmaxf(m,fabsf(__uint_as_float(w&0xffff0000U)));};
 #pragma unroll
     for(unsigned j=0;j<route_prologue_chunks;++j){fold(x[j].x);fold(x[j].y);fold(x[j].z);fold(x[j].w);}
-    for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+    for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,strix::qwen_dpp::xor32(m, stride));
     if((t&31U)==0U)wave_max[t/32U]=m;
     __syncthreads();
     m=wave_max[0];
@@ -176,7 +176,7 @@ __global__ __launch_bounds__(256) void f16_prefill_prologue_v2_certificate(Prefi
     const auto fold=[&](unsigned w){m=fmaxf(m,fabsf(__uint_as_float(w<<16U)));m=fmaxf(m,fabsf(__uint_as_float(w&0xffff0000U)));};
 #pragma unroll
     for(unsigned j=0;j<route_prologue_chunks;++j){fold(x[j].x);fold(x[j].y);fold(x[j].z);fold(x[j].w);}
-    for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+    for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,strix::qwen_dpp::xor32(m, stride));
     if((t&31U)==0U)wave_max[t/32U]=m;
     __syncthreads();
     m=wave_max[0];

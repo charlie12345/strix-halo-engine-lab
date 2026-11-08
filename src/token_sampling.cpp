@@ -1,16 +1,19 @@
 #include "strix/token_sampling.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace strix {
 namespace {
 
 constexpr double tail_cutoff = 40.0;
-constexpr std::uint64_t single_request_identity = 1;
 
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
 
@@ -44,8 +47,43 @@ std::uint64_t token_sampling_policy_identity(const TokenSamplingPolicy& policy) 
     return hash?hash:1U;
 }
 
-SpeculationRngIdentity token_sampling_rng(const TokenSamplingPolicy& policy) {
-    return {policy.seed,single_request_identity,token_sampling_policy_identity(policy)};
+SpeculationRngIdentity token_sampling_rng(const TokenSamplingPolicy& policy,std::uint64_t request_identity) {
+    require(request_identity!=0,"sampling request identity must be non-zero");
+    return {policy.seed,request_identity,token_sampling_policy_identity(policy)};
+}
+
+std::uint64_t next_token_sampling_request_identity() {
+    static const bool counter=[] {
+        const char* v=std::getenv("STRIX_SAMPLING_REQUEST_IDENTITY");
+        if(!v || !*v || std::strcmp(v,"0")==0 || std::strcmp(v,"single")==0) return false;
+        require(std::strcmp(v,"counter")==0,"STRIX_SAMPLING_REQUEST_IDENTITY must be single or counter");
+        return true;
+    }();
+    static std::atomic<std::uint64_t> next{1};
+    return counter?next.fetch_add(1,std::memory_order_relaxed):1U;
+}
+
+TokenSamplerOptions token_sampler_options_from_environment() {
+    TokenSamplerOptions out;
+    if(const char* v=std::getenv("STRIX_MTP_SAMPLED_ACCEPT"); v && *v) {
+        if(std::strcmp(v,"coupled")==0) out.acceptance=SampledAcceptance::coupled;
+        else require(std::strcmp(v,"rejection")==0,"STRIX_MTP_SAMPLED_ACCEPT must be rejection or coupled");
+    }
+    if(const char* v=std::getenv("STRIX_MTP_SAMPLED_ARGMAX_BELOW"); v && *v) {
+        char* end=nullptr;
+        const double t=std::strtod(v,&end);
+        require(end && *end=='\0' && std::isfinite(t) && t>=0.0 && t<=100.0,
+            "STRIX_MTP_SAMPLED_ARGMAX_BELOW must be a temperature in [0, 100]");
+        out.argmax_draft_below=static_cast<float>(t);
+    }
+    if(const char* v=std::getenv("STRIX_MTP_SAMPLED_FORCE_REJECT"); v && *v) {
+        if(std::strcmp(v,"rotate")==0) out.force_reject_row=TokenSamplerOptions::forced_rejection_rotate;
+        else {
+            require(v[1]=='\0' && v[0]>='0' && v[0]<='7',"STRIX_MTP_SAMPLED_FORCE_REJECT must be a row 0..7 or rotate");
+            out.force_reject_row=static_cast<std::uint32_t>(v[0]-'0');
+        }
+    }
+    return out;
 }
 
 double TokenDistribution::probability(std::uint32_t token) const {
@@ -166,33 +204,59 @@ TokenDecision decide_token(const TokenDistribution& p,const TokenDraft* draft,
     return out;
 }
 
-TokenSampler::TokenSampler(TokenSamplingPolicy policy):policy_(policy),rng_(token_sampling_rng(policy)) {
+TokenDecision decide_token_coupled(const TokenDistribution& p,const TokenDraft* draft,double u_plain) {
+    require(!p.empty(),"token decision requires a target distribution");
+    TokenDecision out;
+    out.token=p.sample(u_plain);
+    if(draft) {out.drafted=true;out.accepted=out.token==draft->token;}
+    return out;
+}
+
+TokenSampler::TokenSampler(TokenSamplingPolicy policy):TokenSampler(policy,token_sampler_options_from_environment()) {}
+
+TokenSampler::TokenSampler(TokenSamplingPolicy policy,TokenSamplerOptions options)
+    :policy_(policy),draft_policy_(policy),options_(options),rng_(token_sampling_rng(policy,options.request_identity)) {
     require(token_sampling_enabled(policy_),"token sampler requires a positive temperature");
+    require(std::isfinite(options_.argmax_draft_below) && options_.argmax_draft_below>=0.0F,
+        "argmax draft temperature must be finite and non-negative");
+    // Forcing a rejection keeps the token only under coupled acceptance (rejection sampling would change the
+    // distribution), so the test switch is refused otherwise.
+    require(options_.force_reject_row==TokenSamplerOptions::forced_rejection_off || (coupled() &&
+        (options_.force_reject_row==TokenSamplerOptions::forced_rejection_rotate || options_.force_reject_row<8U)),
+        "forced rejection requires coupled acceptance and a row 0..7 or rotate");
+    // Below the gate a coupled draft is q's first entry by (z desc, id asc): the same transform with top-k 1.
+    if(coupled() && policy_.temperature<options_.argmax_draft_below) draft_policy_.top_k=1U;
 }
 
 TokenDraft TokenSampler::draft(std::span<const float> logits,std::span<const std::uint32_t> ids,std::uint64_t position) {
     TokenDraft out;out.position=position;
-    out.distribution=make_token_distribution(logits,ids,policy_);
-    out.token=out.distribution.sample(speculation_uniform01(rng_,position,SpeculationRandomDrawClass::draft_proposal));
+    out.distribution=make_token_distribution(logits,ids,draft_policy_);
+    out.token=out.distribution.sample(draft_uniform(position));
     ++stats_.drafts;
     return out;
 }
 
 TokenDecision TokenSampler::decide(std::span<const float> logits,std::uint64_t position,const TokenDraft* draft) {
+    const auto out=decide_uncounted(logits,position,draft);
+    count(out);
+    return out;
+}
+
+TokenDecision TokenSampler::decide_uncounted(std::span<const float> logits,std::uint64_t position,const TokenDraft* draft) const {
     require(!draft || draft->position==position,"draft position differs from the decided position");
     const auto p=make_token_distribution(logits,{},policy_);
-    const auto out=decide_token(p,draft,
+    const auto out=coupled()?decide_token_coupled(p,draft,
+        speculation_uniform01(rng_,position,SpeculationRandomDrawClass::serial_target)):decide_token(p,draft,
         speculation_uniform01(rng_,position,SpeculationRandomDrawClass::serial_target),
         draft?speculation_uniform01(rng_,position,SpeculationRandomDrawClass::draft_acceptance):0.0,
         draft?speculation_uniform01(rng_,position,SpeculationRandomDrawClass::residual_fallback):0.0);
-    if(!draft) ++stats_.plain; else if(out.accepted) ++stats_.accepted; else ++stats_.rejected;
     return out;
 }
 
 TokenSampler::Uniforms TokenSampler::uniforms(std::uint64_t position,bool drafted) const {
     Uniforms u;
     u.plain=speculation_uniform01(rng_,position,SpeculationRandomDrawClass::serial_target);
-    if(drafted) {
+    if(drafted && !coupled()) {
         u.accept=speculation_uniform01(rng_,position,SpeculationRandomDrawClass::draft_acceptance);
         u.residual=speculation_uniform01(rng_,position,SpeculationRandomDrawClass::residual_fallback);
     }
@@ -200,20 +264,37 @@ TokenSampler::Uniforms TokenSampler::uniforms(std::uint64_t position,bool drafte
 }
 
 double TokenSampler::draft_uniform(std::uint64_t position) const {
-    return speculation_uniform01(rng_,position,SpeculationRandomDrawClass::draft_proposal);
+    // Coupled: the draft for position n uses the uniform row n decides with, so a draft equal in distribution to
+    // the target row is drawn as the very token that row will sample.
+    return speculation_uniform01(rng_,position,
+        coupled()?SpeculationRandomDrawClass::serial_target:SpeculationRandomDrawClass::draft_proposal);
 }
 
 void TokenSampler::count(const TokenDecision& decision) noexcept {
     if(!decision.drafted) ++stats_.plain; else if(decision.accepted) ++stats_.accepted; else ++stats_.rejected;
+    if(decision.forced) ++stats_.forced;
+}
+
+void TokenSampler::force_rejection(TokenDecision& decision,std::uint32_t row) const noexcept {
+    const auto forced=options_.force_reject_row;
+    if(forced==TokenSamplerOptions::forced_rejection_off || !decision.drafted || !decision.accepted) return;
+    const auto target=forced==TokenSamplerOptions::forced_rejection_rotate?
+        static_cast<std::uint32_t>((windows_?windows_-1U:0U)%8U):forced;
+    // Coupled only (the constructor refuses it otherwise): the token stays the plain sample, which equals the draft.
+    if(row==target) {decision.accepted=false;decision.forced=true;}
 }
 
 std::vector<TokenDecision> TokenSampler::decide_rows(std::uint32_t max_rows,std::uint64_t first_position,
     std::span<const TokenDraft> drafts,std::span<const std::uint32_t> eos,
     const std::function<std::span<const float>(std::uint32_t)>& logits) {
     std::vector<TokenDecision> out;
+    begin_window();
     for(std::uint32_t r=0;r<max_rows;++r) {
         const auto* draft=r<drafts.size()?&drafts[r]:nullptr;
-        out.push_back(decide(logits(r),first_position+r,draft));
+        auto decision=decide_uncounted(logits(r),first_position+r,draft);
+        force_rejection(decision,r);
+        count(decision);
+        out.push_back(decision);
         const auto token=out.back().token;
         if(!draft || !out.back().accepted || std::find(eos.begin(),eos.end(),token)!=eos.end()) break;
     }

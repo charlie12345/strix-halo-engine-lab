@@ -1,4 +1,5 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
+#include "strix/qsa_prefill_budget.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -64,21 +65,21 @@ std::vector<float> scores(Dist dist, std::uint32_t blocks, std::uint64_t seed) {
 }
 // Host model of the serial loop's result: candidates > -inf by (value desc, index asc),
 // block 0 for every slot left, ascending block order, then the partial-block tail.
-void model(std::vector<float>& s, std::uint32_t visible, std::vector<std::uint32_t>& out) {
+void model(std::vector<float>& s, std::uint32_t visible, std::vector<std::uint32_t>& out, std::uint32_t limit = topk) {
     const auto blocks = visible / ratio;
     out.assign(max_selected, 0xffffffffU);
-    if (blocks <= topk) { for (std::uint32_t t = 0; t < visible; ++t) out[t] = t; return; }
+    if (blocks <= limit) { for (std::uint32_t t = 0; t < visible; ++t) out[t] = t; return; }
     std::vector<std::uint32_t> c;
     for (std::uint32_t b = 0; b < blocks; ++b) if (s[b] > ninf) c.push_back(b);
     std::stable_sort(c.begin(), c.end(), [&](auto a, auto b) { return s[a] > s[b]; });
-    c.resize(std::min<std::size_t>(c.size(), topk));
-    const bool fallback = c.size() < topk;
+    c.resize(std::min<std::size_t>(c.size(), limit));
+    const bool fallback = c.size() < limit;
     for (auto b : c) s[b] = ninf;
     if (fallback) s[0] = ninf;
-    c.insert(c.begin(), topk - c.size(), 0U);
+    c.insert(c.begin(), limit - c.size(), 0U);
     std::sort(c.begin(), c.end());
-    for (std::uint32_t i = 0; i < topk; ++i) for (std::uint32_t o = 0; o < ratio; ++o) out[i * ratio + o] = c[i] * ratio + o;
-    for (std::uint32_t t = blocks * ratio; t < visible; ++t) out[topk * ratio + t - blocks * ratio] = t;
+    for (std::uint32_t i = 0; i < limit; ++i) for (std::uint32_t o = 0; o < ratio; ++o) out[i * ratio + o] = c[i] * ratio + o;
+    for (std::uint32_t t = blocks * ratio; t < visible; ++t) out[limit * ratio + t - blocks * ratio] = t;
 }
 
 struct Slot { float* scores; std::uint32_t* selected; };
@@ -108,7 +109,8 @@ struct Fixture {
 
 // One (context, rows) family: every distribution's rows at visible = context + r,
 // serial reference on many streams concurrently, candidate on the window/C1 kernel.
-unsigned family(Fixture& f, std::uint32_t context, std::uint32_t rows) {
+unsigned family(Fixture& f, std::uint32_t context, std::uint32_t rows, std::uint32_t budget = 0U) {
+    const auto limit = qsa_prefill_block_topk(topk, ratio, budget);
     const auto count = static_cast<std::uint32_t>(dists.size()) * rows;
     std::vector<std::vector<float>> host(count);
     for (std::uint32_t d = 0; d < dists.size(); ++d)
@@ -119,7 +121,7 @@ unsigned family(Fixture& f, std::uint32_t context, std::uint32_t rows) {
         }
     for (std::uint32_t i = 0; i < count; ++i) {
         const HipQsaBlockSelectRow row{f.slots[2U * i].scores, f.slots[2U * i].selected, context + i % rows};
-        launch_hip_qsa_block_select_probe(true, {&row, 1}, ratio, topk, nullptr, 0, nullptr, f.stream[i % streams]);
+        launch_hip_qsa_block_select_probe(true, {&row, 1}, ratio, limit, nullptr, 0, nullptr, f.stream[i % streams]);
     }
     for (std::uint32_t d = 0; d < dists.size(); ++d) {
         std::vector<HipQsaBlockSelectRow> window;
@@ -127,19 +129,19 @@ unsigned family(Fixture& f, std::uint32_t context, std::uint32_t rows) {
             const auto& slot = f.slots[2U * (d * rows + r) + 1U];
             window.push_back({slot.scores, slot.selected, context + r});
         }
-        launch_hip_qsa_block_select_probe(false, window, ratio, topk, nullptr, 0, nullptr, f.stream[0]);
+        launch_hip_qsa_block_select_probe(false, window, ratio, limit, nullptr, 0, nullptr, f.stream[0]);
     }
     f.sync();
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto visible = context + i % rows;
         const auto reference = f.read(f.slots[2U * i]), candidate = f.read(f.slots[2U * i + 1U]);
         const auto where = " (context " + std::to_string(visible) + ", rows " + std::to_string(rows) + ", dist " +
-            std::to_string(i / rows) + ")";
+            std::to_string(i / rows) + ", budget " + std::to_string(budget) + ")";
         require(candidate.second == reference.second, "selected indices differ from the serial kernel" + where);
         require(candidate.first == reference.first, "consumed scores differ from the serial kernel" + where);
         std::vector<std::uint32_t> expected;
         auto s = host[i];
-        model(s, visible, expected);
+        model(s, visible, expected, limit);
         require(expected == reference.second, "serial kernel differs from the host model" + where);
         for (std::uint32_t b = 0; b < s.size(); ++b) require(std::bit_cast<std::uint32_t>(s[b]) == reference.first[b], "host model scores" + where);
     }
@@ -233,6 +235,13 @@ int main() try {
         }
     std::cout << "QSA parallel block selection bit-exact row cases passed: " << cases << '\n';
     std::cout << "QSA graph-form selection cases passed: " << graph_family(f) << '\n';
+    // Host oracle ranks the unrestricted candidates before truncating, including incumbent zero-fill.
+    // Full buffer/consumed-score comparisons also catch stores beyond the shortened list.
+    unsigned budget_cases = 0U;
+    for (const auto budget : {0U, 4U, 512U, 1536U, 2048U, 4096U})
+        for (const auto visible : {1U, 4U, 1533U, 1536U, 1537U, 2048U, 32768U, 131072U, 262144U})
+            budget_cases += family(f, visible, 8U, budget);
+    std::cout << "QSA prefill budget selection cases passed: " << budget_cases << '\n';
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "QSA block selection test failed: " << error.what() << '\n';

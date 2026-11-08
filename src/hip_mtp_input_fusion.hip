@@ -1,3 +1,4 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
 #include <cstdlib>
@@ -204,8 +205,8 @@ __global__ __launch_bounds__(256) void mtp_input_projections_wave_rows(HipMtpInp
 #pragma unroll
     for(unsigned k=0;k<R;++k) {
         for(unsigned d=16U;d;d>>=1U) {
-            embedding[k]+=__shfl_xor(embedding[k],static_cast<int>(d),32);
-            for(unsigned s=0;s<hc;++s) sums[k][s]+=__shfl_xor(sums[k][s],static_cast<int>(d),32);
+            embedding[k]+=strix::qwen_dpp::xor32(embedding[k], d);
+            for(unsigned s=0;s<hc;++s) sums[k][s]+=strix::qwen_dpp::xor32(sums[k][s], d);
         }
     }
     if(lane)return;
@@ -261,8 +262,8 @@ __global__ __launch_bounds__(256) void mtp_input_projections_batch(HipMtpInputFu
 #pragma unroll
     for(unsigned t=0;t<Count;++t) {
         for(unsigned d=16U;d;d>>=1U) {
-            embedding[t]+=__shfl_xor(embedding[t],static_cast<int>(d),32);
-            for(unsigned s=0;s<hc;++s) sums[t][s]+=__shfl_xor(sums[t][s],static_cast<int>(d),32);
+            embedding[t]+=strix::qwen_dpp::xor32(embedding[t], d);
+            for(unsigned s=0;s<hc;++s) sums[t][s]+=strix::qwen_dpp::xor32(sums[t][s], d);
         }
     }
     if(lane)return;
@@ -295,8 +296,8 @@ __global__ __launch_bounds__(256) void mtp_input_projections_wave(HipMtpInputFus
         }
     }
     for(unsigned d=16U;d;d>>=1U) {
-        embedding+=__shfl_xor(embedding,static_cast<int>(d),32);
-        for(unsigned stream=0;stream<4U;++stream) sums[stream]+=__shfl_xor(sums[stream],static_cast<int>(d),32);
+        embedding+=strix::qwen_dpp::xor32(embedding, d);
+        for(unsigned stream=0;stream<4U;++stream) sums[stream]+=strix::qwen_dpp::xor32(sums[stream], d);
     }
     if(lane)return;
     const float projected=rounded(embedding,r.projection_rounding);

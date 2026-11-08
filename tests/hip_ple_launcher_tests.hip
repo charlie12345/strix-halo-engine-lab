@@ -1,3 +1,8 @@
+#ifdef STRIX_PLE_TILE_HOST_ONLY
+#include "ple_tile_host.inc"
+int main() try { return ple_tile_host::run(); }
+catch (const std::exception& e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
+#else
 #include "strix/execution_arena.hpp"
 #include "strix/execution_io.hpp"
 #include "strix/execution_memory.hpp"
@@ -21,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -30,6 +36,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "ple_tile_host.inc"
 
 namespace {
 
@@ -484,9 +491,21 @@ void ple_tail_rows_cases() {
     check(hipStreamDestroy(stream), "destroy PLE tail stream");
 }
 
+#include "ple_tile_device.inc"
 }  // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
+    if (argc == 2 && std::string(argv[1]) == "--ple-tile-host") return ple_tile_host::run();
+    if (argc == 2 && (std::string(argv[1]) == "--ple-tile-exact" || std::string(argv[1]) == "--ple-tile-inactive")) {
+        ple_tile_exact_cases(std::string(argv[1]) == "--ple-tile-inactive");
+        return 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--ple-tile-bench") {
+        const auto rows = static_cast<unsigned>(std::stoul(argv[2]));
+        ple_tile_host::require(rows == 8192U || rows == 16384U, "PLE timing requires T8192 or T16384");
+        ple_tile_case(rows, 2560U, 10240U, 2560U, 8U, 1, true, false, true);
+        return 0;
+    }
     ple_tail_rows_cases();
     const auto model =
         strix::ModelContract::qwen38_flash_next();
@@ -1134,3 +1153,4 @@ int main() try {
         << error.what() << '\n';
     return 2;
 }
+#endif  // STRIX_PLE_TILE_HOST_ONLY

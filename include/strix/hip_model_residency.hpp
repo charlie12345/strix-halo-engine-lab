@@ -136,6 +136,9 @@ public:
         return binding_;
     }
 
+    // Setup-only, after host admission and before any capture/consumer.
+    void prepare_qwen_moe_direct_b(const MappedModelFile&, const ModelManifest&);
+
     [[nodiscard]] HipModelResidencyMode
     mode() const noexcept {
         return mode_;

@@ -101,7 +101,7 @@ int main() {
         for (unsigned pattern = 0; pattern < 5; ++pattern) {
             std::vector<std::uint32_t> keys(size);
             for (unsigned i = 0; i < size; ++i)
-                keys[i] = pattern == 0 ? 7U : pattern == 1 ? i : pattern == 2 ? size - i : pattern == 3 ? gen() % 5U : gen();
+                keys[i] = static_cast<std::uint32_t>(pattern == 0 ? 7U : pattern == 1 ? i : pattern == 2 ? size - i : pattern == 3 ? gen() % 5U : gen());
             const auto better = [&](unsigned x, unsigned y) { return keys[x] != keys[y] ? keys[x] > keys[y] : x < y; };
             std::vector<unsigned> all, kept;
             for (unsigned i = 0; i < size; ++i) all.push_back(i);

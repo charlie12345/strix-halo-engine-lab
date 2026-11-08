@@ -1,3 +1,4 @@
+#include "strix/qwen_prefill_pair.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_known_prompt_backend.hpp"
 #include "strix/known_prefill_limits.hpp"
@@ -200,21 +201,23 @@ struct HipKnownPromptBackend::Impl {
             if (session.health != SerialSessionHealth::ready || session.next_position != position + rows ||
                 session.committed_tokens != committed_before + rows || result.logits.size()!=result.logit_row_indices.size())
                 throw std::logic_error("known prompt native window did not commit its configured causal rows");
+            // pair prefill stage A (rank 0, layers 0-23) has no LM head: no logits and no output mapping to check
+            const bool pp_stage_a=qwen_pp::pipe_context.pipe&&qwen_pp::pipe_context.rank==0U;
             std::size_t outputs=0U;
-            for(std::uint32_t r=0;r<rows&&!headless;++r)if(known_window_produces_logits(policy,r,rows)) {
+            for(std::uint32_t r=0;r<rows&&!headless&&!pp_stage_a;++r)if(known_window_produces_logits(policy,r,rows)) {
                 if(outputs>=result.logit_row_indices.size()||result.logit_row_indices[outputs]!=r)
                     throw std::logic_error("known prompt native output mapping differs from its policy");
                 ++outputs;
             }
-            if(outputs!=result.logits.size()||result.omitted_lm_heads!=rows-outputs)
+            if(!pp_stage_a&&(outputs!=result.logits.size()||result.omitted_lm_heads!=rows-outputs))
                 throw std::logic_error("known prompt native output count differs from its policy");
             // execute() has already fenced its owned producer stream and checked
             // D1 before publication. A synchronous full-row download introduces
             // no borrowed stream or additional D1 phase. Output intent was
             // compiled/admitted before execution; never read omitted scratch.
-            if(!state_only && all_rows_sink && !headless) {
+            if(!state_only && !pp_stage_a && all_rows_sink && !headless) {
                 deliver_all_rows(result, tokens, position, logits);
-            } else if(!state_only) {
+            } else if(!state_only && !pp_stage_a) {
                 const auto terminal=std::find(result.logit_row_indices.begin(),result.logit_row_indices.end(),rows-1U);
                 if(terminal==result.logit_row_indices.end())throw std::logic_error("known prompt terminal output is missing");
                 const auto& view=result.logits[static_cast<std::size_t>(terminal-result.logit_row_indices.begin())];

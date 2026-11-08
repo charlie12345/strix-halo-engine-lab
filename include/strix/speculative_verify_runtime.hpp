@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -25,6 +26,20 @@ struct CompiledLaunchPlan;
 // preflight_plan optionally adds owner policy. preflight_scope proves an owned eager stream and
 // deferred-status parity, and null graph-position arguments. complete drains/checks status before publication.
 struct KnownWindowExecutionHooks {
+    // Experimental tiled-prefill stage seam. Save/load use the first next-layer
+    // HC read, HC attention-input write, and the next injection's coefficient read.
+    std::function<void(bool, std::uint32_t,
+        const std::function<ExecutionDispatchContext(std::uint32_t)>&,
+        const std::function<ExecutionDispatchContext(std::uint32_t)>&)> prefill_seam;
+
+    // Diagnostic only: synchronized native timing boundaries, never completion/publication.
+    // nullopt denotes the terminal final-HC/LM-head group.
+    std::function<void(std::optional<std::uint32_t>, bool)> prefill_profile_boundary;
+
+    // Debug only, before each stage-B HC dispatch/skip, independent of folding/observers.
+    std::function<void(std::size_t, std::uint32_t,
+        const std::function<ExecutionDispatchContext(std::uint32_t)>&)> prefill_layer_input;
+
     // Loop top after a completed layer; independent of observers and arithmetic skip/fold decisions.
     std::function<bool()> bundle_closed;
     std::function<void(std::size_t)> yield_point;

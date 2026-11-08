@@ -1,3 +1,5 @@
+#include "strix/qwen_prefill_pair.hpp"
+#include "strix/qwen_prefill_pipeline.hpp"
 #include "strix/startup_markers.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/qsa_cache_only.hpp"
@@ -54,6 +56,17 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     std::span<const KnownWindowRowsEntry> full) {
     const qpf2k::ModelScope defaults_scope(serial_resources.model_manifest ? qpf2k::has_gsq_gate(*serial_resources.model_manifest) : qpf2k::gsq_model);
     // STRIX_PREFILL_TIMING=1: host milliseconds of each phase of every block on stderr.
+    std::uint32_t pp_layers = 0;
+    const char* pp_env = std::getenv("STRIX_QWEN_PF_LAYER_RANGE");
+    if (pp_env) for (const auto& pp_source : serial.execution.steps)
+        if (pp_source.layer) pp_layers = std::max(pp_layers, *pp_source.layer + 1U);
+    const auto pp_range = qwen_pp::parse_range(pp_env, pp_layers);
+    const char* pp_test_env = std::getenv("STRIX_QWEN_PF_SPLIT_TEST");
+    const bool pp_test = pp_test_env && std::string_view(pp_test_env) == "1";
+    if (pp_test && (!pp_range.enabled || pp_range.begin != 0 || pp_range.end != 24 || pp_layers != 48))
+        throw std::invalid_argument("layer-split split test requires layer range 0:24 on the 48-layer model");
+    if (pp_range.enabled && !hooks.prefill_seam)
+        throw std::invalid_argument("layer range requires a native layer-split seam owner");
     static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
     auto mark=std::chrono::steady_clock::now();
     const auto lap=[&](const char* name) {
@@ -328,7 +341,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     startup::first_prefill_tile();
     DirectLaunchDispatcher dispatcher(launch);
     const auto ple=std::find_if(serial.execution.steps.begin(),serial.execution.steps.end(),[](const auto& s){return s.op==SerialOp::ple;});
-    if(resources.ple_lookup&&resources.ple_hash_contract&&resources.ple_prefetch) {
+    if((!pp_range.enabled || pp_range.begin == 0) && resources.ple_lookup&&resources.ple_hash_contract&&resources.ple_prefetch) {
         require(ple!=serial.execution.steps.end(),"known prefill has PLE resources without PLE step");
         start_ple_lookup_prefetch(*resources.ple_hash_contract,ple->id,tokens[0],session.next_position,*resources.model_manifest,
             *resources.model_weights,*resources.tensor_access,*resources.session_state_layout,*resources.session_state_memory,
@@ -340,13 +353,63 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         hooks.after_step(step,[&](std::uint32_t row) {
             require(row<rows,"known prefill observer row is outside the block");return context(step,row);});
     };
+    const auto pp_boundary = [&](std::uint32_t layer, bool save) {
+        std::size_t first_step = steps, inject_step = steps;
+        for (std::size_t candidate = 0; candidate < steps; ++candidate) {
+            const auto& candidate_source = serial.execution.steps[candidate];
+            if (candidate_source.layer != layer) continue;
+            if (first_step == steps) first_step = candidate;
+            if (candidate_source.op == SerialOp::attn_inject) inject_step = candidate;
+        }
+        require(first_step != steps && inject_step != steps, "PP seam topology is missing");
+        require(serial.execution.steps[first_step].op == SerialOp::attn_hyper_mix,
+            "PP cut requires a folded attention-HC boundary of the reference kind");
+        hooks.prefill_seam(save, rows,
+            [&](std::uint32_t row) { return context(first_step, row); },
+            [&](std::uint32_t row) { return context(inject_step, row); });
+    };
+    std::optional<std::uint32_t> profile_layer;
+    bool profile_active = false;
+    const auto profile_end = [&] {
+        if (profile_active) hooks.prefill_profile_boundary(profile_layer, false);
+        profile_active = false;
+    };
     try {
+        if (pp_range.enabled && pp_range.begin) pp_boundary(pp_range.begin, false);
         bool completed_layer=false;
+        bool pp_saved = false;
         for(std::size_t step=0;step<steps;++step) {
             if(step && serial.execution.steps[step-1U].op==SerialOp::mlp_inject) completed_layer=true;
             if(completed_layer && hooks.yield_point && hooks.bundle_closed()) {hooks.yield_point(step);completed_layer=false;}
             const auto& source=serial.execution.steps[step];
+            if (pp_range.enabled) {
+                if (source.layer && *source.layer < pp_range.begin) continue;
+                const bool after_range = source.layer ? *source.layer >= pp_range.end :
+                    pp_range.end < pp_layers && (source.op == SerialOp::final_hyper_mix || source.op == SerialOp::lm_head);
+                if (after_range && !pp_saved) {
+                    profile_end();
+                    pp_boundary(pp_range.end, true);
+                    pp_saved = true;
+                    if (pp_test) pp_boundary(pp_range.end, false);
+                }
+                if (after_range && !pp_test) break;
+                if (!source.layer && pp_range.begin &&
+                    source.op != SerialOp::final_hyper_mix && source.op != SerialOp::lm_head) continue;
+            }
+            if (pp_range.enabled && source.layer && *source.layer >= (pp_range.begin ? pp_range.begin : pp_range.end) &&
+                source.op == SerialOp::attn_hyper_mix && hooks.prefill_layer_input)
+                hooks.prefill_layer_input(step, rows,
+                    [&](std::uint32_t pp_row) { return context(step, pp_row); });
             if(!result.execution.state.contains(source.reads_state)) throw std::logic_error("known prefill persistent state disappeared after admission");
+            if (hooks.prefill_profile_boundary && (!headless || step < headless_from) &&
+                (source.layer || source.op == SerialOp::final_hyper_mix || source.op == SerialOp::lm_head)) {
+                if (!profile_active || profile_layer != source.layer) {
+                    profile_end();
+                    profile_layer = source.layer;
+                    hooks.prefill_profile_boundary(profile_layer, true);
+                    profile_active = true;
+                }
+            }
             const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
             // STRIX_PREFILL_TIMING=1: host enqueue time per step mode (admission inside each launch included).
             const auto launch_begin=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
@@ -442,6 +505,20 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                 first+=count;
             }
             observe(step);
+        }
+        profile_end();
+        if (pp_range.enabled && pp_range.end < pp_layers && !pp_test) {
+            hooks.complete();
+            session.state = result.execution.state;
+            if (qwen_pp::pipe_context.pipe) {
+                materialize(context(steps-1U,rows-1U),post-1U);
+                session.next_position = post;
+                session.committed_tokens = committed;
+                session.arithmetic_lineage = std::move(lineage);
+            }
+            result.logits.clear();
+            result.logit_row_indices.clear();
+            return result;
         }
         if(resources.ple_prefetch&&resources.ple_prefetch->active) throw std::logic_error("known prefill left PLE lookup unconsumed");
         if(timing)

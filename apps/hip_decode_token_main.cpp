@@ -1,3 +1,8 @@
+#include "strix/qwen_prefill_pair.hpp"
+#include "strix/qwen_prefill_handoff.hpp"
+#include "strix/qwen_prefill_pipe_dump.hpp"
+#include "strix/qwen_prefill_balance.hpp"
+#include "strix/dist/communicator.hpp"
 #include "strix/startup_markers.hpp"
 #include "strix/device_profile.hpp"
 #include "strix/mtp_cost_table_session.hpp"
@@ -1262,6 +1267,42 @@ static int run_decode_entry(
             "All paths remain experimental; RAW recording is not performance evidence.\n";
         return 0;
     }
+    // Pair flags belong only to the explicit pair prefill entry.
+    if (strix::qwen_pp::decode_enabled() && !strix::qwen_pp::pipe_enabled())
+        throw std::invalid_argument("pair handoff decode requires STRIX_QWEN_PF_PIPE=1");
+    std::vector<char*> pair_arguments;
+    if (strix::qwen_pp::pipe_enabled()) {
+        pair_arguments.push_back(argv[0]);
+        bool pair_rank_seen = false;
+        const auto pair_setenv = [](const char* key, const char* value) {
+#ifdef _WIN32
+            if (_putenv_s(key, value) != 0) throw std::runtime_error("pair prefill environment update failed");
+#else
+            if (setenv(key, value, 1) != 0) throw std::runtime_error("pair prefill environment update failed");
+#endif
+        };
+        for (int pair_index = 1; pair_index < argc; ++pair_index) {
+            const std::string_view pair_argument(argv[pair_index]);
+            if (pair_argument == "--rank" || pair_argument == "--peer" || pair_argument == "--transport") {
+                if (++pair_index == argc) throw std::invalid_argument("pair prefill pair flag requires a value");
+                const char* pair_value = argv[pair_index];
+                if (pair_argument == "--rank") {
+                    if (pair_rank_seen || (std::string_view(pair_value) != "0" && std::string_view(pair_value) != "1"))
+                        throw std::invalid_argument("pair prefill requires one --rank 0|1");
+                    pair_rank_seen = true;
+                    pair_setenv("STRIX_QWEN_PF_PIPE_RANK", pair_value);
+                } else pair_setenv(pair_argument == "--peer" ? "STRIX_QWEN_PF_PIPE_PEER" : "STRIX_QWEN_PF_PIPE_TRANSPORT", pair_value);
+            } else pair_arguments.push_back(argv[pair_index]);
+        }
+        if (!pair_rank_seen) {
+            const char* pair_inherited_rank = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
+            if (!pair_inherited_rank || (std::string_view(pair_inherited_rank) != "0" && std::string_view(pair_inherited_rank) != "1"))
+                throw std::invalid_argument("pair prefill requires --rank 0|1");
+        }
+        argc = static_cast<int>(pair_arguments.size());
+        pair_arguments.push_back(nullptr);
+        argv = pair_arguments.data();
+    }
     auto options =
         parse_options(
             argc,
@@ -1279,6 +1320,15 @@ static int run_decode_entry(
         if (options.print_plan) std::cout << strix::model_graph::dump(plan);
         return 0;
     }
+    if (strix::qwen_pp::pipe_enabled() && ((options.mtp.enabled && !strix::qwen_pp::decode_enabled()) || options.supplied_options.contains("--http") ||
+        options.supplied_options.contains("--rope-yarn") || std::getenv("STRIX_QWEN_PF_SPLIT_TEST")))
+        throw std::invalid_argument("pair prefill requires tiled CLI prefill, no HTTP, YaRN or layer-split split test; MTP requires pair handoff");
+    if (strix::qwen_pp::pipe_enabled() && options.mtp.enabled &&
+        (!strix::decode_cli::mtp_tiled_prompt(options) || strix::decode_cli::mtp_sampling(options.mtp) ||
+         options.mtp.sample_repeats != 1U || options.session_management_requested || options.session_mtp_fixed ||
+         options.mtp.metadata_only || !options.mtp.golden_dump.empty() || !options.mtp.cohort.empty() ||
+         options.tokens.empty()))
+        throw std::invalid_argument("pair handoff MTP requires one fresh greedy tiled CLI request");
     // Parsing has loaded --prompt-ids (text uint32 IDs) and positional IDs.
     // Gate the process environment before preflight, model setup or cached readers.
     // In particular, do this before eager exec: inherited levers are no longer
@@ -3282,6 +3332,48 @@ static int run_decode_entry(
 
     // Known-prefix windows and the tiled prefill (also the MTP prompt with --known-prefix-window):
     // plans, arenas, native owners and backends, and the optional prefix state cache.
+    // Resolve seam cadence before compiling/allocating any tiled owner. Never enlarge
+    // the resolver-admitted tile, so this cannot exceed its UMA/GTT reservation.
+    strix::qwen_pp::CutPrediction pair_prediction;
+    std::uint64_t pair_bucket = 0;
+    std::optional<strix::qwen_pp::LayerCosts> pair_cost_bucket;
+    strix::qwen_pp::PromptRoute pair_prompt_route;
+    const char* pair_cut_env = std::getenv("STRIX_QWEN_PF_PIPE_CUT");
+    const char* pair_cost_env = std::getenv("STRIX_QWEN_PF_PIPE_COSTS");
+    if (strix::qwen_pp::pipe_enabled()) {
+        strix::qwen_pp::LegalCuts pair_legal{};
+        for (std::uint32_t pair_layer = 1; pair_layer < 48U; ++pair_layer) {
+            const auto pair_first = std::find_if(compiled.execution.steps.begin(), compiled.execution.steps.end(),
+                [&](const auto& pair_step) { return pair_step.layer == pair_layer; });
+            const bool pair_inject = std::any_of(compiled.execution.steps.begin(), compiled.execution.steps.end(),
+                [&](const auto& pair_step) { return pair_step.layer == pair_layer && pair_step.op == strix::SerialOp::attn_inject; });
+            pair_legal[pair_layer] = pair_first != compiled.execution.steps.end() &&
+                pair_first->op == strix::SerialOp::attn_hyper_mix && pair_inject;
+        }
+        if (pair_cost_env) {
+            const auto pair_costs = strix::qwen_pp::load_costs(pair_cost_env, options.tokens.size());
+            pair_bucket = pair_costs.context;
+            pair_cost_bucket = pair_costs;
+            pair_prediction = pair_cut_env ? strix::qwen_pp::predict_cut(pair_costs,
+                strix::qwen_pp::parse_cut(pair_cut_env, pair_legal)) : strix::qwen_pp::choose_cut(pair_costs, pair_legal);
+        } else pair_prediction.cut = strix::qwen_pp::parse_cut(pair_cut_env, pair_legal);
+        const auto pair_legacy_rows = options.known_prefix_prefill_rows;
+        const auto choice = strix::qwen_pp::choose_chunk(std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"),
+            pair_legacy_rows, options.tokens.size(), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
+        options.known_prefix_prefill_rows = choice.rows;
+        pair_prompt_route = strix::qwen_pp::choose_prompt_route(options.tokens.size(), choice.rows,
+            pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
+        std::fprintf(stderr, "qwen-handoff route=%s prefix=%llu suffix=%llu\n", pair_prompt_route.reason,
+            static_cast<unsigned long long>(pair_prompt_route.prefix),
+            static_cast<unsigned long long>(options.tokens.size() - pair_prompt_route.prefix));
+        if (!options.session_save.empty() && choice.rows && options.tokens.size() % choice.rows)
+            throw std::invalid_argument("session save after a two-node prefill requires a prompt length "
+                "that is a multiple of the chunk size");
+        if (strix::qwen_pp::decode_enabled() && !pair_prompt_route.prefix &&
+            std::getenv("STRIX_QWEN_PF_PIPE_RANK")[0] == '1') return 0;
+        std::fprintf(stderr, "qwen-pair chunk-rows=%u legacy-rows=%u chunk-source=%s cost-bucket=%llu\n",
+            choice.rows, pair_legacy_rows, choice.reason, static_cast<unsigned long long>(pair_bucket));
+    }
     std::optional<strix::CompiledKnownPrefixWindow> known_prefix_plan;
     std::shared_ptr<strix::CompiledKnownPrefixPrefill> known_prefill_plan;
     // Optional smaller tiled block for the remainder (--known-prefix-tail-rows).
@@ -5436,7 +5528,220 @@ static int run_decode_entry(
         };
         // One tiled known-prefix request: restore the longest cached block-boundary prefix (prefix
         // state cache), prefill the rest in T-row blocks (capturing selected boundaries), generate.
-        const auto run_known_prompt = [&](std::span<const std::uint32_t> prompt) -> strix::SerialGreedyRequestResult {
+        std::optional<std::vector<float>> pair_decode_logits;
+        // Canonical state resolvers include all retained KV/index capacity; no
+        // assumption about token-major packing or inactive padding is needed.
+        const auto pair_state_views = [&](std::uint32_t begin, std::uint32_t end) {
+            std::vector<std::pair<strix::qwen_pp::StatePart, strix::SessionStateAddress>> views;
+            for (std::uint32_t layer = begin; layer < end; ++layer) {
+                const bool attention = (layer + 1U) % model.full_attention_interval == 0U;
+                for (const auto component : {strix::SessionStateComponent::attention_kv,
+                    strix::SessionStateComponent::recurrent_matrix, strix::SessionStateComponent::gdn_convolution,
+                    strix::SessionStateComponent::sparse_index}) {
+                    const bool indexed = component == strix::SessionStateComponent::attention_kv ||
+                        component == strix::SessionStateComponent::sparse_index;
+                    if (indexed != attention) continue;
+                    const auto address = indexed ? strix::resolve_indexed_attention_layer_state(
+                        state_layout, memory.state(), model, layer, component) : strix::resolve_gdn_layer_state(
+                        state_layout, memory.state(), model, layer, component);
+                    views.push_back({{layer, static_cast<std::uint32_t>(component), address.bytes}, address});
+                }
+            }
+            // The input PLE prelude runs only on stage A. Its session-wide
+            // convolution history must survive the stage-B handoff on rank 0.
+            if (begin == 0U) {
+                const auto shared = strix::resolve_session_state(state_layout, memory.state(),
+                    strix::SessionStateComponent::ple_convolution);
+                views.push_back({{48U, static_cast<std::uint32_t>(strix::SessionStateComponent::ple_convolution), shared.bytes}, shared});
+            }
+            return views;
+        };
+        const auto pair_dump_state = [&](std::uint32_t begin, std::uint32_t end, std::string_view owner) {
+            if (!strix::qwen_pp::dump_enabled()) return;
+            check_hip(hipDeviceSynchronize(), "pair handoff digest producer fence");
+            const auto views = pair_state_views(begin, end);
+            std::vector<std::byte> staging(strix::qwen_pp::seam_piece_bytes);
+            for (std::uint32_t layer = begin; layer <= end; ++layer) {
+                std::uint64_t hash = 14695981039346656037ULL, bytes = 0;
+                std::string metadata;
+                for (const auto& view : views) if (view.first.layer == layer) {
+                    const auto& address = view.second;
+                    metadata += " component=" + std::to_string(view.first.component) + ":" + std::to_string(address.bytes);
+                    for (std::uint64_t offset = 0; offset < address.bytes;) {
+                        const auto size = static_cast<std::size_t>(std::min<std::uint64_t>(staging.size(), address.bytes - offset));
+                        check_hip(hipMemcpy(staging.data(), reinterpret_cast<const void*>(address.address + offset),
+                            size, hipMemcpyDeviceToHost), "pair handoff digest D2H");
+                        hash = strix::qwen_pp::dump_hash(std::span<const std::byte>(staging).first(size), hash);
+                        offset += size; bytes += size;
+                    }
+                }
+                const auto name = strix::qwen_pp::dump_stem(owner, session.next_position, 0U) + "-layer-" + std::to_string(layer) + ".state.txt";
+                strix::qwen_pp::dump_text(name, "wire=1 position=" + std::to_string(session.next_position) +
+                    " bytes=" + std::to_string(bytes) + " fnv1a64=" + std::to_string(hash) + metadata + "\n");
+            }
+        };
+        if (strix::qwen_pp::pipe_enabled() && (!strix::qwen_pp::decode_enabled() || pair_prompt_route.prefix)) {
+            const auto pair_prompt_size = strix::qwen_pp::decode_enabled() ? pair_prompt_route.prefix : options.tokens.size();
+            if (!known_prefill_plan || !known_prefix_owner || model.hidden_layers != 48 || options.tokens.empty() ||
+                pair_prompt_size % 8U != 0U || (pair_prompt_size % known_prefill_plan->logical_rows != 0U &&
+                pair_prompt_size % known_prefill_plan->logical_rows < 16U))
+                throw std::invalid_argument("pair prefill requires the 48-layer tiled model and full tiles or a 16+ row multiple-of-8 tail (prefill-only mode has no handoff for a remainder; set STRIX_QWEN_PF_PIPE_DECODE=1 for any prompt length)");
+            const unsigned pair_rank = std::getenv("STRIX_QWEN_PF_PIPE_RANK")[0] == '0' ? 0U : 1U;
+            if (pair_cost_bucket && session.next_position != 0U)
+                throw std::invalid_argument("pair prefill cost-driven chunk selection requires a fresh prompt");
+            const auto pair_range = pair_rank == 0U ? "0:" + std::to_string(pair_prediction.cut) :
+                std::to_string(pair_prediction.cut) + ":48";
+#if defined(_WIN32)
+            if (_putenv_s("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str()) != 0)
+#else
+            if (::setenv("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str(), 1) != 0)
+#endif
+                throw std::runtime_error("pair prefill layer range update failed");
+            std::fprintf(stderr, "qwen-pair rank=%u cut=%u cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
+                pair_rank, pair_prediction.cut, pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "default"),
+                static_cast<unsigned long long>(pair_bucket), pair_prediction.a * static_cast<double>(options.tokens.size()),
+                pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
+            const char* pair_transport_env = std::getenv("STRIX_QWEN_PF_PIPE_TRANSPORT");
+            const std::string_view pair_transport = pair_transport_env ? pair_transport_env : "usb4auto";
+            std::unique_ptr<strix::dist::Transport> pair_link;
+            if (pair_transport == "usb4auto" || pair_transport == "usb4-auto") {
+                strix::dist::Usb4AutoOptions pair_usb;
+                pair_usb.rank = pair_rank;
+                pair_link = strix::dist::usb4_host_auto(pair_usb);
+            } else if (pair_transport == "tcp") {
+                const char* pair_peer = std::getenv("STRIX_QWEN_PF_PIPE_PEER");
+                if (pair_rank == 1U && !pair_peer) throw std::invalid_argument("pair prefill TCP rank 1 requires --peer HOST (port 29872)");
+                const auto pair_timeout = std::chrono::milliseconds(120000);
+                pair_link = pair_rank == 0U ? strix::dist::tcp_listen(29872, pair_timeout) :
+                    strix::dist::tcp_connect(pair_peer, 29872, pair_timeout);
+            } else throw std::invalid_argument("pair prefill transport must be usb4auto or tcp");
+            strix::qwen_pp::Pipe pair_pipe(pair_rank,
+                (pair_prompt_size + known_prefill_plan->logical_rows - 1U) / known_prefill_plan->logical_rows,
+                [&](std::span<const std::byte> data) { pair_link->send(data); },
+                [&](std::span<std::byte> data) { pair_link->receive(data); },
+                [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.cut,
+                [&] { return strix::qwen_pp::make_hip_pipe_staging(
+                    static_cast<std::size_t>(known_prefill_plan->logical_rows) * strix::qwen_pp::Seam::row_bytes); },
+                [](std::span<const std::byte> data) { return strix::dist::crc32c(data); });
+            auto& pair_context = strix::qwen_pp::pipe_context;
+            pair_context = {&pair_pipe, pair_rank, 0U, known_prefill_plan->prefill_execution_identity, pair_prediction.cut};
+            pair_context.identity ^= compiled.execution_identity ^ known_prefill_plan->prefill_kernel_plan_identity;
+            for (const char pair_byte : strix::model_content_identity_hex(mapped.file_sha256()))
+                pair_context.identity = (pair_context.identity ^ static_cast<unsigned char>(pair_byte)) * 1099511628211ULL;
+            struct PairContextReset {
+                ~PairContextReset() { strix::qwen_pp::pipe_context = {}; }
+            } pair_reset;
+            const auto pair_start = std::chrono::steady_clock::now();
+            std::vector<float> pair_final_logits;
+            {   // drive the chunks through the normal cursor/backend (session handoff), not the raw owner
+                strix::KnownPromptChunkRequest pair_req;
+                pair_req.prompt_tokens = std::span<const std::uint32_t>(options.tokens).first(static_cast<std::size_t>(pair_prompt_size));
+                pair_req.start_position = session.next_position;
+                pair_req.vocab_size = request.vocab_size; pair_req.context_capacity = request.context_capacity;
+                pair_req.max_new_tokens = request.max_new_tokens; pair_req.eos_token_id = request.eos_token_id;
+                pair_req.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
+                pair_req.tiled_prefill = true;
+                pair_req.output_policy = options.known_prefix_output_policy;
+                pair_req.all_row_heads = false;
+                pair_req.schedule_extensions = true;
+                pair_req.schedule_defer = strix::qpf2k::cli_sched_defers(false);
+                pair_req.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+                strix::KnownPromptChunkCursor pair_chunks(pair_req, *known_prefix_backend, backend);
+                for (auto& tail : known_tail_backends) pair_chunks.set_tail_backend(*tail);
+                std::size_t pair_position = 0;
+                for (;;) {
+                    const auto pair_chunk_start = std::chrono::steady_clock::now();
+                    if (!pair_chunks.advance()) break;
+                    const auto pair_rows = std::min<std::size_t>(known_prefill_plan->logical_rows, static_cast<std::size_t>(pair_prompt_size) - pair_position);
+                    if (pair_rank == 1U) pair_pipe.release(pair_context.sequence);
+                    std::fprintf(stderr, "qwen-pair rank=%u chunk=%llu position=%llu rows=%llu seam-bytes=%llu chunk-ms=%.3f\n",
+                        pair_rank, static_cast<unsigned long long>(pair_context.sequence), static_cast<unsigned long long>(pair_position),
+                        static_cast<unsigned long long>(pair_rows), static_cast<unsigned long long>(pair_rows * strix::qwen_pp::Seam::row_bytes),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_chunk_start).count());
+                    ++pair_context.sequence;
+                    pair_position += pair_rows;
+                }
+                if (pair_rank == 1U) {
+                    const auto pair_frontier = pair_chunks.frontier();
+                    if (!pair_frontier.valid || pair_frontier.logits.size() != model.vocab_size)
+                        throw std::runtime_error("pair prefill stage B has no terminal logits");
+                    pair_final_logits.assign(pair_frontier.logits.begin(), pair_frontier.logits.end());
+                }
+            }
+            pair_pipe.finish(pair_context.sequence);
+            if (strix::qwen_pp::decode_enabled()) {
+                const auto handoff_start = std::chrono::steady_clock::now();
+                check_hip(hipDeviceSynchronize(), "pair handoff state producer fence");
+                const auto views = pair_state_views(pair_prediction.cut, 48U);
+                std::vector<strix::qwen_pp::StatePart> parts;
+                for (const auto& view : views) parts.push_back(view.first);
+                parts.push_back({48U, 0xffffffffU, model.vocab_size * sizeof(float)});
+                if (pair_rank == 0U) pair_final_logits.resize(static_cast<std::size_t>(model.vocab_size));
+                auto pair_staging = strix::qwen_pp::make_hip_state_staging();
+                const auto handoff_bytes = strix::qwen_pp::handoff_overlap(pair_rank == 1U, parts,
+                    pair_context.identity ^ session.state_layout_identity, session.next_position, pair_prediction.cut, *pair_staging,
+                    [&](std::span<const std::byte> data) { pair_link->send(data); },
+                    [&](std::span<std::byte> data) { pair_link->receive(data); },
+                    [&](bool save, std::size_t index, std::uint64_t offset, std::span<std::byte> data) {
+                        if (index == views.size()) {
+                            auto logits_bytes = std::as_writable_bytes(std::span(pair_final_logits)).subspan(
+                                static_cast<std::size_t>(offset), data.size());
+                            if (save) std::copy(logits_bytes.begin(), logits_bytes.end(), data.begin());
+                            else std::copy(data.begin(), data.end(), logits_bytes.begin());
+                        } else {
+                            auto* device = reinterpret_cast<void*>(views[index].second.address + offset);
+                            pair_staging->copy_device(save, device, data);
+                        }
+                    }, [](std::span<const std::byte> data) { return strix::dist::crc32c(data); },
+                    [&] { pair_link->abort("pair handoff state transfer failed"); });
+                check_hip(hipDeviceSynchronize(), "pair handoff installed state fence");
+                pair_dump_state(pair_rank == 0U ? 0U : pair_prediction.cut, 48U, pair_rank == 0U ? "handoff-r0" : "handoff-r1");
+                std::fprintf(stderr, "qwen-handoff rank=%u handoff-bytes=%llu handoff-seconds=%.6f prefill-handoff-seconds=%.6f\n",
+                    pair_rank, static_cast<unsigned long long>(handoff_bytes),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - handoff_start).count(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - pair_start).count());
+                if (pair_rank == 0U) pair_decode_logits = std::move(pair_final_logits);
+                pair_context = {};
+#if defined(_WIN32)
+                if (_putenv_s("STRIX_QWEN_PF_LAYER_RANGE", "") != 0)
+#else
+                if (::unsetenv("STRIX_QWEN_PF_LAYER_RANGE") != 0)
+#endif
+                    throw std::runtime_error("pair handoff full-layer restore failed");
+            }
+            // pair handoff exports the complete request below, after rank-0 decode.
+            // pair prefill may export each stage's local prompt state for inspection.
+            if (!strix::qwen_pp::decode_enabled() && !options.validation_final_state_path.empty()) {
+                auto pair_export_request = request;
+                pair_export_request.max_new_tokens = 0U;
+                pair_export_request.prefix_tokens = options.tokens;
+                strix::SerialGreedyRequestResult pair_export_result;
+                pair_export_result.steps_executed = session.next_position;
+                pair_export_result.final_position = session.next_position;
+                pair_export_result.stop_reason = strix::SerialRequestStopReason::max_new_tokens;
+                strix::export_final_generation_state(options.validation_final_state_path,
+                {options.validation_final_state_maximum_bytes}, model, state_layout, memory.state(),
+                session, pair_export_request, pair_export_result, *final_state_metadata,
+                std::static_pointer_cast<const void>(memory_owner), raw_state_reader,
+                raw_require_identity, raw_drain_or_fail, [&] {
+                    raw_require_identity();
+                });
+            }
+            std::fprintf(stderr, "qwen-pair rank=%u prefill-wall-ms=%.3f decode=%s\n", pair_rank,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_start).count(),
+                strix::qwen_pp::decode_enabled() ? "rank0" : "out-of-scope");
+            if (pair_rank == 1U && !strix::qwen_pp::decode_enabled()) {
+                std::cout << "{\"pair_rank\":1,\"logits_sha256\":\"" << strix::model_content_identity_hex(
+                    strix::sha256_bytes(std::as_bytes(std::span<const float>(pair_final_logits)))) << "\",\"logits\":[";
+                std::cout.precision(std::numeric_limits<float>::max_digits10);
+                for (std::size_t pair_logit = 0; pair_logit < pair_final_logits.size(); ++pair_logit)
+                    std::cout << (pair_logit ? "," : "") << pair_final_logits[pair_logit];
+                std::cout << "]}\n";
+            }
+            if (!pair_decode_logits) return 0;
+        }
+        const auto run_known_prompt = [&](std::span<const std::uint32_t> prompt,
+            std::span<const std::uint32_t> digest_history = {}) -> strix::SerialGreedyRequestResult {
             strix::KnownPromptChunkRequest paired;
             paired.prompt_tokens = prompt;
             paired.start_position = session.next_position;
@@ -5509,12 +5814,14 @@ static int run_decode_entry(
             const auto initial_generation_start = std::chrono::steady_clock::now();
             if(strix::mtp_step_logits_digest_enabled() && serial_step_ledger.empty())
                 serial_step_ledger.row(session.next_position-1U,chunks.frontier().logits);
+            pair_dump_state(0U, 48U, "handoff-single");
             if(session_registry && strix::decode_cli::prompt_state_digest_request()) {
                 const auto frontier=chunks.frontier();
                 const auto pending=strix::select_greedy_token(frontier.logits,model.vocab_size);
                 std::fprintf(stderr,"qwen-target-state phase=prompt position=%llu sha256=%s\n",
                     static_cast<unsigned long long>(session.next_position),
-                    strix::model_content_identity_hex(session_registry->target_state_digest(session.next_position,prompt,pending)).c_str());
+                    strix::model_content_identity_hex(session_registry->target_state_digest(session.next_position,
+                        digest_history.empty() ? prompt : digest_history,pending)).c_str());
             }
             // PLE pre-issue: plain eager CLI decode only (prompt consumed above; never an MTP session).
             if (!options.mtp.enabled && ple_lookup == &mapped_ple_lookup) mapped_ple_lookup.enable_preissue(true);
@@ -5560,6 +5867,28 @@ static int run_decode_entry(
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
         auto result = [&]() -> strix::SerialGreedyRequestResult {
+            if (pair_decode_logits) {
+                if (pair_prompt_route.prefix < options.tokens.size()) {
+                    auto generated = run_known_prompt(std::span<const std::uint32_t>(options.tokens).subspan(
+                        static_cast<std::size_t>(pair_prompt_route.prefix)), options.tokens);
+                    generated.steps_executed += pair_prompt_route.prefix;
+                    return generated;
+                }
+                if (session_logit_backend.file.is_open()) {
+                    session_logit_backend.file.write(reinterpret_cast<const char*>(pair_decode_logits->data()),
+                        static_cast<std::streamsize>(pair_decode_logits->size() * sizeof(float)));
+                    if (!session_logit_backend.file) throw std::runtime_error("pair handoff frontier logits write failed");
+                    ++session_logit_backend.rows_written;
+                }
+                strix::SerialGreedyContinuationRequest continuation{*pair_decode_logits, session.next_position,
+                    model.vocab_size, options.context_tokens, options.generate_tokens, generation_eos};
+                continuation.emission_hook = request.emission_hook;
+                auto generated = strix::execute_serial_greedy_continuation(continuation, session_logit_backend);
+                if (options.tokens.size() > std::numeric_limits<std::uint64_t>::max() - generated.steps_executed)
+                    throw std::overflow_error("pair handoff total execution count overflow");
+                generated.steps_executed += options.tokens.size();
+                return generated;
+            }
             if (session_cache_enabled && !options.session_load.empty()) {
                 const auto restore_start = std::chrono::steady_clock::now();
                 strix::SessionIoStats io;

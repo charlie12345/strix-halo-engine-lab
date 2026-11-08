@@ -51,7 +51,29 @@ struct StepOptions {
     // Draft chains of several sessions batched by step (Prefill::draft_cohort, same tokens as per-session chains):
     // -1 = default on unless STRIX_QRTX_DRAFT_BATCH=0; 0 = per session; 1 = batched.
     int draft_batch = -1;
+    // budget above 8: -1 = the marginal rule unless STRIX_QRTX_WIDE_RULE=0; 0 = the budget as given (gates); 1 = the rule
+    int wide_rule = -1;
 };
+// The marginal rule's model (cuda_qwen_cohort_plan.hpp, choose_budget): STRIX_QRTX_WIDE_MS (cost of a 9..16-row window),
+// STRIX_QRTX_WIDE_ACCEPT (acceptance per draft position), STRIX_QRTX_WIDE_A_MS / _B_MS (<= 8-row cost a + b * rows),
+// STRIX_QRTX_WIDE_GAIN (minimum gain); STRIX_QRTX_WIDE_RULE=0 takes the budget as given (the c10-c12 behaviour).
+inline const WideModel& wide_model() {
+    static const WideModel m = [] {
+        WideModel w;
+        const auto rd = [](const char* name, double& v) { if (const char* s = std::getenv(name); s && s[0]) v = std::strtod(s, nullptr); };
+        rd("STRIX_QRTX_WIDE_MS", w.wide_ms);
+        rd("STRIX_QRTX_WIDE_ACCEPT", w.accept);
+        rd("STRIX_QRTX_WIDE_A_MS", w.a_ms);
+        rd("STRIX_QRTX_WIDE_B_MS", w.b_ms);
+        rd("STRIX_QRTX_WIDE_GAIN", w.min_gain);
+        return w;
+    }();
+    return m;
+}
+inline bool wide_rule_default() {
+    static const bool on = [] { const char* v = std::getenv("STRIX_QRTX_WIDE_RULE"); return !(v && v[0] == '0'); }();
+    return on;
+}
 inline bool draft_batch_default() {
     static const bool on = [] { const char* v = std::getenv("STRIX_QRTX_DRAFT_BATCH"); return !(v && v[0] == '0'); }();
     return on;
@@ -87,6 +109,9 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     o.budget = std::clamp<std::uint32_t>(o.budget, 1U, kMaxWindowRows);
     if (o.max_positions == 0) o.max_positions = p.max_positions();
     const auto n = static_cast<std::uint32_t>(streams.size());
+    // above 8 rows only when the marginal rule says the wider windows pay (packing only: every session's tokens are
+    // the same either way)
+    if (o.budget > kWindowRows && (o.wide_rule < 0 ? wide_rule_default() : o.wide_rule != 0)) o.budget = choose_budget(n, o.mtp ? o.depth : 0U, o.policy, o.budget, wide_model());
     std::vector<StreamStep> out(n);
     std::vector<std::vector<std::uint32_t>> rows(n);
     std::vector<std::uint32_t> want(n);

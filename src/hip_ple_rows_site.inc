@@ -68,15 +68,48 @@ inline bool ple_batch_reserve(q8_rows::LaneBuffer& rows, std::uint64_t need) {
     return true;
 }
 
-inline void ple_batch_launch(const PleRowsSite<64>& original, q8_rows::LaneWeights weights,
-    unsigned groups, float* packed, hipStream_t stream) {
+inline void ple_batch_pack(const PleRowsSite<64>& original, unsigned groups, float* packed, hipStream_t stream) {
     PleRowsGroupSite<64> site{};
     static_cast<PleRowsSite<64>&>(site) = original;
-    // Both launches keep the AQL barrier bit, just like launch_lane_waves. A subsequent
-    // value pack cannot overwrite key operands until every key projection block has read them.
     hipLaunchKernelGGL(q8_rows::lane_pack_rows_kernel<PleRowsGroupSite<64>>,
         dim3((64U * site.width + 255U) / 256U, groups), dim3(256U), 0, stream, site, packed);
+}
+
+inline void ple_batch_project(const PleRowsSite<64>& original, q8_rows::LaneWeights weights,
+    unsigned groups, const float* packed, hipStream_t stream) {
+    PleRowsGroupSite<64> site{};
+    static_cast<PleRowsSite<64>&>(site) = original;
     hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::project_wide_rows_lane_kernel<PleRowsGroupSite<64>, 16U, 8U, 2U>),
         dim3((site.outputs + q8_rows::kLaneOutputs - 1U) / q8_rows::kLaneOutputs, groups), dim3(512U),
         0, stream, site, weights.codes, weights.scales, packed);
+}
+
+inline void ple_batch_launch(const PleRowsSite<64>& site, q8_rows::LaneWeights weights,
+    unsigned groups, float* packed, hipStream_t stream) {
+    // Keep every AQL barrier bit: a later pack cannot overwrite earlier consumers.
+    ple_batch_pack(site, groups, packed, stream);
+    ple_batch_project(site, weights, groups, packed, stream);
+}
+
+inline bool ple_tile_requested() {
+    static const bool on = ple_tile::requested(std::getenv("STRIX_QPF2K_PLE_TILE"));
+    return on;
+}
+
+inline bool ple_tile_admits(bool enabled, const PleRowsSite<64>& key, const PleRowsSite<64>& value, unsigned groups) {
+    return key.base == value.base && key.width == value.width && key.in_stride == value.in_stride &&
+        ple_tile::admits(enabled, {reinterpret_cast<std::uintptr_t>(key.base), key.width, key.in_stride},
+            {reinterpret_cast<std::uintptr_t>(key.out), key.outputs, key.out_stride},
+            {reinterpret_cast<std::uintptr_t>(value.out), value.outputs, value.out_stride}, groups);
+}
+
+// Both sites and both weight packs are exactly those of the original transaction.
+// Only reuse the identical, read-only input panel across the two output tilings.
+inline void ple_tile_launch(const PleRowsSite<64>& key, const PleRowsSite<64>& value,
+    unsigned groups, float* packed, hipStream_t stream) {
+    const auto kw = q8_rows::lane_weights(key, stream);
+    ple_batch_pack(key, groups, packed, stream);
+    ple_batch_project(key, kw, groups, packed, stream);
+    const auto vw = q8_rows::lane_weights(value, stream);
+    ple_batch_project(value, vw, groups, packed, stream);
 }

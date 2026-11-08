@@ -1,3 +1,5 @@
+// Exactness comments below describe the default FP32 route target. The explicit
+// BF16 route-storage candidate is a separate, unqualified numerical target.
 // CUDA port of the Qwen routed-MoE prefill (A8 profile, --known-prefix-expert-union), bit-identical to the HIP path
 // moe_experts_known_prefill_rows_launch -> known_moe_prefill_enqueue (src/hip_moe_experts_launcher.hip:2907) ->
 // moe_q4k_a8::known_rows::enqueue_prefill(form -1 = iu8 WMMA) (src/hip_moe_q4k_a8_known_rows.hip:1492).
@@ -65,6 +67,10 @@ struct Rows {
     Strided<float> rawdots;                    // [top_k * hidden]
     Strided<std::uint16_t> output;             // BF16 [hidden]
     Csr csr;
+    // Explicit experimental storage. Candidate callers must provide the actual
+    // rawdot allocation capacity; stride remains in BYTES in both formats.
+    bool route_bf16 = false;
+    std::uint64_t rawdot_capacity = 0;
 };
 
 struct Weights {

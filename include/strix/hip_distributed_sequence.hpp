@@ -4,6 +4,7 @@
 #include "strix/direct_gpu_boundary_staging.hpp"
 #include "strix/distributed_control_receiver.hpp"
 #include "strix/hip_setup_quiescence.hpp"
+#include "strix/copied_stream_transport.hpp"
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -20,6 +21,11 @@ struct HipDistributedSequenceTransport {
     std::shared_ptr<transport::DualLinkRuntimeScheduler> scheduler;
     std::shared_ptr<const void> actual_owner;
     std::shared_ptr<DistributedControlByteStream> step_control, token_control;
+    // Explicit host-copy alternative. Mutually exclusive with ALL native-link
+    // fields. actual_owner retains its payload channel and connection state.
+    // No native DMA/provider readiness or physical qualification is implied.
+    std::shared_ptr<transport::CopiedStreamTransportBackend> copied;
+    std::shared_ptr<AllocationGenerationSource> copied_generations;
 };
 struct HipDistributedSequenceSetup {
     std::shared_ptr<HipDistributedTokenParticipant> participant;

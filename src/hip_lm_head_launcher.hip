@@ -1,3 +1,4 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
@@ -487,7 +488,7 @@ __global__ __launch_bounds__(32) void virtual_q8_lm_head_kernel(
     for (std::uint32_t distance = 16; distance > 0; distance >>= 1U) {
 #pragma unroll
         for (std::uint32_t local = 0; local < 8; ++local) {
-            const float partner = __shfl_down(partial[local], distance, 32);
+            const float partner = strix::qwen_dpp::down_tree32(partial[local], distance);
             if (lane < distance) partial[local] += partner;
         }
     }
@@ -540,7 +541,7 @@ void prefetch8_wave_q8_lm_head_kernel(
     for (unsigned distance = 16; distance > 0; distance /= 2) {
 #pragma unroll
         for (unsigned local = 0; local < 8; ++local) {
-            const auto partner = __shfl_down(partial[local], distance, 32);
+            const auto partner = strix::qwen_dpp::down_tree32(partial[local], distance);
             if (lane < distance) partial[local] += partner;
         }
     }

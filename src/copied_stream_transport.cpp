@@ -181,7 +181,7 @@ struct CopiedStreamTransportBackend::Impl {
         std::uint64_t physical_sequence = 0;
         bool receive = false, submitted = false, exposed = false, received_ack = false;
     };
-    DirectStreamControlByteStream* stream;
+    DistributedControlByteStream* stream;
     CopiedStreamConnectionState* state;
     CopiedStreamTransportPolicy policy;
     std::unique_ptr<Active> active;
@@ -265,7 +265,7 @@ struct CopiedStreamTransportBackend::Impl {
     }
 };
 
-CopiedStreamTransportBackend::CopiedStreamTransportBackend(DirectStreamControlByteStream& stream,
+CopiedStreamTransportBackend::CopiedStreamTransportBackend(DistributedControlByteStream& stream,
     CopiedStreamConnectionState& state, CopiedStreamTransportPolicy policy) : impl_(std::make_unique<Impl>()) {
     if (policy.maximum_payload_bytes == 0 || policy.maximum_frame_bytes > std::numeric_limits<std::uint32_t>::max() ||
         policy.maximum_frame_bytes < 512 || policy.maximum_payload_bytes > policy.maximum_frame_bytes - 512 ||
@@ -424,6 +424,7 @@ CopiedStreamCleanupStatus CopiedStreamTransportBackend::drain_retained() {
         impl_->fail(); return CopiedStreamCleanupStatus::pending;
     } catch (...) { impl_->fail(); return CopiedStreamCleanupStatus::failed_retained; }
 }
+void CopiedStreamTransportBackend::poison() noexcept { impl_->fail(); impl_->stream->abort(); }
 bool CopiedStreamTransportBackend::failed() const noexcept { return impl_->failed || impl_->state->failed_; }
 bool CopiedStreamTransportBackend::retains_buffer() const noexcept { return static_cast<bool>(impl_->active); }
 std::optional<TransferHandle> CopiedStreamTransportBackend::retained_handle() const noexcept {
@@ -445,6 +446,85 @@ bool same_step(const DistributedStepPlacement& a, const DistributedStepPlacement
            a.placement_ambiguous == b.placement_ambiguous;
 }
 }  // namespace
+struct CopiedDistributedTokenLedger {
+    struct Boundary { DistributedExecutionBoundary value; bool complete=false; bool position=false; };
+    transport::CopiedStreamTransportBackend* transport=nullptr;
+    transport::CopiedStreamConnection connection;
+    DistributedRuntimeRequest request;
+    std::uint64_t binding=0,placement=0;
+    std::uint32_t node=0;
+    std::shared_ptr<const void> owner;
+    std::vector<Boundary> boundaries;
+    bool sealed=false,consumed=false,failed=false;
+};
+namespace {
+bool copied_request_equal(const DistributedRuntimeRequest& a,const DistributedRuntimeRequest& b) {
+    return a.connection_epoch==b.connection_epoch && a.request_id==b.request_id &&
+        a.generation==b.generation && a.dtype_id==b.dtype_id;
+}
+void copied_live(const CopiedDistributedTokenLedger& t) {
+    if(!t.owner || !t.transport || t.failed || t.consumed || t.transport->failed() ||
+        t.transport->retains_buffer() || t.transport->connection()!=t.connection)
+        throw std::logic_error("copied retirement owner, connection or completion is invalid");
+}
+}
+void NativeDistributedTokenRetirement::validate_copied_matches(std::uint64_t binding,std::uint64_t placement,
+    const DistributedRuntimeRequest& request,std::uint32_t node,NativeDistributedRetirementOutcome outcome) const {
+    if(!copied_ || !copied_->sealed || copied_->binding!=binding || copied_->placement!=placement ||
+        copied_->node!=node || !copied_request_equal(copied_->request,request) ||
+        outcome!=NativeDistributedRetirementOutcome::completed_boundaries)
+        throw std::invalid_argument("copied token retirement is empty, stale, foreign or aborted");
+    copied_live(*copied_);
+}
+void NativeDistributedTokenRetirement::consume_copied_matches() noexcept {copied_->consumed=true;}
+void CopiedStreamDistributedBackend::begin_token_retirement(std::uint64_t binding,std::shared_ptr<const void> owner) {
+    require_healthy();
+    if(dispatched_ || token_ || !binding || !owner || transport_->retains_buffer() ||
+        placement_->boundaries.empty() || placement_->boundaries.size()>1024U)
+        throw std::invalid_argument("copied token retirement requires fresh bounded actual owners");
+    auto t=std::make_shared<CopiedDistributedTokenLedger>();
+    t->transport=transport_;t->connection=transport_->connection();t->request=request_;
+    t->binding=binding;t->placement=placement_->plan_identity;t->node=placement_->local_node;t->owner=std::move(owner);
+    for(const auto& b:placement_->boundaries) {
+        if(b.source_node!=t->node && b.destination_node!=t->node) continue;
+        if(!b.boundary_id || std::any_of(t->boundaries.begin(),t->boundaries.end(),
+            [&](const auto& v){return v.value.boundary_id==b.boundary_id;}))
+            throw std::invalid_argument("copied retirement has duplicate or zero boundary");
+        const bool position=is_materialized_input_position_dependency(*placement_,b);
+        if((!b.payload_bytes || b.payloads.empty()) && !position)
+            throw std::invalid_argument("copied token has an unsupported zero-payload dependency");
+        t->boundaries.push_back({b,false,position});
+    }
+    if(t->boundaries.empty()) throw std::invalid_argument("copied token has no local boundaries");
+    token_=std::move(t);
+}
+void CopiedStreamDistributedBackend::complete_position_dependencies(NativeDistributedPositionCompletion&& p) {
+    require_healthy();
+    if(!token_ || !p.valid_ || !p.owner_ || !p.decision_ || !p.count_ || p.count_>p.boundaries_.size() || p.binding_!=token_->binding ||
+        p.placement_!=token_->placement || p.node_!=token_->node || !copied_request_equal(p.request_,request_)) {
+        fail_token();
+        throw std::invalid_argument("copied position proof is empty, stale or foreign");
+    }
+    std::size_t count=0;
+    for(const auto& b:token_->boundaries) if(b.position) {
+        if(b.complete || std::count(p.boundaries_.begin(),p.boundaries_.begin()+p.count_,b.value.boundary_id)!=1)
+            { fail_token();throw std::invalid_argument("copied position dependency mismatch"); }
+        ++count;
+    }
+    if(count!=p.count_) {fail_token();throw std::invalid_argument("copied position proof count differs");}
+    for(auto& b:token_->boundaries) if(b.position) b.complete=true;
+    p.valid_=false;
+}
+NativeDistributedTokenRetirement CopiedStreamDistributedBackend::retire_token() {
+    require_healthy();
+    if(!token_ || token_->sealed || !dispatched_) throw std::logic_error("copied token was not dispatched or was sealed");
+    try {
+        copied_live(*token_);
+        for(const auto& b:token_->boundaries) if(!b.complete)
+            throw std::logic_error("copied token has an incomplete bilateral boundary");
+        token_->sealed=true;return NativeDistributedTokenRetirement(token_);
+    } catch(...) {fail_token();throw;}
+}
 CopiedStreamDistributedBackend::CopiedStreamDistributedBackend(transport::CopiedStreamTransportBackend& backend,
     const DistributedPlacementPlan& placement, DistributedRuntimeRequest request, DistributedNativeControlPlane& control,
     DistributedControlReceiver& receiver, DistributedNativeLocalExecutor& local, CopiedStreamBoundarySourceProvider& source,
@@ -455,20 +535,24 @@ CopiedStreamDistributedBackend::CopiedStreamDistributedBackend(transport::Copied
         request.connection_epoch == 0 || request.request_id == 0 || request.generation == 0 || request.dtype_id == 0 ||
         maximum_polls == 0) throw std::invalid_argument("copied distributed backend requires exact executable request/route");
 }
+void CopiedStreamDistributedBackend::fail_token() noexcept {
+    failed_=true;
+    if(token_) {token_->failed=true;transport_->poison();}
+}
 void CopiedStreamDistributedBackend::require_healthy() const {
-    if (failed_ || transport_->failed() || receiver_->failed()) throw std::logic_error("copied distributed backend is failed");
+    if (failed_ || (token_ && (token_->failed || token_->sealed)) || transport_->failed() || receiver_->failed()) throw std::logic_error("copied distributed backend is failed");
 }
 void CopiedStreamDistributedBackend::execute_local_step(const DistributedStepPlacement& step) {
-    require_healthy();
+    require_healthy();dispatched_=true;
     if (step.remote || step.placement_ambiguous || step.node != placement_->local_node ||
         std::none_of(placement_->steps.begin(), placement_->steps.end(), [&](const auto& value) { return same_step(value, step); })) {
-        failed_ = true; throw std::invalid_argument("copied local step is outside placement authority");
+        fail_token(); throw std::invalid_argument("copied local step is outside placement authority");
     }
-    try { local_->execute_local_step(step); } catch (...) { failed_ = true; throw; }
+    try { local_->execute_local_step(step); } catch (...) { fail_token(); throw; }
 }
 void CopiedStreamDistributedBackend::execute_remote_step(const DistributedStepPlacement& step) {
-    require_healthy();
-    try { control_->execute_remote_step(step); } catch (...) { failed_ = true; throw; }
+    require_healthy();dispatched_=true;
+    try { control_->execute_remote_step(step); } catch (...) { fail_token(); throw; }
 }
 void CopiedStreamDistributedBackend::validate_boundary(const DistributedExecutionBoundary& boundary,
     const DistributedBoundaryTransfer& transfer, bool receive, std::uint64_t sequence) const {
@@ -490,7 +574,7 @@ void CopiedStreamDistributedBackend::validate_boundary(const DistributedExecutio
 }
 void CopiedStreamDistributedBackend::send_boundary(const DistributedExecutionBoundary& boundary,
     const DistributedBoundaryTransfer& transfer) {
-    require_healthy(); std::optional<transport::TransferHandle> handle;
+    require_healthy();dispatched_=true; std::optional<transport::TransferHandle> handle;
     try {
         validate_boundary(boundary, transfer, false, next_send_);
         auto source = source_->stage_outbound_owned(boundary, transfer);
@@ -506,21 +590,29 @@ void CopiedStreamDistributedBackend::send_boundary(const DistributedExecutionBou
             else if (completion->kind == transport::CompletionKind::remote_transport_ack) ack = true;
             else if (completion->kind == transport::CompletionKind::remote_consumer_complete) consumed = true;
             else throw std::runtime_error("copied send completion kind is invalid");
-            if (local && ack && consumed) { ++next_send_; return; }
+            if (local && ack && consumed) {
+                if(token_) for(auto& b:token_->boundaries) if(same_boundary(b.value,boundary)) {
+                    if(b.complete) throw std::logic_error("copied token boundary repeated");
+                    b.complete=true;
+                }
+                ++next_send_; return;
+            }
         }
         throw std::runtime_error("copied send progress budget exhausted");
     } catch (...) {
-        failed_ = true;
+        fail_token();
         if (handle && transport_->retains_buffer()) { try { transport_->cancel(*handle); } catch (...) {} }
         throw;
     }
 }
 DistributedBoundaryTransfer CopiedStreamDistributedBackend::receive_boundary(const DistributedExecutionBoundary& boundary) {
-    require_healthy(); std::optional<transport::TransferHandle> handle;
+    require_healthy();dispatched_=true; std::optional<transport::TransferHandle> handle;
+    std::optional<DistributedBoundaryTransfer> received_transfer;
+    transport::TransportBufferView exposed;
     try {
         // The v2 receiver queue, not arrival order of payload bytes, identifies
         // the next expected request/boundary. Revalidate before staging/consume.
-        auto transfer = receiver_->take_boundary(boundary.boundary_id);
+        auto transfer = receiver_->take_boundary(boundary.boundary_id);received_transfer=transfer;
         validate_boundary(boundary, transfer, true, next_receive_);
         auto allocation = std::make_shared<transport::CopiedStreamHostBuffer>(boundary.payload_bytes, *generations_);
         const transport::CopiedStreamOwnedBuffer staged{allocation, allocation->view()};
@@ -529,7 +621,7 @@ DistributedBoundaryTransfer CopiedStreamDistributedBackend::receive_boundary(con
         const auto completion = transport_->poll();
         if (!completion || completion->handle != *handle || completion->kind != transport::CompletionKind::receive_complete ||
             completion->bytes != boundary.payload_bytes) throw std::runtime_error("copied receive completion is invalid");
-        const auto view = transport_->receive_buffer(*handle);
+        const auto view = transport_->receive_buffer(*handle);exposed=view;
         auto inbound_transfer = transfer;
         inbound_transfer.flow = classify_distributed_boundary_flow(*placement_, boundary);
         consumer_->consume_inbound(boundary, view);
@@ -541,11 +633,24 @@ DistributedBoundaryTransfer CopiedStreamDistributedBackend::receive_boundary(con
             if (!ready) continue;
             if (ready->handle != *handle || ready->kind != transport::CompletionKind::local_buffer_reusable ||
                 ready->bytes != boundary.payload_bytes) throw std::runtime_error("copied receive retirement is invalid");
+            if(token_) for(auto& b:token_->boundaries) if(same_boundary(b.value,boundary)) {
+                if(b.complete) throw std::logic_error("copied token boundary repeated");
+                b.complete=true;
+            }
             ++next_receive_; return inbound_transfer;
         }
         throw std::runtime_error("copied consumer progress budget exhausted; host buffer retained");
     } catch (...) {
-        failed_ = true;
+        fail_token();
+        if(handle && exposed.address && received_transfer && transport_->retains_buffer()) {
+            try {
+                // Cleanup only: provider destruction/finish must drain or retain
+                // launched consumers. No consumed ACK or model success follows.
+                auto proof=consumer_->cleanup_inbound(boundary,*received_transfer);
+                if(proof) transport_->attach_cleanup_proof(*handle,transport::bind_copied_stream_inbound_proof(
+                    {received_transfer->descriptor,exposed,transport::CopiedStreamCompletionScope::consumer_complete},std::move(proof)));
+            } catch(...) {} // Retained, never an inferred completion.
+        }
         if (handle && transport_->retains_buffer()) { try { transport_->cancel(*handle); } catch (...) {} }
         throw;
     }

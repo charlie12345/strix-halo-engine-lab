@@ -1,4 +1,5 @@
 #include "strix/cohort_step_plan.hpp"
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"
@@ -69,7 +70,7 @@ __device__ Coefficient coefficient(const unsigned char* packed,unsigned c,unsign
 __device__ __forceinline__ float paired(Coefficient q,int4 a0,int4 a1,int s0,int s1,float e0,float e1) {
     int r0=dot(a0.x,q.low.x,0);r0=dot(a0.y,q.low.y,r0);r0=dot(a0.z,q.low.z,r0);r0=dot(a0.w,q.low.w,r0);
     int r1=dot(a1.x,q.high.x,0);r1=dot(a1.y,q.high.y,r1);r1=dot(a1.z,q.high.z,r1);r1=dot(a1.w,q.high.w,r1);
-    r0+=__shfl_xor(r0,1,32);r1+=__shfl_xor(r1,1,32);
+    r0+=strix::qwen_dpp::xor32(r0, 1);r1+=strix::qwen_dpp::xor32(r1, 1);
     const int i0=static_cast<int>(q.scale0)*r0,i1=static_cast<int>(q.scale1)*r1;
     const int j0=static_cast<int>(q.minimum0)*s0,j1=static_cast<int>(q.minimum1)*s1;
     const float u0=q.d*static_cast<float>(i0),v0=q.dm*static_cast<float>(j0),t0=u0-v0;
@@ -161,8 +162,8 @@ __global__ void project_csr(const unsigned char* gate,const unsigned char* up,De
     }
 #pragma unroll
     for(unsigned a=0;a<Rows;++a)if(begin+a<end) {
-        acc_gate[a]=acc_gate[a]+__shfl_xor(acc_gate[a],2,32);acc_gate[a]=acc_gate[a]+__shfl_xor(acc_gate[a],4,32);
-        acc_up[a]=acc_up[a]+__shfl_xor(acc_up[a],2,32);acc_up[a]=acc_up[a]+__shfl_xor(acc_up[a],4,32);
+        acc_gate[a]=acc_gate[a]+strix::qwen_dpp::xor32(acc_gate[a], 2);acc_gate[a]=acc_gate[a]+strix::qwen_dpp::xor32(acc_gate[a], 4);
+        acc_up[a]=acc_up[a]+strix::qwen_dpp::xor32(acc_up[a], 2);acc_up[a]=acc_up[a]+strix::qwen_dpp::xor32(acc_up[a], 4);
         if(c==0U) {
             const auto r=csr.rows[begin+a],slot=csr.slots[begin+a];
             view.output[r][(slot*2U)*outputs+out]=acc_gate[a];view.output[r][(slot*2U+1U)*outputs+out]=acc_up[a];
@@ -185,7 +186,7 @@ __device__ __forceinline__ float paired_q5k(uint4 hd,uint4 q,uint4 qh,unsigned p
         ((q.w>>4U)&mask)|(((qh.w>>g1)&0x01010101U)<<4U)};
     int r0=dot(a0.x,q0.x,0);r0=dot(a0.y,q0.y,r0);r0=dot(a0.z,q0.z,r0);r0=dot(a0.w,q0.w,r0);
     int r1=dot(a1.x,q1.x,0);r1=dot(a1.y,q1.y,r1);r1=dot(a1.z,q1.z,r1);r1=dot(a1.w,q1.w,r1);
-    r0+=__shfl_xor(r0,1,32);r1+=__shfl_xor(r1,1,32);
+    r0+=strix::qwen_dpp::xor32(r0, 1);r1+=strix::qwen_dpp::xor32(r1, 1);
     const int i0=static_cast<int>(factor(hd,g0,false))*r0,i1=static_cast<int>(factor(hd,g1,false))*r1;
     const int j0=static_cast<int>(factor(hd,g0,true))*s0;
     const int j1=static_cast<int>(factor(hd,g1,true))*s1;
@@ -280,7 +281,7 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
 #pragma unroll
         for(unsigned a=0;a<G;++a)if(group+a<count) {
 #pragma unroll
-            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 2);acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 4);}
             if constexpr(A8Down) {
                 if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
             } else if(c==0U) {
@@ -305,13 +306,13 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
                     const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
                     if(bad!=0){view.output[r][at]=g;if(lane==0)atomicOr(view.status[r],projection_nonfinite);continue;}
                     float x=fabsf(hv);
-                    for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+                    for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
                     const bool tiny=x>0.0F && x<0x1p-119F;
                     const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
                     const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
                     const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
                     int sum=code;
-                    for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+                    for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
                     view.output[r][at]=hv;
                     view.down_codes[r][slot*outputs+feature]=static_cast<signed char>(code);
                     if(lane==0){view.down_deltas[r][slot*(outputs/32U)+blockIdx.x]=delta;view.down_sums[r][slot*(outputs/32U)+blockIdx.x]=sum;}
@@ -501,8 +502,8 @@ __global__ __launch_bounds__(256) void down_window(const unsigned char* weights,
     }
 #pragma unroll
     for(unsigned a=0;a<Rows;++a)if(a<count) {
-        acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
-        acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+        acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 1);
+        acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 2);
         if(owner==0U)view.rawdots[csr.rows[begin+a]][csr.slots[begin+a]*hidden+row]=acc[a];
     }
 }
@@ -571,8 +572,8 @@ __global__ __launch_bounds__(256) void project_window_q20(const unsigned char* g
 #pragma unroll
         for(unsigned a=0;a<G;++a)if(group+a<count) {
 #pragma unroll
-            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],1,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);
-                acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 1);acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 2);
+                acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 4);}
             if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
         }
         __syncthreads();
@@ -585,13 +586,13 @@ __global__ __launch_bounds__(256) void project_window_q20(const unsigned char* g
             const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
             if(bad!=0){view.output[r][at]=g;if(lane==0)atomicOr(view.status[r],projection_nonfinite);continue;}
             float x=fabsf(hv);
-            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
             const bool tiny=x>0.0F && x<0x1p-119F;
             const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
             const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
             const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
             int sum=code;
-            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
             view.output[r][at]=hv;
             view.down_codes[r][slot*outputs+feature]=static_cast<signed char>(code);
             if(lane==0){view.down_deltas[r][slot*(outputs/32U)+blockIdx.x]=delta;view.down_sums[r][slot*(outputs/32U)+blockIdx.x]=sum;}
@@ -633,8 +634,8 @@ __global__ __launch_bounds__(256) void down_window_q20(const unsigned char* weig
     }
 #pragma unroll
     for(unsigned a=0;a<Rows;++a)if(a<count) {
-        acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
-        acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+        acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 1);
+        acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 2);
         if(owner==0U)view.rawdots[csr.rows[begin+a]][csr.slots[begin+a]*hidden+row]=acc[a];
     }
 }
@@ -856,7 +857,7 @@ __global__ __launch_bounds__(256) void project_prefill(const unsigned char* gate
 #pragma unroll
         for(unsigned a=0;a<G;++a)if(group+a<count) {
 #pragma unroll
-            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 2);acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 4);}
             if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
         }
         // Serial down_activation_quantize for group tile_index of each staged (row, slot).
@@ -871,13 +872,13 @@ __global__ __launch_bounds__(256) void project_prefill(const unsigned char* gate
             const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
             if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}continue;}
             float x=fabsf(hv);
-            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
             const bool tiny=x>0.0F && x<0x1p-119F;
             const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
             const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
             const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
             int sum=code;
-            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
             output[at_slot]=hv;
             at(view.down_codes,r)[slot*outputs+feature]=static_cast<signed char>(code);
             if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}
@@ -928,8 +929,8 @@ __global__ __launch_bounds__(256) void project_prefill_q20(const unsigned char* 
 #pragma unroll
         for(unsigned a=0;a<G;++a)if(group+a<count) {
 #pragma unroll
-            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],1,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);
-                acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 1);acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 2);
+                acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 4);}
             if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
         }
         __syncthreads();
@@ -943,13 +944,13 @@ __global__ __launch_bounds__(256) void project_prefill_q20(const unsigned char* 
             const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
             if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}continue;}
             float x=fabsf(hv);
-            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
             const bool tiny=x>0.0F && x<0x1p-119F;
             const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
             const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
             const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
             int sum=code;
-            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
             output[at_slot]=hv;
             at(view.down_codes,r)[slot*outputs+feature]=static_cast<signed char>(code);
             if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}
@@ -992,8 +993,8 @@ __global__ __launch_bounds__(256) void down_prefill_q20(const unsigned char* wei
         }
 #pragma unroll
         for(unsigned a=0;a<Rows;++a)if(first+a<count) {
-            acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
-            acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 1);
+            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 2);
             if(owner==0U)at(view.rawdots,csr.rows[begin+first+a])[csr.slots[begin+first+a]*hidden+row]=acc[a];
         }
     }
@@ -1038,8 +1039,8 @@ __device__ __forceinline__ void project_iq_body(const unsigned char* gate,const 
 #pragma unroll
         for(unsigned a=0;a<G;++a)if(group+a<count) {
 #pragma unroll
-            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],1,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);
-                acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 1);acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 2);
+                acc[m][a]=acc[m][a]+strix::qwen_dpp::xor32(acc[m][a], 4);}
             if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
         }
         __syncthreads();
@@ -1056,13 +1057,13 @@ __device__ __forceinline__ void project_iq_body(const unsigned char* gate,const 
             const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
             if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(status,projection_nonfinite);if constexpr(Prefill)atomicOr(csr.summary,projection_nonfinite);}continue;}
             float x=fabsf(hv);
-            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
             const bool tiny=x>0.0F && x<0x1p-119F;
             const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
             const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
             const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
             int sum=code;
-            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
             output[at_slot]=hv;
             down_codes[slot*outputs+feature]=static_cast<signed char>(code);
             if(lane==0){down_deltas[slot*(outputs/32U)+tile_index]=delta;down_sums[slot*(outputs/32U)+tile_index]=sum;}
@@ -1120,8 +1121,8 @@ __device__ __forceinline__ void down_iq_body(const unsigned char* weights,const 
         }
 #pragma unroll
         for(unsigned a=0;a<Rows;++a)if(first+a<count) {
-            acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
-            acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 1);
+            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 2);
             if(owner==0U) {
                 float* raw;
                 if constexpr(Prefill)raw=at(view.rawdots,csr.rows[begin+first+a]);else raw=view.rawdots[csr.rows[begin+first+a]];
@@ -1204,8 +1205,8 @@ __global__ __launch_bounds__(256) void down_prefill(const unsigned char* weights
         }
 #pragma unroll
         for(unsigned a=0;a<Rows;++a)if(first+a<count) {
-            acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
-            acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 1);
+            acc[a]=acc[a]+strix::qwen_dpp::xor32(acc[a], 2);
             if(owner==0U)at(view.rawdots,csr.rows[begin+first+a])[csr.slots[begin+first+a]*hidden+row]=acc[a];
         }
     }
@@ -1406,13 +1407,13 @@ __global__ __launch_bounds__(32U*Waves) void project_prefill_wmma(const unsigned
         const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
         if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}continue;}
         float x=fabsf(hv);
-        for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+        for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
         const bool tiny=x>0.0F && x<0x1p-119F;
         const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
         const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
         const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
         int sum=code;
-        for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+        for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
         output[at_slot]=hv;
         at(view.down_codes,r)[slot*outputs+feature]=static_cast<signed char>(code);
         if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}
@@ -1613,7 +1614,7 @@ __global__ __launch_bounds__(256) void f16_prefill_prologue(PrefillRows v,unsign
     const auto* x=reinterpret_cast<const unsigned short*>(at(v.input,r));
     float m=0.0F;
     for(unsigned k=t;k<hidden;k+=256U)m=fmaxf(m,fabsf(__uint_as_float(static_cast<unsigned>(x[k])<<16U)));
-    for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+    for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,strix::qwen_dpp::xor32(m, stride));
     if((t&31U)==0U)wave_max[t/32U]=m;
     __syncthreads();
     if(t==0U) {
@@ -1783,7 +1784,7 @@ __global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* 
         if(live)at(view.output,r)[slot*2U*outputs+out]=hv;
         // Largest |h| of the wave's 16 outputs of this row (the lanes of one half hold one row).
         float m=fabsf(hv);
-        for(int stride=8;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+        for(int stride=8;stride!=0;stride/=2)m=fmaxf(m,strix::qwen_dpp::xor32(m, stride));
         if(live&&i==0U)atomicMax(reinterpret_cast<unsigned*>(at(view.down_sums,r))+slot,__float_as_uint(m));
         if(live&&bad){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}
     }
@@ -2039,6 +2040,61 @@ __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_wa
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 }
+inline int& direct_b_override(){static int v=-1;return v;}
+inline bool direct_b_requested(){
+    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DIRECT_B");return v&&v[0]=='1'&&v[1]=='\0';}();
+    return direct_b_override()<0?env:direct_b_override()==1;
+}
+inline bool& direct_b_ran(){static thread_local bool v=false;return v;}
+inline const char*& direct_b_reason(){static thread_local const char* v="off";return v;}
+#include "hip_moe_direct_b.inc"
+template<bool PairedPlanes>
+__global__ __launch_bounds__(32) void direct_b_fragment_probe(const unsigned char* raw,const unsigned char* packed,
+    unsigned long long* stats) {
+    const unsigned unit=blockIdx.x/(PairedPlanes?2U:1U),matrix_of_wave=blockIdx.x%2U;
+    const unsigned lane=threadIdx.x,i=lane%16U,h=lane/16U;
+    const auto* prepared=packed+static_cast<std::size_t>(unit*2U+(PairedPlanes?matrix_of_wave:h))*2304U;
+    const uint4 head=f16_load(prepared+16U*i);
+    const bool fast=__all(f16_affine_exact(head.x&65535U,63U*15U,head.x>>16U,63U));
+    unsigned long long mismatch=0,first=~0ULL;
+    for(unsigned step=0;step<4U;++step)for(unsigned kk=0;kk<4U;++kk) {
+        const unsigned group=2U*step+kk/2U;
+        const auto q=f16_load(prepared+256U+(group*16U+i)*16U);
+        const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(head.x)));
+        const float dm=__half2float(__ushort_as_half(static_cast<unsigned short>(head.x>>16U)));
+        const float da=d*static_cast<float>(factor(head,group,false)),db=-(dm*static_cast<float>(factor(head,group,true)));
+        f16x16 b0,b1;
+        if constexpr(PairedPlanes)direct_b_decode_pair(q,h,da,db,fast,b0,b1);
+        else direct_b_exchange(direct_b_decode(q,kk&1U,da,db,fast),h,b0,b1);
+        for(unsigned which=0;which<(PairedPlanes?1U:2U);++which) {
+            const unsigned matrix=PairedPlanes?matrix_of_wave:which;
+            // Cast the complete fragment before indexing. A bit_cast directly
+            // on an FP16 vector subscript can compile as element 0 for every e.
+            typedef unsigned short Bits16 __attribute__((ext_vector_type(16)));
+            const Bits16 operand_bits=__builtin_bit_cast(Bits16,(PairedPlanes?(kk&1U):matrix)?b1:b0);
+            const auto* original=raw+static_cast<std::size_t>(unit*2U+matrix)*2304U+144U*i;
+            const uint4 rh=f16_load(original);
+            const float rd=__half2float(__ushort_as_half(static_cast<unsigned short>(rh.x)));
+            const float rm=__half2float(__ushort_as_half(static_cast<unsigned short>(rh.x>>16U)));
+            const float a=rd*static_cast<float>(factor(rh,group,false)),b=-(rm*static_cast<float>(factor(rh,group,true)));
+            for(unsigned e=0;e<16U;++e) {
+                const unsigned k=step*64U+kk*16U+e;
+                const unsigned code=(original[16U+(k/64U)*32U+k%32U]>>(4U*((k/32U)%2U)))&15U;
+                const unsigned short expected=static_cast<unsigned short>(f16_pair(fmaf(a,static_cast<float>(code),b),0.0F));
+                const unsigned actual=operand_bits[e];
+                mismatch+=expected!=actual;
+                if(expected!=actual) {
+                    const auto coordinate=((((static_cast<unsigned long long>(unit)*2U+matrix)*16U+i)*2U+h)*16U+step*4U+kk)*16U+e;
+                    // One atomic carries both the coordinate and its values:
+                    // the first failure stays coherent regardless of CTA order.
+                    first=min(first,(coordinate<<32U)|(static_cast<unsigned long long>(expected)<<16U)|actual);
+                }
+            }
+        }
+    }
+    atomicAdd(stats,mismatch);atomicAdd(stats+1,fast?1ULL:0ULL);atomicAdd(stats+2,fast?0ULL:1ULL);
+    atomicMin(stats+3,first);
+}
 template<bool Q51,unsigned Tune,unsigned Core=0U>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune,Core)) void down_prefill_f16x(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width,FuseArgT<Core> fuse) {
 #define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
@@ -2057,6 +2113,8 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 #include "hip_moe_prefill_p1.inc"
 #include "hip_moe_route_bf16.inc"
 #include "hip_moe_prefill_da16.inc"
+#include "hip_moe_prefill_tile64.inc"
+#include "hip_moe_prefill_tiers.inc"
 #include "hip_moe_prefill_p1da16.inc"
 #include "hip_moe_prefill_small.inc"
 // MoE tune bit 4: the FP16 images of the prompt rows (configured maximum rows x max_hidden halves, reserved at setup).
@@ -2131,14 +2189,48 @@ __global__ void fast_dequant_selftest_kernel(unsigned long long seed,unsigned lo
     for(unsigned k=0;k<9U;++k)atomicAdd(counts+k,local[k]);
 }
 bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.address<a.address+a.bytes;}
-template<auto Kernel,unsigned Threads> void prefill_resources(const char* name,unsigned tune) {
+template<bool Q51,unsigned Tune> void prefill_route_i8_resources() {
+    static const bool admitted=[]{
+        constexpr unsigned Threads=F16Tile<Tune>::Threads;
+        const auto base=down_prefill_f16x_da16_certificate_bf16<Q51,Tune>;
+        const auto compact=down_prefill_f16x_da16_certificate_i8<Q51,Tune>;
+        hipFuncAttributes a{},b{};int old_blocks=0,new_blocks=0;
+        check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(base)),"route BF16 resource attributes");
+        check(hipFuncGetAttributes(&b,reinterpret_cast<const void*>(compact)),"route I8 resource attributes");
+        check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&old_blocks,base,Threads,0),"route BF16 occupancy");
+        check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&new_blocks,compact,Threads,0),"route I8 occupancy");
+        const bool ok=old_blocks>0&&new_blocks>=old_blocks&&b.localSizeBytes<=a.localSizeBytes;
+        std::fprintf(stderr,"moe-route-i8-resource tune=%u q51=%u vgpr=%d->%d lds=%zu->%zu local=%zu->%zu blocks=%d->%d %s\n",
+            Tune,static_cast<unsigned>(Q51),a.numRegs,b.numRegs,a.sharedSizeBytes,b.sharedSizeBytes,a.localSizeBytes,b.localSizeBytes,
+            old_blocks,new_blocks,ok?"ADMIT":"BEST-ALREADY");
+        return ok;
+    }();
+    if(!admitted)throw std::runtime_error("BEST-ALREADY: MoE route I8 drops occupancy or increases private storage; restore route BF16");
+}
+void prefill_resources_at(const void* kernel,const char* name,unsigned tune,unsigned threads) {
     static const bool enabled=[]{const char* v=std::getenv("STRIX_INTPREFILL_RESOURCES");return v&&v[0]=='1';}();
     if(!enabled)return;
     hipFuncAttributes attributes{};int blocks=0;
-    check(hipFuncGetAttributes(&attributes,reinterpret_cast<const void*>(Kernel)),"prefill resource attributes");
-    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,Kernel,Threads,0),"prefill resident block query");
+    check(hipFuncGetAttributes(&attributes,kernel),"prefill resource attributes");
+    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,static_cast<int>(threads),0),"prefill resident block query");
     std::fprintf(stderr,"intprefill-resource %s tune=%u threads=%u vgpr=%d lds=%zu local=%zu resident_blocks_per_mp=%d\n",
-        name,tune,Threads,attributes.numRegs,attributes.sharedSizeBytes,attributes.localSizeBytes,blocks);
+        name,tune,threads,attributes.numRegs,attributes.sharedSizeBytes,attributes.localSizeBytes,blocks);
+}
+template<auto Kernel,unsigned Threads> void prefill_resources(const char* name,unsigned tune) {
+    prefill_resources_at(reinterpret_cast<const void*>(Kernel),name,tune,Threads);
+}
+// Bound resource growth before publishing engagement. Query only for requested
+// prepared consumers; OFF never performs an additional runtime resource query.
+template<unsigned Tune,bool DA16> bool direct_b_resource_admitted() {
+    static const bool admitted=[]{
+        hipFuncAttributes a{};
+        check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(direct_b_kernel<Tune,DA16>())),"direct B resources");
+        // Split gate/up waves keep tune 82's eight row16 accumulators within
+        // the same register ceiling as the four paired row16 tiles at 80/88.
+        constexpr int ceiling=160;
+        return a.numRegs<=ceiling && a.sharedSizeBytes<=20000U && a.localSizeBytes==0U;
+    }();
+    return admitted;
 }
 void range(DeviceBytes v){if(!v.address||!v.bytes||v.bytes>UINTPTR_MAX-v.address)throw std::invalid_argument("A8 CSR gate/up owner range is invalid");}
 struct Prepared {DeviceRows rows;DeviceCsr csr;};
@@ -2345,6 +2437,22 @@ PrefillKernelForm prefill_kernel_form(const Request& request,unsigned down_type,
         PrefillKernelForm::dot4;
 }
 inline unsigned& prefill_last_tune_value(){static thread_local unsigned v=0U;return v;}
+// STRIX_QPF2K_SCHED bit 64: the armed one-shot stage hook of this thread (see set_prefill_stage_hook).
+struct PrefillStageHookSlot { PrefillStageHook hook=nullptr; void* user=nullptr; unsigned stage=0U; };
+inline PrefillStageHookSlot& prefill_stage_hook_slot(){static thread_local PrefillStageHookSlot v;return v;}
+void set_prefill_stage_hook(PrefillStageHook hook,void* user,unsigned stage) {
+    auto& slot=prefill_stage_hook_slot();
+    if(hook&&(slot.hook||stage<1U||stage>3U))throw std::logic_error("known prefill stage hook armed twice or at an unknown stage");
+    slot=hook?PrefillStageHookSlot{hook,user,stage}:PrefillStageHookSlot{};
+}
+// Runs the armed hook once when `stage` reaches its stage (3 runs it for every earlier stage the call did not reach).
+void prefill_stage_reached(unsigned stage,hipStream_t stream) {
+    auto& slot=prefill_stage_hook_slot();
+    if(!slot.hook||stage<slot.stage)return;
+    const auto armed=slot;slot={};
+    armed.hook(armed.user,stream);
+}
+bool prefill_stage_hook_armed(){return prefill_stage_hook_slot().hook!=nullptr;}
 unsigned prefill_effective_tune(const Request& request,unsigned count,unsigned down_type,int form) {
     static const unsigned tune_env=[]{const char* v=std::getenv("STRIX_INTPREFILL_MOE_TUNE");
         const int n=v?std::atoi(v):82;return n>=0&&n<=65535?static_cast<unsigned>(n):0U;}();
@@ -2371,10 +2479,11 @@ unsigned prefill_effective_tune(const Request& request,unsigned count,unsigned d
     return tune;
 }
 void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,
-    const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream,int form) {
+    const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream,int form,DirectBOperands direct_assets) {
     const bool q5k=request.gate_type==13U,q20=gsq_a8::gate_type(request.gate_type);  // every GSQ gate type: dot4 form
-    prefill_certificate_flag()=false;
-    prefill_fused_flag()=false;prefill_da16_flag()=false;prefill_small_flag()=false;prefill_clear_skipped_flag()=false;
+    direct_b_ran()=false;direct_b_reason()=direct_b_requested()?"not-selected":"off";
+    prefill_certificate_flag()=false;prefill_tiers_flag()=0;prefill_down_lds_flag()=false;
+    prefill_fused_flag()=false;prefill_da16_flag()=false;prefill_tile64_flag()=false;prefill_small_flag()=false;prefill_clear_skipped_flag()=false;
     if((down_type!=7U&&down_type!=8U&&!gsq_a8::down_type(down_type))||(request.gate_type!=12U&&!q5k&&!q20)||
        (gsq_a8::down_type(down_type)&&!q20)||
        !gate||!up||!down_weights||
@@ -2400,6 +2509,13 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     const bool f16=kernel_form==PrefillKernelForm::f16_wmma;
     const unsigned tune=prefill_effective_tune(request,count,down_type,form);
     prefill_last_tune_value()=tune;
+    if(direct_b_requested()) {
+        direct_b_reason()=request.gate_type!=12U?"format":!f16?"FP16-prefill-required":
+            (count!=4096U&&count!=8192U)?"prompt-shape":
+            (tune!=80U&&tune!=82U&&tune!=88U)?"tune":
+            prefill_core2()!=0U?"core-schedule":prefill_small()!=0U?"small-schedule":
+            rows.route_bf16?"route-BF16":(!direct_assets.gate||!direct_assets.up)?"prepared-pair-unavailable":"resource-ceiling";
+    }
     // Binding requests certification; the launcher supplies it only with MC on. Fail closed on every other recipe.
     const bool certificate=rows.unsafe&&form==3&&!q20&&f16&&(tune==82U||tune==80U||tune==88U)&&prefill_route()==14U&&
         prefill_da16()&&prefill_core2()==0U&&prefill_small()==0U&&clear_words==request.shape.hidden&&
@@ -2407,6 +2523,19 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         reinterpret_cast<std::uintptr_t>(rows.input.base)%16U==0U&&rows.input.stride%16U==0U;
     if(rows.route_bf16 && (!certificate || prefill_core2()!=0U || q20 || (down_type!=7U && down_type!=8U)))
         throw std::invalid_argument("MoE route BF16 requires DA16 certificate writer and matching ordered merge");
+    if(rows.route_i8) {
+        const auto layout=strix::moe_route_i8_layout(request.shape.hidden,request.shape.top_k);
+        if(!rows.route_bf16||!strix::moe_route_i8_enabled()||layout.bytes>4U*layout.values||rows.rawdots.stride<4U*layout.values)
+            throw std::invalid_argument("MoE route I8 requires enabled BF16 route and its reserved FP32 row");
+        const auto resources=[&]<unsigned Tune>() {
+            if(down_type==7U)prefill_route_i8_resources<true,Tune>();else prefill_route_i8_resources<false,Tune>();
+        };
+        if(tune==80U)resources.template operator()<80U>();
+        else if(tune==82U)resources.template operator()<82U>();
+        else resources.template operator()<88U>(); // BF16 admission above fixes the tune set.
+        static const bool witness=[]{std::fprintf(stderr,"MoE FAST lever route i8: ON (bit-changing; STRIX_PREFILL_MOE_ROUTE_I8=0 restores route bf16)\n");return true;}();
+        (void)witness;
+    }
     if(f16&&(request.shape.rows%128U||request.shape.hidden%256U))throw std::invalid_argument("A8 prefill FP16 WMMA geometry is invalid");
     const bool wmma=kernel_form!=PrefillKernelForm::dot4;
     const unsigned cap=f16?((tune&2U)?2U*f16_batch:f16_batch):wmma?wmma_batch:dot4_cap;
@@ -2458,6 +2587,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         hipLaunchKernelGGL(build_prefill_csr_waves,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
     else hipLaunchKernelGGL(build_prefill_csr,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
     check(hipGetLastError(),"A8 prefill CSR");
+    prefill_stage_reached(1U,stream);
     // STRIX_PREFILL_MOE_CSR_DUMP=1 (diagnostic, synchronizes): rows-per-expert histogram of each call.
     static const bool csr_dump=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_CSR_DUMP");return v&&v[0]=='1';}();
     if(csr_dump) {
@@ -2471,6 +2601,17 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         }
         std::fprintf(stderr,"moe-csr T=%u experts n=0:%u 1-16:%u 17-32:%u 33-64:%u 65-128:%u 129-256:%u 257-512:%u >512:%u max %u\n",
             count,bucket[0],bucket[1],bucket[2],bucket[3],bucket[4],bucket[5],bucket[6],bucket[7],largest);
+        // Batch fill at both caps (64/128 rows): batches, partial batches, their rows, padded tile rows; partial < 32 rows too.
+        for(const unsigned c:{64U,128U}) {
+            unsigned long long b=0,partial=0,partial_rows=0,pad=0,small=0,small_rows=0;
+            for(unsigned e=0;e<request.shape.experts;++e) {
+                const unsigned n=offsets[e+1U]-offsets[e];if(!n)continue;
+                b+=(n+c-1U)/c;
+                if(const unsigned r=n%c) {++partial;partial_rows+=r;pad+=c-r;if(r<32U){++small;small_rows+=r;}}
+            }
+            std::fprintf(stderr,"moe-csr-fill T=%u cap %u assignments %u batches %llu partial %llu partial_rows %llu pad_rows %llu fill %.4f small32 %llu small32_rows %llu\n",
+                count,c,offsets[request.shape.experts],b,partial,partial_rows,pad,b?static_cast<double>(offsets[request.shape.experts])/static_cast<double>(b*c):0.0,small,small_rows);
+        }
     }
     const unsigned batches=std::min(assignments,request.shape.experts+(assignments+cap-1U)/cap);
     if(f16&&q20) {
@@ -2523,6 +2664,18 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                 else prefill_resources<down_prefill_f16x<false,Tune>,Threads>("down_q80",Tune);
                 const uint4* a16=(Tune&16U)?f16_prefill_a16():nullptr;
                 const dim3 project_grid(request.shape.rows/Outs,batches);
+                bool direct=direct_b_requested()&&direct_assets.gate&&direct_assets.up&&!q5k&&
+                    (count==4096U||count==8192U)&&prefill_core2()==0U&&prefill_small()==0U&&!rows.route_bf16;
+                if constexpr(Tune==80U||Tune==82U||Tune==88U) {
+                    if(direct)direct=prefill_da16()?direct_b_resource_admitted<Tune,true>():direct_b_resource_admitted<Tune,false>();
+                } else direct=false;
+                const auto direct_project=[&]<bool DA16>(unsigned* arrive,uint4* image) {
+                    using DT=DirectBTile<Tune>;
+                    prefill_resources_at(reinterpret_cast<const void*>(direct_b_kernel<Tune,DA16>()),"gate_up_q4k_direct_b",Tune,DT::Threads);
+                    launch_prefill_direct_b<Tune,DA16>(dim3(request.shape.rows/DT::Outputs,batches),stream,
+                        direct_assets.gate,direct_assets.up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
+                    direct_b_ran()=true;direct_b_reason()="engaged";
+                };
                 // qpf2k core2 (STRIX_QPF2K_MOE = 1, 3, 5 or 7; production tunes 80 and 82 only): same bits.
                 // The depth-D pipeline primes D stages: K steps (hidden/64 for gate/up, rows/64 for down) must be >= 5.
                 if constexpr(Tune==80U||Tune==82U) if(const unsigned core=request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U?prefill_core2():0U) {
@@ -2671,8 +2824,56 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     if(batches>da16_counter_words())throw std::invalid_argument("qpf2k DA16 batch counters exceed the pool");
                     unsigned* arrive=da16_counters();
                     uint4* image=da16_image();
+                    prefill_da16_mark(0U,stream);
                     check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k DA16 counters clear");
-                    if(prefill_hdr_reuse(q20||qpf2k::gsq_model)) {
+                    // Tunes 80/88 already have 64-row CTAs; retain their launch path.
+                    if constexpr(Tune==82U) if(prefill_tiers()) {
+                        if(prefill_tile64()) {
+                            static const bool declined=[] {
+                                std::fprintf(stderr,"qpf2k moe tile64 declined: tier organization active\n");return true;
+                            }();(void)declined;
+                        }
+                        unsigned* narrow=prefill_tier_lists();
+                        unsigned* full=narrow+da16_counter_words()+1U;
+                        check(hipMemsetAsync(narrow,0,sizeof(unsigned),stream),"DA16 narrow count clear");
+                        check(hipMemsetAsync(full,0,sizeof(unsigned),stream),"DA16 full count clear");
+                        prefill_tier_resources<build_prefill_tiers>();
+                        hipLaunchKernelGGL(build_prefill_tiers,dim3((batches+255U)/256U),dim3(256),0,stream,rows,narrow,full);
+                        check(hipGetLastError(),"DA16 tier lists");
+                        const bool reuse=prefill_hdr_reuse(q20||qpf2k::gsq_model);
+                        if(prefill_tiers()==2)
+                            launch_prefill_tier<88U>(gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image,narrow,batches,q5k,reuse,stream);
+                        else launch_prefill_tier<Tune&~2U>(gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image,narrow,batches,q5k,reuse,stream);
+                        if constexpr(Tune==82U)launch_prefill_tier<82U>(gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image,full,batches,q5k,reuse,stream);
+                        prefill_da16_mark(1U,stream);
+                        if(prefill_tiers()==2)
+                            launch_prefill_down_tier<88U>(down_weights,rows,request.shape.hidden,request.shape.rows,image,narrow,batches,down_type==7U,certificate,stream);
+                        else launch_prefill_down_tier<Tune&~2U>(down_weights,rows,request.shape.hidden,request.shape.rows,image,narrow,batches,down_type==7U,certificate,stream);
+                        if constexpr(Tune==82U)launch_prefill_down_tier<82U>(down_weights,rows,request.shape.hidden,request.shape.rows,image,full,batches,down_type==7U,certificate,stream);
+                        prefill_da16_mark(2U,stream);
+                        prefill_tiers_flag()=prefill_tiers();
+                        prefill_certificate_flag()=certificate;
+                        return;
+                    }
+                    // TILE64 (bit 0 gate/up, bit 1 down) is default OFF until node timing, admitted only for the 128-row DA16 tune.
+                    // Q5_K gate/up always retains its incumbent specialization.
+                    // Keep individually qualified organizations independent until joint native gates exist.
+                    const unsigned requested_tile64=Tune==82U&&!q20&&(down_type==7U||down_type==8U)?prefill_tile64():0U;
+                    const unsigned tile64=prefill_down_lds_admitted(rows)?0U:requested_tile64;
+                    if(requested_tile64&&!tile64) {
+                        static const bool declined=[] {
+                            std::fprintf(stderr,"qpf2k moe tile64 declined: LDS epilogue organization active\n");return true;
+                        }();(void)declined;
+                    }
+                    if(((tile64&1U)&&!q5k)||(tile64&2U)){prefill_tile64_flag()=true;static const bool t64_witness=[]{std::fprintf(stderr,"qpf2k moe tile64 active\n");return true;}();(void)t64_witness;}
+                    if constexpr(Tune==80U||Tune==82U||Tune==88U) {
+                        if(direct)direct_project.template operator()<true>(arrive,image);
+                    }
+                    if(direct_b_ran()) {} else
+                    if((tile64&1U)&&!q5k) {
+                        launch_tile64_project(gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image,batches,stream,
+                            prefill_hdr_reuse(q20||qpf2k::gsq_model));
+                    } else if(prefill_hdr_reuse(q20||qpf2k::gsq_model)) {
                         static const bool hdr_witness=[]{std::fprintf(stderr,"qpf2k moe gate/up header reuse active\n");return true;}();(void)hdr_witness;
                         if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<true,Tune>),project_grid,dim3(Threads),0,stream,
                             gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
@@ -2684,9 +2885,29 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16<false,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
                     check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (DA16)");
+                    prefill_da16_mark(1U,stream);
+                    prefill_stage_reached(2U,stream);
                     const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
+                    if(tile64&2U) {
+                        launch_tile64_down_mode(down_type==7U,certificate,down_weights,rows,request.shape.hidden,request.shape.rows,image,batches,stream);
+                        check(hipGetLastError(),"FP16 prefill WMMA down (TILE64)");
+                        if(certificate)prefill_certificate_flag()=true;
+                        prefill_da16_mark(2U,stream);
+                        return;
+                    }
                     if constexpr(Tune==82U||Tune==80U||Tune==88U) if(certificate) {  // 80 = 82 below 96 assignments per expert; 88 = 80 with XOR rows
-                        if(rows.route_bf16) {
+                        if(prefill_down_lds_admitted(rows)) {
+                            launch_prefill_down_tier<Tune>(down_weights,rows,request.shape.hidden,request.shape.rows,image,nullptr,batches,down_type==7U,true,stream);
+                            prefill_certificate_flag()=true;
+                            prefill_da16_mark(2U,stream);
+                            return;
+                        }
+                        if(rows.route_i8) {
+                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_i8<true,Tune>),down_grid,dim3(Threads),0,
+                                stream,down_weights,rows,request.shape.hidden,request.shape.rows,image,request.shape.top_k);
+                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_i8<false,Tune>),down_grid,dim3(Threads),0,
+                                stream,down_weights,rows,request.shape.hidden,request.shape.rows,image,request.shape.top_k);
+                        } else if(rows.route_bf16) {
                             if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_bf16<true,Tune>),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                             else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_bf16<false,Tune>),down_grid,dim3(Threads),0,
@@ -2699,6 +2920,12 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         }
                         check(hipGetLastError(),"FP16 prefill WMMA down (DA16 certificate)");
                         prefill_certificate_flag()=true; // publish only after the entire producer chain was enqueued
+                        prefill_da16_mark(2U,stream);
+                        return;
+                    }
+                    if(prefill_down_lds_admitted(rows)) {
+                        launch_prefill_down_tier<Tune>(down_weights,rows,request.shape.hidden,request.shape.rows,image,nullptr,batches,down_type==7U,false,stream);
+                        prefill_da16_mark(2U,stream);
                         return;
                     }
                     if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<true,Tune>),down_grid,dim3(Threads),0,
@@ -2706,6 +2933,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<false,Tune>),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                     check(hipGetLastError(),"FP16 prefill WMMA down (DA16)");
+                    prefill_da16_mark(2U,stream);
                     return;
                 }
                 // qpf2k/moe-mi SMALL (STRIX_QPF2K_MOE_SMALL=<rows>, hip_moe_prefill_small.inc): gate/up batches with <= rows assignments
@@ -2727,6 +2955,10 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     check(hipGetLastError(),"FP16 prefill WMMA down (SMALL: base down)");
                     return;
                 }
+                if constexpr(Tune==80U||Tune==82U||Tune==88U) {
+                    if(direct)direct_project.template operator()<false>(nullptr,nullptr);
+                }
+                if(direct_b_ran()) {} else
                 if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune>),project_grid,dim3(Threads),0,stream,
                     gate,up,rows,request.shape.hidden,request.shape.rows,a16);
                 else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
@@ -2833,17 +3065,29 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
 void set_prefill_core2(int core){prefill_core2_override()=core;}
 void set_prefill_route(int bits){prefill_route_override()=bits;}
 void set_prefill_da16(int on){prefill_da16_override()=on;}
+void set_prefill_tile64(int on){prefill_tile64_override()=on;}
+void set_prefill_test_events(hipEvent_t* events){prefill_test_events()=events;}
 void set_prefill_hdr(int on){prefill_hdr_override()=on;}
+void set_prefill_tiers(int on){prefill_tiers_override()=on;}
+bool prefill_tiers_ran(){return prefill_tiers_flag();}
+int prefill_tiers_mode_ran(){return prefill_tiers_flag();}
+void set_prefill_down_lds(int on){prefill_down_lds_override()=on;}
+bool prefill_down_lds_ran(){return prefill_down_lds_flag();}
+void prefill_test_da16_events(const std::array<hipEvent_t,3>* events){prefill_da16_events()=events;}
+const void* prefill_test_da16_data(){return da16_image();}
+const unsigned* prefill_test_da16_arrivals(){return da16_counters();}
 void set_prefill_xor64(int on){prefill_xor64_override()=on;}
 unsigned prefill_last_tune(){return prefill_last_tune_value();}
 void set_prefill_small(int rows){prefill_small_override()=rows;}
 bool prefill_small_ran(){return prefill_small_flag();}
 bool prefill_da16_ran(){return prefill_da16_flag();}
+bool prefill_tile64_ran(){return prefill_tile64_flag();}
 bool prefill_certificate_produced(){return prefill_certificate_flag();}
 bool prefill_clear_skipped(){return prefill_clear_skipped_flag();}
 void reserve_prefill_pools(unsigned rows) {
     prefill_pool_owner().setup(rows, [] {
         (void)f16_prefill_a16(true); (void)da16_image(true);
+        if(prefill_tiers())(void)prefill_tier_lists(true);
         (void)da16_counters(true); (void)p1_counter_pool(true);
         (void)fuse_counter_pool(true); (void)csr_mw_scratch(true);
     });
@@ -2855,6 +3099,7 @@ void prefill_test_poison_da16(hipStream_t stream, unsigned rows) {
     reserve_prefill_pools(rows);
     check(hipMemsetAsync(da16_image(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_top_k*max_rows*2U,stream),"poison DA16 image");
 }
+const void* prefill_test_da16_image(){return da16_image();}
 void prefill_test_poison_a16(hipStream_t stream, unsigned rows) {
     reserve_prefill_pools(rows);
     check(hipMemsetAsync(f16_prefill_a16(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_hidden*2U,stream),"poison FP16 prefill A image");
@@ -2997,5 +3242,63 @@ void enqueue(const Request& request,std::span<const Bindings> rows,const q51_kno
     else {STRIX_A8_CSR_PROJECT(8);}
 #undef STRIX_A8_CSR_PROJECT
     check(hipGetLastError(),"A8 CSR shared gate/up projection");
+}
+
+void set_prefill_direct_b(int on){direct_b_override()=on;}
+bool prefill_direct_b_ran(){return direct_b_ran();}
+const char* prefill_direct_b_reason(){return direct_b_reason();}
+void prefill_project_test(const PrefillRows& rows,unsigned hidden,unsigned outputs,const unsigned char* gate,
+    const unsigned char* up,unsigned batches,unsigned tune,bool direct,hipStream_t stream,DirectBOperands direct_assets,
+    unsigned* arrive,uint4* image) {
+    if(batches>da16_counter_words()||!arrive||!image)throw std::invalid_argument("direct B timing completion assets");
+    const auto run=[&]<unsigned Tune>() {
+        const uint4* a16=(Tune&16U)?f16_prefill_a16():nullptr;
+        if(direct) {
+            using DT=DirectBTile<Tune>;
+            static bool reported=false;
+            if(!reported) {
+                prefill_resources_at(reinterpret_cast<const void*>(direct_b_kernel<Tune,true>()),"gate_up_q4k_direct_b_da16",Tune,DT::Threads);
+                reported=true;
+            }
+            launch_prefill_direct_b<Tune,true>(dim3(outputs/DT::Outputs,batches),stream,
+                direct_assets.gate,direct_assets.up,rows,hidden,outputs,a16,arrive,image);
+        } else {
+            using T=F16Tile<Tune>;
+            static bool reported=false;
+            if(!reported) {
+                prefill_resources_at(reinterpret_cast<const void*>(project_prefill_f16x_da16_mg<false,Tune>),"gate_up_q4k_da16_mg",Tune,T::Threads);
+                reported=true;
+            }
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),dim3(outputs/(T::Columns/2U),batches),dim3(T::Threads),0,stream,
+                gate,up,rows,hidden,outputs,a16,arrive,image);
+        }
+        check(hipGetLastError(),"gate/up fixture projection");
+    };
+    switch(tune){case 80:run.template operator()<80>();break;case 82:run.template operator()<82>();break;
+        case 88:run.template operator()<88>();break;default:throw std::invalid_argument("direct B fixture tune");}
+}
+DirectBFragmentResult direct_b_fragment_test(const unsigned char* raw,const unsigned char* packed,unsigned pairs,bool paired_planes) {
+    // Keep the flattened coordinate within 32 bits above the two FP16 values.
+    if(!pairs||pairs>(1U<<18U))throw std::invalid_argument("direct B fragment pair count");
+    unsigned long long* stats=nullptr;check(hipMalloc(&stats,32),"direct B fragment counters");
+    check(hipMemset(stats,0,24),"direct B fragment clear");
+    check(hipMemset(stats+3,255,8),"direct B first fragment clear");
+    if(paired_planes) {
+        hipLaunchKernelGGL(direct_b_fragment_probe<true>,dim3(2U*pairs),dim3(32),0,nullptr,raw,packed,stats);
+    } else {
+        hipLaunchKernelGGL(direct_b_fragment_probe<false>,dim3(pairs),dim3(32),0,nullptr,raw,packed,stats);
+    }
+    check(hipGetLastError(),"direct B fragment probe");
+    std::array<unsigned long long,4> result{};
+    check(hipMemcpy(result.data(),stats,32,hipMemcpyDeviceToHost),"direct B fragment result");
+    check(hipFree(stats),"direct B fragment free");
+    DirectBFragmentResult out{result[0],result[1],result[2]};
+    if(out.mismatched_elements) {
+        out.actual=static_cast<unsigned>(result[3]&65535U);out.expected=static_cast<unsigned>((result[3]>>16U)&65535U);
+        auto coordinate=result[3]>>32U;
+        out.element=coordinate%16U;coordinate/=16U;out.plane=coordinate%16U;coordinate/=16U;
+        out.replica=coordinate%2U;coordinate/=2U;out.lane=coordinate%16U;out.unit=static_cast<unsigned>(coordinate/16U);
+    }
+    return out;
 }
 } // namespace strix::moe_q4k_a8::known_rows

@@ -1,4 +1,5 @@
 #include "virtual_q8_oracle.hpp"
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_arena.hpp"
@@ -913,8 +914,8 @@ void run_gdn_island_fixture() {
         };
         auto islands = create(config, d1->scope());
         const auto initial = islands->receipt();
-        expect(initial.islands == 1U && initial.kernel_nodes == 10U && initial.replays == 0U,
-            "one GDN island validates its exact ten-node emitter ledger without a warmup replay");
+        expect(initial.islands == 1U && initial.kernel_nodes == (strix::qpf2k::decode_fuse_enabled() ? 8U : 10U) && initial.replays == 0U,
+            "one GDN island validates its resolved emitter ledger without a warmup replay");
         strix::HipGdnLauncherBundle bundle(config);
         strix::ExecutionLauncherRegistry registry;
         bundle.register_for_compiled_execution(compiled, registry, islands.get());
@@ -1895,17 +1896,20 @@ int main(int argc, char** argv) try {
         const auto original = defaults.variants().front(); const auto candidate = candidates.variants().front();
         expect(original.id == "hip.gdn.bf16.h128.kh16.vh48.d128.r1.c1.scalar" && original.compiler_identity == "hip-gfx1151-gdn-v2",
             "default GDN selected id and compiler identity remain golden");
-        // Independently derived from unchanged37d00b7 FNV tag/hash fields for
-        // fixture_model(); not copied from this candidate's runtime output.
-        expect(strix::make_hip_gdn_launcher(original.id, &default_config).implementation_identity == 0x4c2e7f55e611b0edULL,
-            "default GDN implementation hash remains golden");
+        // Independent FNV goldens for fixture_model(): only the implementation
+        // hash distinguishes fusion ON/OFF; selected kernel ids remain unchanged.
+        const bool fuse = strix::qpf2k::decode_fuse_enabled();
+        expect(strix::make_hip_gdn_launcher(original.id, &default_config).implementation_identity ==
+                (fuse ? 0x5d16c53e258db5cdULL : 0x4c2e7f55e611b0edULL),
+            "default GDN implementation hash matches its launch organization");
         expect(candidate.id == original.id + ".virtual256.q8-input" && candidate.compiler_identity == "hip-gfx1151-gdn-v3-virtual256-q8-input",
             "candidate GDN id and compiler identity are explicit");
         expect(candidate.resources.workgroup_threads == original.resources.workgroup_threads &&
             candidate.resources.lds_bytes == original.resources.lds_bytes && candidate.resources.scratch_bytes == original.resources.scratch_bytes &&
             candidate.resources.workgroup_threads == 256U && candidate.resources.lds_bytes == 16640U,
             "composite GDN conservative resource bounds remain unchanged");
-        expect(strix::make_hip_gdn_launcher(candidate.id, &candidate_config).implementation_identity == 0x6df298901ec0691aULL,
+        expect(strix::make_hip_gdn_launcher(candidate.id, &candidate_config).implementation_identity ==
+                (fuse ? 0xadc2224b6cf451baULL : 0x6df298901ec0691aULL),
             "current virtual input hash remains independently golden");
         auto prefetch_config = candidate_config; prefetch_config.prefetch_q8_input_projections = true;
         strix::kernels::KernelRegistry prefetch_registry;
@@ -1916,7 +1920,8 @@ int main(int argc, char** argv) try {
             prefetched.resources.workgroup_threads == original.resources.workgroup_threads &&
             prefetched.resources.lds_bytes == original.resources.lds_bytes && prefetched.resources.scratch_bytes == original.resources.scratch_bytes,
             "prefetch id/compiler are distinct and composite resources unchanged");
-        expect(strix::make_hip_gdn_launcher(prefetched.id, &prefetch_config).implementation_identity == 0x31229ee8b0186323ULL,
+        expect(strix::make_hip_gdn_launcher(prefetched.id, &prefetch_config).implementation_identity ==
+                (fuse ? 0xbbac397b35745543ULL : 0x31229ee8b0186323ULL),
             "prefetch implementation hash remains independently golden and distinct");
         auto invalid_config = default_config; invalid_config.prefetch_q8_input_projections = true;
         bool register_rejected = false, factory_rejected = false;

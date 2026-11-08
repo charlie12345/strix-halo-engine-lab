@@ -34,6 +34,6 @@ struct HipQ6pPack {
 // registers it in strix::q6p (cleared when the returned owner is destroyed).
 [[nodiscard]] std::shared_ptr<const HipQ6pPack> load_hip_q6p_pack(const std::filesystem::path& path,
     const MappedModelFile& target, const ModelManifest& target_manifest, const ModelRuntimeBinding& target_binding,
-    AllocationGenerationSource& generations);
+    AllocationGenerationSource& generations, bool router_bf16 = true);
 
 }  // namespace strix

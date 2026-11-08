@@ -1,3 +1,5 @@
+// Exactness comments below describe the default FP32 route target. The explicit
+// BF16 route-storage candidate is a separate, unqualified numerical target.
 // CUDA routed-MoE prefill of the Qwen A8 profile, bit-identical to the HIP iu8 WMMA path (see include/strix/cuda_qwen_moe.hpp).
 //
 // Exactness notes (HIP sources at engine commit bf60d9d2; ISA = the gfx1151 disassembly):
@@ -22,6 +24,7 @@
 //   d*sc*r rounded once (same for zero signs, infinities and NaN). Every other operation is HIP's, in HIP's order.
 #include "strix/cuda_qwen_moe.hpp"
 #include "strix/cuda_qwen_quant.cuh"
+#include "strix/cuda_qwen_route_bf16.hpp"
 
 #include <cuda_fp16.h>
 
@@ -31,6 +34,9 @@
 
 namespace strix::cuda::qwen_moe {
 namespace {
+
+// Storage primitives only; the HIP DA16 arithmetic/certificate is not imported.
+#include "../hip_moe_route_bf16.inc"
 
 constexpr int kMagic = 0x4b400000;
 constexpr float kMagicF = 12582912.0F;  // 0x1.8p23
@@ -422,7 +428,7 @@ template <bool Q51> struct DownLayout {
     static constexpr unsigned total = rowinfo + 2U * tile_rows * 4U;
 };
 
-template <bool Q51>
+template <bool Q51, bool RouteBF16 = false>
 __global__ __launch_bounds__(kDownThreads) void down_kernel(const std::uint8_t* weights, Rows v) {
     using L = DownLayout<Q51>;
     const Csr& csr = v.csr;
@@ -564,7 +570,13 @@ __global__ __launch_bounds__(kDownThreads) void down_kernel(const std::uint8_t* 
                 out[col] = __fadd_rn(__fadd_rn(c[0], c[1]), __fadd_rn(c[2], c[3]));
             }
             const unsigned o = out0 + 32U * wn + 8U * n + 2U * q;
+            if constexpr (RouteBF16) {
+                const auto index = static_cast<std::uint64_t>(slot_of[r]) * hidden + o;
+                moe_route_store<true>(at(v.rawdots, row_of[r]), index, out[0]);
+                moe_route_store<true>(at(v.rawdots, row_of[r]), index + 1U, out[1]);
+            } else {
             *reinterpret_cast<float2*>(at(v.rawdots, row_of[r]) + slot_of[r] * hidden + o) = make_float2(out[0], out[1]);
+            }
         }
 }
 
@@ -711,7 +723,7 @@ __global__ __launch_bounds__(1024) void project_rows_kernel(const std::uint8_t* 
 // down: block = (tile, 8 hidden outputs), warp = one output. Lane L: chain j = L / 8, elements 4 (L % 8) .. + 3 of
 // group g = 4c + j, chunks c ascending: first = d * float(dot), Q5_1: combined = first + m * S, contribution = E *
 // combined, acc_j += contribution; then (acc0 + acc1) + (acc2 + acc3) into rawdots.
-template <bool Q51>
+template <bool Q51, bool RouteBF16 = false>
 __global__ __launch_bounds__(256) void down_rows_kernel(const std::uint8_t* weights, Rows v) {
     using L = DownLayout<Q51>;
     const Csr& csr = v.csr;
@@ -782,7 +794,13 @@ __global__ __launch_bounds__(256) void down_rows_kernel(const std::uint8_t* weig
         if (a >= count) break;
         const float c0 = __shfl_sync(0xffffffffU, acc[a], 0), c1 = __shfl_sync(0xffffffffU, acc[a], 8);
         const float c2 = __shfl_sync(0xffffffffU, acc[a], 16), c3 = __shfl_sync(0xffffffffU, acc[a], 24);
+        if constexpr (RouteBF16) {
+            if (lane == 0U) moe_route_store<true>(at(v.rawdots, row_of[a]),
+                static_cast<std::uint64_t>(slot_of[a]) * hidden + o,
+                __fadd_rn(__fadd_rn(c0, c1), __fadd_rn(c2, c3)));
+        } else {
         if (lane == 0U) at(v.rawdots, row_of[a])[slot_of[a] * hidden + o] = __fadd_rn(__fadd_rn(c0, c1), __fadd_rn(c2, c3));
+        }
     }
     }
 }
@@ -907,6 +925,7 @@ __global__ __launch_bounds__(1024) void native_down_kernel(const std::uint8_t* d
 
 // ---------------------------------------------------------------------------------------------------------------------
 // merge / commit (hip_moe_experts_launcher.hip:2660-2708).
+template <bool RouteBF16 = false>
 __global__ __launch_bounds__(256) void merge_kernel(Rows v) {
     const unsigned row = blockIdx.y;
     std::uint32_t* status = at(v.status, row);
@@ -919,8 +938,15 @@ __global__ __launch_bounds__(256) void merge_kernel(Rows v) {
     const float* rawdots = at(v.rawdots, row);
     const float* w = at(v.route_weights, row);
     float current = 0.0F;
+    if constexpr (RouteBF16) {
+#pragma unroll
+        for (unsigned slot = 0; slot < top_k; ++slot)
+            current = __fmaf_rn(w[slot], moe_route_load<true>(rawdots,
+                static_cast<std::uint64_t>(slot) * hidden + out), current);
+    } else {
 #pragma unroll
     for (unsigned slot = 0; slot < top_k; ++slot) current = __fmaf_rn(w[slot], rawdots[slot * hidden + out], current);
+    }
     at(v.accumulation, row)[out] = canon(current);
     if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); }
 }
@@ -991,27 +1017,44 @@ void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const 
     } else throw std::invalid_argument("MoE gate type");
     check(cudaGetLastError(), "MoE gate/up");
 }
-void enqueue_down(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s) {
+template <bool RouteBF16>
+void enqueue_down_storage(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s) {
     if (rows <= kRowsMax && decode_rows_enabled()) {
         const dim3 grid(csr_sizes(rows).max_tiles, hidden / 8U);
-        if (w.down_type == type_q5_1) down_rows_kernel<true><<<grid, 256, 0, s>>>(w.down, v);
-        else if (w.down_type == type_q8_0) down_rows_kernel<false><<<grid, 256, 0, s>>>(w.down, v);
+        if (w.down_type == type_q5_1) down_rows_kernel<true, RouteBF16><<<grid, 256, 0, s>>>(w.down, v);
+        else if (w.down_type == type_q8_0) down_rows_kernel<false, RouteBF16><<<grid, 256, 0, s>>>(w.down, v);
         else throw std::invalid_argument("MoE down type");
         check(cudaGetLastError(), "MoE down rows");
         return;
     }
     const dim3 grid(csr_sizes(rows).max_tiles, hidden / kDownOuts);
     if (w.down_type == type_q5_1) {
-        static bool once = (set_smem(down_kernel<true>, DownLayout<true>::total), true); (void)once;
-        down_kernel<true><<<grid, kDownThreads, DownLayout<true>::total, s>>>(w.down, v);
+        static bool once = (set_smem(down_kernel<true, RouteBF16>, DownLayout<true>::total), true); (void)once;
+        down_kernel<true, RouteBF16><<<grid, kDownThreads, DownLayout<true>::total, s>>>(w.down, v);
     } else if (w.down_type == type_q8_0) {
-        static bool once = (set_smem(down_kernel<false>, DownLayout<false>::total), true); (void)once;
-        down_kernel<false><<<grid, kDownThreads, DownLayout<false>::total, s>>>(w.down, v);
+        static bool once = (set_smem(down_kernel<false, RouteBF16>, DownLayout<false>::total), true); (void)once;
+        down_kernel<false, RouteBF16><<<grid, kDownThreads, DownLayout<false>::total, s>>>(w.down, v);
     } else throw std::invalid_argument("MoE down type");
     check(cudaGetLastError(), "MoE down");
 }
+namespace {
+void validate_route_storage(const Rows& v, std::uint32_t rows) {
+    if (v.route_bf16) qwen_route::validate_view(reinterpret_cast<std::uintptr_t>(v.rawdots.base),
+        v.rawdots.stride, v.rawdot_capacity, rows, true);
+}
+} // namespace
+
+void enqueue_down(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s) {
+    validate_route_storage(v, rows);
+    if (v.route_bf16 && native_types(w))
+        qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
+    if (v.route_bf16) enqueue_down_storage<true>(v, rows, w, s);
+    else enqueue_down_storage<false>(v, rows, w, s);
+}
 void enqueue_merge(const Rows& v, std::uint32_t rows, cudaStream_t s) {
-    merge_kernel<<<dim3((hidden + 255U) / 256U, rows), 256, 0, s>>>(v);
+    validate_route_storage(v, rows);
+    if (v.route_bf16) merge_kernel<true><<<dim3((hidden + 255U) / 256U, rows), 256, 0, s>>>(v);
+    else merge_kernel<false><<<dim3((hidden + 255U) / 256U, rows), 256, 0, s>>>(v);
     check(cudaGetLastError(), "MoE merge");
 }
 void enqueue_commit(const Rows& v, std::uint32_t rows, std::uint32_t* record, cudaStream_t s) {
@@ -1026,6 +1069,9 @@ bool native_types(const Weights& w) {
 
 void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
              std::uint32_t* record, cudaStream_t s) {
+    validate_route_storage(v, rows);
+    if (v.route_bf16 && native_types(w))
+        qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
     enqueue_prologue(v, rows, clear_words, s);
     enqueue_csr(v, rows, s);
     if (native_types(w)) {

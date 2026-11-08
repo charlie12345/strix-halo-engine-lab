@@ -429,13 +429,19 @@ NativeDistributedTokenRetirement NativeDistributedBackend::retire_token() {
 NativeDistributedTokenRetirement NativeDistributedBackend::retire_aborted_token() {
     return retire(NativeDistributedRetirementOutcome::aborted_attempt);
 }
-void NativeDistributedTokenRetirement::consume_matches(std::uint64_t binding,std::uint64_t placement,
-    const DistributedRuntimeRequest& request,std::uint32_t node,NativeDistributedRetirementOutcome outcome) {
+void NativeDistributedTokenRetirement::validate_matches(std::uint64_t binding,std::uint64_t placement,
+    const DistributedRuntimeRequest& request,std::uint32_t node,NativeDistributedRetirementOutcome outcome) const {
+    if(copied_) {validate_copied_matches(binding,placement,request,node,outcome);return;}
     if(!ledger_ || !ledger_->sealed || ledger_->binding!=binding || ledger_->placement!=placement ||
         ledger_->node!=node || ledger_->outcome!=outcome || !retirement_request_equal(ledger_->request,request))
         throw std::invalid_argument("native token retirement proof is empty, foreign or has the wrong outcome");
     require_retirement_live(*ledger_);
-    ledger_->consumed=true; // last operation: no publication or allocation here
+}
+void NativeDistributedTokenRetirement::consume_matches(std::uint64_t binding,std::uint64_t placement,
+    const DistributedRuntimeRequest& request,std::uint32_t node,NativeDistributedRetirementOutcome outcome) {
+    validate_matches(binding,placement,request,node,outcome);
+    if(copied_) { consume_copied_matches();return; }
+    ledger_->consumed=true;
 }
 
 void NativeDistributedBackend::require_healthy() const {

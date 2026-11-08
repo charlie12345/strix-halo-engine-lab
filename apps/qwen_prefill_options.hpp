@@ -38,18 +38,21 @@ inline std::vector<std::string> split_process_arguments(std::string_view cmdline
 }
 
 // Shared by CLI receipts, host inspection and HTTP capability discovery.
-inline std::string prefill_identity_fields(unsigned mask) {
+inline std::string prefill_identity_fields(unsigned mask, std::uint32_t qsa_budget = qsa_prefill_budget_active()) {
     std::ostringstream out;
-    out << "\"prefill_identity\":\"" << prefill_identity_name(mask)
+    out << "\"prefill_identity\":\"" << prefill_identity_name(mask, qsa_budget)
         << "\",\"prefill_identity_hash\":\"" << std::hex << std::setw(16) << std::setfill('0')
-        << prefill_identity_hash(mask) << "\",\"prefill_options_active\":[";
+        << prefill_identity_hash(mask, qsa_budget) << "\",\"prefill_options_active\":[";
     bool first = true;
     for (unsigned i = 0; i < kPrefillOptions.size(); ++i) {
         if (!(mask & (1U << i))) continue;
         out << (first ? "" : ",") << '"' << kPrefillOptions[i].name << '"';
         first = false;
     }
+    if (qsa_budget) out << (first ? "" : ",") << "\"qsa_budget\"";
     out << ']';
+    if (qsa_budget) out << ",\"qsa_prefill_budget\":" << std::dec << qsa_budget
+        << ",\"qsa_prefill_budget_local_tail\":\"unchanged\",\"qsa_prefill_budget_qualification\":\"in-progress\"";
     return out.str();
 }
 

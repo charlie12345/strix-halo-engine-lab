@@ -81,6 +81,7 @@ struct PrefillRows {
     CsrRows csr; // q51_known_rows::scratch_layout(T, experts, top_k, true) in an exclusive allocation
     bool route_bf16 = false; // Candidate: DA16 certificate writer and matching ordered merge only.
     unsigned* unsafe = nullptr; // Private admission sidecar, stream-owned; null selects base producers.
+    bool route_i8 = false; // Env-only draft, requires route_bf16 and its reserved FP32 row.
 };
 // T CTAs: each row's clear, route checks and quantizer exactly as the window prologue.
 void enqueue_prefill_prologue(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words, hipStream_t);
@@ -99,9 +100,10 @@ void enqueue_prefill_prologue(const Request&, const PrefillRows&, unsigned rows,
 // 128-assignment batches, bit 2 compact 128-column tile, bit 3 unpadded XOR-permuted LDS rows,
 // bit 4 prologue FP16 image of the prompt rows, bit 6 short exact dequantization.
 // Form 3 selects the same schedules with STRIX_INTPREFILL_MOE_TUNE (default 0).
+struct DirectBOperands { const unsigned char* gate=nullptr; const unsigned char* up=nullptr; };
 void enqueue_prefill(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words,
     const unsigned char* gate, const unsigned char* up, unsigned down_type, const unsigned char* down_weights, hipStream_t,
-    int form = -1);
+    int form = -1, DirectBOperands direct = {});
 // Diagnostic: MoE tune bit 6 (short exact FP16 dequantization) against the base conversion on random scales and every
 // code. Returns tested/admitted/mismatched counts for K-quant sub-blocks and Q5_1 blocks, then the same for the rejected
 // Q8_0 offset form (informational: it differs in the sign of zero) (synchronizes).
@@ -129,6 +131,48 @@ void set_prefill_route(int bits);
 void set_prefill_da16(int on);
 // MoE header reuse test hook: overrides STRIX_QPF2K_MOE_HDR (1 = gate/up header reuse kernel; -1 = environment).
 void set_prefill_hdr(int on);
+// Test hooks: STRIX_QPF2K_MOE_TIERS / STRIX_QPF2K_MOE_DOWN_LDS_EPI, default OFF;
+// -1 restores the environment. Enable tiers before reserve_prefill_pools so setup
+// reserves the lists; execution never allocates. Tune 82 splits; 80/88 are already narrow.
+// Tiers 1 = padded narrow LDS, 2 = compact XOR narrow LDS; both keep the full tier.
+void set_prefill_tiers(int on);
+bool prefill_tiers_ran();
+int prefill_tiers_mode_ran(); // 0 = unsplit, otherwise the admitted mode (1/2).
+void set_prefill_down_lds(int on);
+bool prefill_down_lds_ran();
+// Optional caller-owned timing events, recorded on the enqueue stream at DA16
+// gate/up begin/end and down end. Null disables recording; no device work here.
+// The caller retains all three events until stream completion and clears the hook.
+void prefill_test_da16_events(const std::array<hipEvent_t,3>* events);
+// Borrowed scratch, valid on the pool's owning device until its next setup growth.
+const void* prefill_test_da16_data();
+const unsigned* prefill_test_da16_arrivals();
+// TILE64 test override (-1 = environment, 0 = today's tile, 1 = TILE64 gate/up and down, 2 = gate/up only, 3 = down only);
+// default OFF until node timing.
+void set_prefill_tile64(int on);
+// TILE64 test hooks: whether the last enqueue_prefill of this thread took the TILE64 organization (either kernel); the
+// device address of the DA16 FP16 image (the gate/up product the down stages), for a digest.
+bool prefill_tile64_ran();
+const void* prefill_test_da16_image();
+// Test hook: three events recorded on the DA16 path (before gate/up, after gate/up, after down); nullptr = none.
+void set_prefill_test_events(hipEvent_t* events);
+void set_prefill_direct_b(int on);
+bool prefill_direct_b_ran();
+const char* prefill_direct_b_reason();
+struct DirectBFragmentResult {
+    unsigned long long mismatched_elements=0,pass_lanes=0,fallback_lanes=0;
+    // First mismatch in coordinate order. Unit = 2*pair + matrix (gate 0/up 1),
+    // lane = output column 0..15, replica = hardware lane / 16, plane = K / 16.
+    // Expected/actual are FP16 bits; coordinates are valid only on mismatch.
+    unsigned unit=0,lane=0,replica=0,plane=0,element=0,expected=0,actual=0;
+};
+DirectBFragmentResult direct_b_fragment_test(const unsigned char* raw_units,const unsigned char* packed_units,unsigned pairs,bool paired_planes=false);
+// DA16 gate/up plus completion fixture/timing entry. CSR, exponents and A16
+// must be ready; caller clears maxima and arrival counters before every launch.
+// The reference is the production header-reuse specialization at this tune.
+void prefill_project_test(const PrefillRows&, unsigned hidden, unsigned outputs,
+    const unsigned char* gate,const unsigned char* up,unsigned batches,unsigned tune,
+    bool direct,hipStream_t,DirectBOperands,unsigned* arrive,uint4* image);
 // MoE XOR rows test hook: overrides STRIX_QPF2K_MOE_XOR64 (1 = 64-assignment DA16 tune with XOR LDS rows from 3072 rows; -1 = environment).
 void set_prefill_xor64(int on);
 // Test hook: the FP16 tune of the last enqueue_prefill of this thread.
@@ -157,4 +201,11 @@ bool prefill_fused_merge();
 // that waited, [1] polls, [2] down items that ran, [3] down items that skipped, [4..5] total wait (u64 wall-clock ticks).
 std::array<unsigned,8> prefill_p1_stats();
 void enqueue_prefill_merge_check(const PrefillRows& rows,unsigned count,unsigned hidden,unsigned experts,unsigned top_k,hipStream_t stream);
+// STRIX_QPF2K_SCHED bit 64 (the tiled prefill owner's side stream): a one-shot host callback of this thread, run right after
+// the next enqueue_prefill enqueued `stage` on its stream (1 = CSR, 2 = gate/up; 3 = after enqueue_prefill returned, before
+// the caller's merge). A path without the stage runs it at 3 (prefill_stage_reached(3)). It only enqueues other-stream work.
+using PrefillStageHook = void (*)(void* user, hipStream_t stream);
+void set_prefill_stage_hook(PrefillStageHook hook, void* user, unsigned stage);
+void prefill_stage_reached(unsigned stage, hipStream_t stream);
+bool prefill_stage_hook_armed();
 } // namespace strix::moe_q4k_a8::known_rows

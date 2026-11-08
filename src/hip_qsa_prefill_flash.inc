@@ -63,12 +63,12 @@ __device__ __forceinline__ int lo_exponent(unsigned lo) { return lo == 0xfffffff
 __device__ __forceinline__ int hi_exponent(unsigned hi) { return hi == 0U ? -(1 << 20) : exponent_of(hi); }
 __device__ __forceinline__ unsigned wave_min_u(unsigned v) {
 #pragma unroll
-    for (unsigned d = 16U; d > 0U; d >>= 1U) v = min(v, static_cast<unsigned>(__shfl_xor(static_cast<int>(v), static_cast<int>(d), 32)));
+    for (unsigned d = 16U; d > 0U; d >>= 1U) v = min(v, static_cast<unsigned>(strix::qwen_dpp::xor32(static_cast<int>(v), d)));
     return v;
 }
 __device__ __forceinline__ unsigned wave_max_u(unsigned v) {
 #pragma unroll
-    for (unsigned d = 16U; d > 0U; d >>= 1U) v = max(v, static_cast<unsigned>(__shfl_xor(static_cast<int>(v), static_cast<int>(d), 32)));
+    for (unsigned d = 16U; d > 0U; d >>= 1U) v = max(v, static_cast<unsigned>(strix::qwen_dpp::xor32(static_cast<int>(v), d)));
     return v;
 }
 // Per pooled block (first .. first + count - 1): its magnitude range (lo, hi) for score_kernel's guard. Launched
@@ -252,8 +252,8 @@ __global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> 
         if (b < blocks) views.block_scores[r][b] = score;
         if (maxima) {
             float m = b < blocks ? score : -INFINITY;
-            m = fmaxf(m, __shfl_xor(m, 1, 32));
-            m = fmaxf(m, __shfl_xor(m, 2, 32));
+            m = fmaxf(m, strix::qwen_dpp::xor32<1>(m));
+            m = fmaxf(m, strix::qwen_dpp::xor32<2>(m));
             if ((lane & 3U) == 0U && b < blocks) maxima[static_cast<std::uint64_t>(r) * maxima_stride + b / kGroup] = m;
         }
     }
@@ -273,7 +273,7 @@ __global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> 
 constexpr unsigned kCandidates = 6144U;
 template <bool Stats>
 __device__ __forceinline__ void select_row_body(float* const scores, std::uint32_t* const selected, const std::uint32_t visible,
-    const float* const row_max, std::uint32_t compress_ratio, std::uint32_t block_topk, std::uint32_t* stats) {
+    const float* const row_max, std::uint32_t compress_ratio, std::uint32_t block_topk, std::uint32_t* stats, bool preserve_scores = false) {
     const auto tid = static_cast<std::uint32_t>(threadIdx.x);
     const auto complete = visible / compress_ratio;
     if (complete <= block_topk) {
@@ -345,7 +345,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
         if (exact) { atomicAdd(&stats[kCandidateGroups], taken); atomicMax(&stats[kCandidateMax], taken); }
     }
     if (!exact) {
-        select_blocks_parallel_body(scores, complete, block_topk, compress_ratio, visible, selected, GraphSelectionArguments{});
+        select_blocks_parallel_body(scores, complete, block_topk, compress_ratio, visible, selected, GraphSelectionArguments{}, preserve_scores);
         return;
     }
     __syncthreads();
@@ -371,7 +371,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
             const auto block = cand_group[i / kGroup] * kGroup + i % kGroup, slot = g + min(e, need);
             for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
                 selected[slot * compress_ratio + offset] = block * compress_ratio + offset;
-            scores[block] = -INFINITY;
+            if (!preserve_scores) scores[block] = -INFINITY;
         }
         greater_before += tile >> 16U; equal_before += tile & 0xffffU;
     }
@@ -384,14 +384,14 @@ __global__ __launch_bounds__(kSelectThreads) void select_kernel(QsaRowsSelectVie
     std::uint32_t maxima_stride, std::uint32_t compress_ratio, std::uint32_t block_topk, std::uint32_t* stats = nullptr) {
     const auto r = blockIdx.x;
     select_row_body<Stats>(views.block_scores[r], views.selected[r], views.visible[r], maxima + static_cast<std::uint64_t>(r) * maxima_stride,
-        compress_ratio, block_topk, stats);
+        compress_ratio, block_topk, stats, views.preserve_scores);
 }
 // STRIX_QPF2K_QSA bit 4: the selections of every prefill group of a call in one launch (one workgroup per row, the same
 // select_row_body), run after the call's last group was scored and before the batched union / attend.
 struct SelectRow { float* scores; std::uint32_t* selected; const float* maxima; std::uint32_t visible; std::uint32_t pad; };
 __global__ __launch_bounds__(kSelectThreads) void select_batch_kernel(const SelectRow* rows, std::uint32_t compress_ratio, std::uint32_t block_topk) {
     const SelectRow row = rows[blockIdx.x];
-    select_row_body<false>(row.scores, row.selected, row.visible, row.maxima, compress_ratio, block_topk, nullptr);
+    select_row_body<false>(row.scores, row.selected, row.visible, row.maxima, compress_ratio, block_topk, nullptr, row.pad != 0U);
 }
 // One serial decode row (STRIX_QSA_DECODE_SELECT): the 4-block group maxima of a finished score row, with score_kernel's
 // expression fmaxf(fmaxf(s0, s1), fmaxf(s2, s3)) and -inf past the row's blocks, then select_row_body over them.

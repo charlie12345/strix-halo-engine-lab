@@ -1,3 +1,4 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include <hip/hip_fp16.h>
@@ -101,7 +102,7 @@ __global__ __launch_bounds__(256) void draft_q4_head(const std::uint16_t* hidden
         }
         sum=fmaf(__half2float(*reinterpret_cast<const __half*>(block)),local,sum);
     }
-    for(unsigned d=16;d;d>>=1U) sum+=__shfl_xor(sum,static_cast<int>(d),32);
+    for(unsigned d=16;d;d>>=1U) sum+=strix::qwen_dpp::xor32(sum, d);
     if(!lane) logits[row]=sum;
 }
 // draft_q4_head's body for the draft batch's own-row (tail) kernel; the one-token kernel above stays as it was.
@@ -121,7 +122,7 @@ __device__ __forceinline__ void draft_q4_head_body(const std::uint16_t* hidden,c
         }
         sum=fmaf(__half2float(*reinterpret_cast<const __half*>(block)),local,sum);
     }
-    for(unsigned d=16;d;d>>=1U) sum+=__shfl_xor(sum,static_cast<int>(d),32);
+    for(unsigned d=16;d;d>>=1U) sum+=strix::qwen_dpp::xor32(sum, d);
     if(!lane) logits[row]=sum;
 }
 // Draft batch. Rows [0, shared) hold the same ids in every session's compact copy (one gather rule from one
@@ -169,7 +170,7 @@ __global__ __launch_bounds__(256) void draft_q4_head_shared(DraftHeadRows h,std:
         }
     }
 #pragma unroll
-    for(unsigned t=0;t<Count;++t) for(unsigned d=16;d;d>>=1U) sum[t]+=__shfl_xor(sum[t],static_cast<int>(d),32);
+    for(unsigned t=0;t<Count;++t) for(unsigned d=16;d;d>>=1U) sum[t]+=strix::qwen_dpp::xor32(sum[t], d);
     if(lane) return;
 #pragma unroll
     for(unsigned t=0;t<Count;++t) h.logits[t][row]=sum[t];

@@ -27,7 +27,14 @@ struct WideHyperRowsTestViews {
     unsigned output3_band = UINT32_MAX;     // output 7 only: 0..8, 12/16/24/32/48/64 override the read-once env; UINT32_MAX uses it
     bool output3_zero_low_rank_stride = false;  // bench-only output 7 / band 0 / projection skipped; outputs discarded
     unsigned low_band = UINT32_MAX;         // STRIX_QPF2K_HC_LOWBAND override 0..3 (projection 4, output 7, band 16); UINT32_MAX uses it
+    // Exact recompute seam (projection 4, output 7, 14 or 15 only). All raw rows and
+    // weights stay live and disjoint from every written extent until completion.
+    const void* recompute_input = nullptr;
+    std::uint64_t recompute_stride = 0;
+    const float* recompute_inverse = nullptr;
+    const float* recompute_norm = nullptr;
 };
+// Output form 15: experimental OUT16 inverse reuse, wide-rows only; without inverses restores form14.
 // Output form 14: qpf2k OUT16 (HCW2 arithmetic), paired with projection 4 or output-only 255.
 void enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& config, const WideHyperRowsTestViews& views,
     unsigned projection_kernel, unsigned output_kernel, hipStream_t stream);
@@ -49,6 +56,8 @@ struct Qpf2kInjectNormTestViews {
     float* normalized = nullptr; std::uint64_t normalized_stride = 0;
     const float* norm = nullptr;
     std::uint32_t rows = 0;
+    float* recompute_inverse = nullptr; // null = image; otherwise [rows][4]
+    bool norm_only = false;            // norm existing streams, without inject/combine
 };
 void enqueue_qpf2k_inject_norm_test(const HipHyperMixLauncherConfig& config, const Qpf2kInjectNormTestViews& views, bool reference,
     hipStream_t stream);

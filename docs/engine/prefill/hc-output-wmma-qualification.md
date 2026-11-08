@@ -1,5 +1,9 @@
 # HC output WMMA native release gates
 
+The separate [exact normalized-recompute candidate](hc-normalized-recompute.md)
+keeps this arithmetic identity and its existing folds/consumer schedules. Its
+native equality and performance gates remain pending; it is not default enabled.
+
 Run on the native HIP target after its compiler/ISA checks. CPU tests do not
 qualify numerical restoration. Keep all pins, prompts and outputs outside Git.
 Use a clean environment and fresh output directories. `EVIDENCE` and `PINS` below

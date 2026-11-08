@@ -488,7 +488,9 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 policy.seed = job.sampling.seed;
                 try {
                     validate_token_sampling_policy(policy);
-                    request.sampler = std::make_shared<TokenSampler>(policy);
+                    auto sampler_options = token_sampler_options_from_environment();
+                    sampler_options.request_identity = next_token_sampling_request_identity(); // 1 unless STRIX_SAMPLING_REQUEST_IDENTITY=counter
+                    request.sampler = std::make_shared<TokenSampler>(policy, sampler_options);
                 } catch (const std::exception& e) {  // this request fails alone; the server keeps serving
                     queue.finish(*taken, {}, std::string("sampling policy refused: ") + e.what());
                     release(taken);

@@ -68,9 +68,10 @@ void identity() {
     // visible to this scan). qwen_prefix_identity.cpp is the reader.
     const std::regex getenv_pattern(R"re(getenv\("([^"]+)"\))re");
     const std::regex any_getenv(R"re(getenv\s*\()re");
-    // Read only to decline startup (the Prefill constructor throws when the BF16 MoE route is requested), so no
-    // saved state can depend on them.
-    const std::set<std::string> refuse_only = {"STRIX_QPF2K_MOE_ROUTE_BF16", "STRIX_BASELINE", "STRIX_QPF2K_DEFAULTS"};
+    // Resolved into target.prefill/decode/storage/pair only for the experimental
+    // candidate. OFF keys stay byte-preserved; candidate cache reuse is refused.
+    const std::set<std::string> policy_controls = {"STRIX_QPF2K_MOE_ROUTE_BF16", "STRIX_BASELINE",
+        "STRIX_QPF2K_DEFAULTS", "STRIX_PREFILL_EXACT_FP16"};
     const auto scan = [&](const std::string& dir, const std::string& prefix, const std::set<std::string>& exempt) {
         for (const auto& entry : std::filesystem::directory_iterator(dir)) {
             const auto name = entry.path().filename().string();
@@ -81,7 +82,7 @@ void identity() {
             const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             std::size_t literal = 0, all = 0;
             for (auto it = std::sregex_iterator(source.begin(), source.end(), getenv_pattern); it != std::sregex_iterator(); ++it, ++literal)
-                check(has_field((*it)[1].str()) || refuse_only.count((*it)[1].str()) != 0 || exempt.count((*it)[1].str()) != 0, "every Qwen CUDA getenv is covered by identity");
+                check(has_field((*it)[1].str()) || policy_controls.count((*it)[1].str()) != 0 || exempt.count((*it)[1].str()) != 0, "every Qwen CUDA getenv is covered by identity");
             for (auto it = std::sregex_iterator(source.begin(), source.end(), any_getenv); it != std::sregex_iterator(); ++it) ++all;
             check(all == literal, "Qwen CUDA getenv reads use a literal name");
         }
@@ -106,6 +107,23 @@ void identity() {
         check(px::identity_key(changed) != key, "any field name changes key");
     }
     check(px::identity_key({{"a", "b:c"}}) != px::identity_key({{"a:b", "c"}}), "length framing");
+    auto off = c;
+    off.moe_route_bf16 = false;
+    auto candidate = c;
+    candidate.moe_route_bf16 = true;
+    const auto off_fields = px::identity_fields(off, 256);
+    const auto candidate_fields = px::identity_fields(candidate, 256);
+    const auto effective = strix::cuda::qwen_route::environment(true);
+    check((px::identity_key(candidate_fields) != px::identity_key(off_fields)) == effective.enabled,
+        "resolved CUDA route target changes cache identity, masters restore OFF");
+    if (effective.enabled) {
+        for (const auto* name : {"target.prefill", "target.decode", "target.storage", "target.pair"})
+            check(std::any_of(candidate_fields.begin(), candidate_fields.end(),
+                [&](const auto& field) { return field.first == name; }), "composed candidate identity fields");
+        candidate.mtp_sidecar_gguf.clear();
+        check(px::identity_key(px::identity_fields(candidate, 256)) != px::identity_key(candidate_fields),
+              "sidecar asset binding cannot collide even while candidate composition is refused");
+    }
     c.max_positions++;
     check(px::identity_key(px::identity_fields(c, 256)) != key, "config resolution participates");
     check(px::identity_key(px::identity_fields(c, 512)) != px::identity_key(px::identity_fields(c, 256)), "segment size participates");

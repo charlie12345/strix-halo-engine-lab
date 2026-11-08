@@ -1,7 +1,9 @@
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/hip_ple_launcher.hpp"
+#include "strix/ple_projection_tile.hpp"
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/prepared_tensor_views.hpp"
@@ -711,7 +713,7 @@ __global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_kernel(
     for (unsigned distance = 16; distance > 0; distance /= 2) {
 #pragma unroll
         for (unsigned local = 0; local < 8; ++local) {
-            const auto partner = __shfl_down(partial[local], distance, 32);
+            const auto partner = strix::qwen_dpp::down_tree32(partial[local], distance);
             if (lane < distance) partial[local] += partner;
         }
     }
@@ -756,7 +758,7 @@ __global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_rows_kernel
         for (unsigned distance = 16; distance > 0; distance /= 2) {
 #pragma unroll
             for (unsigned local = 0; local < 8; ++local) {
-                const auto partner = __shfl_down(partial[r][local], distance, 32);
+                const auto partner = strix::qwen_dpp::down_tree32(partial[r][local], distance);
                 if (lane < distance) partial[r][local] += partner;
             }
         }
@@ -2489,6 +2491,53 @@ register_for_compiled_execution(
 
 #include "hip_ple_rows_site.inc"
 
+void testing::invalidate_ple_projection_weights() { q8_rows::invalidate_lane_weights(); }
+
+bool testing::enqueue_ple_projection_pair(int mode, const std::uint16_t* input, const void* key_weights,
+    const void* value_weights, std::uint32_t width, std::uint32_t key_outputs, std::uint32_t value_outputs,
+    std::uint32_t rows, std::uint32_t input_stride, float* keys, std::uint32_t key_stride,
+    float* values, std::uint32_t value_stride, void* raw_stream) {
+    const auto stream = static_cast<hipStream_t>(raw_stream);
+    PleRowsSite<64> key{}, value{};
+    key.segments = q8_rows::segments({{key_weights, key_outputs}});
+    value.segments = q8_rows::segments({{value_weights, value_outputs}});
+    key.base = value.base = input; key.width = value.width = width;
+    key.in_stride = value.in_stride = input_stride;
+    key.outputs = key_outputs; key.out_stride = key_stride; key.out = keys;
+    value.outputs = value_outputs; value.out_stride = value_stride; value.out = values;
+    const auto groups = rows / 64U;
+    std::uint32_t first = 0;
+    bool reused = false;
+    static q8_rows::LaneBuffer scratch;
+    if (ple_batch_admits(key, groups) && ple_batch_admits(value, groups) &&
+        ple_batch_reserve(scratch, std::uint64_t{groups} * 64U * width * sizeof(float))) {
+        auto* packed = static_cast<float*>(scratch.base);
+        reused = ple_tile_admits(mode < 0 ? ple_tile_requested() : mode == 1, key, value, groups);
+        if (reused) ple_tile_launch(key, value, groups, packed, stream);
+        else {
+            ple_batch_launch(key, q8_rows::lane_weights(key, stream), groups, packed, stream);
+            ple_batch_launch(value, q8_rows::lane_weights(value, stream), groups, packed, stream);
+        }
+        first = groups * 64U;
+    }
+    for (; rows - first >= 64U; first += 64U) {
+        auto k = key, v = value;
+        k.base += std::uint64_t{first} * input_stride; v.base = k.base;
+        k.out += std::uint64_t{first} * key_stride; v.out += std::uint64_t{first} * value_stride;
+        q8_rows::launch(k, false, stream); q8_rows::launch(v, false, stream);
+    }
+    // Same per-row arithmetic as the production narrow remainder. Leave it out
+    // of the candidate; no speculative row padding or masked arithmetic.
+    for (; first < rows; ++first) {
+        testing::enqueue_ple_q8_projection(true, input + std::uint64_t{first} * input_stride,
+            key_weights, width, key_outputs, keys + std::uint64_t{first} * key_stride, stream);
+        testing::enqueue_ple_q8_projection(true, input + std::uint64_t{first} * input_stride,
+            value_weights, width, value_outputs, values + std::uint64_t{first} * value_stride, stream);
+    }
+    check_hip(hipGetLastError(), "PLE pair fixture launch");
+    return reused;
+}
+
 // Gathers rows (heads row ids each) from the file-mapped table into staging + r * stride on up to 8 threads, each with
 // its own stateless FileMappedPleLookupBackend: the same calls as the launch path's deferred gather.
 static void gather_staged_rows(std::byte* staging, std::uint64_t stride, std::span<const std::uint32_t> row_ids, std::uint32_t heads,
@@ -2676,12 +2725,15 @@ struct HipPleKnownWindow::Impl {
             projections + static_cast<std::uint64_t>(max_rows) * expanded);
         if (!ple_batch_admits(key, groups) || !ple_batch_admits(value, groups)) return false;
         if (!ple_batch_reserve(batch_rows, static_cast<std::uint64_t>(groups) * kPleWideRows * width * sizeof(float))) return false;
-        // Resolve both caches before submitting consumers.
-        const auto kw = q8_rows::lane_weights(key, hip_execution_stream());
-        const auto vw = q8_rows::lane_weights(value, hip_execution_stream());
         auto* packed = static_cast<float*>(batch_rows.base);
-        ple_batch_launch(key, kw, groups, packed, hip_execution_stream());
-        ple_batch_launch(value, vw, groups, packed, hip_execution_stream());
+        if (ple_tile_admits(ple_tile_requested(), key, value, groups)) {
+            static const bool witness = [] { std::fprintf(stderr, "qpf2k ple tile active: shared input panel\n"); return true; }();
+            (void)witness;
+            ple_tile_launch(key, value, groups, packed, hip_execution_stream());
+        } else {
+            ple_batch_launch(key, q8_rows::lane_weights(key, hip_execution_stream()), groups, packed, hip_execution_stream());
+            ple_batch_launch(value, q8_rows::lane_weights(value, hip_execution_stream()), groups, packed, hip_execution_stream());
+        }
         check_hip(hipGetLastError(), "prefill PLE batched projection launch");
         return true;
     }
@@ -2859,7 +2911,7 @@ HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationSt
         for (std::size_t i = 0; i < tensors.size(); ++i) if (tensors[i].role == TensorRole::ngram_table) {
             const auto* runtime = find_runtime_tensor_binding(*prime_resources->model_weights, static_cast<std::uint32_t>(i));
             if (!runtime) throw std::invalid_argument("PLE setup prime lacks its actual table binding");
-            w.start_rolling_stage(reclaim, 0, prime_resources->ple_hash_contract->row_bytes, {&tensors[i], runtime});
+            w.start_rolling_stage(reclaim, reclaim->prompt_begin(), prime_resources->ple_hash_contract->row_bytes, {&tensors[i], runtime});
             break;
         }
     }
@@ -2872,11 +2924,11 @@ void HipPleKnownWindow::preflight(std::span<const ExecutionDispatchContext> rows
     // First-block source reads have already been primed by Prefetcher setup.
     // Start its copy while the preflight and earlier GPU steps are still ahead.
     auto* reclaim = ple_reclaim::active();
-    if (impl_->prefill && rows[0].position == 0 && reclaim && reclaim->rolling() && !impl_->stage.active) {
+    if (impl_->prefill && reclaim && rows[0].position == reclaim->prompt_begin() && reclaim->rolling() && !impl_->stage.active) {
         const auto* backend = dynamic_cast<FileMappedPleLookupBackend*>(rows[0].resources->ple_lookup);
         if (backend && !(rows[0].resources->ple_prefetch && rows[0].resources->ple_prefetch->active)) {
             const auto turn = backend->residency();
-            impl_->start_rolling_stage(reclaim, 0, prepared[0].hash_contract.row_bytes, prepared[0].tensors.table, turn);
+            impl_->start_rolling_stage(reclaim, reclaim->prompt_begin(), prepared[0].hash_contract.row_bytes, prepared[0].tensors.table, turn);
         }
     }
 }

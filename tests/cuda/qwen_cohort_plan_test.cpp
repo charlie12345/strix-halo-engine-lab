@@ -120,6 +120,28 @@ int main() {
         EXPECT(qc::draft_depth_cap(4, 7, qc::DepthPolicy::fair, 16) == 3);
         EXPECT(qc::window_of(9, 12, 16) == 6);
     }
+    // marginal rule (choose_budget): with the c12a model a 16-row budget never pays; with a hypothetical cheap wide
+    // window (40 ms) it pays at C8 (no spare row at 8) but not at C2 / C4 (the 8-row windows already hold the drafts)
+    {
+        for (std::uint32_t c = 1; c <= 16; ++c) EXPECT(qc::choose_budget(c, 7, qc::DepthPolicy::fair, 16) == 8);
+        qc::WideModel cheap;
+        cheap.wide_ms = 40.0;
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, cheap) == 16);
+        EXPECT(qc::choose_budget(2, 7, qc::DepthPolicy::fair, 16, cheap) == 8);
+        // an ideal real 16-row decode form at the 8-row slope (a + b * 16 = 55.5 ms) pays nowhere: C2 / C4 / C8 stay at 8
+        qc::WideModel linear;
+        linear.wide_ms = linear.a_ms + linear.b_ms * 16.0;
+        for (std::uint32_t c : {2U, 4U, 6U, 8U}) EXPECT(qc::choose_budget(c, 7, qc::DepthPolicy::fair, 16, linear) == 8);
+        EXPECT(qc::choose_budget(8, 0, qc::DepthPolicy::fair, 16, cheap) == 8);   // no drafts: nothing to widen for
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 8, cheap) == 8);
+        EXPECT(qc::expected_tokens(1, 0.65) == 1.0);
+        // break-even of a real 16-row form at C8 (p 0.65): wide_ms must be below ~(8 * 1.65) / (8 / 33) / 1.02 = 53.4
+        qc::WideModel edge;
+        edge.wide_ms = 52.0;
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, edge) == 16);
+        edge.wide_ms = 55.0;
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, edge) == 8);
+    }
     // randomized invariants
     std::mt19937 rng(12345);
     for (int t = 0; t < 20000; ++t) {

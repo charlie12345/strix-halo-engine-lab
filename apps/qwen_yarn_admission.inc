@@ -42,6 +42,51 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_EAGER_CODE_LOAD", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"HIP_ENABLE_DEFERRED_LOADING", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_INDEX_PROJ_WMMA", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_PREFILL_INDEX_SCORE_WMMA", YarnEnvironmentClass::nonrotary, ""},
+    // STRIX_QWEN_ALLON (include/strix/qwen_allon.hpp) only fills the per-lever variables that are still unset, before
+    // main; it has no execution effect of its own. Each variable it exports is classified by its own row, so a lever
+    // this table refuses is named in the refusal instead of the profile switch.
+    YarnEnvironmentRule{"STRIX_QWEN_ALLON", YarnEnvironmentClass::nonrotary, "0|1|exact|fast"},
+    // ---- levers admitted after a rotary-site audit (qwen/yarn-levers) ----
+    // Q4_K routed MoE direct-B fragments (STRIX_QPF2K_MOE_DIRECT_B): prepared planes from the mapped file and a different B-operand read (src/hip_moe_direct_b.inc);
+    // routed experts hold no rotary work. Its route policy admits plain YaRN prefill only (apps/qwen_moe_direct_b.hpp), never the MTP verifier windows.
+    YarnEnvironmentRule{"STRIX_QPF2K_MOE_DIRECT_B", YarnEnvironmentClass::nonrotary, "0|1"},
+    // OFF arms of levers this route does not admit, so a leave-one-out arm of the composition profile (STRIX_QWEN_ALLON=1 STRIX_X=0) is not itself refused.
+    // STRIX_PREFILL_MOE_ROUTE_I8: FAST storage that needs the BF16 route; not qualified for YaRN.
+    // STRIX_QPF2K_QSA_UNION_CAP: FAST pruning of the selected set (changes attention). STRIX_QPF2K_QSA_UNION_STATS: device-side counters not audited for YaRN.
+    YarnEnvironmentRule{"STRIX_PREFILL_MOE_ROUTE_I8", YarnEnvironmentClass::off_switch, "0"},
+    YarnEnvironmentRule{"STRIX_QPF2K_QSA_UNION_CAP", YarnEnvironmentClass::off_switch, "0"},
+    YarnEnvironmentRule{"STRIX_QPF2K_QSA_UNION_STATS", YarnEnvironmentClass::off_switch, "0"},
+    // MTP device handoff (STRIX_MTP_DEVICE_HANDOFF) is read by the MTP cycle only (src/hip_mtp_greedy_runtime.hip:26), so on the plain serial route it is
+    // inert and admitted; yarn_mtp_environment_refusal refuses "1" with --mtp until the YaRN reader-ticket lifetime across its deferred completion is audited.
+    YarnEnvironmentRule{"STRIX_MTP_DEVICE_HANDOFF", YarnEnvironmentClass::nonrotary, "0|1"},
+    // Serving prompt-group size by load (STRIX_PROMPT_BATCH_AUTO) and sampled MTP acceptance (STRIX_MTP_SAMPLED_ACCEPT): both are inert on this route.
+    // yarn_route_refusal refuses HTTP serving and MTP sampling before either reader runs, so the variables choose nothing and the composition profile
+    // can export them (the sampled reader accepts rejection or coupled, src/token_sampling.cpp:68).
+    YarnEnvironmentRule{"STRIX_PROMPT_BATCH_AUTO", YarnEnvironmentClass::nonrotary, "0|1"},
+    YarnEnvironmentRule{"STRIX_MTP_SAMPLED_ACCEPT", YarnEnvironmentClass::nonrotary, "rejection|coupled"},
+    // QSA KV pair loader (STRIX_QSA_FAST_KV_PAIR): the fused union attend loads two adjacent tiles' key/value images once
+    // (src/hip_qsa_fast_prefill_kv_pair.inc, src/hip_indexed_attention_launcher.hip:6087). It reads keys and queries that the table-bound norm/RoPE
+    // launches already rotated (the rotary sites of the QSA group are listed in yarn_environment_path); the attend files carry no rotary token.
+    YarnEnvironmentRule{"STRIX_QSA_FAST_KV_PAIR", YarnEnvironmentClass::nonrotary, "0|1"},
+    // MoE 64x64 register tile (STRIX_QPF2K_MOE_TILE64, its own arm: declined while the tier split is active, src/hip_moe_prefill_tile64.inc:332);
+    // routed experts hold no rotary work.
+    YarnEnvironmentRule{"STRIX_QPF2K_MOE_TILE64", YarnEnvironmentClass::nonrotary, "0|1"},
+    // MoE down LDS epilogue (STRIX_QPF2K_MOE_DOWN_LDS_EPI): LDS-backed vector stores of the routed down projection (src/hip_moe_prefill_tiers.inc:37);
+    // no rotary work.
+    YarnEnvironmentRule{"STRIX_QPF2K_MOE_DOWN_LDS_EPI", YarnEnvironmentClass::nonrotary, "0|1"},
+    // MoE narrow tiers (STRIX_QPF2K_MOE_TIERS, 1 = split, 2 = compact XOR): routed MoE tile selection inside the 3-CTA LDS budget
+    // (src/hip_moe_prefill_tiers.inc:22); routed experts hold no rotary work.
+    YarnEnvironmentRule{"STRIX_QPF2K_MOE_TIERS", YarnEnvironmentClass::nonrotary, "0|1|2"},
+    // HC inverse reuse (STRIX_QPF2K_HC_OUT16_INVERSE_REUSE, needs the recompute and OUT16): only the epilogue visit order and the inverse fetch differ
+    // (src/hip_qpf2k_hc_inverse_reuse.inc); matrix and prefetch are unchanged and the file has no rotary site.
+    YarnEnvironmentRule{"STRIX_QPF2K_HC_OUT16_INVERSE_REUSE", YarnEnvironmentClass::nonrotary, "0|1"},
+    // HC normalized recompute (STRIX_QPF2K_HC_RECOMPUTE_NORM): the consumers of the HC output recompute the normalized rows from stored inverses
+    // (src/hip_qpf2k_hc.inc:36); byte-identical to the stored rows and no rotary work in the HC fold kernels.
+    YarnEnvironmentRule{"STRIX_QPF2K_HC_RECOMPUTE_NORM", YarnEnvironmentClass::nonrotary, "0|1"},
+    // PLE shared input panel (STRIX_QPF2K_PLE_TILE): one packed input panel feeds the key and value projections; the sites and weight packs
+    // are those of the original transaction (src/hip_ple_rows_site.inc, include/strix/ple_projection_tile.hpp). PLE projections hold no rotary work.
+    YarnEnvironmentRule{"STRIX_QPF2K_PLE_TILE", YarnEnvironmentClass::nonrotary, "0|1"},
     // Operational policies add no rotary work. Prefix policy uses the
     // shared parser (validates the value and applies CLI precedence);
     // serving tile/unit controls cannot execute here because the route
@@ -77,10 +122,14 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_QSA_DECODE_POOL", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_QSA_DECODE_POOL_CHECK", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_QSA_DECODE_POOL_BF16", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_QWEN_ROUTER_BF16", YarnEnvironmentClass::nonrotary, "0|1"},
+    YarnEnvironmentRule{"STRIX_Q6P", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_QSA_DECODE_SELECT", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_QSA_DECODE_FUSED_MAXIMA", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_QSA_DECODE_ATTN_V2", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_QSA_DECODE_VALUE_V2", YarnEnvironmentClass::nonrotary, ""},
+    // R1 GDN preparation has no rotary arithmetic; QSA norm/RoPE is unchanged.
+    YarnEnvironmentRule{"STRIX_QWEN_DECODE_FUSE", YarnEnvironmentClass::nonrotary, "0|1"},
     // Serial MoE glue launches (clear, route checks, quantizer, merge, scan, commit, status) perform no rotation.
     YarnEnvironmentRule{"STRIX_MOE_R1_GLUE_FUSE", YarnEnvironmentClass::nonrotary, ""},
     // Last-layer cache-only QSA step (strix/qsa_cache_only.hpp): its only rotary site is the k norm/rope of the
@@ -99,6 +148,10 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_DIGEST", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_DIGEST_COMPONENTS", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_FINAL_STATE_DIGEST", YarnEnvironmentClass::nonrotary, "0|1"},
+    // Test producer for RTX state import: copies the committed prompt state at a prompt-unit boundary (path, position);
+    // it adds no rotary site and leaves the continuation's arithmetic unchanged.
+    YarnEnvironmentRule{"STRIX_RTX_EXPORT_STATE", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_RTX_EXPORT_POSITION", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_RELEASE_EVENTS", YarnEnvironmentClass::diagnostic, "0|1"},
     YarnEnvironmentRule{"STRIX_STARTUP_MARKERS", YarnEnvironmentClass::diagnostic, "0|1"},
     YarnEnvironmentRule{"STRIX_SERIAL_LOGITS_DIGEST", YarnEnvironmentClass::nonrotary, "0|1"},
@@ -116,6 +169,7 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_MTP_REQUEST_RESET", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_MTP_GREEDY_ROWS", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_MTP_CACHE_AUDIT", YarnEnvironmentClass::nonrotary, "0|1"},
+    YarnEnvironmentRule{"STRIX_MTP_PRIME_ROWS", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_WINDOW_SETUP_PREFLIGHT", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_MTP_DIAG_FULL_CHAIN", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_CYCLE_LOG", YarnEnvironmentClass::nonrotary, "0|1"},
@@ -158,6 +212,8 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_QPF2K_GDN_COOP_LAUNCH", YarnEnvironmentClass::off_switch, "0|1"},
     // OFF only; caching itself stays refused by the route guard.
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE", YarnEnvironmentClass::off_switch, "0"},
+    // Ranked-key pruning changes attention; only restoration is admitted pending fidelity gates.
+    YarnEnvironmentRule{"STRIX_QPF2K_QSA_BUDGET", YarnEnvironmentClass::off_switch, "0"},
     // Host-only diagnostics: steady_clock spans, stderr lines and host counters; no device work or synchronization.
     YarnEnvironmentRule{"STRIX_PREFILL_TIMING", YarnEnvironmentClass::diagnostic, "0|1"},
     YarnEnvironmentRule{"STRIX_QSA_FAST_STATS", YarnEnvironmentClass::diagnostic, "0|1"},
@@ -245,6 +301,12 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
     for (std::size_t i = 0; i < unsupported.size(); ++i) listing += (i ? ", " : "") + unsupported[i];
     return listing;
 }
+// Environment values that are classified per variable but only safe off the MTP route.
+inline std::string yarn_mtp_environment_refusal(const Options& o, const Environment& environment) {
+    if (o.mtp.enabled && env_is(environment, "STRIX_MTP_DEVICE_HANDOFF", "1"))
+        return "YaRN MTP with STRIX_MTP_DEVICE_HANDOFF=1 is not audited (the rotary reader ticket must outlive the deferred completion); set it to 0";
+    return {};
+}
 inline std::uint64_t prefill_checked_mul(std::uint64_t a, std::uint64_t b) {
     if (a && b > UINT64_MAX / a) throw std::overflow_error("prefill reservation multiplication overflow");
     return a * b;
@@ -255,6 +317,7 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
     auto memory=observation;
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
     auto result = initialize_prefill_config(request);
+    result.router_bf16_reservation = qwen_router_bf16_reservation(manifest, result.options.qwen_router_bf16);
     result.options.ple_rolling_explicit_opt_in=env_is(request.environment,"STRIX_PLE_ROLLING","1");
     result.options.qsa_mtp_pool_explicit_opt_in=env_is(request.environment,"STRIX_QSA_MTP_POOL","1");
     for (const auto& name : request.options.supplied_options) result.sources[name] = OptionSource::explicit_value;
@@ -310,6 +373,7 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
         if (const auto why = yarn_environment_refusal(result.environment, o.rotary.factor()); !why.empty())
             return refuse(why);
         if (!o.disabled_prefill_features.empty()) return refuse("YaRN disabled prefill feature not supported");
+        if (const auto why = yarn_mtp_environment_refusal(o, result.environment); !why.empty()) return refuse(why);
         o.unqualified_context = true;
         const bool explicit_low_level=o.any_low_level_flag;
         // yarn_route_refusal has admitted the closed explicit MTP organization.
@@ -345,7 +409,13 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
         std::uint64_t fixed_credit = 0, fixed_predicted_credit = 0;
         bool fixed_credit_ready = false;
         std::map<std::string,std::uint64_t> refusals;
-        for (const auto rows : {8192U,4096U,2048U}) {
+        // STRIX_QPF2K_T16K=1 (explicit, plain serial prompt of at least 16,384 tokens) tries T16384 first, as the native ladder does,
+        // with the same fallback to the T8192 ladder. Before this the variable was classified but never read on this route; any other
+        // value, and MTP (a closed organization), keep the ladder unchanged.
+        std::vector<std::uint32_t> ladder{8192U,4096U,2048U};
+        if (!o.mtp.enabled && o.tokens.size() >= 16384U && env_is(request.environment,"STRIX_QPF2K_T16K","1"))
+            ladder.insert(ladder.begin(),16384U);
+        for (const auto rows : ladder) {
             if (o.mtp.enabled && rows > memory.yarn_mtp_max_prefill_rows) continue;
             for (unsigned storage_step = 0; storage_step <= last_storage_step; ++storage_step) {
                 // After the tight T8192 set, shrink real call-sized owners;
@@ -423,6 +493,12 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                     select_mtp_bundle_golden(o,model);
                     const auto required = o.mtp.enabled && memory.estimate_with_score_ring
                         ? memory.estimate_with_score_ring(o, score_ring_rows) : memory.estimate(o);
+                    if (rows == 16384U) {
+                        // As the native T16384 route: the budgets become the planned workspace-with-tails and metadata, so the
+                        // runtime compile (which reads these options) sees what the plan needs; physical, GTT and UMA checks decide.
+                        o.known_prefill_workspace_budget = prefill_checked_add(required.workspace, required.tails);
+                        o.known_prefill_metadata_budget = required.metadata;
+                    }
                     auto owners = required.owners;
                     if (owners.empty()) owners = {{"model_backing",required.model_backing},{"state_d1",required.state_d1},
                         {"serial_scratch",required.serial_scratch},{"workspace",required.workspace},{"metadata",required.metadata},

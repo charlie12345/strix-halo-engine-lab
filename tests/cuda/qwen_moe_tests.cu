@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "strix/cuda_qwen_moe.hpp"
+#include "strix/cuda_qwen_route_bf16.hpp"
 #include "qwen_amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
@@ -108,19 +109,24 @@ static const char* kViewName[V_count] = {"input", "routes", "route_weights", "co
 static const size_t kViewBytes[V_count] = {mo::hidden * 2, 40, 40, mo::hidden, mo::hidden / 32 * 4, mo::hidden / 32 * 4, 4,
                                            mo::top_k * 2 * mo::ffn * 4, mo::hidden * 4, mo::top_k * mo::ffn, mo::top_k * mo::ffn / 32 * 4,
                                            mo::top_k * mo::ffn / 32 * 4, mo::top_k * mo::hidden * 4, mo::hidden * 2};
-static size_t stride_of(int v) { return (kViewBytes[v] + 255) / 256 * 256 + 256 + 16 * v; }  // distinct padded strides
+static size_t stride_of(int v, bool bf16 = false) {
+    const auto width = bf16 && v == V_raw ? kViewBytes[v] / 2U : kViewBytes[v];
+    return (width + 255) / 256 * 256 + 256 + 16 * static_cast<size_t>(v);
+}  // distinct padded strides
 
 struct HostCsr { std::vector<u32> summary, offsets, touched, rows, slots, bexp, bbeg, tcount, texp, tbeg; };
 struct State {
     u32 T = 0;
+    bool route_bf16 = false;
     std::vector<u8> view[V_count];
     HostCsr csr;
-    template <class X> X* at(int v, u32 r) { return reinterpret_cast<X*>(view[v].data() + static_cast<size_t>(r) * stride_of(v)); }
+    template <class X> X* at(int v, u32 r) { return reinterpret_cast<X*>(view[v].data() + static_cast<size_t>(r) * stride_of(v, route_bf16)); }
 };
 static constexpr u8 kSentinel = 0xA7;
-static void init_state(State& s, u32 T) {
+static void init_state(State& s, u32 T, bool bf16 = false) {
     s.T = T;
-    for (int v = 0; v < V_count; ++v) s.view[v].assign(static_cast<size_t>(T) * stride_of(v), kSentinel);
+    s.route_bf16 = bf16;
+    for (int v = 0; v < V_count; ++v) s.view[v].assign(static_cast<size_t>(T) * stride_of(v, bf16), kSentinel);
     const auto sz = mo::csr_sizes(T);
     auto fill = [](std::vector<u32>& x, size_t n) { x.assign(n, 0xA7A7A7A7U); };
     fill(s.csr.summary, 32); fill(s.csr.offsets, mo::experts + 1); fill(s.csr.touched, mo::experts);
@@ -310,6 +316,21 @@ static void ref_project(State& s, const HostWeights& w, const HostExp& hx) {
     }
 }
 
+// Independent integer reference of the specified storage rounding.
+static u16 route_reference(u32 bits) {
+    u32 hi = bits >> 16U, lo = bits & 65535U;
+    if ((bits & 0x7fffffffU) > 0x7f800000U) return static_cast<u16>(hi | 64U);
+    if (lo > 32768U || (lo == 32768U && (hi & 1U))) ++hi;
+    return static_cast<u16>(hi);
+}
+static float ref_raw(const State& s, u32 row, u32 index) {
+    const auto* p = s.view[V_raw].data() + static_cast<size_t>(row) * stride_of(V_raw, s.route_bf16);
+    if (s.route_bf16) {
+        u16 h; std::memcpy(&h, p + static_cast<size_t>(index) * 2U, 2);
+        return f_of(static_cast<u32>(h) << 16U);
+    }
+    float f; std::memcpy(&f, p + static_cast<size_t>(index) * 4U, 4); return f;
+}
 static void ref_down(State& s, const HostWeights& w) {
     auto& c = s.csr;
     if (c.summary[0]) return;
@@ -349,7 +370,8 @@ static void ref_down(State& s, const HostWeights& w) {
                     acc[group % 4] = acc[group % 4] + contribution;
                 }
                 const float s01 = acc[0] + acc[1], s23 = acc[2] + acc[3];
-                s.at<float>(V_raw, r)[slot * mo::hidden + o] = s01 + s23;
+                if (s.route_bf16) s.at<u16>(V_raw, r)[slot * mo::hidden + o] = route_reference(b_of(s01 + s23));
+                else s.at<float>(V_raw, r)[slot * mo::hidden + o] = s01 + s23;
             }
         }
     }
@@ -366,7 +388,7 @@ static void ref_merge_commit(State& s, u32* record) {
         if (route_bad) continue;
         for (u32 out = 0; out < mo::hidden; ++out) {
             float current = 0.0F;
-            for (u32 k = 0; k < 10; ++k) current = std::fmaf(s.at<float>(V_rw, row)[k], s.at<float>(V_raw, row)[k * mo::hidden + out], current);
+            for (u32 k = 0; k < 10; ++k) current = std::fmaf(s.at<float>(V_rw, row)[k], ref_raw(s, row, k * mo::hidden + out), current);
             s.at<float>(V_acc, row)[out] = canon(current);
             if ((b_of(current) & 0x7fffffffU) >= 0x7f7f8000U) { *status |= 8; header[0] |= 8; }
         }
@@ -407,7 +429,7 @@ static void upload_state(Device& d, const State& s, bool with_inter) {
     std::vector<u32> rec(2, 0); up(d.record, rec);
     (void)sz;
     auto& v = d.rows_view;
-    auto S = [&](int k) { return static_cast<std::uint64_t>(stride_of(k)); };
+    auto S = [&](int k) { return static_cast<std::uint64_t>(stride_of(k, s.route_bf16)); };
     v.input = {reinterpret_cast<const u16*>(d.view[V_input]), S(V_input)};
     v.routes = {reinterpret_cast<const u32*>(d.view[V_routes]), S(V_routes)};
     v.route_weights = {reinterpret_cast<const float*>(d.view[V_rw]), S(V_rw)};
@@ -421,6 +443,8 @@ static void upload_state(Device& d, const State& s, bool with_inter) {
     v.down_deltas = {reinterpret_cast<float*>(d.view[V_ddeltas]), S(V_ddeltas)};
     v.down_sums = {reinterpret_cast<int*>(d.view[V_dsums]), S(V_dsums)};
     v.rawdots = {reinterpret_cast<float*>(d.view[V_raw]), S(V_raw)};
+    v.route_bf16 = s.route_bf16;
+    v.rawdot_capacity = s.view[V_raw].size();
     v.output = {reinterpret_cast<u16*>(d.view[V_out]), S(V_out)};
     v.csr = {d.summary, d.offsets, d.touched, d.rows, d.slots, d.bexp, d.bbeg, d.tcount, d.texp, d.tbeg};
 }
@@ -453,7 +477,7 @@ static void compare(const std::string& name, const Device& d, const State& s, bo
         for (size_t i = 0; i < got.size(); ++i) if (got[i] != s.view[v][i]) { if (!bad) first = i; ++bad; }
         g_checked += got.size();
         if (bad) {
-            const size_t row = first / stride_of(v), off = first % stride_of(v);
+            const size_t row = first / stride_of(v, s.route_bf16), off = first % stride_of(v, s.route_bf16);
             u32 e = 0, g = 0; const size_t al = first & ~size_t(3);
             std::memcpy(&e, s.view[v].data() + al, std::min<size_t>(4, got.size() - al)); std::memcpy(&g, got.data() + al, std::min<size_t>(4, got.size() - al));
             std::printf("  %s/%s: %zu bytes differ, first row %zu byte %zu: expected word %08x (%g) got %08x (%g)\n", name.c_str(), kViewName[v],
@@ -653,6 +677,50 @@ static void fixture_replay(const am::Tables& tables) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+namespace route_rounding {
+#include "../../src/hip_moe_route_bf16.inc"
+__global__ void probe(const u32* inputs, float* storage, u32* returned, u32* widened, u32 count) {
+    const auto i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    returned[i] = __float_as_uint(moe_route_store<true>(storage,i,__uint_as_float(inputs[i])));
+    widened[i] = __float_as_uint(moe_route_load<true>(storage,i));
+}
+}
+static void route_rounding_device_test() {
+    std::vector<u32> bits;
+    for (u32 upper=0; upper<65536U; ++upper)
+        for (const auto lower : {0U,1U,0x7ffeU,0x7fffU,0x8000U,0x8001U,0xfffeU,0xffffU})
+            bits.push_back(upper*65536U+lower);
+    auto* in=dalloc<u32>(bits.size());
+    auto* returned=dalloc<u32>(bits.size());
+    auto* widened=dalloc<u32>(bits.size());
+    const auto storage_bytes=bits.size()*2U+64U;
+    auto* storage=dalloc<u8>(storage_bytes);
+    CK(cudaMemcpy(in,bits.data(),bits.size()*4U,cudaMemcpyHostToDevice));
+    CK(cudaMemset(storage,kSentinel,storage_bytes));
+    route_rounding::probe<<<static_cast<u32>((bits.size()+255U)/256U),256>>>(in,
+        reinterpret_cast<float*>(storage+16),returned,widened,static_cast<u32>(bits.size()));
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    std::vector<u8> actual(storage_bytes);
+    std::vector<u32> returned_host(bits.size()), widened_host(bits.size());
+    CK(cudaMemcpy(actual.data(),storage,storage_bytes,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(returned_host.data(),returned,bits.size()*4U,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(widened_host.data(),widened,bits.size()*4U,cudaMemcpyDeviceToHost));
+    size_t bad=0, first=bits.size();
+    for (size_t i=0; i<bits.size(); ++i) {
+        u16 stored; std::memcpy(&stored,actual.data()+16+2U*i,2);
+        const auto expected=route_reference(bits[i]);
+        if (!(stored==expected && returned_host[i]==(static_cast<u32>(expected)<<16U) &&
+            widened_host[i]==returned_host[i])) { ++bad; if (first==bits.size()) first=i; }
+        g_checked+=10U;
+    }
+    if (bad) std::printf("RNE device differences %zu first input %08x\n",bad,bits[first]);
+    expect(bad==0,"device RNE boundaries");
+    for (size_t i=0;i<actual.size();++i)
+        if (i<16U || i>=16U+bits.size()*2U) expect(actual[i]==kSentinel,"device RNE guards");
+    cudaFree(in);cudaFree(returned);cudaFree(widened);cudaFree(storage);
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { std::printf("usage: qwen_moe_tests <tables dir> [bench|fixture]\n"); return 2; }
     const std::string mode = argc > 2 ? argv[2] : "";
@@ -687,6 +755,46 @@ int main(int argc, char** argv) {
         return 0;
     }
     HostExp hx(argv[1]);
+    if (mode == "route-bf16") {
+        route_rounding_device_test();
+        std::mt19937 candidate_rng(2206);
+        const int selected_pair = argc > 3 ? std::stoi(argv[3]) : -1;
+        if (selected_pair < -1 || selected_pair > 3) throw std::invalid_argument("route BF16 pair index 0..3");
+        int pair_index = 0;
+        for (const auto [gt, dt] : {std::pair{mo::type_q4_k, mo::type_q5_1},
+                std::pair{mo::type_q4_k, mo::type_q8_0}, std::pair{mo::type_q5_k, mo::type_q5_1},
+                std::pair{mo::type_q5_k, mo::type_q8_0}}) {
+            const int current_pair = pair_index++;
+            if (selected_pair >= 0 && current_pair != selected_pair) continue;
+            HostWeights w = synthetic_weights(gt, dt, 24, candidate_rng);
+            Device d; upload_weights(d, w);
+            // All window sizes, transition to tiled, CSR tails and a multi-tile expert.
+            for (const u32 T : {1U,2U,3U,4U,5U,6U,7U,8U,9U,15U,16U,17U,40U,56U,65U}) {
+                for (const bool bf16 : {false, true}) {
+                    State s; init_state(s, T, bf16); synthetic_inputs(s, 24, 7, candidate_rng);
+                    run_pipeline(std::string(bf16 ? "BF16" : "OFF") + " g" + std::to_string(gt) +
+                        " d" + std::to_string(dt), s, w, d, tables, hx, true);
+                    free_state_buffers(d);
+                }
+            }
+            for (const unsigned kind : {0U, 1U, 2U, 3U, 4U}) {
+                State s; init_state(s, 16, true); synthetic_inputs(s, 24, 3, candidate_rng);
+                if (kind == 0U) s.at<u16>(V_input, 5)[77] = 0x7fc1U;
+                if (kind == 1U) s.at<u16>(V_input, 5)[77] = 0xff80U;
+                if (kind == 2U) s.at<u32>(V_routes, 5)[4] = 600U;
+                if (kind == 3U) s.at<u32>(V_rw, 5)[4] = 0x7fc00000U;
+                if (kind == 4U) for (u32 i=0;i<mo::hidden;++i)
+                    s.at<u16>(V_input,5)[i]=bf16_of(i&1U ? -3e38F : 3e38F);
+                run_pipeline("BF16 guard " + std::to_string(kind), s, w, d, tables, hx, false);
+                free_state_buffers(d);
+            }
+            free_device(d);
+        }
+        std::printf("ROUTE BF16 OPERATOR %s: %d failures, %llu bytes compared\n",
+                    g_fail ? "FAIL" : "PASS", g_fail, g_checked);
+        am::free_tables(tables);
+        return g_fail ? 1 : 0;
+    }
     std::mt19937 rng(12345);
     // 1. Synthetic weights, the four (gate, down) type combinations of the model, skew + duplicates + special rows.
     const u32 NE = 24;

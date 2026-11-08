@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_dense_trellis.hpp"
 
 // T-row Q8_0 projections for known-prefix windows (T = 1..8) and prompt
@@ -124,9 +125,9 @@ __device__ __forceinline__ void group_rows(const Segments& s, std::uint32_t g, s
     }
 }
 
-// Lane ^ D: the widest exchange runs on the LDS pipe, row-local ones as DPP moves.
+// Lane ^ D: shared exact exchange for distance 16; retain the existing row-local DPP.
 template <unsigned D> __device__ __forceinline__ float lane_xor(float v) {
-    if constexpr (D == 16U) return __shfl_xor(v, 16, 32);
+    if constexpr (D == 16U) return strix::qwen_dpp::xor32<16U>(v);
     else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
 }
 
@@ -1156,7 +1157,7 @@ __device__ __forceinline__ void dense_a8_quantize_lane(float x, std::int8_t* cod
     const bool bad = __ballot(!isfinite(x)) != 0;
     float amax = fabsf(x);
 #pragma unroll
-    for (int d = 16; d != 0; d /= 2) amax = fmaxf(amax, __shfl_xor(amax, d, 32));
+    for (int d = 16; d != 0; d /= 2) amax = fmaxf(amax, strix::qwen_dpp::xor32(amax, d));
     const bool tiny = amax > 0.0F && amax < 0x1p-119F;
     const float scale = bad ? __uint_as_float(kDenseA8CanonicalNan) : amax == 0.0F || tiny ? 1.0F : __fdiv_rn(amax, 127.0F);
     const float rounded = bad || tiny ? 0.0F : rintf(__fdiv_rn(x, scale));

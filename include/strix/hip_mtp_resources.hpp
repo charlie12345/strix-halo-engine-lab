@@ -111,15 +111,26 @@ public:
     };
     // Serial, non-nesting capability; successful full admission is required to
     // construct it. Keep this scope through all stages and actual completion.
-    [[nodiscard]] NativeValidationScope admit_native_entry() const;
+    // carry_deferred: the entry enqueues behind deferred work on this stream and leaves it to the next
+    // completion (see defer_completion); every other entry completes deferred work first.
+    [[nodiscard]] NativeValidationScope admit_native_entry(bool carry_deferred=false) const;
     // Cheap immutable-source/lease/current-device checks inside an admitted
     // entry. Standalone raw calls retain full validation when no scope exists.
     void validate_stage() const;
     // Native queue lifecycle only: not a semantic qualification or target
     // transaction. Failure remains sticky and cleanup proves quiescence.
-    void require_idle() const;
+    void require_idle(bool carry_deferred=false) const;
     void mark_submitted();
     void complete();
+    // STRIX_MTP_DEVICE_HANDOFF: submitted work stays queued without a host fence; its first-error status
+    // (sticky) is read by the next completion on this stream. Only an entry that admits with
+    // carry_deferred may enqueue behind it; any other entry (require_idle, admit_native_entry) and
+    // settle_deferred complete it first, so no host reader or foreign stream sees it unfinished.
+    void defer_completion();
+    [[nodiscard]] bool completion_deferred() const noexcept;
+    void settle_deferred() const;
+    // Deferred completions: begun, carried into later work on the stream, completed by another entry.
+    [[nodiscard]] std::array<std::uint64_t,3> deferred_counts() const noexcept;
     void fail() noexcept;
     [[nodiscard]] bool failed() const noexcept;
 private:

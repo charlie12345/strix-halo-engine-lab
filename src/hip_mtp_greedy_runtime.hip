@@ -20,6 +20,14 @@
 namespace strix {
 namespace {
 void require(bool ok,const char* msg){if(!ok)throw std::invalid_argument(msg);}
+// STRIX_MTP_DEVICE_HANDOFF=1: a cycle that continues (no EOS, budget left) leaves its reconciliation's teacher
+// cache rows queued on the predictor stream; the next draft chain enqueues behind them and its completion
+// checks their status, so the host's next-cycle setup overlaps their GPU time instead of a fence. Same
+// launches in the same stream order: tokens, drafts and caches are unchanged.
+bool mtp_device_handoff() {
+    static const bool on=[]{const char* v=std::getenv("STRIX_MTP_DEVICE_HANDOFF");return v && v[0]=='1';}();
+    return on;
+}
 bool session_matches(const SerialSessionContext& a,const SerialSessionContext& b) {
     return a.execution_identity==b.execution_identity && a.state_layout_identity==b.state_layout_identity &&
         a.runtime_compatibility_identity==b.runtime_compatibility_identity &&
@@ -99,7 +107,13 @@ HipMtpGreedyRuntime::HipMtpGreedyRuntime(std::shared_ptr<HipMtpRuntime> m,
     SerialSessionContext& s,const ExecutionRuntimeResources& r,DirectLaunchDispatcher& d,
     std::shared_ptr<const void> owner)
     :impl_(std::make_unique<Impl>(std::move(m),std::move(q),std::move(a),std::move(t),s,r,d,std::move(owner))){}
-HipMtpGreedyRuntime::~HipMtpGreedyRuntime()=default;
+HipMtpGreedyRuntime::~HipMtpGreedyRuntime() {
+    if(!impl_ || !impl_->mtp || !mtp_device_handoff()) return;
+    try {impl_->mtp->settle_deferred();} catch(...) {}
+    const auto n=impl_->mtp->deferred_completion_counts();
+    std::fprintf(stderr,"mtp device handoff: deferred %llu carried %llu settled %llu\n",
+        static_cast<unsigned long long>(n[0]),static_cast<unsigned long long>(n[1]),static_cast<unsigned long long>(n[2]));
+}
 bool HipMtpGreedyRuntime::failed() const noexcept {
     return impl_->failed || impl_->mtp->failed() || (impl_->window && impl_->window->failed());
 }
@@ -220,7 +234,7 @@ std::uint32_t HipMtpGreedyRuntime::draft_begin(const HipMtpTargetHiddenTicket& i
         std::min(limit,budget-1),std::min<std::uint64_t>(remaining-1,i.target->retained_rows()-3)));
     i.candidates.clear();i.probabilities.clear();i.external_first=SIZE_MAX;
     const auto pending=initial.predicted_token();
-    if(std::find(eos.begin(),eos.end(),pending)!=eos.end())return depth;
+    if(std::find(eos.begin(),eos.end(),pending)!=eos.end()) {i.mtp->settle_deferred();return depth;}
     i.busy=true;
     try {
         host_phase_mark("0 cycle start",true);
@@ -548,7 +562,9 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
         }
         host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);
+        i.mtp->defer_next_reconcile_completion(mtp_device_handoff() && !out.eos && !out.terminal_budget);
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);
+        i.mtp->defer_next_reconcile_completion(false);
         reconcile_draft_proposal_state(i.draft,*i.session);
         host_phase_mark("a reconcile");
         if(verified.selection_receipt) {
@@ -567,6 +583,7 @@ std::vector<std::uint32_t> HipMtpGreedyRuntime::propose_wide(const HipMtpTargetH
         "MTP wide cycle requires exact current committed target ticket");
     initial.admit_rotary_reader(i.target->model().rotary_identity());
     require(forced.empty() || forced.size()+1U==rows,"MTP forced wide proposal must fill the wide rows");
+    i.mtp->settle_deferred();
     const auto pending=initial.predicted_token();
     if(budget<rows || std::find(eos.begin(),eos.end(),pending)!=eos.end() || !i.resources.session_state_layout ||
        i.session->next_position<=i.wide_resume) return {};
@@ -700,7 +717,9 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         if(i.context)i.context->finish_cycle(out.emitted_tokens,std::min(i.candidates.size(),out.emitted_tokens.size()),out.accepted_candidates);
         host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);
+        i.mtp->defer_next_reconcile_completion(mtp_device_handoff() && !out.eos && !out.terminal_budget);
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);
+        i.mtp->defer_next_reconcile_completion(false);
         reconcile_draft_proposal_state(i.draft,*i.session);
         host_phase_mark("a reconcile");
         if(transaction) {out.accepted_candidates=static_cast<std::uint32_t>(out.emitted_tokens.size()-1U);

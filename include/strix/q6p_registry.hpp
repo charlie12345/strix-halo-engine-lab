@@ -37,6 +37,8 @@ constexpr std::uint64_t q6p32_bytes(std::uint64_t rows, std::uint64_t cols) noex
 
 // Registers or replaces one copy; its addresses must stay valid until clear().
 void register_tensor(const void* original_address, const Tensor& tensor);
+// Retire only this owner's copy, preserving later replacements/other owners.
+void unregister_tensor(const void* original_address, const unsigned char* copy_address) noexcept;
 void clear() noexcept;
 // Registered copy of the tensor that starts at this device address, or nullptr
 // (always nullptr when STRIX_Q6P=0).

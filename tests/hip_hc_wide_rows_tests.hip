@@ -13,10 +13,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace {
 void check(hipError_t e, const char* text) {
@@ -819,14 +822,58 @@ void fixtures_v3(hipStream_t stream) {
     }
     std::cout << "qpf2k HC output v3 == lane-chain output: ok\n";
 }
+#include "hip_hc_recompute_norm_fixtures.inc"
+#include "hip_hc_inverse_reuse_fixtures.inc"
 }  // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
+    bool recompute = false, timing = false, trace = false, arm = false, reuse = false;
+    unsigned site = 1U, output = 14U;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--inverse-reuse") { recompute = true; reuse = true; }
+        else if (arg == "--inverse-reuse-time") { recompute = true; reuse = true; timing = true; }
+        else if (arg == "--inverse-reuse-trace") { recompute = true; reuse = true; trace = true; }
+        else if (arg == "--recompute-norm") recompute = true;
+        else if (arg == "--time") { recompute = true; timing = true; }
+        else if (arg == "--trace") { recompute = true; trace = true; }
+        else if (arg == "--site" && i + 1 < argc) site = static_cast<unsigned>(std::stoul(argv[++i]));
+        else if (arg == "--output" && i + 1 < argc) output = static_cast<unsigned>(std::stoul(argv[++i]));
+        else if (arg == "--arm" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value != "off" && value != "on") throw std::invalid_argument("--arm must be off or on");
+            arm = value == "on";
+        } else throw std::invalid_argument("unknown or incomplete HC fixture argument: " + arg);
+    }
+    if (site > 2U || (output != 7U && output != 14U) || (trace && timing))
+        throw std::invalid_argument("HC recompute requires --site 0|1|2, --output 7|14 and one execution mode");
     const char* configured_rows = std::getenv("STRIX_HC_WIDE_BENCH_ROWS");
     const auto pool_rows = configured_rows ? static_cast<std::uint32_t>(std::stoul(configured_rows)) : 8192U;
-    strix::reserve_hyper_mix_prefill_pools(std::max(8224U, pool_rows));
+    strix::reserve_hyper_mix_prefill_pools(std::max(recompute ? 16384U : 8224U, pool_rows));
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+    if (reuse) {
+        std::cout << std::setprecision(9);
+        if (output != 14U) throw std::invalid_argument("inverse reuse requires --output 14");
+        if (trace) {
+            RecomputeFixture f(16384U, site, 0U, false, 1e-6F);
+            f.reset(); f.enqueue(true, arm ? 15U : 14U, 0U, stream);
+            check(hipStreamSynchronize(stream), "inverse reuse trace drain");
+        } else if (timing) time_inverse_reuse(site, stream);
+        else fixtures_inverse_reuse(stream);
+        check(hipStreamDestroy(stream), "stream");
+        return 0;
+    }
+    if (recompute) {
+        if (trace) {
+            RecomputeFixture f(16384U, site, 0U, false, 1e-6F);
+            f.reset(); f.enqueue(arm, output, output == 7U ? 3U : 0U, stream);
+            check(hipStreamSynchronize(stream), "recompute trace drain");
+        } else if (timing) time_recompute_norm(site, output, stream);
+        else fixtures_recompute_norm(stream);
+        check(hipStreamDestroy(stream), "stream");
+        return 0;
+    }
     if (std::getenv("STRIX_HC_OUT16_FIXTURES_ONLY")) {
         fixtures_out16(stream);
         if (std::getenv("STRIX_HC_WIDE_BENCH")) bench_out16(stream);
@@ -910,7 +957,7 @@ int main() try {
         for (const bool bf16 : {true, false})
             for (const std::uint32_t rows : {8U, 40U, 264U, 2048U})
                 for (const unsigned flavor : {0U, 2U})
-                    for (const unsigned output : {1U, 2U}) compare_fast(rows, bf16, flavor, stream, output);
+                    for (const unsigned output_mode : {1U, 2U}) compare_fast(rows, bf16, flavor, stream, output_mode);
         std::cout << "fast HC kernels within the error bound: ok\n";
         for (const std::uint32_t rows : {40U, 2048U, 8192U}) compare_half(rows, true, 0U, stream);
         compare_half(264U, false, 2U, stream);

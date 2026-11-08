@@ -147,13 +147,13 @@ __global__ __launch_bounds__(32U*Waves) void project_prefill_wmma_q20(const unsi
         const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
         if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}continue;}
         float x=fabsf(hv);
-        for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+        for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,strix::qwen_dpp::xor32(x, stride));
         const bool tiny=x>0.0F && x<0x1p-119F;
         const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
         const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
         const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
         int sum=code;
-        for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+        for(int stride=16;stride!=0;stride/=2) sum+=strix::qwen_dpp::xor32(sum, stride);
         output[at_slot]=hv;
         at(view.down_codes,r)[slot*outputs+feature]=static_cast<signed char>(code);
         if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}

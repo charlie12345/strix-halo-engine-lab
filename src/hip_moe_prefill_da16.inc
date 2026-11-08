@@ -56,16 +56,17 @@ inline unsigned* da16_counters(bool setup = false) {
 // then the arrival count; the last arriving tile of the batch writes the batch's FP16 image.
 // Reuse (MoE header reuse, STRIX_QPF2K_MOE_HDR): the body skips reloading the superblock header / Q5_K qh words that the
 // register stage already holds (hip_moe_f16x_project_body.inc); the base kernel instantiates Reuse = false.
-template<bool Q5K,unsigned Tune,bool Reuse>
+template<bool Q5K,unsigned Tune,bool Reuse,bool Listed=false,unsigned Tag=0U>
 __device__ __forceinline__ void project_prefill_f16x_da16_entry(const unsigned char* gate,const unsigned char* up,
-    const PrefillRows& view,unsigned hidden,unsigned outputs,const uint4* a16,unsigned* arrive,uint4* image) {
+    const PrefillRows& view,unsigned hidden,unsigned outputs,const uint4* a16,unsigned* arrive,uint4* image,const unsigned* list=nullptr) {
     using L=F16LdsOf<F16TileX<Tune,0U>>;
     __shared__ __align__(16) typename L::Stage sb[1];
     __shared__ typename L::Rows rows;
     __shared__ unsigned last;
     __shared__ float scale_of[F16TileX<Tune,0U>::Batch];
-    const unsigned batch=blockIdx.y,t=threadIdx.x;
-    project_f16x_body<Q5K,Tune,0U,Reuse>(gate,up,view,hidden,outputs,a16,batch,blockIdx.x,sb,rows);
+    if constexpr(Listed)if(blockIdx.y>=list[0])return;
+    const unsigned batch=Listed?list[1U+blockIdx.y]:blockIdx.y,t=threadIdx.x;
+    project_f16x_body<Q5K,Tune,0U,Reuse,Tag>(gate,up,view,hidden,outputs,a16,batch,blockIdx.x,sb,rows);
     const auto& csr=view.csr;
     // The body's own guard (bit 8 masked: it may be set by other CTAs meanwhile, the rest is fixed before the launch).
     if((csr.summary[0]&~projection_nonfinite)||batch>=csr.summary[2])return;
@@ -121,7 +122,8 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16
 template<bool Q51,unsigned Tune>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16_certificate(const unsigned char* weights,PrefillRows view,
     unsigned hidden,unsigned width,const uint4* image) {
-    constexpr bool RouteBF16=false;
+    constexpr bool RouteBF16=false,RouteI8=false;
+    [[maybe_unused]] constexpr unsigned route_top_k=0U;
 #define STRIX_DA16_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
@@ -137,7 +139,23 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16
 template<bool Q51,unsigned Tune>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16_certificate_bf16(const unsigned char* weights,PrefillRows view,
     unsigned hidden,unsigned width,const uint4* image) {
-    constexpr bool RouteBF16=true;
+    constexpr bool RouteBF16=true,RouteI8=false;
+    [[maybe_unused]] constexpr unsigned route_top_k=0U;
+#define STRIX_DA16_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
+#define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
+#define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
+#define STRIX_DA16_CERTIFICATE
+#include "hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_CERTIFICATE
+#undef STRIX_DA16_BATCH_TILE
+#undef STRIX_DA16_GUARD
+#undef STRIX_DA16_LDS
+}
+
+template<bool Q51,unsigned Tune>
+__global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16_certificate_i8(const unsigned char* weights,PrefillRows view,
+    unsigned hidden,unsigned width,const uint4* image,unsigned route_top_k) {
+    constexpr bool RouteBF16=true,RouteI8=true;
 #define STRIX_DA16_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;

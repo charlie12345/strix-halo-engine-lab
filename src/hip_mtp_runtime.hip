@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <utility>
 #include <functional>
 #include <bit>
 #include <string>
@@ -135,8 +136,14 @@ struct HipMtpRuntime::Impl {
     std::uint64_t ticketless_frontier=0;
     std::uint32_t step=0,pending_token=0;
     bool active=false,cycle=false,have_replay=false,broken=false,cache_only_active=false,first_cache_reusable=false;
+    // STRIX_MTP_DEVICE_HANDOFF: the next reconciliation leaves its teacher cache rows queued (owner->defer_completion).
+    bool defer_reconcile=false;
     // Rows of a submitted, not yet completed prime_hidden_rows_submit (STRIX_PREFILL_PIPE).
     std::size_t primed_rows=0;
+    // STRIX_MTP_PRIME_ROWS (opt-in "1", default off = one row at a time; part of STRIX_QWEN_ALLON): per-row scratch of the batched prompt priming.
+    std::unique_ptr<unsigned char,void(*)(unsigned char*)> prime_scratch{nullptr,[](unsigned char* p){(void)hipFree(p);}};
+    std::uint64_t prime_slot=0;
+    bool prime_unavailable=false;
     // Multi-session draft batch: the batch stream carrying this chain's steps (null outside a batch) and the
     // entry/exit events ordering it with the owner stream.
     hipStream_t batch_stream=nullptr;
@@ -249,6 +256,7 @@ struct HipMtpRuntime::Impl {
     }
     ~Impl() {
         if(batch_stream) (void)hipStreamSynchronize(batch_stream);
+        if(owner && owner->completion_deferred()) {try {owner->settle_deferred();} catch(...) {}}
         if(batch_entry) (void)hipEventDestroy(batch_entry);
         if(batch_exit) (void)hipEventDestroy(batch_exit);
     }
@@ -381,7 +389,8 @@ struct HipMtpRuntime::Impl {
     }
     // Batched teacher cache rows: same per-row launches as teacher_cache, one
     // admission and one completion for the whole contiguous run.
-    void teacher_cache_rows(std::span<const HipMtpReplayRow> rows,bool fast_cache=false) {
+    // defer: the rows stay queued; the next chain on this stream (or any other owner entry) completes them.
+    void teacher_cache_rows(std::span<const HipMtpReplayRow> rows,bool fast_cache=false,bool defer=false) {
         if(rows.empty()) return;
         require(!active && !validation && stats.cache_only_rows<=UINT64_MAX-rows.size(),"MTP batched cache rows require an idle owner");
         for(const auto& row:rows) row.hidden.admit_rotary_reader(owner->model().rotary_identity());
@@ -411,7 +420,7 @@ struct HipMtpRuntime::Impl {
                 launch_hip_mtp_embedding(c,row.next_input_token,stream);cache_row_front(c,stream);
                 launch_hip_mtp_cache_rows(c,stream,fast_cache);
             }
-            owner->complete();
+            if(defer) owner->defer_completion(); else owner->complete();
             active=false;cache_only_active=false;next_source+=rows.size();stats.cache_only_rows+=rows.size();validation.reset();
             if(owner->qsa_pool()) owner->qsa_pool()->commit(true,next_source);
             last_target=rows.back().hidden;last_teacher_next_input=rows.back().next_input_token;
@@ -439,10 +448,12 @@ struct HipMtpRuntime::Impl {
         require(draft && cycle && cycle_base && !active && !validation && candidates.empty() &&
             depth<=owner->budget().maximum_candidate_depth,"MTP draft chain requires a fresh bounded proposal");
         sampled.clear();
-        if(!depth) return false;
+        if(!depth) {owner->settle_deferred();return false;}
         require(stats.full_forward_rows<=UINT64_MAX-depth && epoch!=UINT64_MAX,"MTP draft chain counters exhausted");
         cycle_base->admit_rotary_reader(owner->model().rotary_identity());
-        validation.emplace(owner->admit_native_entry());
+        // Deferred teacher cache rows of the last reconciliation run first on this stream; the chain's
+        // completion reads their first-error status with its own.
+        validation.emplace(owner->admit_native_entry(true));
         try {
             for(std::uint32_t k=0;k<depth;++k) preflight(next_source+k,k?0U:pending_token,true);
             validate_ticket(*cycle_base);owner->mark_submitted();
@@ -564,6 +575,69 @@ struct HipMtpRuntime::Impl {
             first_cache_reusable=true;candidates=tokens;return tokens;
         } catch(...) {failure();throw;}
     }
+    // Batched prompt priming (STRIX_MTP_PRIME_ROWS): up to 8 rows per launch on the production draft branch, each row
+    // with the one-row kernels' arithmetic (embedding row load, draft input fusion, draft attention HC mix, exact
+    // cache rows), row t in its own scratch slot and reading its target hidden in place. Only the owner's KV/raw-index
+    // rows, pool frontier and status word are shared with the one-row path; its staging buffers are not written.
+    bool prime_rows_admitted() const {
+        static const bool on=[]{const char* v=std::getenv("STRIX_MTP_PRIME_ROWS");return v && v[0]=='1' && !v[1];}();
+        if(!on || !draft || draft_exact || !hc_inject || owner->model().hc_count!=4U || !hip_mtp_hyper_mix_draft_rows_supported() ||
+           owner->view(HipMtpBuffer::hyper_workspace).address%16U)return false;
+        return hip_mtp_draft_q4(reinterpret_cast<const void*>(owner->tensors().eh_projection.runtime->address))!=nullptr;
+    }
+    struct PrimeSlot {std::uint64_t embedding,normalized,fused,hyper,hidden,injection,index_key,key,value,bytes;};
+    PrimeSlot prime_layout() const {
+        const auto align=[](std::uint64_t v){return (v+255U)&~std::uint64_t{255U};};
+        const auto& m=owner->model();PrimeSlot l{};std::uint64_t at=0;
+        const auto take=[&](std::uint64_t bytes){const auto o=at;at=align(at+bytes);return o;};
+        l.embedding=take(owner->view(HipMtpBuffer::embedding).bytes);l.normalized=take(owner->view(HipMtpBuffer::normalized_input).bytes);
+        l.fused=take(owner->view(HipMtpBuffer::fused_wide).bytes);l.hyper=take(owner->view(HipMtpBuffer::hyper_workspace).bytes);
+        l.hidden=take(owner->view(HipMtpBuffer::hidden0).bytes);l.injection=take(owner->view(HipMtpBuffer::injection).bytes);
+        l.index_key=take(m.indexer_head_dim*4U);l.key=take(m.kv_heads*m.head_dim*4U);l.value=take(m.kv_heads*m.head_dim*4U);
+        l.bytes=at;return l;
+    }
+    // The scratch is allocated on first use; when that fails the one-row loop runs instead.
+    bool prime_rows_ready() {
+        if(prime_scratch) return true;
+        if(prime_unavailable) return false;
+        const auto l=prime_layout();unsigned char* raw=nullptr;
+        if(hipMalloc(reinterpret_cast<void**>(&raw),8U*l.bytes)!=hipSuccess || !raw) {(void)hipGetLastError();prime_unavailable=true;return false;}
+        prime_scratch.reset(raw);prime_slot=l.bytes;return true;
+    }
+    void prime_rows(std::uint64_t position,std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> tokens,void* stream) {
+        const auto n=hidden.size();const auto l=prime_layout();
+        require(prime_scratch && prime_slot==l.bytes && n && n<=8U,"MTP batched priming scratch/rows are invalid");
+        const auto base=reinterpret_cast<std::uintptr_t>(prime_scratch.get());
+        const auto at=[&](std::size_t t,std::uint64_t offset){return base+t*prime_slot+offset;};
+        const auto c=context(position);
+        std::array<std::uint16_t*,8> embedding{};
+        for(std::size_t t=0;t<n;++t) embedding[t]=reinterpret_cast<std::uint16_t*>(at(t,l.embedding));
+        launch_hip_mtp_embedding_rows_to(c,tokens,std::span<std::uint16_t* const>(embedding.data(),n),stream);
+        std::array<HipMtpInputFusionRequest,8> requests{};const auto one=fusion();
+        for(std::size_t t=0;t<n;++t) {
+            auto& r=requests[t];r=one;
+            r.embedding={at(t,l.embedding),one.embedding.bytes,1U};
+            r.wide_hidden={hidden[t].address,hidden[t].bytes,hidden[t].allocation_generation};
+            r.normalized_scratch={at(t,l.normalized),one.normalized_scratch.bytes,1U};
+            r.output={at(t,l.fused),one.output.bytes,1U};
+        }
+        launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionRequest>(requests.data(),n),stream);
+        HipMtpHyperDraftRows mix{};
+        for(std::size_t t=0;t<n;++t) {
+            mix.input[t]=reinterpret_cast<const std::uint16_t*>(at(t,l.fused));mix.output[t]=reinterpret_cast<std::uint16_t*>(at(t,l.hidden));
+            mix.workspace[t]=reinterpret_cast<float*>(at(t,l.hyper));mix.injection[t]=reinterpret_cast<float*>(at(t,l.injection));
+        }
+        const auto& t=owner->tensors();
+        enqueue_hip_mtp_hyper_mix_q8_rows(mix,static_cast<std::uint32_t>(n),reinterpret_cast<const float*>(t.attention_hc_norm.runtime->address),
+            reinterpret_cast<const void*>(t.attention_hc_down.runtime->address),hc_inject.get(),
+            reinterpret_cast<const void*>(t.attention_hc_up.runtime->address),owner->model().rms_norm_epsilon,stream);
+        HipMtpCacheRowsBatch cache{};
+        for(std::size_t r=0;r<n;++r) {
+            cache.input[r]=reinterpret_cast<const std::uint16_t*>(at(r,l.hidden));cache.index_key[r]=reinterpret_cast<float*>(at(r,l.index_key));
+            cache.key[r]=reinterpret_cast<float*>(at(r,l.key));cache.value[r]=reinterpret_cast<float*>(at(r,l.value));
+        }
+        launch_hip_mtp_cache_rows_batch(c,cache,static_cast<std::uint32_t>(n),stream);
+    }
     // Teacher cache rows only feed the predictor's own attention cache, so a
     // draft-only chain builds them with the same fast kernels as its proposals.
     void cache_row_front(const MtpNativeContext& c,void* stream) const {
@@ -674,7 +748,15 @@ bool HipMtpRuntime::prime_hidden_rows_submit(const QualifiedMtpDraftPlan& plan,c
     p.active=true;p.cache_only_active=true;
     try {
         void* stream=p.owner->stream();
-        for(std::size_t i=0;i<hidden.size();++i) {
+        std::size_t i=0;
+        // STRIX_MTP_PRIME_ROWS: rows in batches of up to 8; the last row stays on the one-row path below so the
+        // owner's staging buffers end holding it, as before.
+        if(hidden.size()>1U && p.prime_rows_admitted() && p.prime_rows_ready())
+            for(;i+1U<hidden.size();) {
+                const auto n=std::min<std::size_t>(hidden.size()-1U-i,8U);
+                p.prime_rows(p.next_source+i,hidden.subspan(i,n),next_tokens.subspan(i,n),stream);i+=n;
+            }
+        for(;i<hidden.size();++i) {
             const auto c=p.context(p.next_source+i);
             p.copy(wide,hidden[i]);
             launch_hip_mtp_embedding(c,next_tokens[i],stream);p.cache_row_front(c,stream);
@@ -715,8 +797,8 @@ void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTick
         require_chain(*p.last_target,ticket);
         require(p.last_teacher_next_input && *p.last_teacher_next_input==ticket.input_token(),"MTP cycle does not continue its actual primed target input");
     }
-    const auto admission=p.owner->admit_native_entry();
-    p.preflight(p.next_source,token,true);p.owner->require_idle();
+    const auto admission=p.owner->admit_native_entry(true);
+    p.preflight(p.next_source,token,true);p.owner->require_idle(true);
     // Metadata-only checkpoint: proposals overwrite rows starting at
     // base_source. All earlier rows are immutable, and every later reader is
     // bounded by its current source position after that row was overwritten.
@@ -1208,6 +1290,12 @@ std::uint32_t HipMtpRuntime::read_greedy_token(const QualifiedMtpDraftPlan& plan
         p.candidates.push_back(token);return token;
     } catch(...) {if(p.active) p.failure();throw;}
 }
+void HipMtpRuntime::defer_next_reconcile_completion(bool defer) noexcept {impl_->defer_reconcile=defer;}
+void HipMtpRuntime::settle_deferred() {
+    auto& p=*impl_;
+    try {p.owner->settle_deferred();} catch(...) {p.failure();throw;}
+}
+std::array<std::uint64_t,3> HipMtpRuntime::deferred_completion_counts() const noexcept {return impl_->owner->deferred_counts();}
 void HipMtpRuntime::set_reconciliation_rows(std::span<const HipMtpReplayRow> rows,const HipMtpTargetHiddenTicket& final_target) {
     auto& p=*impl_;require(p.cycle && !p.active && p.cycle_base && rows.size()<=p.owner->budget().maximum_candidate_depth+1U,
         "MTP reconciliation requires its bounded completed proposal");p.validate_ticket(final_target);
@@ -1238,6 +1326,7 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
     // Output tokens do not attest draft-cache correctness; real committed
     // tickets and complete teacher-pair coverage above are the authority.
     host_phase_mark("9a reconcile validation");
+    const bool defer=std::exchange(p.defer_reconcile,false);
     {
         const auto admission=p.owner->admit_native_entry();
         for(const auto& row:p.replay) p.preflight(row.hidden.source_position(),row.next_input_token,true,true);
@@ -1260,7 +1349,7 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
                p.replay[0].next_input_token==p.pending_token) {p.reuse_first_teacher_cache(p.replay[0]);first=1;}
             host_phase_mark("9c reuse first cache");
             p.teacher_cache_rows(std::span<const HipMtpReplayRow>(p.replay).subspan(first),
-                !p.draft_exact && p.cache_profile==DraftCacheProfile::fast);
+                !p.draft_exact && p.cache_profile==DraftCacheProfile::fast,defer);
             host_phase_mark("9d teacher cache rows (gpu+sync)");
             p.draft->observe(emitted);first=p.replay.size();
             host_phase_mark("9e draft observe");

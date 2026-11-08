@@ -277,6 +277,21 @@ rápida midió **19.13 s / 1,713 tok/s a 32K**, **81.08 s a 131,072 tokens** y
 Los digests coinciden con la referencia de esa identidad a 32K/64K/128K/262K; esto no es igualdad de bits con el serial A8 denso
 ni una nueva cualificación de fidelidad del modelo en contexto largo. Véase el [catálogo](../../optimizations.md#qwen-tiled).
 
+**Pesos exactos del router en BF16.** `STRIX_QWEN_ROUTER_BF16` está activado por defecto:
+la carga comprueba los 16 bits bajos de todos los coeficientes F32 antes de registrar
+una copia BF16 exacta en dispositivo. Si falla un coeficiente, el tensor conserva F32;
+los ceros con signo, infinitos y payloads NaN representables conservan sus bits.
+El respaldo F32 original no cambia. La admisión reserva 120 MiB para 48 routers de
+512 × 2560 coeficientes más 64 KiB de staging durante la carga, tanto en CLI como
+en HTTP, MTP y YaRN hasta 1M. Las copias de packs existentes se reutilizan y el
+inventario real cuenta cada respaldo una vez. La inspección informa de la política;
+los recibos de ejecución indican copias, rechazos y reutilización.
+`STRIX_QWEN_ROUTER_BF16=0` restaura F32 tras reiniciar; baseline,
+`STRIX_QPF2K_DEFAULTS=0` y `STRIX_Q6P=0` también lo desactivan. La selección conserva
+su lanzamiento separado y su orden de comparación y desempate. Quedan pendientes
+las pruebas de dispositivo y de carga completa; no se afirma ninguna mejora medida.
+Véase el [contrato de almacenamiento](../../optimizations.md#qwen-exact-bf16-router-weights).
+
 La atención de draft MTP exacta y los valores predeterminados del router están activados en la línea pública de Qwen.
 El drafting MTP por batch sigue siendo opt-in. El servidor HTTP dimensiona sus slots de petición a partir de la memoria (`--http-batch N` pone el límite, `0` = de uno en uno), atiende las peticiones en decode en los límites de capa dentro de bloques de prompt largos (`STRIX_BATCH_SERVICE_MS=250`), ejecuta primero los prompts cortos y los anida en un prompt largo en pausa (`STRIX_BATCH_NEST_ROWS=2048`), y cancela en esos límites; cada petición conserva los IDs de token y el estado confirmado que tendría sola. Un grupo de prompts toma como máximo 4 bloques salvo que todos los slots estén ocupados y una petición espere (`STRIX_PROMPT_BATCH_AUTO=0` lo desactiva): el p50 del primer token de una ráfaga de 8 x 1024 baja un 21 % y el de una de 16 x 1024 un 15 %, con el makespan dentro del ruido y tokens idénticos ([grupos de prompts](../../engine/prefill/prompt-batch.md)). Con un prompt de 32K llegando entre tres flujos en decode (comando predeterminado), el hueco de decode p90 pasó de 14.3 s a 0.54 s y el primer token de una petición corta de 42-52 s a 2.3-3.8 s ([servicio](../../engine/serving/serving.md#batched-decoding)).
 

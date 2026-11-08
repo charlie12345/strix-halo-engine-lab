@@ -72,4 +72,9 @@ void launch_hip_mtp_embedding_device(const MtpNativeContext&,const std::uint32_t
 void launch_hip_mtp_embedding_rows(std::span<const MtpNativeContext> contexts,std::span<const std::uint32_t* const> tokens,
     std::span<const std::uint32_t> values,void* stream);
 
+// Tiled prompt priming: row t loads host token tokens[t] into outputs[t] (BF16 [hidden]) with
+// launch_hip_mtp_embedding's row load/store; one owner, at most 8 rows.
+void launch_hip_mtp_embedding_rows_to(const MtpNativeContext&,std::span<const std::uint32_t> tokens,
+    std::span<std::uint16_t* const> outputs,void* stream);
+
 }  // namespace strix

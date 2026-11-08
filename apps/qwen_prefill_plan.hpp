@@ -51,7 +51,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
             binding_request.prefill_arithmetic_identity = prefill_arithmetic_identity(pair,
                 options.resolved_prefill_option_mask.value_or(resolve_prefill_options(
                     [](const char* name) { return std::getenv(name); }, options.prefill_exact_fp16, options.prefill_disabled)),
-                qpf2k::has_gsq_gate(manifest));
+                qpf2k::has_gsq_gate(manifest), options.resolved_qsa_prefill_budget ?
+                    *options.resolved_qsa_prefill_budget : qsa_prefill_budget_active());
         catalog_config.numerical_profile = pair.prefill;
         catalog_config.fast_prefill_components = pair.fast_components;
         kernels::KernelRegistry prefill_registry;
@@ -209,6 +210,10 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         result.organization.emplace("qsa_score_ring_workspace_bytes",plan.qsa_score_ring_workspace_bytes);
         result.organization.emplace("qsa_score_ring_rows",plan.qsa_score_ring_rows);
     }
+    // Shared model storage, independent of T, slots, rotary extent and MTP.
+    // runtime_payload participates in every UMA admission formula; device_base
+    // participates in every GTT formula. Split named owners without charging twice.
+    account_qwen_router_bf16(result, manifest, options.qwen_router_bf16, full_owners);
     if(mtp_prompt_phase_separation(options)) result.organization.emplace("mtp_prompt_phase_separation",1U);
     if (registered_mtp) result.registered_plan=registered;
     if(mtp_pool) result.organization.emplace("qsa_mtp_pool_bytes",mtp_pool);

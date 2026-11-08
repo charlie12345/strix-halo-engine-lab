@@ -59,7 +59,8 @@ struct HipMtpResources::Impl {
     std::uint64_t pool_generation=0,identity=0;
     HipRuntimeAllocationDescription pool_lease;
     hipStream_t stream=nullptr;
-    bool pending=false,failed=false;
+    bool pending=false,failed=false,deferred=false;
+    std::array<std::uint64_t,3> deferred_counts{};
     mutable bool validation_entry=false;
     const RuntimeTensorBinding* sidecar_data=nullptr;
     const RuntimeTensorBinding* target_data=nullptr;
@@ -230,8 +231,9 @@ HipMtpResources::NativeValidationScope::~NativeValidationScope() {
 }
 HipMtpResources::NativeValidationScope::NativeValidationScope(NativeValidationScope&& other) noexcept
     :owner_(std::exchange(other.owner_,nullptr)) {}
-HipMtpResources::NativeValidationScope HipMtpResources::admit_native_entry() const {
-    require(!impl_->validation_entry && !impl_->pending,"MTP native admission cannot nest or borrow queued work");
+HipMtpResources::NativeValidationScope HipMtpResources::admit_native_entry(bool carry_deferred) const {
+    if(impl_->deferred && !carry_deferred) settle_deferred();
+    require(!impl_->validation_entry && (!impl_->pending || (carry_deferred && impl_->deferred)),"MTP native admission cannot nest or borrow queued work");
     validate();
     impl_->validation_entry=true;
     return NativeValidationScope(shared_from_this());
@@ -257,17 +259,35 @@ void HipMtpResources::validate_stage() const {
     require(p.allocator->describe_allocation(p.pool,p.reservation.device_pool_bytes,HipRuntimeAllocationSpace::device)==p.pool_lease,
         "MTP original allocator lease changed");
 }
-void HipMtpResources::require_idle() const {validate_stage();require(!impl_->pending,"MTP native queue is already pending");}
-void HipMtpResources::mark_submitted() {validate_stage();impl_->pending=true;}
+void HipMtpResources::require_idle(bool carry_deferred) const {
+    if(impl_->deferred && !carry_deferred) settle_deferred();
+    validate_stage();require(!impl_->pending || (carry_deferred && impl_->deferred),"MTP native queue is already pending");
+}
+void HipMtpResources::mark_submitted() {
+    validate_stage();
+    if(impl_->deferred) {impl_->deferred=false;++impl_->deferred_counts[1];}
+    impl_->pending=true;
+}
+void HipMtpResources::defer_completion() {
+    validate_stage();require(impl_->pending && !impl_->deferred,"MTP deferred completion requires submitted native work");
+    impl_->deferred=true;++impl_->deferred_counts[0];
+}
+bool HipMtpResources::completion_deferred() const noexcept {return impl_->deferred;}
+// Every HipMtpResources is a heap object owned through a non-const shared_ptr (create()).
+void HipMtpResources::settle_deferred() const {
+    if(!impl_->deferred) return;
+    ++impl_->deferred_counts[2];const_cast<HipMtpResources&>(*this).complete();
+}
+std::array<std::uint64_t,3> HipMtpResources::deferred_counts() const noexcept {return impl_->deferred_counts;}
 void HipMtpResources::complete() {
     auto& p=*impl_;validate_stage();require(p.pending,"MTP completion requires submitted native work");
     try {
         std::array<std::uint32_t,2> status{};const auto source=view(HipMtpBuffer::status);
         check(hipMemcpyAsync(status.data(),reinterpret_cast<const void*>(source.address),8U,hipMemcpyDeviceToHost,p.stream),"MTP status transfer failed");
         check(hipStreamSynchronize(p.stream),"MTP native completion failed");p.guard->require_original();
-        require(!status[0] && !status[1],"MTP native first-error status is nonzero");p.pending=false;
+        require(!status[0] && !status[1],"MTP native first-error status is nonzero");p.pending=false;p.deferred=false;
     } catch(...) {fail();throw;}
 }
-void HipMtpResources::fail() noexcept {impl_->failed=true;if(impl_->guard) impl_->guard->recover_or_fail_stop();impl_->pending=false;}
+void HipMtpResources::fail() noexcept {impl_->failed=true;if(impl_->guard) impl_->guard->recover_or_fail_stop();impl_->pending=false;impl_->deferred=false;}
 bool HipMtpResources::failed() const noexcept {return impl_->failed;}
 } // namespace strix

@@ -5,10 +5,12 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <string_view>
 #include <vector>
 
 namespace strix {
+namespace qwen_moe_prepared { struct Model; }
 
 struct ModelContentIdentity {
     std::array<std::uint8_t, 32> bytes{};
@@ -47,6 +49,8 @@ struct ModelRuntimeBinding {
     ModelContentIdentity model_content_identity;
 
     std::vector<RuntimeTensorBinding> tensors;
+    // Optional setup-owned prepared operands; original bindings remain the decode source.
+    std::shared_ptr<const qwen_moe_prepared::Model> qwen_moe_prepared;
 };
 
 [[nodiscard]] bool runtime_tensor_gpu_visible(

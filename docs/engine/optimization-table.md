@@ -133,3 +133,31 @@ environment variable, the shipped value, the value that restores the previous pa
 | qwen | STRIX_QPF2K_MOE_HDR | `STRIX_QPF2K_MOE_HDR` | 1 | 0 | STRIX_QPF2K_MOE_HDR |
 | qwen | STRIX_QPF2K_MOE_XOR64 | `STRIX_QPF2K_MOE_XOR64` | 1 | 0 | STRIX_QPF2K_MOE_XOR64 |
 | qwen | STRIX_QPF2K_HC_LOWBAND | `STRIX_QPF2K_HC_LOWBAND` | 3 | 0 | STRIX_QPF2K_HC_LOWBAND |
+
+## Opt-in levers (not defaults)
+
+Levers that are not part of the shipped defaults. `STRIX_QWEN_ALLON=1` (or `exact`) switches on every exact row of
+this section for Qwen, `STRIX_QWEN_ALLON=fast` also the FAST rows. An explicit per-lever value wins, and
+`STRIX_BASELINE=1` vetoes the profile. With `STRIX_QWEN_ALLON` unset nothing changes.
+
+| engine | switch | environment | value | class | receipt |
+|---|---|---|---|---|---|
+| qwen | prompt_group_by_load | `STRIX_PROMPT_BATCH_AUTO` | 1 | exact | serve scheduling; 8x1024 burst first-token p50 -21 %, tokens equal |
+| qwen | ple_panel_reuse | `STRIX_QPF2K_PLE_TILE` | 1 | exact | PLE operator exact on both nodes; engine gain not shown |
+| qwen | hc_recompute | `STRIX_QPF2K_HC_RECOMPUTE_NORM` | 1 | exact | HC normalized rows recomputed in consumers; OUT16 17.006 -> 14.991 ms per call; engine bytes pending |
+| qwen | hc_inverse_reuse | `STRIX_QPF2K_HC_OUT16_INVERSE_REUSE` | 1 | exact | needs hc_recompute; 1,327 host cases, native ISA/byte gates pending |
+| qwen | moe_tiers | `STRIX_QPF2K_MOE_TIERS` | 1 | exact | narrow routed MoE tier in a 3-CTA LDS budget; byte gate and timing pending |
+| qwen | moe_down_lds_epilogue | `STRIX_QPF2K_MOE_DOWN_LDS_EPI` | 1 | exact | down LDS-backed vector stores; byte gate and timing pending |
+| qwen | moe_direct_b | `STRIX_QPF2K_MOE_DIRECT_B` | 1 | exact | Q4_K gate/up direct-B fragments (plain CLI prefill only); native gate pending |
+| qwen | qsa_kv_pair | `STRIX_QSA_FAST_KV_PAIR` | 1 | exact | single-image paired QSA attend loader; fixture byte-equal, native pending |
+| qwen | mtp_prime_rows | `STRIX_MTP_PRIME_ROWS` | 1 | exact | 262,144-token MTP prompt 210.9-213.2 -> 202.8-203.8 s, digests equal |
+| qwen | mtp_device_handoff | `STRIX_MTP_DEVICE_HANDOFF` | 1 | exact | MTP cycle without a host fence; same launches and stream order |
+| qwen | decode_fuse | `STRIX_QWEN_DECODE_FUSE` | 1 | exact | single-row GDN preparation fusion; host and fixture checks |
+| qwen | router_bf16 | `STRIX_QWEN_ROUTER_BF16` | 1 | exact | exact BF16 router weight copy (120 MiB); device gate pending |
+| qwen | sampled_coupled_accept | `STRIX_MTP_SAMPLED_ACCEPT` | coupled | exact | sampled MTP: drafted output equals plain sampled output per seed (3,456 runs) |
+| qwen | gdn_fp16_chunk | `STRIX_QPF2K_GDN_FP16_CHUNK` | 1 | fast (qualification in progress) | 262,144-token prefill 177.9 -> 170.0 s; relL2 3.3-4.4e-4 against FP64 |
+| qwen | moe_route_bf16 | `STRIX_QPF2K_MOE_ROUTE_BF16` | 1 | fast (qualification in progress) | BF16 routed output storage |
+| qwen | moe_route_i8 | `STRIX_PREFILL_MOE_ROUTE_I8` | 1 | fast (qualification in progress) | one-byte route dot storage with per-group exponent; needs moe_route_bf16 |
+| qwen | index_proj_wmma | `STRIX_PREFILL_INDEX_PROJ_WMMA` | 1 | fast (qualification in progress) | BF16 indexer projections on WMMA |
+| qwen | index_score_wmma | `STRIX_PREFILL_INDEX_SCORE_WMMA` | 1 | fast (qualification in progress) | BF16 index score on WMMA; P16384 unpacked regression recorded, repair pending |
+| qwen | qsa_budget_1536 | `STRIX_QPF2K_QSA_BUDGET` | 1536 | fast (qualification in progress) | attention budget 1536 (kept at 1536 by decision) |

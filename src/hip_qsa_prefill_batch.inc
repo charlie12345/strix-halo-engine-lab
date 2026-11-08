@@ -134,7 +134,12 @@ void qpf2k_stage_score_slice(const Qpf2kStageBatch& batch, QsaPrefillPool* pool,
             static const bool witness = [] { std::fprintf(stderr, "qpf2k qsa score rows > 16 active\n"); return true; }();
             (void)witness;
         }
-        qpf2k_stage_score_launch(slot.scores, pool->packed ? static_cast<const void*>(pool->packed) : pool->keys,
+        if (qpf2k_index_score_wmma_active) {
+            qsa_flash::launch_index_score_wmma<64U, true>(QsaRowsScoreViews<64U>{},
+                pool->packed ? static_cast<const void*>(pool->packed) : pool->keys, pool->packed != nullptr,
+                max_blocks, nullptr, 0U, slot.scores + first, count, stream);
+            qpf2k_index_score_wmma_witness();
+        } else qpf2k_stage_score_launch(slot.scores, pool->packed ? static_cast<const void*>(pool->packed) : pool->keys,
             pool->packed != nullptr, static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), index_dim,
             max_blocks, first, count, stream);
         check_hip(hipGetLastError(), "QSA stage batch score launch");

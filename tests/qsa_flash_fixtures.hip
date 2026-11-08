@@ -8,11 +8,13 @@
 //     vs the production kernel of that group size (block_score_parked_kernel<64, 4>; block_score_pooled_rows_kernel
 //     <Rows, 4> for 16 / 32 rows), every score bitwise; raw head dots (before relu) of the fused and the separate
 //     form vs the production lane tree, bitwise where the guard admits the fused form (NaNs compared as a class).
+//  P: --attend-kv-pair-only (output + FP32 state bytes), --attend-kv-pair-timing (uninstrumented ABBA).
 //  O: native gfx1151 OCC vs production attend, complete bytes and guards (--attend-occ-only / --attend-occ-timing).
 //  G: guard boundary cases, counted per path.
 //  L: selector cases (crafted score rows; maxima from the scorer's own epilogue code) - qsa_flash::select_kernel vs
 //     select_rows_kernel, selected lists (canary-filled buffers, whole capacity) and post-selection scores bitwise.
 #include "qsa_flash_prod.inc"
+#include "strix/qsa_prefill_budget.hpp"
 #include <map>
 #include <chrono>
 #include <algorithm>
@@ -196,8 +198,10 @@ static void run_score_case(const ScoreCase& c, std::uint32_t blocks, hipStream_t
 // ---------------------------------------------------------------------------------------------- selector cases
 struct SelectCase { std::string name; std::vector<std::vector<float>> rows; std::vector<std::uint32_t> visible; };
 
-static void run_select_case(const SelectCase& c, hipStream_t s, std::map<std::string, std::uint64_t>& paths) {
+static void run_select_case(const SelectCase& c, hipStream_t s, std::map<std::string, std::uint64_t>& paths,
+    std::uint32_t budget = 0U) {
     constexpr unsigned Rows = 64;
+    const auto topk = qsa_prefill_block_topk(kTopk, kRatio, budget);
     const std::size_t n = static_cast<std::size_t>(Rows) * 65536U;
     auto* d_a = dalloc<float>(n); auto* d_b = dalloc<float>(n);
     std::vector<float> host(n, bits(0x7f7fbeefU));
@@ -213,8 +217,8 @@ static void run_select_case(const SelectCase& c, hipStream_t s, std::map<std::st
     }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(group_max_kernel<Rows>), dim3(65536U / 32U, Rows), dim3(32), 0, s, vb, kRatio, d_max, kStride);
     auto* d_stats = dalloc<std::uint32_t>(qsa_flash::kStats); check(hipMemsetAsync(d_stats, 0, qsa_flash::kStats * 4, s), "memset");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, s, va, kRatio, kTopk);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows, true>), dim3(Rows), dim3(kSelectThreads), 0, s, vb, d_max, kStride, kRatio, kTopk, d_stats);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, s, va, kRatio, topk);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows, true>), dim3(Rows), dim3(kSelectThreads), 0, s, vb, d_max, kStride, kRatio, topk, d_stats);
     check(hipGetLastError(), "launch"); check(hipStreamSynchronize(s), "sync");
     std::vector<std::uint32_t> sa(Rows * kMaxsel), sb(Rows * kMaxsel);
     check(hipMemcpy(sa.data(), d_sa, sa.size() * 4, hipMemcpyDeviceToHost), "d2h"); check(hipMemcpy(sb.data(), d_sb, sb.size() * 4, hipMemcpyDeviceToHost), "d2h");
@@ -223,12 +227,31 @@ static void run_select_case(const SelectCase& c, hipStream_t s, std::map<std::st
     for (unsigned r = 0; r < Rows; ++r) {
         rows_sel += std::memcmp(sa.data() + r * kMaxsel, sb.data() + r * kMaxsel, kMaxsel * 4) != 0;
         rows_post += std::memcmp(pa.data() + static_cast<std::size_t>(r) * 65536U, pb.data() + static_cast<std::size_t>(r) * 65536U, 65536U * 4) != 0;
+        std::vector<std::uint32_t> expected(kMaxsel, 0xaaaaaaaaU);
+        const auto visible = c.visible[r], complete = visible / kRatio;
+        if (complete <= topk) {
+            for (std::uint32_t t = 0; t < visible; ++t) expected[t] = t;
+        } else {
+            // Rank the unrestricted candidates first, then take its prefix. Ties retain block-ID order;
+            // NaNs/-inf are excluded and exhausted slots repeat block zero, exactly as the old loop.
+            std::vector<std::uint32_t> ranking;
+            for (std::uint32_t b = 0; b < complete; ++b) if (c.rows[r][b] > -INFINITY) ranking.push_back(b);
+            std::stable_sort(ranking.begin(), ranking.end(), [&](auto lhs, auto rhs) { return c.rows[r][lhs] > c.rows[r][rhs]; });
+            ranking.resize(std::min<std::size_t>(ranking.size(), topk));
+            ranking.resize(topk, 0U);
+            std::sort(ranking.begin(), ranking.end());
+            for (std::uint32_t b = 0; b < topk; ++b)
+                for (std::uint32_t t = 0; t < kRatio; ++t) expected[b * kRatio + t] = ranking[b] * kRatio + t;
+            for (auto t = complete * kRatio; t < visible; ++t) expected[topk * kRatio + t - complete * kRatio] = t;
+        }
+        expect(std::equal(expected.begin(), expected.end(), sb.begin() + static_cast<std::ptrdiff_t>(r) * kMaxsel),
+            "ranked prefix/local tail/canary " + c.name + " budget " + std::to_string(budget) + " row " + std::to_string(r));
     }
     std::vector<std::uint32_t> st(qsa_flash::kStats); check(hipMemcpy(st.data(), d_stats, st.size() * 4, hipMemcpyDeviceToHost), "d2h");
     paths["select_candidates"] += st[qsa_flash::kSelectCandidates]; paths["select_few_maxima"] += st[qsa_flash::kSelectFewMaxima];
     paths["select_capacity"] += st[qsa_flash::kSelectCapacity]; paths["select_dense"] += st[qsa_flash::kSelectDense];
-    std::printf("  L %-30s rows with different selections %zu, different post-selection scores %zu; paths candidates %u few-maxima %u capacity %u dense %u, "
-        "candidate groups mean %.0f max %u\n", c.name.c_str(), rows_sel, rows_post, st[qsa_flash::kSelectCandidates], st[qsa_flash::kSelectFewMaxima],
+    std::printf("  L %-30s budget %u rows with different selections %zu, different post-selection scores %zu; paths candidates %u few-maxima %u capacity %u dense %u, "
+        "candidate groups mean %.0f max %u\n", c.name.c_str(), budget, rows_sel, rows_post, st[qsa_flash::kSelectCandidates], st[qsa_flash::kSelectFewMaxima],
         st[qsa_flash::kSelectCapacity], st[qsa_flash::kSelectDense],
         st[qsa_flash::kSelectCandidates] ? static_cast<double>(st[qsa_flash::kCandidateGroups]) / st[qsa_flash::kSelectCandidates] : 0.0, st[qsa_flash::kCandidateMax]);
     expect(rows_sel == 0 && rows_post == 0, "selector case " + c.name);
@@ -726,17 +749,19 @@ int main(int argc, char** argv) {
     const bool stage_only = argc == 2 && std::strcmp(argv[1], "--stage-batch-only") == 0;
     const bool occ_only = argc == 2 && std::strcmp(argv[1], "--attend-occ-only") == 0;
     const bool occ_timing = argc == 2 && std::strcmp(argv[1], "--attend-occ-timing") == 0;
-    if (argc != 1 && !stage_only && !occ_only && !occ_timing) {
-        std::fprintf(stderr, "usage: %s [--stage-batch-only|--attend-occ-only|--attend-occ-timing]\n", argv[0]); return 2;
+    const bool pair_only = argc == 2 && std::strcmp(argv[1], "--attend-kv-pair-only") == 0;
+    const bool pair_timing = argc == 2 && std::strcmp(argv[1], "--attend-kv-pair-timing") == 0;
+    if (argc != 1 && !stage_only && !occ_only && !occ_timing && !pair_only && !pair_timing) {
+        std::fprintf(stderr, "usage: %s [--stage-batch-only|--attend-occ-only|--attend-occ-timing|--attend-kv-pair-only|--attend-kv-pair-timing]\n", argv[0]); return 2;
     }
     hipStream_t s; check(hipStreamCreate(&s), "stream");
     // qsa_flash_prod.inc also exposes this bench-only kernel; retain its symbol
     // when this fixture is built with the engine's unused-function diagnostics.
     static_cast<void>(&qsa_fast::kv_to_f16_kernel);
-    if (occ_only || occ_timing) {
-        const int result = run_occ_fixtures(s, occ_timing);
+    if (occ_only || occ_timing || pair_only || pair_timing) {
+        const int result = run_occ_fixtures(s, occ_timing || pair_timing, pair_only || pair_timing);
         check(hipStreamDestroy(s), "stream destroy");
-        std::printf("attend occ fixtures: %s (%d failures)\n", result ? "FAIL" : "PASS", failures);
+        std::printf("attend %s fixtures: %s (%d failures)\n", pair_only || pair_timing ? "kv-pair" : "occ", result ? "FAIL" : "PASS", failures);
         return result;
     }
     run_stage_batch_cases(s);
@@ -869,7 +894,13 @@ int main(int argc, char** argv) {
         std::vector<float> x(blocks, 0.0F); for (std::uint32_t i = 0; i < blocks; i += 1U + r) x[i] = 0.5F * static_cast<float>(i % 5U); return x; }));
     sel.push_back(mk("long-65536", [&](unsigned r, std::uint32_t& v) { const std::uint32_t blocks = 65536U - (r % 4U) * 3U; v = 4U * blocks + r % 4U;
         std::vector<float> x(blocks); for (std::uint32_t i = 0; i < blocks; ++i) x[i] = std::fabs(rng.normal()) + (i > blocks - 3000U ? 1.0F : 0.0F); return x; }));
-    for (const auto& c : sel) run_select_case(c, s, paths);
+    sel.push_back(mk("budget-dense-boundaries", [&](unsigned r, std::uint32_t& v) {
+        const std::uint32_t boundaries[] = {0U, 1U, 383U, 384U, 385U, 511U, 512U, 513U};
+        const auto blocks = boundaries[r % 8U]; v = blocks * 4U + (blocks ? r % 4U : 1U);
+        return std::vector<float>(blocks, 0.75F);
+    }));
+    for (const auto budget : {0U, 4U, 512U, 1536U, 2048U, 4096U})
+        for (const auto& c : sel) run_select_case(c, s, paths, budget);
     std::printf("paths:");
     for (const auto& [k, v] : paths) std::printf(" %s=%llu", k.c_str(), static_cast<unsigned long long>(v));
     std::printf("\n");

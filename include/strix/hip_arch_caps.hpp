@@ -2,8 +2,14 @@
 
 // Instruction/fragment availability, not tuning or numerical qualification.
 // Keep target detection in one place. Unknown targets fail closed.
-#ifndef __has_builtin
-#define __has_builtin(x) 0
+// Indirection so host tests can model builtin availability without touching
+// the compiler-reserved __has_builtin.
+#ifndef STRIX_HAS_BUILTIN
+#ifdef __has_builtin
+#define STRIX_HAS_BUILTIN(x) __has_builtin(x)
+#else
+#define STRIX_HAS_BUILTIN(x) 0
+#endif
 #endif
 
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
@@ -19,11 +25,11 @@
 
 // The packed IU4/IU8 operand ABI used by integer_projection is RDNA 3.5 only.
 #define STRIX_HAS_RDNA35_WMMA (STRIX_HIP_ARCH_RDNA35 && \
-    __has_builtin(__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32) && \
-    __has_builtin(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32))
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32) && \
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32))
 #define STRIX_HAS_WMMA_BF16_W32 ((STRIX_HIP_ARCH_RDNA3 || STRIX_HIP_ARCH_RDNA35) && \
-    __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32))
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32))
 #define STRIX_HAS_DPP_ROW ((STRIX_HIP_ARCH_RDNA3 || STRIX_HIP_ARCH_RDNA35) && \
-    __has_builtin(__builtin_amdgcn_update_dpp))
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_update_dpp))
 #define STRIX_HAS_SUDOT4 ((STRIX_HIP_ARCH_RDNA3 || STRIX_HIP_ARCH_RDNA35) && \
-    __has_builtin(__builtin_amdgcn_sudot4))
+    STRIX_HAS_BUILTIN(__builtin_amdgcn_sudot4))

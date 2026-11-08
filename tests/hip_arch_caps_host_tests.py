@@ -26,8 +26,7 @@ def main():
                 family = target in targets[:8]
                 expected = [rdna35 and values[0] and values[1], family and values[2],
                             family and values[3], family and values[4]]
-                text = '#ifdef __has_builtin\n#undef __has_builtin\n#endif\n'
-                text += '#define __has_builtin(x) STRIX_TEST_##x\n'
+                text = '#define STRIX_HAS_BUILTIN(x) STRIX_TEST_##x\n'
                 text += ''.join(f'#define STRIX_TEST___builtin_amdgcn_{name} {value}\n'
                                 for name, value in zip(builtins, values))
                 if target:
@@ -41,7 +40,7 @@ def main():
         # Batch files to stay below Windows command-line limits.
         for start in range(0, len(fixtures), 24):
             flags = ['/nologo', '/std:c++20', '/Zs', '/W4', '/WX'] if msvc else [
-                '-std=c++20', '-fsyntax-only', '-Wall', '-Wextra', '-Werror', '-Wno-builtin-macro-redefined']
+                '-std=c++20', '-fsyntax-only', '-Wall', '-Wextra', '-Werror']
             result = subprocess.run([args.compiler, *flags, *fixtures[start:start + 24]],
                                     capture_output=True, text=True)
             if result.returncode:

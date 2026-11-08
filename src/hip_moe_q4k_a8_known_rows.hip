@@ -233,7 +233,7 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
         }
         __syncthreads();
         float acc[2][G]={};
-#pragma unroll
+#pragma unroll 1
         for(unsigned m=0;m<2U;++m) {
             const unsigned char* w=(m==0U?gate:up)+offset;
             if constexpr(Q5K) {
@@ -356,7 +356,7 @@ __global__ __launch_bounds__(256) void project_window_split(const unsigned char*
     const unsigned g0=2U*p,g1=g0+1U;
     constexpr unsigned max_blocks=max_hidden/256U;
     static_assert(G==4U || G==8U);
-#pragma unroll
+#pragma unroll 1
     for(unsigned m=0;m<2U;++m) {
         const unsigned char* w=(m==0U?gate:up)+offset;
         uint4 staged_weights[Q5K?3U:2U][max_blocks];

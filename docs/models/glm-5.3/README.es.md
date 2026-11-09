@@ -15,8 +15,8 @@ en sí: [dos nodos por USB4](../../pair.es.md).
 ## Ejecución: el par
 
 La división de GLM por tokens es un perfil FAST de memoria calificado. Está desactivada por defecto;
-`STRIX_GLM_KV_SHARD=auto` (con `STRIX_GLM_PF_PIPELINE=1`) selecciona la división solo si falla la admisión de inicio del estado
-replicado; `=1` fuerza la división y `=0` fuerza la replicación. Exige una solicitud,
+`STRIX_GLM_KV_SHARD=auto` (con `STRIX_GLM_PF_PIPELINE=1`) selecciona la división solo después de que todos los candidatos replicados
+de scratch/ventana permitidos fallen la admisión de inicio en alguno de los ranks; `=1` fuerza la división y `=0` fuerza la replicación. Exige una solicitud,
 `STRIX_GLM_PF_PIPELINE=1`, prefill por chunks y ausencia de MTP o especulación. FAST cambia el
 orden de suma, por lo que no es bit a bit igual al perfil exacto replicado predeterminado.
 Consulte la [guía de almacenamiento KV y división por tokens](../../engine/kv-sharding.es.md)
@@ -24,6 +24,58 @@ para conocer la organización, los límites de contexto y tiempos medidos, la ve
 costes. El experimento de transporte independiente `STRIX_XPORT_SMALL_SPIN=1` activa progreso
 acotado para mensajes pequeños; sin definir o con `0`, restaura el progreso anterior tras reiniciar.
 Véanse los [contratos de funciones](../../optimizations.md#kv-cache-sharding-and-shared-transport-progress).
+
+La capacidad del prefill se elige al arrancar. `STRIX_GLM_PF_SCRATCH` (`auto` predeterminado, `full`, `routed`) y
+`STRIX_GLM_PF_ATTN_QWIN` (`auto` predeterminado, o de 0 a 65536 filas de consulta; `0` = el chunk entero) eligen la
+organización del scratch de prefill y la ventana de consultas de atención. `auto` prueba, en orden, scratch completo
+con atención sobre el chunk entero, scratch enrutado con atención sobre el chunk entero y, por último, scratch
+enrutado con una ventana de 2048 filas; un rechazo en cualquiera de los ranks descarta el candidato, y la admisión
+cuenta el límite compartido de instalación/staging en el dispositivo y en el host. El scratch enrutado elimina solo
+el arena heredado de MoE agrupado que no se usa; la ventana acota el scratch de atención, mientras que el tamaño de
+chunk y la aritmética por fila no cambian. Un valor explícito fija su eje. La alternativa necesita la votación
+interna de arranque; con un intercambio externo se mantiene la organización inicial. Cada rank imprime una línea
+`glm capacity: rank=... scratch requested=... resolved=...; qwin requested=... resolved=...; kv=... reason=...`.
+Los demás valores se rechazan al arrancar. Reinicie ambos ranks tras un cambio. La selección está cubierta por
+pruebas de host de la matriz de admisión; no se publican cifras nativas de bytes, tiempo hasta el primer token ni
+capacidad para este control.
+
+Paralelismo de secuencia del prefill, `STRIX_GLM_PF_SEQPAR` (`auto` predeterminado, `1`, `0`): en chunks con un
+número par de filas (al menos 2), cada rank ejecuta residual/mHC/norm sobre su mitad de las filas y las mitades se
+unen con un all-gather solapado que reutiliza el ciclo de CRC/drenado del intercambio; con
+`STRIX_GLM_PF_PIPELINE=2` y un número de filas múltiplo de 4, cada mitad se divide en dos tiles. Los chunks impares
+y de una sola fila siguen la ruta heredada. Necesita dos ranks con comunicador TP2, sin intercambio externo y sin
+división del KV: `auto` lo declina con una línea en stderr que indica el motivo, y `1` sin esas condiciones se
+rechaza al arrancar. Los ranks comparan su política y rechazan una discrepancia. `0` restaura la ruta heredada.
+Reinicie ambos ranks tras un cambio.
+
+`STRIX_GLM_PF_AUX_COMBINE` está activado de forma predeterminada (sin definir o `1`); `=0` restaura
+la ruta anterior. `STRIX_GLM_PF_AUX_INPUT`, `STRIX_GLM_PF_AUX_ACT`, `STRIX_GLM_PF_AUX_DENSE` y
+`STRIX_GLM_PF_AUX_NORM` son optativos (`=1` los activa; sin definir o `=0` los desactiva). Estos
+interruptores solo aceptan `0` o `1`.
+
+Los selectores de variante de kernel del prefill (`STRIX_GLM_PF_HC`, `_MLA`, `_IDX`, `_SELECT`, `_OBAR`,
+`_MLA_GEMM`, `_SCORES`, `_KDA_SCAN`, `_DENSE_ROWS`) comparten una tabla que usan el motor y
+`--print-effective-config`. Sin definir se elige el predeterminado; cualquier valor definido, incluido el vacío,
+debe ser una variante de la lista o el arranque se rechaza con
+`ENV='v' is not a known variant (allowed: ...; unset = D)`. La línea de configuración efectiva indica la variante
+que se ejecuta.
+
+| Variable | Valores admitidos (predeterminado primero) |
+|---|---|
+| `STRIX_GLM_PF_HC` | 2, 1 |
+| `STRIX_GLM_PF_MLA` | 2, 1 |
+| `STRIX_GLM_PF_IDX` | 3, 2, 1 |
+| `STRIX_GLM_PF_SELECT` | 2, 1 |
+| `STRIX_GLM_PF_OBAR` | 10, 7, 6, 5, 4, 2 |
+| `STRIX_GLM_PF_MLA_GEMM` | 3, 2, 1 |
+| `STRIX_GLM_PF_SCORES` | 7, 6, 5, 4, 3, 2 |
+| `STRIX_GLM_PF_KDA_SCAN` | 5, 3, 1 |
+| `STRIX_GLM_PF_DENSE_ROWS` | 3, 2, 1 |
+
+Con `STRIX_XPORT_TRACE=1`, el intercambio del prefill imprime
+`xport prefill bytes=... copied=... messages=... reuse_dependencies=...` al cerrarse. `reuse_dependencies`
+(antes `exposed_wait`) cuenta aristas de eventos de reutilización de búferes, dos por cada reutilización trazada;
+no es tiempo transcurrido.
 
 Ejecute una vez por nodo con `R` establecido en 0 o 1 y el mismo prompt tokenizado en ambos:
 

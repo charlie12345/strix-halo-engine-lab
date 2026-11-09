@@ -14,7 +14,8 @@ read and what "exact" covers: [methodology](../../methodology.md). Build instruc
 ## Run: the pair
 
 Optional GLM token sharding is a qualified FAST memory profile. It is off by default; `STRIX_GLM_KV_SHARD=auto`
-(with `STRIX_GLM_PF_PIPELINE=1`) selects sharding only when replicated-state startup admission fails;
+(with `STRIX_GLM_PF_PIPELINE=1`) selects sharding only after all permitted replicated scratch/window candidates
+fail startup admission on either rank;
 `=1` forces sharding and `=0` forces replication. It requires one request,
 `STRIX_GLM_PF_PIPELINE=1`, chunked prefill and no MTP or speculation. FAST sharding changes
 the summation order, so it is not bitwise equal to the default replicated exact profile.
@@ -22,6 +23,53 @@ See the [KV storage and token-sharding guide](../../engine/kv-sharding.md) for t
 measured context limits, timings, verification steps and trade-offs. The independent transport
 experiment `STRIX_XPORT_SMALL_SPIN=1` enables bounded small-message progress; unset or `0`
 restores prior progress after restart. See [feature contracts](../../optimizations.md#kv-cache-sharding-and-shared-transport-progress).
+
+Prefill capacity is chosen at startup. `STRIX_GLM_PF_SCRATCH` (`auto` default, `full`, `routed`) and
+`STRIX_GLM_PF_ATTN_QWIN` (`auto` default, or 0..65536 query rows; `0` = the whole chunk) pick the prefill scratch
+layout and the attention query window. `auto` tries, in order, full scratch with whole-chunk attention, routed
+scratch with whole-chunk attention, then routed scratch with a 2048-row query window; a refusal on either rank
+rejects a candidate, and admission counts the shared install/staging bound on device and host. Routed scratch
+drops only the unused legacy grouped-MoE arena; the query window bounds attention scratch, while chunk size and
+per-row arithmetic stay the same. An explicit value pins its axis. The fallback needs the internal startup vote;
+with an external exchange the initial layout is kept. Each rank prints one
+`glm capacity: rank=... scratch requested=... resolved=...; qwin requested=... resolved=...; kv=... reason=...`
+line. Other values are refused at startup. Restart both ranks after a change. Selection is covered by host
+admission-matrix tests; native byte, first-token-time and capacity figures are not published for this control.
+
+Prefill sequence parallelism, `STRIX_GLM_PF_SEQPAR` (`auto` default, `1`, `0`): on chunks with an even number of
+rows (at least 2), each rank runs residual/mHC/norm on its half of the rows and the halves are joined by an
+overlapped all-gather that reuses the exchange CRC/drain lifecycle; with `STRIX_GLM_PF_PIPELINE=2` and rows a
+multiple of 4, each half is split into two tiles. Odd and single-row chunks take the legacy path. It needs two
+ranks with a TP2 communicator, no external exchange and no KV sharding: `auto` declines with a stderr line naming
+the reason, and `1` without those conditions is refused at startup. The ranks compare their policy and refuse a
+mismatch. `0` restores the legacy path. Restart both ranks after a change.
+
+`STRIX_GLM_PF_AUX_COMBINE` is on by default (unset or `1`); `=0` restores the old path.
+`STRIX_GLM_PF_AUX_INPUT`, `STRIX_GLM_PF_AUX_ACT`, `STRIX_GLM_PF_AUX_DENSE`, and
+`STRIX_GLM_PF_AUX_NORM` are opt-in (`=1` enables, unset or `=0` disables). These switches accept only
+`0` or `1`.
+
+Prefill kernel variant selectors (`STRIX_GLM_PF_HC`, `_MLA`, `_IDX`, `_SELECT`, `_OBAR`, `_MLA_GEMM`, `_SCORES`,
+`_KDA_SCAN`, `_DENSE_ROWS`) share one table used by the engine and by `--print-effective-config`. Unset selects
+the default; any set value, empty included, must be a listed variant or startup is refused with
+`ENV='v' is not a known variant (allowed: ...; unset = D)`. The effective-config line reports the variant that
+runs.
+
+| Variable | Allowed values (default first) |
+|---|---|
+| `STRIX_GLM_PF_HC` | 2, 1 |
+| `STRIX_GLM_PF_MLA` | 2, 1 |
+| `STRIX_GLM_PF_IDX` | 3, 2, 1 |
+| `STRIX_GLM_PF_SELECT` | 2, 1 |
+| `STRIX_GLM_PF_OBAR` | 10, 7, 6, 5, 4, 2 |
+| `STRIX_GLM_PF_MLA_GEMM` | 3, 2, 1 |
+| `STRIX_GLM_PF_SCORES` | 7, 6, 5, 4, 3, 2 |
+| `STRIX_GLM_PF_KDA_SCAN` | 5, 3, 1 |
+| `STRIX_GLM_PF_DENSE_ROWS` | 3, 2, 1 |
+
+With `STRIX_XPORT_TRACE=1`, the prefill exchange prints
+`xport prefill bytes=... copied=... messages=... reuse_dependencies=...` when it closes. `reuse_dependencies`
+(formerly `exposed_wait`) counts buffer-reuse event edges, two per traced reuse; it is not elapsed time.
 
 Run once per node with `R` set to 0 or 1 and the same tokenized prompt on both:
 

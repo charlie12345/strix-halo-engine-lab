@@ -3,7 +3,7 @@
 [English](README.md) · [Español](README.es.md) · [README principal](../../../README.es.md)
 
 MiniMax M3.1 Flash, pesos trellis EXL3 a 3.06 bpw, en dos nodos Strix Halo (TP2 sobre USB4): prefill y decode
-exactos, servicio DSpark con admisión automática, modo 8 de prefill MSA, servicio con plazos y anidado. Production; la
+exactos, servicio DSpark con admisión automática, modo 10 de prefill MSA, servicio con plazos y anidado. Production; la
 puerta de calidad de ocho textos superada. Esta página conserva todas las mediciones publicadas con su compilación y sus
 condiciones y el comando de lanzamiento. Cómo se leen las tablas y qué cubre "exacto":
 [metodología](../../methodology.es.md). Instrucciones de compilación (biblioteca trellis incluida):
@@ -20,7 +20,8 @@ Ejecute una vez por nodo con `R` establecido en 0 o 1 y assets EXL3 coincidentes
 ```
 
 El [resolutor](../../../src/minimax/engine/mm_defaults.cpp) activa el conjunto de producción de decode/prefill/intercambio,
-incluido el modo de prefill MSA 8. `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
+incluido el modo de prefill MSA 10 (bucle de chunks dentro del bloque con lista de bloques y parciales en LDS, sin
+parciales globales; `STRIX_MM_PF_MSA_REWORK=8` restablece el modo anterior, valores válidos de 0 a 10). `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
 locales compatibles; las peticiones elegibles sin contención pueden usar draft, mientras que las peticiones en competencia/agrupadas o no admitidas
 se quedan en simple. Véase [admisión y cualificación](../../engine/serving/dspark-auto-qualification.md).
 Una petición de sesión con nombre que no cabe en el contexto devuelve HTTP 400 `context_length_exceeded` (la
@@ -37,6 +38,29 @@ como máximo 8 sesiones aparcadas; el nivel de disco es opcional (`--session-dis
 Se desactiva con `--session-cache off` / `STRIX_SESSION_CACHE=0` o con los interruptores de baseline. Las
 peticiones con nombre decodifican sin el drafter DSpark (mantiene el prefill agrupado; los ids son los mismos);
 `STRIX_MM_SESSION_DRAFT=1` lo restablece.
+
+Los pesos de proyección del indexador se cargan según la ruta. La carga conserva solo las disposiciones que usa
+la ruta resuelta por `STRIX_MM_INDEX_PROJ` (`attn` predeterminada, `tiled`, `off`) y `STRIX_MM_INDEX_DECODE`
+(predeterminado 1) para decode/verificación (1–8 filas) y prompt (más de 8 filas): la ruta predeterminada `attn`
+carga solo la disposición empaquetada; `tiled` carga la disposición FP16 por bloques (decode, con
+`STRIX_MM_INDEX_DECODE=1`) y la FP16 traspuesta; `off` carga la FP32 traspuesta. Las salidas de prefill y decode
+son idénticas bit a bit a las obtenidas cargando todas las disposiciones. Las demás rutas siguen funcionando:
+defina ambas variables antes de que el motor cargue. Seleccionar una ruta cuya disposición no se cargó se rechaza
+con un error que pide recargar; un conjunto de disposiciones que no cabe en la memoria del dispositivo hace fallar la carga.
+
+Las capacidades del transporte USB4 son opcionales y están todas desactivadas en MiniMax: `STRIX_MM_USB4_CAPS`
+acepta una lista separada por comas de `streams`, `joint`, `ready`, `deferred-crc`, `chunks`, `crc-overlap`,
+`gpu-lean` (tabla de streams, calibración conjunta, disponibilidad escalonada, CRC diferido, chunk predeterminado
+del host, solapamiento de CRC predeterminado del host, cola de GPU ligera). Sin definir o vacía conserva el
+emparejamiento anterior. La selección viaja en el campo de versión hello/plan del emparejamiento cubierto por CRC,
+sin trama ni byte adicionales; ambos ranks deben definir la misma lista o el emparejamiento se rechaza, los nombres
+desconocidos o vacíos se rechazan y la variable requiere transporte USB4. Se aplica a `strix-minimax-rank` y a la
+ruta de servicio. Con `STRIX_XPORT_TIMED_WAIT=1`, las esperas del host imprimen
+`xport host_wait owner=... wait=... class=... calls=... ns=...` en stderr. Sin definir o con cualquier valor
+distinto de `1`, el informe de espera temporizada del host permanece desactivado; solo se activa con el valor
+exacto `1`. El contador del intercambio de prefill
+antes llamado `exposed_wait` ahora es `reuse_dependencies`: cuenta aristas de eventos de reutilización de búferes,
+no tiempo transcurrido.
 
 <a id="how-fast"></a>
 

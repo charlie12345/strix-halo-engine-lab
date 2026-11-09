@@ -2998,7 +2998,7 @@ Mode 6 writes per-chunk partials and combines them in a second launch; mode 7 ru
 
 ### MSA prefill mode 8
 
-**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 8.
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 10 (mode 8 is the previous default; see [mode 10](#mm-pf-msa-mode10)).
 
 Mode 7 reduces the 16-key tile maximum through LDS; mode 8 keeps everything else of mode 7 and computes that maximum as a ds_swizzle lane tree inside the wave. Max is exact and order-free, so every score, partial and output is the same bit pattern.
 
@@ -3009,6 +3009,38 @@ Mode 7 reduces the 16-key tile maximum through LDS; mode 8 keeps everything else
 - **Off switch:** STRIX_MM_PF_MSA_REWORK=7 (previous default), =6, =5, =3, =0 (original)
 - **Measured gain:** TTFT in-process A/B vs mode 7 8K -2.6 %, 16K -0.5 %; 32K fresh process 8/7/8 + 7/8/7 -2.6 % (-1.67 s), result hash identical on both ranks.
 - **Implementation / evidence:** [kernel](../src/minimax/attn/msa_fused.hip), [tests](../src/minimax/attn/msa_fused_tests.hip)
+
+<a id="mm-pf-msa-mode10"></a>
+
+### MSA prefill mode 10
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 10.
+
+Mode 10 runs the chunk loop inside each block: the block list and the per-chunk partials are staged in LDS and combined in the same block, so no global partials buffer is written or read. Valid values are 0..10; mode 9 is a DPP diagnostic and is never selected automatically.
+
+- **Preconditions:** Supported MSA prefill shapes (as mode 8).
+- **Automatic selection:** Resolver supplies 10 only when unset; explicit values win.
+- **Fallback notice:** As mode 6.
+- **Exactness evidence:** Exact: prefill state and final-row hashes identical in every arm on both ranks.
+- **Off switch:** STRIX_MM_PF_MSA_REWORK=8 (previous default), =7, =6, =5, =3, =0 (original)
+- **Measured gain:** Not stated here.
+- **Implementation / evidence:** [kernel](../src/minimax/attn/msa_fused.hip), [tests](../src/minimax/attn/msa_fused_tests.hip)
+
+<a id="mm-usb4-caps"></a>
+
+### USB4 transport capabilities (opt-in)
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_USB4_CAPS`. **Default:** off (unset).
+
+Comma list of `streams`, `joint`, `ready`, `deferred-crc`, `chunks`, `crc-overlap`, `gpu-lean` (stream table, joint calibration, staged readiness, deferred CRC, host chunk default, host CRC overlap default, GPU queue lean). The selection travels in the CRC-covered pairing hello/plan version field, with no extra frame or byte.
+
+- **Preconditions:** USB4 transport; both ranks set the same list. Applies to `strix-minimax-rank` and the serve path.
+- **Automatic selection:** None; unset or empty keeps the previous pairing.
+- **Fallback notice:** None; a rank mismatch, an unknown or empty name, or a non-USB4 transport is refused.
+- **Exactness evidence:** Not qualified as a default; off by default.
+- **Off switch:** Leave `STRIX_MM_USB4_CAPS` unset or empty.
+- **Measured gain:** Not stated here.
+- **Implementation / evidence:** [MiniMax README](models/minimax-m3.1/README.md#minimax-pair)
 
 <a id="mm-rank-pfx"></a>
 
@@ -3716,19 +3748,20 @@ Register-blocked exact prefill linear: LDS-decoded weights reused over 64 rows, 
 
 <a id="glm-pf-obar-v5"></a>
 
-### Prefill MLA o-bar v7
+### Prefill MLA o-bar v10
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_OBAR`. **Default:** 7.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_OBAR`. **Default:** 10.
 
 Exact MLA probability-weighted latent sum (o-bar) with the same lane chains and 256-lane pairing tree as v5, placed as
 4 heads x 4 latent dims per thread: the probabilities are wave-uniform and come through scalar registers, and the latent
-is widened to f32 once per block.
+is widened to f32 once per block (v7). v10 keeps v7's k order and merge and stages the latent 2 k per batch in LDS
+(18 KB, 4 CTAs per WGP).
 
 - **Preconditions:** Exact chunked prefill, 32 MLA heads per rank (64 heads use v2).
-- **Automatic selection:** Unset resolves to 7; the engine default provides it; the resolver reports it. Explicit values win.
+- **Automatic selection:** Unset resolves to 10; the engine default provides it; the resolver reports it. Explicit values win.
 - **Fallback notice:** 64 heads run v2 (same bits); invalid explicit combinations fail.
-- **Exactness evidence:** Bitwise equal to v5 and to the decode kernel on the prefill gate (probabilities, o-bar, outputs; NaN/Inf/subnormal latents, list lengths 1..2051).
-- **Off switch:** STRIX_GLM_PF_OBAR=5 (v5) or =2 (v2)
+- **Exactness evidence:** Bitwise equal to v7, v5 and the decode kernel on the prefill gate (probabilities, o-bar, outputs; NaN/Inf/subnormal latents, list lengths 1..2051).
+- **Off switch:** STRIX_GLM_PF_OBAR=7 (v7), =5 (v5) or =2 (v2)
 - **Measured gain:** 9.0-10.2 vs 16.6-17.3 us/row per DSA layer at chunk positions 4096..28672 (6.6 vs 11.3 at 0); v5 was 2.9x v2
 - **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
 
@@ -4196,6 +4229,61 @@ Unit-file reads in flight in a three-tier open; `auto` picks 4 / 6 / 8 from the 
 - **Off switch:** `--tier-disk-queue 1`
 - **Measured gain:** Auto vs 1 at about 76 % file share (24 GiB VRAM + 32 GiB RAM) was never slower in the latest measured decode cell means: 1K cold / warm +42 / +35 %, 8K cold / warm +33 / +16 %. Earlier one-drive cells were +9..+42 % in seven of eight (remaining -3.4 % traced to drive read phases); two-drive stripes +26..+38 %. Single loads vary up to 2x, so the gain size is uncertain. At about 61 % (48 GiB + 32 GiB), one earlier night observed cold-1K decode -32 % against the queue-1 mean; warm 1K +3 %, cold 8K +7 %, warm 8K +1 %. A later set at the same budget reversed the cold-1K result: auto +8.4 % pooled, every auto arm faster. The 70 % cut remains a conservative empirical cutoff: 61 % stays at 1. Full card (about 1-4 % at tile 2048) tied in TTFT (8K +0.6..+2 %, 32K equal), so it stays at 1.
 - **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md)
+
+<a id="glm-pf-seqpar"></a>
+
+### Prefill sequence-parallel residual/mHC
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_SEQPAR` (`auto`, `1`, `0`). **Default:** `auto`.
+
+On an even prefill chunk of at least 2 rows, each rank runs the residual/mHC/norm work on half of the rows and the halves are joined by an overlapped all-gather. With pipeline depth 2 and a row count divisible by 4, each half is split into two tiles. Odd and single-row chunks use the legacy path.
+
+- **Preconditions:** World 2 with a TP2 communicator, no external exchange, no KV sharding; even chunks of at least 2 rows.
+- **Fallback notice:** `auto` declines with a reason on stderr and uses the legacy path; `1` on an ineligible run throws; ranks that resolve different policies throw.
+- **Exactness evidence:** Not stated here; this entry does not claim bitwise equality with the legacy path.
+- **Off switch:** `STRIX_GLM_PF_SEQPAR=0` (legacy path)
+- **Measured gain:** Not stated here.
+- **Implementation / evidence:** [GLM README](models/glm-5.3/README.md#glm-pair)
+
+<a id="glm-pf-scratch-route"></a>
+
+### Prefill scratch route and attention query window
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_SCRATCH` (`auto`, `full`, `routed`), `STRIX_GLM_PF_ATTN_QWIN` (`auto` or 0..65536). **Default:** `auto` / `auto`.
+
+The load admits the first prefill memory plan that fits, in this order: full scratch with full-chunk attention, routed scratch with full-chunk attention, routed scratch with a 2048-query attention window. KV sharding in AUTO is tried only after every replicated candidate fails. Startup prints the admitted plan on a `glm capacity:` line.
+
+- **Preconditions:** GLM prefill load; explicit values select that plan directly.
+- **Fallback notice:** The `glm capacity:` line reports the admitted scratch route and query window.
+- **Exactness evidence:** Host admission-matrix tests; native byte, TTFT and capacity qualification is not stated here.
+- **Off switch:** `STRIX_GLM_PF_SCRATCH=full` and `STRIX_GLM_PF_ATTN_QWIN=0` force full scratch and full-chunk attention.
+- **Measured gain:** Not stated here.
+- **Implementation / evidence:** [admission](../src/glm/prefill/glm_pf_load_admission.hpp), [GLM README](models/glm-5.3/README.md#glm-pair)
+
+<a id="glm-pf-variants"></a>
+
+### Prefill kernel variant selectors
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_*` variant variables. **Default:** the newest variant of each.
+
+| Variable suffix | Allowed values | Default |
+|---|---|---|
+| `HC` | 2, 1 | 2 |
+| `MLA` | 2, 1 | 2 |
+| `IDX` | 3, 2, 1 | 3 |
+| `SELECT` | 2, 1 | 2 |
+| `OBAR` | 10, 7, 6, 5, 4, 2 | 10 |
+| `MLA_GEMM` | 3, 2, 1 | 3 |
+| `SCORES` | 7, 6, 5, 4, 3, 2 | 7 |
+| `KDA_SCAN` | 5, 3, 1 | 5 |
+| `DENSE_ROWS` | 3, 2, 1 | 3 |
+
+- **Preconditions:** Any set value, empty included, must be in the allowed list.
+- **Fallback notice:** None; an unknown or empty value throws `ENV='v' is not a known variant (allowed: ...; unset = D)`.
+- **Exactness evidence:** See each variant's own entry.
+- **Off switch:** Set the variable to an older allowed value.
+- **Measured gain:** Not stated here.
+- **Implementation / evidence:** [variants](../src/glm/prefill/glm_pf_variants.hpp)
 
 ## Qwen RTX PRO standalone
 

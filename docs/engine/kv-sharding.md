@@ -27,7 +27,7 @@ On the two-node 128 GB APU pair over USB4, for one request at 8K context, the me
 
 ## When to use it and how it is selected
 
-The default `STRIX_GLM_KV_SHARD=auto` keeps replicated state when its startup admission passes. It selects sharding when the replicated layout does not pass admission and the sharded layout does. Startup reports the effective layout and the admission reason. Use `auto` when you want the largest admitted context without manually selecting the layout.
+Sharding is off by default (`STRIX_GLM_KV_SHARD` unset or `0`). Set `STRIX_GLM_KV_SHARD=auto` together with `STRIX_GLM_PF_PIPELINE=1` to let startup choose: `auto` keeps replicated state when its startup admission passes. It selects sharding when the replicated layout does not pass admission and the sharded layout does. Startup reports the effective layout and the admission reason. Use `auto` when you want the largest admitted context without manually selecting the layout.
 
 Set `STRIX_GLM_KV_SHARD=1` to force sharding, or `STRIX_GLM_KV_SHARD=0` to force the replicated layout. Set the same value on both ranks. Forced sharding fails startup if its required resources do not fit; forced replication fails startup when that layout does not fit.
 

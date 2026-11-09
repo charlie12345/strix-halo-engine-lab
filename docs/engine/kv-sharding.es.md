@@ -27,7 +27,7 @@ En el par de dos nodos con APU de 128 GB por USB4, con una solicitud y contexto 
 
 ## Cuándo usarlo y cómo se selecciona
 
-El valor predeterminado `STRIX_GLM_KV_SHARD=auto` conserva el estado replicado cuando supera la admisión de inicio. Selecciona la división cuando la organización replicada no supera la admisión y la dividida sí. El inicio informa de la organización efectiva y del motivo de admisión. Use `auto` si desea admitir el contexto más largo posible sin elegir manualmente la organización.
+La división está desactivada por defecto (`STRIX_GLM_KV_SHARD` sin definir o `0`). Defina `STRIX_GLM_KV_SHARD=auto` junto con `STRIX_GLM_PF_PIPELINE=1` para que el inicio elija: `auto` conserva el estado replicado cuando supera la admisión de inicio. Selecciona la división cuando la organización replicada no supera la admisión y la dividida sí. El inicio informa de la organización efectiva y del motivo de admisión. Use `auto` si desea admitir el contexto más largo posible sin elegir manualmente la organización.
 
 Establezca `STRIX_GLM_KV_SHARD=1` para forzar la división o `STRIX_GLM_KV_SHARD=0` para forzar la organización replicada. Use el mismo valor en ambos rangos. El inicio falla si la división forzada no cabe; también falla si la replicación forzada no cabe.
 

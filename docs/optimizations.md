@@ -3337,7 +3337,7 @@ GLM token sharding is a qualified FAST memory profile for one request on a two-n
 stores each node's own token blocks, preserves global top-k selection through exchanged score
 keys, and merges the FP32 attention partials in fixed rank order. Because this changes summation
 order, its declared numerical identity differs from the default bitwise exact replicated profile.
-`STRIX_GLM_KV_SHARD=auto` is the default: startup selects sharding only when replicated-state
+Sharding is off by default (`STRIX_GLM_KV_SHARD` unset = `0`). With `STRIX_GLM_KV_SHARD=auto` startup selects sharding only when replicated-state
 admission fails and sharded admission succeeds. `=1` forces sharding; `=0` forces replication.
 The current scope requires `STRIX_GLM_PF_PIPELINE=1`, one request, chunked prefill and no MTP
 or speculation. See the [KV storage and GLM token sharding guide](engine/kv-sharding.md) for

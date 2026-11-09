@@ -14,8 +14,8 @@ en sí: [dos nodos por USB4](../../pair.es.md).
 
 ## Ejecución: el par
 
-La división de GLM por tokens es un perfil FAST de memoria calificado. El valor predeterminado
-`STRIX_GLM_KV_SHARD=auto` selecciona la división solo si falla la admisión de inicio del estado
+La división de GLM por tokens es un perfil FAST de memoria calificado. Está desactivada por defecto;
+`STRIX_GLM_KV_SHARD=auto` (con `STRIX_GLM_PF_PIPELINE=1`) selecciona la división solo si falla la admisión de inicio del estado
 replicado; `=1` fuerza la división y `=0` fuerza la replicación. Exige una solicitud,
 `STRIX_GLM_PF_PIPELINE=1`, prefill por chunks y ausencia de MTP o especulación. FAST cambia el
 orden de suma, por lo que no es bit a bit igual al perfil exacto replicado predeterminado.

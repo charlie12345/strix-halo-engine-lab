@@ -13,8 +13,8 @@ read and what "exact" covers: [methodology](../../methodology.md). Build instruc
 
 ## Run: the pair
 
-Optional GLM token sharding is a qualified FAST memory profile. `STRIX_GLM_KV_SHARD=auto`
-is the default and selects sharding only when replicated-state startup admission fails;
+Optional GLM token sharding is a qualified FAST memory profile. It is off by default; `STRIX_GLM_KV_SHARD=auto`
+(with `STRIX_GLM_PF_PIPELINE=1`) selects sharding only when replicated-state startup admission fails;
 `=1` forces sharding and `=0` forces replication. It requires one request,
 `STRIX_GLM_PF_PIPELINE=1`, chunked prefill and no MTP or speculation. FAST sharding changes
 the summation order, so it is not bitwise equal to the default replicated exact profile.

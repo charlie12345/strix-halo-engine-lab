@@ -83,6 +83,17 @@ __device__ __forceinline__ void transform_block_at(const float* x, const std::ui
 #pragma unroll
     for (int j = 0; j < 4; ++j) out[obegin + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
 }
+// Same transform, returning the four per-lane values in registers (no store).
+__device__ __forceinline__ void transform_values(const float* x, const std::uint16_t* suh,
+                                                unsigned begin, unsigned lane, float (&v)[4]) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const unsigned c = begin + lane + 32U * static_cast<unsigned>(j);
+        const float scaled = materialize(x[c] * half_bits(suh[c]));
+        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
+    }
+    hadamard128(v, lane);
+}
 
 // ---------------------------------------------------------------- mul1 decode (packed_decoder.hpp, qualified bitwise
 // against trellis_optimized.hpp mul1_half2)

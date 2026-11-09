@@ -435,6 +435,8 @@ if(BUILD_TESTING)
         add_test(NAME strix-glm-dsa-policy-identity-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/glm_dsa_policy_identity_tests.py)
         set_tests_properties(strix-glm-dsa-policy-identity-tests PROPERTIES LABELS "cpu;glm;kvshard;identity")
+        add_test(NAME strix-glm-trellis-identity-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/glm_trellis_identity_tests.py)
     endif()
     target_link_libraries(strix-xport-kvshard-oracle-tests PRIVATE strix_xport)
     target_compile_features(strix-xport-kvshard-oracle-tests PRIVATE cxx_std_17)

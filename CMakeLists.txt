@@ -2188,6 +2188,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     add_compile_options("$<$<COMPILE_LANGUAGE:HIP>:SHELL:-isystem ${STRIX_HIP_INCLUDE_DIR}>")
 
     if(BUILD_TESTING)
+        add_executable(strix-moe-mul1-pair-decode-tests tests/moe_mul1_pair_decode_tests.hip)
+        target_include_directories(strix-moe-mul1-pair-decode-tests PRIVATE src)
+        set_target_properties(strix-moe-mul1-pair-decode-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        target_compile_options(strix-moe-mul1-pair-decode-tests PRIVATE
+            -Wsign-conversion -Wshadow -Werror -Wrange-loop-construct -ffp-contract=off -fno-fast-math)
+        add_test(NAME strix-moe-mul1-pair-decode-tests COMMAND strix-moe-mul1-pair-decode-tests)
+        set_tests_properties(strix-moe-mul1-pair-decode-tests PROPERTIES LABELS "cpu;moe;exactness")
         # Some HIP SDKs reject RDNA wave64 at preprocessing time. Test that
         # fallback only when the installed SDK supports building it.
         include(CMakePushCheckState)

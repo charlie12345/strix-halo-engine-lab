@@ -1,5 +1,7 @@
 #pragma once
 
+#include <type_traits>
+
 #include "../../moe_core/exl3_trellis.hpp"
 #include "../../moe_core/decode_schedule.hpp"
 #include "mmx_moe.hpp"
@@ -7,6 +9,12 @@
 namespace strix::minimax::moe::opt {
 
 template <int Bits> using WeightDecode = strix::moe_core::Exl3Trellis<Bits>;
+
+// Host dispatch selects a policy on the existing grouped PAIR/PIPE kernels.
+template <bool Packed> struct MinimaxPrefillTraits {
+    template <int Bits> using Decode = std::conditional_t<Packed, strix::moe_core::Mul1PairDecode<Bits>,
+                                                         strix::moe_core::ScalarDecode<Bits>>;
+};
 
 // C1's Args, LDS vector and device operations stay private to the translation
 // unit. This contract supplies the shared Decode family with MiniMax geometry;

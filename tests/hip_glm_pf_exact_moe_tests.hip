@@ -59,6 +59,14 @@ void rcap_env(const char* value) {
 #endif
         throw std::runtime_error("setting v3 row buckets");
 }
+void in_token_env(const char* value) {
+#ifdef _WIN32
+    if (_putenv_s("STRIX_GLM_PF_IN_TOKEN", value ? value : "") != 0)
+#else
+    if ((value ? setenv("STRIX_GLM_PF_IN_TOKEN", value, 1) : unsetenv("STRIX_GLM_PF_IN_TOKEN")) != 0)
+#endif
+        throw std::runtime_error("setting token-ordered input transform");
+}
 struct Arena {
     std::vector<void*> p;
     ~Arena() { for (void* v : p) (void)hipFree(v); }
@@ -355,7 +363,38 @@ struct Fixture {
         const bool pair_pass = equal32(pr, pairs, name + " device-plan pair-output");
         const bool at_pass = at == ar;
         check(at_pass, name + " device-plan down-input FP16");
-        return plan_same && out_pass && gu_pass && pair_pass && at_pass;
+        // Token-ordered gate/up input transform (STRIX_GLM_PF_IN_TOKEN=1): the FP16 operand rows of every pair in the
+        // plan, and every downstream output, equal the tile-ordered transform's bytes.
+        const std::size_t ni = std::size_t{R} * (Top + 1U) * 2U * H;
+        std::vector<std::uint16_t> in_ref(ni), in_tok(ni);
+        ok(hipMemcpy(in_ref.data(), X::pair_gate_up_input(ws, MaxR, 0), ni * 2, hipMemcpyDeviceToHost), "device gate/up input");
+        in_token_env("1");
+        bool tok_pass = false;
+        try {
+            ok(hipMemsetAsync(ws, 0xff, wsb, stream), "token poison workspace");
+            ok(hipMemsetAsync(out, 0xff, std::size_t{MaxR} * H * 4, stream), "token poison output");
+            ok(hipMemsetAsync(flag, 0, 4, stream), "flag");
+            X::enqueue_device(dv, plan, ws, wsb, stream, flag);
+            ok(hipStreamSynchronize(stream), "device plan token-ordered input");
+            ok(hipMemcpy(in_tok.data(), X::pair_gate_up_input(ws, MaxR, 0), ni * 2, hipMemcpyDeviceToHost), "token gate/up input");
+            ok(hipMemcpy(y.data(), out, y.size() * 4, hipMemcpyDeviceToHost), "token out");
+            ok(hipMemcpy(gu.data(), X::pair_gate_up(ws, MaxR, 0), gu.size() * 4, hipMemcpyDeviceToHost), "token gate/up");
+            ok(hipMemcpy(at.data(), X::pair_down_input(ws, MaxR, 0), at.size() * 2, hipMemcpyDeviceToHost), "token at");
+            std::size_t in_mismatch = 0;
+            for (unsigned r = 0; r < R; ++r)
+                for (unsigned k = 0; k <= Top; ++k) {
+                    const std::size_t o = (std::size_t{r} * (Top + 1U) + k) * 2U * H;
+                    if (std::memcmp(in_ref.data() + o, in_tok.data() + o, 2U * H * 2) != 0) ++in_mismatch;
+                }
+            tok_pass = in_mismatch == 0 && equal32(yr, y, name + " token-input R16") && equal32(gr, gu, name + " token-input gate/up") && at == ar;
+            check(in_mismatch == 0, name + " token-ordered gate/up input FP16 == tile-ordered (" + std::to_string(in_mismatch) + " pair rows differ)");
+            check(tok_pass, name + " token-ordered input: outputs equal");
+        } catch (...) {
+            in_token_env(nullptr);
+            throw;
+        }
+        in_token_env(nullptr);
+        return plan_same && out_pass && gu_pass && pair_pass && at_pass && tok_pass;
     }
     // Invalid ids (duplicate within a row, id >= 288) on the device plan set the flag instead of throwing.
     void device_invalid(std::mt19937& rng) {

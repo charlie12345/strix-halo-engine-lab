@@ -65,6 +65,7 @@ const Tile* plan_groups(void* workspace, unsigned max_rows);  // [289]
 bool device_plan(unsigned rows, unsigned tm = 0);
 void enqueue_device(const DeviceView& v, Plan& plan, void* workspace, std::size_t bytes, hipStream_t stream, unsigned* flag);
 const std::uint16_t* pair_down_input(void* workspace, unsigned max_rows, unsigned pair);
+const std::uint16_t* pair_gate_up_input(void* workspace, unsigned max_rows, unsigned pair); // [2][H] FP16 gate/up operand rows
 const float* pair_gate_up(void* workspace, unsigned max_rows, unsigned pair); // [2][1024]
 const std::uint16_t* pair_gate_up_input(void* workspace, unsigned max_rows, unsigned pair); // [2][4096], V2+
 const float* pair_output(void* workspace, unsigned max_rows, unsigned pair);

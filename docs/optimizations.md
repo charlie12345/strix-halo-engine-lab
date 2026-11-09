@@ -3369,6 +3369,18 @@ epilogue; other routes retain their existing combine. There is no separate fallb
 local guard; effective config reports the selector. OFF: `STRIX_GLM_PF_AUX_COMBINE=0` restores the
 separate combine; baseline sets `0`. No new timing qualification is claimed here.
 
+<a id="glm-pf-in-token"></a>
+### Prefill token-ordered MoE input transform (`STRIX_GLM_PF_IN_TOKEN`)
+
+Opt-in `1` runs the grouped MoE gate/up input transform (suh sign scale + Hadamard-128 to FP16 operand rows) in
+token order: one CTA per (row, 1024-channel chunk) loads each x value once and writes the same FP16 rows for the
+row's eight routed experts x two matrices and the shared expert. The default tile-ordered kernel reads the row once
+per (pair, matrix), 18 times, from an x buffer that is not cache resident at 8K. Device plan only (the host plan
+keeps the tile-ordered kernel); rows the device plan rejects get only their shared-expert rows, as before. Same
+operations in the same order, so the operand rows and every downstream output are bitwise equal (test:
+`strix-hip-glm5-pf-exact-moe-tests`, device-plan arm). OFF: unset or `0`. Timing qualification: see
+`wave4/pfwhy/glm-exactfuse-log.md` in the lab notes; no production default change is claimed until it is measured.
+
 <a id="glm-pf-scratch"></a>
 ### Prefill scratch capacity (`STRIX_GLM_PF_SCRATCH`)
 

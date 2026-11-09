@@ -144,6 +144,42 @@ inline unsigned layer_end(unsigned begin, unsigned budget, unsigned layers) {
 }
 inline bool fp32_profile(const char* value) { return value != nullptr && std::string_view(value) == "fp32"; }
 inline std::size_t append_rows(std::size_t remaining) { return remaining >= 32 ? 32 : std::min<std::size_t>(8, remaining); }
+// Weight ownership and launch selection share this policy. The packed kernel's
+// ring/LDS/tile subroutes below all consume the same packed layout.
+struct IndexProjection { bool attn = true, tiled = true, decode = true; };
+enum class IndexLayout : unsigned { fp32_transposed = 1, fp16_transposed = 2, fp16_block = 4, packed = 8 };
+constexpr unsigned index_layout_bit(IndexLayout layout) { return static_cast<unsigned>(layout); }
+inline IndexProjection resolve_index_projection(const char* mode, bool decode) {
+    const std::string_view value = mode == nullptr ? "attn" : mode;
+    if (value != "attn" && value != "tiled" && value != "off")
+        throw std::invalid_argument("STRIX_MM_INDEX_PROJ must be attn, tiled or off");
+    return {value == "attn", value != "off", decode};
+}
+constexpr IndexLayout index_projection_route(IndexProjection policy, std::size_t rows) {
+    return policy.attn ? IndexLayout::packed : !policy.tiled ? IndexLayout::fp32_transposed :
+           rows <= 8 && policy.decode ? IndexLayout::fp16_block : IndexLayout::fp16_transposed;
+}
+constexpr unsigned index_projection_layouts(IndexProjection policy) {
+    // Both decode/verify (1..8) and prompt (>8) must be available after load.
+    return index_layout_bit(index_projection_route(policy, 1)) | index_layout_bit(index_projection_route(policy, 9));
+}
+constexpr unsigned kAllIndexLayouts = 15;
+constexpr std::uint64_t index_weight_bytes(unsigned layouts, unsigned hidden, unsigned query, unsigned key, unsigned layers) {
+    const unsigned bytes = ((layouts & index_layout_bit(IndexLayout::fp32_transposed)) ? 4U : 0U) +
+                           ((layouts & index_layout_bit(IndexLayout::fp16_transposed)) ? 2U : 0U) +
+                           ((layouts & index_layout_bit(IndexLayout::fp16_block)) ? 2U : 0U) +
+                           ((layouts & index_layout_bit(IndexLayout::packed)) ? 2U : 0U);
+    return std::uint64_t{hidden} * (std::uint64_t{query} + key) * layers * bytes;
+}
+inline void require_index_layouts(unsigned loaded, unsigned needed) {
+    if ((loaded & needed) != needed)
+        throw std::logic_error("MiniMax index projection: required weight layout not loaded; select STRIX_MM_INDEX_PROJ "
+                               "and STRIX_MM_INDEX_DECODE before load() and reload the engine");
+}
+inline void admit_index_weights(std::uint64_t available, std::uint64_t needed) {
+    if (available < needed)
+        throw std::runtime_error("MiniMax index projection: insufficient device memory for selected weight layouts");
+}
 struct IndexRoute { unsigned ring, rows_per_wave; bool lds, tiled; };
 inline IndexRoute index_route(unsigned rows, unsigned ring, unsigned split, unsigned lds) {
     return {ring != 0 ? ring : rows == 1 ? 32U : 16U, rows > 2 ? split : 0U,

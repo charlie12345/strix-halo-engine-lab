@@ -364,7 +364,7 @@ struct Layer {
     mmoe::ExpertSlices rdense{};
     _Float16 *wiq16 = nullptr, *wik16 = nullptr;
     _Float16 *wiq16b = nullptr, *wik16b = nullptr;
-    _Float16* wip = nullptr;  // packed index projection (pack_index_proj layout) // block-major [ob][i][32] copies for the decode kernel // the same index projections, F16 (STRIX_MM_INDEX_PROJ=tiled)
+    _Float16* wip = nullptr;  // packed index projection (pack_index_proj layout); only the selected layouts are resident
     float *wiq = nullptr, *wik = nullptr, *norm[4] = {}, *w_post = nullptr, *w_next = nullptr, *wr = nullptr, *wb = nullptr;
     bool moe = false;
     Mlp dense, shared;
@@ -489,6 +489,12 @@ struct Engine::Impl {
     bool index_attn = true;  // STRIX_MM_INDEX_PROJ (runtime; default attn = index_proj, decode and prefill)
     bool index_decode = true;  // STRIX_MM_INDEX_DECODE (runtime, default 1; =0: tiled dense_t form): decode rows on index_proj_decode_kernel
     bool index_tiled = true;  // STRIX_MM_INDEX_PROJ (runtime; default tiled, =off: dense_t): index q/k projections, token-tiled, F16 weights
+    unsigned index_layouts_loaded = 0;
+    bool index_weights_ready = false;
+
+    void require_index_policy(route::IndexProjection policy) const {
+        if (index_weights_ready) route::require_index_layouts(index_layouts_loaded, route::index_projection_layouts(policy));
+    }
     bool attn_prefill_fused = true;  // STRIX_MM_ATTN_PREFILL (runtime; default fused, =off: K1-K4): prefill MSA in fused 16-row windows
     bool pf_idx_tile = false;
     unsigned pf_msa_scratch_mb = 1152;  // STRIX_MM_PF_MSA_SCRATCH_MB: prefill MSA window scratch cap (former 512)
@@ -615,9 +621,11 @@ struct Engine::Impl {
         shared_first = env_flag("STRIX_MM_SHARED_FIRST", false);
         const char* at = std::getenv("STRIX_MM_ATTN");
         attn_fused = at == nullptr || std::string(at) != "off";  // ON by default (measurement: bitwise, ABA x3 never slower); =off
-        const char* ip = std::getenv("STRIX_MM_INDEX_PROJ");
-        index_attn = ip == nullptr || std::string(ip) == "attn";  // default (measurement: same tokens, decode -7.9 %, TTFT -2 %); =tiled|off
-        index_tiled = ip == nullptr || std::string(ip) != "off";  // ON by default (measurement: bitwise, TTFT -6 %, decode -9.6 %); =off
+        const auto index_policy = route::resolve_index_projection(std::getenv("STRIX_MM_INDEX_PROJ"),
+                                                                 env_flag("STRIX_MM_INDEX_DECODE", true));
+        index_attn = index_policy.attn;
+        index_tiled = index_policy.tiled;
+        index_decode = index_policy.decode;
         index_conc = env_flag("STRIX_MM_INDEX_CONC", true);  // ON (measurement: ids identical, 17/18 in-process block pairs faster, ~-0.2 ms/token); =0
         attend_diet = env_flag("STRIX_MM_ATTEND_DIET", true);  // ON on the N2/W1 sparse >= 8K grids only (t9: exact, 8K 83.9 -> 76.2 us); =0
         attend4_decode = env_flag("STRIX_MM_ATTEND4_DECODE", true);  // ON on the same grids (t12: exact, 8K 78.6 -> 75.2 us); =0
@@ -641,7 +649,6 @@ struct Engine::Impl {
         }
         if (const char* wm = std::getenv("STRIX_MM_XB_WARM")) xb_warm_mb = static_cast<unsigned>(std::strtoul(wm, nullptr, 10));
         if (const char* wo = std::getenv("STRIX_MM_XB_WARM_O")) xb_warm_o_mb = static_cast<unsigned>(std::strtoul(wo, nullptr, 10));
-        index_decode = env_flag("STRIX_MM_INDEX_DECODE", true);  // ON by default (measurement: same tokens, decode 129.4 -> 55.4 ms/token); =0
         const char* apf = std::getenv("STRIX_MM_ATTN_PREFILL");
         attn_prefill_fused = apf == nullptr || std::string(apf) != "off";  // ON by default (measurement: bitwise, TTFT -5.5 %); =off
         if (const char* rework = std::getenv("STRIX_MM_PF_MSA_REWORK")) {
@@ -730,6 +737,15 @@ struct Engine::Impl {
 
     LoadReport load() {
         const auto t0 = Clock::now();
+        const unsigned layouts = route::index_projection_layouts({index_attn, index_tiled, index_decode});
+        const auto needs = [layouts](route::IndexLayout layout) { return (layouts & route::index_layout_bit(layout)) != 0; };
+        const auto index_bytes = route::index_weight_bytes(layouts, kHidden, kIdxLocal, 128, kLayers);
+        const auto index_saved = route::index_weight_bytes(route::kAllIndexLayouts, kHidden, kIdxLocal, 128, kLayers) - index_bytes;
+        std::size_t index_free = 0, index_total = 0;
+        hip_ok(hipMemGetInfo(&index_free, &index_total), "index weight admission");
+        route::admit_index_weights(index_free, index_bytes);
+        std::printf("mm rank %u: index weight layouts 0x%x, %llu bytes, saved %.6f GiB\n", opt.rank, layouts,
+                    static_cast<unsigned long long>(index_bytes), static_cast<double>(index_saved) / 1073741824.0);
         static const char* const kMlp[3] = {"gate_proj", "up_proj", "down_proj"};
         static const char* const kExp[3] = {"w1", "w3", "w2"};
         const std::uint32_t rank = opt.rank;
@@ -762,31 +778,39 @@ struct Engine::Impl {
             const auto wiq_all = pack.floats(a + "index_q_proj.weight");  // [512][6144]
             const std::vector<float> wiq_mine(wiq_all.begin() + rank * kIdxLocal * kHidden,
                                               wiq_all.begin() + (rank + 1) * kIdxLocal * kHidden);
-            const auto wiq_t = transpose_f(wiq_mine, kIdxLocal, kHidden);
-            const auto wik_t = transpose_f(pack.floats(a + "index_k_proj.weight"), 128, kHidden);
-            y.wiq = dupload(wiq_t);
-            y.wik = dupload(wik_t);
-            auto to16 = [](const std::vector<float>& f) {  // exact: the values are F16 in the file
-                std::vector<_Float16> h16(f.size());
-                for (std::size_t i = 0; i < f.size(); ++i) h16[i] = static_cast<_Float16>(f[i]);
-                return h16;
-            };
-            y.wiq16 = dupload(to16(wiq_t));
-            y.wik16 = dupload(to16(wik_t));
-            auto block_major = [](const std::vector<float>& t, std::size_t d, std::size_t n) {  // [d][n] -> [n/32][d][32]
-                std::vector<_Float16> b(t.size());
-                for (std::size_t ob = 0; ob < n / kDecOut; ++ob)
-                    for (std::size_t i = 0; i < d; ++i)
-                        for (std::size_t j = 0; j < kDecOut; ++j)
-                            b[(ob * d + i) * kDecOut + j] = static_cast<_Float16>(t[i * n + ob * kDecOut + j]);
-                return b;
-            };
-            {
-                const auto wik_rows = pack.floats(a + "index_k_proj.weight");  // [128][6144]
+            const auto wik_rows = pack.floats(a + "index_k_proj.weight");  // [128][6144]
+            if (needs(route::IndexLayout::packed))
                 y.wip = dupload(strix::minimax::attn::pack_index_proj(wiq_mine.data(), wik_rows.data()));
+            if (needs(route::IndexLayout::fp32_transposed) || needs(route::IndexLayout::fp16_transposed) ||
+                needs(route::IndexLayout::fp16_block)) {
+                const auto wiq_t = transpose_f(wiq_mine, kIdxLocal, kHidden);
+                const auto wik_t = transpose_f(wik_rows, 128, kHidden);
+                if (needs(route::IndexLayout::fp32_transposed)) {
+                    y.wiq = dupload(wiq_t);
+                    y.wik = dupload(wik_t);
+                }
+                auto to16 = [](const std::vector<float>& f) {  // exact: the values are F16 in the file
+                    std::vector<_Float16> h16(f.size());
+                    for (std::size_t i = 0; i < f.size(); ++i) h16[i] = static_cast<_Float16>(f[i]);
+                    return h16;
+                };
+                if (needs(route::IndexLayout::fp16_transposed)) {
+                    y.wiq16 = dupload(to16(wiq_t));
+                    y.wik16 = dupload(to16(wik_t));
+                }
+                auto block_major = [](const std::vector<float>& t, std::size_t d, std::size_t n) {  // [d][n] -> [n/32][d][32]
+                    std::vector<_Float16> b(t.size());
+                    for (std::size_t ob = 0; ob < n / kDecOut; ++ob)
+                        for (std::size_t i = 0; i < d; ++i)
+                            for (std::size_t j = 0; j < kDecOut; ++j)
+                                b[(ob * d + i) * kDecOut + j] = static_cast<_Float16>(t[i * n + ob * kDecOut + j]);
+                    return b;
+                };
+                if (needs(route::IndexLayout::fp16_block)) {
+                    y.wiq16b = dupload(block_major(wiq_t, kHidden, kIdxLocal));
+                    y.wik16b = dupload(block_major(wik_t, kHidden, 128));
+                }
             }
-            y.wiq16b = dupload(block_major(wiq_t, kHidden, kIdxLocal));
-            y.wik16b = dupload(block_major(wik_t, kHidden, 128));
             const char* names[4] = {"q_norm", "k_norm", "index_q_norm", "index_k_norm"};
             for (int i = 0; i < 4; ++i) y.norm[i] = dupload(pack.floats(a + names[i] + ".weight"));
             y.w_post = dupload(pack.floats(lp + "post_attention_layernorm.weight"));
@@ -840,6 +864,10 @@ struct Engine::Impl {
         hip_ok(hipMemGetInfo(&fr, &tot), "meminfo");
         r.device_gib = static_cast<double>(tot - fr) / 1073741824.0;
         r.direct_io = env_flag("STRIX_MM_LOAD_DIRECT", true);
+        r.index_weight_bytes = index_bytes;
+        r.index_weight_saved_bytes = index_saved;
+        index_layouts_loaded = layouts;
+        index_weights_ready = true;
         return r;
     }
 
@@ -1436,8 +1464,10 @@ struct Engine::Impl {
         {
             const bool f32 = fp32_prefill && !gemv;  // FP32 prefill identity
             const Layer& y = layers[L];
+            const auto index_route = route::index_projection_route({index_attn, index_tiled, index_decode}, n);
+            route::require_index_layouts(index_layouts_loaded, route::index_layout_bit(index_route));
             const bool lin_opt = gemv && linears_opt;  // decode linears on enqueue_linears (strix_gemv bits)
-            const bool conc = index_attn && (gemv ? index_conc && !f32 : pf_idx_conc != 0);  // same kernels and bits, side stream
+            const bool conc = index_route == route::IndexLayout::packed && (gemv ? index_conc && !f32 : pf_idx_conc != 0);
             const strix::minimax::attn::IndexProjView ipv{hn, y.wip, iq, ik, static_cast<std::uint32_t>(n)};
             const std::size_t ie = pf_idx_member * kLayers + L;
             // hn belongs to this chunk; q/k/v only read it. Join below precedes
@@ -1499,16 +1529,16 @@ struct Engine::Impl {
             if (conc) {
                 strix::minimax::attn::index_proj_join(nullptr, idx_side,
                     gemv ? idx_join[L] : pf_idx_conc == 2 ? pf_idx_join_device[ie] : pf_idx_join[ie]);
-            } else if (index_attn) {  // The one-launch projection (decode register ring / prefill tiles), same bits
+            } else if (index_route == route::IndexLayout::packed) {  // decode register ring / prefill tiles, same bits
                 strix::minimax::attn::enqueue_index_proj(ipv, nullptr);
-            } else if (index_tiled && n <= 8 && index_decode) {
+            } else if (index_route == route::IndexLayout::fp16_block) {
                 hipLaunchKernelGGL(index_proj_decode_kernel, dim3(kIdxLocal / kDecOut + 128 / kDecOut), dim3(256), 0, nullptr, hn, y.wiq16b, iq,
                                    kIdxLocal, y.wik16b, ik, 128U, kHidden, static_cast<unsigned>(n));
-            } else if (index_tiled && n <= 8) {
+            } else if (index_route == route::IndexLayout::fp16_transposed && n <= 8) {
                 const auto nn = static_cast<unsigned>(n);
                 hipLaunchKernelGGL(dense_t16_kernel<8>, dim3(1, kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq16, iq, kHidden, kIdxLocal, nn);
                 hipLaunchKernelGGL(dense_t16_kernel<8>, dim3(1, 1), dim3(128), 0, nullptr, hn, y.wik16, ik, kHidden, 128U, nn);
-            } else if (index_tiled) {
+            } else if (index_route == route::IndexLayout::fp16_transposed) {
                 const auto nn = static_cast<unsigned>(n), gx = (nn + 15) / 16;
                 hipLaunchKernelGGL(dense_t16_kernel<16>, dim3(gx, kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq16, iq, kHidden, kIdxLocal, nn);
                 hipLaunchKernelGGL(dense_t16_kernel<16>, dim3(gx, 1), dim3(128), 0, nullptr, hn, y.wik16, ik, kHidden, 128U, nn);
@@ -2908,11 +2938,17 @@ void Engine::set_prefill_attend4(bool on) {
 bool Engine::prefill_attend4() const { return impl_->pf_attend4; }
 void Engine::set_index_tiled(bool on) {
     impl_->no_task("set_index_tiled");
+    impl_->require_index_policy({impl_->index_attn, on, impl_->index_decode});
     impl_->index_tiled = on;
 }
-void Engine::set_index_decode(bool on) { impl_->index_decode = on; }
+void Engine::set_index_decode(bool on) {
+    impl_->no_task("set_index_decode");
+    impl_->require_index_policy({impl_->index_attn, impl_->index_tiled, on});
+    impl_->index_decode = on;
+}
 void Engine::set_index_attn(bool on) {
     impl_->no_task("set_index_attn");
+    impl_->require_index_policy({on, impl_->index_tiled, impl_->index_decode});
     impl_->index_attn = on;
 }
 void Engine::set_prefill_index_concurrent(int mode) {

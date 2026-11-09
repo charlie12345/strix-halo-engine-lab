@@ -2139,6 +2139,50 @@
   },
   {
     "engine": "glm",
+    "name": "Prefill sequence parallel ownership",
+    "flag_or_env": "STRIX_GLM_PF_SEQPAR",
+    "default": "auto",
+    "exact": "Row ownership organization; no kernel arithmetic change in this fix. Device exactness gates remain required.",
+    "gain": "No new timing claim.",
+    "preconditions": "Ordinary TP2 replicated ownership, internal communicator, pipeline-capable GEMV Tier B prefill and max_rows >= 2. Auto falls back to legacy with seqpar auto declined: <reason>; explicit 1 may refuse. Installed decisions must agree across ranks.",
+    "off_switch": "STRIX_GLM_PF_SEQPAR=0; baseline sets 0; restart both ranks",
+    "doc_anchor": "docs/optimizations.md#glm-pf-seqpar"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill auxiliary combine",
+    "flag_or_env": "STRIX_GLM_PF_AUX_COMBINE",
+    "default": "1",
+    "exact": "Exact MoE auxiliary epilogue organization; no new qualification asserted here.",
+    "gain": "No new timing claim.",
+    "preconditions": "Exact MoE epilogue required; other routes retain their existing combine. No separate local-guard fallback notice; effective config reports the selector.",
+    "off_switch": "STRIX_GLM_PF_AUX_COMBINE=0 restores separate combine; baseline sets 0; restart both ranks",
+    "doc_anchor": "docs/optimizations.md#glm-pf-aux-combine"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill scratch capacity",
+    "flag_or_env": "STRIX_GLM_PF_SCRATCH",
+    "default": "auto",
+    "exact": "Storage organization; kernel arithmetic unchanged.",
+    "gain": "Capacity fallback only; no new timing claim.",
+    "preconditions": "Joint rank capacity admission tries full then routed scratch. Candidate/refusal and selected-layout notices state layout and reason; exhausted candidates refuse startup. Inspection reports initial layout and pending admission.",
+    "off_switch": "STRIX_GLM_PF_SCRATCH=full pins original arena; baseline sets full; restart both ranks",
+    "doc_anchor": "docs/optimizations.md#glm-pf-scratch"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill attention query window",
+    "flag_or_env": "STRIX_GLM_PF_ATTN_QWIN",
+    "default": "auto",
+    "exact": "Query staging organization; attention mathematics unchanged.",
+    "gain": "Capacity fallback only; no new timing claim.",
+    "preconditions": "Joint rank capacity admission tries full-query-chunk candidates before a 2048-row query window. Candidate/refusal and selected-layout notices state window and reason; exhausted candidates refuse startup. Inspection reports initial layout and pending admission.",
+    "off_switch": "STRIX_GLM_PF_ATTN_QWIN=0 pins original full query chunk; baseline sets 0; restart both ranks",
+    "doc_anchor": "docs/optimizations.md#glm-pf-attn-qwin"
+  },
+  {
+    "engine": "glm",
     "name": "Exact chunked prefill",
     "flag_or_env": "--prefill auto",
     "default": "auto",

@@ -4,6 +4,8 @@
 // -fno-gpu-flush-denormals-to-zero.
 #include "glm/prefill/glm_prefill.hpp"
 #include "glm/prefill/glm_pf_variants.hpp"
+#include "glm/prefill/glm_pf_workspace.hpp"
+#include "glm/prefill/glm_pf_aux.hpp"
 
 #include <cstdlib>
 #include <cstdio>
@@ -323,13 +325,21 @@ __global__ __launch_bounds__(128) void kda_out_rows_kernel(KdaDev k, const float
 
 // ---------------------------------------------------------------- DSA append
 // dsa_store_kernel without the pooling (row-parallel: the pool reads other rows), position t0 + r.
+template<bool Norm = false>
 __global__ __launch_bounds__(128) void dsa_store_rows_kernel(DsaSlot sl, unsigned t0, const float* latent, IndexerDev w,
                                                              const float* key, const float* gs, unsigned* flag,
-                                                             bool kv_shard, unsigned rank) {
+                                                             bool kv_shard, unsigned rank, const std::uint16_t* latent_norm = nullptr) {
     __shared__ float s[128];
     const unsigned r = blockIdx.x, i = threadIdx.x, global = t0 + r;
     if (kv_shard && (global / kKpool) % 2 != rank) return;
     const unsigned t = kv_shard ? (global / (2 * kKpool)) * kKpool + global % kKpool : global;
+    float latent_rr = 1.0F;
+    if constexpr (Norm) {
+        const float* xr = latent + static_cast<std::size_t>(r) * kKvLora;
+        const float part = aux::norm_pair(xr, kKvLora, i,
+            [] __host__ __device__ (float a, float b, float c) { return __builtin_fmaf(a, b, c); });
+        latent_rr = inv_sqrt(lds_tree<128>(s, part) / static_cast<float>(kKvLora) + kEps);
+    }
     const float k = key[static_cast<std::size_t>(r) * kIdxDim + i];
     const float mu = lds_tree<128>(s, 0.0F + k) / static_cast<float>(kIdxDim);
     const float d = k - mu;
@@ -341,7 +351,9 @@ __global__ __launch_bounds__(128) void dsa_store_rows_kernel(DsaSlot sl, unsigne
     sl.ikey[static_cast<std::size_t>(t) * kIdxDim + i] = kb;
     sl.igate[static_cast<std::size_t>(t) * kIdxDim + i] = gb;
     for (unsigned l = i; l < kKvLora; l += 128) {
-        const std::uint16_t lb = float_to_bf16(latent[static_cast<std::size_t>(r) * kKvLora + l]);
+        float lv = latent[static_cast<std::size_t>(r) * kKvLora + l];
+        if constexpr (Norm) lv = (lv * latent_rr) * bf16_to_float(latent_norm[l]);
+        const std::uint16_t lb = float_to_bf16(lv);
         if (!bf16_is_finite(lb)) atomicOr(flag, 1U);
         sl.latent[static_cast<std::size_t>(t) * kKvLora + l] = lb;
     }
@@ -2198,24 +2210,24 @@ struct DenseGroupArgs {
     unsigned o0[kDenseGroupMax], n[kDenseGroupMax], first[kDenseGroupMax + 1];  // first[p] = first column block of p
     unsigned count;
 };
-template <unsigned RT, unsigned C, dev::WType WT>
+template <unsigned RT, unsigned C, dev::WType WT, unsigned NP = 1>
 __global__ __launch_bounds__(C * 4) void dense_rows_v3_kernel(const float* x, unsigned in, unsigned rows, DenseGroupArgs g) {
     constexpr unsigned K = 32, NT = C * 4, RI = RT / 16;
     static_assert(RI == 2 || RI == 4 || RI == 8, "dense v3 row tile");
     __shared__ alignas(16) float as[K][RT + 4];
     __shared__ alignas(16) float ws[K][C + 4];
-    unsigned p = 0;
-    while (p + 1 < g.count && blockIdx.y >= g.first[p + 1]) ++p;
-    const void* w = g.w[p];
-    float* y = g.y[p];
-    const unsigned o0 = g.o0[p], n = g.n[p];
+    unsigned first_p = 0;
+    if constexpr (NP == 1)
+        while (first_p + 1 < g.count && blockIdx.y >= g.first[first_p + 1]) ++first_p;
     const unsigned tid = threadIdx.x, tr = tid / (C / 4), tc = tid % (C / 4);
-    const unsigned r0 = blockIdx.x * RT, c0 = (blockIdx.y - g.first[p]) * C;
-    float acc[RI][4];
+    const unsigned r0 = blockIdx.x * RT, c0 = (NP == 1 ? blockIdx.y - g.first[first_p] : blockIdx.y) * C;
+    float acc[NP][RI][4];
+    const unsigned projections = NP == 1 ? 1U : g.count;
+    for (unsigned pp = 0; pp < projections; ++pp)
 #pragma unroll
     for (unsigned i = 0; i < RI; ++i)
 #pragma unroll
-        for (unsigned j = 0; j < 4; ++j) acc[i][j] = 0.0F;
+        for (unsigned j = 0; j < 4; ++j) acc[pp][i][j] = 0.0F;
     for (unsigned k0 = 0; k0 < in; k0 += K) {
         __syncthreads();
         for (unsigned v = tid; v < RT * K / 4; v += NT) {
@@ -2233,66 +2245,76 @@ __global__ __launch_bounds__(C * 4) void dense_rows_v3_kernel(const float* x, un
             as[kk + 2][rr] = a.z;
             as[kk + 3][rr] = a.w;
         }
-        for (unsigned v = tid; v < C * K / 2; v += NT) {
-            const unsigned cc = v / (K / 2), kk = 2 * (v % (K / 2)), o = c0 + cc;
-            float a = 0.0F, b = 0.0F;
-            if (o < n) {
-                const std::size_t at = static_cast<std::size_t>(o0 + o) * in + k0 + kk;
-                if constexpr (WT == dev::WType::F32) {
-                    a = static_cast<const float*>(w)[at];
-                    b = static_cast<const float*>(w)[at + 1];
-                } else {
-                    const auto* wp = static_cast<const std::uint16_t*>(w) + at;
-                    const std::uint32_t q = (reinterpret_cast<std::uintptr_t>(w) & 3U) == 0
-                        ? *reinterpret_cast<const std::uint32_t*>(wp)
-                        : static_cast<std::uint32_t>(wp[0]) | (static_cast<std::uint32_t>(wp[1]) << 16);
-                    const auto lo = static_cast<std::uint16_t>(q), hi = static_cast<std::uint16_t>(q >> 16);
-                    if constexpr (WT == dev::WType::F16) {
-                        a = f16_to_float(lo);
-                        b = f16_to_float(hi);
+        for (unsigned pp = 0; pp < projections; ++pp) {
+            const unsigned p = first_p + pp;
+            const void* w = g.w[p];
+            const unsigned o0 = g.o0[p], n = g.n[p];
+            for (unsigned v = tid; v < C * K / 2; v += NT) {
+                const unsigned cc = v / (K / 2), kk = 2 * (v % (K / 2)), o = c0 + cc;
+                float a = 0.0F, b = 0.0F;
+                if (o < n) {
+                    const std::size_t at = static_cast<std::size_t>(o0 + o) * in + k0 + kk;
+                    if constexpr (WT == dev::WType::F32) {
+                        a = static_cast<const float*>(w)[at];
+                        b = static_cast<const float*>(w)[at + 1];
                     } else {
-                        a = bf16_to_float(lo);
-                        b = bf16_to_float(hi);
+                        const auto* wp = static_cast<const std::uint16_t*>(w) + at;
+                        const std::uint32_t q = (reinterpret_cast<std::uintptr_t>(w) & 3U) == 0
+                            ? *reinterpret_cast<const std::uint32_t*>(wp)
+                            : static_cast<std::uint32_t>(wp[0]) | (static_cast<std::uint32_t>(wp[1]) << 16);
+                        const auto lo = static_cast<std::uint16_t>(q), hi = static_cast<std::uint16_t>(q >> 16);
+                        if constexpr (WT == dev::WType::F16) {
+                            a = f16_to_float(lo);
+                            b = f16_to_float(hi);
+                        } else {
+                            a = bf16_to_float(lo);
+                            b = bf16_to_float(hi);
+                        }
                     }
                 }
+                ws[kk][cc] = a;
+                ws[kk + 1][cc] = b;
             }
-            ws[kk][cc] = a;
-            ws[kk + 1][cc] = b;
-        }
-        __syncthreads();
-#pragma unroll 4
-        for (unsigned kk = 0; kk < K; ++kk) {
-            float a[RI];
-            if constexpr (RI == 2) {
-                const float2 a0 = *reinterpret_cast<const float2*>(&as[kk][tr * RI]);
-                a[0] = a0.x;
-                a[1] = a0.y;
-            } else {
-#pragma unroll
-                for (unsigned h = 0; h < RI / 4; ++h) {
-                    const float4 a4 = *reinterpret_cast<const float4*>(&as[kk][tr * RI + 4 * h]);
-                    a[4 * h] = a4.x;
-                    a[4 * h + 1] = a4.y;
-                    a[4 * h + 2] = a4.z;
-                    a[4 * h + 3] = a4.w;
+            __syncthreads();
+    #pragma unroll 4
+            for (unsigned kk = 0; kk < K; ++kk) {
+                float a[RI];
+                if constexpr (RI == 2) {
+                    const float2 a0 = *reinterpret_cast<const float2*>(&as[kk][tr * RI]);
+                    a[0] = a0.x;
+                    a[1] = a0.y;
+                } else {
+    #pragma unroll
+                    for (unsigned h = 0; h < RI / 4; ++h) {
+                        const float4 a4 = *reinterpret_cast<const float4*>(&as[kk][tr * RI + 4 * h]);
+                        a[4 * h] = a4.x;
+                        a[4 * h + 1] = a4.y;
+                        a[4 * h + 2] = a4.z;
+                        a[4 * h + 3] = a4.w;
+                    }
                 }
+                const float4 b4 = *reinterpret_cast<const float4*>(&ws[kk][tc * 4]);
+                const float b[4] = {b4.x, b4.y, b4.z, b4.w};
+    #pragma unroll
+                for (unsigned i = 0; i < RI; ++i)
+    #pragma unroll
+                    for (unsigned j = 0; j < 4; ++j) acc[pp][i][j] = __builtin_fmaf(a[i], b[j], acc[pp][i][j]);
             }
-            const float4 b4 = *reinterpret_cast<const float4*>(&ws[kk][tc * 4]);
-            const float b[4] = {b4.x, b4.y, b4.z, b4.w};
-#pragma unroll
-            for (unsigned i = 0; i < RI; ++i)
-#pragma unroll
-                for (unsigned j = 0; j < 4; ++j) acc[i][j] = __builtin_fmaf(a[i], b[j], acc[i][j]);
+            if constexpr (NP > 1) __syncthreads();  // retire before the next projection reuses ws
         }
     }
-#pragma unroll
-    for (unsigned i = 0; i < RI; ++i) {
-        const unsigned r = r0 + tr * RI + i;
-        if (r >= rows) continue;
-#pragma unroll
-        for (unsigned j = 0; j < 4; ++j) {
-            const unsigned o = c0 + tc * 4 + j;
-            if (o < n) y[static_cast<std::size_t>(r) * n + o] = acc[i][j];
+    for (unsigned pp = 0; pp < projections; ++pp) {
+        const unsigned p = first_p + pp, n = g.n[p];
+        float* y = g.y[p];
+    #pragma unroll
+        for (unsigned i = 0; i < RI; ++i) {
+            const unsigned r = r0 + tr * RI + i;
+            if (r >= rows) continue;
+    #pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned o = c0 + tc * 4 + j;
+                if (o < n) y[static_cast<std::size_t>(r) * n + o] = acc[pp][i][j];
+            }
         }
     }
 }
@@ -2735,9 +2757,13 @@ void kda_prefill(const KdaDev& k, const float* qkv, const float* f, const float*
 }
 
 void dsa_append_rows(const DsaSlot& slot, unsigned t0, const float* latent, const float* key, const float* gate,
-                     const IndexerDev& w, unsigned* flag, unsigned C, hipStream_t s, bool kv_shard, unsigned rank) {
+                     const IndexerDev& w, unsigned* flag, unsigned C, hipStream_t s, bool kv_shard, unsigned rank,
+                     const std::uint16_t* latent_norm) {
     if (C == 0) return;
-    dsa_store_rows_kernel<<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag, kv_shard, rank);
+    if (latent_norm)
+        dsa_store_rows_kernel<true><<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag, kv_shard, rank, latent_norm);
+    else
+        dsa_store_rows_kernel<false><<<C, 128, 0, s>>>(slot, t0, latent, w, key, gate, flag, kv_shard, rank);
     ok(hipGetLastError(), "glm pf dsa_store_rows");
     const unsigned p_lo = t0 / kKpool, p_hi = (t0 + C) / kKpool;
     if (p_hi > p_lo) {
@@ -2862,7 +2888,30 @@ void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned
 }
 
 void dense_rows_group(const float* x, dev::WType wt, unsigned in, const DenseProj* p, unsigned count, unsigned rows, hipStream_t s) {
-    dense_rows_group_versioned(x, wt, in, p, count, rows, s, dense_rows_version());
+    if (!aux::enabled("STRIX_GLM_PF_AUX_DENSE") || dense_rows_version() != 3 ||
+        count < 2 || count > 3 || in == 0 || in > 4096 || in % 32U || rows == 0) {
+        dense_rows_group_versioned(x, wt, in, p, count, rows, s, dense_rows_version());
+        return;
+    }
+    DenseGroupArgs g{};
+    unsigned widths[3]{};
+    for (unsigned i = 0; i < count; ++i) {
+        if (!p[i].n) continue;
+        widths[g.count] = g.n[g.count] = p[i].n;
+        g.w[g.count] = p[i].w; g.y[g.count] = p[i].y; g.o0[g.count] = p[i].o0;
+        ++g.count;
+    }
+    if (!g.count) return;
+    // Fixed 64x128 geometry limits the live accumulators to 48 FP32 values.
+    // All projections reuse the same A tile. Ragged columns never read W or write Y.
+    const dim3 grid((rows + 63U) / 64U, (aux::dense_columns(widths, g.count) + 127U) / 128U);
+    if (wt == dev::WType::F16)
+        dense_rows_v3_kernel<64, 128, dev::WType::F16, 3><<<grid, 512, 0, s>>>(x, in, rows, g);
+    else if (wt == dev::WType::BF16)
+        dense_rows_v3_kernel<64, 128, dev::WType::BF16, 3><<<grid, 512, 0, s>>>(x, in, rows, g);
+    else
+        dense_rows_v3_kernel<64, 128, dev::WType::F32, 3><<<grid, 512, 0, s>>>(x, in, rows, g);
+    ok(hipGetLastError(), "glm pf dense shared input");
 }
 
 void dense_rows_group_versioned(const float* x, dev::WType wt, unsigned in, const DenseProj* p, unsigned count, unsigned rows,
@@ -3214,6 +3263,28 @@ void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const 
                         hipStream_t s) {
     mla_attention_rows_versions(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
                                 mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_version(), mla_gemm_version());
+}
+
+void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window) {
+    if (C == 0) return;
+    const unsigned Q = attention_scratch_rows(C, query_window);
+    // All KV is already appended/selected. Reuse qt/e/ob on the existing stream;
+    // only the query/list/count/output origins move. No recursion or extra waits.
+    for (unsigned begin = 0; begin < C; begin += Q) {
+        const std::size_t offset = std::size_t{begin} * heads * kMlaDim;
+        mla_attention_rows_versions(slot, tokens + std::size_t{begin} * kMaxTokens, n + begin, q + offset,
+            kv_b, heads, qt, e, ob, o + offset, std::min(Q, C - begin), s, scores_v, obar_v, gemm_v);
+    }
+}
+
+void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s, unsigned query_window) {
+    mla_attention_rows_versions(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
+                                mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_version(), mla_gemm_version(),
+                                query_window);
 }
 
 }  // namespace strix::glm::pf

@@ -1,6 +1,6 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0x7aaff9d2d92e8caaULL},
+{"CMakeLists.txt", 0xec68938f21545d4aULL},
 {"apps/minimax_rank_main.cpp", 0x8ed1583275894e9dULL},
 {"apps/minimax_serve_main.cpp", 0x32dfafeb546e923eULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
@@ -143,9 +143,9 @@
 {"src/moe_core/qwen_k_weight_decode.inc", 0xb3796f17d32c5ef1ULL},
 {"src/xport/backend.hpp", 0xad6763285b3e3859ULL},
 {"src/xport/borrowed_transport.hpp", 0x630202a7d683e70eULL},
-{"src/xport/channel.hpp", 0xed685e800cdf3da8ULL},
+{"src/xport/channel.hpp", 0x153da15575fcb3b1ULL},
 {"src/xport/channel_device.hpp", 0x6c8157a4f8e47ae3ULL},
-{"src/xport/channel_impl.hip", 0xba6348e314367412ULL},
+{"src/xport/channel_impl.hip", 0x320b300506e80ccaULL},
 {"src/xport/communicator_backend.hpp", 0xd1ff9d8099ca168fULL},
 {"src/xport/ds41_adapter.hpp", 0x8f1a81fee9f24b62ULL},
 {"src/xport/kvshard_channel.hpp", 0x3adc3f24401e4120ULL},
@@ -156,4 +156,4 @@
 {"src/xport/staging.hpp", 0x8d7ac900d9b462ebULL},
 {"src/xport/stats.hpp", 0x2d491799a3d6a36bULL},
 {"src/xport/transport_backend.hpp", 0xe55fde715548edf1ULL},
-{"src/xport/wire.hpp", 0x7d7ac0cfc9f38ddfULL},
+{"src/xport/wire.hpp", 0x7f1782a0671f1afdULL},

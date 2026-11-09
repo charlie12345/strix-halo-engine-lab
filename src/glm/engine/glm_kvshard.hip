@@ -511,8 +511,13 @@ void KvShard::prefill_rows(const DsaLayerWeights& weights, const DsaState& state
             hip_ok(hipGetLastError(), "kvshard prefill selected merge");
             const dev::DsaSlot selected{latent_full.data, nullptr, nullptr, nullptr, limits.latents};
             const std::size_t offset = static_cast<std::size_t>(begin + row) * weights.heads * kMlaDim;
-            pf::mla_attention_rows(selected, ids[slot].data + limits.latents, work.counts + begin + row, work.query + offset,
-                weights.kv_b, weights.heads, work.qt, work.scores, work.obar, work.output + offset, window.rows, call.stream);
+            if (work.attention_window == 0)
+                pf::mla_attention_rows(selected, ids[slot].data + limits.latents, work.counts + begin + row, work.query + offset,
+                    weights.kv_b, weights.heads, work.qt, work.scores, work.obar, work.output + offset, window.rows, call.stream);
+            else
+                pf::mla_attention_rows(selected, ids[slot].data + limits.latents, work.counts + begin + row, work.query + offset,
+                    weights.kv_b, weights.heads, work.qt, work.scores, work.obar, work.output + offset, window.rows, call.stream,
+                    work.attention_window);
             hip_ok(hipEventRecord(consumed[slot].value, call.stream), "kvshard IDs consumed");
             used[slot] = true;
             row += window.rows;

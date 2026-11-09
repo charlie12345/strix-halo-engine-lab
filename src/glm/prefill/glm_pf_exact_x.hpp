@@ -1,4 +1,5 @@
 #pragma once
+#include "glm/prefill/glm_pf_aux.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
 
 namespace strix::glm::pf::exact_x {
@@ -187,8 +188,8 @@ __device__ __forceinline__ unsigned scalar(unsigned v) {
     return static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(v)));
 }
 
-template<int Bits, unsigned R, class Mat, class Rows>
-__device__ __forceinline__ void core_s(Mat m, Rows rows, unsigned nr, unsigned splits, bool hp, StorageS<R>& lds) {
+template<int Bits, unsigned R, class Mat, class Rows, class Output = aux::Store>
+__device__ __forceinline__ void core_s(Mat m, Rows rows, unsigned nr, unsigned splits, bool hp, StorageS<R>& lds, Output output = {}) {
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid / 32U;
     const unsigned col0 = blockIdx.x * 128U, og = lane;
     const unsigned rg = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(wave)));
@@ -289,11 +290,7 @@ __device__ __forceinline__ void core_s(Mat m, Rows rows, unsigned nr, unsigned s
 #pragma unroll
         for (unsigned j = 0; j < 4U; ++j) v[j] = lds.total[r][lane + 32U * j];
         d::hadamard128(v, lane);
-#pragma unroll
-        for (unsigned j = 0; j < 4U; ++j) {
-            const unsigned o = col0 + lane + 32U * j;
-            rows.output(r)[o] = v[j] * d::half_bits(m.svh[o]);
-        }
+        output(rows, m, r, col0, v, lane);
     }
     __syncthreads();
 }

@@ -4,6 +4,8 @@
 namespace strix::xport {
 template struct ChannelOptions<glm::xfer::GlmTraits>;
 template class Channel<glm::xfer::GlmTraits>;
+template struct ChannelOptions<glm::xfer::GlmSeqparTraits>;
+template class Channel<glm::xfer::GlmSeqparTraits>;
 }
 namespace strix::glm::xfer {
 void argmax_exchange(Exchanger& x, const float* logits, unsigned rows, unsigned vn, unsigned ld,

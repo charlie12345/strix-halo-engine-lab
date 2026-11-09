@@ -1,5 +1,6 @@
 // Exact grouped routed + shared experts. Arithmetic helpers retain their original provenance.
 #include "glm/prefill/glm_pf_exact_moe.hpp"
+#include "glm/prefill/glm_moe_traits.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/common/glm_math.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
@@ -55,6 +56,7 @@ struct Args {
     _Float16* input;
     unsigned rcap;  // v3 row buckets on (1) / off (0)
     const unsigned* ntiles;  // device tile count (device plan) or null (host plan: grid == tiles)
+    bool aux_act = false, aux_combine = false;
 };
 // One global load from the device table (entry E = the shared expert): selecting a member of a by-value / kernarg
 // struct with a runtime index forces the struct to scratch (328 B/lane in the first draft).
@@ -430,16 +432,19 @@ __global__ __launch_bounds__(256) void linear_kernel_s3_full(Args a) {
     __shared__ exact_x::StorageS<8> lds;
     const unsigned expert = Shared ? E : blockIdx.y;
     const Tile group = a.groups[expert];
-    const unsigned m = Down ? 2U : blockIdx.z;
     const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
     if (r0 >= group.count) return;
     const unsigned span = Shared ? (group.count - r0 < kSharedRows ? group.count - r0 : kSharedRows) : group.count;
     const unsigned full = full_rows<Fold>(span);
     if (full == 0) return;  // uniform, before any barrier
-    const auto w = *d::uniform((&a.experts[expert].gate) + m);
-    for (unsigned r = r0; r < r0 + full; r += 64U) {
-        const unsigned n = r0 + full - r < 64U ? r0 + full - r : 64U;
-        exact_x::core_s<Bits, 8>(w, XRows<Down>{a, Tile{expert, group.first + r, n}, m}, n, Down ? 4U : 32U, false, lds);
+    const unsigned first_m = Down ? 2U : blockIdx.z;
+    const unsigned end_m = !Down && a.aux_act ? 2U : first_m + 1U;
+    for (unsigned m = first_m; m < end_m; ++m) {
+        const auto w = *d::uniform((&a.experts[expert].gate) + m);
+        for (unsigned r = r0; r < r0 + full; r += 64U) {
+            const unsigned n = r0 + full - r < 64U ? r0 + full - r : 64U;
+            exact_x::core_s<Bits, 8>(w, XRows<Down>{a, Tile{expert, group.first + r, n}, m}, n, Down ? 4U : 32U, false, lds, MoeAuxEpilogue<Down>{});
+        }
     }
 }
 template<int Bits, bool Down, bool Shared, bool Fold = false>
@@ -447,28 +452,31 @@ __global__ __launch_bounds__(256) void linear_kernel_s3_tail(Args a) {
     __shared__ exact_x::StorageS<4> lds;
     const unsigned expert = Shared ? E : blockIdx.y;
     const Tile group = a.groups[expert];
-    const unsigned m = Down ? 2U : blockIdx.z;
     const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
     if (r0 >= group.count) return;
     const unsigned span = Shared ? (group.count - r0 < kSharedRows ? group.count - r0 : kSharedRows) : group.count;
     const unsigned full = full_rows<Fold>(span);
     if (full == span) return;  // uniform, before any barrier
-    const auto w = *d::uniform((&a.experts[expert].gate) + m);
-    auto& one = *reinterpret_cast<exact_x::StorageS<1>*>(&lds);
-    auto& two = *reinterpret_cast<exact_x::StorageS<2>*>(&lds);
-    for (unsigned r = r0 + full; r < r0 + span;) {
-        const unsigned n = r0 + span - r < 32U ? r0 + span - r : 32U;
-        const Tile tile{expert, group.first + r, n};
-        if (n <= 8U) exact_x::core_s<Bits, 1>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, one);
-        else if (n <= 16U) exact_x::core_s<Bits, 2>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, two);
-        else exact_x::core_s<Bits, 4>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, lds);
-        r += n;
+    const unsigned first_m = Down ? 2U : blockIdx.z;
+    const unsigned end_m = !Down && a.aux_act ? 2U : first_m + 1U;
+    for (unsigned m = first_m; m < end_m; ++m) {
+        const auto w = *d::uniform((&a.experts[expert].gate) + m);
+        auto& one = *reinterpret_cast<exact_x::StorageS<1>*>(&lds);
+        auto& two = *reinterpret_cast<exact_x::StorageS<2>*>(&lds);
+        for (unsigned r = r0 + full; r < r0 + span;) {
+            const unsigned n = r0 + span - r < 32U ? r0 + span - r : 32U;
+            const Tile tile{expert, group.first + r, n};
+            if (n <= 8U) exact_x::core_s<Bits, 1>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, one, MoeAuxEpilogue<Down>{});
+            else if (n <= 16U) exact_x::core_s<Bits, 2>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, two, MoeAuxEpilogue<Down>{});
+            else exact_x::core_s<Bits, 4>(w, XRows<Down>{a, tile, m}, n, Down ? 4U : 32U, false, lds, MoeAuxEpilogue<Down>{});
+            r += n;
+        }
     }
 }
 template<bool Down, bool Fold = false>
 void launch_linear_s3(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
-    const dim3 routed(N / 128U, E, Down ? 1U : 2U), shared(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U);
+    const dim3 routed(N / 128U, E, Down || a.aux_act ? 1U : 2U), shared(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down || a.aux_act ? 1U : 2U);
     linear_kernel_s3_full<4, Down, false, Fold><<<routed, 256, 0, stream>>>(a);
     linear_kernel_s3_tail<4, Down, false, Fold><<<routed, 256, 0, stream>>>(a);
     ok(hipGetLastError(), "X3 routed linear");
@@ -653,7 +661,7 @@ __global__ __launch_bounds__(kPlanRows) void plan_scatter_kernel(PlanArgs p) {
 }
 // The grouped variants (v3 and the X cores): input transform, gate/up, activation, down, combine. grid_tiles is the
 // tile count (host plan) or its upper bound (device plan; surplus CTAs return on Args::ntiles).
-void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream) {
+void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream) {
     input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "v3 gate/up input transform");
     // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): the X3 calls (V11 / V14) on the WMMA linears.
@@ -661,6 +669,9 @@ void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const
         selected = 20;
         wmma_x::moe_calls.fetch_add(1, std::memory_order_relaxed);
     }
+    const bool epilogue = selected == 11 || selected == 14 || selected == 20;
+    a.aux_act = epilogue && aux::enabled("STRIX_GLM_PF_AUX_ACT");
+    a.aux_combine = epilogue && aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE")  /* default on: -0.08..-0.13 s at 8K, bitwise */;
     if (selected == 20) launch_linear_w<false>(a, shared.gate.bits, stream);
     else if (selected == 14) launch_linear_s3<false, true>(a, shared.gate.bits, stream);
     else if (selected == 11) launch_linear_s3<false>(a, shared.gate.bits, stream);
@@ -670,8 +681,10 @@ void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const
     else if (selected == 7) launch_linear_x<false, true>(a, shared.gate.bits, stream);
     else if (selected == 6) launch_linear_x<false>(a, shared.gate.bits, stream);
     else launch_linear_v3<false>(a, shared.gate.bits, stream);
-    activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
-    ok(hipGetLastError(), "v3 R15/down transform");
+    if (!a.aux_act) {
+        activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
+        ok(hipGetLastError(), "v3 R15/down transform");
+    }
     if (selected == 20) launch_linear_w<true>(a, shared.down.bits, stream);
     else if (selected == 14) launch_linear_s3<true, true>(a, shared.down.bits, stream);
     else if (selected == 11) launch_linear_s3<true>(a, shared.down.bits, stream);
@@ -681,8 +694,10 @@ void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const
     else if (selected == 7) launch_linear_x<true, true>(a, shared.down.bits, stream);
     else if (selected == 6) launch_linear_x<true>(a, shared.down.bits, stream);
     else launch_linear_v3<true>(a, shared.down.bits, stream);
-    combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
-    ok(hipGetLastError(), "v3 R16");
+    if (!a.aux_combine) {
+        combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
+        ok(hipGetLastError(), "v3 R16");
+    }
 }
 void check_matrix(const moe::Exl3& w, unsigned input, unsigned output, bool shared) {
     if (!w.trellis || !w.suh || !w.svh || w.input != input || w.output != output ||

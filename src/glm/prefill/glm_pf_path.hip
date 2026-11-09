@@ -1,3 +1,4 @@
+#include "glm/prefill/glm_pf_aux.hpp"
 // GLM-5.3-Flash chunked prefill seam (see glm_pf_path.hpp). Build with -ffp-contract=off -fno-fast-math
 // -fno-gpu-flush-denormals-to-zero (the Tier A kernels it calls are bitwise to src/glm/host).
 #include "glm/prefill/glm_pf_path.hpp"
@@ -106,7 +107,11 @@ __global__ void scatter_rows_kernel(const float* y, const std::uint32_t* dst, fl
 class GlmPfPath final : public PrefillPath {
 public:
     GlmPfPath(unsigned kda_heads, unsigned mla_heads, std::uint64_t cap, unsigned max_rows, TierB tb)
-        : Hk_(kda_heads), Hm_(mla_heads), I_(kExpertI * kda_heads / kKdaHeads), cap_(cap), Rmax_(max_rows), tb_(tb), xmoe_plan_(max_rows) {
+        : Hk_(kda_heads), Hm_(mla_heads), I_(kExpertI * kda_heads / kKdaHeads), cap_(cap), Rmax_(max_rows),
+          Qmax_(attention_scratch_rows(max_rows)), tb_(tb),
+          moe_route_(prefill_moe_route(tb, I_ == kMoeInter, exact_moe_enabled(), capacity_layout().routed)),
+          path_bytes_(device_bytes(kda_heads, mla_heads, cap, max_rows, moe_route_, Qmax_)),
+          attention_window_(Qmax_ < max_rows ? Qmax_ : 0), xmoe_plan_(max_rows) {
         check_geometry(kda_heads, mla_heads, cap, max_rows);
         const std::size_t R = Rmax_, C = static_cast<std::size_t>(Hk_) * kKdaDim;
         tq_ = own_.alloc<float>(R * C);
@@ -134,12 +139,14 @@ public:
         keys_ = own_.alloc<std::uint32_t>(R * kIndexerKeyStride);
         tok_ = own_.alloc<std::uint32_t>(R * kMaxTokens);
         ntok_ = own_.alloc<std::uint32_t>(R);
-        qt_ = own_.alloc<float>(R * Hm_ * kKvLora);
-        e_ = own_.alloc<float>(R * Hm_ * kEStride);
-        ob_ = own_.alloc<float>(R * Hm_ * kKvLora);
+        qt_ = own_.alloc<float>(std::size_t{Qmax_} * Hm_ * kKvLora);
+        e_ = own_.alloc<float>(std::size_t{Qmax_} * Hm_ * kEStride);
+        ob_ = own_.alloc<float>(std::size_t{Qmax_} * Hm_ * kKvLora);
         sh_ = own_.alloc<float>(R * kHidden);
-        moe_wsb_ = prefill_moe_workspace_bound(Rmax_);
-        moe_ws_ = own_.alloc<unsigned char>(moe_wsb_);
+        if (moe_route_.legacy_arena) {
+            moe_wsb_ = prefill_moe_workspace_bound(Rmax_);
+            moe_ws_ = own_.alloc<unsigned char>(moe_wsb_);
+        }
         // Reserved up front and included in device_bytes / pf_mem_budget even when
         // disabled: no allocation if the exact linear switch is enabled.
         exact_wsb_ = exact_workspace_bytes(Hk_, Hm_, Rmax_);
@@ -155,7 +162,7 @@ public:
         (void)exact::tile_rows();
         route_ids_.resize(R * kTopE);
         route_weights_.resize(R * kTopE);
-        if (exact_moe_enabled() && I_ == kMoeInter && tb_ == TierB::gemv) {  // the wmma identity never uses it
+        if (moe_route_.exact) {
             xmoe_wsb_ = exact_moe::workspace_bytes(Rmax_);
             xmoe_ws_ = own_.alloc<unsigned char>(xmoe_wsb_);
         }
@@ -177,24 +184,28 @@ public:
             pe_rows_ = own_.alloc<std::uint32_t>(pe_cap_);
             pe_dst_ = own_.alloc<std::uint32_t>(pe_cap_);
         }
-        if (own_.bytes != device_bytes(Hk_, Hm_, cap_, Rmax_, tb_) || own_.ptrs.size() > kPrefillAllocationBound)
+        // Validate the immutable legacy route at install, not at every MoE enqueue.
+        if (moe_route_.legacy_arena != (moe_ws_ != nullptr))
+            throw std::logic_error("glm pf path: grouped WMMA MoE was not admitted");
+        if (own_.bytes != path_bytes_ || own_.ptrs.size() > kPrefillAllocationBound)
             throw std::logic_error("glm pf path: allocation tally differs from prefill_budget (update both)");
     }
     // Exact bytes the constructor allocates, also used by both admission checks.
-    static std::uint64_t device_bytes(unsigned Hk, unsigned Hm, std::uint64_t /*cap*/, unsigned Rmax, TierB tb = TierB::gemv) {
+    static std::uint64_t device_bytes(unsigned Hk, unsigned Hm, std::uint64_t /*cap*/, unsigned Rmax, PrefillMoeRoute route,
+                                      unsigned attention_rows) {
         const std::uint64_t R = Rmax, C = std::uint64_t{Hk} * kKdaDim, I = std::uint64_t{kExpertI} * Hk / kKdaHeads;
         const std::uint64_t f = 3 * C + 3 * C + 2 * C + Hk + 2 * kKdaDim + std::uint64_t{Hk} * 4 * kKdaDim + Hk +
                                 std::max<std::uint64_t>(C, std::uint64_t{Hm} * kMlaDim) + C + 2 * kQLora + std::uint64_t{Hm} * kMlaDim +
-                                2 * kKvLora + std::uint64_t{kIdxHeads} * kIdxDim + 2 * kIdxDim + kIdxHeads + std::uint64_t{Hm} * kKvLora +
-                                std::uint64_t{Hm} * kEStride + std::uint64_t{Hm} * kKvLora + kHidden;
+                                2 * kKvLora + std::uint64_t{kIdxHeads} * kIdxDim + 2 * kIdxDim + kIdxHeads + kHidden;
         std::uint64_t b = R * f * 4 + indexer_workspace_bytes(Rmax) + R * kMaxTokens * 4 + R * 4;
-        b += prefill_moe_workspace_bound(Rmax);
+        b += std::uint64_t{attention_rows} * Hm * (2 * kKvLora + kEStride) * 4;
+        if (route.legacy_arena) b += prefill_moe_workspace_bound(Rmax);
         b += exact_workspace_bytes(Hk, Hm, Rmax);
         // pf_mem_budget mirror: optional TP2 exact MoE adds workspace_bytes(Rmax),
         // including 9R pairs of GU FP32, down-input FP16, output FP32,
         // two matrix-specific H-wide FP16 input transforms and plan/table.
         // 792849408 bytes at R=2048; 1585660416 bytes at R=4096 (64-bit ABI).
-        if (exact_moe_enabled() && I == kMoeInter && tb == TierB::gemv) b += exact_moe::workspace_bytes(Rmax);
+        if (route.exact) b += exact_moe::workspace_bytes(Rmax);
         b += (std::uint64_t{kTopE} * kHidden + 3 * kExpertI + kHidden) * 4;
         b += 3 * R * std::max<std::uint64_t>(std::uint64_t{kDenseI} * Hk / kKdaHeads, I) * 4;
         if (I != kMoeInter) b += R * kTopE * (3 * kHidden * 4 + 2 * 4);
@@ -273,7 +284,8 @@ public:
         D::rmsnorm(qa_, w.q_a_norm, D::WType::BF16, kQLora, kEps, qr_, R, c.stream);
         linear(c, w.q_b, qr_, q_, R, kQLora, H * kMlaDim);
         linear(c, w.kv_a, x, kva_, R, kHidden, kKvLora);
-        D::rmsnorm(kva_, w.kv_a_norm, D::WType::BF16, kKvLora, kEps, lat_, R, c.stream);
+        const bool fused_latent = !st.shard && w.kv_a_norm && aux::enabled("STRIX_GLM_PF_AUX_NORM");
+        if (!fused_latent) D::rmsnorm(kva_, w.kv_a_norm, D::WType::BF16, kKvLora, kEps, lat_, R, c.stream);
         linear(c, w.wq_b, qr_, qI_, R, kQLora, kIdxHeads * kIdxDim);
         const D::IndexerDev iw{w.wk, w.gate, w.weights_proj, w.k_norm_w, w.k_norm_b, w.ape};
         const D::DsaSlot sl{st.latent + static_cast<std::size_t>(slot) * st.cap * kKvLora, st.ikey + static_cast<std::size_t>(slot) * st.cap * kIdxDim,
@@ -285,11 +297,15 @@ public:
         }
         if (st.shard) {
             st.shard->prefill_rows(w, st, c,
-                {lat_, key_, gate_, qI_, q_, wh_, qt_, e_, ob_, o_, keys_, tok_, ntok_, device_bytes(Hk_, Hm_, cap_, Rmax_, tb_)}, margin_);
+                {lat_, key_, gate_, qI_, q_, wh_, qt_, e_, ob_, o_, keys_, tok_, ntok_, path_bytes_, attention_window_}, margin_);
         } else {
-            dsa_append_rows(sl, t0, lat_, key_, gate_, iw, c.flag, R, c.stream);
+            dsa_append_rows(sl, t0, fused_latent ? kva_ : lat_, key_, gate_, iw, c.flag, R, c.stream, false, 0,
+                            fused_latent ? w.kv_a_norm : nullptr);
             indexer_select_rows_bounded(sl, t0, qI_, wh_, keys_, tok_, ntok_, R, c.stream);
-            mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream);
+            if (attention_window_ == 0)
+                mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream);
+            else
+                mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream, attention_window_);
         }
         linear(c, w.o, o_, y, R, H * kMlaDim, kHidden);
     }
@@ -382,6 +398,7 @@ public:
         v.bits_dn = kExpertBits;
         v.shared = sh_;
         v.out = y;
+        // GEMV/world-1 fallbacks return above; this immutable arena was checked at install.
         enqueue_prefill_moe_glm(v, moe_ws_, moe_wsb_, c.stream);
     }
 
@@ -528,7 +545,11 @@ private:
     unsigned Hk_, Hm_, I_;  // rank heads; rank expert I (2048 / world)
     std::uint64_t cap_;
     unsigned Rmax_;
+    const unsigned Qmax_;
     TierB tb_;
+    const PrefillMoeRoute moe_route_;
+    const std::uint64_t path_bytes_;
+    const unsigned attention_window_;
     exact_moe::Plan xmoe_plan_;
     void* xmoe_ws_ = nullptr;
     std::size_t xmoe_wsb_ = 0;
@@ -543,8 +564,8 @@ private:
     std::size_t exact_wsb_ = 0;
     bool exact_on_ = false;
     bool kda_pack_ = false;
-    void* moe_ws_;
-    std::size_t moe_wsb_;
+    void* moe_ws_ = nullptr;
+    std::size_t moe_wsb_ = 0;
     float *eo_, *ge_, *ue_, *ae_, *sh1_;
     float* big_ = nullptr;
     std::size_t big_n_ = 0;
@@ -577,7 +598,9 @@ unsigned gemv_block() {
 PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp, TierB tierb, bool kv_shard) {
     check_geometry(kda_heads, mla_heads, capacity, max_rows);
     PrefillBudget b;
-    b.path = GlmPfPath::device_bytes(kda_heads, mla_heads, capacity, max_rows, tierb);
+    b.moe_route = prefill_moe_route(tierb, kExpertI * kda_heads / kKdaHeads == kMoeInter, exact_moe_enabled(), capacity_layout().routed);
+    b.attention_rows = attention_scratch_rows(max_rows);
+    b.path = GlmPfPath::device_bytes(kda_heads, mla_heads, capacity, max_rows, b.moe_route, b.attention_rows);
     b.workspace = tierb == TierB::wmma ? GlmPfPath::workspace_bytes(kda_heads, mla_heads, max_rows) : 0;
     if (kv_shard) b.workspace += kKvShardPrefillTemporaryBytes;
     const std::uint64_t RC = std::max(8U, max_rows);

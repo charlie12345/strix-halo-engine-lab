@@ -132,6 +132,11 @@ public:
     void send(std::size_t bytes, const Tag& tag) { send(bytes, tag, options_.publish); }
     // Copy `bytes` of device buffer `local` into tx() with one kernel whose last block publishes, then send.
     void send_copy(const void* local, std::size_t bytes, const Tag& tag);
+    // SP-only direct coherent host aliases. Both buffers must remain live and
+    // unchanged until RX completion; consumers must retire before reuse. Unlike
+    // send_copy this publishes readiness only, and receives into the consumer.
+    // Uses a separate trailer exchange; the peer must use this same API.
+    void send_host(const void* local, void* remote, std::size_t bytes, const Tag& tag);
     // The stream waits for the peer's message of the oldest send() not yet received; returns its payload (RX slot).
     [[nodiscard]] const void* recv();
     // As recv() without the stream wait packet: the consumer kernels wait in-kernel (glmx_wait), saving the command
@@ -154,6 +159,8 @@ private:
         std::size_t bytes = 0;
         Tag tag;
         bool seal = false;  // host-only 0-byte message carrying the last deferred CRC (drain())
+        const std::byte* direct_tx = nullptr;
+        std::byte* direct_rx = nullptr;
     };
     class CrcWorker;
     static constexpr std::size_t kQueue = 256;

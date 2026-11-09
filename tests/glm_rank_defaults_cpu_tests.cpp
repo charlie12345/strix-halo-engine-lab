@@ -112,7 +112,24 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 36);  // + pf-dense-rows-v3, pf-mixnorm, pf-sumexp, pf-hc-hoist, pf-hc-expand-rows; pf-mla-gemm-v3 replaces v2 (one item per environment selector)
+    CHECK(rd::env_items().size() == 40);  // one item per environment selector
+    const auto normal = resolve({}, {});
+    const auto baseline = resolve({"--baseline"}, {});
+    for (const auto& [key, off] : Env{{"STRIX_GLM_PF_SEQPAR", "0"}, {"STRIX_GLM_PF_AUX_COMBINE", "0"},
+                                     {"STRIX_GLM_PF_SCRATCH", "full"}, {"STRIX_GLM_PF_ATTN_QWIN", "0"}}) {
+        CHECK(baseline.env.at(key).value == off);
+        CHECK(baseline.env.at(key).source == "baseline");
+        CHECK(resolve({"--baseline"}, {{key, normal.env.at(key).value}}).env.at(key).value == normal.env.at(key).value);
+    }
+    CHECK(rd::print(normal).find("effective pf-seqpar=on") != std::string::npos);
+    CHECK(rd::print(baseline).find("effective pf-seqpar=off") != std::string::npos);
+    CHECK(rd::print(baseline).find("capacity-layout=replicated/full/qwin=0") != std::string::npos);
+    for (const Args& args : {Args{"--prefill", "wmma"}, Args{"--max-rows", "1"}, Args{"--world", "1"}})
+        CHECK(rd::print(resolve(args, {})).find("effective pf-seqpar=declined") != std::string::npos);
+    const auto routed = resolve({}, {{"STRIX_GLM_PF_SCRATCH", "routed"}, {"STRIX_GLM_PF_ATTN_QWIN", "2048"}});
+    CHECK(rd::print(routed).find("capacity-layout=replicated/routed/qwin=2048") != std::string::npos);
+    CHECK(rd::print(routed).find("capacity_layout_reason=first-admitted-query-window") != std::string::npos);
+    CHECK(rd::print(routed).find("admission and rank vote pending") != std::string::npos);
     CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "3");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "1");
     for (const char* v : {"1", "2", "3"})
@@ -143,8 +160,8 @@ void test_apply_env_default() {
     CHECK(set == merge(kHp, {{"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}, {"STRIX_GLM_PF_PIPELINE", "2"},
                               {"STRIX_DIST_ASYNC_START", "1"}, {"STRIX_GLM_SPEC_KDA_TREE", "2"},
                               {"STRIX_GLM_PF_EXACT_X", "auto"}, {"STRIX_GLM_PF_EXACTMOE_V", "auto"},
-                              {"STRIX_GLM_HC_NORM", "1"}}));
-    // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree + the fused HC norm
+                              {"STRIX_GLM_HC_NORM", "1"}, {"STRIX_GLM_PF_HC_EXPAND_ROWS", "2"}}));
+    // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree + the fused HC norm + two-row mHC expand
     // an explicit value is never overwritten
     const auto expl = resolve(cat(kDeploy, kDecodeWork), {{"STRIX_DIST_CRC_PARALLEL", "0"}});
     Env set2;

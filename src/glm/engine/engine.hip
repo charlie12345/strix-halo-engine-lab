@@ -1,5 +1,6 @@
 #include <limits>
 #include <array>
+#include <exception>
 #include "xport/channel.hpp"
 #include "xport/communicator_backend.hpp"
 #include "glm/xfer/glm_traits.hpp"
@@ -20,6 +21,7 @@
 #include "glm/engine/glm_pack.hpp"
 #include "glm/engine/glm_r1b.hpp"
 #include "glm/engine/glm_kvshard.hpp"
+#include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "glm/engine/glm_kvshard_exchange.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "../kernels/glm_norm.hpp"
@@ -30,6 +32,7 @@
 #include "glm/spec/glm_spec_dev.hpp"
 #include "glm/xfer/glm_post_fast.hpp"
 #include "glm/xfer/glm_xfer_exchange.hpp"
+#include "glm/xfer/glm_post_exchange.hpp"
 #include "strix/dist/communicator.hpp"
 
 #include <strix_trellis.h>
@@ -566,6 +569,11 @@ struct Engine::Impl {
     std::shared_ptr<Exchange> fallback_xch; // installed seam (CommExchange unless explicitly overridden)
     std::shared_ptr<Exchange> decode_xch;   // borrowed transport; only automatic plain decode uses this
     std::shared_ptr<PrefillPath> pf;
+    bool pf_seqpar = false;  // ordinary decode/verify never use it
+    bool pf_seqpar_auto_eligible = false;
+    std::unique_ptr<xfer::SeqparExchange> seqpar_xch;
+    struct InstallRefused : std::runtime_error { using std::runtime_error::runtime_error; };
+    unsigned capacity_skip = 0, capacity_candidate = 0;
     bool loaded = false;        // load() finished
     bool pf_installed = false;  // pf came from Engine::set_prefill (not the default reference path)
     std::vector<LayerW> layers;
@@ -686,6 +694,21 @@ struct Engine::Impl {
         }
         if (opt.pf_pipeline != 1 && opt.pf_pipeline != 2) throw std::invalid_argument("pf_pipeline must be 1 or 2");
         if ((kv_shard || kv_shard_auto) && opt.pf_pipeline != 1) throw std::invalid_argument("kvshard: prefill pipeline 1 required");
+        // STRIX_GLM_PF_SEQPAR: auto (default) | 1 | 0. auto = on for ordinary TP2 replicated attention ownership,
+        // off (declined, legacy path) for TP1, external exchange or any KV-shard policy; 1 refuses those cases.
+        const char* seqpar_env = std::getenv("STRIX_GLM_PF_SEQPAR");
+        const std::string seqpar_policy = seqpar_env == nullptr ? "auto" : seqpar_env;
+        if (seqpar_policy != "0" && seqpar_policy != "1" && seqpar_policy != "auto")
+            throw std::invalid_argument("STRIX_GLM_PF_SEQPAR must be 0, 1 or auto");
+        const bool seqpar_eligible = opt.world == 2 && opt.rank <= 1 && c != nullptr && !opt.external_exchange &&
+                                     !kv_shard && !kv_shard_auto;
+        if (seqpar_policy == "1" && !seqpar_eligible)
+            throw std::invalid_argument("glm seqpar: requires TP2 communicator and ordinary attention cache ownership");
+        pf_seqpar = seqpar_policy == "1" || (seqpar_policy == "auto" && seqpar_eligible);
+        pf_seqpar_auto_eligible = seqpar_policy == "auto" && seqpar_eligible;
+        if (seqpar_policy == "auto" && !seqpar_eligible && opt.world == 2)
+            std::fprintf(stderr, "glm prefill seqpar auto declined: %s; legacy path\n",
+                         kv_shard || kv_shard_auto ? "kv-shard policy" : opt.external_exchange ? "external exchange" : "no TP2 communicator");
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("world must be 1 or 2");
         // STRIX_GLM_LOAD_TEST=1: one rank's slice loaded without a peer (load timing only; any forward throws).
         load_test = opt.world == 2 && comm == nullptr && std::getenv("STRIX_GLM_LOAD_TEST") != nullptr &&
@@ -981,9 +1004,12 @@ struct Engine::Impl {
     }
 
     LoadReport load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows,
-                    const std::function<void(const mem::LoadAdmission&)>& admit_prefill) {
+                    const std::function<void(const mem::LoadAdmission&)>& admit_prefill,
+                    const std::function<std::shared_ptr<PrefillPath>(bool)>& make_prefill) {
         try {
-            return load_checked(select_max_rows, admit_prefill);
+            return load_checked(select_max_rows, admit_prefill, make_prefill);
+        } catch (const InstallRefused&) {
+            throw;  // a coordinated capacity fallback, not a failed load
         } catch (const std::exception& e) {  // printed before the unwinding (HIP teardown can stall)
             std::fprintf(stderr, "load: rank %u FAILED: %s\n", opt.rank, e.what());
             if (monitor) monitor->phase("failed");
@@ -992,21 +1018,28 @@ struct Engine::Impl {
     }
 
     LoadReport load_checked(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows,
-                            const std::function<void(const mem::LoadAdmission&)>& admit_prefill) {
+                            const std::function<void(const mem::LoadAdmission&)>& admit_prefill,
+                    const std::function<std::shared_ptr<PrefillPath>(bool)>& make_prefill) {
         model::validate_model_directory(opt.model_dir);
         load_identity = identity;
         const auto t0 = Clock::now();
         start_monitor();
         hip_ok(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+        const auto& pf_policy = pf::capacity_policy();
+        const auto initial_pf_layout = pf::capacity_candidates(pf_policy, kv_shard != nullptr).front();
+        pf::capacity_layout() = initial_pf_layout;
+        const bool capacity_peer = opt.world == 2 && comm != nullptr && !opt.external_exchange && !load_test;
         if (opt.world == 2 && comm != nullptr && !opt.external_exchange && !load_test) {
             // All policies participate, so mismatched auto/explicit peers fail
             // before only one rank can enter the memory-plan vote.
-            const std::uint32_t policy = kv_shard_auto ? 2U : kv_shard ? 1U : 0U;
-            std::uint32_t peer_policy = 0;
-            comm->exchange_host({reinterpret_cast<const std::byte*>(&policy), sizeof(policy)},
-                                {reinterpret_cast<std::byte*>(&peer_policy), sizeof(peer_policy)},
+            const std::array<std::uint32_t, 4> policy{kv_shard_auto ? 2U : kv_shard ? 1U : 0U,
+                static_cast<std::uint32_t>(pf_policy.scratch), static_cast<std::uint32_t>(pf_policy.query_window + 1),
+                pf_seqpar ? 4U | (opt.pf_pipeline << 3U) : 0U};
+            std::array<std::uint32_t, 4> peer_policy{};
+            comm->exchange_host({reinterpret_cast<const std::byte*>(policy.data()), sizeof(policy)},
+                                {reinterpret_cast<std::byte*>(peer_policy.data()), sizeof(peer_policy)},
                                 {static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0xFFFFFFFDU, 0});
-            if (peer_policy != policy) throw std::runtime_error("kvshard: rank policy mismatch (0/1/auto)");
+            if (peer_policy != policy) throw std::runtime_error("glm: rank policy mismatch (KV_SHARD/PF_SCRATCH/PF_ATTN_QWIN/PF_SEQPAR)");
         }
         // STRIX_GLM_SMOKE_HEAD=1 (test only): the head on a truncated stack, allowed only for a synthetic model
         // (tools/glm/make_synth_model.py writes "synthetic": true into the index metadata); refused for any other model.
@@ -1029,19 +1062,10 @@ struct Engine::Impl {
             alloc();
             plan.step("buffers");
             lib.set_plan(nullptr);
-            // Conservative install bound: planned handles are null even for already-prepared linears.
-            prefill_install = 0;
-            std::uint64_t staging = 0;
-            for (const auto& w : layers) {
-                if (!w.moe) continue;
-                prefill_install += moe->warm_bytes(w.moew);
-                for (const Linear* l : {&w.moew.shared.gate, &w.moew.shared.up, &w.moew.shared.down}) {
-                    const auto parts = Lib::raw_trellis_bytes(l->raw) + std::uint64_t{l->raw.input} * 2 + std::uint64_t{l->raw.output} * 2;
-                    prefill_install += mem::round_up(parts + 3 * 256, 2 * mem::kMiB);
-                    staging = std::max(staging, parts);
-                }
-            }
-            prefill_install += staging;
+            // Planned handles are null: conservatively include every shared
+            // expert, using the SAME accounting as the later install guard.
+            prefill_install = prefill_install_bytes(true);
+            if (pf_seqpar) prefill_install += xfer::SeqparExchange::workspace_bytes(opt.max_rows);
             layers.clear();
         };
         make_plan();
@@ -1079,49 +1103,72 @@ struct Engine::Impl {
             // so an admission refusal at the larger size becomes a shared fallback before the first weight.
             if (opt.auto_rows) select_rows(true);
         }
-        if (kv_shard_auto) {
-            // Both ranks test the load guard AND the same prefill owner check
-            // that will run after load, at the negotiated chunk-row count.
+        if (admit_prefill || kv_shard_auto) {
+            // Exhaust replicated capacity levers BEFORE considering sharding.
+            // The same candidate must pass on both ranks; candidate checks never
+            // install a path. The post-load guard keeps the chosen layout fixed.
             struct Vote { std::uint32_t fits = 0; std::array<char, 768> reason{}; };
-            auto vote = [&](unsigned phase) {
-                std::array<Vote, 2> votes{};
-                try {
-                    const auto a = prefill_admission(true);
-                    if (!mem::fits(a.terms, a.snapshot, a.margins, a.device_free))
-                        throw std::runtime_error("load plan / first-forward reserve exceeds RAM, GTT or device headroom");
-                    if (!admit_prefill) throw std::runtime_error("unified prefill admission callback required");
-                    admit_prefill(a);
-                    votes[0].fits = 1;
-                    std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "admitted");
-                } catch (const std::runtime_error& e) {
-                    std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "%s", e.what());
-                }
-                comm->exchange_host({reinterpret_cast<const std::byte*>(&votes[0]), sizeof(Vote)},
-                                    {reinterpret_cast<std::byte*>(&votes[1]), sizeof(Vote)},
-                                    {static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0xFFFFFFFEU, phase});
-                if (votes[1].fits > 1U || votes[1].reason.back() != '\0')
-                    throw std::runtime_error("kvshard: invalid auto admission vote");
-                return votes;
-            };
-            const auto replicated = vote(0);
-            const bool enabled = kvshard::auto_shard(replicated[0].fits != 0, replicated[1].fits != 0);
-            if (enabled) {
-                kv_shard = std::make_unique<KvShard>(*comm, opt.rank);
-                bind_shard_exchange();
-                make_plan();
-                const auto sharded = vote(1);
-                if (kvshard::prefill_layout(replicated[0].fits != 0, replicated[1].fits != 0,
-                                            sharded[0].fits != 0, sharded[1].fits != 0) == kvshard::PrefillLayout::refuse)
-                    throw std::runtime_error(std::string("kvshard auto: neither layout admitted; replicated local: ") +
-                        replicated[0].reason.data() + "; peer: " + replicated[1].reason.data() +
-                        "; sharded local: " + sharded[0].reason.data() + "; peer: " + sharded[1].reason.data());
-            }
-            std::fprintf(stderr, "kvshard auto: context=%llu effective=%u reason=%s; replicated local: %s; peer: %s\n",
-                         static_cast<unsigned long long>(opt.capacity), enabled ? 1U : 0U,
-                         enabled ? "replicated-prefill-or-load-refused-sharded-admitted" : "replicated-prefill-and-load-admitted",
-                         replicated[0].reason.data(), replicated[1].reason.data());
+            std::array<Vote, 2> last_votes{};
+            unsigned phase = capacity_skip;
+            pf::CapacityLayout selected;
+            const bool initial_sharded = kv_shard != nullptr;
+            const bool admitted = pf::select_capacity_layout(pf_policy, initial_sharded, kv_shard_auto,
+                [&](pf::CapacityLayout layout) {
+                    last_votes = {};
+                    std::exception_ptr install_error;
+                    try {
+                        if (layout.sharded && !kv_shard) {
+                            kv_shard = std::make_unique<KvShard>(*comm, opt.rank);
+                            bind_shard_exchange();
+                            make_plan();
+                        }
+                        pf::capacity_layout() = layout;
+                        if (opt.world == 2 && !capacity_peer && !load_test &&
+                            (layout.routed != initial_pf_layout.routed || layout.query_window != initial_pf_layout.query_window))
+                            throw std::runtime_error("automatic scratch/window fallback requires the internal two-rank startup policy vote");
+                        const auto a = prefill_admission(true);
+                        if (!mem::fits(a.terms, a.snapshot, a.margins, a.device_free))
+                            throw std::runtime_error("load plan / first-forward reserve exceeds RAM, GTT or device headroom");
+                        if (!admit_prefill) throw std::runtime_error("unified prefill admission callback required");
+                        admit_prefill(a);
+                        last_votes[0].fits = 1;
+                        std::snprintf(last_votes[0].reason.data(), last_votes[0].reason.size(), "admitted");
+                    } catch (const std::runtime_error& e) {
+                        std::snprintf(last_votes[0].reason.data(), last_votes[0].reason.size(), "%s", e.what());
+                    } catch (...) {
+                        install_error = std::current_exception();
+                        last_votes[0].fits = 2;
+                        std::snprintf(last_votes[0].reason.data(), last_votes[0].reason.size(), "install failed");
+                    }
+                    if (capacity_peer) {
+                        comm->exchange_host({reinterpret_cast<const std::byte*>(&last_votes[0]), sizeof(Vote)},
+                                            {reinterpret_cast<std::byte*>(&last_votes[1]), sizeof(Vote)},
+                                            {static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0xFFFFFFFEU, phase});
+                        if (last_votes[1].fits > 2U || last_votes[1].reason.back() != '\0')
+                            throw std::runtime_error("glm capacity: invalid auto admission vote");
+                    } else {
+                        last_votes[1] = last_votes[0];
+                    }
+                    if (install_error) std::rethrow_exception(install_error);
+                    if (last_votes[1].fits == 2U) throw std::runtime_error("peer install failed");
+                    std::fprintf(stderr, "glm capacity candidate: rank=%u kv=%s scratch=%s qwin=%u local=%s peer=%s\n",
+                        opt.rank, layout.sharded ? "sharded" : "replicated", layout.routed ? "routed" : "full",
+                        layout.query_window, last_votes[0].reason.data(), last_votes[1].reason.data());
+                    capacity_candidate = phase++;
+                    return std::array<bool, 2>{last_votes[0].fits != 0, last_votes[1].fits != 0};
+                }, selected, capacity_skip);
+            if (!admitted)
+                throw std::runtime_error(std::string("glm capacity: no layout admitted; local: ") +
+                    last_votes[0].reason.data() + "; peer: " + last_votes[1].reason.data());
+            pf::capacity_layout() = selected;
+            const std::string requested_window = pf_policy.query_window < 0 ? "auto" : std::to_string(pf_policy.query_window);
+            std::fprintf(stderr, "glm capacity: rank=%u context=%llu scratch requested=%s resolved=%s; qwin requested=%s resolved=%u; kv=%s reason=%s\n",
+                opt.rank, static_cast<unsigned long long>(opt.capacity), pf::scratch_policy_name(pf_policy.scratch),
+                selected.routed ? "routed" : "full", requested_window.c_str(), selected.query_window,
+                selected.sharded ? "sharded" : "replicated",
+                initial_sharded ? "explicit-sharding-first-admitted-scratch-window" : pf::capacity_layout_reason(selected));
         }
-        if (admit_prefill) admit_prefill(prefill_admission(false));
+        if (admit_prefill) vote_prefill_install([&] { admit_prefill(prefill_admission(false)); }, 0xFFFFFFFDU);
         const std::uint64_t stage = mem::round_up(std::max<std::uint64_t>(plan.stage_max, 1), 2 * mem::kMiB);
         lib.set_stage_bytes(stage);
         const std::uint64_t phys = plan.physical(amodel);
@@ -1165,7 +1212,13 @@ struct Engine::Impl {
         if (load_limit) monitor->set_max_gtt_used(0);
         monitor->phase("ready");
         loaded = true;
-        if (pf_installed && pf) install_prefill(*pf);  // a path set before load() (admits its own allocations)
+        if (make_prefill || (pf_installed && pf)) vote_prefill_install([&] {
+            auto path = make_prefill ? make_prefill(kv_shard != nullptr) : pf;
+            if (!path) return;
+            install_prefill(*path);
+            pf = std::move(path);
+            pf_installed = true;
+        }, 0xFFFFFFFCU);
         LoadReport rep;
         rep.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
         rep.gib_read = pack.gib_read();
@@ -1209,14 +1262,54 @@ struct Engine::Impl {
     // copies of raw-only shared experts (needs_prepared_shared), the MoE seam's per-layer tables (used per row when
     // moe_by_row, and by decode), and the LinearRunner workspace for the path's calls and every GEMV call. Each step
     // is admitted against hipMemGetInfo free and MemAvailable with the path's margin before it allocates.
-    void install_prefill(PrefillPath& p) {
+    template<class Install>
+    void vote_prefill_install(Install&& install, std::uint32_t tag) {
+        struct Vote { std::uint32_t fits = 0, seqpar = 0; std::array<char, 768> reason{}; };
+        std::array<Vote, 2> votes{};
+        std::exception_ptr install_error;
+        try {
+            install();
+            votes[0].fits = 1;
+            std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "installed");
+        } catch (const std::runtime_error& e) {
+            // Retry only an admission refusal. Compiler/runtime and model errors
+            // are not evidence that a smaller layout is safe to execute.
+            votes[0].fits = std::string(e.what()).find("refusing") != std::string::npos ? 0U : 2U;
+            std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "%s", e.what());
+        } catch (...) {
+            install_error = std::current_exception();
+            votes[0].fits = 3;
+            std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "install failed");
+        }
+        votes[0].seqpar = pf_seqpar ? 1U : 0U;
+        if (opt.world == 2 && comm && !load_test && !opt.external_exchange) {
+            comm->exchange_host({reinterpret_cast<const std::byte*>(&votes[0]), sizeof(Vote)},
+                                {reinterpret_cast<std::byte*>(&votes[1]), sizeof(Vote)},
+                                {static_cast<std::uint32_t>(dist::TagKind::raw_slots), tag, capacity_candidate});
+            if (votes[1].fits > 3U || votes[1].seqpar > 1U || votes[1].reason.back() != '\0')
+                throw std::runtime_error("glm capacity: invalid install vote");
+        } else votes[1] = votes[0];
+        if (install_error) std::rethrow_exception(install_error);
+        if (votes[1].fits == 3U) throw std::runtime_error("peer install failed");
+        if (votes[0].fits == 1U && votes[1].fits == 1U && votes[0].seqpar != votes[1].seqpar)
+            throw std::runtime_error("glm: rank policy mismatch (PF_SEQPAR install decision)");
+        if (votes[0].fits == 1U && votes[1].fits == 1U) return;
+        const std::string reason = std::string("glm capacity install: local: ") + votes[0].reason.data() +
+            "; peer: " + votes[1].reason.data();
+        std::fprintf(stderr, "%s; %s\n", reason.c_str(),
+            votes[0].fits == 2U || votes[1].fits == 2U ? "fatal install error" : "trying next permitted layout");
+        if (votes[0].fits == 2U || votes[1].fits == 2U) throw std::runtime_error(reason);
+        throw InstallRefused(reason);
+    }
+
+    std::uint64_t prefill_install_bytes(bool prepared_shared) const {
         constexpr std::uint64_t kGranule = std::uint64_t{2} << 20;
         auto granules = [&](std::uint64_t b) { return (b + kGranule - 1) / kGranule * kGranule; };
         std::uint64_t need = 0, staging = 0;
         for (auto& w : layers) {
             if (!w.moe) continue;
             need += moe->warm_bytes(w.moew);
-            if (!p.needs_prepared_shared()) continue;
+            if (!prepared_shared) continue;
             for (const Linear* l : {&w.moew.shared.gate, &w.moew.shared.up, &w.moew.shared.down}) {
                 if (l->prepared != nullptr) continue;
                 const std::uint64_t parts = Lib::raw_trellis_bytes(l->raw) + std::uint64_t{l->raw.input} * 2 + std::uint64_t{l->raw.output} * 2;
@@ -1224,9 +1317,20 @@ struct Engine::Impl {
                 staging = std::max(staging, parts);  // prepare_from_raw's host copy, one matrix at a time
             }
         }
+        return need + staging;
+    }
+
+    void install_prefill(PrefillPath& p) {
+        if (pf_seqpar_auto_eligible) {
+            pf_seqpar = p.supports_pipeline() && opt.max_rows >= 2;
+            if (!pf_seqpar)
+                std::fprintf(stderr, "glm prefill seqpar auto declined: %s; legacy path\n",
+                             !p.supports_pipeline() ? "prefill path does not support pipeline" : "max_rows < 2");
+        }
+        const auto need = prefill_install_bytes(p.needs_prepared_shared());
         if (need != 0) {
             hip_ok(hipDeviceSynchronize(), "sync");
-            Lib::admit(need + staging, p.admission_margin(), "prefill install (prepared shared experts, MoE tables)");
+            Lib::admit(need, p.admission_margin(), "prefill install (prepared shared experts, MoE tables)");
             for (std::size_t i = 0; i < layers.size(); ++i) {
                 auto& w = layers[i];
                 if (!w.moe) continue;
@@ -1242,6 +1346,14 @@ struct Engine::Impl {
         // fit. The reservation fails closed (device free and MemAvailable must cover it + the margin while the old
         // workspace still exists).
         lib.reserve(std::max(p.linear_workspace_bytes(), lib.gemv_workspace_bound(8, p.admission_margin())), p.admission_margin());
+        if (pf_seqpar && p.supports_pipeline() && opt.max_rows >= 2 && !seqpar_xch) {
+            Lib::admit(xfer::SeqparExchange::workspace_bytes(opt.max_rows), p.admission_margin(), "prefill seqpar channel");
+            xch->complete(stream);
+            hip_ok(hipStreamSynchronize(stream), "seqpar install");
+            seqpar_xch = std::make_unique<xfer::SeqparExchange>(comm->transport(), opt.rank, opt.max_rows, stream);
+            std::fprintf(stderr, "glm prefill seqpar: on even chunks=owner-mhc-norm odd/singleton=legacy pipeline=%u\n",
+                         opt.pf_pipeline);
+        }
     }
 
     void warm_moe(MoePath& m, std::uint64_t margin) {
@@ -1549,12 +1661,175 @@ struct Engine::Impl {
         check_flag("layers");
     }
 
+    // TP2 SP island: residual/mHC/norm are owner-local, column/head/K-half work
+    // still consumes every row. Pipeline halves each contain both owners, so
+    // their independently queued RS/AG can overlap the other half's column work.
+    void layers_forward_seqpar(std::span<const Row> rows, unsigned n_layers) {
+        const unsigned R = static_cast<unsigned>(rows.size());
+        const unsigned tiles = xfer::seqpar_tiles(R, opt.pf_pipeline);
+        const unsigned block = opt.pf_pipeline == 2 ? R / 2U : R;
+        std::array<float*, 2> tile_x{X, X}, tile_out{X2, X2};
+        if (!pf->supports_pipeline() || layer_dump != nullptr || null_layer >= 0)
+            throw std::logic_error("glm seqpar: requires row-invariant chunked prefill without diagnostic mutation hooks");
+        // No two progress owners may borrow the transport at once. CRC/seal and
+        // device consumers retire before entry and before the unchanged head.
+        xch->complete(stream);
+        hip_ok(hipStreamSynchronize(stream), "seqpar entry");
+        if (!seqpar_xch) throw std::logic_error("glm seqpar: channel must be admitted by set_prefill before execution");
+        const bool fuse = opt.pf_pipeline == 2 && glm::pf::hc_expand_norm_enabled();
+        float* const sp_xn = seqpar_xch->normalized(); // coherent direct AG consumer
+        const bool mixnorm = glm::pf::hc_mix_norm_enabled();
+        std::array<bool, 2> normed{};
+        auto pre = [&](unsigned i, const HcSite& site, const std::uint16_t* norm) {
+            const auto half_stream = seqpar_xch->compute(i);
+            const auto tile = xfer::seqpar_tile(R, opt.pf_pipeline, i);
+            const auto own = xfer::seqpar_owner(tile, opt.rank);
+            const std::size_t q = own.first, hidden_offset = own.elements(), residual_offset = own.elements(kHc * kHidden);
+            float* local = tile_x[i] + residual_offset;
+            if (normed[i]) {
+                if (mixnorm)
+                    glm::pf::hc_pre_rows_normed(local, site.fn, site.base, site.scale, hrr + q, hz + q * kHcMix,
+                                                mix + q * kHcMix, norm, sp_xn + hidden_offset, own.count, half_stream);
+                else
+                    glm::pf::hc_pre_rows_normed(local, site.fn, site.base, site.scale, hrr + q, hz + q * kHcMix,
+                                                mix + q * kHcMix, xc + hidden_offset, own.count, half_stream);
+            } else if (mixnorm) {
+                glm::pf::hc_pre_rows_v2(local, site.fn, site.base, site.scale, F + residual_offset, hz + q * kHcMix,
+                                       mix + q * kHcMix, norm, sp_xn + hidden_offset, own.count, half_stream);
+            } else {
+                glm::pf::hc_pre_rows(local, site.fn, site.base, site.scale, F + residual_offset, hz + q * kHcMix,
+                                    mix + q * kHcMix, xc + hidden_offset, own.count, half_stream);
+            }
+            if (!mixnorm)
+                D::GlmNorm::run(xc + hidden_offset, norm, D::WType::BF16, kHidden, kEps, sp_xn + hidden_offset, own.count, half_stream);
+            normed[i] = false;
+            // Restore all rows before KDA recurrence, MLA/KV writes, router or
+            // any TP column projection. Absolute positions/cache layouts stay intact.
+            seqpar_xch->start_gather(sp_xn, tile, i, half_stream);
+        };
+        auto post = [&](unsigned i) {
+            const auto half_stream = seqpar_xch->compute(i);
+            const float* peer = seqpar_xch->finish_reduce_scatter(i, half_stream);
+            const auto own = xfer::seqpar_owner(xfer::seqpar_tile(R, opt.pf_pipeline, i), opt.rank);
+            const std::size_t q = own.first, hidden_offset = own.elements(), residual_offset = own.elements(kHc * kHidden);
+            if (fuse && !glm::pf::hc_expand_norm_split()) {
+                const float* local = part + hidden_offset;
+                // Reuse the existing mHC input path: rank-ordered FP32 sum on
+                // load, followed by the unchanged expand/norm expressions.
+                glm::pf::hc_sum_expand_norm_rows(tile_x[i] + residual_offset, mix + q * kHcMix,
+                                                 opt.rank == 0 ? local : peer, opt.rank == 0 ? peer : local,
+                                                 tile_out[i] + residual_offset, hrr + q, flag, own.count, half_stream);
+            } else {
+                xfer::post_expand(tile_x[i] + residual_offset, mix + q * kHcMix, part + hidden_offset,
+                                  peer, xfer::RxView{}, opt.rank, tile_out[i] + residual_offset, flag, own.count, half_stream);
+                if (fuse) glm::pf::hc_norm_factor_rows(tile_out[i] + residual_offset, hrr + q, own.count, half_stream);
+            }
+            seqpar_xch->release_reduce_scatter(i, half_stream);
+            normed[i] = fuse;
+            std::swap(tile_x[i], tile_out[i]);
+        };
+        auto column = [&](unsigned i, LayerW& w, bool ffn) {
+            const auto half_stream = seqpar_xch->compute(i);
+            seqpar_xch->column_begin(i);
+            const auto tile = xfer::seqpar_tile(R, opt.pf_pipeline, i);
+            for (unsigned first = tile.first; first < tile.first + tile.count; first += block) {
+                const CallCtx c{&lib, rows.subspan(first, block), slot_d + first, pos_d + first, flag, half_stream, false, nullptr};
+                const auto off = std::size_t{first} * kHidden;
+                const float* x = sp_xn + off;
+                if (!ffn) {
+                    if (w.kda) pf->kda(w.kdaw, w.kst, c, x, part + off);
+                    else pf->dsa(w.dsaw, w.dst, c, x, part + off);
+                } else if (w.moe) {
+                    auto* id = ids + std::size_t{first} * kTopE;
+                    auto* wt = wts + std::size_t{first} * kTopE;
+                    auto* log = rlog + std::size_t{first} * kExperts;
+                    // Router and matrix-specific MoE input transforms stay replicated.
+                    glm::pf::dense_rows(x, w.moew.router, D::WType::F16, kHidden, 0, kExperts, log, block, half_stream);
+                    D::route(log, w.moew.bias, id, wt, block, half_stream);
+                    if (pf->moe_by_row()) {
+                        const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
+                        for (unsigned r = 0; r < block; r += B) {
+                            const CallCtx cr{&lib, c.rows.subspan(r, std::min(B, block - r)), slot_d + first + r,
+                                             pos_d + first + r, flag, half_stream, false, nullptr};
+                            moe->forward(w.moew, cr, x + std::size_t{r} * kHidden, id + std::size_t{r} * kTopE,
+                                         wt + std::size_t{r} * kTopE, part + off + std::size_t{r} * kHidden);
+                        }
+                    } else pf->moe(w.moew, c, x, id, wt, part + off);
+                } else pf->dense(w.dense, c, x, dense_i, part + off);
+            }
+            seqpar_xch->column_end(i);
+        };
+        auto consume_column = [&](unsigned i, LayerW& w, bool ffn) {
+            seqpar_xch->finish(i, seqpar_xch->compute(i));  // only this half's xn must be present
+            column(i, w, ffn);
+        };
+        auto start_rs = [&](unsigned i) {
+            seqpar_xch->start_reduce_scatter(part, xfer::seqpar_tile(R, opt.pf_pipeline, i), i, seqpar_xch->compute(i));
+        };
+        try {
+            for (unsigned li = 0; li < n_layers; ++li) {
+                LayerW& w = layers[li];
+                cur_layer = li;
+                pre(0, w.hc_attn, w.in_norm);
+                if (tiles == 1) {
+                    consume_column(0, w, false);
+                    start_rs(0);
+                    post(0);
+                    pre(0, w.hc_ffn, w.post_norm);
+                    consume_column(0, w, true);
+                    start_rs(0);
+                    post(0);
+                    continue;
+                }
+                if (li == 0) pre(1, w.hc_attn, w.in_norm);
+                else start_rs(1); // previous FFN B; AG A precedes it on the wire
+                consume_column(0, w, false);
+                if (li != 0) {
+                    post(1);
+                    pre(1, w.hc_attn, w.in_norm);
+                }
+                start_rs(0); // attention A overlaps attention B
+                consume_column(1, w, false);
+                post(0);
+                pre(0, w.hc_ffn, w.post_norm);
+                start_rs(1); // attention B overlaps FFN A, after its AG
+                consume_column(0, w, true);
+                post(1);
+                pre(1, w.hc_ffn, w.post_norm);
+                start_rs(0); // FFN A overlaps FFN B, after its AG
+                consume_column(1, w, true);
+                post(0);
+                // Defer B's RS until AFTER next-layer AG A, so that a side
+                // stream RX wait cannot sit in front of A's next column call.
+            }
+            if (tiles == 2 && n_layers != 0) {
+                start_rs(1);
+                post(1);
+            }
+            seqpar_xch->join();
+            seqpar_xch->materialize_last(X, R);
+            seqpar_xch->complete();
+            hip_ok(hipStreamSynchronize(stream), "seqpar exit");
+        } catch (...) {
+            try { seqpar_xch->complete(); } catch (...) {}
+            throw;
+        }
+        // Legacy segment events are single-stream intervals. Attribute this
+        // multi-queue island as one exchange interval; use a queue trace for
+        // per-kernel/overlap accounting, never sum cross-stream intervals.
+        mark(segXch);
+        check_flag("seqpar layers");
+    }
+
     // sp != nullptr: speculative verify rows (one slot): checkpoints go to sp->row_flag[r], nothing throws here.
     // pfc: a chunk of a chunked prefill (rows of one slot, any count <= max_rows): attention, MoE and the dense FFN go
     // through the PrefillPath seam; the row-batched Tier A sites use pf::hc_pre_rows / pf::dense_rows (== decode bits).
     void layers_forward(std::span<const Row> rows, unsigned n_layers, ForwardKind kind, const SpecRows* sp = nullptr) {
         const bool pfc = kind == ForwardKind::Prefill;
         const auto R = static_cast<unsigned>(rows.size());
+        const bool seqpar = pfc && pf_seqpar && xfer::seqpar_admits(R);
+        if (pfc && pf_seqpar && !seqpar)
+            std::fprintf(stderr, "glm prefill seqpar: rows=%u declined (requires even rows >= 2); legacy path\n", R);
         if (pfc && opt.pf_pipeline == 2) {
             if (sp != nullptr || layer_dump != nullptr || null_layer >= 0)
                 throw std::logic_error("prefill pipeline 2 does not support spec / layer_dump / null_layer hooks");
@@ -1584,13 +1859,25 @@ struct Engine::Impl {
         hip_ok(hipMemcpyAsync(pos_d, ps.data(), R * 8, hipMemcpyHostToDevice, stream), "pos");
         seg_n = 0;  // only step() collects; a verify / gate forward's marks are dropped here
         mark(segStart);
-        embed4_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, X);
+        if (seqpar) {
+            for (unsigned i = 0; i < xfer::seqpar_tiles(R, opt.pf_pipeline); ++i) {
+                const auto embed_rows = xfer::seqpar_owner(xfer::seqpar_tile(R, opt.pf_pipeline, i), opt.rank);
+                embed4_kernel<<<dim3(kHidden / 256, embed_rows.count), 256, 0, stream>>>(
+                    embed, tok_d + embed_rows.first, X + embed_rows.elements(kHc * kHidden));
+            }
+        } else {
+            embed4_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, X);
+        }
         hip_ok(hipGetLastError(), "embed");
         mark(segEmbed);
         if (!pfc && R > 8) throw std::invalid_argument("layers_forward: decode calls take 1..8 rows");
         if (R > std::max<unsigned>(8U, opt.max_rows)) throw std::invalid_argument("layers_forward: rows > max_rows");
         if (pfc && r1b) throw std::logic_error("r1b-all needs the reference prefill; the chunked prefill implements R1 prompts");
         select_exchange(kind, R);
+        if (seqpar) {
+            layers_forward_seqpar(rows, n_layers);
+            return;
+        }
         if (pfc && opt.pf_pipeline == 2) {
             layers_forward_pipeline(rows, n_layers);
             return;
@@ -1792,8 +2079,31 @@ struct Engine::Impl {
             rows.resize(R);
             for (unsigned j = 0; j < R; ++j) rows[j] = Row{slot, tokens[c0 + j], pos0 + c0 + j};
             layers_forward(rows, opt.layers, ForwardKind::Prefill);
-            D::hc_final(X, hfin, R, stream);
-            D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
+            if (pf_seqpar && xfer::seqpar_admits(R)) {
+                if (!seqpar_xch) throw std::logic_error("glm seqpar: channel must be admitted before final gather");
+                // MTP teacher forcing consumes all trunk hidden rows. Residual
+                // streams remain local; gather only the final normalized hidden.
+                float* const gathered = seqpar_xch->normalized();
+                const unsigned tiles = xfer::seqpar_tiles(R, opt.pf_pipeline);
+                for (unsigned i = 0; i < tiles; ++i) {
+                    const auto tile = xfer::seqpar_tile(R, opt.pf_pipeline, i);
+                    const auto own = xfer::seqpar_owner(tile, opt.rank);
+                    D::hc_final(X + own.elements(kHc * kHidden), hfin + own.elements(), own.count, stream);
+                    D::GlmNorm::run(hfin + own.elements(), final_norm, D::WType::BF16, kHidden, kEps,
+                                   gathered + own.elements(), own.count, stream);
+                    seqpar_xch->start_gather(gathered, tile, i, stream);
+                }
+                for (unsigned i = 0; i < tiles; ++i) seqpar_xch->finish(i, stream);
+                seqpar_xch->complete();
+                // One chunk-boundary handoff into the existing MTP buffer;
+                // per-sublayer AG has no staging/copy kernel.
+                hip_ok(hipMemcpyAsync(hidden, gathered, xfer::GlmSchedule::row_bytes(R), hipMemcpyDeviceToDevice, stream),
+                       "seqpar MTP hidden copy");
+                hip_ok(hipStreamSynchronize(stream), "seqpar MTP hidden handoff");
+            } else {
+                D::hc_final(X, hfin, R, stream);
+                D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
+            }
             // Like the plain chunked prefill, interior rows run no vocabulary head (trunk or MTP): their ids are
             // discarded and drafts are always verified, so only the final row's head (y0) and the seed drafter
             // below need logits. Per-row vocabulary heads cost ~15 % of the prefill at 8K/32K.
@@ -2138,8 +2448,24 @@ struct Engine::Impl {
 Engine::Engine(Options options, dist::Communicator* comm) : impl_(std::make_unique<Impl>(std::move(options), comm)) {}
 Engine::~Engine() = default;
 LoadReport Engine::load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows,
-                        const std::function<void(const mem::LoadAdmission&)>& admit_prefill) {
-    return impl_->load(select_max_rows, admit_prefill);
+                        const std::function<void(const mem::LoadAdmission&)>& admit_prefill,
+                    const std::function<std::shared_ptr<PrefillPath>(bool)>& make_prefill) {
+    for (;;) {
+        try {
+            return impl_->load(select_max_rows, admit_prefill, make_prefill);
+        } catch (const Impl::InstallRefused&) {
+            // No forward has run. Drop the rejected path, weights, KV and any
+            // partial install before replanning; AUTO may now change KV storage.
+            const auto options = impl_->opt;
+            auto* comm = impl_->comm;
+            const auto skip = impl_->capacity_candidate + 1;
+            auto external = options.external_exchange ? impl_->fallback_xch : nullptr;
+            impl_.reset();
+            impl_ = std::make_unique<Impl>(options, comm);
+            impl_->capacity_skip = skip;
+            if (external) set_exchange(std::move(external));
+        }
+    }
 }
 std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
     // Cover every forward issued by either path, including prompt-time MTP work.

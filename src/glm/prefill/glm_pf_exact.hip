@@ -155,12 +155,23 @@ __global__ __launch_bounds__(256) void x3_kernel(Mat m, const _Float16* t, float
     exact_x::core_s<B, R>(m, XRows{t, y, ys, m.input, row0}, nr, splits, hp, lds);
 }
 // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): 64-row blocks on the WMMA core.
-template<int B, unsigned Rows = 64, unsigned CP = 1>
-__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void w_kernel(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows) {
-    __shared__ wmma_x::StorageR<Rows> lds;
+template<int B, unsigned Rows = 64, unsigned CP = 1, bool FusedInput = false>
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void w_kernel(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, const float* raw = nullptr, std::size_t xs = 0) {
+    __shared__ wmma_x::StorageR<Rows, FusedInput ? 68U : 36U> lds;
     const unsigned row0 = blockIdx.y * Rows;
     const unsigned nr = rows - row0 < Rows ? rows - row0 : Rows;
-    wmma_x::span<B, CP>(m, [&](unsigned r, unsigned) { return XRows{t, y, ys, m.input, row0 + r}; }, nr, lds);
+    auto at = [&](unsigned r, unsigned) { return XRows{t, y, ys, m.input, row0 + r}; };
+    if constexpr (FusedInput) wmma_x::span<B, CP>(m, at, nr, lds, aux::Store{}, aux::H128Input{raw, xs, row0});
+    else wmma_x::span<B, CP>(m, at, nr, lds);
+}
+template<int B, bool Fused>
+void launch_w(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s,
+              const float* raw, std::size_t xs) {
+    if (wmma_x::tile_rows() == 128U && wmma_x::cols_per_wave() == 2U)
+        w_kernel<B, 128, 2, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
+    else if (wmma_x::tile_rows() == 128U)
+        w_kernel<B, 128, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
+    else w_kernel<B, 64, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 64U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
 }
 template<int B, unsigned TM>
 void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s, std::size_t* scratch) {
@@ -171,11 +182,7 @@ void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, h
             *scratch = a.localSizeBytes;
             return;
         }
-        if (wmma_x::tile_rows() == 128U && wmma_x::cols_per_wave() == 2U)
-            w_kernel<B, 128, 2><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows);
-        else if (wmma_x::tile_rows() == 128U)
-            w_kernel<B, 128><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows);
-        else w_kernel<B><<<dim3(m.output / 128U, (rows - 1U) / wmma_x::kRowsMax + 1U), 256, 0, s>>>(m, t, y, ys, rows);
+        launch_w<B, false>(m, t, y, ys, rows, s, nullptr, 0);
         ok(hipGetLastError());
         return;
     } else if constexpr (TM == 3 || TM == 4) {
@@ -288,11 +295,21 @@ void linear_rows(const engine::Linear& l, const float* x, std::size_t xs, float*
     const unsigned tm = tile_rows();
     auto* t = static_cast<_Float16*>(ws);
     const auto grid = static_cast<unsigned>((std::size_t{rows} * (m.input / 128U) + 3U) / 4U);
-    input_kernel<<<grid, 128, 0, s>>>(x, xs, m, rows, t);
-    ok(hipGetLastError());
     const unsigned core = selected == Route::x3r8 && wmma_x::enabled() && m.input % 64U == 0 ? 5U : selected == Route::x3r8 ? 4U : selected == Route::x3 ? 3U :
         selected == Route::x2 ? 1U : (selected == Route::x ? 0U : tm);
     if (core == 5U) wmma_x::dense_calls.fetch_add(1, std::memory_order_relaxed);
+    if (core == 5U && aux::input_admitted(m.output) && aux::enabled("STRIX_GLM_PF_AUX_INPUT")) {
+#define CASE(B) case B: launch_w<B, true>(m, t, y, ys, rows, s, x, xs); break
+        switch (m.bits) {
+        CASE(2); CASE(3); CASE(4); CASE(5); CASE(6); CASE(7); CASE(8);
+        default: throw std::invalid_argument("glm pf exact: bits");
+        }
+#undef CASE
+        ok(hipGetLastError());
+        return;
+    }
+    input_kernel<<<grid, 128, 0, s>>>(x, xs, m, rows, t);
+    ok(hipGetLastError());
     dispatch_tm(core, m, t, y, ys, rows, s);
 }
 hipFuncAttributes x_resources(const engine::Linear& l, unsigned variant) {

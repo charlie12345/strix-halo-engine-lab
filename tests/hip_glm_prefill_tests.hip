@@ -1437,6 +1437,50 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
             compare(ob[0], ob[1], nq);
             compare(out[0], out[1], no);
             check(same, "MLA 7/7/3 == 7/7/2 bitwise intermediates/output/guards, C=129 H=" + std::to_string(H));
+            // Same full piece as an MTP consumer: internal windows must cover
+            // every output and keep qt/e/ob inside their smaller poisoned arenas.
+            // Odd windows move rows across GEMM/score CTA groups; the last piece
+            // must match the corresponding full-call intermediate rows as well.
+            const unsigned window_versions[][3] = {{7, 10, 3}, {7, 7, 3}, {4, 6, 3}, {1, 1, 1}};
+            for (const auto& version : window_versions) {
+                hok(hipMemset(ep[1], 0xFF, (ne + guard) * sizeof(float)), "query window reference poison");
+                P::mla_attention_rows_versions(slot.s, tk, nn, q, kv, H, qt[1], ep[1], ob[1], out[1], C, nullptr,
+                                               version[0], version[1], version[2]);
+                for (unsigned window : {1U, 17U, 64U, 128U, 256U}) {
+                    const unsigned Q = std::min(C, window), tail = (C - 1) % Q + 1;
+                    const std::size_t sq = static_cast<std::size_t>(Q) * H * kKvLora;
+                    const std::size_t se = static_cast<std::size_t>(Q) * H * P::kEStride;
+                    auto* wqt = poison<float>(sq + guard);
+                    auto* we = poison<float>(se + guard);
+                    auto* wob = poison<float>(sq + guard);
+                    auto* wo = poison<float>(no + guard);
+                    P::mla_attention_rows_versions(slot.s, tk, nn, q, kv, H, wqt, we, wob, wo, C, nullptr,
+                                                   version[0], version[1], version[2], window);
+                    bool window_ok = bits_eq(down(wo, no + guard), down(out[1], no + guard));
+                    const auto image = [&](const float* actual, const float* reference, std::size_t allocated, unsigned stride) {
+                        const auto got = down(actual, allocated + guard);
+                        const std::size_t valid = static_cast<std::size_t>(tail) * H * stride;
+                        const auto want = down(reference + static_cast<std::size_t>(C - tail) * H * stride, valid);
+                        window_ok &= std::memcmp(got.data(), want.data(), valid * sizeof(float)) == 0;
+                        for (std::size_t i = allocated; i < got.size(); ++i) {
+                            std::uint32_t bits;
+                            std::memcpy(&bits, &got[i], sizeof(bits));
+                            window_ok &= bits == 0xFFFFFFFFU;
+                        }
+                    };
+                    image(wqt, qt[1], sq, kKvLora);
+                    image(we, ep[1], se, P::kEStride);
+                    image(wob, ob[1], sq, kKvLora);
+                    check(window_ok, "MLA query window output/tail/guards bitwise C=129 H=" + std::to_string(H) + " Q=" + std::to_string(window) +
+                                     " versions=" + std::to_string(version[0]) + "/" + std::to_string(version[1]) + "/" + std::to_string(version[2]));
+                    // These are the four most recent owners; do not retain every
+                    // window's scratch until the complete attention fixture ends.
+                    for (unsigned i = 0; i < 4; ++i) {
+                        hok(hipFree(g_allocs.back()), "query window free");
+                        g_allocs.pop_back();
+                    }
+                }
+            }
             free_all();
         }
     }

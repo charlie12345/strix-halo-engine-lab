@@ -30,7 +30,20 @@ void test_common_default_rows() {
     static_assert(std::is_same_v<rd::EnvItem, profile::DefaultItem>);
     const Env absent;
     const auto empty = lookup(absent);
-    CHECK(rd::env_items().size() == 36);
+    CHECK(rd::env_items().size() == 40);
+    const auto normal = rd::resolve(rd::scan({}), empty);
+    const auto baseline_config = rd::resolve(rd::scan({"--baseline"}), empty);
+    CHECK(rd::print(normal).find("effective pf-seqpar=on") != std::string::npos);
+    CHECK(rd::print(baseline_config).find("effective pf-seqpar=off") != std::string::npos);
+    CHECK(rd::print(baseline_config).find("capacity-layout=replicated/full/qwin=0") != std::string::npos);
+    for (const auto& args : {std::vector<std::string>{"--prefill", "wmma"},
+                             std::vector<std::string>{"--max-rows", "1"}, std::vector<std::string>{"--world", "1"}})
+        CHECK(rd::print(rd::resolve(rd::scan(args), empty)).find("effective pf-seqpar=declined") != std::string::npos);
+    const Env routed{{"STRIX_GLM_PF_SCRATCH", "routed"}, {"STRIX_GLM_PF_ATTN_QWIN", "2048"}};
+    const auto config = rd::print(rd::resolve(rd::scan({}), lookup(routed)));
+    CHECK(config.find("capacity-layout=replicated/routed/qwin=2048") != std::string::npos);
+    CHECK(config.find("capacity_layout_reason=first-admitted-query-window") != std::string::npos);
+    CHECK(config.find("admission and rank vote pending") != std::string::npos);
     for (const auto& row : rd::env_items()) {
         using Source = profile::DefaultSource;
         auto value = profile::resolve_default(row, false, empty);
@@ -61,6 +74,15 @@ void test_glm_exports_and_precedence() {
         r.baseline_flag = baseline;
         for (const std::string& setting : {std::string(row.off), std::string{}}) {
             const Env env{{row.env, setting}};
+            if (setting.empty() && (std::string(row.env) == "STRIX_GLM_PF_SEQPAR" ||
+                                    std::string(row.env) == "STRIX_GLM_PF_SCRATCH" ||
+                                    std::string(row.env) == "STRIX_GLM_PF_ATTN_QWIN")) {
+                bool refused = false;
+                try { (void)rd::resolve(r, lookup(env)); }
+                catch (const std::invalid_argument&) { refused = true; }
+                CHECK(refused);
+                continue;
+            }
             const auto e = rd::resolve(r, lookup(env));
             CHECK(e.env.at(row.env).value == setting && e.env.at(row.env).source == "explicit");
             Env exported;

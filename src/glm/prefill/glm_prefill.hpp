@@ -27,9 +27,11 @@ void set_kda_scan_version(unsigned v);
 // ---- DSA indexer + MLA. The slot holds positions [0, t0) on entry.
 // Cache writes for rows t0 .. t0 + C - 1 (latent [C][512] normed, key / gate [C][128] = the R1 wk / gate outputs of
 // the rows) and every pool completed by them (R12). C3/C4 -> flag.
+// With latent_norm (BF16 [512]), latent is raw kv_a: the append consumes the
+// original 256-lane RMSNorm graph before conversion, without a FP32 norm image.
 void dsa_append_rows(const dev::DsaSlot& slot, unsigned t0, const float* latent, const float* key, const float* gate,
                      const dev::IndexerDev& w, unsigned* flag, unsigned C, hipStream_t s,
-                     bool kv_shard = false, unsigned rank = 0);
+                     bool kv_shard = false, unsigned rank = 0, const std::uint16_t* latent_norm = nullptr);
 
 // Canonical token lists of rows t0 .. t0 + C - 1 (section 1.4): tokens [C][2051], n [C].
 //   qI [C][32 * 128] (wq_b outputs), wh [C][32] = R1 weights_proj outputs, unscaled on entry. Only when some row of the
@@ -51,16 +53,22 @@ void indexer_select_rows_versions(const dev::DsaSlot& slot, unsigned t0, const f
 void set_idx_profile(hipEvent_t* ev3);
 
 // R13 for `heads` rank heads and C rows: q [C][heads][256]; kv_b rank rows [heads * 512][512] F16.
-//   qt [C][heads][512], e [C][heads][kEStride] and ob [C][heads][512] are workspace; o [C][heads][256]. e holds the
+//   qt [Q][heads][512], e [Q][heads][kEStride] and ob [Q][heads][512] are workspace; o [C][heads][256].
+//   The explicit query_window overload uses Q=min(C, query_window); zero/default keeps Q=C.
+//   The owner resolves the environment at install; these launchers never read it.
+//   Workspace contains only the final query window after return. e holds the
 //   probabilities in token order, or lane-major (slot 9 * bitrev8(t % 256) + t / 256, padding +0) when
 //   mla_e_lane_major(heads) (o-bar v5 / v7).
 bool mla_e_lane_major(unsigned heads);
 // Profiling hook (bench only): when set, mla_attention_rows records 6 events on its stream (before absorb, scores, softmax,
-// o-bar, out, after). nullptr disables.
+// o-bar, out, after). With query windows the events describe the final window. nullptr disables.
 void set_mla_profile(hipEvent_t* ev6);
 void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s);
+void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s, unsigned query_window);
 
 // Scores v7 (heads 32; heads 64 runs v5) and o-bar v10 are the defaults (STRIX_GLM_PF_SCORES=6 / STRIX_GLM_PF_OBAR=7
 // restore the previous ones); STRIX_GLM_PF_OBAR=6 opts into o-bar v6 (exact, slower: not a default).
@@ -69,9 +77,14 @@ void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, c
 // o-bar 5, 7 or 10 with heads=32 uses lane-major e; all other pairs use token-order e. gemm (absorb / out): 1 / 2 / 3
 // (same per-output chain; the legacy pair has its own). The default entry point runs 3; STRIX_GLM_PF_MLA_GEMM=2
 // restores v2, =1 the legacy tiled GEMM. V3 is bitwise equal to v2 on the pair at 8K and 32K.
+// Explicit query_window is independent of the environment for bitwise/guard gates;
+// zero retains C-row scratch and the full intermediate images used by existing gates.
 void mla_attention_rows_versions(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                                  const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                                  hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v = 1);
+void mla_attention_rows_versions(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                                 const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                                 hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window);
 
 // ---- R1 plain-weight chains for many rows (router, KDA f_a/f_b/g_a/g_b/b_proj, indexer wk/gate/weights_proj):
 // y[r][o] = chain over i ascending of fmaf(x[r][i], W[o0 + o][i], acc) from +0 = dev::dense bit for bit, as a tiled

@@ -17,6 +17,53 @@
 
 namespace strix::glm::xfer {
 
+// Prefill-only owner policy. The caller retires the ordinary exchange owner
+// before entry, and drains this one before returning to head/decode.
+class SeqparExchange {
+public:
+    SeqparExchange(dist::Transport& transport, unsigned rank, unsigned max_rows, hipStream_t stream);
+    ~SeqparExchange();
+    static std::size_t workspace_bytes(unsigned max_rows);
+    void materialize_last(float* residual, unsigned rows);
+    hipStream_t compute(unsigned lane) const { return side_.compute.at(lane); }
+    float* normalized() const { return side_.normalized_dev; }
+    // Column scratch and attention recurrence remain ordered A then B even
+    // though each half's row-local kernels have their own compute stream.
+    void column_begin(unsigned lane);
+    void column_end(unsigned lane);
+    void join();  // both compute tails -> original engine stream
+    void start_reduce_scatter(float* partial, SeqparRows tile, unsigned lane, hipStream_t producer);
+    const float* finish_reduce_scatter(unsigned lane, hipStream_t consumer);
+    void release_reduce_scatter(unsigned lane, hipStream_t consumer);
+    void start_gather(float* normalized, SeqparRows tile, unsigned lane, hipStream_t producer);
+    void finish(unsigned lane, hipStream_t consumer);
+    void complete() { channel_.drain(); }
+private:
+    struct Side {
+        hipStream_t stream = nullptr;
+        std::array<hipStream_t, 2> compute{};
+        std::array<hipEvent_t, 2> ready{}, done{};
+        std::array<hipEvent_t, 64> consumed{};
+        hipEvent_t column = nullptr;
+        float* normalized_host = nullptr;
+        float* normalized_dev = nullptr;
+        explicit Side(unsigned max_rows);
+        ~Side();
+    } side_;  // destroyed after Channel has stopped its progress owner
+    unsigned rank_, max_rows_;
+    hipStream_t stream_;
+    std::uint64_t site_ = 0;
+    std::array<bool, 2> pending_{};
+    std::array<bool, 2> reduction_{}, holding_{};
+    std::array<unsigned, 2> slot_{};
+    std::array<const float*, 2> peer_{};
+    std::array<bool, 64> slot_live_{}, slot_recorded_{};
+    bool column_recorded_ = false;
+    void produce(unsigned lane, hipStream_t producer);
+    void produced(unsigned lane);
+    SeqparChannel channel_;
+};
+
 class XferExchange final : public engine::Exchange {
 public:
     // `transport` is borrowed (the communicator's, between its own uses) or owned; options as Options::from_env().

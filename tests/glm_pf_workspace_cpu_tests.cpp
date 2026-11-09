@@ -33,9 +33,133 @@ struct Admission {
     std::uint64_t first_forward_reserve = 0;
     PhysicalModel model;
 };
+
+bool same_layout(pf::CapacityLayout a, pf::CapacityLayout b) {
+    return a.routed == b.routed && a.query_window == b.query_window && a.sharded == b.sharded;
+}
+void admission_matrix(pf::CapacityPolicy policy, bool initial_sharded, bool shard_auto,
+                      const std::vector<pf::CapacityLayout>& expected) {
+    // Every per-rank admission combination, including asymmetric refusals and
+    // nonmonotone outcomes. A later rank-local success cannot rescue a different
+    // candidate on the peer. Also verify early exit at the first joint success.
+    const unsigned count = static_cast<unsigned>(expected.size());
+    for (unsigned skip = 0; skip <= count; ++skip)
+    for (unsigned mask = 0; mask < (1U << (2 * count)); ++mask) {
+        unsigned first = count;
+        for (unsigned i = skip; i < count; ++i)
+            if (((mask >> (2 * i)) & 3U) == 3U) { first = i; break; }
+        unsigned calls = 0;
+        pf::CapacityLayout selected;
+        const bool admitted = pf::select_capacity_layout(policy, initial_sharded, shard_auto,
+            [&](pf::CapacityLayout layout) {
+                check(calls < count && same_layout(layout, expected[skip + calls]));
+                const auto bits = mask >> (2 * (skip + calls++));
+                return std::array<bool, 2>{(bits & 1U) != 0, (bits & 2U) != 0};
+            }, selected, skip);
+        check(admitted == (first < count));
+        check(calls == (admitted ? first + 1 : count) - skip);
+        if (admitted) check(same_layout(selected, expected[first]));
+    }
+}
 }
 
 int main() {
+    using Scratch = pf::ScratchPolicy;
+    check(pf::parse_scratch_policy(nullptr) == Scratch::automatic);
+    check(pf::parse_scratch_policy("auto") == Scratch::automatic);
+    check(pf::parse_scratch_policy("full") == Scratch::full);
+    check(pf::parse_scratch_policy("routed") == Scratch::routed);
+    for (const char* value : {"", "0", "1", "AUTO", "typo"}) {
+        bool invalid = false;
+        try { (void)pf::parse_scratch_policy(value); }
+        catch (const std::invalid_argument&) { invalid = true; }
+        check(invalid);
+    }
+    check(pf::parse_query_window_policy(nullptr) == -1);
+    check(pf::parse_query_window_policy("auto") == -1);
+    check(pf::parse_query_window_policy("0") == 0);
+    check(pf::parse_query_window_policy("2048") == 2048);
+    check(pf::parse_query_window_policy("65536") == 65536);
+    admission_matrix({}, false, true, {{false, 0, false}, {true, 0, false}, {true, 2048, false},
+                                      {false, 0, true}, {true, 0, true}, {true, 2048, true}});
+    admission_matrix({}, false, false, {{false, 0, false}, {true, 0, false}, {true, 2048, false}});
+    admission_matrix({}, true, false, {{false, 0, true}, {true, 0, true}, {true, 2048, true}});
+    admission_matrix({Scratch::full, -1}, false, true,
+                     {{false, 0, false}, {false, 2048, false}, {false, 0, true}, {false, 2048, true}});
+    admission_matrix({Scratch::routed, -1}, false, false, {{true, 0, false}, {true, 2048, false}});
+    admission_matrix({Scratch::automatic, 0}, false, false, {{false, 0, false}, {true, 0, false}});
+    admission_matrix({Scratch::automatic, 17}, false, false, {{false, 17, false}, {true, 17, false}});
+    admission_matrix({Scratch::full, 0}, false, false, {{false, 0, false}});
+    admission_matrix({Scratch::routed, 2048}, false, true, {{true, 2048, false}, {true, 2048, true}});
+    std::cout << "PASS: AUTO capacity admission matrices, explicit pins and first joint-fit ordering\n";
+    // Two independent ranks, with load+KV, communication, forward reserve,
+    // path/workspace and the layout-independent install/staging allowance.
+    // One-byte boundaries include asymmetric headroom. Without the install term
+    // the first layout would admit and subsequently fail its install guard.
+    for (bool shard_auto : {false, true}) {
+        const std::vector<pf::CapacityLayout> order{{false, 0, false}, {true, 0, false}, {true, 2048, false},
+                                                   {false, 0, true}, {true, 0, true}, {true, 2048, true}};
+        for (unsigned install : {0U, 76U, 192U}) {
+            for (unsigned left = 0; left <= 512; ++left) {
+                for (int skew : {-1, 0, 1}) {
+                    unsigned first = shard_auto ? 6U : 3U;
+                    unsigned calls = 0;
+                    pf::CapacityLayout selected;
+                    const auto need = [&](unsigned i) {
+                        return (i < 3 ? 100U : 40U) + (i % 3 == 0 ? 200U : i % 3 == 1 ? 120U : 60U)
+                            + 20U + 8U + 16U + 12U + install;
+                    };
+                    const auto right = static_cast<unsigned>(static_cast<int>(left) + skew + 1);
+                    for (unsigned i = 0; i < (shard_auto ? 6U : 3U); ++i)
+                        if (left >= need(i) && right >= need(i)) { first = i; break; }
+                    const bool admitted = pf::select_capacity_layout({}, false, shard_auto,
+                        [&](pf::CapacityLayout layout) {
+                            const unsigned i = calls++;
+                            check(same_layout(layout, order[i]));
+                            std::array<bool, 2> fits{};
+                            for (unsigned rank = 0; rank < 2; ++rank) {
+                                Admission a;
+                                a.snapshot.meminfo_ok = true;
+                                a.prefill_install = install;
+                                a.post_load_device_bytes = a.post_load_host_bytes = i < 3 ? 100 : 40;
+                                a.first_forward_reserve = 12;
+                                a.device_free = a.snapshot.mem_available = rank == 0 ? left : right;
+                                const auto path = i % 3 == 0 ? 200 : i % 3 == 1 ? 120 : 60;
+                                fits[rank] = !refused([&] { pf::admit_prefill_load(a, path, 20, 8, 16); });
+                            }
+                            return fits;
+                        }, selected);
+                    check(admitted == (first < (shard_auto ? 6U : 3U)));
+                    if (admitted) check(same_layout(selected, order[first]));
+                }
+            }
+        }
+    }
+    // Late install refusals from either rank advance the shared cursor. Check
+    // every success position, alternating which rank refuses, and exhaustion.
+    const std::vector<pf::CapacityLayout> retry_order{{false, 0, false}, {true, 0, false}, {true, 2048, false},
+                                                    {false, 0, true}, {true, 0, true}, {true, 2048, true}};
+    for (unsigned refusing_rank : {0U, 1U}) {
+        for (unsigned success = 0; success <= retry_order.size(); ++success) {
+            unsigned skip = 0;
+            bool installed = false;
+            for (;;) {
+                pf::CapacityLayout selected;
+                const bool admitted = pf::select_capacity_layout({}, false, true, [&](pf::CapacityLayout layout) {
+                    check(skip < retry_order.size() && same_layout(layout, retry_order[skip]));
+                    return std::array<bool, 2>{true, true};
+                }, selected, skip);
+                if (!admitted) break;
+                check(same_layout(selected, retry_order[skip]));
+                std::array<bool, 2> install_fits{true, true};
+                if (skip < success) install_fits[(skip + refusing_rank) % 2] = false;
+                if (install_fits[0] && install_fits[1]) { installed = true; break; }
+                ++skip;
+            }
+            check(skip == success && installed == (success < retry_order.size()));
+        }
+    }
+    std::cout << "PASS: install/staging admission matrix and post-install retry order\n";
     namespace rd = strix::glm::rank_defaults;
     check(rd::resolve_prefill_auto(false, false, false, false, true, false, 0, false) == "gemv");
     check(rd::resolve_prefill_auto(true, false, false, false, true, false, 0, false, true) == "gemv");
@@ -43,6 +167,74 @@ int main() {
     check(rd::resolve_prefill_auto(false, false, true, false, true, false, 0, false) == "ref");
     check(pf::indexer_workspace_bytes(8192) == 144 * mem::kMiB);
     check(pf::indexer_workspace_bytes(4096) == 72 * mem::kMiB);
+    for (const bool grouped_shape : {false, true}) {
+        for (const bool exact : {false, true}) {
+            const auto gemv = pf::prefill_moe_route(pf::TierB::gemv, grouped_shape, exact);
+            const auto wmma = pf::prefill_moe_route(pf::TierB::wmma, grouped_shape, exact);
+            check(!gemv.legacy_wmma && gemv.exact == (grouped_shape && exact));
+            check(wmma.legacy_wmma == grouped_shape && !wmma.exact);
+            check(gemv.legacy_arena == gemv.legacy_wmma);
+            check(wmma.legacy_arena == wmma.legacy_wmma);
+            for (auto tier : {pf::TierB::gemv, pf::TierB::wmma}) {
+                const auto full = pf::prefill_moe_route(tier, grouped_shape, exact, false);
+                const auto routed = pf::prefill_moe_route(tier, grouped_shape, exact, true);
+                check(full.legacy_arena);
+                check(full.legacy_wmma == routed.legacy_wmma && full.exact == routed.exact);
+            }
+        }
+    }
+    check(pf::parse_attention_query_window(nullptr) == 0);
+    check(pf::parse_attention_query_window("0") == 0);
+    check(pf::parse_attention_query_window("2048") == 2048);
+    check(pf::parse_attention_query_window("65536") == 65536);
+    for (const char* value : {"", "-1", "+1", " 1", "1x", "65537", "4294967296"}) {
+        bool invalid = false;
+        try { (void)pf::parse_attention_query_window(value); }
+        catch (const std::invalid_argument&) { invalid = true; }
+        check(invalid);
+    }
+    for (unsigned rows : {0U, 1U, 17U, 2047U, 2048U, 2049U, 8192U, 65536U}) {
+        check(pf::attention_scratch_rows(rows, 0) == rows);
+        for (unsigned window : {1U, 17U, 2048U, 65536U}) {
+            const unsigned scratch = pf::attention_scratch_rows(rows, window);
+            check(scratch == std::min(rows, window));
+            unsigned covered = 0;
+            while (covered < rows) {
+                const unsigned piece = std::min(scratch, rows - covered);
+                check(piece > 0 && piece <= scratch);
+                covered += piece;
+            }
+            check(covered == rows);
+        }
+    }
+
+    { // Synthetic replicated startup boundary, not a machine capacity claim.
+        // 11 trunk DSA layers + MTP: 12 * (1024 + 256 + 256 + 512/4)
+        // bytes/token, plus the slot's FP32 pool scores and u32 work (8/4).
+        constexpr std::uint64_t per_token = 12 * 1664 + 2;
+        constexpr std::uint64_t legacy = 2899324672ULL; // existing 64-bit ABI bound at 8192 rows
+        constexpr std::uint64_t attn = std::uint64_t{8192 - 2048} * 32 * (512 + 2304 + 512) * 4;
+        static_assert(attn == 2617245696ULL);
+        constexpr std::uint64_t old_capacity = 131072, old_path = 16 * mem::kGiB;
+        constexpr std::uint64_t fixed = 64 * mem::kGiB, workspace = 144 * mem::kMiB, margin = 8 * mem::kGiB;
+        Admission boundary;
+        boundary.snapshot.meminfo_ok = true;
+        boundary.device_free = fixed + old_capacity * per_token + old_path + workspace + margin;
+        boundary.snapshot.mem_available = boundary.device_free;
+        for (const auto saved : {std::uint64_t{0}, legacy, legacy + attn}) {
+            const auto capacity = old_capacity + (saved / per_token / 4) * 4;
+            const auto path_bytes = old_path - saved;
+            for (unsigned extra : {0U, 4U}) {
+                boundary.post_load_device_bytes = fixed + (capacity + extra) * per_token;
+                boundary.post_load_host_bytes = boundary.post_load_device_bytes;
+                const bool startup = !refused([&] { pf::admit_prefill_load(boundary, path_bytes, workspace, margin, 0); });
+                const auto free = boundary.device_free - boundary.post_load_device_bytes;
+                const bool loaded = !refused([&] { pf::admit_prefill_bytes(path_bytes, workspace, margin, free, free); });
+                check(startup == (extra == 0) && loaded == startup);
+            }
+            std::cout << "synthetic replicated max-context=" << capacity << " saved-bytes=" << saved << " PASS\n";
+        }
+    }
     pf::admit_prefill_bytes(100, 20, 8, 128, 128);
     check(refused([] { pf::admit_prefill_bytes(100, 20, 8, 127, 128); }));
     check(refused([] { pf::admit_prefill_bytes(100, 20, 8, 128, 127); }));
@@ -52,16 +244,16 @@ int main() {
     a.snapshot.meminfo_ok = true;
     a.post_load_device_bytes = 1000;
     a.post_load_host_bytes = 1100;
-    // These are load-only guards, not post-load hipMemGetInfo/MemAvailable.
+    // Load terms stay separate; install/staging must survive the projection.
     a.terms = {{"temporary load staging and reserves", 5000, 5000}};
     a.prefill_install = 5000;
     a.snapshot.gpu = true;
     a.snapshot.gtt_total = 1;
     a.margins = {8000, 8000};
-    // Device: retained 1000 + comm 40 + path 200 + workspace 30 + margin 20.
-    // Host: retained 1100 + comm 40 + the same path/workspace/margin.
-    a.device_free = 1290;
-    a.snapshot.mem_available = 1390;
+    // Device: retained 1000 + comm 40 + install 5000 + path 200 + workspace 30 + margin 20.
+    // Host: retained 1100 + comm 40 + the same install/path/workspace/margin.
+    a.device_free = 6290;
+    a.snapshot.mem_available = 6390;
     pf::admit_prefill_load(a, 200, 30, 20, 40);
     --a.device_free;
     check(refused([&] { pf::admit_prefill_load(a, 200, 30, 20, 40); }));
@@ -74,6 +266,8 @@ int main() {
     a.snapshot.meminfo_ok = true;
     a.post_load_device_bytes = std::numeric_limits<std::uint64_t>::max();
     check(refused([&] { pf::admit_prefill_load(a, 200, 30, 20, 40); }));
+
+    a.prefill_install = 0;
 
     // Receipt-derived, rounded 8192-row fixture, not a device qualification.
     // The post-load oracle is independent of the startup ledger subtraction.

@@ -2,10 +2,34 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
+#include "glm/prefill/glm_pf_capacity_policy.hpp"
 
 namespace strix::glm::pf {
+
+enum class TierB { wmma, gemv };
+
+// Admit the only two grouped MoE consumers before reserving their arenas.
+// FAST WMMA-X is inside the exact consumer; it is not TierB::wmma.
+struct PrefillMoeRoute {
+    bool legacy_wmma = false;
+    bool exact = false;
+    bool legacy_arena = false;
+};
+constexpr PrefillMoeRoute prefill_moe_route(TierB tier, bool grouped_shape, bool exact_enabled, bool routed = true) {
+    return {grouped_shape && tier == TierB::wmma,
+            grouped_shape && tier == TierB::gemv && exact_enabled,
+            !routed || (grouped_shape && tier == TierB::wmma)};
+}
+
+constexpr unsigned attention_scratch_rows(unsigned rows, unsigned window) {
+    return window == 0 ? rows : std::min(rows, window);
+}
+inline unsigned attention_scratch_rows(unsigned rows) {
+    return attention_scratch_rows(rows, capacity_layout().query_window);
+}
 
 // One score window plus the retained top-512 pools; independent of slot capacity.
 inline constexpr unsigned kIndexerPoolWindow = 4096;

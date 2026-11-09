@@ -12,6 +12,8 @@ template <int Bits> using Window = typename WeightDecode<Bits>::Window;
 template <int Bits> using Norm = typename WeightDecode<Bits>::Norm;
 template <int MT> using Accum = strix::moe_core::Accum<MT>;
 using Core = strix::moe_core::GroupedCore<WeightDecode, ExpertLayout, InputTransform, Epilogue>;
+template <bool Packed> using PipeCore = strix::moe_core::GroupedCore<WeightDecode, ExpertLayout, InputTransform, Epilogue,
+                                                                  MinimaxPrefillTraits<Packed>>;
 
 __device__ __forceinline__ float codebook_mul1(std::uint32_t state) {
     return WeightDecode<3>::codebook_value(state);
@@ -63,9 +65,9 @@ __device__ __forceinline__ void item_pipe(const Item& it, unsigned bx, unsigned 
     return Core::item_pipe<Bits, MT, G, FullRows, Simplify>(it, bx, by, bz);
 }
 
-template <int Bits, int MT, int G, bool Simplify>
+template <int Bits, int MT, int G, bool Simplify, bool Packed = false>
 __device__ __forceinline__ void pipe_or_tail(const Item& it, unsigned bx, unsigned by, unsigned bz) {
-    return Core::pipe_or_tail<Bits, MT, G, Simplify>(it, bx, by, bz);
+    return PipeCore<Packed>::template pipe_or_tail<Bits, MT, G, Simplify>(it, bx, by, bz);
 }
 
 template <int Bits, bool Simplify>
@@ -73,9 +75,9 @@ __device__ __forceinline__ void item_pipe_pair(const Item& it, unsigned bx, unsi
     return Core::item_pipe_pair<Bits, Simplify>(it, bx, by, bz, exchange);
 }
 
-template <int Bits, bool Simplify>
+template <int Bits, bool Simplify, bool Packed = false>
 __device__ __forceinline__ void pipe_pair_or_tail(const Item& it, unsigned bx, unsigned by, unsigned bz, Half16* exchange) {
-    return Core::pipe_pair_or_tail<Bits, Simplify>(it, bx, by, bz, exchange);
+    return PipeCore<Packed>::template pipe_pair_or_tail<Bits, Simplify>(it, bx, by, bz, exchange);
 }
 
 template <int Bits, int Core8>
@@ -83,7 +85,7 @@ __device__ __forceinline__ void item_core8(const Item& it, unsigned bx, unsigned
     return Core::item_core8<Bits, Core8>(it, bx, by, bz, exchange);
 }
 
-template <int MT = 8, int G = 4, bool Simplify = false>
+template <int MT = 8, int G = 4, bool Simplify = false, bool Packed = false>
 __global__ __launch_bounds__(128) void grouped_pipe_kernel(const Item* items, unsigned count) {
     unsigned lo = 0, hi = count;
     while (hi - lo > 1) {
@@ -95,15 +97,15 @@ __global__ __launch_bounds__(128) void grouped_pipe_kernel(const Item* items, un
     const unsigned local = blockIdx.x - it.cta_begin;
     const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
     switch (it.bits) {
-        case 3: pipe_or_tail<3, MT, G, Simplify>(it, bx, by, bz); break;
-        case 4: pipe_or_tail<4, MT, G, Simplify>(it, bx, by, bz); break;
-        case 5: pipe_or_tail<5, MT, G, Simplify>(it, bx, by, bz); break;
-        case 6: pipe_or_tail<6, MT, G, Simplify>(it, bx, by, bz); break;
-        default: pipe_or_tail<8, MT, G, Simplify>(it, bx, by, bz); break;
+        case 3: pipe_or_tail<3, MT, G, Simplify, Packed>(it, bx, by, bz); break;
+        case 4: pipe_or_tail<4, MT, G, Simplify, Packed>(it, bx, by, bz); break;
+        case 5: pipe_or_tail<5, MT, G, Simplify, Packed>(it, bx, by, bz); break;
+        case 6: pipe_or_tail<6, MT, G, Simplify, Packed>(it, bx, by, bz); break;
+        default: pipe_or_tail<8, MT, G, Simplify, Packed>(it, bx, by, bz); break;
     }
 }
 
-template <bool Simplify = false>
+template <bool Simplify = false, bool Packed = false>
 __global__ __launch_bounds__(128) void grouped_pipe_pair_kernel(const Item* items, unsigned count) {
     __shared__ Half16 exchange[128];  // 2 buffers x 4 decoded tiles x 16 columns
     unsigned lo = 0, hi = count;
@@ -116,11 +118,11 @@ __global__ __launch_bounds__(128) void grouped_pipe_pair_kernel(const Item* item
     const unsigned local = blockIdx.x - it.cta_begin;
     const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
     switch (it.bits) {
-        case 3: pipe_pair_or_tail<3, Simplify>(it, bx, by, bz, exchange); break;
-        case 4: pipe_pair_or_tail<4, Simplify>(it, bx, by, bz, exchange); break;
-        case 5: pipe_pair_or_tail<5, Simplify>(it, bx, by, bz, exchange); break;
-        case 6: pipe_pair_or_tail<6, Simplify>(it, bx, by, bz, exchange); break;
-        default: pipe_pair_or_tail<8, Simplify>(it, bx, by, bz, exchange); break;
+        case 3: pipe_pair_or_tail<3, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        case 4: pipe_pair_or_tail<4, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        case 5: pipe_pair_or_tail<5, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        case 6: pipe_pair_or_tail<6, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        default: pipe_pair_or_tail<8, Simplify, Packed>(it, bx, by, bz, exchange); break;
     }
 }
 

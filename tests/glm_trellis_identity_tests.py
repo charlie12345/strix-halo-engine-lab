@@ -4,6 +4,8 @@ Fingerprints cover the complete original declarations, including template argume
 from src/glm/moe/glm_trellis_device.hpp at 2261cb42d. Each imported declaration was
 byte-identical to moe_core before extraction (LF-normalized, no token rewriting).
 This establishes source construction identity, not compiled/device qualification.
+Shared primitives that later gained a host emulation are compared through their device
+view: `__host__ ` dropped and only the `__HIP_DEVICE_COMPILE__` branch kept.
 """
 from hashlib import sha256
 from pathlib import Path
@@ -64,9 +66,19 @@ def declaration(source, marker):
     return source[start:end]
 
 
+DEVICE_BRANCH = re.compile(
+    r"^#if defined\(__HIP_DEVICE_COMPILE__\)\n(.*?)^#else\n.*?^#endif\n", re.MULTILINE | re.DOTALL)
+
+
+def device_view(source):
+    """Device-compiled text of declarations that also carry a host emulation."""
+    source = DEVICE_BRANCH.sub(r"\1", source)
+    return source.replace("__host__ __device__ __forceinline__", "__device__ __forceinline__")
+
+
 def main():
     adapter = (ROOT / "src/glm/moe/glm_trellis_device.hpp").read_text()
-    shared = (ROOT / "src/moe_core/exl3_trellis.hpp").read_text()
+    shared = device_view((ROOT / "src/moe_core/exl3_trellis.hpp").read_text())
     imports = re.findall(r"^using strix::moe_core::(\w+);$", adapter, re.MULTILINE)
     assert sorted(imports) == sorted(set(EXPECTED) - {"vector_splits"}), imports
     for name, (marker, expected) in EXPECTED.items():

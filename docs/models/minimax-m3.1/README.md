@@ -99,6 +99,8 @@ qualification is conditional on those eight texts; it supersedes the earlier two
 
 ## Every shipped MiniMax default
 
+- `STRIX_PF_P1` bit 0: packed MUL1 decode in the PAIR/PIPE prefill MoE kernels, on by default (`=0` restores the scalar decode); bitwise-equal output; 8K TTFT -1.3 %. Read once on the host, so restart both ranks.
+
 The changelog of every default-on MiniMax lever with its measured gain, exactness evidence and off switch is in
 [measured gains](../../measured-gains.md); the full catalog is [docs/optimizations.md](../../optimizations.md#minimax).
 Related notes: [grouped host prefill scheduling](../../minimax-grouped-prefill.md), [MSA prefill](../../minimax-msa.md),

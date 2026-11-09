@@ -22,7 +22,12 @@ struct Accum {
 };
 
 // No launch policy lives here: adapters retain their kernel signatures and row policy.
-template <template <int> class WeightDecode, class ExpertLayout, class InputTransform, class Epilogue>
+template <template <int> class WeightDecode> struct GroupedDecodeTraits {
+    template <int Bits> using Decode = ScalarDecode<Bits, WeightDecode>;
+};
+
+template <template <int> class WeightDecode, class ExpertLayout, class InputTransform, class Epilogue,
+          class Traits = GroupedDecodeTraits<WeightDecode>>
 struct GroupedCore : GroupedPrefillPolicy<> {
     using Input = InputTransform;
     using Output = Epilogue;
@@ -435,19 +440,35 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
             std::uint32_t nrm[NW::kNL - 1], mine[8], f0[8], f1[8];
 #pragma unroll
             for (int i = 0; i < NW::kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(ln[i], ln[i + 1], sh);
+            if constexpr (!Simplify && Traits::template Decode<Bits>::kPacked) {
 #pragma unroll
-            for (int r = 0; r < 16; r += 2) {
-                std::uint16_t v[2];
+                for (int r = 0; r < 16; r += 8) {
+                    std::uint32_t st[8];
+                    Half2 decoded[4];
 #pragma unroll
-                for (int i = 0; i < 2; ++i) {
-                    const int rr = r + i;
-                    const auto state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
-                    if constexpr (Simplify)
-                        v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::pipe_codebook(state)));
-                    else
-                        v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::codebook_value(state)));
+                    for (int i = 0; i < 8; ++i) {
+                        const int rr = r + i;
+                        st[i] = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
+                    }
+                    Traits::template Decode<Bits>::decode8(st, decoded);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) mine[r / 2 + i] = __builtin_bit_cast(std::uint32_t, decoded[i]);
                 }
-                mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
+            } else {
+#pragma unroll
+                for (int r = 0; r < 16; r += 2) {
+                    std::uint16_t v[2];
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const int rr = r + i;
+                        const auto state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
+                        if constexpr (Simplify)
+                            v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::pipe_codebook(state)));
+                        else
+                            v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::codebook_value(state)));
+                    }
+                    mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
+                }
             }
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
@@ -557,19 +578,30 @@ static __device__ void item_pipe_pair(const Item& it, unsigned bx, unsigned by, 
             std::uint32_t nrm[kNL - 1], mine[4], full[8];
 #pragma unroll
             for (int i = 0; i < kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(ln[i], ln[i + 1], sh);
+            if constexpr (!Simplify && Traits::template Decode<Bits>::kPacked) {
+                std::uint32_t st[8];
+                Half2 decoded[4];
 #pragma unroll
-            for (int r = 0; r < 8; r += 2) {
-                std::uint16_t v[2];
+                for (int i = 0; i < 8; ++i)
+                    st[i] = __builtin_amdgcn_alignbit(nrm[NW::g(i) - 1], nrm[NW::g(i)], NW::shift(i)) & 65535U;
+                Traits::template Decode<Bits>::decode8(st, decoded);
 #pragma unroll
-                for (int i = 0; i < 2; ++i) {
-                    const int rr = r + i;
-                    const auto state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
-                    if constexpr (Simplify)
-                        v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::pipe_codebook(state)));
-                    else
-                        v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::codebook_value(state)));
+                for (int i = 0; i < 4; ++i) mine[i] = __builtin_bit_cast(std::uint32_t, decoded[i]);
+            } else {
+#pragma unroll
+                for (int r = 0; r < 8; r += 2) {
+                    std::uint16_t v[2];
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const int rr = r + i;
+                        const auto state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
+                        if constexpr (Simplify)
+                            v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::pipe_codebook(state)));
+                        else
+                            v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::codebook_value(state)));
+                    }
+                    mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
                 }
-                mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
             }
 #pragma unroll
             for (int i = 0; i < 4; ++i) {

@@ -6,6 +6,7 @@
 #include "minimax/moe/mmx_trellis_device.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -867,19 +868,44 @@ constexpr const char* kGuLabel[8] = {"gate_up.mt1", "gate_up.mt2", "gate_up.mt3"
                                    "gate_up.mt5", "gate_up.mt6", "gate_up.mt7", "gate_up.mt8"};
 constexpr const char* kDnLabel[8] = {"down.mt1", "down.mt2", "down.mt3", "down.mt4",
                                    "down.mt5", "down.mt6", "down.mt7", "down.mt8"};
+
+bool prefill_p1_packed() {
+    static const bool enabled = [] {
+        // Default on: the packed decode is bitwise-equal to the scalar decode (exhaustive E1, K3..K6) and faster on
+        // PAIR/PIPE; STRIX_PF_P1=0 restores the scalar decode. Empty means unset.
+        const char* value = std::getenv("STRIX_PF_P1");
+        if (value == nullptr || value[0] == ' ') return true;
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long mask = std::strtoul(value, &end, 0);
+        if (value[0] < '0' || value[0] > '9' || end == value || *end != '\0' || errno == ERANGE)
+            throw std::invalid_argument("STRIX_PF_P1 must be an unsigned bitmask");
+        return (mask & 1UL) != 0;
+    }();
+    return enabled;
+}
+
+template <bool Packed>
+void launch_pipe_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream, bool pair, bool simplify) {
+    if (pair && simplify)
+        hipLaunchKernelGGL(pfk::grouped_pipe_pair_kernel<true>, dim3(ctas), dim3(128), 0, stream, items_d, n);
+    else if (pair)
+        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+    else if (simplify)
+        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+    else
+        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+}
+
 template <int V>
 void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false) {
     if constexpr (V == 4) {
         if (cls == 7 && prefill_pipe() != 0) {
             const bool simplify = prefill_pipe() == 2;
-            if (pair && simplify)
-                hipLaunchKernelGGL(pfk::grouped_pipe_pair_kernel<true>, dim3(ctas), dim3(128), 0, stream, items_d, n);
-            else if (pair)
-                hipLaunchKernelGGL(pfk::grouped_pipe_pair_kernel<false>, dim3(ctas), dim3(128), 0, stream, items_d, n);
-            else if (simplify)
-                hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+            if (prefill_p1_packed())
+                launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
             else
-                hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+                launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
             return;
         }
         if (cls == 7 && prefill_core8() != 0) {

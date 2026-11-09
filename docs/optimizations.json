@@ -1,4 +1,5 @@
 [
+  {"engine":"minimax","name":"Packed MoE decode","flag_or_env":"STRIX_PF_P1 bit 0","default":"ON (1)","exact":"Bitwise: exhaustive 65,536-state check K3..K6; MiniMax 8K/32K state and tokens unchanged.","gain":"PAIR -2.3 %, PIPE -4.0 %, 8K TTFT -1.3 %; VGPR 247 -> 239.","preconditions":"Existing MiniMax v4 PAIR/PIPE routes; Simplify and other routes unchanged. Host reads once; restart both ranks.","off_switch":"STRIX_PF_P1=0 (or clear bit 0)","doc_anchor":"docs/optimizations.md#mm-pf-moe-pipe"},
   {
     "engine": "qwen",
     "name": "HC normalized recompute candidate",

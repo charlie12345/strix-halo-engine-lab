@@ -8,6 +8,7 @@
 // The split count S is the library's vector policy for <= 8 rows (vector_splits below). Every helper keeps the
 // library's operation order; only addressing, scheduling and launch structure differ.
 // Compile with -ffp-contract=off (engine flags).
+#include <cmath>
 #include <cstdint>
 
 #include <hip/hip_fp16.h>
@@ -97,7 +98,8 @@ __device__ __forceinline__ void transform_values(const float* x, const std::uint
 
 // ---------------------------------------------------------------- mul1 decode (packed_decoder.hpp, qualified bitwise
 // against trellis_optimized.hpp mul1_half2)
-template <std::uint32_t Multiplier> __device__ __forceinline__ std::uint32_t hash16(std::uint32_t state) {
+template <std::uint32_t Multiplier> __host__ __device__ __forceinline__ std::uint32_t hash16(std::uint32_t state) {
+#if defined(__HIP_DEVICE_COMPILE__)
     constexpr std::uint32_t adjusted = Multiplier - 1U;
     constexpr std::uint32_t upper = (adjusted & 0xffff0000U) | 1U;
     constexpr std::uint32_t lower = adjusted & 65535U;
@@ -105,9 +107,14 @@ template <std::uint32_t Multiplier> __device__ __forceinline__ std::uint32_t has
     asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel:[0,0] op_sel_hi:[0,1]" : "=v"(high) : "v"(state), "s"(upper));
     asm("v_mad_u32_u16 %0, %1, %2, %1" : "=v"(result) : "v"(high), "s"(lower));
     return result;
+#else
+    // Emulate the low-u16 operands of the two packed ISA instructions.
+    return (state & 65535U) * Multiplier;
+#endif
 }
-__device__ __forceinline__ Half2 mul1_pair(std::uint32_t first, std::uint32_t second) {
+__host__ __device__ __forceinline__ Half2 mul1_pair(std::uint32_t first, std::uint32_t second) {
     const std::uint32_t a = hash16<0x83dcd12dU>(first), b = hash16<0x83dcd12dU>(second);
+#if defined(__HIP_DEVICE_COMPILE__)
     std::uint32_t low, both;
     constexpr std::uint32_t seed = 0x64006400U;
     asm("v_sad_u8 %0, %1, 0, %2" : "=v"(low) : "v"(a), "s"(seed));
@@ -115,6 +122,19 @@ __device__ __forceinline__ Half2 mul1_pair(std::uint32_t first, std::uint32_t se
     const __half2 d = __hfma2(__builtin_bit_cast(__half2, both), __builtin_bit_cast(__half2, 0x1eee1eeeU),
                               __builtin_bit_cast(__half2, 0xc931c931U));
     return __builtin_bit_cast(Half2, d);
+#else
+    const auto packed_input = [](std::uint32_t product) {
+        const unsigned sum = (product & 255U) + ((product >> 8U) & 255U) +
+                             ((product >> 16U) & 255U) + (product >> 24U);
+        return __builtin_bit_cast(_Float16, static_cast<std::uint16_t>(0x6400U + sum));
+    };
+    const float scale = static_cast<float>(__builtin_bit_cast(_Float16, std::uint16_t{0x1eee}));
+    const float bias = static_cast<float>(__builtin_bit_cast(_Float16, std::uint16_t{0xc931}));
+    // Both FP16 multiplicands have <=11 significant bits. Their exact product
+    // and this bounded sum fit FP32, so RN16(fmaf) emulates packed RN16 FMA.
+    return Half2{static_cast<_Float16>(fmaf(static_cast<float>(packed_input(a)), scale, bias)),
+                 static_cast<_Float16>(fmaf(static_cast<float>(packed_input(b)), scale, bias))};
+#endif
 }
 
 // Per-lane constants of the aligned 16x16 tile reader (trellis_optimized.hpp AlignedLane<Bits, true>): the lane owns
@@ -525,14 +545,27 @@ struct Norm {
 
 struct Mul1 {};
 
+template <int Bits> struct Mul1PairDecode {
+    static constexpr bool kPacked = true;
+    static __host__ __device__ __forceinline__ void decode8(const std::uint32_t (&st)[8], Half2 (&out)[4]) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) out[i] = mul1_pair(st[2 * i], st[2 * i + 1]);
+    }
+};
+
 template <int Bits> struct Exl3Trellis {
     using Window = moe_core::Window<Bits>;
     using Norm = moe_core::Norm<Bits>;
     using InputTransform = Exl3Trellis<Bits>;
-    static __device__ __forceinline__ float codebook_value(std::uint32_t state, Mul1 = {}) {
+    static __host__ __device__ __forceinline__ float codebook_value(std::uint32_t state, Mul1 = {}) {
   // library mul1 codebook (gemm.hip)
     const std::uint32_t product = state * 0x83dcd12dU;
+#if defined(__HIP_DEVICE_COMPILE__)
     const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
+#else
+    const unsigned sum = (product & 255U) + ((product >> 8U) & 255U) +
+                         ((product >> 16U) & 255U) + (product >> 24U);
+#endif
     return __half2float(__float2half_rn(fmaf(static_cast<float>(1024 + sum), __half2float(__ushort_as_half(0x1eee)),
                                              __half2float(__ushort_as_half(0xc931)))));
     }
@@ -561,6 +594,18 @@ static __device__ __forceinline__ float codebook_value_v2(std::uint32_t state) {
         const auto product = pipe_product(state);
         const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
         return __half2float(__float2half_rn(fmaf(static_cast<float>(sum), 887.0f / 131072.0f, -3.453125f)));
+    }
+};
+
+// Scalar-default policy: preserve the previous codebook conversion and order.
+template <int Bits, template <int> class WeightDecode = Exl3Trellis> struct ScalarDecode {
+    static constexpr bool kPacked = false;
+    static __host__ __device__ __forceinline__ void decode8(const std::uint32_t (&st)[8], Half2 (&out)[4]) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            out[i] = Half2{static_cast<_Float16>(WeightDecode<Bits>::codebook_value(st[2 * i])),
+                           static_cast<_Float16>(WeightDecode<Bits>::codebook_value(st[2 * i + 1]))};
+        }
     }
 };
 

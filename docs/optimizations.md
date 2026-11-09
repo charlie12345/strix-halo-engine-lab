@@ -3228,6 +3228,8 @@ Score 64 prefill queries per loaded index-key tile in four 16-query subtiles; ev
 
 Pipeline compatible expert prefill work.
 
+- **Packed MoE decode (default on):** `STRIX_PF_P1` bit 0 (default `=1`; `=0` restores the scalar decode) selects packed MUL1 decode on existing MiniMax PAIR/PIPE kernels; restart both ranks; Simplify and other routes retain their arithmetic; bitwise-equal to the scalar decode (exhaustive 65,536-state check, K3..K6; MiniMax 8K and 32K state/tokens unchanged); PAIR -2.3 %, PIPE -4.0 %, 8K TTFT -1.3 %; VGPR 247 -> 239.
+
 - **Preconditions:** Supported prefill expert core and ordered workspace ownership.
 - **Automatic selection:** Resolver supplies 1 only when unset; explicit values win. Shape/core dispatch determines actual use.
 - **Fallback notice:** Unsupported operator geometry keeps its supported dispatch without a universal decline notice; invalid explicit settings fail validation.

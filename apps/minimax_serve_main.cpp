@@ -131,7 +131,8 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
 }
 
 // The transport shared in turn by the communicator and the exchange module (as strix-minimax-rank).
-using Borrowed = strix::xport::BorrowedTransport<>;
+using Borrowed = strix::xport::BorrowedTransport<
+    strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;
 
 // ---- control channel: one 512-byte block per round, rank 0 -> rank 1 (rank 1 answers with its own) ----
 // prefill: opens the resumable prefill of `plen` tokens (they follow in kTokensPerMessage chunks) in `pslot`; pflags bit 0

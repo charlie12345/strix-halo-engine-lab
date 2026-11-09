@@ -22,7 +22,7 @@ struct Fake final : strix::dist::Transport {
     void (*callback)(void*) = nullptr;
     void* context = nullptr;
     const std::string* reason = nullptr;
-    bool fail_overlap = false;
+    bool fail_exchange = false;
     mutable bool fail_state = false;
     unsigned& destroyed;
 
@@ -40,6 +40,7 @@ struct Fake final : strix::dist::Transport {
     void exchange(std::span<const std::byte> out, std::span<std::byte> in) override {
         calls.push_back(Call::exchange);
         messages.push_back({Call::exchange, out.data(), out.size(), in.data(), in.size()});
+        if (fail_exchange) throw std::runtime_error("exchange failure");
         for (std::size_t k = 0; k < in.size(); ++k) in[k] = out[k];
     }
     void exchange_overlapped(std::span<const std::byte> out, std::span<std::byte> in,
@@ -48,8 +49,7 @@ struct Fake final : strix::dist::Transport {
         messages.push_back({Call::overlap_begin, out.data(), out.size(), in.data(), in.size()});
         callback = on_wire;
         context = ctx;
-        if (fail_overlap) throw std::runtime_error("overlap failure");
-        on_wire(ctx); // Before completion: inherited exchange-then-callback must fail this test.
+        on_wire(ctx); // Deliberately before completion: the adapter must bypass this override.
         for (std::size_t k = 0; k < in.size(); ++k) in[k] = out[k];
         calls.push_back(Call::overlap_end);
     }
@@ -69,22 +69,25 @@ struct Fake final : strix::dist::Transport {
 };
 struct Callback {
     Fake& fake;
+    std::span<const std::byte> out;
+    std::span<const std::byte> in;
     unsigned count = 0;
     static void run(void* ctx) {
         auto& self = *static_cast<Callback*>(ctx);
-        require(self.fake.calls.back() == Call::overlap_begin);
+        require(self.fake.calls.back() == Call::exchange);
+        for (std::size_t k = 0; k < self.in.size(); ++k) require(self.in[k] == self.out[k]);
         ++self.count;
         self.fake.calls.push_back(Call::callback);
     }
 };
 
-template<strix::xport::BorrowedAbort Abort>
+template<strix::xport::BorrowedAbort Abort, strix::xport::BorrowedState State>
 void forwarding() {
     unsigned destroyed = 0;
     {
         Fake fake(destroyed);
         {
-            strix::xport::BorrowedTransport<Abort> borrowed(fake);
+            strix::xport::BorrowedTransport<Abort, State> borrowed(fake);
             strix::dist::Transport& transport = borrowed;
             const strix::dist::Transport& inspect = borrowed;
             const std::array out{std::byte{1}, std::byte{0x80}, std::byte{0xff}};
@@ -95,23 +98,27 @@ void forwarding() {
             transport.exchange(out, in);
             require(in == out);
             in.fill(std::byte{0});
-            Callback callback{fake};
+            Callback callback{fake, out, in};
             transport.exchange_overlapped(out, in, Callback::run, &callback);
             require(in == out && callback.count == 1);
-            require(fake.callback == Callback::run && fake.context == &callback);
+            require(fake.callback == nullptr && fake.context == nullptr);
             require(inspect.name() == "recording");
             const std::string why = "stop";
             transport.abort(why);
-            require(inspect.state() == "progress 7/11");
+            if constexpr (State == strix::xport::BorrowedState::forward)
+                require(inspect.state() == "progress 7/11");
+            else
+                require(inspect.state().empty());
             std::vector<Call> expected{Call::send, Call::receive, Call::exchange,
-                Call::overlap_begin, Call::callback, Call::overlap_end, Call::name};
+                Call::exchange, Call::callback, Call::name};
             if constexpr (Abort == strix::xport::BorrowedAbort::forward) {
                 expected.push_back(Call::abort);
                 require(fake.reason == &why);
             } else {
                 require(fake.reason == nullptr);
             }
-            expected.push_back(Call::state);
+            if constexpr (State == strix::xport::BorrowedState::forward)
+                expected.push_back(Call::state);
             require(fake.calls == expected);
             require(fake.messages.size() == 4);
             for (const auto& m : fake.messages) {
@@ -120,16 +127,28 @@ void forwarding() {
                 if (m.call != Call::send)
                     require(m.in == in.data() && m.in_size == in.size());
             }
-            fake.fail_overlap = true;
+            fake.fail_exchange = true;
             bool threw = false;
             try { transport.exchange_overlapped(out, in, Callback::run, &callback); }
-            catch (const std::runtime_error& e) { threw = std::string(e.what()) == "overlap failure"; }
+            catch (const std::runtime_error& e) { threw = std::string(e.what()) == "exchange failure"; }
             require(threw && callback.count == 1);
             fake.fail_state = true;
+            const auto calls_before_state = fake.calls.size();
             threw = false;
-            try { (void)inspect.state(); }
-            catch (const std::runtime_error& e) { threw = std::string(e.what()) == "state failure"; }
-            require(threw);
+            try {
+                const auto state = inspect.state();
+                if constexpr (State == strix::xport::BorrowedState::base_default) require(state.empty());
+            }
+            catch (const std::runtime_error& e) {
+                threw = true;
+                require(std::string(e.what()) == "state failure");
+            }
+            if constexpr (State == strix::xport::BorrowedState::forward) {
+                require(threw && fake.calls.size() == calls_before_state + 1);
+                require(fake.calls.back() == Call::state);
+            } else {
+                require(!threw && fake.calls.size() == calls_before_state);
+            }
         }
         require(destroyed == 0); // The adapter never destroys the borrowed transport.
     }
@@ -159,7 +178,11 @@ void fallback() {
 } // namespace
 
 int main() {
-    forwarding<strix::xport::BorrowedAbort::forward>();
-    forwarding<strix::xport::BorrowedAbort::base_default>();
+    using strix::xport::BorrowedAbort;
+    using strix::xport::BorrowedState;
+    forwarding<BorrowedAbort::base_default, BorrowedState::base_default>(); // Probe.
+    forwarding<BorrowedAbort::forward, BorrowedState::base_default>(); // MiniMax rank.
+    forwarding<BorrowedAbort::forward, BorrowedState::base_default>(); // MiniMax serve.
+    forwarding<BorrowedAbort::forward, BorrowedState::forward>(); // GLM.
     fallback();
 }

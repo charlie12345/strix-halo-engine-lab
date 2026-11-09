@@ -111,7 +111,8 @@ std::uint64_t fnv(const void* p, std::size_t bytes, std::uint64_t h = 1469598103
 }
 
 // The transport shared in turn by the communicator and the exchange module (shared exchange form).
-using Borrowed = strix::xport::BorrowedTransport<>;
+using Borrowed = strix::xport::BorrowedTransport<
+    strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;
 
 // usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (as the DS apps).
 std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;

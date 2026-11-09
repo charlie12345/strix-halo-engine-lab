@@ -272,7 +272,8 @@ int main(int argc, char** argv) try {
             std::cout << "}\n" << std::flush;
         }
     };
-    using Borrowed = strix::xport::BorrowedTransport<strix::xport::BorrowedAbort::base_default>;
+    using Borrowed = strix::xport::BorrowedTransport<
+        strix::xport::BorrowedAbort::base_default, strix::xport::BorrowedState::base_default>;
     if (path != "gpu" && path != "gpu4") {
         strix::dist::Communicator host({rank, 2U, 1U, 1U}, std::make_unique<Borrowed>(*control), largest);
         run(host, "host");

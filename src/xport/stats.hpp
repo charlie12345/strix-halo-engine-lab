@@ -6,6 +6,6 @@ struct Stats {
     double producer_wait = 0.0;
     double wire = 0.0;
     double check = 0.0;
-    std::uint64_t staging_bytes = 0, exposed_wait = 0;
+    std::uint64_t staging_bytes = 0, reuse_dependencies = 0; // event edges, never elapsed time
 };
 } // namespace strix::xport

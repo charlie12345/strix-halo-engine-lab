@@ -370,12 +370,13 @@ if(BUILD_TESTING)
     endif()
 endif()
 add_library(strix_xport INTERFACE)
-target_include_directories(strix_xport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(strix_xport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(strix_xport INTERFACE cxx_std_20)
 target_sources(strix_xport INTERFACE
     src/xport/channel.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
     src/xport/transport_backend.hpp src/xport/staging.hpp src/xport/stats.hpp src/xport/backend.hpp src/xport/communicator_backend.hpp
-    src/xport/ds41_adapter.hpp src/xport/kvshard_channel.hpp src/xport/kvshard_channel_hip.hpp)
+    src/xport/ds41_adapter.hpp src/xport/kvshard_channel.hpp src/xport/kvshard_channel_hip.hpp
+    include/strix/dist/host_wait.hpp include/strix/dist/transport_caps.hpp)
 if(BUILD_TESTING)
     add_executable(strix-xport-small-progress-tests tests/xport_small_progress_tests.cpp)
     target_link_libraries(strix-xport-small-progress-tests PRIVATE strix_xport Threads::Threads)

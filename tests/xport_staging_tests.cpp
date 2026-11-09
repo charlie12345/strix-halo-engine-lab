@@ -1,4 +1,5 @@
 #include "xport/staging.hpp"
+#include "strix/dist/transport_caps.hpp"
 #include "xport/communicator_backend.hpp"
 #include "glm/xfer/glm_traits.hpp"
 #include <array>
@@ -273,13 +274,68 @@ void run() {
 }
 } // namespace backend_fixture
 
+namespace {
+void capability_and_timing_tests() {
+    using namespace strix::dist;
+    require(parse_transport_capabilities("") == 0U);
+    require(transport_pairing_version(0) == 2U);
+    require(transport_pairing_version(all_transport_capabilities) == 3U);
+    require(parse_transport_capabilities("joint,streams") == (usb4_stream_table | usb4_joint_calibration));
+    require(parse_transport_capabilities("streams,joint,ready,deferred-crc,chunks,crc-overlap,gpu-lean") == all_transport_capabilities);
+    for (std::uint16_t a = 0; a <= all_transport_capabilities; ++a) {
+        const auto av = transport_pairing_version(a);
+        require_transport_agreement(av, av);
+        for (std::uint16_t b = 0; b < a; ++b) {
+            bool refused = false;
+            try { require_transport_agreement(av, transport_pairing_version(b)); }
+            catch (const std::runtime_error& e) {
+                refused = std::string(e.what()).find("capability mismatch") != std::string::npos;
+            }
+            require(refused);
+            refused = false;
+            try { require_transport_agreement(transport_pairing_version(b), av); }
+            catch (const std::runtime_error&) { refused = true; }
+            require(refused);
+        }
+    }
+    for (const auto* invalid : {"unknown", "streams,", ",joint"}) {
+        bool refused = false;
+        try { (void)parse_transport_capabilities(invalid); }
+        catch (const std::invalid_argument&) { refused = true; }
+        require(refused);
+    }
+    bool unknown = false;
+    try { (void)transport_pairing_version(0x80U); }
+    catch (const std::invalid_argument&) { unknown = true; }
+    require(unknown);
+
+    strix::xport::HostWaitMetric off("test-off", "slot", false), on("test-on", "peer", true);
+    unsigned polls = 0;
+    off.block_while(1, [&] { return polls < 3; }, [&] { ++polls; });
+    require(polls == 3 && off.samples() == nullptr);
+    require(off.measure(2, [] { return 17; }) == 17 && off.samples() == nullptr);
+    on.block_while(1, [] { return false; }, [] { require(false); });
+    require(on.samples()->empty());
+    polls = 0;
+    on.block_while(2, [&] { return polls < 3; }, [&] { ++polls; });
+    require(polls == 3 && on.samples()->at(2).calls == 1);
+    const auto begin = std::chrono::steady_clock::time_point{};
+    on.observe(3, begin, begin + std::chrono::seconds(2));
+    require(on.samples()->at(3).calls == 1 && on.samples()->at(3).ns == 2000000000ULL);
+    try { on.measure(4, [] { throw std::runtime_error("wait failed"); }); }
+    catch (const std::runtime_error&) {}
+    require(on.samples()->at(4).calls == 1 && on.samples()->size() == 3);
+}
+} // namespace
+
 int main() {
     backend_fixture::run();
     try {
+        capability_and_timing_tests();
         const auto two = run(2), eight = run(8), off = run(8, false);
-        require(off.bytes == 0 && off.staging_bytes == 0 && off.exchanges == 0 && off.exposed_wait == 0);
+        require(off.bytes == 0 && off.staging_bytes == 0 && off.exchanges == 0 && off.reuse_dependencies == 0);
         require(two.bytes == eight.bytes && two.staging_bytes == eight.staging_bytes);
-        require(two.exchanges == eight.exchanges && eight.exposed_wait == 16);
+        require(two.exchanges == eight.exchanges && eight.reuse_dependencies == 16);
         std::cout << "PASS xport staging: two ranks, N=8, tags, reverse completion, both fences, R17, counters\n";
         return 0;
     } catch (const std::exception& error) {

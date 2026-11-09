@@ -200,6 +200,8 @@ private:
     std::string failure_;
     mutable std::mutex failure_mutex_;
     Stats stats_;
+    HostWaitMetric slot_wait_{"channel", "slot"}; // caller only
+    HostWaitMetric peer_wait_{"channel", "peer"}; // progress thread only
     std::thread thread_;
 };
 

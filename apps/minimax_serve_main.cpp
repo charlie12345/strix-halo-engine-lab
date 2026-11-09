@@ -118,7 +118,7 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
     }
     if (kind == "usb4-auto") {
         strix::dist::Usb4AutoOptions o;
-        o.minimax_compat = true;
+        o.transport_capabilities = 0; // preserve the qualified serving contract
         o.rank = rank;
         o.timeout = limit;
         strix::dist::Usb4Topology topology;
@@ -837,7 +837,7 @@ int main(int argc, char** argv) {
         std::string receipt;
         auto transport = open_transport(transport_spec, opt.rank, receipt);
         strix::dist::Group group;
-        group.minimax_compat = true;
+        group.transport_capabilities = 0;
         group.rank = opt.rank;
         group.world = 2;
         group.plan = 0x4d4d5331ULL;  // "MMS1"

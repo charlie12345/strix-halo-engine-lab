@@ -198,10 +198,12 @@ void Exchanger::send(std::size_t bytes, const Tag& tag) {
     if (s > retired_ + options_.depth) throw std::logic_error("mmpfx: send() of a sequence whose slot is still in use");
     hipLaunchKernelGGL(publish_kernel, dim3(1), dim3(32), 0, options_.stream, flags_dev_ + kTxFlag, s);
     hip_check(hipGetLastError(), "publish kernel");
-    while (posted_.load(std::memory_order_relaxed) - done_.load(std::memory_order_acquire) >= kQueue) {
+    slot_wait_.block_while(static_cast<std::uint32_t>(tag.kind), [&] {
+        return posted_.load(std::memory_order_relaxed) - done_.load(std::memory_order_acquire) >= kQueue;
+    }, [&] {
         check();
         _mm_pause();
-    }
+    });
     jobs_[(s - 1) % kQueue] = Job{s, bytes, tag};
     next_ = s;
     posted_.store(s, std::memory_order_seq_cst);
@@ -221,10 +223,12 @@ void Exchanger::send_copy(const void* local, std::size_t bytes, const Tag& tag) 
     hipLaunchKernelGGL(copy_publish_kernel, dim3(blocks), dim3(kCopyThreads), 0, options_.stream, dst, static_cast<const std::byte*>(local),
                        bytes, xfer::ProducerTarget{flags_dev_ + kTxFlag, counter_dev_, s});
     hip_check(hipGetLastError(), "copy kernel");
-    while (posted_.load(std::memory_order_relaxed) - done_.load(std::memory_order_acquire) >= kQueue) {
+    slot_wait_.block_while(static_cast<std::uint32_t>(tag.kind), [&] {
+        return posted_.load(std::memory_order_relaxed) - done_.load(std::memory_order_acquire) >= kQueue;
+    }, [&] {
         check();
         _mm_pause();
-    }
+    });
     jobs_[(s - 1) % kQueue] = Job{s, bytes, tag};
     next_ = s;
     posted_.store(s, std::memory_order_seq_cst);
@@ -387,14 +391,18 @@ void Exchanger::process(const Job& job) {
     try {
         // The ranks agree on the identity and the size before any payload moves (a mismatch cannot desynchronise the
         // streams' part sizes).
-        transport_->exchange(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&mine), sizeof(mine)),
-                             std::span<std::byte>(reinterpret_cast<std::byte*>(&peer), sizeof(peer)));
+        peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] {
+            transport_->exchange(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&mine), sizeof(mine)),
+                                 std::span<std::byte>(reinterpret_cast<std::byte*>(&peer), sizeof(peer)));
+        });
         if (peer.magic != kHeaderMagic || !same_identity(mine, peer))
             fail("mmpfx: peer header differs: mine " + describe(mine) + " / peer " + describe(peer));
         if (options_.crc) post_lane(rx_lane_, rx, job.bytes, 0);
         for (std::size_t k = 0; k < count; ++k) {
             const std::size_t off = k * options_.chunk, n = std::min(options_.chunk, job.bytes - off);
-            transport_->exchange(std::span<const std::byte>(tx + off, n), std::span<std::byte>(rx + off, n));
+            peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] {
+                transport_->exchange(std::span<const std::byte>(tx + off, n), std::span<std::byte>(rx + off, n));
+            });
             if (options_.crc) rx_lane_.ready.store(k + 1, std::memory_order_release);
         }
     } catch (const std::exception& e) {
@@ -408,7 +416,7 @@ void Exchanger::process(const Job& job) {
         std::vector<std::byte> out(sizeof(Header) + count * 4), in(out.size());
         PrefillTraits::trailer(out.data(), mine, tx_lane_.crcs.data(), count);
         try {
-            transport_->exchange(out, in);
+            peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] { transport_->exchange(out, in); });
         } catch (const std::exception& e) {
             if (failed_.load()) throw;
             fail(std::string("mmpfx: transport (trailer): ") + e.what());

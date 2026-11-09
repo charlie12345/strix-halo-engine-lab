@@ -17,6 +17,7 @@
 // stream (scatter, wait, gather).
 
 #include "strix/dist/communicator.hpp"
+#include "xport/borrowed_transport.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/staged_ready_kernels.hpp"
 #include "../src/dist_latency_trace.hpp"
@@ -271,14 +272,7 @@ int main(int argc, char** argv) try {
             std::cout << "}\n" << std::flush;
         }
     };
-    struct Borrowed final : strix::dist::Transport {
-        strix::dist::Transport& t;
-        explicit Borrowed(strix::dist::Transport& x) : t(x) {}
-        void send(std::span<const std::byte> m) override { t.send(m); }
-        void receive(std::span<std::byte> m) override { t.receive(m); }
-        void exchange(std::span<const std::byte> o, std::span<std::byte> i) override { t.exchange(o, i); }
-        [[nodiscard]] std::string name() const override { return t.name(); }
-    };
+    using Borrowed = strix::xport::BorrowedTransport<strix::xport::BorrowedAbort::base_default>;
     if (path != "gpu" && path != "gpu4") {
         strix::dist::Communicator host({rank, 2U, 1U, 1U}, std::make_unique<Borrowed>(*control), largest);
         run(host, "host");

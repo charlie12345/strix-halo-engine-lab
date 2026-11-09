@@ -46,6 +46,7 @@
 #include "minimax/serve/minimax_dspark_policy.hpp"
 #include <filesystem>
 #include "strix/dist/communicator.hpp"
+#include "xport/borrowed_transport.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "hip_minimax_dspark.hpp"
 #include "minimax/session/runtime.hpp"
@@ -130,18 +131,7 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
 }
 
 // The transport shared in turn by the communicator and the exchange module (as strix-minimax-rank).
-class Borrowed final : public strix::dist::Transport {
-public:
-    explicit Borrowed(strix::dist::Transport& t) : t_(t) {}
-    void send(std::span<const std::byte> m) override { t_.send(m); }
-    void receive(std::span<std::byte> m) override { t_.receive(m); }
-    void exchange(std::span<const std::byte> o, std::span<std::byte> i) override { t_.exchange(o, i); }
-    [[nodiscard]] std::string name() const override { return t_.name(); }
-    void abort(const std::string& why) override { t_.abort(why); }
-
-private:
-    strix::dist::Transport& t_;
-};
+using Borrowed = strix::xport::BorrowedTransport<>;
 
 // ---- control channel: one 512-byte block per round, rank 0 -> rank 1 (rank 1 answers with its own) ----
 // prefill: opens the resumable prefill of `plen` tokens (they follow in kTokensPerMessage chunks) in `pslot`; pflags bit 0

@@ -37,6 +37,7 @@
 #include "glm/kernels/glm_tier_a.hpp"
 
 #include "strix/dist/communicator.hpp"
+#include "xport/borrowed_transport.hpp"
 
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -262,19 +263,7 @@ __global__ void sum_kernel(const float* a, const float* b, float* y, unsigned n)
 }
 
 // A transport shared by several users in turn (the arms of one pairing).
-class Borrowed final : public dist::Transport {
-public:
-    explicit Borrowed(dist::Transport& t) : t_(t) {}
-    void send(std::span<const std::byte> m) override { t_.send(m); }
-    void receive(std::span<std::byte> m) override { t_.receive(m); }
-    void exchange(std::span<const std::byte> o, std::span<std::byte> i) override { t_.exchange(o, i); }
-    [[nodiscard]] std::string name() const override { return t_.name(); }
-    void abort(const std::string& why) override { t_.abort(why); }
-    [[nodiscard]] std::string state() const override { return t_.state(); }
-
-private:
-    dist::Transport& t_;
-};
+using Borrowed = strix::xport::BorrowedTransport<>;
 
 // ---- arms
 enum class Path { local, sync, glmx };

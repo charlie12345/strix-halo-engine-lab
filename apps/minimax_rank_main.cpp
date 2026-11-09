@@ -258,8 +258,23 @@ std::vector<std::uint32_t> session(mm::Engine& eng, const std::string& name, con
                     px.tail - last.tail);
         last = px;
     }
+    // STRIX_MM_QUALITY_OUT=PREFIX: the prefill's head logits (this rank's vocabulary slice) and its last final normed row
+    // as raw FP32 files PREFIX-<name>-{logits,row}-r<rank>.f32 (quality comparisons between payload formats).
+    if (const char* qo = std::getenv("STRIX_MM_QUALITY_OUT"); qo != nullptr && *qo != '\0') {
+        const auto lg = eng.last_logits(1);
+        const auto rows = eng.prefill_out_rows();
+        const std::string base = std::string(qo) + "-" + name + "-";
+        const auto put = [&](const std::string& what, const float* p, std::size_t n) {
+            std::ofstream f(base + what + "-r" + std::to_string(eng.rank()) + ".f32", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n * sizeof(float)));
+            if (!f) throw std::runtime_error("STRIX_MM_QUALITY_OUT: cannot write " + base + what);
+        };
+        put("logits", lg.data(), lg.size());
+        if (rows.size() >= kHidden) put("row", rows.data() + rows.size() - kHidden, kHidden);
+    }
     if (state_fnv_on())
         std::printf("rank %u %s: state fnv %016llx (slot 0, %zu positions, K/V/index key, 60 layers), final rows fnv %016llx\n",
+
                     eng.rank(), name.c_str(), static_cast<unsigned long long>(eng.state_fnv(0, prompt.size())), prompt.size(),
                     static_cast<unsigned long long>(eng.prefill_out_fnv()));
     std::fflush(stdout);

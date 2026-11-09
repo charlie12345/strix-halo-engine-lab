@@ -2312,6 +2312,13 @@ struct Engine::Impl {
     // FNV-1a of the last prefill's final normed rows (the head's input; exactness checks).
     std::pair<const float*, std::size_t> last_out{nullptr, 0};
     Engine::PfResult last_result;
+    std::vector<float> prefill_out_rows() {
+        if (last_out.first == nullptr) return {};
+        hip_ok(hipDeviceSynchronize(), "out rows");
+        std::vector<float> rows(last_out.second * kHidden);
+        hip_ok(hipMemcpy(rows.data(), last_out.first, rows.size() * 4, hipMemcpyDeviceToHost), "out rows copy");
+        return rows;
+    }
     std::uint64_t prefill_out_fnv() {
         if (last_out.first == nullptr) return 0;
         hip_ok(hipDeviceSynchronize(), "out fnv");
@@ -3089,5 +3096,7 @@ bool Engine::prefill_tx_uncached() const { return impl_->pf_tx_uncached; }
 bool Engine::prefill_interleave() const { return impl_->pf_interleave; }
 std::uint64_t Engine::state_fnv(std::uint32_t slot, std::uint64_t positions) { return impl_->state_fnv(slot, positions); }
 std::uint64_t Engine::prefill_out_fnv() { return impl_->prefill_out_fnv(); }
+std::vector<float> Engine::prefill_out_rows() { return impl_->prefill_out_rows(); }
+
 
 }  // namespace strix::minimax::engine

@@ -661,9 +661,9 @@ void test_pf_variants() {
     bool threw = false;
     try { (void)resolve(cat(kDeploy, kDecodeWork), {{"STRIX_GLM_PF_OBAR", "9"}}); } catch (const std::invalid_argument&) { threw = true; }
     CHECK(threw);
-    threw = false;
-    try { (void)resolve(cat(kDeploy, kDecodeWork), {{"STRIX_GLM_PF_SCORES", ""}}); } catch (const std::invalid_argument&) { threw = true; }
-    CHECK(threw);
+    // an explicit empty value is legal (not exported) and selects the default variant
+    const auto se = rd::print(resolve(cat(kDeploy, kDecodeWork), {{"STRIX_GLM_PF_OBAR", ""}}));
+    CHECK(se.find("effective env STRIX_GLM_PF_OBAR= (explicit, item pf-obar-v10; resolved v10, heads 64 runs v2)\n") != std::string::npos);
     const auto s10 = rd::print(resolve(cat(kDeploy, kDecodeWork), {}));
     CHECK(s10.find("effective env STRIX_GLM_PF_OBAR=10 (default, item pf-obar-v10; resolved v10, heads 64 runs v2)\n") != std::string::npos);
     const auto s7 = rd::print(resolve(cat(kDeploy, kDecodeWork), {{"STRIX_GLM_PF_OBAR", "4"}}));

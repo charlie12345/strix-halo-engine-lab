@@ -36,9 +36,10 @@ inline const PfVariant* pf_variant_find(std::string_view env) {
     return nullptr;
 }
 
-// Version selected by `value` (nullptr = unset = default); throws std::invalid_argument when unknown.
+// Version selected by `value` (nullptr or empty = unset = default, matching the defaults contract where an
+// explicit empty setting is not exported); throws std::invalid_argument when unknown.
 inline unsigned pf_variant_parse(const PfVariant& p, const char* value) {
-    if (value == nullptr) return p.def;
+    if (value == nullptr || *value == '\0') return p.def;
     const std::string_view v(value);
     std::string_view rest(p.allowed);
     while (!rest.empty()) {

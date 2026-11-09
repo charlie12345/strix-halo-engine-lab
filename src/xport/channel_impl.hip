@@ -332,6 +332,19 @@ void Channel<Traits>::send_copy(const void* local, std::size_t bytes, const Tag&
 }
 
 template<class Traits>
+void Channel<Traits>::send_host(const void* local, void* remote, std::size_t bytes, const Tag& tag) {
+    check();
+    if (!local || !remote || bytes == 0 || bytes > options_.capacity)
+        throw std::invalid_argument("glmxfer: direct host payload outside 1..capacity");
+    const auto s = next_ + 1;
+    if (s > received_ + options_.depth) throw std::logic_error("glmxfer: direct host slot still in use");
+    hip_check(hipStreamWriteValue64(options_.stream, flags_dev_ + kTxFlag, s, 0), "direct host producer ready");
+    next_ = s;
+    tail_deferred_ = options_.crc && options_.crc_deferred && bytes > kInlineCrcMax;
+    post(Job{s, bytes, tag, false, static_cast<const std::byte*>(local), static_cast<std::byte*>(remote)});
+}
+
+template<class Traits>
 void argmax_exchange(Channel<Traits>& x, const float* logits, unsigned rows, unsigned vn, unsigned ld, std::uint32_t id0, std::uint64_t step,
                      std::uint32_t* out_ids) {
     if (rows == 0 || vn == 0 || ld < vn) throw std::invalid_argument("glmxfer argmax: bad shape");
@@ -425,8 +438,8 @@ void Channel<Traits>::process(const Job& job) {
         _mm_pause();
     }
     const auto t1 = Clock::now();
-    std::byte* tx = job.seal ? seal_tx_ : tx_slot(job.sequence);
-    std::byte* rx = job.seal ? seal_rx_ : rx_slot(job.sequence);
+    const std::byte* tx = job.direct_tx ? job.direct_tx : (job.seal ? seal_tx_ : tx_slot(job.sequence));
+    std::byte* rx = job.direct_rx ? job.direct_rx : (job.seal ? seal_rx_ : rx_slot(job.sequence));
     const bool deferred = options_.crc && options_.crc_deferred && job.bytes > kInlineCrcMax;
     std::uint64_t tx_ticket = 0;
     if (deferred) tx_ticket = crc_worker_->submit(tx, job.bytes);  // overlaps the wire below
@@ -434,17 +447,18 @@ void Channel<Traits>::process(const Job& job) {
         job.bytes, options_.rank, deferred,
         !deferred && options_.crc ? dist::crc32c(std::span<const std::byte>(tx, job.bytes)) : 0U,
         prev_deferred_, prev_tx_crc_);
+    Trailer p;
     try {
         peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] {
-            exchange_frame(*transport_, tx, rx, job.bytes, t);
+            if (job.direct_rx) exchange_frame_direct(*transport_, tx, rx, job.bytes, t, p);
+            else exchange_frame(*transport_, job.seal ? seal_tx_ : tx_slot(job.sequence), rx, job.bytes, t);
         });
     } catch (const std::exception& e) {
         fail(std::string("glmxfer: transport: ") + e.what());
     }
     const auto t2 = Clock::now();
     if (!job.seal && job.sequence == options_.test_corrupt_sequence && job.bytes > 0) rx[0] ^= std::byte{1};
-    Trailer p;
-    std::memcpy(&p, rx + job.bytes, sizeof(p));
+    if (!job.direct_rx) std::memcpy(&p, rx + job.bytes, sizeof(p));
     if (p.magic != kTrailerMagic || p.epoch != t.epoch || p.plan != t.plan || p.sequence != t.sequence || p.step != t.step ||
         p.bytes != t.bytes || p.kind != t.kind || p.layer != t.layer || p.rank != 1U - options_.rank || p.flags != t.flags)
         fail("glmxfer: peer message identity differs at sequence " + std::to_string(job.sequence) + " (peer seq " +

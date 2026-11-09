@@ -17,6 +17,7 @@ struct MoePolicy {
 #include "glm/prefill/glm_pf_moe.hpp"
 #include "glm/common/glm_math.hpp"
 #include "moe_core/grouped_core.hpp"
+#include "glm/prefill/glm_pf_aux.hpp"
 
 namespace strix::glm::pf {
 using strix::moe_core::hadamard128;
@@ -66,6 +67,51 @@ static __device__ __forceinline__ float swiglu_r15(float g, float u) {
     const float uu = u > kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
     return silu(gg) * uu;
 }
+};
+// Grouped X and WMMA cores share this H128 epilogue. Gate/up are paired
+// within one CTA; shared down is launched after all routed-down producers.
+template<bool Down>
+struct MoeAuxEpilogue {
+    template<class Rows, class Mat>
+    __device__ __forceinline__ void operator()(Rows rows, Mat m, unsigned r, unsigned col0,
+                                               float (&v)[4], unsigned lane) const {
+        namespace d = strix::glm::moe::dev;
+        const auto& a = rows.a;
+        const unsigned pair = a.pairs[rows.tile.first + r];
+        if constexpr (!Down) {
+            if (a.aux_act && rows.m == 1U) {
+                const auto down = a.experts[rows.tile.expert].down;
+#pragma unroll
+                for (unsigned j = 0; j < 4U; ++j) {
+                    const unsigned i = col0 + lane + 32U * j;
+                    const float u = d::materialize(v[j] * d::half_bits(m.svh[i]));
+                    const float g = a.gu[(std::size_t{pair} * 2U) * MoeTraits::kI + i];
+                    const float scaled = d::materialize(MoeTraits::swiglu_r15(g, u) * d::half_bits(down.suh[i]));
+                    v[j] = static_cast<float>(static_cast<_Float16>(scaled));
+                }
+                d::hadamard128(v, lane);
+#pragma unroll
+                for (unsigned j = 0; j < 4U; ++j)
+                    a.at[std::size_t{pair} * MoeTraits::kI + col0 + lane + 32U * j] = static_cast<_Float16>(v[j]);
+                return;
+            }
+        } else if (a.aux_combine && rows.tile.expert == MoeTraits::kE) {
+            constexpr unsigned P = MoeTraits::kTop + 1U, H = MoeTraits::kH;
+            const unsigned row = pair / P;
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) {
+                const unsigned i = col0 + lane + 32U * j;
+                const float shared = d::materialize(v[j] * d::half_bits(m.svh[i]));
+                float sum = 0.0F;
+                for (unsigned k = 0; k < MoeTraits::kTop; ++k)
+                    sum = __builtin_fmaf(a.weights[row * MoeTraits::kTop + k],
+                                        a.output[(std::size_t{row} * P + k) * H + i], sum);
+                a.out[std::size_t{row} * H + i] = sum + shared;
+            }
+            return;
+        }
+        aux::Store{}(rows, m, r, col0, v, lane);
+    }
 };
 }  // namespace strix::glm::pf
 #endif

@@ -1,3 +1,4 @@
+#include "glm/prefill/glm_pf_aux.hpp"
 // strix-glm5-rank: GLM-5.3-Flash engine runner (one node or one rank of the TP2 pair).
 //
 //   strix-glm5-rank MODEL_DIR --world 1                      [modes...]   one node (all heads / full I / full vocab)
@@ -379,7 +380,7 @@ int main(int argc, char** argv) {
             admitted_mem_available = admission.snapshot.mem_available;
             if (rd::max_rows_auto(eff)) prefill_margin = std::max(prefill_margin, rd::kMaxRowsSafetyBytes);
             if (rd::max_rows_auto(eff)) {
-                const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
+                auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
                 const auto comm_bytes = opt.world > 1 && !admission.recheck
                     ? std::uint64_t{rd::kAutoMaxRows} * (3 * 4096 * 4 + 16) + 16384 : 0;
                 rd::select_max_rows(eff, [&] {
@@ -388,13 +389,23 @@ int main(int argc, char** argv) {
                         terms.push_back({"communication growth and chunk staging", 3 * comm_bytes, 0});
                         return mem::fits(terms, admission.snapshot, admission.margins, admission.device_free);
                     }
-                    try {
-                        pf::admit_prefill_load(admission, b.path, b.workspace,
-                                              prefill_margin, 3 * comm_bytes);
-                        return true;
-                    } catch (const std::runtime_error&) {
-                        return false;
+                    // Preserve the preferred chunk size if ANY scratch candidate
+                    // admits locally. The engine later votes the SAME layout on
+                    // both ranks before installation, including at fallback rows.
+                    const auto saved = pf::capacity_layout();
+                    for (const auto layout : pf::capacity_candidates(pf::capacity_policy(), admission.kv_shard)) {
+                        pf::capacity_layout() = layout;
+                        b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity,
+                                               rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
+                        pf::capacity_layout() = saved;
+                        try {
+                            pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
+                            return true;
+                        } catch (const std::runtime_error&) {
+                            // A local refusal is only a row-size probe here.
+                        }
                     }
+                    return false;
                 });
                 opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
                 std::fprintf(stderr, "rank %u max-rows admission: %s; candidate %u, path %.2f GiB, workspace %.2f GiB, install %.2f GiB\n",
@@ -424,16 +435,21 @@ int main(int argc, char** argv) {
                 const auto comm_bytes = opt.world > 1 && !admission.recheck
                     ? std::uint64_t{opt.max_rows} * (3 * 4096 * 4 + 16) + 16384 : 0;
                 pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
-                std::fprintf(stderr, "rank %u prefill admission: path %.3f GiB, workspace %.3f GiB, install/staging %.3f GiB, late safety %.3f GiB, first-forward reserve %.3f GiB, layout %s%s\n",
+                std::fprintf(stderr, "rank %u prefill admission: path %.3f GiB, workspace %.3f GiB, install/staging %.3f GiB, late safety %.3f GiB, first-forward reserve %.3f GiB, layout %s%s, grouped-moe legacy-wmma=%u exact=%u, attention-scratch-rows=%u\n",
                              opt.rank, mem::gib(b.path), mem::gib(b.workspace), mem::gib(admission.prefill_install),
                              mem::gib(prefill_margin), mem::gib(prefill_first_forward),
-                             admission.kv_shard ? "sharded" : "replicated", admission.candidate ? " (candidate)" : "");
+                             admission.kv_shard ? "sharded" : "replicated", admission.candidate ? " (candidate)" : "",
+                             unsigned(b.moe_route.legacy_wmma), unsigned(b.moe_route.exact), b.attention_rows);
             }
             if (!admission.candidate && pf_before_load && !mem_plan && (!opt.auto_rows || admission.recheck)) {
                 eng.set_prefill(pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
                                                       pf_tier, prefill_margin, admission.kv_shard, prefill_first_forward));
                 std::printf("rank %u prefill %s set before load\n", opt.rank, prefill_mode.c_str());
             }
+        }, [&](bool sharded) -> std::shared_ptr<ge::PrefillPath> {
+            if (prefill_mode == "ref" || pf_before_load || mem_plan) return {};
+            return strix::glm::pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
+                                                    pf_tier, prefill_margin, sharded, prefill_first_forward);
         });
         eff.kv_shard = eng.kv_shard_enabled();
         if (eff.kv_shard_auto || eff.kv_shard)
@@ -468,26 +484,12 @@ int main(int argc, char** argv) {
         if (!startup_agreed) startup_agree();
         if (mtp_spec_on && profile)
             std::printf("rank %u mtp-spec: --profile covers plain steps only; skipping decode profile\n", opt.rank);
-        if (prefill_mode != "ref" && !pf_before_load) {  // chunked prefill, installed after the load so its admission check sees real free memory
-            namespace pf = strix::glm::pf;
-            const unsigned heads = 64 / opt.world;
-            const auto b = pf::prefill_budget(heads, heads, opt.capacity, opt.max_rows, opt.mtp, pf_tier, eff.kv_shard);
-            std::shared_ptr<ge::PrefillPath> path;
-            try {
-                path = pf::make_prefill_path(heads, heads, opt.capacity, opt.max_rows,
-                                             pf_tier, prefill_margin, eff.kv_shard, prefill_first_forward);
-            } catch (const std::exception& e) {
-                // world 2: the ranks must run the same prefill (chunk vs row exchanges pair up), so no per-rank fallback
-                if (prefill_requested != "auto" || opt.world != 1) throw;
-                std::printf("rank %u prefill auto: exact chunked path not admitted (%s) -> ref (same bits, slower)\n", opt.rank, e.what());
-                prefill_mode = "ref";
-            }
-            if (path) {
-                eng.set_prefill(std::move(path));
-                std::printf("rank %u prefill %s: max_rows %u, pipeline %u, path %.2f GiB + workspace %.2f GiB (engine rows %.2f GiB)\n", opt.rank,
-                            prefill_mode.c_str(), opt.max_rows, eng.prefill_pipeline(), static_cast<double>(b.path) / double(1ULL << 30),
-                            static_cast<double>(b.workspace) / double(1ULL << 30), static_cast<double>(b.engine_rows) / double(1ULL << 30));
-            }
+        if (prefill_mode != "ref" && !pf_before_load) {
+            const auto b = strix::glm::pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
+                                                       opt.mtp, pf_tier, eff.kv_shard);
+            std::printf("rank %u prefill %s: max_rows %u, pipeline %u, path %.2f GiB + workspace %.2f GiB (engine rows %.2f GiB)\n", opt.rank,
+                        prefill_mode.c_str(), opt.max_rows, eng.prefill_pipeline(), static_cast<double>(b.path) / double(1ULL << 30),
+                        static_cast<double>(b.workspace) / double(1ULL << 30), static_cast<double>(b.engine_rows) / double(1ULL << 30));
         }
 
         std::printf("rank %u prefill %s (requested %s), pipeline %u\n", opt.rank, prefill_mode.c_str(), prefill_requested.c_str(), eng.prefill_pipeline());
@@ -1688,7 +1690,23 @@ int main(int argc, char** argv) {
                         const std::size_t b = std::min(pf_ttft.find(',', a), pf_ttft.size());
                         const auto toks = read_u32(pf_ttft.substr(a, b - a));
                         if (toks.size() + 1 > opt.capacity) throw std::invalid_argument("--pf-ttft prompt longer than --capacity");
-                        const Run r = guarded_run(toks, false, (mode + " ttft").c_str());
+                        // Snapshot after the TTFT timer stops. The ordinary timing route
+                        // retains its old cost; qualification explicitly requests full anchors.
+                        const char* anchor = std::getenv("STRIX_GLM_PF_TTFT_ANCHOR");
+                        const Run r = guarded_run(toks, anchor && *anchor, (mode + " ttft").c_str());
+                        if (anchor && *anchor) {
+                            const std::string prefix = std::string(anchor) + ".n" + std::to_string(toks.size()) +
+                                ".r" + std::to_string(opt.rank) + "." + mode;
+                            auto save = [&](const char* suffix, const void* data, std::size_t bytes) {
+                                std::ofstream file(prefix + suffix, std::ios::binary);
+                                file.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+                                if (!file) throw std::runtime_error("prefill anchor write failed");
+                            };
+                            save(".token.u32", &r.token, sizeof(r.token));
+                            save(".logits.f32", r.logits.data(), r.logits.size() * sizeof(float));
+                            save(".state.u8", r.state.data(), r.state.size());
+                            std::printf("rank %u pf anchor: %zu logits, %zu state bytes\n", opt.rank, r.logits.size(), r.state.size());
+                        }
                         digest((mode + "-ttft").c_str(), r, toks.size());
                         a = b + 1;
                     }

@@ -1,4 +1,5 @@
 #pragma once
+#include "glm/prefill/glm_pf_aux.hpp"
 // GLM prefill FAST identity glm-pf-wmma-x (hwops G-01b): the exact X cores' operands on v_wmma_f32_16x16x16_f16.
 // Same FP16 operands as exact_x::core_s (trellis tiles decoded with mul1_pair, transformed FP16 rows), same epilogue
 // (H128 on the 128-output block, svh scale). The accumulation is new: per (row, output) and stage of four k-units one
@@ -54,14 +55,15 @@ inline unsigned split() {
 
 constexpr unsigned kRowsMax = 64;  // MT = 4 row tiles; the epilogue always works in 64-row halves
 // Pair pitch 36 dwords (as exact_x): b128 reads stay aligned and rows rotate banks.
-template<unsigned NR>
+template<unsigned NR, unsigned ActivationPitch = 36>
 union alignas(16) StorageR {
-    struct { std::uint32_t w[128][36], a[NR][36]; } stage;
+    struct { std::uint32_t w[128][36], a[NR][ActivationPitch]; } stage;
     float total[kRowsMax][128];
 };
 using Storage = StorageR<64>;
 using Storage128 = StorageR<128>;
 static_assert(sizeof(Storage) == 32768 && sizeof(Storage128) == 36864);
+static_assert(sizeof(StorageR<64, 68>) == 35840 && sizeof(StorageR<128, 68>) == 53248);
 
 __device__ __forceinline__ Half16 frag(const std::uint32_t* p) {
     const U4 lo = *reinterpret_cast<const U4*>(p), hi = *reinterpret_cast<const U4*>(p + 4);
@@ -70,8 +72,8 @@ __device__ __forceinline__ Half16 frag(const std::uint32_t* p) {
 }
 
 // Rows: input(r) = transformed FP16 row, output(r) = FP32 destination (exact_x interface). nr <= 16 * MT.
-template<int Bits, unsigned MT, unsigned CP = 1, class Mat, class Rows, class Lds>
-__device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds) {
+template<int Bits, unsigned MT, unsigned CP = 1, class Mat, class Rows, class Lds, class Output = aux::Store, class Input = aux::StagedInput>
+__device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds, Output output = {}, Input input = {}) {
     static_assert(MT == 1 || MT == 2 || MT == 4 || MT == 8);
     static_assert(CP == 1 || (CP == 2 && MT == 8));
     // CP 2: wave w owns output tiles 2 (w & 3), 2 (w & 3) + 1 and row tiles 4 (w >> 2) .. 4 (w >> 2) + 3;
@@ -90,12 +92,12 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds) {
         const unsigned q = tid + j * 256U;
         qrow[j] = q / 8U;
         qcol[j] = q % 8U;
-        src[j] = rows.input(qrow[j] < nr ? qrow[j] : 0U);
+        if constexpr (!Input::kFused) src[j] = rows.input(qrow[j] < nr ? qrow[j] : 0U);
     }
     // MT 1: 128 chunks, the upper half of the CTA stages nothing.
     const bool stager = Q > 0 || tid < NR * 8U;
     const unsigned q1 = tid, r1 = q1 / 8U, c1 = q1 % 8U;
-    const _Float16* src1 = (Q == 0 && stager) ? rows.input(r1 < nr ? r1 : 0U) : nullptr;
+    const _Float16* src1 = (Q == 0 && stager && !Input::kFused) ? rows.input(r1 < nr ? r1 : 0U) : nullptr;
 
     std::uint32_t raw[4][3];
     U4 xa[Q > 0 ? Q : 1];
@@ -107,13 +109,13 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds) {
             raw[kk][1] = d::load_u32(tile, geo.ob);
             raw[kk][2] = d::load_u32(tile, geo.oc);
         }
-        if constexpr (Q > 0) {
+        if constexpr (!Input::kFused && Q > 0) {
 #pragma unroll
             for (unsigned j = 0; j < Q; ++j) {
                 xa[j] = U4{0, 0, 0, 0};
                 if (qcol[j] < nk * 2U) xa[j] = *reinterpret_cast<const U4*>(src[j] + base * 16U + qcol[j] * 8U);
             }
-        } else {
+        } else if constexpr (!Input::kFused) {
             xa[0] = U4{0, 0, 0, 0};
             if (stager && c1 < nk * 2U) xa[0] = *reinterpret_cast<const U4*>(src1 + base * 16U + c1 * 8U);
         }
@@ -134,7 +136,9 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds) {
             lds.stage.w[o + 8U][p] = __builtin_bit_cast(std::uint32_t, d::mul1_pair(st.template state<4>(), st.template state<5>()));
             lds.stage.w[o + 8U][p + 4U] = __builtin_bit_cast(std::uint32_t, d::mul1_pair(st.template state<6>(), st.template state<7>()));
         }
-        if constexpr (Q > 0) {
+        if constexpr (Input::kFused) {
+            input.template stage<NR>(m, nr, base, lds);
+        } else if constexpr (Q > 0) {
 #pragma unroll
             for (unsigned j = 0; j < Q; ++j) *reinterpret_cast<U4*>(&lds.stage.a[qrow[j]][qcol[j] * 4U]) = xa[j];
         } else if (stager) {
@@ -146,6 +150,7 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds) {
             fetch(next, units - next < 4U ? units - next : 4U);
         }
         asm volatile("" ::: "memory");
+        const unsigned aoff = Input::kFused ? (base & 4U) * 8U : 0U;
         // The WMMA accumulator add is not round-to-nearest (synthetic drift grew linearly with K when one chain ran
         // over all of K): chain only the stage's k-units from +0, then fold the stage into the total with v_add_f32.
         Float8 part[MT] = {};
@@ -154,7 +159,7 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds) {
                 const Half16 b = frag(&lds.stage.w[wave * 16U + c][kk * 8U]);
 #pragma unroll
                 for (unsigned t = 0; t < MT; ++t)
-                    part[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(frag(&lds.stage.a[t * 16U + c][kk * 8U]), b, part[t]);
+                    part[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(frag(&lds.stage.a[t * 16U + c][aoff + kk * 8U]), b, part[t]);
             }
         } else {
             const unsigned ot = 2U * (wave & 3U), rt = 4U * (wave >> 2U);
@@ -162,7 +167,7 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds) {
                 const Half16 b0 = frag(&lds.stage.w[ot * 16U + c][kk * 8U]), b1 = frag(&lds.stage.w[(ot + 1U) * 16U + c][kk * 8U]);
 #pragma unroll
                 for (unsigned t = 0; t < 4U; ++t) {
-                    const Half16 a = frag(&lds.stage.a[(rt + t) * 16U + c][kk * 8U]);
+                    const Half16 a = frag(&lds.stage.a[(rt + t) * 16U + c][aoff + kk * 8U]);
                     part[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b0, part[t]);
                     part[4U + t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b1, part[4U + t]);
                 }
@@ -197,28 +202,24 @@ __device__ __forceinline__ void core(Mat m, Rows rows, unsigned nr, Lds& lds) {
 #pragma unroll
             for (unsigned j = 0; j < 4U; ++j) v[j] = lds.total[r - h0][lane + 32U * j];
             d::hadamard128(v, lane);
-#pragma unroll
-            for (unsigned j = 0; j < 4U; ++j) {
-                const unsigned o = col0 + lane + 32U * j;
-                rows.output(r)[o] = v[j] * d::half_bits(m.svh[o]);
-            }
+            output(rows, m, r, col0, v, lane);
         }
         __syncthreads();
     }
 }
 
 // A row span [0, n) in tiles of 64 (or 128) rows, the last one on the smallest MT covering it (uniform per CTA).
-template<int Bits, unsigned CP = 1, class Mat, class RowsAt, class Lds>
-__device__ __forceinline__ void span(Mat m, RowsAt at, unsigned n, Lds& lds) {
+template<int Bits, unsigned CP = 1, class Mat, class RowsAt, class Lds, class Output = aux::Store, class Input = aux::StagedInput>
+__device__ __forceinline__ void span(Mat m, RowsAt at, unsigned n, Lds& lds, Output output = {}, Input input = {}) {
     constexpr unsigned Tile = sizeof(lds.stage.a) / sizeof(lds.stage.a[0]);
     for (unsigned r = 0; r < n; r += Tile) {
         const unsigned k = n - r < Tile ? n - r : Tile;
         if constexpr (Tile == 128U) {
-            if (k > 64U) { core<Bits, 8, CP>(m, at(r, k), k, lds); continue; }
+            if (k > 64U) { core<Bits, 8, CP>(m, at(r, k), k, lds, output, input.offset(r)); continue; }
         }
-        if (k > 32U) core<Bits, 4>(m, at(r, k), k, lds);
-        else if (k > 16U) core<Bits, 2>(m, at(r, k), k, lds);
-        else core<Bits, 1>(m, at(r, k), k, lds);
+        if (k > 32U) core<Bits, 4>(m, at(r, k), k, lds, output, input.offset(r));
+        else if (k > 16U) core<Bits, 2>(m, at(r, k), k, lds, output, input.offset(r));
+        else core<Bits, 1>(m, at(r, k), k, lds, output, input.offset(r));
     }
 }
 } // namespace strix::glm::pf::wmma_x

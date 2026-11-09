@@ -51,6 +51,169 @@ __global__ void merge_kernel(float* value, std::uint32_t* id, const std::uint64_
 }  // namespace
 
 namespace {
+strix::xport::ChannelOptions<GlmSeqparTraits> seqpar_options(unsigned rank, unsigned rows, hipStream_t stream) {
+    strix::xport::ChannelOptions<GlmSeqparTraits> o;
+    o.rank = rank;
+    o.capacity = std::max(GlmSchedule::row_bytes((rows + 1U) / 2U), std::size_t{4} * kRowF32);
+    o.stream = stream;
+    o.from_env();
+    return o;
+}
+}
+
+SeqparExchange::SeqparExchange(dist::Transport& transport, unsigned rank, unsigned max_rows, hipStream_t stream)
+    : side_(max_rows), rank_(rank), max_rows_(max_rows), stream_(stream),
+      channel_(transport, seqpar_options(rank, max_rows, side_.stream)) {}
+
+SeqparExchange::~SeqparExchange() {
+    // Retire device users BEFORE Channel frees its RX slots, including after
+    // an enqueue failure. A progress failure releases all flag wait packets.
+    try { channel_.drain(); } catch (...) {}
+    for (auto s : side_.compute) (void)hipStreamSynchronize(s);
+    (void)hipStreamSynchronize(side_.stream);
+    (void)hipStreamSynchronize(stream_);
+}
+
+SeqparExchange::Side::Side(unsigned max_rows) {
+    try {
+        int least = 0, greatest = 0;
+        ok(hipDeviceGetStreamPriorityRange(&least, &greatest), "seqpar priority range");
+        ok(hipStreamCreateWithPriority(&stream, hipStreamNonBlocking, least), "seqpar transfer queue");
+        for (unsigned i = 0; i < ready.size(); ++i) {
+            ok(hipStreamCreateWithFlags(&compute[i], hipStreamNonBlocking), "seqpar compute queue");
+            ok(hipEventCreateWithFlags(&ready[i], hipEventDisableTiming), "seqpar ready event");
+            ok(hipEventCreateWithFlags(&done[i], hipEventDisableTiming), "seqpar done event");
+        }
+        for (auto& e : consumed) ok(hipEventCreateWithFlags(&e, hipEventDisableTiming), "seqpar slot retirement event");
+        ok(hipEventCreateWithFlags(&column, hipEventDisableTiming), "seqpar column handoff");
+        // The transport writes peer rows straight into this consumer buffer.
+        // Ordinary hipMalloc storage is not assumed host-coherent or CPU writable.
+        ok(hipHostMalloc(reinterpret_cast<void**>(&normalized_host), GlmSchedule::row_bytes(max_rows),
+                         hipHostMallocMapped | hipHostMallocCoherent), "seqpar normalized buffer");
+        ok(hipHostGetDevicePointer(reinterpret_cast<void**>(&normalized_dev), normalized_host, 0), "seqpar normalized alias");
+    } catch (...) {
+        if (normalized_host) (void)hipHostFree(normalized_host);
+        if (column) (void)hipEventDestroy(column);
+        for (auto e : consumed) if (e) (void)hipEventDestroy(e);
+        for (auto e : ready) if (e) (void)hipEventDestroy(e);
+        for (auto e : done) if (e) (void)hipEventDestroy(e);
+        for (auto s : compute) if (s) (void)hipStreamDestroy(s);
+        if (stream) (void)hipStreamDestroy(stream);
+        throw;
+    }
+}
+SeqparExchange::Side::~Side() {
+    // Consumers may still be queued during exception unwinding. Channel's
+    // failure path releases RX flags before its owner and slots are destroyed;
+    // normal execution joins and synchronizes the compute queues before exit.
+    for (auto s : compute) if (s) (void)hipStreamSynchronize(s);
+    if (stream) (void)hipStreamSynchronize(stream);
+    if (normalized_host) (void)hipHostFree(normalized_host);
+    if (column) (void)hipEventDestroy(column);
+    for (auto e : consumed) if (e) (void)hipEventDestroy(e);
+    for (auto e : ready) if (e) (void)hipEventDestroy(e);
+    for (auto e : done) if (e) (void)hipEventDestroy(e);
+    for (auto s : compute) if (s) (void)hipStreamDestroy(s);
+    if (stream) (void)hipStreamDestroy(stream);
+}
+
+void SeqparExchange::column_begin(unsigned lane) {
+    if (column_recorded_) ok(hipStreamWaitEvent(compute(lane), side_.column, 0), "seqpar shared column scratch");
+}
+void SeqparExchange::column_end(unsigned lane) {
+    ok(hipEventRecord(side_.column, compute(lane)), "seqpar column complete");
+    column_recorded_ = true;
+}
+void SeqparExchange::join() {
+    for (unsigned lane = 0; lane < 2; ++lane) {
+        if (pending_[lane] || holding_[lane]) throw std::logic_error("glm seqpar: join with unretired exchange");
+        ok(hipEventRecord(side_.ready[lane], compute(lane)), "seqpar compute tail");
+        ok(hipStreamWaitEvent(stream_, side_.ready[lane], 0), "seqpar compute join");
+    }
+}
+void SeqparExchange::produce(unsigned lane, hipStream_t producer) {
+    if (lane >= pending_.size() || pending_[lane] || holding_[lane]) throw std::logic_error("glm seqpar: busy lane");
+    const auto slot = static_cast<unsigned>(channel_.sent() % channel_.options().depth);
+    // The CPU progress owner cannot reuse an RS slot until the actual mHC
+    // consumer has retired. Gate producer publication, not just the next GPU read.
+    if (slot_live_[slot]) throw std::logic_error("glm seqpar: missing RS consumer retirement");
+    if (slot_recorded_[slot])
+        ok(hipStreamWaitEvent(side_.stream, side_.consumed[slot], 0), "seqpar slot reuse");
+    slot_[lane] = slot;
+    ok(hipEventRecord(side_.ready[lane], producer), "seqpar producer ready");
+    ok(hipStreamWaitEvent(side_.stream, side_.ready[lane], 0), "seqpar producer wait");
+}
+void SeqparExchange::produced(unsigned lane) {
+    ok(hipEventRecord(side_.done[lane], side_.stream), "seqpar consumer ready");
+    pending_[lane] = true;
+}
+void SeqparExchange::finish(unsigned lane, hipStream_t consumer) {
+    if (lane >= pending_.size() || !pending_[lane]) throw std::logic_error("glm seqpar: idle lane");
+    ok(hipStreamWaitEvent(consumer, side_.done[lane], 0), "seqpar first consumer");
+    pending_[lane] = false;
+}
+const float* SeqparExchange::finish_reduce_scatter(unsigned lane, hipStream_t consumer) {
+    if (lane >= reduction_.size() || !reduction_[lane]) throw std::logic_error("glm seqpar: expected RS");
+    finish(lane, consumer);
+    holding_[lane] = true;
+    return peer_[lane];
+}
+void SeqparExchange::release_reduce_scatter(unsigned lane, hipStream_t consumer) {
+    if (lane >= holding_.size() || !holding_[lane]) throw std::logic_error("glm seqpar: no RS consumer");
+    ok(hipEventRecord(side_.consumed[slot_[lane]], consumer), "seqpar mHC consumed peer");
+    slot_live_[slot_[lane]] = false;
+    slot_recorded_[slot_[lane]] = true;
+    holding_[lane] = reduction_[lane] = false;
+}
+
+std::size_t SeqparExchange::workspace_bytes(unsigned max_rows) {
+    const auto o = seqpar_options(0, max_rows, nullptr);
+    if (o.depth < 2 || o.depth > 64) throw std::invalid_argument("glm seqpar: channel depth must be 2..64");
+    const auto stride = (o.capacity + sizeof(Trailer) + 4095U) & ~std::size_t{4095};
+    // Includes the direct coherent consumer buffer (128 MiB at 8192 rows).
+    return 2U * o.depth * stride + GlmSchedule::row_bytes(max_rows) + (8U << 20U);
+}
+
+void SeqparExchange::start_reduce_scatter(float* partial, SeqparRows tile, unsigned lane, hipStream_t producer) {
+    if (tile.first > max_rows_ || tile.count > max_rows_ - tile.first) throw std::invalid_argument("glm seqpar: capacity");
+    const auto peer_rows = seqpar_owner(tile, 1U - rank_);
+    produce(lane, producer);
+    channel_.send_copy(partial + peer_rows.elements(), peer_rows.bytes(),
+                       Tag{Kind::shard_partial, static_cast<std::uint32_t>(site_ % 90U), site_ / 90U});
+    // Only the low-priority transfer queue waits. The owner mHC will add the
+    // rank partials on load; no polling or standalone reduction kernel here.
+    peer_[lane] = static_cast<const float*>(channel_.recv());
+    reduction_[lane] = slot_live_[slot_[lane]] = true;
+    produced(lane);
+    ++site_;
+}
+
+void SeqparExchange::start_gather(float* normalized, SeqparRows tile, unsigned lane, hipStream_t producer) {
+    if (tile.first > max_rows_ || tile.count > max_rows_ - tile.first) throw std::invalid_argument("glm seqpar: capacity");
+    if (normalized != side_.normalized_dev) throw std::invalid_argument("glm seqpar: AG needs coherent consumer buffer");
+    const auto own = seqpar_owner(tile, rank_), peer_rows = seqpar_owner(tile, 1U - rank_);
+    produce(lane, producer);
+    channel_.send_host(side_.normalized_host + own.elements(), side_.normalized_host + peer_rows.elements(), own.bytes(),
+                       Tag{Kind::gather, static_cast<std::uint32_t>(site_ % 90U), site_ / 90U});
+    (void)channel_.recv();
+    produced(lane);
+    ++site_;
+}
+
+void SeqparExchange::materialize_last(float* residual, unsigned rows) {
+    (void)seqpar_rows(rows, rank_);
+    const unsigned source = seqpar_last_source(rows, rank_);
+    produce(0, stream_);
+    channel_.send_copy(residual + std::size_t{source} * 4U * 4096U, 4U * kRowF32, Tag{Kind::gather, 0xFFFFFFFFU, site_});
+    const auto* peer = channel_.recv();
+    if (rank_ == 0)
+        ok(hipMemcpyAsync(residual + std::size_t{rows - 1U} * 4U * 4096U, peer, 4U * kRowF32,
+                          hipMemcpyDeviceToDevice, side_.stream), "seqpar final residual");
+    produced(0);
+    finish(0, stream_);
+}
+
+namespace {
 void boundary_form(bool& kwait, bool& bracket) {
     const char* v = std::getenv("STRIX_GLMX_BOUNDARY");
     // Default kw: measured token level (N = 1 / 8) kw 16.35 / 22.36 ms vs kw-br 16.50 / 22.41 ms; the separate bracket kernel

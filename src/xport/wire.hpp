@@ -15,6 +15,15 @@ void exchange_frame(Transport& transport, std::byte* tx, std::byte* rx,
                        std::span<std::byte>(rx, bytes + sizeof(Trailer)));
 }
 
+// Direct coherent payloads have no trailer-sized padding. Exchange the trailer
+// separately: never write past the payload into the next owner's live rows.
+template<class Transport, class Trailer>
+void exchange_frame_direct(Transport& transport, const std::byte* tx, std::byte* rx,
+                           std::size_t bytes, const Trailer& trailer, Trailer& peer) {
+    transport.exchange(std::span<const std::byte>(tx, bytes), std::span<std::byte>(rx, bytes));
+    transport.exchange(std::as_bytes(std::span(&trailer, 1)), std::as_writable_bytes(std::span(&peer, 1)));
+}
+
 template<class Traits>
 [[nodiscard]] typename Traits::Trailer make_trailer(
     const typename Traits::Tag& tag, std::uint64_t epoch, std::uint64_t plan,

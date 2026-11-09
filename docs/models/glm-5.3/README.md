@@ -14,7 +14,8 @@ read and what "exact" covers: [methodology](../../methodology.md). Build instruc
 ## Run: the pair
 
 Optional GLM token sharding is a qualified FAST memory profile. It is off by default; `STRIX_GLM_KV_SHARD=auto`
-(with `STRIX_GLM_PF_PIPELINE=1`) selects sharding only when replicated-state startup admission fails;
+(with `STRIX_GLM_PF_PIPELINE=1`) selects sharding only after all permitted replicated scratch/window
+candidates fail startup admission on either rank;
 `=1` forces sharding and `=0` forces replication. It requires one request,
 `STRIX_GLM_PF_PIPELINE=1`, chunked prefill and no MTP or speculation. FAST sharding changes
 the summation order, so it is not bitwise equal to the default replicated exact profile.
@@ -22,6 +23,26 @@ See the [KV storage and token-sharding guide](../../engine/kv-sharding.md) for t
 measured context limits, timings, verification steps and trade-offs. The independent transport
 experiment `STRIX_XPORT_SMALL_SPIN=1` enables bounded small-message progress; unset or `0`
 restores prior progress after restart. See [feature contracts](../../optimizations.md#kv-cache-sharding-and-shared-transport-progress).
+
+Prefill capacity controls default to `STRIX_GLM_PF_SCRATCH=auto` and
+`STRIX_GLM_PF_ATTN_QWIN=auto`. Startup tries full scratch with full-chunk attention
+first, then routed scratch with full-chunk attention, then routed scratch with a
+2048-query attention window. It selects the first candidate that passes the calibrated
+load and projected post-load prefill guards on **both ranks**. Only after those
+replicated candidates fail may KV-shard AUTO try sharded storage, in the same
+scratch/window order. A refusal on either rank rejects that candidate. Startup prints
+requested and resolved controls, the KV layout and the admission reason.
+
+Full scratch preserves the original allocation order and sizes; AUTO keeps this
+layout whenever it admits. Routed scratch removes only the unused legacy grouped-MoE
+arena. The query window bounds internal attention scratch without changing chunk
+size or per-row arithmetic. Explicit `STRIX_GLM_PF_SCRATCH=full|routed` pins the
+scratch axis; explicit `STRIX_GLM_PF_ATTN_QWIN=0|N` pins full-chunk attention or a
+window of 1..65536 queries. The other axis may still resolve automatically. Restart
+both ranks after changing controls. Two-rank automatic fallback requires the internal
+startup policy vote; external exchange retains the initial layout or requires explicit
+controls. Admission-matrix host tests cover selection; native byte equality, TTFT and
+capacity qualification of this AUTO policy remain pending.
 
 Run once per node with `R` set to 0 or 1 and the same tokenized prompt on both:
 

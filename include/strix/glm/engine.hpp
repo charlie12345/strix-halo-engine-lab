@@ -322,8 +322,12 @@ public:
     // The caller must coordinate the result across ranks. Comm row buffers grow only after selection.
     // Row negotiation precedes layout votes. admit_prefill must be read-only
     // for candidate admissions; the final call may install a pre-load path.
+    // make_prefill builds the post-load path inside the startup install vote.
+    // A joint install refusal releases the failed load and retries the next
+    // permitted layout (including AUTO sharding) before any forward executes.
     LoadReport load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows = {},
-                    const std::function<void(const mem::LoadAdmission&)>& admit_prefill = {});
+                    const std::function<void(const mem::LoadAdmission&)>& admit_prefill = {},
+                    const std::function<std::shared_ptr<PrefillPath>(bool kv_shard)>& make_prefill = {});
     // Positions [pos0, pos0 + n) of `slot`; returns the greedy next token after the last row (both ranks).
     // Default kR1b runs all prompt forwards in R1, restoring R1b on return or exception.
     // kR1bAll requires the reference path and runs prompts in R1b; kR1 uses R1 throughout.

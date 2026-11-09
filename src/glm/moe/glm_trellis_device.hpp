@@ -57,9 +57,8 @@ __device__ __forceinline__ void hadamard128(float (&v)[4], unsigned lane) {
 __device__ __forceinline__ float half_bits(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
 
 // One wave: input transform of the 128 channels [begin, begin + 128) of one row.
-__device__ __forceinline__ void transform_block(const float* x, const std::uint16_t* suh, _Float16* out, unsigned begin,
-                                                unsigned lane) {
-    float v[4];
+__device__ __forceinline__ void transform_values(const float* x, const std::uint16_t* suh,
+                                                unsigned begin, unsigned lane, float (&v)[4]) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const unsigned c = begin + lane + 32U * static_cast<unsigned>(j);
@@ -67,22 +66,17 @@ __device__ __forceinline__ void transform_block(const float* x, const std::uint1
         v[j] = static_cast<float>(static_cast<_Float16>(scaled));
     }
     hadamard128(v, lane);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) out[begin + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
 }
-// Same transform, writing the 128 results at out[obegin ...] (an LDS chunk that starts at channel begin - obegin).
 __device__ __forceinline__ void transform_block_at(const float* x, const std::uint16_t* suh, _Float16* out, unsigned begin,
                                                    unsigned obegin, unsigned lane) {
     float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = begin + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = materialize(x[c] * half_bits(suh[c]));
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    hadamard128(v, lane);
+    transform_values(x, suh, begin, lane, v);
 #pragma unroll
     for (int j = 0; j < 4; ++j) out[obegin + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
+}
+__device__ __forceinline__ void transform_block(const float* x, const std::uint16_t* suh, _Float16* out, unsigned begin,
+                                                unsigned lane) {
+    transform_block_at(x, suh, out, begin, begin, lane);
 }
 
 // ---------------------------------------------------------------- mul1 decode (packed_decoder.hpp, qualified bitwise

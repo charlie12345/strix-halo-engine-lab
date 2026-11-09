@@ -1,6 +1,6 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0xec68938f21545d4aULL},
+{"CMakeLists.txt", 0xa5d25bfc2d29cb90ULL},
 {"apps/minimax_rank_main.cpp", 0x8ed1583275894e9dULL},
 {"apps/minimax_serve_main.cpp", 0x32dfafeb546e923eULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
@@ -118,7 +118,7 @@
 {"src/minimax_msa.cpp", 0x7bd7c5829c4e50e4ULL},
 {"src/moe_core/decode.hpp", 0x5cf3af66ebb9eeb3ULL},
 {"src/moe_core/decode_schedule.hpp", 0x11d945bbc7e75567ULL},
-{"src/moe_core/exl3_trellis.hpp", 0x55abe5a54fd01bbdULL},
+{"src/moe_core/exl3_trellis.hpp", 0xfa2e792a7c5789f5ULL},
 {"src/moe_core/grouped_core.hpp", 0x2aa6e6de29d869f0ULL},
 {"src/moe_core/grouped_f16.hpp", 0xecadba26a0bae943ULL},
 {"src/moe_core/grouped_integer_decode.hpp", 0xe4193b966715f39cULL},

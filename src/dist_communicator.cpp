@@ -235,23 +235,63 @@ private:
     std::thread thread_;
 };
 
+// No-progress timeout of a USB4 host stream: STRIX_DIST_USB4_TIMEOUT_MS when set, else `fallback`. The data path
+// (Usb4HostTransport) and the pairing/probe loops below share it, so a stalled peer fails them on the same budget.
+std::chrono::milliseconds usb4_stream_timeout(std::chrono::milliseconds fallback = std::chrono::milliseconds(120000)) {
+    if (const char* t = std::getenv("STRIX_DIST_USB4_TIMEOUT_MS"); t && *t) return std::chrono::milliseconds(std::stoll(t));
+    return fallback;
+}
+
+// Pairing and probe transfers on non-blocking streams. The success path is the plain write/read loop; only the
+// EAGAIN/EINTR retry reads the clock (every 1024 retries; each transfer re-arms the no-progress deadline), so a peer
+// that stalls or died fails the startup/recalibration probe with a clear error instead of hanging the joined workers.
 void write_all(int fd, std::span<const std::byte> bytes, const char* what) {
+    const auto timeout = usb4_stream_timeout();
+    std::chrono::steady_clock::time_point deadline{};
+    bool armed = false; // the no-progress clock starts at the first checked retry after the last transfer
+    std::uint32_t retries = 0;
     std::size_t done = 0;
     while (done < bytes.size()) {
         const auto n = ::write(fd, bytes.data() + done, bytes.size() - done);
-        if (n < 0 && (errno == EINTR || errno == EAGAIN)) { cpu_relax(); continue; }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+            if ((++retries & 1023U) == 0U) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!armed) { deadline = now + timeout; armed = true; }
+                else if (now >= deadline)
+                    fail(std::string(what) + " write: no progress within " + std::to_string(timeout.count()) + " ms (" +
+                     std::to_string(done) + "/" + std::to_string(bytes.size()) + " bytes; peer stalled or gone)");
+            }
+            cpu_relax();
+            continue;
+        }
         if (n <= 0) fail(std::string(what) + " write failed: " + std::strerror(errno));
         done += static_cast<std::size_t>(n);
+        armed = false;
     }
 }
 void read_all(int fd, std::span<std::byte> bytes, const char* what) {
+    const auto timeout = usb4_stream_timeout();
+    std::chrono::steady_clock::time_point deadline{};
+    bool armed = false; // the no-progress clock starts at the first checked retry after the last transfer
+    std::uint32_t retries = 0;
     std::size_t done = 0;
     while (done < bytes.size()) {
         const auto n = ::read(fd, bytes.data() + done, bytes.size() - done);
-        if (n < 0 && (errno == EINTR || errno == EAGAIN)) { cpu_relax(); continue; }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+            if ((++retries & 1023U) == 0U) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!armed) { deadline = now + timeout; armed = true; }
+                else if (now >= deadline)
+                    fail(std::string(what) + " read: no progress within " + std::to_string(timeout.count()) + " ms (" +
+                     std::to_string(done) + "/" + std::to_string(bytes.size()) + " bytes; peer stalled or gone)");
+            }
+            cpu_relax();
+            continue;
+        }
         if (n == 0) fail(std::string(what) + " closed");
         if (n < 0) fail(std::string(what) + " read failed: " + std::strerror(errno));
         done += static_cast<std::size_t>(n);
+        armed = false;
     }
 }
 
@@ -289,7 +329,7 @@ public:
                 for (const int fd : fds_) ::close(fd);
                 fail("usb4 host transport weights must be positive");
             }
-        if (const char* t = std::getenv("STRIX_DIST_USB4_TIMEOUT_MS"); t && *t) timeout_ = std::chrono::milliseconds(std::stoll(t));
+        timeout_ = usb4_stream_timeout(timeout_);
         // Every read and write is non-blocking (poll() bounds the waits: deadline, abort), whoever opened the streams.
         for (const int fd : fds_)
             if (const int flags = ::fcntl(fd, F_GETFL); flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {

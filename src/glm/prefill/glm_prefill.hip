@@ -3,6 +3,7 @@
 // tests/hip_glm_prefill_tests.hip (prefill == decode row by row, bitwise). Build with -ffp-contract=off -fno-fast-math
 // -fno-gpu-flush-denormals-to-zero.
 #include "glm/prefill/glm_prefill.hpp"
+#include "glm/prefill/glm_pf_variants.hpp"
 
 #include <cstdlib>
 #include <cstdio>
@@ -2332,11 +2333,7 @@ void dense_rows_v3_auto(unsigned, const unsigned*, unsigned, unsigned& rt, unsig
 
 unsigned dense_rows_version() {
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_DENSE_ROWS");
-        if (e == nullptr || std::string(e) == "3") return 3U;
-        if (std::string(e) == "2") return 2U;
-        if (std::string(e) == "1") return 1U;
-        throw std::invalid_argument("STRIX_GLM_PF_DENSE_ROWS must be 1, 2 or 3");
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_DENSE_ROWS"));
     }();
     return v;
 }
@@ -2649,32 +2646,26 @@ __global__ __launch_bounds__(256) void hc_mix_norm_rows_kernel(const float* X, c
 
 unsigned hc_version() {  // default v2 (measurement: PF-K 30/0 + synthetic 6-layer engine gate PASS, 2.72 -> 1.75 us/row/site); STRIX_GLM_PF_HC=1: v1
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_HC");
-        return e && std::string(e) == "1" ? 1U : 2U;
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_HC"));
     }();
     return v;
 }
 
 bool mla_v1() {
     static const bool v1 = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_MLA");
-        return e && std::string(e) == "1";
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_MLA")) == 1U;
     }();
     return v1;
 }
 unsigned idx_version() {  // default v3 (bitwise == v2, -35..-44 % at t0 4096..28672); STRIX_GLM_PF_IDX=2 / 1: v2 / v1 (same keys)
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_IDX");
-        if (e && std::string(e) == "1") return 1U;
-        if (e && std::string(e) == "2") return 2U;
-        return 3U;
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_IDX"));
     }();
     return v;
 }
 unsigned select_version() {  // default v2 (same lists as v1, -60..-85 % at t0 4096..28672); STRIX_GLM_PF_SELECT=1: v1
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_SELECT");
-        return e && std::string(e) == "1" ? 1U : 2U;
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_SELECT"));
     }();
     return v;
 }
@@ -2683,34 +2674,19 @@ unsigned obar_version() {  // default 10 (heads 32; heads 64 runs v2); STRIX_GLM
     // (-8..-10 %); v7 9.0-10.2 vs v5 16.6-17.3 us/row at t0 4096..28672 (6.6 vs 11.3 at t0 0); v5 18.1 vs v2
     // 53.9 at the 32K chunk; v4 5 % slower than v2; v6 2.4x slower than v5
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_OBAR");
-        if (e && std::string(e) == "7") return 7U;
-        if (e && std::string(e) == "6") return 6U;
-        if (e && std::string(e) == "5") return 5U;
-        if (e && std::string(e) == "4") return 4U;
-        if (e && std::string(e) == "2") return 2U;
-        return 10U;
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_OBAR"));
     }();
     return v;
 }
 unsigned mla_gemm_version() {  // default v3 absorb / out GEMM; STRIX_GLM_PF_MLA_GEMM=2: v2, =1: v1
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_MLA_GEMM");
-        if (e && std::string(e) == "1") return 1U;
-        if (e && std::string(e) == "2") return 2U;
-        return 3U;
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_MLA_GEMM"));
     }();
     return v;
 }
 unsigned scores_version() {  // default v7 (v6 in 256-row groups, bitwise == v6 / v5, -1..-28 % vs v6); STRIX_GLM_PF_SCORES=6 / 5 / 4 / 3 / 2
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_SCORES");
-        if (e && std::string(e) == "6") return 6U;
-        if (e && std::string(e) == "5") return 5U;
-        if (e && std::string(e) == "4") return 4U;
-        if (e && std::string(e) == "3") return 3U;
-        if (e && std::string(e) == "2") return 2U;
-        return 7U;
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_SCORES"));
     }();
     return v;
 }
@@ -2728,9 +2704,7 @@ namespace {
 unsigned g_kda_scan_v = 0;  // explicit selector (gates / bench); 0 = kda_scan_version()
 unsigned kda_scan_version() {  // default v5 (v3 + fill off the serial path, same bits, -3.7 % vs v3); STRIX_GLM_PF_KDA_SCAN=3 / 1: v3 / v1
     static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_KDA_SCAN");
-        if (e && std::string(e) == "3") return 3U;
-        return e && std::string(e) == "1" ? 1U : 5U;
+        return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_KDA_SCAN"));
     }();
     return v;
 }

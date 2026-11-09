@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <vector>
@@ -355,9 +356,9 @@ void test_scan_and_print() {
     CHECK(s.find("effective prefill=gemv (requested auto, default)\n") != std::string::npos);
     CHECK(s.find("effective identity=r1b (default)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_DIST_CRC_PARALLEL=1 (default, item hp-crc-parallel)\n") != std::string::npos);
-    CHECK(s.find("effective env STRIX_GLM_PF_DENSE_ROWS=3 (default, item pf-dense-rows-v3)\n") != std::string::npos);
+    CHECK(s.find("effective env STRIX_GLM_PF_DENSE_ROWS=3 (default, item pf-dense-rows-v3; resolved v3)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_MIXNORM=1 (default, item pf-mixnorm)\n") != std::string::npos);
-    CHECK(s.find("effective env STRIX_GLM_PF_MLA_GEMM=3 (default, item pf-mla-gemm-v3)\n") != std::string::npos);
+    CHECK(s.find("effective env STRIX_GLM_PF_MLA_GEMM=3 (default, item pf-mla-gemm-v3; resolved v3)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_SUMEXP=1 (default, item pf-sumexp)\n") != std::string::npos);
 }
 
@@ -655,9 +656,26 @@ void test_reference_prefill_rows() {
     }
 }
 
+void test_pf_variants() {
+    // unknown prefill variant values fail at startup; the printer reports the resolved variant
+    bool threw = false;
+    try { (void)resolve(cat(kDeploy, kDecodeWork), {{"STRIX_GLM_PF_OBAR", "9"}}); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    threw = false;
+    try { (void)resolve(cat(kDeploy, kDecodeWork), {{"STRIX_GLM_PF_SCORES", ""}}); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    const auto s10 = rd::print(resolve(cat(kDeploy, kDecodeWork), {}));
+    CHECK(s10.find("effective env STRIX_GLM_PF_OBAR=10 (default, item pf-obar-v10; resolved v10, heads 64 runs v2)\n") != std::string::npos);
+    const auto s7 = rd::print(resolve(cat(kDeploy, kDecodeWork), {{"STRIX_GLM_PF_OBAR", "4"}}));
+    CHECK(s7.find("effective env STRIX_GLM_PF_OBAR=4 (explicit, item pf-obar-v10; resolved v4)\n") != std::string::npos);
+    const auto sb = rd::print(resolve(cat(cat(kDeploy, kDecodeWork), {"--baseline"}), {}));
+    CHECK(sb.find("STRIX_GLM_PF_OBAR=2 (baseline, item pf-obar-v10; resolved v2)\n") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
+    test_pf_variants();
     test_mtp_default();
     test_plain_equals_receipt();
     test_apply_env_default();

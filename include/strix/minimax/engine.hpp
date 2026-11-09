@@ -44,6 +44,8 @@ struct Options {
 struct LoadReport {
     double seconds = 0, gib_read = 0, device_gib = 0;
     bool direct_io = false;
+    // Exact resident index-weight payload and saving versus retaining all four layouts.
+    std::uint64_t index_weight_bytes = 0, index_weight_saved_bytes = 0;
 };
 
 // Per-phase times (seconds, synchronised) when STRIX_MM_PROFILE=1; zero otherwise.
@@ -207,6 +209,9 @@ public:
     void set_prefill_attend4(bool on);  // STRIX_MM_PF_ATTEND4, default off; prefill only
     [[nodiscard]] bool prefill_attend4() const;
     [[nodiscard]] bool fused_prefill_attention() const;
+    // Index layouts are selected at load time by STRIX_MM_INDEX_PROJ and STRIX_MM_INDEX_DECODE.
+    // These setters (including diagnostic A/B calls) throw before changing the route if its layouts were not loaded.
+    // Set the environment before constructing/loading a new engine to select a different layout set.
     // STRIX_MM_INDEX_PROJ=tiled: index q/k projections token-tiled with F16 weights (same per-output chain, same bits).
     void set_index_tiled(bool on);
     // STRIX_MM_INDEX_DECODE=1: decode rows' index projections in one wide launch (block-major F16, same chain/bits).

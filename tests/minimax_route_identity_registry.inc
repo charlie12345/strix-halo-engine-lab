@@ -5,7 +5,7 @@
 // src/minimax/attn/index_proj.hip:341
 {"index-proj", 'a', "index projection FP32 chain", "index_proj_tests.hip; split/ring/LDS bitwise gates", ""},
 // src/minimax/engine/engine.hip:1372
-{"index-fallback", 'a', "index projection FP32 chain", "mm_kernels.hpp dense_t16 contract; engine index fallback contract; index_proj_tests.hip", ""},
+{"index-fallback", 'a', "index projection FP32 chain", "mm_kernels.hpp dense_t16 contract; engine index fallback contract; index_proj_tests.hip; minimax_index_layout_tests.cpp ownership/admission/refusal (native load-change equality pending)", ""},
 // src/minimax/moe/mmx_moe.hip:1128
 {"decode-wide", 'a', "EXL3 vector shape+bits+S", "mm_defaults.cpp moe_wide; rows == alone hardware gate; mmx_moe.hip wide-column contract", ""},
 // src/minimax/moe/mmx_moe.hip: make_args / launch_experts4_grid

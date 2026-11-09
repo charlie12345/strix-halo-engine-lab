@@ -68,6 +68,13 @@ int main() try {
     expect(!ds::prefix_memory_admitted(8192, 8192, 1), "reserve is after predicted allocations");
     expect(ds::prefix_memory_admitted(8193, 8192, 1), "round predicted bytes upward");
     expect(!ds::prefix_memory_admitted(1, UINT64_MAX, UINT64_MAX), "admission arithmetic cannot wrap");
+    // The service-directory quota is never smaller than the tier it holds: 4096 MiB at least, the tier's ceiling
+    // above that, unlimited for an unlimited tier (0); the filesystem free-space floor still applies.
+    expect(ds::prefix_disk_quota_bytes(1024) == 4096ULL << 20U, "small tier keeps the 4096 MiB directory quota");
+    expect(ds::prefix_disk_quota_bytes(4096) == 4096ULL << 20U, "default tier: 4096 MiB quota");
+    expect(ds::prefix_disk_quota_bytes(262144) == 262144ULL << 20U, "256 GiB tier: 256 GiB quota");
+    expect(ds::prefix_disk_quota_bytes(0) == UINT64_MAX, "unlimited tier: no directory quota");
+    expect(ds::prefix_disk_quota_bytes(UINT64_MAX >> 20U) == (UINT64_MAX >> 20U) << 20U, "largest accepted tier does not wrap");
 #if defined(__unix__)
     const auto root = std::filesystem::temp_directory_path() / ("ds41-host-lease-test-" + std::to_string(::getpid()));
     {

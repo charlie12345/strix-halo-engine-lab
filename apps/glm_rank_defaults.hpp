@@ -11,6 +11,7 @@
 
 #include "glm_model_facts.hpp"
 #include "glm/engine/glm_kvshard_layout.hpp"
+#include "glm/prefill/glm_pf_variants.hpp"
 #include "strix/engine_profile.hpp"
 
 #include <cstdint>
@@ -277,6 +278,9 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         using Source = strix::profile::DefaultSource;
         e.env[it.env] = {v.value, v.source == Source::env || v.source == Source::cli ? "explicit" :
                                 v.source == Source::baseline ? "baseline" : "default"};
+        // Prefill variant selectors: an unknown value fails here, at startup, instead of
+        // silently selecting the default inside the engine.
+        if (const auto* p = strix::glm::pf::pf_variant_find(it.env)) (void)strix::glm::pf::pf_variant_parse(*p, v.value.c_str());
     }
     const std::string shard_policy = env("STRIX_GLM_KV_SHARD") ? env("STRIX_GLM_KV_SHARD") : "0";
     if (shard_policy != "0" && shard_policy != "1" && shard_policy != "auto")
@@ -339,7 +343,14 @@ inline std::string print(const Effective& e) {
     s += "effective xch=" + e.xch + "\n";
     for (const auto& it : env_items()) {
         const Value& v = e.env.at(it.env);
-        s += std::string("effective env ") + it.env + "=" + v.value + " (" + v.source + ", item " + it.name + ")\n";
+        std::string resolved;
+        if (const auto* p = strix::glm::pf::pf_variant_find(it.env)) {
+            const unsigned ver = strix::glm::pf::pf_variant_parse(*p, v.value.c_str());
+            resolved = "; resolved v" + std::to_string(ver);
+            if (std::string_view(it.env) == "STRIX_GLM_PF_OBAR" && (ver == 5U || ver == 7U || ver == 10U))
+                resolved += ", heads 64 runs v2";
+        }
+        s += std::string("effective env ") + it.env + "=" + v.value + " (" + v.source + ", item " + it.name + resolved + ")\n";
     }
     return s;
 }

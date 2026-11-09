@@ -99,7 +99,7 @@ qualification is conditional on those eight texts; it supersedes the earlier two
 
 ## Every shipped MiniMax default
 
-- `STRIX_PF_P1` bit 0 (`=1`): opt-in draft packed MUL1 decode for existing PAIR/PIPE prefill kernels; default off (`=0`); read once on the host, so restart both ranks. Strict build, native equality and 8K/32K workload gates remain pending; no speed claim.
+- `STRIX_PF_P1` bit 0: packed MUL1 decode in the PAIR/PIPE prefill MoE kernels, on by default (`=0` restores the scalar decode); bitwise-equal output; 8K TTFT -1.3 %. Read once on the host, so restart both ranks.
 
 The changelog of every default-on MiniMax lever with its measured gain, exactness evidence and off switch is in
 [measured gains](../../measured-gains.md); the full catalog is [docs/optimizations.md](../../optimizations.md#minimax).

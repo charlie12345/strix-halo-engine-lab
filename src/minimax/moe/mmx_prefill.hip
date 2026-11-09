@@ -871,8 +871,10 @@ constexpr const char* kDnLabel[8] = {"down.mt1", "down.mt2", "down.mt3", "down.m
 
 bool prefill_p1_packed() {
     static const bool enabled = [] {
+        // Default on: the packed decode is bitwise-equal to the scalar decode (exhaustive E1, K3..K6) and faster on
+        // PAIR/PIPE; STRIX_PF_P1=0 restores the scalar decode. Empty means unset.
         const char* value = std::getenv("STRIX_PF_P1");
-        if (value == nullptr) return false;
+        if (value == nullptr || value[0] == ' ') return true;
         char* end = nullptr;
         errno = 0;
         const unsigned long mask = std::strtoul(value, &end, 0);

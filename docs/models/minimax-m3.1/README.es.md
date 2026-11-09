@@ -104,7 +104,7 @@ cualificación está condicionada a esos ocho textos; sustituye al fallo anterio
 
 ## Todos los valores predeterminados incorporados de MiniMax
 
-- Bit 0 de `STRIX_PF_P1` (`=1`): borrador de decodificación MUL1 empaquetada, de activación explícita, para los kernels PAIR/PIPE de prefill existentes; desactivado por defecto (`=0`); se lee una vez en el host, por lo que hay que reiniciar ambos rangos. Quedan pendientes la compilación estricta, la igualdad nativa y las pruebas completas de 8K/32K; no se afirma una mejora de velocidad.
+- Bit 0 de `STRIX_PF_P1`: decodificación MUL1 empaquetada en los kernels MoE PAIR/PIPE del prefill, activada por defecto (`=0` vuelve a la decodificación escalar); salida idéntica bit a bit; TTFT 8K −1,3 %. Se lee una vez en el host, así que hay que reiniciar ambos rangos.
 
 El registro de cambios de cada palanca de MiniMax activada por defecto, con su ganancia medida, su evidencia de
 exactitud y su interruptor de desactivación, está en [ganancias medidas](../../measured-gains.es.md); el catálogo

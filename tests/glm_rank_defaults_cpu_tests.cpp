@@ -124,7 +124,7 @@ void test_apply_env_default() {
     CHECK(rd::print(normal).find("effective pf-seqpar=on") != std::string::npos);
     CHECK(rd::print(baseline).find("effective pf-seqpar=off") != std::string::npos);
     CHECK(rd::print(baseline).find("capacity-layout=replicated/full/qwin=0") != std::string::npos);
-    for (const Args args : {Args{"--prefill", "wmma"}, Args{"--max-rows", "1"}, Args{"--world", "1"}})
+    for (const Args& args : {Args{"--prefill", "wmma"}, Args{"--max-rows", "1"}, Args{"--world", "1"}})
         CHECK(rd::print(resolve(args, {})).find("effective pf-seqpar=declined") != std::string::npos);
     const auto routed = resolve({}, {{"STRIX_GLM_PF_SCRATCH", "routed"}, {"STRIX_GLM_PF_ATTN_QWIN", "2048"}});
     CHECK(rd::print(routed).find("capacity-layout=replicated/routed/qwin=2048") != std::string::npos);

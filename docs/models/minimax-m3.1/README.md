@@ -3,7 +3,7 @@
 [English](README.md) · [Español](README.es.md) · [Main README](../../../README.md)
 
 MiniMax M3.1 Flash, EXL3 trellis weights at 3.06 bpw, on two Strix Halo nodes (TP2 over USB4): exact prefill and
-decode, DSpark serving with automatic admission, MSA prefill mode 8, deadline-based and nested serving. Production;
+decode, DSpark serving with automatic admission, MSA prefill mode 10, deadline-based and nested serving. Production;
 the eight-text quality gate passed. This page keeps every published measurement with its build and conditions and the
 launch command. How the tables are read and what "exact" covers: [methodology](../../methodology.md). Build
 instructions (trellis library included): [getting started](../../getting-started/README.md); the pair itself:
@@ -20,7 +20,8 @@ Run once per node with `R` set to 0 or 1 and matching EXL3 assets:
 ```
 
 The [resolver](../../../src/minimax/engine/mm_defaults.cpp) enables the production decode/prefill/exchange set,
-including MSA prefill mode 8. `strix-minimax-serve` uses structural DSpark auto admission with compatible
+including MSA prefill mode 10 (in-block chunk loop with LDS-staged block list and partials, no global partials;
+`STRIX_MM_PF_MSA_REWORK=8` restores the previous mode, valid values 0..10). `strix-minimax-serve` uses structural DSpark auto admission with compatible
 local assets; eligible uncontended requests may draft, while competing/grouped or unsupported requests
 stay plain. See [admission and qualification](../../engine/serving/dspark-auto-qualification.md).
 A named session request that does not fit the context returns HTTP 400 `context_length_exceeded` (the
@@ -36,6 +37,25 @@ Budget min(8 GiB, 25 % of the memory free after the model load), at most 8 parke
 opt-in (`--session-disk on` / `STRIX_SESSION_DISK=1`). Turn off with `--session-cache off` /
 `STRIX_SESSION_CACHE=0` or the baseline switches. Named requests decode without the DSpark drafter (keeps
 grouped prefill; ids are the same); `STRIX_MM_SESSION_DRAFT=1` restores it.
+
+Index projection weights are loaded by route. The load keeps only the layouts that the resolved
+`STRIX_MM_INDEX_PROJ` (`attn` default, `tiled`, `off`) and `STRIX_MM_INDEX_DECODE` (default 1) route uses for
+decode/verify (1–8 rows) and prompt (more than 8 rows): the default `attn` route loads the packed layout only;
+`tiled` loads the FP16 block (decode, with `STRIX_MM_INDEX_DECODE=1`) and FP16 transposed layouts; `off` loads the
+FP32 transposed layout. Prefill and decode outputs are bitwise identical to loading every layout. The other
+routes still work: set both variables before the engine loads. Selecting a route whose layout was not loaded is
+refused with an error that asks for a reload; a layout set that does not fit in device memory fails the load.
+
+USB4 transport capabilities are opt-in and all off for MiniMax: `STRIX_MM_USB4_CAPS` takes a comma list of
+`streams`, `joint`, `ready`, `deferred-crc`, `chunks`, `crc-overlap`, `gpu-lean` (stream table, joint
+calibration, staged readiness, deferred CRC, host chunk default, host CRC overlap default, GPU queue lean). Unset
+or empty keeps the previous pairing. The selection travels in the CRC-covered pairing hello/plan version field, with
+no extra frame or byte; both ranks must set the same list or pairing is refused, unknown or empty names are
+refused, and the variable requires a USB4 transport. It applies to `strix-minimax-rank` and the serve path. With
+`STRIX_XPORT_TIMED_WAIT=1`, host waits print `xport host_wait owner=... wait=... class=... calls=... ns=...` on
+stderr. Unset or any value other than `1` leaves timed host-wait reporting off; exactly `1` enables it.
+The prefill exchange counter formerly named `exposed_wait` is now `reuse_dependencies`: it counts
+buffer-reuse event edges, not elapsed time.
 
 <a id="how-fast"></a>
 

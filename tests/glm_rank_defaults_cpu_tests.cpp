@@ -160,8 +160,8 @@ void test_apply_env_default() {
     CHECK(set == merge(kHp, {{"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}, {"STRIX_GLM_PF_PIPELINE", "2"},
                               {"STRIX_DIST_ASYNC_START", "1"}, {"STRIX_GLM_SPEC_KDA_TREE", "2"},
                               {"STRIX_GLM_PF_EXACT_X", "auto"}, {"STRIX_GLM_PF_EXACTMOE_V", "auto"},
-                              {"STRIX_GLM_HC_NORM", "1"}}));
-    // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree + the fused HC norm
+                              {"STRIX_GLM_HC_NORM", "1"}, {"STRIX_GLM_PF_HC_EXPAND_ROWS", "2"}}));
+    // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree + the fused HC norm + two-row mHC expand
     // an explicit value is never overwritten
     const auto expl = resolve(cat(kDeploy, kDecodeWork), {{"STRIX_DIST_CRC_PARALLEL", "0"}});
     Env set2;

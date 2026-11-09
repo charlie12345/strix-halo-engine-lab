@@ -56,6 +56,23 @@ def patch(name, replacements):
     if name == 'apps/minimax_serve_main.cpp':
         # Observe every transport call from construction through session admission,
         # including peer scalars, hello, votes and any future startup messages.
+        # The shared adapter is a template alias; observe through an equivalent
+        # local adapter (abort forwards, state keeps the base default).
+        alias=('using Borrowed = strix::xport::BorrowedTransport<\n'
+               '    strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;')
+        if source.count(alias)==1:
+            source=source.replace(alias, '''class Borrowed final : public strix::dist::Transport {
+public:
+    explicit Borrowed(strix::dist::Transport& t) : t_(t) {}
+    void send(std::span<const std::byte> m) override { t_.send(m); }
+    void receive(std::span<std::byte> m) override { t_.receive(m); }
+    void exchange(std::span<const std::byte> o, std::span<std::byte> i) override { t_.exchange(o, i); }
+    [[nodiscard]] std::string name() const override { return t_.name(); }
+    void abort(const std::string& why) override { t_.abort(why); }
+
+private:
+    strix::dist::Transport& t_;
+};''')
         source=source.replace('explicit Borrowed(strix::dist::Transport& t) : t_(t) {}',
                               'explicit Borrowed(strix::dist::Transport& t, unsigned rank) : t_(t), rank_(rank) {}')
         source=source.replace('std::make_unique<Borrowed>(*transport)', 'std::make_unique<Borrowed>(*transport, opt.rank)')

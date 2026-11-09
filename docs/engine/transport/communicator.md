@@ -28,7 +28,11 @@ Status: first layer of the distributed runtime. `include/strix/dist/communicator
   every stream is closed (the peer reads CLOSE on its live streams and fails at once instead of waiting) and the
   transport refuses later calls. `strix-dist-transport-tests` checks this over Unix socket pairs: 42 MB
   exchanges, a peer that dies mid-exchange (reported in ~50 ms), a silent peer (the deadline).
-  `DirectTransport` declares the device-buffer path (registered windows, submit, repost, completion by sequence).
+  `$STRIX_DIST_USB4_TIMEOUT_MS` also bounds the pairing and startup/recalibration probe transfers: each transfer
+  re-arms a no-progress deadline, so a peer that stalls or died fails the probe with an error instead of hanging.
+  The override is a millisecond timeout; unset or empty uses the caller’s fallback (120000 ms in the communicator,
+  with launchers able to supply their own default). `DirectTransport` declares the device-buffer path
+  (registered windows, submit, repost, completion by sequence).
 - **`Transport::exchange(out, in)`**: both ranks send and receive at once; backends use persistent threads, never a
   thread per call.
 - **Message format**: the payload, then a 64-byte trailer (`magic, epoch, plan, sequence, request, bytes, rank,

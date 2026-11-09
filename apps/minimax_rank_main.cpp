@@ -60,6 +60,7 @@
 #include "../src/minimax/model_graph.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/dist/communicator.hpp"
+#include "xport/borrowed_transport.hpp"
 #include "strix/bp_codec.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
@@ -110,18 +111,8 @@ std::uint64_t fnv(const void* p, std::size_t bytes, std::uint64_t h = 1469598103
 }
 
 // The transport shared in turn by the communicator and the exchange module (shared exchange form).
-class Borrowed final : public strix::dist::Transport {
-public:
-    explicit Borrowed(strix::dist::Transport& t) : t_(t) {}
-    void send(std::span<const std::byte> m) override { t_.send(m); }
-    void receive(std::span<std::byte> m) override { t_.receive(m); }
-    void exchange(std::span<const std::byte> o, std::span<std::byte> i) override { t_.exchange(o, i); }
-    [[nodiscard]] std::string name() const override { return t_.name(); }
-    void abort(const std::string& why) override { t_.abort(why); }
-
-private:
-    strix::dist::Transport& t_;
-};
+using Borrowed = strix::xport::BorrowedTransport<
+    strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;
 
 // usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (as the DS apps).
 std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;

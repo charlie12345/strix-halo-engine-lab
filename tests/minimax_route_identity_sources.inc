@@ -1,8 +1,8 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0x184de506b08c714bULL},
-{"apps/minimax_rank_main.cpp", 0x41cbc83cf5d7e61eULL},
-{"apps/minimax_serve_main.cpp", 0x78ccbfaf1881e2f5ULL},
+{"CMakeLists.txt", 0xec68938f21545d4aULL},
+{"apps/minimax_rank_main.cpp", 0x8ed1583275894e9dULL},
+{"apps/minimax_serve_main.cpp", 0x32dfafeb546e923eULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
 {"include/strix/hip_minimax_moe.hpp", 0xafeacaf792657053ULL},
 {"include/strix/hip_minimax_msa.hpp", 0x52145037fe615f8dULL},
@@ -142,6 +142,7 @@
 {"src/moe_core/qwen_k_scalar_decode.inc", 0xdbccbbb61a21d2f6ULL},
 {"src/moe_core/qwen_k_weight_decode.inc", 0xb3796f17d32c5ef1ULL},
 {"src/xport/backend.hpp", 0xad6763285b3e3859ULL},
+{"src/xport/borrowed_transport.hpp", 0x630202a7d683e70eULL},
 {"src/xport/channel.hpp", 0x153da15575fcb3b1ULL},
 {"src/xport/channel_device.hpp", 0x6c8157a4f8e47ae3ULL},
 {"src/xport/channel_impl.hip", 0x320b300506e80ccaULL},

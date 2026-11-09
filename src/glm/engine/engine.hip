@@ -1,5 +1,6 @@
 #include <limits>
 #include <array>
+#include <exception>
 #include "xport/channel.hpp"
 #include "xport/communicator_backend.hpp"
 #include "glm/xfer/glm_traits.hpp"
@@ -568,7 +569,8 @@ struct Engine::Impl {
     std::shared_ptr<Exchange> fallback_xch; // installed seam (CommExchange unless explicitly overridden)
     std::shared_ptr<Exchange> decode_xch;   // borrowed transport; only automatic plain decode uses this
     std::shared_ptr<PrefillPath> pf;
-    bool pf_seqpar = false;  // draft, opt-in; ordinary decode/verify never use it
+    bool pf_seqpar = false;  // ordinary decode/verify never use it
+    bool pf_seqpar_auto_eligible = false;
     std::unique_ptr<xfer::SeqparExchange> seqpar_xch;
     struct InstallRefused : std::runtime_error { using std::runtime_error::runtime_error; };
     unsigned capacity_skip = 0, capacity_candidate = 0;
@@ -703,8 +705,9 @@ struct Engine::Impl {
         if (seqpar_policy == "1" && !seqpar_eligible)
             throw std::invalid_argument("glm seqpar: requires TP2 communicator and ordinary attention cache ownership");
         pf_seqpar = seqpar_policy == "1" || (seqpar_policy == "auto" && seqpar_eligible);
+        pf_seqpar_auto_eligible = seqpar_policy == "auto" && seqpar_eligible;
         if (seqpar_policy == "auto" && !seqpar_eligible && opt.world == 2)
-            std::fprintf(stderr, "glm prefill seqpar: auto declined (%s); legacy path\n",
+            std::fprintf(stderr, "glm prefill seqpar auto declined: %s; legacy path\n",
                          kv_shard || kv_shard_auto ? "kv-shard policy" : opt.external_exchange ? "external exchange" : "no TP2 communicator");
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("world must be 1 or 2");
         // STRIX_GLM_LOAD_TEST=1: one rank's slice loaded without a peer (load timing only; any forward throws).
@@ -1111,14 +1114,15 @@ struct Engine::Impl {
             const bool initial_sharded = kv_shard != nullptr;
             const bool admitted = pf::select_capacity_layout(pf_policy, initial_sharded, kv_shard_auto,
                 [&](pf::CapacityLayout layout) {
-                    if (layout.sharded && !kv_shard) {
-                        kv_shard = std::make_unique<KvShard>(*comm, opt.rank);
-                        bind_shard_exchange();
-                        make_plan();
-                    }
-                    pf::capacity_layout() = layout;
                     last_votes = {};
+                    std::exception_ptr install_error;
                     try {
+                        if (layout.sharded && !kv_shard) {
+                            kv_shard = std::make_unique<KvShard>(*comm, opt.rank);
+                            bind_shard_exchange();
+                            make_plan();
+                        }
+                        pf::capacity_layout() = layout;
                         if (opt.world == 2 && !capacity_peer && !load_test &&
                             (layout.routed != initial_pf_layout.routed || layout.query_window != initial_pf_layout.query_window))
                             throw std::runtime_error("automatic scratch/window fallback requires the internal two-rank startup policy vote");
@@ -1131,16 +1135,22 @@ struct Engine::Impl {
                         std::snprintf(last_votes[0].reason.data(), last_votes[0].reason.size(), "admitted");
                     } catch (const std::runtime_error& e) {
                         std::snprintf(last_votes[0].reason.data(), last_votes[0].reason.size(), "%s", e.what());
+                    } catch (...) {
+                        install_error = std::current_exception();
+                        last_votes[0].fits = 2;
+                        std::snprintf(last_votes[0].reason.data(), last_votes[0].reason.size(), "install failed");
                     }
                     if (capacity_peer) {
                         comm->exchange_host({reinterpret_cast<const std::byte*>(&last_votes[0]), sizeof(Vote)},
                                             {reinterpret_cast<std::byte*>(&last_votes[1]), sizeof(Vote)},
                                             {static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0xFFFFFFFEU, phase});
-                        if (last_votes[1].fits > 1U || last_votes[1].reason.back() != '\0')
+                        if (last_votes[1].fits > 2U || last_votes[1].reason.back() != '\0')
                             throw std::runtime_error("glm capacity: invalid auto admission vote");
                     } else {
                         last_votes[1] = last_votes[0];
                     }
+                    if (install_error) std::rethrow_exception(install_error);
+                    if (last_votes[1].fits == 2U) throw std::runtime_error("peer install failed");
                     std::fprintf(stderr, "glm capacity candidate: rank=%u kv=%s scratch=%s qwin=%u local=%s peer=%s\n",
                         opt.rank, layout.sharded ? "sharded" : "replicated", layout.routed ? "routed" : "full",
                         layout.query_window, last_votes[0].reason.data(), last_votes[1].reason.data());
@@ -1254,8 +1264,9 @@ struct Engine::Impl {
     // is admitted against hipMemGetInfo free and MemAvailable with the path's margin before it allocates.
     template<class Install>
     void vote_prefill_install(Install&& install, std::uint32_t tag) {
-        struct Vote { std::uint32_t fits = 0; std::array<char, 768> reason{}; };
+        struct Vote { std::uint32_t fits = 0, seqpar = 0; std::array<char, 768> reason{}; };
         std::array<Vote, 2> votes{};
+        std::exception_ptr install_error;
         try {
             install();
             votes[0].fits = 1;
@@ -1265,14 +1276,23 @@ struct Engine::Impl {
             // are not evidence that a smaller layout is safe to execute.
             votes[0].fits = std::string(e.what()).find("refusing") != std::string::npos ? 0U : 2U;
             std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "%s", e.what());
+        } catch (...) {
+            install_error = std::current_exception();
+            votes[0].fits = 3;
+            std::snprintf(votes[0].reason.data(), votes[0].reason.size(), "install failed");
         }
+        votes[0].seqpar = pf_seqpar ? 1U : 0U;
         if (opt.world == 2 && comm && !load_test && !opt.external_exchange) {
             comm->exchange_host({reinterpret_cast<const std::byte*>(&votes[0]), sizeof(Vote)},
                                 {reinterpret_cast<std::byte*>(&votes[1]), sizeof(Vote)},
                                 {static_cast<std::uint32_t>(dist::TagKind::raw_slots), tag, capacity_candidate});
-            if (votes[1].fits > 2U || votes[1].reason.back() != '\0')
+            if (votes[1].fits > 3U || votes[1].seqpar > 1U || votes[1].reason.back() != '\0')
                 throw std::runtime_error("glm capacity: invalid install vote");
         } else votes[1] = votes[0];
+        if (install_error) std::rethrow_exception(install_error);
+        if (votes[1].fits == 3U) throw std::runtime_error("peer install failed");
+        if (votes[0].fits == 1U && votes[1].fits == 1U && votes[0].seqpar != votes[1].seqpar)
+            throw std::runtime_error("glm: rank policy mismatch (PF_SEQPAR install decision)");
         if (votes[0].fits == 1U && votes[1].fits == 1U) return;
         const std::string reason = std::string("glm capacity install: local: ") + votes[0].reason.data() +
             "; peer: " + votes[1].reason.data();
@@ -1301,6 +1321,12 @@ struct Engine::Impl {
     }
 
     void install_prefill(PrefillPath& p) {
+        if (pf_seqpar_auto_eligible) {
+            pf_seqpar = p.supports_pipeline() && opt.max_rows >= 2;
+            if (!pf_seqpar)
+                std::fprintf(stderr, "glm prefill seqpar auto declined: %s; legacy path\n",
+                             !p.supports_pipeline() ? "prefill path does not support pipeline" : "max_rows < 2");
+        }
         const auto need = prefill_install_bytes(p.needs_prepared_shared());
         if (need != 0) {
             hip_ok(hipDeviceSynchronize(), "sync");
@@ -2054,6 +2080,7 @@ struct Engine::Impl {
             for (unsigned j = 0; j < R; ++j) rows[j] = Row{slot, tokens[c0 + j], pos0 + c0 + j};
             layers_forward(rows, opt.layers, ForwardKind::Prefill);
             if (pf_seqpar && xfer::seqpar_admits(R)) {
+                if (!seqpar_xch) throw std::logic_error("glm seqpar: channel must be admitted before final gather");
                 // MTP teacher forcing consumes all trunk hidden rows. Residual
                 // streams remain local; gather only the final normalized hidden.
                 float* const gathered = seqpar_xch->normalized();

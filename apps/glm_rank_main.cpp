@@ -84,6 +84,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <exception>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -393,19 +394,37 @@ int main(int argc, char** argv) {
                     // admits locally. The engine later votes the SAME layout on
                     // both ranks before installation, including at fallback rows.
                     const auto saved = pf::capacity_layout();
-                    for (const auto layout : pf::capacity_candidates(pf::capacity_policy(), admission.kv_shard)) {
-                        pf::capacity_layout() = layout;
-                        b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity,
-                                               rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
-                        pf::capacity_layout() = saved;
-                        try {
-                            pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
-                            return true;
-                        } catch (const std::runtime_error&) {
-                            // A local refusal is only a row-size probe here.
+                    std::exception_ptr install_error;
+                    std::uint32_t fits = 0;
+                    try {
+                        for (const auto layout : pf::capacity_candidates(pf::capacity_policy(), admission.kv_shard)) {
+                            try {
+                                pf::capacity_layout() = layout;
+                                b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity,
+                                                       rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
+                                pf::capacity_layout() = saved;
+                                pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
+                                fits = 1;
+                                break;
+                            } catch (const std::runtime_error&) {
+                                // A local refusal is only a row-size probe here.
+                            }
                         }
+                    } catch (...) {
+                        install_error = std::current_exception();
+                        fits = 2;
                     }
-                    return false;
+                    pf::capacity_layout() = saved;
+                    // One vote per probe, even if ranks admit different candidates.
+                    std::uint32_t peer_fits = fits;
+                    if (comm) {
+                        comm->exchange_host(std::as_bytes(std::span{&fits, 1}), std::as_writable_bytes(std::span{&peer_fits, 1}),
+                            {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFBU, admission.recheck ? 1U : 0U});
+                        if (peer_fits > 2U) throw std::runtime_error("glm capacity: invalid row probe vote");
+                    }
+                    if (install_error) std::rethrow_exception(install_error);
+                    if (peer_fits == 2U) throw std::runtime_error("peer install failed");
+                    return fits == 1U;
                 });
                 opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
                 std::fprintf(stderr, "rank %u max-rows admission: %s; candidate %u, path %.2f GiB, workspace %.2f GiB, install %.2f GiB\n",
@@ -452,6 +471,10 @@ int main(int argc, char** argv) {
                                                     pf_tier, prefill_margin, sharded, prefill_first_forward);
         });
         eff.kv_shard = eng.kv_shard_enabled();
+        const auto admitted_layout = strix::glm::pf::capacity_layout();
+        std::printf("rank %u effective capacity-layout=%s/%s/qwin=%u (capacity_layout_reason=%s)\n", opt.rank,
+                    admitted_layout.sharded ? "sharded" : "replicated", admitted_layout.routed ? "routed" : "full",
+                    admitted_layout.query_window, strix::glm::pf::capacity_layout_reason(admitted_layout));
         if (eff.kv_shard_auto || eff.kv_shard)
             std::printf("rank %u kv-shard effective=%u identity=%s\n", opt.rank, eff.kv_shard ? 1U : 0U,
                         eff.kv_shard ? strix::glm::kvshard::numerical_identity : "replicated");

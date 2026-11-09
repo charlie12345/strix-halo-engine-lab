@@ -12,6 +12,7 @@
 #include "glm_model_facts.hpp"
 #include "glm/engine/glm_kvshard_layout.hpp"
 #include "glm/prefill/glm_pf_variants.hpp"
+#include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "strix/engine_profile.hpp"
 
 #include <cstdint>
@@ -47,6 +48,14 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16", true, true},
         {"pf-pipeline-2", "STRIX_GLM_PF_PIPELINE", "2", "1",
          "Measurement: N=2 whole-layer prefill pipeline + async start, prefill gate bitwise, 8K -4.0 % (needs dist-async-start)", true, true},
+        {"pf-seqpar", "STRIX_GLM_PF_SEQPAR", "auto", "0",
+         "Guard: ordinary TP2 ownership, pipeline-capable prefill and at least two rows; auto declines to legacy", true, true},
+        {"pf-aux-combine", "STRIX_GLM_PF_AUX_COMBINE", "1", "0",
+         "Guard: exact MoE epilogue; off restores the separate auxiliary combine", true, true},
+        {"pf-scratch", "STRIX_GLM_PF_SCRATCH", "auto", "full",
+         "Guard: joint capacity admission; auto tries routed scratch after the original full layout", true, true},
+        {"pf-attn-qwin", "STRIX_GLM_PF_ATTN_QWIN", "auto", "0",
+         "Guard: joint capacity admission; auto tries a 2048-row query window after full-chunk candidates", true, true},
         {"dist-async-start", "STRIX_DIST_ASYNC_START", "1", "0",
          "Measurement: async exchange start (full-host chunked path; only the pipeline uses it)", true, true},
         {"hsa-no-fragment-allocator", "HSA_DISABLE_FRAGMENT_ALLOCATOR", "1", "0",
@@ -212,6 +221,7 @@ struct Value {
 
 struct Effective {
     bool baseline = false;
+    std::uint32_t world = 2;
     bool kv_shard = false, kv_shard_auto = false;
     Value identity, prefill_requested, mtp, mtp_spec, spec, decode_xch, max_rows;
     ModelFacts head;
@@ -293,6 +303,12 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         if (e.kv_shard && e.decode_xch.source != "explicit")
             e.decode_xch = {"xfer", "kv-shard-draft"};  // device 11-08: Xfer TP is faster under sharding (8K 41.8 vs 43.9 ms/token with comm)
     }
+    const auto& seqpar = e.env.at("STRIX_GLM_PF_SEQPAR").value;
+    if (seqpar != "0" && seqpar != "1" && seqpar != "auto")
+        throw std::invalid_argument("STRIX_GLM_PF_SEQPAR must be 0, 1 or auto");
+    (void)strix::glm::pf::parse_scratch_policy(e.env.at("STRIX_GLM_PF_SCRATCH").value.c_str());
+    (void)strix::glm::pf::parse_query_window_policy(e.env.at("STRIX_GLM_PF_ATTN_QWIN").value.c_str());
+    e.world = r.world;
     return e;
 }
 
@@ -337,6 +353,20 @@ inline std::string print(const Effective& e) {
     s += "effective mtp-kmax=" + std::to_string(e.kmax) + " adaptive=" + (e.adaptive ? "1" : "0") + "\n";
     s += "effective mtp-bootstrap=" + std::string(e.mtp_spec.value == "1" ? (e.prefill == "gemv" ? "chunked" : "ref") : "plain") + "\n";
     s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";
+    const auto& seqpar = e.env.at("STRIX_GLM_PF_SEQPAR").value;
+    const std::string seqpar_reason = e.world != 2 ? "requires TP2" : e.xch != "comm" ? "external exchange" :
+        e.kv_shard || e.kv_shard_auto ? "kv-shard policy" : e.prefill != "gemv" ? "prefill path does not support pipeline" :
+        std::stoul(e.max_rows.value) < 2 ? "max_rows < 2" : "eligible; channel admission and rank vote pending";
+    s += "effective pf-seqpar=" + std::string(seqpar == "0" ? "off" : seqpar == "1" ? "on" :
+        seqpar_reason == "eligible; channel admission and rank vote pending" ? "on" : "declined") +
+        " (requested " + seqpar + "; " + (seqpar == "0" ? "disabled" : seqpar_reason) + ")\n";
+    namespace pf = strix::glm::pf;
+    const pf::CapacityPolicy capacity_policy{pf::parse_scratch_policy(e.env.at("STRIX_GLM_PF_SCRATCH").value.c_str()),
+        pf::parse_query_window_policy(e.env.at("STRIX_GLM_PF_ATTN_QWIN").value.c_str())};
+    const auto layout = pf::capacity_candidates(capacity_policy, e.kv_shard).front();
+    s += "effective capacity-layout=" + std::string(layout.sharded ? "sharded" : "replicated") +
+        "/" + (layout.routed ? "routed" : "full") + "/qwin=" + std::to_string(layout.query_window) +
+        " (initial candidate; admission and rank vote pending; capacity_layout_reason=" + pf::capacity_layout_reason(layout) + ")\n";
     line("decode-xch", e.decode_xch);
     line("max-rows", e.max_rows);
     if (max_rows_auto(e)) s += "effective max-rows-admission=startup-admission-and-rank-min (8192 candidate, 4096 fallback)\n";

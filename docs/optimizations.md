@@ -82,7 +82,7 @@ and [qualification](engine/serving/ds41-prefix-cache-qualification.md).
 | DeepSeek pair | `STRIX_DS41_BASELINE=1` | `--print-effective-config` | Stop production pack/draft/argv injection and switch the nine recent code defaults off unless explicitly set; older kernel defaults remain |
 | DeepSeek RTX | `--baseline` / `STRIX_DS41_RTX_BASELINE=1` | `--print-config` | CLI baseline applies at its argument position; later flags win; env baseline applies before argv |
 | MiniMax | `STRIX_MM_BASELINE=1` | `--print-effective-config` | All 22 resolver items use their off values; explicit environment wins; older built-in routes remain |
-| GLM | `--baseline` / `STRIX_GLM_BASELINE=1` | `--print-effective-config` | R1, reference prefill, MTP loaded, comm decode exchange and 28 env off values; explicit overrides win; fast MoE retained for capacity |
+| GLM | `--baseline` / `STRIX_GLM_BASELINE=1` | `--print-effective-config` | R1, reference prefill, MTP loaded, comm decode exchange and per-item env off values, including seqpar/aux combine off and full scratch/query chunks; explicit overrides win; fast MoE retained for capacity |
 
 Use a fresh process for startup-cached settings, and the same settings on both ranks where the protocol requires it.
 For A/B, change one off switch at a time, first compare complete token IDs and logits/state digests, then compare
@@ -3330,6 +3330,47 @@ producer overwrites it, so the copies overlap compute. Compute and scratch stay 
 - **Implementation / evidence:** [grouped prefill](minimax-grouped-prefill.md)
 
 ## GLM
+
+<a id="glm-pf-seqpar"></a>
+### Prefill sequence parallel ownership (`STRIX_GLM_PF_SEQPAR`)
+
+Default `auto` requires ordinary TP2 replicated attention ownership, an internal communicator,
+a pipeline-capable (GEMV Tier B) prefill path and `max_rows >= 2`. Auto declines to the legacy path
+with `seqpar auto declined: <reason>` when ineligible; explicit `1` may refuse instead. Both ranks
+vote on the installed decision before execution. OFF: `STRIX_GLM_PF_SEQPAR=0`; baseline sets `0`.
+This changes row ownership only; no new mathematical identity or performance claim is introduced here.
+
+<a id="glm-pf-aux-combine"></a>
+### Prefill auxiliary combine (`STRIX_GLM_PF_AUX_COMBINE`)
+
+Default `1` combines the auxiliary contribution in the exact MoE epilogue. The guard requires that
+epilogue; other routes retain their existing combine. There is no separate fallback notice for this
+local guard; effective config reports the selector. OFF: `STRIX_GLM_PF_AUX_COMBINE=0` restores the
+separate combine; baseline sets `0`. No new timing qualification is claimed here.
+
+<a id="glm-pf-scratch"></a>
+### Prefill scratch capacity (`STRIX_GLM_PF_SCRATCH`)
+
+Default `auto` tries the original full arena, then routed scratch under the joint rank capacity
+admission guard. Candidate/refusal and selected-layout notices report the layout and reason;
+exhausted permitted candidates refuse startup. OFF: `STRIX_GLM_PF_SCRATCH=full` pins the original
+arena and disables automatic routed fallback; baseline sets `full`. Explicit `routed` pins routed scratch.
+This is a storage organization choice, with no kernel arithmetic change.
+
+<a id="glm-pf-attn-qwin"></a>
+### Prefill attention query window (`STRIX_GLM_PF_ATTN_QWIN`)
+
+Default `auto` tries full-query-chunk candidates before a 2048-row query window, guarded by joint
+rank capacity admission. Candidate/refusal and selected-layout notices report the admitted window
+and reason; exhausted permitted candidates refuse startup. OFF: `STRIX_GLM_PF_ATTN_QWIN=0` pins
+the original full query chunk; baseline sets `0`. Explicit windows pin that capacity policy.
+Only query staging is windowed; attention mathematics remain unchanged.
+
+Inspection reports the resolved seqpar decision and the initial capacity candidate with its
+`capacity_layout_reason`. `--print-effective-config` exits before device/peer work, so channel and
+capacity admission remain explicitly pending. Execution reports the admitted `capacity_layout()`
+and `capacity_layout_reason()` after the rank vote. Apply these startup controls consistently on
+both ranks and restart for A/B comparisons; explicit environment overrides still win over baseline.
 
 ### KV cache sharding and shared transport progress
 

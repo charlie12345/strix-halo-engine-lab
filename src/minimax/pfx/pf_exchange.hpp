@@ -150,6 +150,8 @@ private:
     std::string failure_;
     mutable std::mutex failure_mutex_;
     Stats stats_;
+    xport::HostWaitMetric slot_wait_{"minimax-prefill", "slot"}; // caller only
+    xport::HostWaitMetric peer_wait_{"minimax-prefill", "peer"}; // progress thread only
     mutable std::mutex stats_mutex_;
     Lane tx_lane_, rx_lane_;
     std::thread thread_;

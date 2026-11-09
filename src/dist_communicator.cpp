@@ -881,6 +881,8 @@ struct Candidate {
     std::string service;
     int fd = -1;
     bool dead = false;
+    bool capability_refused = false;
+    std::uint16_t refused_version = 0;
     // handshake state of the current open (generation)
     std::uint32_t generation = 0;
     std::chrono::steady_clock::time_point opened_at{}, last_hello{}, reopen_at{};
@@ -1094,6 +1096,8 @@ bool handshake_step(Candidate& c, std::uint32_t index, const Handshake& hs) {
             return lost(c.last_error);
         }
     }
+    if (c.capability_refused && c.out_done == c.out_size)
+        require_transport_agreement(hs.version, c.refused_version);
     const auto n = ::read(c.fd, c.in.data() + c.have, c.in.size() - c.have);
     if (n > 0) { c.have += static_cast<std::size_t>(n); moved = true; }
     else if (n == 0) { c.last_error = "peer closed the stream"; return lost("read end of stream (peer CLOSE)"); }
@@ -1102,9 +1106,17 @@ bool handshake_step(Candidate& c, std::uint32_t index, const Handshake& hs) {
         c.have = 0;
         Hello h;
         std::memcpy(&h, c.in.data(), sizeof(h));
-        if (h.magic != hello_magic || h.crc != body_crc(h) || h.version != hs.version) {
+        if (h.magic != hello_magic || h.crc != body_crc(h)) {
             ++c.garbage; // stale bytes of an earlier session (whole 64-byte units)
             note(c, "read garbage unit");
+        } else if (h.version != hs.version) {
+            // Send our hello before refusing so rank 1 also names the mismatch.
+            // Drain it through the normal nonblocking handshake write path.
+            if (hs.rank == 0U && h.kind == 1U) {
+                c.capability_refused = true;
+                c.refused_version = h.version;
+                queue(c, make(hs, c, index, 1U));
+            } else require_transport_agreement(hs.version, h.version);
         } else if (h.kind == 1U) {
             const bool fresh = !c.hello_ok || h.nonce != c.peer.nonce || h.generation != c.peer.generation;
             note(c, "read " + describe(h) + (fresh ? "" : " (repeat)"));
@@ -1467,7 +1479,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
     std::random_device random;
     Handshake hs;
     hs.rank = options.rank;
-    hs.version = options.minimax_compat ? 2U : pairing_version;
+    hs.version = transport_pairing_version(options.transport_capabilities);
     hs.host = topo.local_host;
     hs.nonce = (static_cast<std::uint64_t>(random()) << 32U) ^ random() ^
         static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^ static_cast<std::uint64_t>(::getpid());
@@ -1480,7 +1492,10 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             auto& c = candidates[i];
             if (c.dead) continue;
-            if (!handshake_done(c, hs.rank)) moved = handshake_step(c, static_cast<std::uint32_t>(i), hs) || moved;
+            if (!handshake_done(c, hs.rank)) {
+                try { moved = handshake_step(c, static_cast<std::uint32_t>(i), hs) || moved; }
+                catch (...) { close_all(); throw; }
+            }
             if (c.dead) continue;
             if (handshake_done(c, hs.rank)) { if (first_done == std::chrono::steady_clock::time_point{}) first_done = std::chrono::steady_clock::now(); }
             else all = false;
@@ -1671,8 +1686,8 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
                 if (k != accepted.size()) fail("STRIX_DIST_USB4_WEIGHTS: one weight per stream (" + std::to_string(accepted.size()) + ")");
                 explicit_weights = true;
             }
-            if (const char* t = std::getenv("STRIX_DIST_USB4_STREAMS"); !options.minimax_compat && t && *t) parse_stream_table(t, weights.streams_up_to, weights.streams_count);
-            if (const char* c = std::getenv("STRIX_DIST_USB4_CALIBRATE"); !options.minimax_compat && c && std::string(c) == "joint" && !explicit_weights && accepted.size() > 1U)
+            if (const char* t = std::getenv("STRIX_DIST_USB4_STREAMS"); transport_has(options.transport_capabilities, usb4_stream_table) && t && *t) parse_stream_table(t, weights.streams_up_to, weights.streams_count);
+            if (const char* c = std::getenv("STRIX_DIST_USB4_CALIBRATE"); transport_has(options.transport_capabilities, usb4_joint_calibration) && c && std::string(c) == "joint" && !explicit_weights && accepted.size() > 1U)
                 weights.flags |= plan_joint;
         }
         agree(fds[0], options.rank, weights);
@@ -1826,8 +1841,8 @@ public:
         }
         if (failed.load(std::memory_order_acquire)) throw std::runtime_error("dist pipeline: a stage failed");
     }
-    bool legacy = false;
-    Pipeline(std::size_t bytes, std::size_t size, bool compatible) : chunk(size), capacity(bytes), legacy(compatible) {
+    bool crc_overlap_default = true;
+    Pipeline(std::size_t bytes, std::size_t size, bool overlap_default) : chunk(size), capacity(bytes), crc_overlap_default(overlap_default) {
         const auto count = (capacity - 1U) / chunk + 1U;
         const auto allocation = capacity + count * sizeof(Trailer);
         try {
@@ -1839,7 +1854,7 @@ public:
             check(hipEventCreateWithFlags(&consumer, hipEventDisableTiming), "pipeline consumer");
             ready.resize(count, nullptr);
             for (auto& e : ready) check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline ready");
-            if (const char* v = std::getenv("STRIX_DIST_HOST_CRC_OVERLAP"); compatible ? (v && std::string(v) == "1") : (!v || std::string(v) != "0")) {  // default on
+            if (const char* v = std::getenv("STRIX_DIST_HOST_CRC_OVERLAP"); overlap_default ? (!v || std::string(v) != "0") : (v && std::string(v) == "1")) {
                 crc_send = std::make_unique<Worker>(); crc_receive = std::make_unique<Worker>();
                 crc_send->name("u4-crctx"); crc_receive->name("u4-crcrx");
             }
@@ -1884,7 +1899,7 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
             throw std::invalid_argument("STRIX_DIST_HOST_D2H_KERNEL_BYTES must be 0..1048576");
     }
     // default 262144 (with the lean releases of STRIX_DS41_READY_LEAN); =0: no readiness views
-    staged_ready_bytes_ = group_.minimax_compat ? 0U : 262144U;
+    staged_ready_bytes_ = transport_has(group_.transport_capabilities, staged_readiness) ? 262144U : 0U;
     if (const char* t = std::getenv("STRIX_DIST_STAGED_READY_BYTES"); t && *t) {
         staged_ready_bytes_ = std::stoull(t);
         if (staged_ready_bytes_ > (std::size_t{1} << 20U))
@@ -1944,14 +1959,14 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
         }
     }
     // default on (ds41/xfer t1: R6 -0.7 %, R1/N8 equal or better, exact); =0: inline CRCs
-    crc_defer_ = !group_.minimax_compat;
+    crc_defer_ = transport_has(group_.transport_capabilities, deferred_crc);
     if (const char* v = std::getenv("STRIX_DIST_CRC_DEFER"); v && v[0] == '0' && v[1] == '\0') crc_defer_ = false;
     {  // default 1 MiB chunks (w5); =0: one piece
         const char* v = std::getenv("STRIX_DIST_HOST_CHUNK_BYTES");
-        const auto chunk = v && *v ? static_cast<std::size_t>(std::stoull(v)) : (group_.minimax_compat ? std::size_t{0} : std::size_t{1048576});
+        const auto chunk = v && *v ? static_cast<std::size_t>(std::stoull(v)) : (transport_has(group_.transport_capabilities, host_chunk_default) ? std::size_t{1048576} : std::size_t{0});
         if (chunk && (chunk < 65536U || chunk > (16U << 20U) || chunk % 64U))
             throw std::invalid_argument("STRIX_DIST_HOST_CHUNK_BYTES: 0 or a multiple of 64 in [65536,16777216]");
-        if (chunk && max_bytes_ > chunk) pipeline_ = std::make_unique<Pipeline>(max_bytes_, chunk, group_.minimax_compat);
+        if (chunk && max_bytes_ > chunk) pipeline_ = std::make_unique<Pipeline>(max_bytes_, chunk, transport_has(group_.transport_capabilities, host_crc_overlap_default));
     }
     if (const char* t = std::getenv("STRIX_DIST_TRACE"); t && *t) {
         const auto path = std::string(t) + ".r" + std::to_string(group_.rank);
@@ -1979,7 +1994,7 @@ void Communicator::resize_bytes(std::size_t bytes, bool grow_pipeline) {
     check(hipDeviceSynchronize(), "reserve sync");
     const auto old_bytes = max_bytes_;
     const auto chunk = pipeline_ ? pipeline_->chunk : 0;
-    const bool legacy = pipeline_ && pipeline_->legacy;
+    const bool overlap_default = pipeline_ && pipeline_->crc_overlap_default;
     if (grow_pipeline) pipeline_.reset();
     check(hipHostFree(send_host_), "release send capacity");
     send_host_ = nullptr;
@@ -1990,7 +2005,7 @@ void Communicator::resize_bytes(std::size_t bytes, bool grow_pipeline) {
     check(hipHostMalloc(reinterpret_cast<void**>(&send_host_), bytes + sizeof(Trailer), flags), "grow pinned send buffer");
     check(hipHostMalloc(reinterpret_cast<void**>(&receive_host_), bytes + sizeof(Trailer), flags), "grow pinned receive buffer");
     if (d2h_kernel_bytes_) check(hipHostGetDevicePointer(&send_device_alias_, send_host_, 0), "grow send alias");
-    if (chunk && grow_pipeline) pipeline_ = std::make_unique<Pipeline>(bytes, chunk, legacy);
+    if (chunk && grow_pipeline) pipeline_ = std::make_unique<Pipeline>(bytes, chunk, overlap_default);
     max_bytes_ = bytes;
     for (auto& r : routes_) if (!r.direct && r.up_to == old_bytes) r.up_to = bytes;
 }
@@ -2421,7 +2436,9 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
             if (std::chrono::steady_clock::now() >= deadline) stop("pipeline receive-buffer reuse timeout");
             cpu_relax();
         }
-        p.reuse_wait = std::chrono::duration<double>(std::chrono::steady_clock::now() - reuse_begin).count();
+        const auto reuse_end = std::chrono::steady_clock::now();
+        p.reuse_wait = std::chrono::duration<double>(reuse_end - reuse_begin).count();
+        slot_wait_.observe(tag_.kind, reuse_begin, reuse_end);
     }
     receive_pending_ = false;
     p.async = remote != nullptr;
@@ -2554,7 +2571,9 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
                     throw std::runtime_error("pipeline receive-buffer reuse timeout");
                 cpu_relax();
             }
-            q.reuse_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - reuse_begin).count();
+            const auto reuse_end = std::chrono::steady_clock::now();
+            q.reuse_wait += std::chrono::duration<double>(reuse_end - reuse_begin).count();
+            worker_slot_wait_.observe(tag_.kind, reuse_begin, reuse_end);
         }
         void* destination = nullptr;
         for (std::size_t at = 0, k = 0; at < bytes_; at += q.chunk, ++k) {
@@ -2564,7 +2583,9 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
             latency::mark("chunk_transport_begin", at);
             set_phase(Phase::transfer);
             const auto t = std::chrono::steady_clock::now();
-            transport_->exchange({q.send + slot, n + sizeof(Trailer)}, {q.receive + slot, n + sizeof(Trailer)});
+            peer_wait_.measure(tag_.kind, [&] {
+                transport_->exchange({q.send + slot, n + sizeof(Trailer)}, {q.receive + slot, n + sizeof(Trailer)});
+            });
             q.wire += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
             latency::mark("chunk_transport_end", at);
             if (q.crc_receive) {
@@ -2643,7 +2664,9 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
                 stop("the previous exchange's copy out of the receive buffer did not complete within " + std::to_string(wait_timeout_.count()) + " ms");
             cpu_relax();
         }
-        stats_.host_reuse_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - reuse_begin).count();
+        const auto reuse_end = std::chrono::steady_clock::now();
+        stats_.host_reuse_wait += std::chrono::duration<double>(reuse_end - reuse_begin).count();
+        slot_wait_.observe(tag_.kind, reuse_begin, reuse_end);
     }
     if (!staged_started_) receive_pending_ = false;
     // The copy is ordered after the producer of `local` on the stream; the progress thread waits for it on
@@ -2742,6 +2765,7 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
                                  std::span<std::byte>(receive_host_, bytes_ + sizeof(Trailer)));
         latency::mark("transport_end");
         stats_.last_received = std::chrono::steady_clock::now();
+        peer_wait_.observe(tag_.kind, stats_.last_staged, stats_.last_received);
         if (trace_) t_received_ = wall_ns();
         std::uint64_t got = 0;
         std::memcpy(&got, receive_host_, std::min<std::size_t>(sizeof(got), bytes_));

@@ -1,5 +1,7 @@
 #pragma once
 #include "strix/dist/staged_ready.hpp"
+#include "strix/dist/transport_caps.hpp"
+#include "strix/dist/host_wait.hpp"
 
 // Two-rank communicator for the distributed runtime: whole-message transports between two ranks and a
 // device-buffer exchange on top of them.
@@ -140,8 +142,8 @@ struct Usb4AutoOptions {
     std::size_t min_part_bytes = 0;
     // A transfer that makes no progress for this long fails the transport ($STRIX_DIST_USB4_TIMEOUT_MS overrides).
     std::chrono::milliseconds io_timeout{120000};
-    // Keep the MiniMax host pairing protocol and its measured transport choices.
-    bool minimax_compat = false;
+    // Exact set agreed by both ranks in the existing startup handshake.
+    std::uint16_t transport_capabilities = all_transport_capabilities;
 };
 struct Usb4StreamPair {
     std::string key;           // layout key of the local stream
@@ -192,8 +194,7 @@ struct Group {
     std::uint32_t world = 2;
     std::uint64_t epoch = 0;
     std::uint64_t plan = 0;
-    // Preserve MiniMax readiness and inline-CRC defaults independently of other engines.
-    bool minimax_compat = false;
+    std::uint16_t transport_capabilities = all_transport_capabilities;
 };
 struct Tag {
     std::uint32_t kind = 0;
@@ -334,6 +335,9 @@ public:
 
 private:
     Group group_;
+    xport::HostWaitMetric slot_wait_{"communicator", "slot"};
+    xport::HostWaitMetric peer_wait_{"communicator", "peer"};
+    xport::HostWaitMetric worker_slot_wait_{"communicator-worker", "slot"};
     std::unique_ptr<Transport> transport_;
     std::size_t max_bytes_;
     std::byte* send_host_ = nullptr;

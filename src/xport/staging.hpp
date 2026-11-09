@@ -1,5 +1,6 @@
 #pragma once
 #include "stats.hpp"
+#include "strix/dist/host_wait.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -15,19 +16,6 @@ void rank_pair(unsigned rank, const T* local, const T* remote, const T** p0, con
 }
 // Shared ticket/lease core. Ops owns storage and implements event operations on
 // its producer/copy streams; it must never synchronize the host in reuse().
-inline std::string staging_env(const char* name) {
-#ifdef _MSC_VER
-    char* value = nullptr;
-    std::size_t size = 0;
-    if (_dupenv_s(&value, &size, name) != 0) throw std::runtime_error("xport: environment read failed");
-    const std::string result = value ? value : "";
-    std::free(value);
-    return result;
-#else
-    const char* value = std::getenv(name);
-    return value ? value : "";
-#endif
-}
 inline bool staging_trace_enabled() { return staging_env("STRIX_XPORT_TRACE") == "1"; }
 inline unsigned staging_slots(unsigned fallback = 2) {
     const auto setting = staging_env("STRIX_XPORT_STAGING_SLOTS");
@@ -78,7 +66,7 @@ public:
             ops_.init(slot.source_free, slot.remote_last_use, stream);
             if (slot.used) {
                 ops_.reuse(slot.source_free, slot.remote_last_use, stream);
-                if (trace_) counters_.exposed_wait += 2;
+                if (trace_) counters_.reuse_dependencies += 2;
             }
             slot.view = {local, ops_.remote(index, offset), index, ++sequence_};
             slot.state = State::reserved;
@@ -101,7 +89,9 @@ public:
     StagingView wait(const Ticket& ticket, Stream stream) {
         auto& slot = find(ticket);
         if (slot.state != State::posted) throw std::logic_error("xport: ticket already waited");
-        slot.view.remote = const_cast<void*>(ops_.wait(slot.view, stream, slot.source_free));
+        slot.view.remote = const_cast<void*>(peer_wait_.measure(static_cast<std::uint32_t>(ticket.tag.kind), [&] {
+            return ops_.wait(slot.view, stream, slot.source_free);
+        }));
         slot.state = State::held;
         return slot.view;
     }
@@ -145,6 +135,7 @@ private:
     std::vector<Slot> slots_;
     bool trace_;
     Counters counters_;
+    HostWaitMetric peer_wait_{"staging", "peer-call"};
     std::uint64_t sequence_ = 0;
 };
 } // namespace strix::xport

@@ -333,9 +333,9 @@ public:
     ~CommExchange() override {
         if (xport::staging_trace_enabled()) {
             const auto& c = staging_channel_.counters();
-            std::fprintf(stderr, "xport prefill bytes=%llu copied=%llu messages=%llu exposed_wait=%llu\n",
+            std::fprintf(stderr, "xport prefill bytes=%llu copied=%llu messages=%llu reuse_dependencies=%llu\n",
                 static_cast<unsigned long long>(c.bytes), static_cast<unsigned long long>(c.staging_bytes),
-                static_cast<unsigned long long>(c.exchanges), static_cast<unsigned long long>(c.exposed_wait));
+                static_cast<unsigned long long>(c.exchanges), static_cast<unsigned long long>(c.reuse_dependencies));
         }
         (void)hipFree(remote_);
         (void)hipFree(am_l_);

@@ -126,7 +126,8 @@ private:
 // usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (as the DS apps).
 std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
 
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt) {
+std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt,
+                                                     std::uint16_t capabilities) {
     const std::chrono::seconds limit(180);
     const auto colon = spec.find(':');
     const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
@@ -137,7 +138,7 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
     }
     if (kind == "usb4-auto") {
         strix::dist::Usb4AutoOptions o;
-        o.minimax_compat = true;
+        o.transport_capabilities = capabilities;
         o.rank = rank;
         o.timeout = limit;
         strix::dist::Usb4Topology topology;
@@ -147,7 +148,7 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
     }
     if (kind == "usb4gpu") {
         strix::dist::Usb4AutoOptions o;
-        o.minimax_compat = true;
+        o.transport_capabilities = capabilities;
         o.rank = rank;
         o.timeout = limit;
         strix::dist::Usb4Topology topology;
@@ -1784,10 +1785,13 @@ int main(int argc, char** argv) {
         // Measurement: exact, 1K -0.5 %, 8K not slower. An explicit value or STRIX_MM_BASELINE=1 wins.
         if (const char* base = std::getenv("STRIX_MM_BASELINE"); base == nullptr || std::string(base) != "1")
             (void)::setenv("STRIX_MM_PF_TABLE_RING", "1", 0);
-        auto transport = open_transport(argv[3], opt.rank, receipt);
+        const auto capabilities = strix::dist::parse_transport_capabilities(strix::xport::staging_env("STRIX_MM_USB4_CAPS"));
+        if (capabilities && std::string(argv[3]).rfind("usb4", 0) != 0)
+            throw std::invalid_argument("STRIX_MM_USB4_CAPS requires USB4 startup capability agreement");
+        auto transport = open_transport(argv[3], opt.rank, receipt, capabilities);
         if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
         strix::dist::Group group;
-        group.minimax_compat = true;
+        group.transport_capabilities = capabilities;
         group.rank = opt.rank;
         group.world = 2;
         group.plan = 0x4d4d4531ULL;  // "MME1"

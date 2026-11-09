@@ -46,7 +46,7 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
     }
     if (kind == "usb4-auto") {
         strix::dist::Usb4AutoOptions o;
-        o.minimax_compat = true;
+        o.transport_capabilities = 0;
         o.rank = rank;
         o.timeout = limit;
         strix::dist::Usb4Topology topology;
@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
         const std::size_t T = tokens.size(), S = rows.size();
         const std::uint32_t max_blocks = static_cast<std::uint32_t>(msa::block_count(T));
         strix::dist::Group group;
-        group.minimax_compat = true;
+        group.transport_capabilities = 0;
         group.rank = rank;
         group.world = kWorld;
         group.plan = 0x4d4d5833ULL;  // "MMX3"

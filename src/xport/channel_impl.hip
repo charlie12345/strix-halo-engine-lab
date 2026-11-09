@@ -306,10 +306,12 @@ void Channel<Traits>::send(std::size_t bytes, const Tag& tag, Publish how) {
 
 template<class Traits>
 void Channel<Traits>::post(const Job& job) {
-    while (jobs_posted_ - done_.load(std::memory_order_acquire) >= kQueue) {
+    slot_wait_.block_while(static_cast<std::uint32_t>(job.tag.kind), [&] {
+        return jobs_posted_ - done_.load(std::memory_order_acquire) >= kQueue;
+    }, [&] {
         check();
         _mm_pause();
-    }
+    });
     jobs_[jobs_posted_ % kQueue] = job;
     ++jobs_posted_;
     posted_.store(jobs_posted_, std::memory_order_seq_cst);
@@ -433,7 +435,9 @@ void Channel<Traits>::process(const Job& job) {
         !deferred && options_.crc ? dist::crc32c(std::span<const std::byte>(tx, job.bytes)) : 0U,
         prev_deferred_, prev_tx_crc_);
     try {
-        exchange_frame(*transport_, tx, rx, job.bytes, t);
+        peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] {
+            exchange_frame(*transport_, tx, rx, job.bytes, t);
+        });
     } catch (const std::exception& e) {
         fail(std::string("glmxfer: transport: ") + e.what());
     }

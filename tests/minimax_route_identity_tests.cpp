@@ -41,25 +41,53 @@ std::uint64_t fingerprint(const fs::path& path) {
     require(input.eof(), "source read failed");
     return hash;
 }
+// Audit scope: every file compiled into, or included by, the MiniMax rank/serve
+// targets in CMakeLists.txt (strix-minimax-rank, strix-minimax-serve and the
+// strix_minimax_* libraries they link), except shared non-MiniMax libraries
+// (strix_core, strix_dist, strix_serve, strix_lookup, strix_model_graph, ...),
+// which have their own gates. A directory rule takes every regular file below
+// it (recursive), so any new file in scope must be added to the receipt.
+struct ScopeRule { const char* dir; const char* prefix; bool recursive; const char* why; };
+constexpr ScopeRule scope_rules[] = {
+    {"src/minimax", "", true, "strix_minimax_{engine,assets,defaults,session,serve,pfx,dspark,moe_opt_hip,model_description}"},
+    {"src/moe_core", "", true, "shared MoE device core included by the MiniMax engine kernels"},
+    {"src/dspark_common", "", true, "drafter kernels included by strix_minimax_dspark"},
+    {"src/xport", "", true, "strix_xport INTERFACE linked by strix_minimax_engine (xfer)"},
+    {"include/strix/minimax", "", true, "public headers of the strix_minimax_* libraries"},
+    {"apps", "minimax_", false, "strix-minimax-rank / strix-minimax-serve mains"},
+    {"src", "minimax_", false, "strix_minimax_msa (minimax_msa.cpp, minimax_moe.cpp)"},
+    {"src", "hip_minimax_", false, "strix_minimax_msa_hip"},
+    {"include/strix", "minimax_", false, "headers of strix_minimax_msa"},
+    {"include/strix", "hip_minimax_", false, "headers of strix_minimax_msa_hip"},
+    {"src", "bp_codec.", false, "compiled directly into strix-minimax-rank"},
+    {"include/strix", "bp_codec.", false, "header of bp_codec.cpp"},
+};
 void source_coverage() {
     const fs::path root(STRIX_ROUTE_SOURCE_DIR);
     std::set<std::string> found, expected;
     found.insert("CMakeLists.txt");  // build-time arithmetic/addressing switches
-    for (const auto& entry : fs::recursive_directory_iterator(root / "src/minimax"))
-        if (entry.is_regular_file()) found.insert(entry.path().lexically_relative(root).generic_string());
-    for (const auto& entry : fs::directory_iterator(root / "src/moe_core"))  // shared MiniMax device core
-        if (entry.is_regular_file()) found.insert(entry.path().lexically_relative(root).generic_string());
-    for (const auto& entry : fs::directory_iterator(root / "src/dspark_common"))  // kernels shared with the MiniMax drafter
-        if (entry.is_regular_file()) found.insert(entry.path().lexically_relative(root).generic_string());
-    for (const auto& entry : fs::directory_iterator(root / "apps"))
-        if (entry.is_regular_file() && entry.path().filename().generic_string().starts_with("minimax_"))
+    const auto take = [&](const fs::directory_entry& entry, const ScopeRule& rule) {
+        if (entry.is_regular_file() && entry.path().filename().generic_string().starts_with(rule.prefix))
             found.insert(entry.path().lexically_relative(root).generic_string());
+    };
+    for (const auto& rule : scope_rules) {
+        require(fs::is_directory(root / rule.dir), std::string("audit scope directory missing: ") + rule.dir);
+        if (rule.recursive)
+            for (const auto& entry : fs::recursive_directory_iterator(root / rule.dir)) take(entry, rule);
+        else
+            for (const auto& entry : fs::directory_iterator(root / rule.dir)) take(entry, rule);
+    }
     for (const auto& source : sources) {
         require(expected.insert(source.path).second, "duplicate source receipt");
         require(fingerprint(root / source.path) == source.hash,
                 std::string("UNCOVERED source change; audit selectors before updating receipt: ") + source.path);
     }
-    require(found == expected, "UNCOVERED added/removed MiniMax source; update census and source receipt");
+    std::string drift;
+    for (const auto& path : found)
+        if (!expected.contains(path)) drift += "\n  untracked in-scope: " + path;
+    for (const auto& path : expected)
+        if (!found.contains(path)) drift += "\n  receipt outside scope: " + path;
+    require(drift.empty(), "UNCOVERED added/removed MiniMax source; update census and source receipt" + drift);
 }
 const Selector& allow(std::string_view id) {
     for (const auto& selector : selectors) if (id == selector.id) return selector;

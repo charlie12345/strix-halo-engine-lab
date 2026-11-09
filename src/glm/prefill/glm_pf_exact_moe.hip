@@ -808,9 +808,6 @@ std::size_t workspace_bytes(unsigned max_rows) { return Layout(max_rows).bytes; 
 const std::uint16_t* pair_down_input(void* ws, unsigned rows, unsigned pair) {
     return reinterpret_cast<const std::uint16_t*>(static_cast<unsigned char*>(ws) + Layout(rows).at) + std::size_t{pair} * I;
 }
-const std::uint16_t* pair_gate_up_input(void* ws, unsigned rows, unsigned pair) {
-    return reinterpret_cast<const std::uint16_t*>(static_cast<unsigned char*>(ws) + Layout(rows).input) + std::size_t{pair} * 2U * H;
-}
 const float* pair_gate_up(void* ws, unsigned rows, unsigned pair) {
     return reinterpret_cast<const float*>(static_cast<unsigned char*>(ws) + Layout(rows).gu) + std::size_t{pair} * 2 * I;
 }

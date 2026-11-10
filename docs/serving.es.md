@@ -17,6 +17,12 @@ petición, las opciones y las puertas están en [docs/engine/serving/serving.md]
 
 ## Exposición de los servidores
 
+DeepSeek V4.1 usa chat sin razonamiento cuando la petición omite la elección.
+`--default-thinking on|off` cambia ese valor del servidor (por defecto `off`).
+La petición tiene prioridad mediante `enable_thinking` (también en
+`chat_template_kwargs`) o `thinking.type` en Messages; `reasoning_effort: "none"`
+desactiva el razonamiento. `GET /v1/capabilities` informa de `default_thinking`.
+
 En DeepSeek, `--prefix-cache-disk-mb` fija el límite del nivel de disco. La cuota
 del directorio compartido es el mayor de ese límite y 4096 MiB; con valor 0 el
 nivel y la cuota no tienen límite. Se mantienen el mínimo libre de 16384 MiB y

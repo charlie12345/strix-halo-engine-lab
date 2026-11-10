@@ -48,7 +48,7 @@ __global__ __launch_bounds__(kCopyThreads) void copy_publish_kernel(std::byte* d
 constexpr unsigned kArgThreads = 1024;
 __device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::uint32_t bi) { return v > bv || (v == bv && i < bi); }
 
-__global__ __launch_bounds__(kArgThreads) void argmax_candidate_kernel(const float* logits, unsigned vn, unsigned ld, std::uint32_t id0,
+[[maybe_unused]] __global__ __launch_bounds__(kArgThreads) void argmax_candidate_kernel(const float* logits, unsigned vn, unsigned ld, std::uint32_t id0,
                                                                        std::uint32_t* tx, ProducerTarget target) {
     __shared__ float sv[kArgThreads];
     __shared__ std::uint32_t si[kArgThreads];
@@ -86,7 +86,7 @@ __global__ __launch_bounds__(kArgThreads) void argmax_candidate_kernel(const flo
     publish(target, gridDim.x);
 }
 
-__global__ void argmax_pick_kernel(const std::uint32_t* c0, const std::uint32_t* c1, unsigned rows, std::uint32_t* out) {
+[[maybe_unused]] __global__ void argmax_pick_kernel(const std::uint32_t* c0, const std::uint32_t* c1, unsigned rows, std::uint32_t* out) {
     const unsigned r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
     const std::uint32_t i0 = c0[2 * r + 1], i1 = c1[2 * r + 1];

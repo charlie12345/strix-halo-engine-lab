@@ -593,7 +593,9 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                     f[(wave_m * 16 + 2 * j + lane / 16) * FSTRIDE + wave_n * WN + nt * 16 + lane % 16] = acc[mt][nt][j];
             __syncthreads();
             constexpr int groups = SLICE * (BN / 128);
-            for (int g = wave; g < groups; g += G::waves) {
+            // One epilogue group; gi = its step in this wave (compile-time in the unrolled chain loop,
+            // so the paired chain's saved gate registers never need a dynamic index / scratch).
+            auto epilogue_group = [&](const int g, [[maybe_unused]] const int gi) {
                 const int slice_row = g / (BN / 128), col_group = g % (BN / 128);
                 const int row = first_row + (slice_row / 16) * WM + mt * 16 + slice_row % 16;
                 if (row < rows) {
@@ -606,7 +608,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                         for (int j = 0; j < 4; ++j) values[j] = f[slice_row * FSTRIDE + col_group * 128 + lane + 32 * j];
                         hadamard128(values);
                         ad.store(at, row, begin_col, values, lane);
-                        continue;
+                        return;
                     }
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) values[j] += f[slice_row * FSTRIDE + col_group * 128 + lane + 32 * j];
@@ -616,8 +618,8 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                         for (int j = 0; j < 4; ++j)
                             values[j] *= __half2float(__ushort_as_half(scales[begin_col + lane + 32*j]));
                         chain.store(map_first + uint32_t(row), uint32_t(begin_col), chain_pass,
-                            mt * chain_groups + g / G::waves, values, chain_saved);
-                        continue;
+                            mt * chain_groups + gi, values, chain_saved);
+                        return;
                     }
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
@@ -630,6 +632,14 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                         output[index] = value;
                     }
                 }
+            };
+            if constexpr (Chain::kActive) {
+                constexpr int gsteps = (groups + G::waves - 1) / G::waves;
+                #pragma unroll
+                for (int gi = 0; gi < gsteps; ++gi)
+                    if (wave + gi * G::waves < groups) epilogue_group(wave + gi * G::waves, gi);
+            } else {
+                for (int g = wave; g < groups; g += G::waves) epilogue_group(g, 0);
             }
             __syncthreads();
         }

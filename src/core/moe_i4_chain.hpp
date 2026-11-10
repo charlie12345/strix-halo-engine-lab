@@ -23,27 +23,27 @@ struct Weights {
     size_t q_stride[3], s_stride[3];
 };
 struct WaveOps {
-    __device__ static unsigned channel(unsigned j) { return (threadIdx.x&31U)+32*j; }
-    __device__ static float round16(float x) { return float(_Float16(x)); }
-    __device__ static float materialize(float x) { return materialize_fp32(x); }
-    __device__ static void transform(float (&v)[4]) { hadamard128(v); }
+    __device__ __forceinline__ static unsigned channel(unsigned j) { return (threadIdx.x&31U)+32*j; }
+    __device__ __forceinline__ static float round16(float x) { return float(_Float16(x)); }
+    __device__ __forceinline__ static float materialize(float x) { return materialize_fp32(x); }
+    __device__ __forceinline__ static void transform(float (&v)[4]) { hadamard128(v); }
 };
 template<class Binding> struct InputPolicy {
     Binding b;
-    __device__ void load(unsigned e,unsigned p,unsigned m,unsigned c,float (&v)[4],const float* cached=nullptr) const {
+    __device__ __forceinline__ void load(unsigned e,unsigned p,unsigned m,unsigned c,float (&v)[4],const float* cached=nullptr) const {
         input_values<WaveOps>(b,e,p,m,c,v,cached);
     }
 };
 template<class Binding> struct EpiloguePolicy {
     Binding b;
-    __device__ void activation(unsigned e,unsigned c,const float (&g)[4],const float (&u)[4],float (&v)[4]) const {
+    __device__ __forceinline__ void activation(unsigned e,unsigned c,const float (&g)[4],const float (&u)[4],float (&v)[4]) const {
         activation_values<WaveOps>(b,e,c,g,u,v);
     }
     // Deterministic combine, stage 1: the down epilogue stores each routed pair's FP32 output row
     // (the value the unfused control writes to its down image). Stage 2 is the model's existing
     // ordered combine (ascending top-k FMA, shared expert last), so the chain adds no rounding
     // point, no atomics and no run-to-run or cross-rank order dependence.
-    __device__ void contribution(unsigned pair, unsigned col, const float (&v)[4]) const {
+    __device__ __forceinline__ void contribution(unsigned pair, unsigned col, const float (&v)[4]) const {
         float* row = b.contribution(pair);
         #pragma unroll
         for (unsigned j = 0; j < 4; ++j) row[col + (threadIdx.x & 31U) + 32*j] = v[j];
@@ -55,7 +55,7 @@ struct ReferenceRow {
     const float* gu=nullptr;
     uint8_t* aq=nullptr; float* as=nullptr; _Float16* fp16=nullptr;
 };
-__device__ inline void reference_store(const ReferenceRow& r,const float (&v)[4]) {
+__device__ __forceinline__ void reference_store(const ReferenceRow& r,const float (&v)[4]) {
     if(r.aq) iu4_quant128(v,r.aq+size_t(r.pair)*(r.width/2),r.as+size_t(r.pair)*(r.width/64),r.col,threadIdx.x&31U);
     else {
         #pragma unroll
@@ -129,8 +129,8 @@ template<class Binding> __global__ void fp16_activation_rows(Binding b,const flo
 // Packed-IU4 LDS writer: same quantiser as global packed operands, different physical layout.
 template<int BM,int BN> struct StageStore {
     uint8_t* base; unsigned row;
-    __device__ void byte(unsigned c, uint8_t v) const { base[iu4_lds_offset(int(row),int(c))] = v; }
-    __device__ void scale(unsigned g, float v) const {
+    __device__ __forceinline__ void byte(unsigned c, uint8_t v) const { base[iu4_lds_offset(int(row),int(c))] = v; }
+    __device__ __forceinline__ void scale(unsigned g, float v) const {
         auto* s = reinterpret_cast<float*>(base+(BM+BN)*64);
         s[g*BM + (row&~15U)+(row&1U)*8+((row&15U)>>1U)] = v;
     }
@@ -141,10 +141,13 @@ template<class Binding,bool Pair> struct Chain {
     Binding b; Weights w;
     uint8_t* aq; float* as;
     unsigned expert = 0;
-    __device__ void bind(unsigned e, int pass, const uint32_t* __restrict__& q, const _Float16*& s, const uint16_t* __restrict__& svh) {
-        expert=e; const unsigned m=Pair ? unsigned(pass) : 2U;
-        q=reinterpret_cast<const uint32_t*>(w.q[m]+size_t(e)*w.q_stride[m]);
-        s=w.s[m]+size_t(e)*w.s_stride[m]; svh=w.svh[m][e];
+    __device__ __forceinline__ void bind(unsigned e, int pass, const uint32_t* __restrict__& q, const _Float16*& s, const uint16_t* __restrict__& svh) {
+        expert=e;
+        // Select, never index, the by-value argument arrays with the runtime pass: a dynamic index
+        // would copy the whole kernel argument to scratch.
+        auto pick=[&](const auto (&v)[3]) { if constexpr (Pair) return pass==0 ? v[0] : v[1]; else return v[2]; };
+        q=reinterpret_cast<const uint32_t*>(pick(w.q)+size_t(e)*pick(w.q_stride));
+        s=pick(w.s)+size_t(e)*pick(w.s_stride); svh=pick(w.svh)[e];
     }
     template<int BM,int BN,int Waves> __device__ void stage(uint8_t* lds,unsigned first,int rows,int k,int pass) const {
         const unsigned wave=threadIdx.x/32;
@@ -154,7 +157,7 @@ template<class Binding,bool Pair> struct Chain {
             iu4_quant128_store(v,0,threadIdx.x&31U,StageStore<BM,BN>{lds,r});
         }
     }
-    __device__ void store(unsigned pos,unsigned col,int pass,int slot,float (&v)[4],float* saved) const {
+    __device__ __forceinline__ void store(unsigned pos,unsigned col,int pass,int slot,float (&v)[4],float* saved) const {
         const unsigned pair=b.pair(pos);
         if constexpr (Pair) {
             if (!pass) {

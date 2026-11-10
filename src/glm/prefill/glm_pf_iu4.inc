@@ -35,13 +35,13 @@ bool iu4_fuse_quant() {
 struct I4Binding {
     static constexpr unsigned H=::strix::glm::pf::exact_moe::H, I=::strix::glm::pf::exact_moe::I;
     const float* x; float* out; Args a;
-    __host__ __device__ const unsigned* map() const { return a.pairs; }
-    __device__ unsigned pair(unsigned pos) const { return a.pairs[pos]; }
-    __device__ unsigned token(unsigned p) const { return p/P; }
-    __device__ float weight(unsigned p) const { return a.weights[(p/P)*8+p%P]; }
-    __device__ float* contribution(unsigned p) const { return a.output+size_t(p)*H; }
-    __device__ float suh(unsigned e,unsigned m,unsigned c) const { return d::half_bits(matrix(a,e,m).suh[c]); }
-    __device__ float activation(float g,float u) const {
+    __host__ __device__ __forceinline__ const unsigned* map() const { return a.pairs; }
+    __device__ __forceinline__ unsigned pair(unsigned pos) const { return a.pairs[pos]; }
+    __device__ __forceinline__ unsigned token(unsigned p) const { return p/P; }
+    __device__ __forceinline__ float weight(unsigned p) const { return a.weights[(p/P)*8+p%P]; }
+    __device__ __forceinline__ float* contribution(unsigned p) const { return a.output+size_t(p)*H; }
+    __device__ __forceinline__ float suh(unsigned e,unsigned m,unsigned c) const { return d::half_bits(matrix(a,e,m).suh[c]); }
+    __device__ __forceinline__ float activation(float g,float u) const {
         const float gg=g>kClamp ? kClamp : g, uu=u>kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
         return silu(gg)*uu;
     }
@@ -50,15 +50,15 @@ struct I4ReferenceSchedule {
     using Binding=I4Binding;
     static constexpr bool kCachedInput=false;
     Binding b; uint8_t* aq; float* as;
-    __device__ unsigned source_pair(unsigned row) const { return row/2; }
-    __device__ bool input(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
+    __device__ __forceinline__ unsigned source_pair(unsigned row) const { return row/2; }
+    __device__ __forceinline__ bool input(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
         const auto& a=b.a;
         if(a.ntiles && blockIdx.y>=*a.ntiles) return false;
         const auto tile=a.tiles[blockIdx.y];if(i>=tile.count) return false;
         const unsigned p=a.pairs[tile.first+i],m=blockIdx.z;
         r={tile.expert,2*p+m,m,(blockIdx.x*8+threadIdx.x/32)*128,H,nullptr,tile.expert==E ? nullptr:aq,as,a.input};return true;
     }
-    __device__ bool activation(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
+    __device__ __forceinline__ bool activation(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
         const auto& a=b.a;
         if(a.ntiles && blockIdx.y>=*a.ntiles) return false;
         const auto tile=a.tiles[blockIdx.y];const unsigned row=threadIdx.x/32+8*i;if(row>=tile.count) return false;
@@ -71,9 +71,11 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
     const iu4::Scratch& s,hipStream_t stream) {
     namespace st=strix::core;
     (void)grid_tiles;
-    const int plan=iu4_plan(a.rows*8U);
-    const auto max_tiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,plan));
-    if(a.rows>s.max_rows || max_tiles>s.max_tiles) throw std::logic_error("glm chain scratch too small");
+    // Plan 2 (BM128) paired gate/up spills on gfx1151: the paired call runs at most plan 1 on its own tile list.
+    const int plan=iu4_plan(a.rows*8U), pplan=plan<1 ? plan : 1;
+    const auto ptiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,pplan));
+    const auto dtiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,plan));
+    if(a.rows>s.max_rows || ptiles>s.max_tiles || dtiles>s.max_tiles) throw std::logic_error("glm chain scratch too small");
     auto* tiles=static_cast<st::IU4GroupTile*>(s.tiles);
     st::moe_i4::Weights w{};
     for(unsigned m=0;m<3;++m) {
@@ -82,9 +84,11 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
         w.q_stride[m]=size_t(K)*N/2; w.s_stride[m]=size_t(N)*(K/64);
     }
     I4Binding b{a.x,a.out,a};
-    iu4_ok(st::build_iu4_grouped_tiles(reinterpret_cast<const st::IU4Group*>(a.groups),E,plan,tiles,s.ntiles,max_tiles,stream),"chain tiles");
-    iu4_ok(st::moe_i4::launch<true>(plan,b,w,tiles,s.ntiles,max_tiles,s.aq_down,s.as_down,stream),"chain paired gate/up");
-    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,s.ntiles,max_tiles,s.aq_down,s.as_down,stream),"chain down");
+    const auto* groups=reinterpret_cast<const st::IU4Group*>(a.groups);
+    iu4_ok(st::build_iu4_grouped_tiles(groups,E,pplan,tiles,s.ntiles,ptiles,stream),"chain tiles");
+    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,s.ntiles,ptiles,s.aq_down,s.as_down,stream),"chain paired gate/up");
+    if(pplan!=plan) iu4_ok(st::build_iu4_grouped_tiles(groups,E,plan,tiles,s.ntiles,dtiles,stream),"chain down tiles");
+    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,s.ntiles,dtiles,s.aq_down,s.as_down,stream),"chain down");
     // Shared expert retains its existing exact FP16 operand and WMMA-X arithmetic; the combine is the
     // control's ordered one (shared-down aux epilogue, or R16), not atomics.
     a.aux_act=false; a.aux_combine=aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE");

@@ -32,40 +32,40 @@ void iu4_ok(hipError_t e, const char* what) { ok(e, what); }
 struct I4Binding {
     static constexpr unsigned H=kHidden, I=kInter;
     const float* x; float* out; Tables t; bool dense_groups=true; bool reference_group_ids=false; float* dn=nullptr;
-    __device__ float* contribution(unsigned p) const { return dn+size_t(p)*H; }
-    __device__ unsigned slot(unsigned tok,unsigned k) const {
+    __device__ __forceinline__ float* contribution(unsigned p) const { return dn+size_t(p)*H; }
+    __device__ __forceinline__ unsigned slot(unsigned tok,unsigned k) const {
         return k<kTopE ? t.tok_pair[tok*kTopE+k] : t.groups[t.shared_group].pair_begin+tok;
     }
-    __host__ __device__ const unsigned* map() const { return nullptr; }
-    __device__ unsigned pair(unsigned pos) const { return pos; }
-    __device__ unsigned token(unsigned p) const { return t.pair_row[p]; }
-    __device__ float weight(unsigned p) const {
+    __host__ __device__ __forceinline__ const unsigned* map() const { return nullptr; }
+    __device__ __forceinline__ unsigned pair(unsigned pos) const { return pos; }
+    __device__ __forceinline__ unsigned token(unsigned p) const { return t.pair_row[p]; }
+    __device__ __forceinline__ float weight(unsigned p) const {
         const unsigned tok=token(p);
         if (t.pair_group[p]==t.shared_group) return 1.f;
         for (unsigned k=0;k<kTopE;++k) if(t.tok_pair[tok*kTopE+k]==p) return t.tok_w[tok*kTopE+k];
         return 0.f;
     }
-    __device__ float suh(unsigned e,unsigned m,unsigned c) const {
+    __device__ __forceinline__ float suh(unsigned e,unsigned m,unsigned c) const {
         unsigned gi=e;
         if(!dense_groups && !reference_group_ids) { gi=0; while(t.groups[gi].expert!=e) ++gi; }
         const auto& w=t.groups[gi].w;
         return strix::moe_core::half_bits((m==0 ? w.gate.suh : m==1 ? w.up.suh : w.down.suh)[c]);
     }
-    __device__ float activation(float g,float u) const { return Epilogue::swiglu(g,u); }
+    __device__ __forceinline__ float activation(float g,float u) const { return Epilogue::swiglu(g,u); }
 };
 struct I4ReferenceSchedule {
     using Binding=I4Binding;
     static constexpr bool kCachedInput=true;
     Binding b; uint8_t* aq; float* as; const float* gu=nullptr;
-    __device__ unsigned source_pair(unsigned row) const { return row/2; }
-    __device__ bool input(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
+    __device__ __forceinline__ unsigned source_pair(unsigned row) const { return row/2; }
+    __device__ __forceinline__ bool input(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
         const unsigned q=blockIdx.x*8+threadIdx.x/32;
         if(q>=b.t.rows*kHB || i>=2*(kTopE+1)) return false;
         const unsigned tok=q/kHB,k=i/2,m=i%2;
         const unsigned p=k<kTopE ? b.t.tok_pair[tok*kTopE+k] : b.t.groups[b.t.shared_group].pair_begin+tok;
         r={b.t.pair_group[p],2*p+m,m,(q%kHB)*128,kHidden,nullptr,aq,as,nullptr};return true;
     }
-    __device__ bool activation(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
+    __device__ __forceinline__ bool activation(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
         const unsigned q=blockIdx.x*8+threadIdx.x/32;
         if(i || q>=b.t.pairs*kIB) return false;
         const unsigned p=q/kIB;
@@ -76,8 +76,12 @@ struct I4ReferenceSchedule {
 void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups=true) {
     namespace st=strix::core;
-    const int plan=iu4_plan(t.pairs);
-    const auto max_tiles=static_cast<unsigned>(st::iu4_grouped_max_tiles(t.pairs,kI4Experts,plan));
+    // Plan 2 (BM128) paired gate/up spills the saved gate registers on gfx1151; the paired call
+    // runs at most plan 1 on its own tile list, the down call keeps the selected plan.
+    const int plan=iu4_plan(t.pairs), pplan=plan<1 ? plan : 1;
+    const auto ptiles=static_cast<unsigned>(st::iu4_grouped_max_tiles(t.pairs,kI4Experts,pplan));
+    const auto dtiles=static_cast<unsigned>(st::iu4_grouped_max_tiles(t.pairs,kI4Experts,plan));
+    const unsigned max_tiles=ptiles>dtiles ? ptiles : dtiles;
     const std::size_t tile_bytes=align256(max_tiles*sizeof(st::IU4GroupTile));
     const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/2));
     const std::size_t sbytes=align256(std::size_t(t.pairs)*(kInter/64)*4);
@@ -94,10 +98,11 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
         w.q_stride[m]=kI4ExpertBytes; w.s_stride[m]=kI4ExpertBytes/2;
     }
     I4Binding b{x,out,t,dense_groups,false,dn};
-    iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,plan,tiles,ntiles,max_tiles,stream),"chain tiles");
-    iu4_ok(st::moe_i4::launch<true>(plan,b,w,tiles,ntiles,max_tiles,aq,as,stream),"chain paired gate/up");
+    iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,pplan,tiles,ntiles,ptiles,stream),"chain tiles");
+    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,ntiles,ptiles,aq,as,stream),"chain paired gate/up");
     mark("gate_up",stream);
-    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,max_tiles,aq,as,stream),"chain down");
+    if(pplan!=plan) iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,plan,tiles,ntiles,dtiles,stream),"chain down tiles");
+    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,dtiles,aq,as,stream),"chain down");
     mark("down",stream);
     // Ordered combine of the control: ascending top-k FMA, shared expert last. Deterministic.
     hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<I4Binding>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,b,dn,t.rows,kTopE);

@@ -171,6 +171,33 @@ bool equal32(const std::vector<float>& a, const std::vector<float>& b, const std
     check(count == 0 && finite, name);
     return count == 0 && finite;
 }
+// STRIX_GLM_PF_AUX_COMBINE (default on) folds the shared pair's down output into the R16 combine inside the X3
+// epilogue (variants 11 / 14): that pair's output row is never written, so it keeps the workspace poison. The final
+// output still carries it and is checked bitwise (R16); the routed pairs' outputs are compared as before.
+bool aux_combine_fused(unsigned R) {
+    const unsigned v = X::selected_variant(R);
+    const char* e = std::getenv("STRIX_GLM_PF_AUX_COMBINE");
+    return (v == 11 || v == 14) && (!e || std::string(e) == "1");
+}
+// Zeroes the shared pair's rows in both vectors; true when every such row of `got` is still poison.
+bool mask_shared_pairs(std::vector<float>& ref, std::vector<float>& got, unsigned R) {
+    bool untouched = true;
+    for (unsigned row = 0; row < R; ++row) {
+        const std::size_t o = (std::size_t{row} * (Top + 1U) + Top) * H;
+        for (unsigned i = 0; i < H; ++i) {
+            untouched = untouched && bits(got[o + i]) == 0xffffffffU;
+            ref[o + i] = got[o + i] = 0.0F;
+        }
+    }
+    return untouched;
+}
+bool equal_pairs(const std::vector<float>& ref, const std::vector<float>& got, unsigned R, const std::string& name) {
+    if (!aux_combine_fused(R)) return equal32(ref, got, name);
+    std::vector<float> r = ref, g = got;
+    const bool untouched = mask_shared_pairs(r, g, R);
+    check(untouched, name + " shared pair combined in the epilogue (row not written)");
+    return equal32(r, g, name) && untouched;
+}
 // Capture the R=1 seam's expert-sorted pairs into the chunk's fixed row/slot layout.
 __global__ void capture(const float* src_o, const std::uint16_t* src_a, float* dst_o,
                         std::uint16_t* dst_a, const float* src_gu, float* dst_gu, unsigned pair) {
@@ -304,7 +331,7 @@ struct Fixture {
             const auto name = label + " V=" + version + " TM=" + std::to_string(tm) + " repeat=" + std::to_string(repeat);
             const bool out_pass = equal32(yr, y, name + " R16");
             const bool gu_pass = equal32(gr, gu, name + " gate/up");
-            const bool pair_pass = equal32(pr, pairs, name + " pair-output");
+            const bool pair_pass = equal_pairs(pr, pairs, R, name + " pair-output");
             std::size_t mismatches = 0, first = 0;
             unsigned max_ulp = 0;
             for (std::size_t i = 0; i < at.size(); ++i) if (at[i] != ar[i]) {
@@ -360,7 +387,7 @@ struct Fixture {
         ok(hipMemcpy(at.data(), X::pair_down_input(ws, MaxR, 0), at.size() * 2, hipMemcpyDeviceToHost), "device at");
         const bool out_pass = equal32(yr, y, name + " device-plan R16");
         const bool gu_pass = equal32(gr, gu, name + " device-plan gate/up");
-        const bool pair_pass = equal32(pr, pairs, name + " device-plan pair-output");
+        const bool pair_pass = equal_pairs(pr, pairs, R, name + " device-plan pair-output");
         const bool at_pass = at == ar;
         check(at_pass, name + " device-plan down-input FP16");
         // Token-ordered gate/up input transform (STRIX_GLM_PF_IN_TOKEN=1): the FP16 operand rows of every pair in the
@@ -529,7 +556,10 @@ struct Fixture {
                         }
                         std::printf("DIFF gate/up words: nan-vs-nan %zu, nan-vs-inf %zu, other %zu\n", nan_nan, nan_inf, other);
                     }
-                    check(std::memcmp(pr.data(), pairs.data(), pairs.size() * 4) == 0, label + " v3 pair-output bytes");
+                    std::vector<float> rp = pr, gp = pairs;
+                    if (aux_combine_fused(R))
+                        check(mask_shared_pairs(rp, gp, R), label + " shared pair combined in the epilogue (row not written)");
+                    check(std::memcmp(rp.data(), gp.data(), gp.size() * 4) == 0, label + " v3 pair-output bytes");
                     check(std::memcmp(ar.data(), at.data(), at.size() * 2) == 0, label + " v3 down-input FP16 bytes");
                 }
             }

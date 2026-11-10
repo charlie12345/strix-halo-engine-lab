@@ -2088,11 +2088,23 @@ struct Engine::Impl {
                 post(0);
                 pre(0, w.hc_ffn, w.post_norm);
                 start_rs(1); // attention B overlaps FFN A, after its AG
-                consume_column(0, w, true);
-                post(1);
-                pre(1, w.hc_ffn, w.post_norm);
-                start_rs(0); // FFN A overlaps FFN B, after its AG
-                consume_column(1, w, true);
+                if(model_fast_i4 && w.moe && glm::pf::exact_moe::iu4::chain_enabled()) {
+                    post(1);
+                    pre(1,w.hc_ffn,w.post_norm);
+                    const auto consumer=seqpar_xch->compute(0);
+                    seqpar_xch->finish(0,consumer);
+                    seqpar_xch->finish(1,consumer);
+                    column_range(0,w,true,{0,R},std::min(R,8192U));
+                    // Both half consumers wait on the whole-group column completion.
+                    seqpar_xch->column_begin(1);
+                    start_rs(0);
+                } else {
+                    consume_column(0,w,true);
+                    post(1);
+                    pre(1,w.hc_ffn,w.post_norm);
+                    start_rs(0); // FFN A overlaps FFN B, after its AG
+                    consume_column(1,w,true);
+                }
                 post(0);
                 // Defer B's RS until AFTER next-layer AG A, so that a side
                 // stream RX wait cannot sit in front of A's next column call.

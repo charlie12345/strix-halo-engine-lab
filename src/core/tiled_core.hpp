@@ -118,6 +118,10 @@ template<int Bits> struct WmmaXContract {
 //   void store(const Tile&, int r, int col0, float (&v)[4], int lane)
 //        - 128 outputs col0 + lane + 32 j after hadamard128 (FP32 total, no svh): svh scale,
 //          activation, combine... Fused epilogue only.
+struct NoChain {
+    static constexpr bool kActive = false, kInput = false;
+    static constexpr int kPasses = 1;
+};
 struct NoAdapter {
     static constexpr bool kActive = false, kTiles = false;
     struct Tile {};
@@ -126,14 +130,14 @@ struct NoAdapter {
 // 1 = no Q decode/LDS store, 2 = no WMMA, 3 = WMMA + fragment reads only.
 template<class Contract, int BM, int BN, int WM, int WN, bool Fused, int Probe = 0,
     bool IU4Audit = false, bool IU4FullRows = false, int IU4Group = 64, bool IU4Grouped = false,
-    class Adapter = NoAdapter>
+    class Adapter = NoAdapter, class Chain = NoChain>
 __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operand>::threads)) void tiled_core(
     const uint32_t* __restrict__ packed, const _Float16* __restrict__ input,
     float* __restrict__ partial, int inputs, int outputs, int rows, int splits,
     const uint16_t* __restrict__ scales, const float* __restrict__ bias,
     float* __restrict__ output, float alpha, float beta, int raster_m,
     const uint8_t* a_q = nullptr, const float* a_scale = nullptr,
-    const _Float16* w_scale = nullptr, int32_t* group_sums = nullptr, GroupedArgs gp = {}, Adapter ad = {}) {
+    const _Float16* w_scale = nullptr, int32_t* group_sums = nullptr, GroupedArgs gp = {}, Adapter ad = {}, Chain chain = {}) {
     using Operand = typename Contract::Operand;
     using G = Geometry<BM, BN, WM, WN, Operand>;
     constexpr bool Integer = is_integer_operand<Operand>::value;
@@ -154,13 +158,21 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
     constexpr bool AD = Adapter::kActive;
     static_assert(!AD || (Integer || (!IU4 && !DenseF16 && Probe == 0 && (!Fused || BN % 128 == 0))), "adapters: trellis F16 operands");
     static_assert(Fold == 0 || (!IU4 && !DenseF16));
+    static_assert(!Chain::kActive || (IU4Grouped && Fused && IU4Group == 64 && !AD));
+    // Gate values stay in each lane's registers across the paired gate/up mainloops.
+    constexpr int chain_groups = (G::waves_m * 16 * (BN / 128) + G::waves - 1) / G::waves;
+    float chain_saved[Chain::kPasses == 2 ? MT * chain_groups * 4 : 1];
+    const auto* chain_packed = packed;
+    const auto* chain_wscale = w_scale;
+    for (int chain_pass = 0; chain_pass < Chain::kPasses; ++chain_pass) {
+    if constexpr (Chain::kActive) { packed = chain_packed; w_scale = chain_wscale; }
     // Adapter tile loop: one pass for library launches; kTiles adapters iterate their CTA's tiles.
     for (unsigned iter = 0;; ++iter) {
     [[maybe_unused]] typename Adapter::Tile at{};
     if constexpr (Adapter::kTiles) {
         if (!ad.next(at, iter, BN)) return;   // uniform
         rows = at.rows; packed = at.packed; splits = at.splits;
-    } else if (iter) return;
+    } else if (iter) { if constexpr (Chain::kActive) break; else return; }
     // Grouped rasterisation: consecutive blocks cover raster_m row blocks of one column
     // block, then the next column block, so resident blocks share A rows and Q slabs.
     // Only the block -> tile mapping changes; every tile is computed exactly as before.
@@ -180,6 +192,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
         packed += size_t(expert) * (gp.w_expert_bytes / 4U);
         w_scale += size_t(expert) * gp.w_scale_expert;
         if constexpr (Fused) scales = gp.col_scale[expert];
+        if constexpr (Chain::kActive) chain.bind(expert, chain_pass, packed, w_scale, scales);
         (void)raster_m;
     } else if constexpr (!Adapter::kTiles) {
     const int blocks_m = (rows + BM - 1) / BM;
@@ -259,6 +272,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
             static_assert(G::a_chunks % G::threads == 0 && b_chunks % G::threads == 0);
             const int groups = inputs / IU4Group;
             const auto* wq = reinterpret_cast<const uint8_t*>(packed);
+            if constexpr (!Chain::kInput)
             #pragma unroll
             for (int i = 0; i < G::a_per_thread; ++i) {
                 const int chunk = thread + i * G::threads;
@@ -286,6 +300,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                 }
             }
             
+            if constexpr (!Chain::kInput)
             #pragma unroll
             for (int i = 0; i < sa_per_thread; ++i) {
                 const int e = thread + i * G::threads;
@@ -353,6 +368,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
         auto* ab = lds + buffer * G::stage_bytes;
         _Float16* as = reinterpret_cast<_Float16*>(ab);
         _Float16* bs = as + BM * STRIDE;
+        if constexpr (!Chain::kInput)
         #pragma unroll
         for (int i = 0; i < G::a_per_thread; ++i) {
             const int chunk = thread + i * G::threads;
@@ -363,6 +379,9 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                     *reinterpret_cast<U2*>(ab + row_offset(r, part * 16 + 8)) = __builtin_shufflevector(a_reg[i], a_reg[i], 2, 3);
                 } else *reinterpret_cast<U4*>(ab + row_offset(r, part * 16)) = a_reg[i];
             }
+        }
+        if constexpr (Chain::kInput) {
+            chain.template stage<BM, BN, G::waves>(ab, map_first, rows, k0 * 16, chain_pass);
         }
         if constexpr (IU4 || DenseF16) {
 
@@ -381,6 +400,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
             
             if constexpr (IU4) {
                 float* sl = reinterpret_cast<float*>(ab + (BM + BN) * G::row_bytes);
+                if constexpr (!Chain::kInput)
                 #pragma unroll
                 for (int i = 0; i < sa_per_thread; ++i) {
                     const int e = thread + i * G::threads;
@@ -591,6 +611,14 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) values[j] += f[slice_row * FSTRIDE + col_group * 128 + lane + 32 * j];
                     hadamard128(values);
+                    if constexpr (Chain::kActive) {
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            values[j] *= __half2float(__ushort_as_half(scales[begin_col + lane + 32*j]));
+                        chain.store(map_first + uint32_t(row), begin_col, chain_pass,
+                            mt * chain_groups + g / G::waves, values, chain_saved);
+                        continue;
+                    }
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
                         const int channel = begin_col + lane + 32 * j;
@@ -608,6 +636,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
     }
     } // non-integer operand
     }   // adapter tile loop
+    }   // paired chain passes
 }
 } // namespace wmma_tiled
 } // namespace strix::core

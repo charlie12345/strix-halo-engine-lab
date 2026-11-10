@@ -1,0 +1,203 @@
+#pragma once
+// Candidate FAST_I4 chain. Bindings name model geometry, row maps and nonlinear arithmetic;
+// all gather/transform/quantise, paired mainloops and output accumulation live on this core.
+#include "tiled_core.hpp"
+#include "activation_quant.hpp"
+#include "linear_plan.hpp"
+#include "moe_i4_arithmetic.hpp"
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+
+namespace strix::core::moe_i4 {
+inline bool enabled() {
+    const char* p = std::getenv("STRIX_MOE_I4_CHAIN");
+    if (!p || !*p || std::strcmp(p, "0") == 0) return false;
+    if (std::strcmp(p, "1") == 0) return true;
+    throw std::invalid_argument("STRIX_MOE_I4_CHAIN must be 0 or 1 (candidate, native gates pending)");
+}
+__global__ inline void add_shared_rows(const float* rows,float* out,unsigned tokens,unsigned hidden,unsigned stride,unsigned slot) {
+    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<size_t(tokens)*hidden) out[i]+=rows[((i/hidden)*stride+slot)*hidden+i%hidden];
+}
+struct Weights {
+    const uint8_t* q[3];
+    const _Float16* s[3];
+    const uint16_t* const* svh[3];
+    size_t q_stride[3], s_stride[3];
+};
+struct WaveOps {
+    __device__ static unsigned channel(unsigned j) { return (threadIdx.x&31U)+32*j; }
+    __device__ static float round16(float x) { return float(_Float16(x)); }
+    __device__ static float materialize(float x) { return materialize_fp32(x); }
+    __device__ static void transform(float (&v)[4]) { hadamard128(v); }
+};
+template<class Binding> struct InputPolicy {
+    Binding b;
+    __device__ void load(unsigned e,unsigned p,unsigned m,unsigned c,float (&v)[4],const float* cached=nullptr) const {
+        input_values<WaveOps>(b,e,p,m,c,v,cached);
+    }
+};
+template<class Binding> struct EpiloguePolicy {
+    Binding b;
+    __device__ void activation(unsigned e,unsigned c,const float (&g)[4],const float (&u)[4],float (&v)[4]) const {
+        activation_values<WaveOps>(b,e,c,g,u,v);
+    }
+    __device__ void combine(unsigned pair, unsigned col, const float (&v)[4]) const {
+        const unsigned lane = threadIdx.x & 31U, token = b.token(pair);
+        const float w = b.weight(pair);
+        // FAST only: FP32 product then unordered atomic add replaces the ordered FMA fold.
+        // A4/FP16 boundaries do not move. This arithmetic change requires the quality gate.
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j) atomicAdd(b.out + size_t(token)*Binding::H + col+lane+32*j, combine_product<WaveOps>(w,v[j]));
+    }
+};
+// Unfused control uses the same policies; schedules only name rows and destinations.
+struct ReferenceRow {
+    unsigned expert,pair,m,col,width;
+    const float* gu=nullptr;
+    uint8_t* aq=nullptr; float* as=nullptr; _Float16* fp16=nullptr;
+};
+__device__ inline void reference_store(const ReferenceRow& r,const float (&v)[4]) {
+    if(r.aq) iu4_quant128(v,r.aq+size_t(r.pair)*(r.width/2),r.as+size_t(r.pair)*(r.width/64),r.col,threadIdx.x&31U);
+    else {
+        #pragma unroll
+        for(unsigned j=0;j<4;++j) r.fp16[size_t(r.pair)*r.width+r.col+(threadIdx.x&31U)+32*j]=_Float16(v[j]);
+    }
+}
+template<class Schedule> __global__ __launch_bounds__(256) void reference_input_kernel(Schedule s) {
+    ReferenceRow r{};
+    float cached[4];
+    if constexpr (Schedule::kCachedInput) {
+        if(!s.input(0,r)) return;
+        const unsigned token=s.b.token(s.source_pair(r.pair));
+        #pragma unroll
+        for(unsigned j=0;j<4;++j) cached[j]=s.b.x[size_t(token)*Schedule::Binding::H+r.col+(threadIdx.x&31U)+32*j];
+    }
+    for(unsigned i=0;s.input(i,r);++i) {
+        float v[4]; InputPolicy<typename Schedule::Binding>{s.b}.load(r.expert,s.source_pair(r.pair),r.m,r.col,v,Schedule::kCachedInput ? cached : nullptr);
+        reference_store(r,v);
+    }
+}
+template<class Schedule> __global__ __launch_bounds__(256) void reference_activation_kernel(Schedule s) {
+    ReferenceRow r{};
+    for(unsigned i=0;s.activation(i,r);++i) {
+        float g[4],u[4],v[4];
+        #pragma unroll
+        for(unsigned j=0;j<4;++j) { const unsigned c=r.col+(threadIdx.x&31U)+32*j;g[j]=r.gu[size_t(r.pair)*2*r.width+c];u[j]=r.gu[(size_t(r.pair)*2+1)*r.width+c]; }
+        EpiloguePolicy<typename Schedule::Binding>{s.b}.activation(r.expert,r.col,g,u,v);
+        reference_store(r,v);
+    }
+}
+template<class Binding> __global__ __launch_bounds__(256) void reference_combine_kernel(Binding b,const float* dn,unsigned rows,unsigned topk) {
+    const unsigned q=blockIdx.x*8+threadIdx.x/32,blocks=Binding::H/128,lane=threadIdx.x&31U;
+    if(q>=rows*blocks) return;
+    const unsigned tok=q/blocks,col=(q%blocks)*128;
+    float acc[4]={};
+    for(unsigned k=0;k<topk;++k) {
+        const unsigned pair=b.slot(tok,k);const float weight=b.weight(pair);
+        #pragma unroll
+        for(unsigned j=0;j<4;++j) acc[j]=__builtin_fmaf(weight,dn[size_t(pair)*Binding::H+col+lane+32*j],acc[j]);
+    }
+    const unsigned shared=b.slot(tok,topk);
+    #pragma unroll
+    for(unsigned j=0;j<4;++j) b.out[size_t(tok)*Binding::H+col+lane+32*j]=acc[j]+dn[size_t(shared)*Binding::H+col+lane+32*j];
+}
+// Existing FP16 shared experts can use the same policy arithmetic without entering A4.
+template<class Binding> __global__ void fp16_input_rows(Binding b,_Float16* input,unsigned rows,unsigned expert,unsigned stride,unsigned slot) {
+    const unsigned lane=threadIdx.x&31U,wave=threadIdx.x/32,col=(blockIdx.x*8+wave)*128;
+    for(unsigned r=0;r<16;++r) {
+        const unsigned token=blockIdx.y*16+r;
+        if(token>=rows) return;
+        const unsigned pair=token*stride+slot;
+        float v[4]; InputPolicy<Binding>{b}.load(expert,pair,blockIdx.z,col,v);
+        #pragma unroll
+        for(unsigned j=0;j<4;++j) input[(size_t(pair)*2+blockIdx.z)*Binding::H+col+lane+32*j]=_Float16(v[j]);
+    }
+}
+template<class Binding> __global__ void fp16_activation_rows(Binding b,const float* gu,_Float16* at,unsigned rows,unsigned expert,unsigned stride,unsigned slot) {
+    const unsigned lane=threadIdx.x&31U,wave=threadIdx.x/32,col=blockIdx.x*128;
+    for(unsigned r=wave;r<16;r+=8) {
+        const unsigned token=blockIdx.y*16+r;
+        if(token>=rows) return;
+        const unsigned pair=token*stride+slot;
+        float g[4],u[4],v[4];
+        #pragma unroll
+        for(unsigned j=0;j<4;++j) { const unsigned c=col+lane+32*j;g[j]=gu[size_t(pair)*2*Binding::I+c];u[j]=gu[(size_t(pair)*2+1)*Binding::I+c]; }
+        EpiloguePolicy<Binding>{b}.activation(expert,col,g,u,v);
+        #pragma unroll
+        for(unsigned j=0;j<4;++j) at[size_t(pair)*Binding::I+col+lane+32*j]=_Float16(v[j]);
+    }
+}
+// Packed-IU4 LDS writer: same quantiser as global packed operands, different physical layout.
+template<int BM,int BN> struct StageStore {
+    uint8_t* base; unsigned row;
+    __device__ void byte(unsigned c, uint8_t v) const { base[iu4_lds_offset(int(row),int(c))] = v; }
+    __device__ void scale(unsigned g, float v) const {
+        auto* s = reinterpret_cast<float*>(base+(BM+BN)*64);
+        s[g*BM + (row&~15U)+(row&1U)*8+((row&15U)>>1U)] = v;
+    }
+};
+template<class Binding,bool Pair> struct Chain {
+    static constexpr bool kActive = true, kInput = Pair;
+    static constexpr int kPasses = Pair ? 2 : 1;
+    Binding b; Weights w;
+    uint8_t* aq; float* as;
+    unsigned expert = 0;
+    __device__ void bind(unsigned e, int pass, const uint32_t*& q, const _Float16*& s, const uint16_t*& svh) {
+        expert=e; const unsigned m=Pair ? unsigned(pass) : 2U;
+        q=reinterpret_cast<const uint32_t*>(w.q[m]+size_t(e)*w.q_stride[m]);
+        s=w.s[m]+size_t(e)*w.s_stride[m]; svh=w.svh[m][e];
+    }
+    template<int BM,int BN,int Waves> __device__ void stage(uint8_t* lds,unsigned first,int rows,int k,int pass) const {
+        const unsigned wave=threadIdx.x/32;
+        for (unsigned r=wave; r<BM; r+=Waves) {
+            const unsigned rr=r<unsigned(rows) ? r : unsigned(rows-1);
+            float v[4]; InputPolicy<Binding>{b}.load(expert,b.pair(first+rr),unsigned(pass),unsigned(k),v);
+            iu4_quant128_store(v,0,threadIdx.x&31U,StageStore<BM,BN>{lds,r});
+        }
+    }
+    __device__ void store(unsigned pos,unsigned col,int pass,int slot,float (&v)[4],float* saved) const {
+        const unsigned pair=b.pair(pos);
+        if constexpr (Pair) {
+            if (!pass) {
+                #pragma unroll
+                for (unsigned j=0;j<4;++j) saved[slot*4+j]=v[j];
+            } else {
+                float g[4],a[4];
+                #pragma unroll
+                for (unsigned j=0;j<4;++j) g[j]=saved[slot*4+j];
+                EpiloguePolicy<Binding>{b}.activation(expert,col,g,v,a);
+                iu4_quant128(a,aq+size_t(pair)*(Binding::I/2),as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
+            }
+        } else EpiloguePolicy<Binding>{b}.combine(pair,col,v);
+    }
+};
+template<int Plan,bool Pair,class Binding> hipError_t launch(const Binding& b,const Weights& w,
+    const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,uint8_t* aq,float* as,hipStream_t stream) {
+    constexpr auto c=iu4_tiles[Plan];
+    using G=wmma_tiled::Geometry<c.bm,c.bn,c.wm,c.wn,PackedIU4>;
+    using C=Chain<Binding,Pair>;
+    wmma_tiled::GroupedArgs gp; gp.tiles=tiles; gp.ntiles=ntiles; gp.col_scale=w.svh[0]; gp.map=b.map();
+    const unsigned K=Pair ? Binding::H : Binding::I, N=Pair ? Binding::I : Binding::H;
+    const auto kernel=wmma_tiled::tiled_core<TiledContract<PackedIU4>,c.bm,c.bn,c.wm,c.wn,true,0,false,false,64,true,wmma_tiled::NoAdapter,C>;
+    // Reject spills/insufficient residency before launching. No token/route readback.
+    hipFuncAttributes attr{}; auto status=hipFuncGetAttributes(&attr,reinterpret_cast<const void*>(kernel));
+    if (status!=hipSuccess) return status;
+    int blocks=0; status=hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,G::threads,0);
+    if (status!=hipSuccess) return status;
+    if (attr.localSizeBytes || blocks*G::waves<4) return hipErrorNotSupported;
+    kernel<<<dim3(max_tiles*(N/c.bn)),G::threads,0,stream>>>(reinterpret_cast<const uint32_t*>(w.q[0]),nullptr,nullptr,
+        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? nullptr : aq,Pair ? nullptr : as,w.s[0],nullptr,gp,{},C{b,w,aq,as});
+    return hipGetLastError();
+}
+template<bool Pair,class Binding> hipError_t launch(int plan,const Binding& b,const Weights& w,
+    const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,uint8_t* aq,float* as,hipStream_t stream) {
+    switch(plan) {
+        case 0:return launch<0,Pair>(b,w,tiles,ntiles,max_tiles,aq,as,stream);
+        case 1:return launch<1,Pair>(b,w,tiles,ntiles,max_tiles,aq,as,stream);
+        case 2:return launch<2,Pair>(b,w,tiles,ntiles,max_tiles,aq,as,stream);
+        default:return hipErrorInvalidValue;
+    }
+}
+} // namespace strix::core::moe_i4

@@ -24,7 +24,7 @@ inline constexpr std::size_t iu4_scale_bytes(unsigned K, unsigned N) { return st
 // block (after the input transform). Two K64 groups (j 0-1, j 2-3): wave max, s = max / 7 (1 when 0), q = clamp(RNE(x /
 // s), -7, 7); even lanes store the (even, odd) byte of row_q, lane 0 the two FP32 scales of row_s. The bits of the
 // library quantiser (quantise_wmma_iu4_activations) on the same FP16 rows.
-__device__ __forceinline__ void iu4_quant128(const float (&v)[4], std::uint8_t* row_q, float* row_s, unsigned begin, unsigned lane) {
+template<class Store> __device__ __forceinline__ void iu4_quant128_store(const float (&v)[4], unsigned begin, unsigned lane, Store store) {
 #pragma unroll
     for (unsigned g = 0; g < 2U; ++g) {
         float amax = fmaxf(fabsf(v[2U * g]), fabsf(v[2U * g + 1U]));
@@ -37,11 +37,20 @@ __device__ __forceinline__ void iu4_quant128(const float (&v)[4], std::uint8_t* 
             const int qv = max(-7, min(7, static_cast<int>(nearbyintf(v[j] / scale))));
             const int odd = __shfl_xor(qv, 1);
             if (!(lane & 1U))
-                row_q[(begin + lane + 32U * j) / 2U] =
-                    static_cast<std::uint8_t>((static_cast<unsigned>(qv) & 15U) | ((static_cast<unsigned>(odd) & 15U) << 4U));
+                store.byte((begin + lane + 32U * j) / 2U,
+                    static_cast<std::uint8_t>((static_cast<unsigned>(qv) & 15U) | ((static_cast<unsigned>(odd) & 15U) << 4U)));
         }
-        if (lane == 0U) row_s[begin / 64U + g] = scale;
+        if (lane == 0U) store.scale(begin / 64U + g, scale);
     }
+}
+
+struct IU4RowStore {
+    std::uint8_t* q; float* s;
+    __device__ void byte(unsigned i, std::uint8_t v) const { q[i] = v; }
+    __device__ void scale(unsigned i, float v) const { s[i] = v; }
+};
+__device__ __forceinline__ void iu4_quant128(const float (&v)[4], std::uint8_t* q, float* s, unsigned begin, unsigned lane) {
+    iu4_quant128_store(v, begin, lane, IU4RowStore{q, s});
 }
 
 // Fake-quant twin of iu4_quant128 (quality studies): v <- q * s with the same s and q, in place.

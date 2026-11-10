@@ -1,92 +1,12 @@
 // Included by mmx_prefill.hip inside namespace strix::minimax::moe::opt (Plan, Tables, PGroup, InputTransform,
 // Epilogue, ok): FAST_I4 prefill MoE (identity minimax-fast-i4, lossy, opt-in) on the strix-trellis grouped IU4 core
 // (wmma_tiled.hpp launch_wmma_tiled_iu4_grouped, W4A4 g64) for every routed expert and the shared expert (index 128).
-//   input:   gather_transform_token_kernel's values (suh + had128, FP16), quantised in the same kernel (no FP16 rows,
-//            no separate quantiser pass): rows 2 p + m of aq_gu / as_gu (core::iu4_quant128).
-//   gate/up: two grouped IU4 launches, fused output transform (had128 x svh) -> FP32 [P][2][1536].
-//   down:    SwiGLU + down suh + had128 + A4 quantiser in one kernel -> grouped IU4 with the fused output transform
-//            -> FP32 [P][6144]; combine = down_combine_kernel's order (ascending expert id, then + shared).
-// Launches per call: gather+quant, tile list, gate, up, act+quant, down, combine (7, no host sync).
+// STRIX_MOE_I4_CHAIN=1: device A-load gather/H128/A4; paired gate/up with SwiGLU/down-H128/A4
+// epilogue; down epilogue accumulates weighted FP32 directly. No global GU or down FP32 image.
+// OFF: the unfused control uses the same shared arithmetic with materialized intermediates.
+// All FP16/A4 boundaries stay fixed; the candidate combine uses product RN32 + atomic addition.
 namespace {
 int g_iu4_override = -1;
-
-__global__ __launch_bounds__(256) void iu4_gather_kernel(const float* y, Tables t, std::uint8_t* aq, float* as) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.rows * kHB) return;
-    const unsigned tok = q / kHB, b = q % kHB;
-    const float* x = y + static_cast<std::size_t>(tok) * kHidden;
-    float xv[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) xv[j] = x[b * 128U + lane + 32U * static_cast<unsigned>(j)];
-#pragma unroll 1
-    for (unsigned k = 0; k <= kTopE; ++k) {
-        const unsigned p = k < kTopE ? t.tok_pair[tok * kTopE + k] : t.groups[t.shared_group].pair_begin + tok;
-        const PGroup& g = t.groups[t.pair_group[p]];
-#pragma unroll
-        for (unsigned m = 0; m < 2; ++m) {
-            const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-            float v[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
-                v[j] = static_cast<float>(static_cast<_Float16>(InputTransform::scale(xv[j], suh[c])));
-            }
-            InputTransform::h128(v, lane);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) v[j] = static_cast<float>(static_cast<_Float16>(v[j]));
-            const std::size_t row = std::size_t{p} * 2U + m;
-            strix::core::iu4_quant128(v, aq + row * (kHidden / 2U), as + row * (kHidden / 64U), b * 128U, lane);
-        }
-    }
-}
-
-// gu = [P][2][1536] FP32 (finished gate, up); one wave = one (pair, 128-block): gate_up_tiled_store's values.
-__global__ __launch_bounds__(256) void iu4_act_kernel(Tables t, const float* gu, std::uint8_t* aq, float* as) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * kIB) return;
-    const unsigned p = q / kIB, b = q % kIB;
-    const PGroup& g = t.groups[t.pair_group[p]];
-    const float* gr = gu + std::size_t{p} * 2U * kInter;
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = b * 128 + lane + 32U * static_cast<unsigned>(j);
-        const float act = Epilogue::swiglu(gr[c], gr[kInter + c]);
-        v[j] = static_cast<float>(static_cast<_Float16>(InputTransform::scale(act, g.w.down.suh[c])));
-    }
-    InputTransform::h128(v, lane);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = static_cast<float>(static_cast<_Float16>(v[j]));
-    if (aq != nullptr) {
-        strix::core::iu4_quant128(v, aq + std::size_t{p} * (kInter / 2U), as + std::size_t{p} * (kInter / 64U), b * 128U, lane);
-    } else {  // gate_up scope: the existing row-major EXL3 down operand, without A4
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            t.at[std::size_t{p} * kInter + b * 128U + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
-    }
-}
-
-// dn = [P][6144] FP32 finished down rows; down_combine_kernel's accumulation order.
-__global__ __launch_bounds__(256) void iu4_combine_kernel(Tables t, const float* dn, float* out) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.rows * kHB) return;
-    const unsigned tok = q / kHB, b = q % kHB;
-    float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-    for (unsigned k = 0; k < kTopE; ++k) {
-        const float* r = dn + std::size_t{t.tok_pair[tok * kTopE + k]} * kHidden + b * 128U + lane;
-        const float w = t.tok_w[tok * kTopE + k];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] = Epilogue::router_accumulate(w, r[32U * static_cast<unsigned>(j)], acc[j]);
-    }
-    const float* s = dn + std::size_t{t.groups[t.shared_group].pair_begin + tok} * kHidden + b * 128U + lane;
-#pragma unroll
-    for (int j = 0; j < 4; ++j)
-        out[static_cast<std::size_t>(tok) * kHidden + b * 128 + lane + 32U * static_cast<unsigned>(j)] =
-            Epilogue::shared_add(acc[j], s[32U * static_cast<unsigned>(j)]);
-}
 
 // STRIX_MMX_IU4_PLAN: library IU4 plan 0 (BM32), 1 (BM64), 2 (BM128); default by the mean group size of the call:
 // plan 2 when the (expert, token) pairs average >= 128 rows per expert (one 128-row tile per group), else plan 1.
@@ -109,9 +29,84 @@ static_assert(std::size_t{kHidden} * (kInter / 64U) == kI4S && kI4ExpertBytes ==
 void iu4_ok(hipError_t e, const char* what) { ok(e, what); }
 
 
+struct I4Binding {
+    static constexpr unsigned H=kHidden, I=kInter;
+    const float* x; float* out; Tables t; bool dense_groups=true; bool reference_group_ids=false;
+    __device__ unsigned slot(unsigned tok,unsigned k) const {
+        return k<kTopE ? t.tok_pair[tok*kTopE+k] : t.groups[t.shared_group].pair_begin+tok;
+    }
+    __device__ const unsigned* map() const { return nullptr; }
+    __device__ unsigned pair(unsigned pos) const { return pos; }
+    __device__ unsigned token(unsigned p) const { return t.pair_row[p]; }
+    __device__ float weight(unsigned p) const {
+        const unsigned tok=token(p);
+        if (t.pair_group[p]==t.shared_group) return 1.f;
+        for (unsigned k=0;k<kTopE;++k) if(t.tok_pair[tok*kTopE+k]==p) return t.tok_w[tok*kTopE+k];
+        return 0.f;
+    }
+    __device__ float suh(unsigned e,unsigned m,unsigned c) const {
+        unsigned gi=e;
+        if(!dense_groups && !reference_group_ids) { gi=0; while(t.groups[gi].expert!=e) ++gi; }
+        const auto& w=t.groups[gi].w;
+        return strix::moe_core::half_bits((m==0 ? w.gate.suh : m==1 ? w.up.suh : w.down.suh)[c]);
+    }
+    __device__ float activation(float g,float u) const { return Epilogue::swiglu(g,u); }
+};
+struct I4ReferenceSchedule {
+    using Binding=I4Binding;
+    static constexpr bool kCachedInput=true;
+    Binding b; uint8_t* aq; float* as; const float* gu=nullptr;
+    __device__ unsigned source_pair(unsigned row) const { return row/2; }
+    __device__ bool input(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
+        const unsigned q=blockIdx.x*8+threadIdx.x/32;
+        if(q>=b.t.rows*kHB || i>=2*(kTopE+1)) return false;
+        const unsigned tok=q/kHB,k=i/2,m=i%2;
+        const unsigned p=k<kTopE ? b.t.tok_pair[tok*kTopE+k] : b.t.groups[b.t.shared_group].pair_begin+tok;
+        r={b.t.pair_group[p],2*p+m,m,(q%kHB)*128,kHidden,nullptr,aq,as,nullptr};return true;
+    }
+    __device__ bool activation(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
+        const unsigned q=blockIdx.x*8+threadIdx.x/32;
+        if(i || q>=b.t.pairs*kIB) return false;
+        const unsigned p=q/kIB;
+        r={b.t.pair_group[p],p,2,(q%kIB)*128,kInter,gu,aq,as,b.t.at};return true;
+    }
+};
+
+void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
+    const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups=true) {
+    namespace st=strix::core;
+    const int plan=iu4_plan(t.pairs);
+    const auto max_tiles=static_cast<unsigned>(st::iu4_grouped_max_tiles(t.pairs,kI4Experts,plan));
+    const std::size_t tile_bytes=align256(max_tiles*sizeof(st::IU4GroupTile));
+    const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/2));
+    const std::size_t sbytes=align256(std::size_t(t.pairs)*(kInter/64)*4);
+    if(bytes<tile_bytes+256+qbytes+sbytes) throw std::logic_error("minimax fused i4 scratch too small");
+    auto* tiles=reinterpret_cast<st::IU4GroupTile*>(ws);
+    auto* ntiles=reinterpret_cast<unsigned*>(ws+tile_bytes);
+    auto* aq=ws+tile_bytes+256;
+    auto* as=reinterpret_cast<float*>(aq+qbytes);
+    st::moe_i4::Weights w{};
+    for(unsigned m=0;m<3;++m) {
+        w.q[m]=q.wq[m]; w.s[m]=q.ws[m]; w.svh[m]=q.svh[m];
+        w.q_stride[m]=kI4ExpertBytes; w.s_stride[m]=kI4ExpertBytes/2;
+    }
+    I4Binding b{x,out,t,dense_groups};
+    iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,plan,tiles,ntiles,max_tiles,stream),"chain tiles");
+    iu4_ok(st::moe_i4::launch<true>(plan,b,w,tiles,ntiles,max_tiles,aq,as,stream),"chain paired gate/up");
+    mark("gate_up",stream);
+    iu4_ok(hipMemsetAsync(out,0,std::size_t(t.rows)*kHidden*4,stream),"chain output init");
+    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,max_tiles,aq,as,stream),"chain down/combine");
+    mark("combine",stream);
+}
+
 void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigned char* ws, std::size_t ws_bytes, hipStream_t stream) {
     namespace st = strix::core;
     const I4Layer& q = *v.i4;
+    if(v.i4_all && st::moe_i4::enabled()) {
+        launch_i4_chain(t,q,v.y,v.out,reinterpret_cast<const st::IU4Group*>(ws+p.off_i4_groups),
+            ws+p.off_xt,ws_bytes-p.off_xt,stream,false);
+        return;
+    }
     const std::size_t P = t.pairs;
     const int plan = iu4_plan(P);
     const auto max_tiles = static_cast<std::uint32_t>(st::iu4_grouped_max_tiles(P, static_cast<int>(kI4Experts), plan));
@@ -131,7 +126,7 @@ void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigne
     auto* dn = v.i4_all ? reinterpret_cast<float*>(take(P * kHidden * 4U)) : nullptr;
     if (off > ws_bytes) throw std::logic_error("minimax prefill iu4: workspace smaller than the call");
     if (!v.i4_all && off > p.off_at) throw std::logic_error("minimax prefill iu4: gate/up overlaps EXL3 down workspace");
-    hipLaunchKernelGGL(iu4_gather_kernel, dim3((t.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t, aq_gu, as_gu);
+    hipLaunchKernelGGL((st::moe_i4::reference_input_kernel<I4ReferenceSchedule>), dim3((t.rows*kHB+7)/8), dim3(256),0,stream, (I4ReferenceSchedule{{v.y,v.out,t,false,true},aq_gu,as_gu}));
     launched("iu4 gather + quantiser");
     mark("gather", stream);
     iu4_ok(st::build_iu4_grouped_tiles(reinterpret_cast<const st::IU4Group*>(ws + p.off_i4_groups), static_cast<int>(kI4Experts), plan, tiles,
@@ -145,7 +140,7 @@ void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigne
                "iu4 gate/up");
     }
     mark("gate_up", stream);
-    hipLaunchKernelGGL(iu4_act_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, gu, aq_dn, as_dn);
+    hipLaunchKernelGGL((st::moe_i4::reference_activation_kernel<I4ReferenceSchedule>),dim3((t.pairs*kIB+7)/8),dim3(256),0,stream,(I4ReferenceSchedule{{v.y,v.out,t,false,true},aq_dn,as_dn,gu}));
     launched("iu4 swiglu + down transform + quantiser");
     mark("finish", stream);
     if (!v.i4_all) {
@@ -173,7 +168,7 @@ void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigne
     iu4_ok(st::launch_wmma_tiled_iu4_grouped(o, tiles, ntiles, max_tiles, dn, static_cast<int>(kInter), static_cast<int>(kHidden), stream, plan),
            "iu4 down");
     mark("down", stream);
-    hipLaunchKernelGGL(iu4_combine_kernel, dim3((t.rows * kHB + 7) / 8), dim3(256), 0, stream, t, dn, v.out);
+    hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<I4Binding>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,(I4Binding{v.y,v.out,t,false}),dn,t.rows,kTopE);
     launched("iu4 combine");
     mark("combine", stream);
 }

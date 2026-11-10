@@ -7,13 +7,13 @@ __device__ __forceinline__ uint32_t mul1_sum(uint32_t state) {
     return __builtin_amdgcn_udot4(state * 0x83dcd12du, 0x01010101u, 0, false);
 }
 __device__ __forceinline__ __half mul1_half(uint32_t state) {
-    return __hfma(__ushort_as_half(0x6400u + mul1_sum(state)),
+    return __hfma(__ushort_as_half(static_cast<unsigned short>(0x6400u + mul1_sum(state))),
                   __ushort_as_half(0x1eee), __ushort_as_half(0xc931));
 }
 // Low half is the first state. Suitable for a subsequent packed FP16 dot.
 __device__ __forceinline__ __half2 mul1_half2(uint32_t first, uint32_t second) {
-    __half2 input = __halves2half2(__ushort_as_half(0x6400u + mul1_sum(first)),
-                                  __ushort_as_half(0x6400u + mul1_sum(second)));
+    __half2 input = __halves2half2(__ushort_as_half(static_cast<unsigned short>(0x6400u + mul1_sum(first))),
+                                  __ushort_as_half(static_cast<unsigned short>(0x6400u + mul1_sum(second))));
     return __hfma2(input, __halves2half2(__ushort_as_half(0x1eee), __ushort_as_half(0x1eee)),
                          __halves2half2(__ushort_as_half(0xc931), __ushort_as_half(0xc931)));
 }

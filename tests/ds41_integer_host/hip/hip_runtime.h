@@ -10,7 +10,9 @@
 #define __device__
 #define __forceinline__ inline
 inline struct HostDim { unsigned x = 0; } threadIdx, blockDim{32};
+#if defined(_MSC_VER)
 inline unsigned __builtin_popcount(unsigned v) { return std::popcount(v); }
+#endif
 inline float __uint_as_float(unsigned v) { return std::bit_cast<float>(v); }
 inline float __int_as_float(int v) { return std::bit_cast<float>(v); }
 inline unsigned __builtin_amdgcn_perm(unsigned a, unsigned b, unsigned selectors) {

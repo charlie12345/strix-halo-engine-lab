@@ -94,7 +94,7 @@ __global__ void argmax_pick_kernel(const std::uint32_t* c0, const std::uint32_t*
     out[r] = i0 == 0xFFFFFFFFU || i1 == 0xFFFFFFFFU ? 0xFFFFFFFFU : v1 > v0 ? i1 : i0;  // tie: rank 0 (lower ids)
 }
 
-std::uint64_t env_u64(const char* name, std::uint64_t fallback) {
+[[maybe_unused]] std::uint64_t env_u64(const char* name, std::uint64_t fallback) {
     const char* v = std::getenv(name);
     return v != nullptr && *v != '\0' ? std::stoull(v) : fallback;
 }

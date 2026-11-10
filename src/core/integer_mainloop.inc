@@ -70,7 +70,7 @@ for (int chunk = 0; chunk < groups; chunk += Relaxed ? 1 : 32) {
                     #pragma unroll
                     for (int j = 0; j < 32; ++j) {
                         int value;
-                        if constexpr (Affine) value = int((raw.q[j / 4] >> (8 * (j % 4) + raw.shift)) & 3U);
+                        if constexpr (Affine) value = int((raw.q[j / 4] >> (8U * unsigned(j % 4) + raw.shift)) & 3U);
                         else {
                             const auto v = j < 16 ? weight.b0 : weight.b1;
                             value = integer_math::iq4(int(static_cast<signed char>(unsigned(v[(j % 16) / 4]) >> (8 * (j % 4)))));

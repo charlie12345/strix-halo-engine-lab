@@ -182,15 +182,18 @@ struct Runner {
         if (dd != nullptr) for (std::uint32_t s = 0; s < eng.slots(); ++s)
             if ((mask >> s) & 1U) dd->drop_staged(s);
     }
+    // `resident` positions of the slot are a reused prefix already in the cache; only `prompt` (the suffix) is
+    // prefilled, opening at that position. The reused prefix's drafter taps stay archived (drop_staged clears only
+    // the deferred staging, not the archive); the lead only reuses when the drafter window is covered (see Lead).
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> prompt, bool context,
-                       std::uint64_t id, std::uint64_t parent = 0, std::uint64_t generation = 0) {
+                       std::uint64_t id, std::uint64_t parent = 0, std::uint64_t generation = 0, std::uint64_t resident = 0) {
         contexts = (contexts & ~(1U << slot)) | (context ? 1U << slot : 0U);
         if (dd != nullptr) dd->drop_staged(slot);  // a new sequence: the previous one's staged rows are never read
         mm::Engine::PrefillTapSink sink;
         if (dd != nullptr && context)
             sink = [this](const float* taps, std::size_t n, std::uint32_t s, std::uint64_t pos0) { if ((contexts >> s) & 1U) dd->append(s, taps, n, pos0, nullptr); };
         if (id == 0) throw std::runtime_error("prefill begin: missing task ID");
-        eng.prefill_begin_task(id, parent, generation, slot, prompt, std::move(sink));
+        eng.prefill_begin_task(id, parent, generation, slot, prompt, resident, std::move(sink));
     }
     void prefill_check(std::uint64_t id, std::uint32_t next) const {
         const auto p = eng.prefill_progress();
@@ -626,6 +629,7 @@ sv::Json policy_json(Shared& shared, bool drafter) {
     b.set("dspark", sv::Json(drafter && (p.dspark_mode == ds::Mode::on || shared.dspark_contexts != 0)));
     b.set("dspark_mode", sv::Json(ds::mode_name(p.dspark_mode)));
     b.set("lookup", sv::Json(p.lookup));
+    b.set("prefix_cache", sv::Json(shared.prefix_reuse));
     b.set("dspark_effective", sv::Json(p.dspark_mode == ds::Mode::on && drafter ? "on" : p.dspark_mode == ds::Mode::automatic && p.dspark_prior == ds::Prior::structural_v1 && drafter ? "per_request" : "plain"));
     b.set("dspark_assets", sv::Json(drafter));
     b.set("dspark_live", sv::Json(static_cast<std::int64_t>(shared.dspark_live)));
@@ -893,8 +897,11 @@ int main(int argc, char** argv) {
         const char* session_switch = std::getenv("STRIX_SESSION_CACHE");
         const bool session_explicit = session_cli || (session_switch &&
             (std::string(session_switch) == "1" || std::string(session_switch) == "on"));
+        bool prefix_agreed = false;
         const bool session_vote = ms::session_hello(eng, session_config.reason != "baseline" &&
-            (session_config.enabled || session_explicit));
+            (session_config.enabled || session_explicit), ms::lead::prefix_cache_requested(), &prefix_agreed);
+        if (ms::lead::prefix_cache_requested() && !prefix_agreed)
+            std::printf("minimax serve: prefix reuse off (STRIX_MM_SERVE_PREFIX=1 here, the peer did not vote for it)\n");
         if (session_vote) {
             try {
                 if (session_cli) {
@@ -955,6 +962,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         Shared shared;
+        shared.prefix_reuse = prefix_agreed;
         {
             shared.policy.nest = env_num("STRIX_MM_SERVE_NEST", 1) != 0;
             shared.nest_rows = eng.nested_rows();
@@ -1001,6 +1009,7 @@ int main(int argc, char** argv) {
         oi.load_seconds = lr.seconds;
         oi.device_used_bytes = static_cast<std::uint64_t>(std::max(0.0, lr.device_gib) * 1073741824.0);
         oi.draft = drafter != nullptr;
+        oi.prefix_cache = prefix_agreed;
         ms::Observer observer(std::move(oi));
         ms::MinimaxApiOptions ao;
         ao.session_enabled = session_runtime != nullptr;
@@ -1049,6 +1058,7 @@ int main(int argc, char** argv) {
         http.listen();
         std::thread http_thread([&] { http.serve(); });
         std::printf("minimax serve policy: %s\n", policy_json(shared, drafter != nullptr).dump().c_str());
+        if (shared.prefix_reuse) std::printf("minimax serve: prefix reuse on (STRIX_MM_SERVE_PREFIX=1 on both ranks)\n");
         std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu sched %s gap %.0f ms dspark %s\n", bind.c_str(), http.port(),
                     model_id.c_str(), opt.slots, static_cast<unsigned long long>(opt.capacity),
                     shared.policy.sched == Sched::interleave ? "interleave" : "off", shared.policy.gap_ms, ds::mode_name(shared.policy.dspark_mode));

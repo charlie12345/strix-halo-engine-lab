@@ -4738,6 +4738,8 @@ if(STRIX_FAMILY_MINIMAX)
             set_tests_properties(minimax-session-gate-helpers PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
             add_test(NAME minimax-session-phasing COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/minimax_session_phasing_tests.py)
             add_test(NAME minimax-session-default-observer COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/minimax_session_default_probe_tests.py)
+            # The prefix-reuse exactness gate itself needs the running pair; only its comparison logic is checked here.
+            add_test(NAME minimax-prefix-cache-gate-selftest COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/minimax_prefix_cache_gpu_gate.py self-test)
         endif()
     endif()
     # MiniMax tokenizer (tokenizer.json BPE: o200k-style split, NFC, byte level) and chat template, host only.

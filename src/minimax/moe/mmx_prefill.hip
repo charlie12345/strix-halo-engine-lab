@@ -1031,7 +1031,7 @@ constexpr unsigned kDevGroups = kExperts + 1;
 constexpr unsigned kGuSlot = 2 * kDevGroups, kDnSlot = kDevGroups;  // items per class: gate+up per group / down
 constexpr unsigned kDevItems = 8 * kGuSlot + 8 * kDnSlot;
 struct DevMeta {  // [0..7] gate/up classes, [8..15] down classes
-    unsigned count[16], total[16], next[16];
+    unsigned count[16], total[16];
 };
 struct DevOut {
     PGroup* groups;
@@ -1047,7 +1047,7 @@ struct DevOut {
     _Float16* at;
     float* part;
     unsigned tpairs;
-    unsigned grid7[2];  // the direct MT8 grids (grid_mt8) of the two stages
+    unsigned grid[16];  // the launch grid of every (stage, class): a bound of its CTAs (class_grids)
 };
 struct DevPolicy {
     static constexpr unsigned kExperts = ::strix::minimax::moe::opt::kExperts, kTopK = kTopE, kRows = 256;
@@ -1188,10 +1188,8 @@ struct DevPolicy {
         if (x < 16) {
             p.out.meta->count[x] = ncls[kDevGroups][x];
             p.out.meta->total[x] = ncta[kDevGroups][x];
-            p.out.meta->next[x] = 0;
+            if (ncta[kDevGroups][x] > p.out.grid[x]) atomicOr(p.flag, 2U);  // above the launch grid (bug)
         }
-        if (x == 0 && (ncta[kDevGroups][7] > p.out.grid7[0] || ncta[kDevGroups][15] > p.out.grid7[1]))
-            atomicOr(p.flag, 2U);  // above the direct MT8 grid
     }
     __device__ static void routed(const A& p, unsigned r, unsigned k, unsigned e, float w, unsigned pos) {
         p.out.pair_row[pos] = r;
@@ -1276,24 +1274,16 @@ unsigned* dev_flag() {
         case 6: CALL(6); break;     \
         default: CALL(8); break;    \
     }
-// Tail classes MT 1..7 (grouped_kernel<MT, 4>): persistent, resident-capacity grid.
+// grouped_kernel<MT, 4> (tail classes MT 1..7, and MT8 without PIPE / core8).
 template <int MT> __global__ __launch_bounds__(128) void dq_v4_kernel(Queue q) {
-    dp::run_items<true>(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
-#define STRIX_MMX_CALL(B) pfk::item_core_v3<B, MT, 0, true>(it, bx, by, bz)
-        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
-#undef STRIX_MMX_CALL
-    });
-}
-// MT8 class (launch_class<4> class 7): direct, grid = the class bound.
-template <int MT> __global__ __launch_bounds__(128) void dq_v4_direct_kernel(Queue q) {
-    dp::run_items<false>(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+    dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
 #define STRIX_MMX_CALL(B) pfk::item_core_v3<B, MT, 0, true>(it, bx, by, bz)
         STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
 #undef STRIX_MMX_CALL
     });
 }
 template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_kernel(Queue q) {
-    dp::run_items<false>(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+    dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
 #define STRIX_MMX_CALL(B) pfk::pipe_or_tail<B, 8, 4, Simplify, Packed>(it, bx, by, bz)
         STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
 #undef STRIX_MMX_CALL
@@ -1301,7 +1291,7 @@ template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_
 }
 template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_pair_kernel(Queue q) {
     __shared__ pfk::Half16 exchange[128];  // as grouped_pipe_pair_kernel
-    dp::run_items<false>(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+    dp::run_items(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
 #define STRIX_MMX_CALL(B) pfk::pipe_pair_or_tail<B, Simplify, Packed>(it, bx, by, bz, exchange)
         STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
 #undef STRIX_MMX_CALL
@@ -1309,7 +1299,7 @@ template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_
 }
 template <int Core8> __global__ __launch_bounds__(128) void dq_core8_kernel(Queue q) {
     __shared__ pfk::Half16 exchange[256];  // as grouped_core8_kernel
-    dp::run_items<false>(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+    dp::run_items(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
 #define STRIX_MMX_CALL(B) pfk::item_core8<B, Core8>(it, bx, by, bz, exchange)
         STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
 #undef STRIX_MMX_CALL
@@ -1317,37 +1307,19 @@ template <int Core8> __global__ __launch_bounds__(128) void dq_core8_kernel(Queu
 }
 #undef STRIX_MMX_BITS_SWITCH
 
-unsigned device_cus() {
-    static const unsigned cus = [] {
-        int dev = 0, n = 0;
-        ok(hipGetDevice(&dev), "device");
-        ok(hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev), "CU count");
-        return static_cast<unsigned>(std::max(n, 1));
-    }();
-    return cus;
-}
-template <int MT> void launch_dq_tail(const Queue& q, hipStream_t stream) {
-    static const unsigned grid = [] {
-        int blocks = 0;
-        ok(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, reinterpret_cast<const void*>(&dq_v4_kernel<MT>), 128, 0),
-           "tail occupancy");
-        return static_cast<unsigned>(std::max(blocks, 1)) * device_cus();
-    }();
-    hipLaunchKernelGGL(dq_v4_kernel<MT>, dim3(grid), dim3(128), 0, stream, q);
-}
-void launch_dq_class(const Queue& q, unsigned cls, unsigned grid7, hipStream_t stream, bool pair) {
+void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t stream, bool pair) {
+    const dim3 g(grid);
     switch (cls) {
-        case 0: launch_dq_tail<1>(q, stream); return;
-        case 1: launch_dq_tail<2>(q, stream); return;
-        case 2: launch_dq_tail<3>(q, stream); return;
-        case 3: launch_dq_tail<4>(q, stream); return;
-        case 4: launch_dq_tail<5>(q, stream); return;
-        case 5: launch_dq_tail<6>(q, stream); return;
-        case 6: launch_dq_tail<7>(q, stream); return;
+        case 0: hipLaunchKernelGGL(dq_v4_kernel<1>, g, dim3(128), 0, stream, q); return;
+        case 1: hipLaunchKernelGGL(dq_v4_kernel<2>, g, dim3(128), 0, stream, q); return;
+        case 2: hipLaunchKernelGGL(dq_v4_kernel<3>, g, dim3(128), 0, stream, q); return;
+        case 3: hipLaunchKernelGGL(dq_v4_kernel<4>, g, dim3(128), 0, stream, q); return;
+        case 4: hipLaunchKernelGGL(dq_v4_kernel<5>, g, dim3(128), 0, stream, q); return;
+        case 5: hipLaunchKernelGGL(dq_v4_kernel<6>, g, dim3(128), 0, stream, q); return;
+        case 6: hipLaunchKernelGGL(dq_v4_kernel<7>, g, dim3(128), 0, stream, q); return;
         default: break;
     }
     // Class 7: the kernel that launch_class<4> selects, from the same switches.
-    const dim3 g(grid7);
     if (prefill_pipe() != 0) {
         const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
         if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false>), g, dim3(128), 0, stream, q);
@@ -1360,14 +1332,34 @@ void launch_dq_class(const Queue& q, unsigned cls, unsigned grid7, hipStream_t s
     }
     if (prefill_core8() == 1) hipLaunchKernelGGL((dq_core8_kernel<1>), g, dim3(128), 0, stream, q);
     else if (prefill_core8() == 2) hipLaunchKernelGGL((dq_core8_kernel<2>), g, dim3(128), 0, stream, q);
-    else hipLaunchKernelGGL((dq_v4_direct_kernel<8>), g, dim3(128), 0, stream, q);
+    else hipLaunchKernelGGL((dq_v4_kernel<8>), g, dim3(128), 0, stream, q);
 }
-// MT8-class CTA bound of a stage: an MT8 item is a group's 128-row tiles (floor(n / 128)) or its remainder when that
-// is >= 113 rows, both with splits 1 (n >= 113); floor(n / 128) + [n % 128 >= 113] <= n / 113 and the groups hold 5T
-// rows, so the class has at most gx x matrices x floor(5T / 113) CTAs (the planner flags a larger total).
-unsigned grid_mt8(unsigned stage, unsigned T) {
+// CTA bound of every (stage, class) for any routes of T rows: the launch grids (surplus CTAs return at once).
+// MT8: an MT8 item is the 128-row tiles of a group (floor(n / 128)) or its remainder when that is >= 113 rows, both with
+// splits 1 (n >= 113); floor(n / 128) + [n % 128 >= 113] <= n / 113 and the groups hold 5T rows, so these items have at
+// most gx x matrices x floor(5T / 113) CTAs. Tail items of class c: at most one per matrix and group, so 129 groups x
+// gx x matrices x the largest split count of a group size whose remainder falls in class c.
+std::array<unsigned, 16> class_grids(unsigned T) {
+    static unsigned cached_t = 0;
+    static std::array<unsigned, 16> cached{};
+    if (cached_t == T) return cached;
+    std::array<unsigned, 16> g{};
+    for (unsigned n = 1; n <= T; ++n) {
+        const auto fit = route::mtfit(n);
+        if (fit.remainder == 0) continue;
+        for (const unsigned bits : {3U, 4U, 5U, 6U, 8U}) {
+            g[fit.tail_class] = std::max(g[fit.tail_class], 2U * (kInter / 128) * route::gemm_splits(kHidden, kInter, bits, n));
+            g[8 + fit.tail_class] = std::max(g[8 + fit.tail_class], (kHidden / 128) * route::gemm_splits(kInter, kHidden, bits, n));
+        }
+    }
+    for (unsigned c = 0; c < 16; ++c) g[c] *= kDevGroups;
     const unsigned tiles = std::max(1U, 5U * T / 113U);
-    return stage == 0 ? 2U * (kInter / 128) * tiles : (kHidden / 128) * tiles;
+    g[7] += 2U * (kInter / 128) * tiles;
+    g[15] += (kHidden / 128) * tiles;
+    for (auto& v : g) v = std::max(v, 1U);
+    cached = g;
+    cached_t = T;
+    return cached;
 }
 
 void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
@@ -1396,8 +1388,8 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
     a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
     a.out.part = reinterpret_cast<float*>(ws + l.part);
     a.out.tpairs = l.tpairs;
-    a.out.grid7[0] = grid_mt8(0, T);
-    a.out.grid7[1] = grid_mt8(1, T);
+    const auto grids = class_grids(T);
+    for (unsigned c = 0; c < 16; ++c) a.out.grid[c] = grids[c];
     mark("start", stream);
     ok(dp::enqueue(a, stream), "device plan");
     Tables t{};
@@ -1421,18 +1413,17 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
     DevMeta* meta = a.out.meta;
     auto queue = [&](unsigned stage, unsigned c) {
         const unsigned qi = stage * 8U + c;
-        return Queue{a.out.items + (stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot), &meta->count[qi], &meta->total[qi],
-                     &meta->next[qi]};
+        return Queue{a.out.items + (stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot), &meta->count[qi], &meta->total[qi]};
     };
     // As the stage() of enqueue_prefill_moe: tails (MT 1..7) on the side stream beside MT8, joined before the consumer.
     auto stage = [&](unsigned s, const char* const* labels) {
         if (side) tail_fork(stream);
         try {
             for (unsigned c = 0; c < 7; ++c) {
-                launch_dq_class(queue(s, c), c, 0, side ? g_tail_side : stream, pair);
+                launch_dq_class(queue(s, c), c, grids[s * 8U + c], side ? g_tail_side : stream, pair);
                 if (!side) mark(labels[c], stream);
             }
-            launch_dq_class(queue(s, 7), 7, grid_mt8(s, T), stream, pair);
+            launch_dq_class(queue(s, 7), 7, grids[s * 8U + 7], stream, pair);
             mark(labels[7], stream);
         } catch (...) {
             if (side) tail_join(stream);
@@ -1593,7 +1584,7 @@ void prefill_moe_device_check() {
     ok(hipMemcpy(&flag, g_dev_flag, sizeof(flag), hipMemcpyDeviceToHost), "device plan flag read");
     if (flag != 0) {
         ok(hipMemset(g_dev_flag, 0, sizeof(unsigned)), "device plan flag reset");
-        throw std::runtime_error(flag & 2U ? "minimax prefill moe: device plan MT8 class above its grid bound (bug)"
+        throw std::runtime_error(flag & 2U ? "minimax prefill moe: device plan class above its grid bound (bug)"
                                             : "minimax prefill moe: device plan saw invalid routes (expert id >= 128 or repeated in a row)");
     }
 }

@@ -507,8 +507,27 @@ void test_disk() {
             if (e.is_regular_file() && (e.path().extension() == ".blk" || e.path().extension() == ".snp")) physical += e.file_size();
         expect(physical <= one * 2U + one / 2U, "full tier: files on disk within the quota");
     }
+    {  // The quota is exactly one state; no spare room for in-flight double counting.
+        const auto x = random_tokens(512, rng), y = random_tokens(512, rng);
+        std::uint64_t one = 0;
+        {
+            ds::PrefixCache probe(disk_options(fresh_dir("tight-probe")));
+            expect(probe.insert(synthetic(x, 512U), 0U), "tight sizing probe");
+            one = probe.stats().disk_bytes;
+        }
+        const auto root = fresh_dir("tight");
+        auto o = disk_options(root / "ns0", 0U, one);
+        o.quota_dir = root; o.aggregate_disk_budget_bytes = one;
+        ds::PrefixCache cache(o);
+        expect(cache.insert(synthetic(x, 512U), 0U), "tight first state");
+        // Deliberately no flush: eviction must drain pending writes and deletions before reserving y.
+        expect(cache.insert(synthetic(y, 512U), 0U), "tight replacement without caller flush");
+        cache.flush(); cache.clear_ram();
+        expect(cache.lookup(y).resume == 512U && cache.lookup(y).disk, "tight replacement persisted");
+        expect(cache.lookup(x).resume == 0U && cache.stats().disk_bytes <= one, "tight old state evicted within quota");
+    }
 #endif
-    for (const char* n : {"disk", "other", "late", "probe", "budget", "r0", "r1", "resources", "free-floor", "peer-denial", "aggregate", "aggregate-probe", "full", "full-probe"}) fs::remove_all(fs::temp_directory_path() / (std::string("ds41-prefix-cache-test-") + n));
+    for (const char* n : {"disk", "other", "late", "probe", "budget", "r0", "r1", "resources", "free-floor", "peer-denial", "aggregate", "aggregate-probe", "full", "full-probe", "tight", "tight-probe"}) fs::remove_all(fs::temp_directory_path() / (std::string("ds41-prefix-cache-test-") + n));
 }
 
 }  // namespace

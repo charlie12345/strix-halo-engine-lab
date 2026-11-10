@@ -63,7 +63,7 @@ persistence-refusal contracts are tested.
 
 Both ranks admit capture before planning/copying. Host leases cap retention at 1024 MiB per
 service user/node. Explicit disk uses one shared service root: an aggregate directory quota of
-max(4096 MiB, tier ceiling), 128 MiB outstanding payloads, 16384 MiB free-space floor; separate roots/users are outside
+max(4096 MiB, tier ceiling) (unlimited with `--prefix-cache-disk-mb 0`), 128 MiB outstanding payloads, 16384 MiB free-space floor; separate roots/users are outside
 one disk quota. Target kernels and numerical identity are unchanged. Exactness means live
 continuation state, fresh logits and complete IDs, with the documented digest normalization.
 

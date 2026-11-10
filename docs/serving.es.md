@@ -17,6 +17,13 @@ petición, las opciones y las puertas están en [docs/engine/serving/serving.md]
 
 ## Exposición de los servidores
 
+En DeepSeek, `--prefix-cache-disk-mb` fija el límite del nivel de disco. La cuota
+del directorio compartido es el mayor de ese límite y 4096 MiB; con valor 0 el
+nivel y la cuota no tienen límite. Se mantienen el mínimo libre de 16384 MiB y
+el máximo de 128 MiB de payloads pendientes. Un nivel lleno expulsa sus estados
+menos usados y termina sus borrados antes de reservar otra escritura; no expulsa
+otros espacios de nombres. Véase el [contrato de caché](engine/serving/prefix-state-cache.md).
+
 Qwen y DeepSeek publican las funciones ejecutadas en `GET /v1/capabilities`; el objeto `strix` de cada respuesta
 indica la política de muestreo solicitada frente a la efectiva. En todos los servidores (Qwen, DeepSeek, MiniMax) los
 campos de generación no admitidos devuelven 400 indicando el campo. MiniMax decodifica de forma greedy: una temperatura

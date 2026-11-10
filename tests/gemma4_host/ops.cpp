@@ -67,7 +67,7 @@ int main() {
         for (unsigned l = 0; l < 32; ++l)
             for (unsigned chunk = l; chunk < (a.size()+15)/16; chunk += 32)
                 for (unsigned e = 0; e < 16; ++e) { const auto i = chunk*16+e; lane[l] = lane[l] + (i < a.size() ? a[i]*b[i] : 0); }
-        for (unsigned distance : {16,8,4,2,1}) {
+        for (unsigned distance : {16U,8U,4U,2U,1U}) {
             auto old = lane;
             for (unsigned l = 0; l < 32; ++l) lane[l] = old[l] + old[l^distance];
         }
@@ -91,7 +91,7 @@ int main() {
         CHECK(global[0] == old[0]*cs[0]-old[256]*sn[0]);
         std::ifstream rotary(std::string(G4_FIXTURE_DIR) + "/rope.bin",std::ios::binary);
         CHECK(rotary.good());
-        for (unsigned position : {0,511,512,65535}) for (unsigned route = 0; route < 2; ++route) {
+        for (unsigned position : {0U,511U,512U,65535U}) for (unsigned route = 0; route < 2; ++route) {
             const auto pairs = route ? 256U : 128U;
             std::vector<float> table(pairs*2); rotary.read(reinterpret_cast<char*>(table.data()),std::streamsize(table.size()*4));
             CHECK(rotary.good());

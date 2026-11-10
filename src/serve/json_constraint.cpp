@@ -434,7 +434,7 @@ struct ByteTrie {
         budget.literal(text.size());
         std::size_t at = 0;
         nodes[at].descendants.push_back(id);
-        for (unsigned char b : text) {
+        for (const char b_char : text) { unsigned char b = static_cast<unsigned char>(b_char);
             auto to = next(at, b);
             if (to == SIZE_MAX) {
                 budget.trie(); to = nodes.size();
@@ -633,7 +633,7 @@ private:
             case '{': {
                 p->bytes = 2;
                 for (auto& property : p->properties) {
-                    for (unsigned char b : property.name) property.scalars += (b & 0xc0U) != 0x80U;
+                    for (const char b_char : property.name) { unsigned char b = static_cast<unsigned char>(b_char); property.scalars += (b & 0xc0U) != 0x80U; }
                     property.suffix.resize(property.name.size() + 1); property.suffix.back() = 1;
                     for (std::size_t i = property.name.size(); i-- > 0;) {
                         const auto b = static_cast<unsigned char>(property.name[i]);
@@ -729,7 +729,7 @@ private:
                     }
                     auto child_plan = permitted ? child(std::move(sub), depth + 1) : std::make_shared<PlanSet>();
                     std::size_t scalars = 0;
-                    for (unsigned char byte : name) scalars += (byte & 0xc0U) != 0x80U;
+                    for (const char byte_char : name) { unsigned char byte = static_cast<unsigned char>(byte_char); scalars += (byte & 0xc0U) != 0x80U; }
                     if (scalars > d.limits.max_string_length || child_plan->alternatives.empty()) {
                         if (required) viable = false;
                         // Keep an empty value plan for a prohibited declared name.
@@ -940,7 +940,7 @@ bool unknown_name(const Frame& f, StringState text, std::size_t trie, std::uint6
         auto next = text; std::string scalar; bool closed;
         if (!next.feed(b, limits.max_string_length, scalar, closed) || closed) continue;
         auto to = trie; auto next_name = name;
-        for (unsigned char byte : scalar) {
+        for (const char byte_char : scalar) { unsigned char byte = static_cast<unsigned char>(byte_char);
             to = f.plan->trie.next(to, byte);
             if (next_name != UINT64_MAX) {
                 const auto id = name_lookup(f.object->names, (next_name << 9U) | byte);
@@ -1171,7 +1171,7 @@ void consume(Frame f, unsigned char b, const ConstraintLimits& limits, Constrain
             if (!f.text.feed(b, limits.max_string_length, scalar, closed)) return;
             if (!closed) {
                 auto object = f.plan->additional && !scalar.empty() ? std::make_shared<ObjectState>(*f.object) : nullptr;
-                for (unsigned char byte : scalar) {
+                for (const char byte_char : scalar) { unsigned char byte = static_cast<unsigned char>(byte_char);
                     f.trie = f.plan->trie.next(f.trie, byte);
                     if (object) {
                         if (f.name > (UINT64_MAX >> 9U) || object->next_name > (UINT64_MAX >> 9U)) return;
@@ -1262,7 +1262,7 @@ void schema_size(const Json& value, std::size_t& bytes, std::size_t limit, std::
     const auto add = [&](std::size_t n) { CompilationBudget::charge(bytes, n, limit); };
     const auto text = [&](std::string_view s) {
         add(2); if (s.size() > limit - bytes) error("", "limits", "schema byte limit");
-        for (unsigned char b : s) add(b == '"' || b == '\\' ? 2 : b >= 32 ? 1 : b == '\b' || b == '\f' || b == '\n' || b == '\r' || b == '\t' ? 2 : 6);
+        for (const char b_char : s) { unsigned char b = static_cast<unsigned char>(b_char); add(b == '"' || b == '\\' ? 2 : b >= 32 ? 1 : b == '\b' || b == '\f' || b == '\n' || b == '\r' || b == '\t' ? 2 : 6); }
     };
     if (value.is_string()) text(value.as_string());
     else if (value.is_number()) add(value.number_source().size());
@@ -1321,7 +1321,7 @@ bool ConstraintCursor::dead() const {
 }
 ConstraintCursor advance_token(ConstraintCursor cursor, std::string_view bytes) {
     if (bytes.empty()) throw ConstraintError("empty constraint token");
-    for (unsigned char b : bytes) if (!cursor.advance(b)) throw ConstraintError("token refused by constraint");
+    for (const char b_char : bytes) { unsigned char b = static_cast<unsigned char>(b_char); if (!cursor.advance(b)) throw ConstraintError("token refused by constraint"); }
     return cursor;
 }
 TokenByteTrie::TokenByteTrie(const BpeTokenizer& tokenizer, std::span<const std::uint32_t> excluded) : vocab_size_(tokenizer.vocab_size()) {
@@ -1338,7 +1338,7 @@ void TokenByteTrie::insert(std::string_view bytes, std::uint32_t id) {
     if (members_.size() < vocab_size_) members_.resize(vocab_size_, false);
     members_.at(id) = true;
     std::size_t at = 0;
-    for (unsigned char b : bytes) {
+    for (const char b_char : bytes) { unsigned char b = static_cast<unsigned char>(b_char);
         const auto it = std::find_if(nodes_[at].edges.begin(), nodes_[at].edges.end(), [&](auto e) { return e.first == b; });
         if (it != nodes_[at].edges.end()) at = it->second;
         else {

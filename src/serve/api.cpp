@@ -406,7 +406,7 @@ struct ApiService::Impl {
             out = std::move(canonical);
         }
         std::uint64_t hash = 14695981039346656037ULL;
-        for (const unsigned char c : out.dump()) { hash ^= c; hash *= 1099511628211ULL; }
+        for (const char c_char : out.dump()) { const unsigned char c = static_cast<unsigned char>(c_char); hash ^= c; hash *= 1099511628211ULL; }
         char hex[17]; std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(hash));
         capabilities_id = hex;
         out.set("capabilities_id", Json(capabilities_id));
@@ -748,7 +748,7 @@ struct ApiService::Impl {
     Json score_json(const TokenScore& score) const {
         const auto token = [&](std::uint32_t id, const std::optional<double>& value) {
             Json out = Json::object(), bytes = Json::array(); const auto raw = tokenizer->token_bytes(id);
-            for (const unsigned char b : raw) bytes.push(Json(static_cast<std::uint64_t>(b)));
+            for (const char b_char : raw) { const unsigned char b = static_cast<unsigned char>(b_char); bytes.push(Json(static_cast<std::uint64_t>(b))); }
             out.set("token", Json(sanitize_utf8(raw))); out.set("bytes", std::move(bytes));
             out.set("logprob", value ? Json(*value) : Json()); return out;
         };

@@ -316,10 +316,10 @@ struct DevicePrefill::Impl {
         if (rows <= 8) {
             const std::size_t need = std::size_t(rows) * (matrix.inputs + std::size_t(matrix.inputs / a8::group_width) * sizeof(a8::Meta));
             if (a8_scratch.size() < need) throw std::logic_error("g4-a8-v1 scratch not sized");
-            const gpu::A8Rows q{a8_scratch.as<std::int8_t>(), reinterpret_cast<a8::Meta*>(a8_scratch.as<std::int8_t>() + std::size_t(rows) * matrix.inputs),
+            const gpu::A8Rows a8_rows{a8_scratch.as<std::int8_t>(), reinterpret_cast<a8::Meta*>(a8_scratch.as<std::int8_t>() + std::size_t(rows) * matrix.inputs),
                                 matrix.inputs};
-            if (!quantized) gpu::a8_quantize(input, rows, matrix.inputs, q, queue);
-            if (!gpu::a8_linear(matrix, q, rows, output, {}, queue, failure.as<unsigned>())) throw std::logic_error("g4-a8-v1 decode linear refused");
+            if (!quantized) gpu::a8_quantize(input, rows, matrix.inputs, a8_rows, queue);
+            if (!gpu::a8_linear(matrix, a8_rows, rows, output, {}, queue, failure.as<unsigned>())) throw std::logic_error("g4-a8-v1 decode linear refused");
             return;
         }
         auto it = a8_prepared.find(matrix.data);

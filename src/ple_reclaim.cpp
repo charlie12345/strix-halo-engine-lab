@@ -711,8 +711,8 @@ void Prefetcher::on_gather(std::uint64_t first_position, std::span<const PleHash
             static_cast<unsigned long long>(receipt.bytes_read), static_cast<double>(receipt.read_wait_ns) / 1e6,
             static_cast<double>(receipt.copy_ns) / 1e6, static_cast<double>(receipt.hash_ns) / 1e6,
             static_cast<double>(receipt.stage_wait_ns) / 1e6, static_cast<unsigned long long>(a.bytes),
-            static_cast<double>(elapsed) / 1e6, seconds ? static_cast<double>(a.reads) / seconds : 0.0,
-            seconds ? static_cast<double>(a.bytes) / seconds / 1e6 : 0.0, static_cast<unsigned long long>(io.lookahead_bytes));
+            static_cast<double>(elapsed) / 1e6, static_cast<bool>(seconds) ? static_cast<double>(a.reads) / seconds : 0.0,
+            static_cast<bool>(seconds) ? static_cast<double>(a.bytes) / seconds / 1e6 : 0.0, static_cast<unsigned long long>(io.lookahead_bytes));
     }
     if (manager_ && snapshot.bound_exceeded) manager_->invalidate();
     if ((rolling() || config_.strict) && snapshot.bound_exceeded)
@@ -821,7 +821,7 @@ std::string Prefetcher::receipt_json() const {
     std::string direct;
     if (direct_) {
         const auto d = direct_->stats();
-        direct = ",\"reader_backend\":\"" + std::string(direct_->reader()) + "\",\"reader_fallback_errno\":" + u(direct_->fallback_errno()) + ",\"source_io\":\"O_DIRECT-owned\",\"page_cache_contribution_bytes\":0,\"reads_issued\":" + u(d.reads) +
+        direct = ",\"reader_backend\":\"" + std::string(direct_->reader()) + "\",\"reader_fallback_errno\":" + u(static_cast<std::uint64_t>(direct_->fallback_errno())) + ",\"source_io\":\"O_DIRECT-owned\",\"page_cache_contribution_bytes\":0,\"reads_issued\":" + u(d.reads) +
             ",\"peak_inflight\":" + u(d.peak_inflight) + ",\"bytes_read\":" + u(d.bytes) + ",\"cache_hits\":" + u(d.hits) +
             ",\"read_wait_hidden_ns\":" + u(d.hidden_wait_ns) + ",\"read_wait_exposed_ns\":" + u(d.exposed_wait_ns) +
             ",\"peak_owned_bytes\":" + u(d.peak_owned_bytes) + ",\"peak_used_bytes\":" + u(d.peak_used_bytes) +

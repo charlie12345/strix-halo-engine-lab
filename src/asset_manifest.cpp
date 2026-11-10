@@ -127,7 +127,7 @@ Json parse(std::string_view text, bool manifest) {
                 if (host != "huggingface.co" && host != "github.com" && host != "www.apache.org" &&
                     host != "spdx.org" && host != "creativecommons.org") invalid();
                 // Public source paths may contain Unicode scalars (already strict UTF-8).
-                for (const unsigned char c : value.substr(slash + 1)) {
+                for (const char c_char : value.substr(slash + 1)) { const unsigned char c = static_cast<unsigned char>(c_char);
                     if (c < 0x80U && !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                         (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '/')) invalid();
                 }

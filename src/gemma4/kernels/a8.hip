@@ -232,7 +232,7 @@ __device__ inline unsigned split_tree(float (&va)[split_rows(Rows)], float (&vb)
         } else {
             va[0] = va[0] + __shfl_xor(va[0], int(d), 16);
             if constexpr (Gate)
-                vb[0] = vb[0] + __shfl_xor(vb[0], d, 16);
+                vb[0] = vb[0] + __shfl_xor(vb[0], int(d), 16);
         }
     }
     return row;

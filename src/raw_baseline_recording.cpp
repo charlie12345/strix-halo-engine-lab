@@ -27,7 +27,7 @@ std::uint64_t mul(std::uint64_t a, std::uint64_t b) {
 std::string quote(const std::string& text) {
     constexpr char hex[] = "0123456789abcdef";
     std::string out = "\"";
-    for (unsigned char c : text) {
+    for (const char c_char : text) { unsigned char c = static_cast<unsigned char>(c_char);
         if (c == '"' || c == '\\') { out += '\\'; out += static_cast<char>(c); }
         else if (c < 32) { out += "\\u00"; out += hex[c >> 4]; out += hex[c & 15]; }
         else out += static_cast<char>(c);

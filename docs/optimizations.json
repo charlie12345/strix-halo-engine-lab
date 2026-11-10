@@ -1084,13 +1084,13 @@
   },
   {
     "engine": "deepseek",
-    "name": "Final KV ownership, prefill tiles and Engram cache",
-    "flag_or_env": "STRIX_DS41_PREFILL_FINAL_KV=all; STRIX_DS41_PREFILL_TILES=1 (opt-in); STRIX_DS41_PREFILL_TILES_MIN_ROWS=2048; STRIX_DS41_ENGRAM_PAYLOAD_CACHE",
+    "name": "Final KV ownership and Engram cache",
+    "flag_or_env": "STRIX_DS41_PREFILL_FINAL_KV=all; STRIX_DS41_ENGRAM_PAYLOAD_CACHE",
     "default": "auto",
     "exact": "The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms. Final KV qualification used prefill --reference and identical decode continuation.",
-    "gain": "Final KV 8K 714.9 -> 729.4 tok/s; cache 32K TTFT -1.63%; tiles on are slower on the current kernels (TTFT 2K/8K/32K +1.0/+3.4/+1.9 %), hence off",
-    "preconditions": "Row-split prefill with final ring/compressed-state owners; tile runs at least 2048 rows by default; a cache budget that fits memory.",
-    "off_switch": "STRIX_DS41_PREFILL_FINAL_KV=none or STRIX_DS41_ENGRAM_PAYLOAD_CACHE=0, separately (tiles are opt-in: STRIX_DS41_PREFILL_TILES=1)",
+    "gain": "Final KV 8K 714.9 -> 729.4 tok/s; cache 32K TTFT -1.63%",
+    "preconditions": "Row-split prefill with final ring/compressed-state owners; a cache budget that fits memory.",
+    "off_switch": "STRIX_DS41_PREFILL_FINAL_KV=none or STRIX_DS41_ENGRAM_PAYLOAD_CACHE=0, separately",
     "doc_anchor": "docs/optimizations.md#ds-prefill"
   },
   {
@@ -2005,17 +2005,6 @@
     "preconditions": "Decode steps with two sequences of one row each, both past 8191 positions (sparse), and a selection scratch that fits the 32 KB tile.",
     "off_switch": "STRIX_MM_ATTEND_DIET=0",
     "doc_anchor": "docs/optimizations.md#mm-attend-diet"
-  },
-  {
-    "engine": "minimax",
-    "name": "Decode index split by index head",
-    "flag_or_env": "STRIX_MMATTN_INDEX_SPLIT",
-    "default": "0",
-    "exact": "msa_fused_tests byte-compare split 0 and 1, sharded and unsharded (scores, selections, outputs); same dot order, scale and maximum tree; tokens identical in every pair run.",
-    "gain": "Opt-in, slower at C1 / 8K today: a later audit measured about +0.5 ms/token (duplicated index tiles); an earlier two-node pair run, 8K context, 48 decode steps, A B A B, measured 44.26 -> 44.15 ms/token",
-    "preconditions": "Decode index launches; prefill index query tiles are unchanged.",
-    "off_switch": "STRIX_MMATTN_INDEX_SPLIT unset or =0",
-    "doc_anchor": "docs/optimizations.md#mm-index-split"
   },
   {
     "engine": "minimax",

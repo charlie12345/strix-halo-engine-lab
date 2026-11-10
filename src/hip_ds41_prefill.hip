@@ -498,7 +498,7 @@ unsigned prefill_band() {
 // Q2_K down on split_down_v2_kernel in 16-row halves; the same bits.
 bool prefill_r2() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_R2");
-    return v && std::strcmp(v, "1") == 0 && (prefill_v2() & v2_on) != 0U && !prefill_tuning::tiles() && !stage_forced();
+    return v && std::strcmp(v, "1") == 0 && (prefill_v2() & v2_on) != 0U && !stage_forced();
 }
 template <WeightFormat Format, unsigned L>
 void launch_split_gate_up_v2(const PrefillGateUpView& view, hipStream_t stream) {
@@ -738,8 +738,7 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
         check(hipGetLastError(), "prefill gate/up launch");
         return;
     }
-    if (view.routes.batch_rows == 16U && !stage_forced() &&
-        !(prefill_tuning::tiles() && format == WeightFormat::q8_0) && view.hidden % 256U == 0U) {
+    if (view.routes.batch_rows == 16U && !stage_forced() && view.hidden % 256U == 0U) {
         if (format == WeightFormat::iq2_xxs) launch_split_gate_up<WeightFormat::iq2_xxs>(view, queue);
         else if (format == WeightFormat::q8_0) launch_split_gate_up<WeightFormat::q8_0>(view, queue);
         else launch_split_gate_up<WeightFormat::mxfp4>(view, queue);
@@ -785,8 +784,7 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         check(hipGetLastError(), "prefill down launch");
         return;
     }
-    if (view.routes.batch_rows == 16U && !stage_forced() &&
-        !(prefill_tuning::tiles() && (format == WeightFormat::q2_k || format == WeightFormat::q8_0 || prefill_tuning::down_stage(view.width, view.outputs))) && view.width % 256U == 0U) {
+    if (view.routes.batch_rows == 16U && !stage_forced() && view.width % 256U == 0U) {
         if (format == WeightFormat::q2_k) launch_split_down<WeightFormat::q2_k>(view, queue);
         else if (format == WeightFormat::q8_0) launch_split_down<WeightFormat::q8_0>(view, queue);
         else launch_split_down<WeightFormat::mxfp4>(view, queue);
@@ -884,12 +882,9 @@ void PrefillMoe::enqueue_experts(const PrefillMoeInputs& in, std::uint32_t chunk
     experts_rows(in, row0, rows, stream);
 }
 // Routes and expert products of rows [row0, row0 + rows) of `in` (at most chunk_rows), by the selected path.
-unsigned PrefillMoe::selected_batch_rows(unsigned rows) const {
-    if (!prefill_tuning::tiles())
-        return prefill_r2() && w_.gate_up_format == WeightFormat::iq2_xxs && w_.down_format == WeightFormat::q2_k &&
-                       w_.hidden % (split_chunk_groups * 32U) == 0U && w_.down_width % 256U == 0U ? 32U : 16U;
-    return prefill_tuning::tile_override("STRIX_DS41_PREFILL_MOE_TILE",
-        prefill_tuning::moe_rows(w_.hidden, w_.down_width, rows, top_k_, end_ - first_));
+unsigned PrefillMoe::selected_batch_rows(unsigned /*rows*/) const {
+    return prefill_r2() && w_.gate_up_format == WeightFormat::iq2_xxs && w_.down_format == WeightFormat::q2_k &&
+                   w_.hidden % (split_chunk_groups * 32U) == 0U && w_.down_width % 256U == 0U ? 32U : 16U;
 }
 void PrefillMoe::experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, std::uint32_t rows, void* stream) {
     const std::uint32_t owned = end_ - first_;

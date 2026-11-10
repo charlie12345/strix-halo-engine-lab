@@ -3062,8 +3062,6 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         return false;
     }
     unsigned outputs = 32U;
-    if (prefill_tuning::tiles())
-        outputs = prefill_tuning::tile_override("STRIX_DS41_PREFILL_DENSE_TILE", prefill_tuning::dense_outputs(v.width, v.count, v.rows));
     const dim3 grid((v.rows + 15U) / 16U, (v.count + outputs - 1U) / outputs);
     static const bool staged = [] {
         const char* e = std::getenv("STRIX_DS41_DENSE_FORM");

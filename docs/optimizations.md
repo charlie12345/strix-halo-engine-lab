@@ -1647,18 +1647,18 @@ Hides shared-expert work and attention-site HC mixes inside exchange waits.
 
 <a id="ds-prefill"></a>
 
-### Final KV ownership, prefill tiles and Engram cache
+### Final KV ownership and Engram cache
 
-**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_FINAL_KV=all; STRIX_DS41_PREFILL_TILES=1 (opt-in); STRIX_DS41_PREFILL_TILES_MIN_ROWS=2048; STRIX_DS41_ENGRAM_PAYLOAD_CACHE`. **Default:** auto.
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_FINAL_KV=all; STRIX_DS41_ENGRAM_PAYLOAD_CACHE`. **Default:** auto.
 
-Transfers final state instead of intermediate FP32 K/V and caches repeated Engram payloads; unsplit prefill tiles are available as an opt-in.
+Transfers final state instead of intermediate FP32 K/V and caches repeated Engram payloads.
 
-- **Preconditions:** Row-split prefill with final ring/compressed-state owners; tile runs at least 2048 rows by default; a cache budget that fits memory.
-- **Automatic selection:** Final KV defaults to all; prefill tiles are off (split-K kernels), and with STRIX_DS41_PREFILL_TILES=1 they apply above the row threshold; payload caching is on with STRIX_DS41_ENGRAM_PAYLOAD_CACHE_MIB controlling its cap.
-- **Fallback notice:** Subthreshold tiling silently keeps split-K. Cache misses use normal reads. No general decline line is printed for these ordinary selections.
+- **Preconditions:** Row-split prefill with final ring/compressed-state owners; a cache budget that fits memory.
+- **Automatic selection:** Final KV defaults to all; payload caching is on with STRIX_DS41_ENGRAM_PAYLOAD_CACHE_MIB controlling its cap.
+- **Fallback notice:** Cache misses use normal reads. No general decline line is printed for these ordinary selections.
 - **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms. Final KV qualification used prefill --reference and identical decode continuation.
-- **Off switch:** STRIX_DS41_PREFILL_FINAL_KV=none or STRIX_DS41_ENGRAM_PAYLOAD_CACHE=0, separately (tiles are opt-in: STRIX_DS41_PREFILL_TILES=1)
-- **Measured gain:** Final KV 8K 714.9 -> 729.4 tok/s; cache 32K TTFT -1.63%; tiles on are slower on the current kernels (TTFT 2K/8K/32K +1.0/+3.4/+1.9 %), hence off
+- **Off switch:** STRIX_DS41_PREFILL_FINAL_KV=none or STRIX_DS41_ENGRAM_PAYLOAD_CACHE=0, separately
+- **Measured gain:** Final KV 8K 714.9 -> 729.4 tok/s; cache 32K TTFT -1.63%
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
 <a id="ds-prefetch"></a>
@@ -3127,19 +3127,6 @@ On two single-row sparse decode sequences at 8K positions or more, the v3 attend
 - **Off switch:** STRIX_MM_ATTEND_DIET=0
 - **Measured gain:** Same binary/process bench on current main kernels (msa_fused_tests, STRIX_MMATTN_BENCH_DIET=1, graph, cache rotation; v3-full / v3 32 KB diet / v4 one head per wave): sparse N2/W1 8K 74.4 / 69.9 / 71.0, 32K 133.5 / 130.7 / 131.4, 128K 343.1 / 342.1 / 342.6 us/layer; the diet is chosen first. Controls: 8K N4 v3-full 122.8 vs diet 129.3 (stays v3). Earlier t9: 8K 83.9 -> 76.2 us
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
-
-<a id="mm-index-split"></a>
-
-### Decode index split by index head
-**Engine:** `minimax`. **Control:** `STRIX_MMATTN_INDEX_SPLIT`. **Default:** 0 (off; opt-in with `=1`).
-
-The decode MSA `index_kernel` launches grid x index-heads blocks, one index head per block, instead of one block scoring all index heads. Every block reads cached index-key rows only below the step's first new position and patches the new rows from the raw index keys, so no block reads a row another block is writing; only the head-0 block of each grid slot stores the new rows.
-
-- **Preconditions:** Decode index launches (prefill index query tiles are unchanged).
-- **Exactness evidence:** msa_fused_tests byte-compare split 0 and 1, sharded and unsharded (scores, selections, outputs); each score keeps the same dot order, scale and maximum tree; tokens identical in every pair run.
-- **Off switch:** STRIX_MMATTN_INDEX_SPLIT unset or =0
-- **Measured gain:** Opt-in, slower at C1 / 8K today: a later audit measured about +0.5 ms/token (duplicated index tiles); an earlier two-node pair run, 8K context, 48 decode steps, A B A B, measured 44.26 -> 44.15 ms/token.
-- **Implementation / evidence:** [fused MSA kernels](../src/minimax/attn/msa_fused.hip), [tests](../src/minimax/attn/msa_fused_tests.hip), [MSA notes](minimax-msa.md)
 
 <a id="mm-attend4-decode"></a>
 

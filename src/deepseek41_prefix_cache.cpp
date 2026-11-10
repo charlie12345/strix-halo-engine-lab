@@ -592,6 +592,14 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     // FAST MoE: every routed entry takes the relaxed kernels whatever the chunking and route selectors (window / sparse
     // paths are off under the lever), so its arithmetic is one identity
     if (env_or("STRIX_DS41_FAST_MOE") == "1") t += "prefill_moe=relaxed-v1;";
+    if (env_or("STRIX_DS41_FAST_I4") == "1") {
+        if (env_or("STRIX_DS41_FAST_MOE") == "1")
+            throw std::invalid_argument("FAST_I4 and FAST_MOE are distinct policies");
+        const auto scope = env_or("STRIX_DS41_FAST_I4_SCOPE");
+        if (!scope.empty() && scope != "all" && scope != "gu")
+            throw std::invalid_argument("STRIX_DS41_FAST_I4_SCOPE must be all or gu");
+        t += "prefill_moe=gguf-iu4-direct-v1:" + (scope.empty() ? std::string("all") : scope) + ";";
+    }
     if (env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1") {
         const auto picks = env_or("STRIX_DS41_FP16_CACHE");
         if (picks.empty() || env_or("STRIX_DS41_FP16_CACHE_READONLY") != "1")

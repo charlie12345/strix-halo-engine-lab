@@ -475,7 +475,7 @@ DevicePrefill::DevicePrefill(HostWeights weights, RopeTables t, Residency reside
     auto& b = *impl_;
     b.profile = profile;
     b.stats.attention = attention;
-    b.stats.attention_packed = attention == AttentionMode::wmma && attention_pack_enabled();
+    b.stats.attention_packed = attention == AttentionMode::flash || (attention == AttentionMode::wmma && attention_pack_enabled());
     b.stats.canonical_kernel = attention == AttentionMode::canonical && canonical_kernel_enabled();
     b.stats.linears = linears;
     b.stats.tiled = linears == Linears::wmma && tiled_enabled();
@@ -738,7 +738,14 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             auto* q = b.q.as<float>() + std::size_t(p.first) * c.heads * d;
             auto* att = b.att.as<float>() + std::size_t(p.first) * c.heads * d;
             const auto* reads = layer_reads + p.first;
-            if (b.stats.attention == AttentionMode::wmma) {
+            if (b.stats.attention == AttentionMode::flash) {
+                auto& owner = packed_producer[global ? 1 : 0];
+                const bool pack = owner != a.producer || !pack_reuse_enabled() || parts.size() > 1;
+                owner = a.producer;
+                prefill::attention_flash(q, reads, rows, c.heads, d, att, b.failure.as<unsigned>(), b.queue,
+                                         (global ? b.global_halves : b.attention_halves).data(),
+                                         p.stride, global ? p.stride : std::min(p.stride, c.window + rows - 1), pack);
+            } else if (b.stats.attention == AttentionMode::wmma) {
                 // Packs are reused across layers only within a one-segment pass: segments share the pack buffers.
                 auto& owner = packed_producer[global ? 1 : 0];
                 const bool pack = !b.stats.attention_packed || owner != a.producer || !pack_reuse_enabled() || parts.size() > 1;

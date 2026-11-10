@@ -91,7 +91,7 @@ public:
         const auto* attention_switch = std::getenv("STRIX_G4_PREFILL_ATTN");
         const auto attention = wmma_route ? prefill::resolve_attention(attention_switch ? attention_switch : "")
                                           : prefill::AttentionMode::canonical;
-        if (wmma_route) metadata_.set("prefill_attention",attention == prefill::AttentionMode::wmma ? prefill::attention_identity : "canonical");
+        if (wmma_route) metadata_.set("prefill_attention",prefill::attention_name(attention));
         metadata_.set("prefill_route",exl3_wmma ? exl3::prefill_identity : v2 ? prefill::v2_identity : wmma_route ? prefill::identity
                                        : a8_route ? "a8-many-row" : many_row ? "many-row" : "rows8");
         if (a8_route) std::cerr << "gemma4 prefill route a8-many-row (g4-a8-v1 linears, 512-row chunks)\n";

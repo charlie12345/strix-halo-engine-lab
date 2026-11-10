@@ -461,7 +461,7 @@ int main(int argc, char** argv) try {
               << (prefill.stats().tiled ? "true" : "false") << ",\"prepared_weights\":" << (prefill.stats().prepared ? "true" : "false")
               << ",\"direct_mode\":" << prefill.stats().direct
               << ",\"prepared_bytes\":" << prefill.stats().prepared_bytes << ",\"attention_identity\":\""
-              << (prefill.stats().attention == pf::AttentionMode::wmma ? pf::attention_identity : "g4-v1")
+              << (prefill.stats().attention == pf::AttentionMode::canonical ? "g4-v1" : pf::attention_name(prefill.stats().attention))
               << "\",\"attention_packed\":" << (prefill.stats().attention_packed ? "true" : "false")
               << ",\"canonical_kernel\":" << (prefill.stats().canonical_kernel ? "true" : "false")
               << ",\"hf_embedding\":\"" << args.hf_embedding << "\"}\n";

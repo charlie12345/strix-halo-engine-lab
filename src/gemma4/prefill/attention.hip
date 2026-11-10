@@ -1,6 +1,7 @@
 #include "device.hpp"
 #include "attention.hpp"
 #include <hip/hip_runtime.h>
+#include "../../attn_core/dense_flash_prefill.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
@@ -188,6 +189,8 @@ __global__ __launch_bounds__(128) void flash(const float* q, const gpu::KvRead* 
 // [width][key] each. Keys of the K16 tiles that hold [first, last] but lie
 // outside it are written as zeros, so every operand a tile reads is finite.
 __host__ __device__ constexpr unsigned split_stride(unsigned stride) { return (stride + 15U) / 16U * 16U; }
+// Split=false (flash): the V^T half holds plain FP16 V (no sign split); the negative half is unused.
+template <bool Split = true>
 __global__ __launch_bounds__(256) void pack_split(const gpu::KvRead* reads, unsigned rows, unsigned width, unsigned stride,
                                                   _Float16* packed, unsigned* failure) {
     __shared__ unsigned short positive[32][33], negative[32][33];
@@ -216,7 +219,7 @@ __global__ __launch_bounds__(256) void pack_split(const gpu::KvRead* reads, unsi
             bits = bit_cast<unsigned short>(half(v ? v[d] : 0.0F, failure));
         }
         packed[std::size_t(p) * width + d] = key;
-        positive[tx][ty + 8 * i] = bits & 0x8000U ? 0U : bits;
+        positive[tx][ty + 8 * i] = !Split ? bits : bits & 0x8000U ? 0U : bits;
         negative[tx][ty + 8 * i] = bits & 0x8000U ? bits & 0x7fffU : 0U;
     }
     __syncthreads();
@@ -225,7 +228,7 @@ __global__ __launch_bounds__(256) void pack_split(const gpu::KvRead* reads, unsi
         const auto p = p0 + tx;
         if (p > end || d >= width) continue;
         vpos[std::size_t(d) * vstride + p] = bit_cast<_Float16>(positive[ty + 8 * i][tx]);
-        vneg[std::size_t(d) * vstride + p] = bit_cast<_Float16>(negative[ty + 8 * i][tx]);
+        if constexpr (Split) vneg[std::size_t(d) * vstride + p] = bit_cast<_Float16>(negative[ty + 8 * i][tx]);
     }
 }
 __device__ inline bool nonfinite(float value) { return (bit_cast<unsigned>(value) & 0x7f800000U) == 0x7f800000U; }
@@ -441,7 +444,7 @@ void attention(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned
         // layer sharing its producer's KV within the same chunk).
         if (!repack) {}
         else if (split)
-            hipLaunchKernelGGL(pack_split, dim3((key_capacity + 61U) / 32U, (width + 31U) / 32U), dim3(256), 0, stream,
+            hipLaunchKernelGGL(pack_split<true>, dim3((key_capacity + 61U) / 32U, (width + 31U) / 32U), dim3(256), 0, stream,
                                reads, rows, width, packed_stride, static_cast<_Float16*>(packed), failure);
         else
             hipLaunchKernelGGL(pack, dim3(unsigned((std::size_t(key_capacity) * width + 255) / 256)), dim3(256), 0, stream,
@@ -452,6 +455,56 @@ void attention(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned
         G4_FLASH(8); G4_FLASH(16); G4_FLASH(32); G4_FLASH(64); G4_FLASH(256); G4_FLASH(512);
 #undef G4_FLASH
         default: throw std::invalid_argument("WMMA attention head dimension");
+    }
+    if (const auto e = hipGetLastError(); e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));
+}
+namespace {
+// Adapter of the shared dense flash core (src/attn_core/dense_flash_prefill.hpp): queries/output FP32
+// [row][head][D], K FP16 [pos][width] and V^T FP16 [width][vstride] from pack_split<false>, rows at consecutive
+// positions of one stream (reads[0]), sliding layers by their descriptor's window. Rope and q/k norms are applied.
+struct FlashArgs {
+    const float* q; const gpu::KvRead* reads; float* out; unsigned* failure; const _Float16* k; const _Float16* vt;
+    unsigned rows, heads, width, vstride, packed_stride;
+};
+template <unsigned D>
+struct FlashPolicy {
+    using Args = FlashArgs;
+    using Shape = attn_core::dense::Shape<D, group, D / 128U>;
+    static constexpr float kScaleLog2 = attention_scale * 1.44269504088896341F;
+    __device__ static bool valid(const Args& a) {
+        const auto& r = a.reads[0];
+        return r.position < max_positions && a.rows <= max_positions - r.position && r.width == a.width &&
+               r.position + a.rows - 1U < a.packed_stride;
+    }
+    __host__ __device__ static unsigned rows(const Args& a) { return a.rows; }
+    __device__ static unsigned position(const Args& a) { return unsigned(a.reads[0].position); }
+    __device__ static unsigned window(const Args& a) { return a.reads[0].global ? 0U : a.reads[0].window; }
+    __device__ static const float* query(const Args& a, unsigned row, unsigned h) { return a.q + (std::size_t(row) * a.heads + h) * D; }
+    __device__ static float* out(const Args& a, unsigned row, unsigned h) { return a.out + (std::size_t(row) * a.heads + h) * D; }
+    __device__ static const _Float16* key(const Args& a, unsigned p, unsigned kvh) { return a.k + std::size_t(p) * a.width + kvh * D; }
+    __device__ static const _Float16* value_t(const Args& a, unsigned kvh, unsigned d) { return a.vt + std::size_t(kvh * D + d) * a.vstride; }
+    __device__ static unsigned* failure(const Args& a) { return a.failure; }
+};
+} // namespace
+void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned heads, unsigned dim, float* out,
+                     unsigned* failure, gpu::Queue queue, void* packed, unsigned packed_stride, unsigned key_capacity, bool repack) {
+    if (!rows || rows > max_chunk_rows || !heads || heads % group || !q || !reads || !out || !failure || !packed)
+        throw std::invalid_argument("flash attention geometry");
+    if (!packed_stride || packed_stride > max_positions) throw std::invalid_argument("flash attention packed stride");
+    const auto stream = static_cast<hipStream_t>(queue);
+    const auto width = heads / group * dim;
+    if (!key_capacity) key_capacity = packed_stride;
+    if (key_capacity > packed_stride) throw std::invalid_argument("flash attention key capacity");
+    if (repack)
+        hipLaunchKernelGGL(pack_split<false>, dim3((key_capacity + 61U) / 32U, (width + 31U) / 32U), dim3(256), 0, stream,
+                           reads, rows, width, packed_stride, static_cast<_Float16*>(packed), failure);
+    const auto* k = static_cast<const _Float16*>(packed);
+    const FlashArgs a{q, reads, out, failure, k, k + std::size_t(split_stride(packed_stride)) * width, rows, heads, width,
+                      split_stride(packed_stride), packed_stride};
+    switch (dim) {
+    case 256: attn_core::dense::launch<FlashPolicy<256>>(a, heads, stream); break;
+    case 512: attn_core::dense::launch<FlashPolicy<512>>(a, heads, stream); break;
+    default: throw std::invalid_argument("flash attention head dimension");
     }
     if (const auto e = hipGetLastError(); e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));
 }

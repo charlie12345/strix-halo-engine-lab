@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.24)
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/StrixHipArchs.cmake")
 
+# Single-config builds default to optimized code; explicit configurations and
+# multi-config generators keep their existing selection. Select before project():
+# the MSVC platform otherwise supplies its own implicit Debug default.
+get_property(strix_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT strix_multi_config AND NOT DEFINED CMAKE_BUILD_TYPE AND NOT "$ENV{CMAKE_BUILD_TYPE}" STREQUAL "")
+    set(CMAKE_BUILD_TYPE "$ENV{CMAKE_BUILD_TYPE}" CACHE STRING "Build type")
+endif()
+if(NOT strix_multi_config AND "${CMAKE_BUILD_TYPE}" STREQUAL "")
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type: Debug, Release, RelWithDebInfo or MinSizeRel" FORCE)
+    message(STATUS "CMAKE_BUILD_TYPE not set: using Release")
+endif()
+
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
@@ -8,14 +20,6 @@ option(STRIX_CUDA_QWEN_ONLY "Build only the CUDA Qwen prefill service and gates"
 if(STRIX_CUDA_QWEN_ONLY)
     include(cmake/QwenCuda.cmake)
     return()
-endif()
-
-# A single-config tree configured without a build type applies no CMAKE_<LANG>_FLAGS_<CONFIG>: every host source and
-# every device kernel compiles unoptimized, and the result still links, loads and runs. An explicit type always wins.
-get_property(strix_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-if(NOT strix_multi_config AND NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type: Debug, Release, RelWithDebInfo or MinSizeRel" FORCE)
-    message(STATUS "CMAKE_BUILD_TYPE not set: using Release")
 endif()
 
 if(WIN32)

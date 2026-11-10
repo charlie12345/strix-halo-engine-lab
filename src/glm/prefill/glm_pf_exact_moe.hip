@@ -5,7 +5,18 @@
 #include "glm/common/glm_math.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
 #include "glm/prefill/glm_pf_wmma_x.hpp"
+#ifndef STRIX_GLM_PF_IU4_LIB
+#define STRIX_GLM_PF_IU4_LIB 0
+#endif
+#if STRIX_GLM_PF_IU4_LIB
+#include "core/wmma_tiled.hpp"
+#include "core/activation_quant.hpp"  // strix-trellis fast/iu4-grouped (STRIX_GLM_PF_IU4_TRELLIS_DIR/src)
+#endif
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstring>
+#include <vector>
 #include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
@@ -659,9 +670,21 @@ __global__ __launch_bounds__(kPlanRows) void plan_scatter_kernel(PlanArgs p) {
             p.pairs[p.off[e[k]] + p.blk[std::size_t{blockIdx.x} * E + e[k]] + p.rank[std::size_t{r} * 8U + k]] = r * P + k;
     p.pairs[p.off[E] + r] = r * P + 8U;
 }
+#include "glm/prefill/glm_pf_iu4.inc"
 // The grouped variants (v3 and the X cores): input transform, gate/up, activation, down, combine. grid_tiles is the
 // tile count (host plan) or its upper bound (device plan; surplus CTAs return on Args::ntiles).
-void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream) {
+void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream,
+                    const iu4::Layer* q = nullptr, const iu4::Scratch* qs = nullptr) {
+#if STRIX_GLM_PF_IU4_LIB
+    if (q != nullptr && qs != nullptr && (q->replace || ((selected == 11 || selected == 14) && wmma_x::enabled()))) {  // IU4 layer
+        wmma_x::moe_calls.fetch_add(1, std::memory_order_relaxed);
+        launch_iu4(a, grid_tiles, shared, *q, *qs, stream);
+        return;
+    }
+#else
+    (void)q;
+    (void)qs;
+#endif
     input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "v3 gate/up input transform");
     // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): the X3 calls (V11 / V14) on the WMMA linears.
@@ -943,6 +966,100 @@ void enqueue_device(const DeviceView& v, Plan& plan, void* ws, std::size_t bytes
            reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
            reinterpret_cast<_Float16*>(base + l.input), v3_row_buckets() ? 1U : 0U, off + E + 1};
     const auto grid_tiles = static_cast<unsigned>(std::size_t{v.rows} * P / 16U + E + 1U);
-    launch_grouped(a, grid_tiles, selected, v.shared, stream);
+    launch_grouped(a, grid_tiles, selected, v.shared, stream, v.iu4, v.iu4_scratch);
 }
+namespace iu4 {
+bool built() { return STRIX_GLM_PF_IU4_LIB != 0; }
+namespace {
+template<class T> T* device_alloc(std::size_t count, std::size_t& total) {
+    void* p = nullptr;
+    ok(hipMalloc(&p, count * sizeof(T)), "iu4 allocation");
+    total += count * sizeof(T);
+    return static_cast<T*>(p);
+}
+}  // namespace
+double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream) {
+#if STRIX_GLM_PF_IU4_LIB
+    const auto t0 = std::chrono::steady_clock::now();
+    for (unsigned e = 0; e < E; ++e) {
+        check_matrix(host_table[e].gate, H, I, false);
+        check_matrix(host_table[e].up, H, I, false);
+        check_matrix(host_table[e].down, I, H, false);
+        if (host_table[e].gate.bits != 4 || host_table[e].up.bits != 4 || host_table[e].down.bits != 4)
+            throw std::invalid_argument("glm pf iu4: routed experts must be 4-bit EXL3");
+    }
+    std::size_t scratch = 0;
+    auto* table = device_alloc<moe::ExpertSlices>(E, scratch);
+    ok(hipMemcpyAsync(table, host_table, E * sizeof(moe::ExpertSlices), hipMemcpyHostToDevice, stream), "iu4 table");
+    std::vector<const std::uint16_t*> cols(E);
+    auto* trellis_tab = device_alloc<const std::uint32_t*>(E, scratch);
+    for (unsigned m = 0; m < 3U; ++m) {
+        const unsigned K = m == 2U ? I : H, N = m == 2U ? H : I;
+        if (m == 2U && !q.wq[m]) continue;  // fast_i4 scope gate_up: the routed down stays EXL3
+        if (!q.wq[m] || !q.ws[m] || !q.svh[m]) throw std::invalid_argument("glm pf iu4: convert_into needs the buffers");
+        for (unsigned e = 0; e < E; ++e) cols[e] = (&host_table[e].gate)[m].svh;
+        ok(hipMemcpyAsync(const_cast<const std::uint16_t**>(q.svh[m]), cols.data(), E * sizeof(void*), hipMemcpyHostToDevice, stream),
+           "iu4 svh table");
+        ok(hipStreamSynchronize(stream), "iu4 svh table");  // cols is reused for the next matrix
+        // The shared strix-trellis converter (convert_exl3_iu4, fast/exl3-iu4-fused): one per-expert trellis pointer table.
+        std::vector<const std::uint32_t*> tr(E);
+        for (unsigned e = 0; e < E; ++e) tr[e] = (&host_table[e].gate)[m].trellis;
+        ok(hipMemcpyAsync(trellis_tab, tr.data(), E * sizeof(void*), hipMemcpyHostToDevice, stream), "iu4 trellis table");
+        iu4_ok(strix::core::convert_exl3_iu4(trellis_tab, 4, static_cast<int>(E), static_cast<int>(K), static_cast<int>(N), q.wq[m],
+                                               reinterpret_cast<_Float16*>(q.ws[m]), std::size_t{K} * N / 2U, std::size_t{N} * (K / 64U), stream),
+               "iu4 convert (strix-trellis convert_exl3_iu4)");
+        ok(hipStreamSynchronize(stream), "iu4 trellis table");  // tr is reused for the next matrix
+    }
+    ok(hipFree(trellis_tab), "iu4 trellis table free");
+    ok(hipStreamSynchronize(stream), "iu4 convert");
+    ok(hipFree(table), "iu4 table free");
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+#else
+    (void)host_table;
+    (void)q;
+    (void)stream;
+    throw std::invalid_argument("glm pf iu4: not built");
+#endif
+}
+std::size_t scratch_bytes(unsigned max_rows) {
+#if STRIX_GLM_PF_IU4_LIB
+    const std::size_t pairs = std::size_t{max_rows} * P;
+    std::size_t tiles = 0;
+    for (int plan = 0; plan < 3; ++plan)
+        tiles = std::max(tiles, strix::core::iu4_grouped_max_tiles(std::size_t{max_rows} * 8U, static_cast<int>(E), plan));
+    return pairs * (H + 2U * (H / 64U) * 4U + I / 2U + (I / 64U) * 4U) +
+           tiles * sizeof(strix::core::IU4GroupTile) + sizeof(std::uint32_t);
+#else
+    (void)max_rows;
+    return 0;
+#endif
+}
+Scratch make_scratch(unsigned max_rows) {
+    Scratch s;
+#if STRIX_GLM_PF_IU4_LIB
+    const std::size_t pairs = std::size_t{max_rows} * P;
+    s.max_rows = max_rows;
+    s.aq_gu = device_alloc<std::uint8_t>(pairs * 2U * H / 2U, s.bytes);
+    s.as_gu = device_alloc<float>(pairs * 2U * (H / 64U), s.bytes);
+    s.aq_down = device_alloc<std::uint8_t>(pairs * I / 2U, s.bytes);
+    s.as_down = device_alloc<float>(pairs * (I / 64U), s.bytes);
+    std::size_t most = 0;
+    for (int plan = 0; plan < 3; ++plan)
+        most = std::max(most, strix::core::iu4_grouped_max_tiles(std::size_t{max_rows} * 8U, static_cast<int>(E), plan));
+    s.max_tiles = static_cast<std::uint32_t>(most);
+    s.tiles = device_alloc<strix::core::IU4GroupTile>(most, s.bytes);
+    s.ntiles = device_alloc<std::uint32_t>(1, s.bytes);
+#else
+    (void)max_rows;
+    throw std::invalid_argument("glm pf iu4: not built");
+#endif
+    return s;
+}
+void release(Scratch& s) {
+    for (void* p : {static_cast<void*>(s.aq_gu), static_cast<void*>(s.as_gu), static_cast<void*>(s.aq_down),
+                    static_cast<void*>(s.as_down), s.tiles, static_cast<void*>(s.ntiles)})
+        if (p) (void)hipFree(p);
+    s = Scratch{};
+}
+}  // namespace iu4
 } // namespace strix::glm::pf::exact_moe

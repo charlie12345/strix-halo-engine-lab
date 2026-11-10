@@ -7,6 +7,9 @@
 #include "strix/deepseek41_plan.hpp"
 #include "strix/dist/communicator.hpp"
 #include "xport/ds41_adapter.hpp"
+#include "hip_deepseek41_prefill_xport.hpp"
+#include "core/hip_host_ready.hpp"
+#include "core/layer_read_ahead.hpp"
 #include <optional>
 #include "strix/ds41_engram.hpp"
 #include "strix/ds41_expert_tp.hpp"
@@ -1156,7 +1159,7 @@ const char* expert_kind_tensor(const std::string& kind) {
 DevicePrefill::DraftSeed DevicePrefill::draft_seed() const noexcept {
     const auto& m = *impl_;
     if (m.state_incomplete) return DraftSeed{};  // a deferred run leaves no seed
-    return DraftSeed{{m.seed[0].p, m.seed[1].p, m.seed[2].p}, m.seed_rows, m.seed_first};
+    return DraftSeed{{m.seed[0].p, m.seed[1].p, m.seed[2].p}, m.seed_rows, m.seed_first, m.model.config.hc_mult * m.model.config.hidden_size};
 }
 
 // ---- PrefillTask: run_from on a worker thread that stops at the unit boundaries ----
@@ -1672,11 +1675,31 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             break;
         }
     const std::uint32_t seed_own = Tn - seed_l0;
-    // row_split all-gathers on the communication stream: rows of this rank's buffer `own` to the peer and the peer's
-    // rows into `dst`, both padded to the larger count, pieces of <= 16 MB. The caller records gather_ready after the
-    // producers (start_gather) and enqueues independent work on the main stream before exchange_rows, which blocks the
-    // CPU until the pieces have crossed; join_gather() orders the main stream after them.
-    using PrefillRawCommunicator = std::remove_reference_t<decltype(*m.options.communicator)>;
+    // Draft structural paths remain opt-in until the paired device gates pass.
+    const auto structure_enabled = [](const char* name) {
+        const char* baseline = std::getenv("STRIX_DS41_BASELINE");
+        const char* value = std::getenv(name);
+        return !(baseline && std::strcmp(baseline, "1") == 0) && value && std::strcmp(value, "1") == 0;
+    };
+    std::unique_ptr<prefill_xport::Exchange> prefill_channel;
+    if (structure_enabled("STRIX_DS41_PREFILL_LEASE") && m.distributed() && m.task == nullptr) {
+        // The communicator and Channel must never progress the same transport
+        // together. Task scheduling can park and run other communicator users;
+        // retain its existing route until persistent ownership is qualified.
+        m.options.communicator->release_transport(st);
+        prefill_xport::Exchange::Options opt;
+        opt.rank = me;
+        opt.stream = st;
+        opt.capacity = std::size_t{16} << 20U;
+        opt.depth = 4;
+        prefill_channel = std::make_unique<prefill_xport::Exchange>(m.options.communicator->transport(), opt);
+    }
+    if (structure_enabled("STRIX_DS41_PREFILL_LEASE"))
+        std::fprintf(stderr, "ds41 prefill lease: requested=1 effective=%u reason=%s\n", prefill_channel ? 1U : 0U,
+                     prefill_channel ? "draft-channel" : m.task ? "task-transport-ownership" : "not-distributed");
+    prefill_xport::Runtime prefill_runtime;
+    prefill_xport::Communicator prefill_wire(m.options.communicator, prefill_channel.get(), prefill_runtime);
+    using PrefillRawCommunicator = prefill_xport::Communicator;
     using PrefillRawExchange = xport::Ds41RawSlotsExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>;
     using PrefillStagedRawExchange = xport::Ds41RawSlotsStagedExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>;
     std::uint64_t exchange_seq = 0;
@@ -1692,7 +1715,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         hipStream_t gs = m.async_gather ? m.comm_stream : st;
         for (std::uint32_t p0 = 0; p0 < n; p0 += per) {
             const std::uint32_t pn = std::min(per, n - p0);
-            xport::ds41_exchange_raw_slots(*m.options.communicator, gs,
+            xport::ds41_exchange_raw_slots(prefill_wire, gs,
                 const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(own)) + std::size_t{p0} * row_bytes,
                 static_cast<std::uint8_t*>(dst) + std::size_t{p0} * row_bytes, std::size_t{pn} * row_bytes,
                 dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq}, [] {});
@@ -1733,6 +1756,29 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         check(hipEventRecord(m.gathered, m.comm_stream), "gathered");
         check(hipStreamWaitEvent(st, m.gathered, 0), "gather join");
     };
+    std::array<bool, 3> seed_started{};
+    const bool seed_early = structure_enabled("STRIX_DS41_SEED_EARLY") && prefill_wire.active() &&
+                            split && m.async_gather && m.options.layers >= 4U;
+    const auto assemble_seed = [&](std::uint32_t j, bool early) {
+        const std::size_t rb = std::size_t{hc} * H * 4U;
+        if (split) {
+            start_gather();
+            exchange_rows(m.seed_local[j].p, seed_own, m.seed_peer[j].p, seed_n - seed_own, rb, 1100U + j);
+            if (!early) join_gather();
+        }
+        const hipStream_t copy_stream = early ? m.comm_stream : st;
+        std::uint32_t own = 0, other = 0;
+        for (std::uint32_t g = seed_begin; g < T;) {
+            const std::uint32_t end = split ? std::min(T, (g / W + 1U) * W) : T;
+            const bool mine = !split || window_owner(g / W) == me;
+            auto* src = mine ? m.seed_local[j].p + std::size_t{own} * hc * H : m.seed_peer[j].p + std::size_t{other} * hc * H;
+            check(hipMemcpyAsync(m.seed[j].p + std::size_t{g - seed_begin} * hc * H, src,
+                                std::size_t{end - g} * rb, hipMemcpyDeviceToDevice, copy_stream), "seed order");
+            (mine ? own : other) += end - g;
+            g = end;
+        }
+        seed_started[j] = true;
+    };
     // row_split, staged MoE input (m.staged_gather): packed on the main stream straight into the pinned send buffer and
     // put on the wire right after the router, so it crosses while the shared expert runs (a pack kernel or a copy on the
     // communication stream waits behind the shared expert's kernels); unpacked from the pinned receive buffer
@@ -1750,14 +1796,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         const std::uint32_t n = std::max(own_rows, Tp - local_of(peer, R.o0));
         const PackFields pf = moe_input_pack(R, own0);
         const std::size_t bytes = std::size_t{n} * pf.stride * 4U;
-        auto* send = m.staged_gather && m.pack && n > 0U ? static_cast<std::uint32_t*>(m.options.communicator->send_staging(bytes)) : nullptr;
+        auto* send = m.staged_gather && m.pack && n > 0U ? static_cast<std::uint32_t*>(prefill_wire.send_staging(bytes)) : nullptr;
         if (send == nullptr) {
             start_gather();
             return;
         }
         hipLaunchKernelGGL(pack_rows_kernel, dim3(n), dim3(256), 0, st, pf, send);
         check(hipGetLastError(), "pack rows");
-        moe_input_exchange.emplace(*m.options.communicator, st, send, bytes,
+        moe_input_exchange.emplace(prefill_wire, st, send, bytes,
             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
         moe_input_rows = n;
     };
@@ -1779,18 +1825,18 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     }
     m.candidates.zero(st);
 
-    // Engram rows of every token (hash of the whole prompt), read from the NVMe: now (overlap off) or on a thread
-    // joined before the first Engram layer (overlap: into the pinned buffer)
+    // Engram rows of every token (hash of the whole prompt): inline with overlap
+    // off, otherwise a pinned read-ahead producer with independent layer readiness.
     std::vector<std::uint8_t> engram_bytes;
     const std::uint8_t* engram_data = nullptr;
     const std::uint32_t engram_cols = m.model.engram.rows_per_token();
     std::vector<std::uint32_t> engram_layers;
     std::vector<ds41::EngramRowRequest> requests;
-    std::future<double> engram_job;  // declared after `requests`: destroyed (joined) first
-    // STRIX_DS41_ENGRAM_SPLIT_READ (default on, =0 off): the read thread signals once the first Engram layer's rows are
-    // in, and the first Engram layer waits only for those (the other layers' rows keep arriving while it runs; same bytes)
-    std::shared_future<void> engram_first;
-    std::uint32_t engram_first_layer = 0xFFFFFFFFU;
+    std::unique_ptr<core::HipHostReady> engram_ready;
+    std::vector<std::promise<void>> engram_signals;
+    std::vector<std::shared_future<void>> engram_futures;
+    std::future<double> engram_job;  // destroyed (joined) before gates, promises and requests
+    bool engram_split_read = true, engram_layer_blocks = false;
     m.join_engram_ahead();  // the previous run's lookahead: its rows are in the payload cache (or it failed: read below)
     const std::vector<std::uint32_t> engram_next = std::exchange(m.engram_next, {});
     {
@@ -1865,27 +1911,40 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             engram_data = m.engram_pinned;
             if (!requests.empty())
             {
-                static const bool split_read = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_SPLIT_READ"); return !(v && std::strcmp(v, "0") == 0); }();
-                // requests are [Engram layer][row][column]: the first layer's block is the first Tn * engram_cols of them
-                const std::size_t first = split_read && engram_layers.size() >= 2U ? std::size_t{Tn} * engram_cols : 0U;
-                std::promise<void> first_in;
-                if (first != 0U) {
-                    engram_first = first_in.get_future().share();
-                    engram_first_layer = m.model.engram.layer_ids[engram_layers[0]];
+                const char* split_env = std::getenv("STRIX_DS41_ENGRAM_SPLIT_READ");
+                engram_split_read = !(split_env && std::strcmp(split_env, "0") == 0);
+                engram_layer_blocks = structure_enabled("STRIX_DS41_ENGRAM_DEVICE_READY");
+                // OFF retains the qualified first/rest read order. ON generalises
+                // the same shared read-ahead loop to independently ready layers.
+                const std::size_t layer_requests = std::size_t{Tn} * engram_cols;
+                std::vector<std::size_t> offsets{0};
+                if (engram_split_read) {
+                    if (engram_layer_blocks)
+                        for (std::size_t at = layer_requests; at < requests.size(); at += layer_requests) offsets.push_back(at);
+                    else if (engram_layers.size() >= 2U) offsets.push_back(layer_requests);
                 }
-                engram_job = std::async(std::launch::async, [&m, &requests, bytes, first, start_ahead, first_in = std::move(first_in)]() mutable {
+                offsets.push_back(requests.size());
+                const std::size_t blocks = offsets.size() - 1U;
+                engram_signals = std::vector<std::promise<void>>(blocks);
+                for (auto& signal : engram_signals) engram_futures.push_back(signal.get_future().share());
+                if (engram_layer_blocks)
+                    engram_ready = std::make_unique<core::HipHostReady>(blocks, st);
+                engram_job = std::async(std::launch::async, [&m, &requests, &engram_signals, &engram_ready,
+                                                           blocks, offsets = std::move(offsets), start_ahead]() {
                     const auto t1 = std::chrono::steady_clock::now();
                     const std::span<const ds41::EngramRowRequest> all(requests);
-                    if (first != 0U) {
-                        try {
-                            m.engram_reader->read(all.first(first), std::span<std::uint8_t>(m.engram_pinned, first * 264U));
-                        } catch (...) {
-                            first_in.set_exception(std::current_exception());
-                            throw;
-                        }
-                        first_in.set_value();
-                    }
-                    m.engram_reader->read(all.subspan(first), std::span<std::uint8_t>(m.engram_pinned + first * 264U, bytes - first * 264U));
+                    core::read_ahead_blocks(blocks,
+                        [&](std::size_t block) {
+                            m.engram_reader->read(all.subspan(offsets[block], offsets[block + 1U] - offsets[block]),
+                                std::span<std::uint8_t>(m.engram_pinned + offsets[block] * 264U, (offsets[block + 1U] - offsets[block]) * 264U));
+                        },
+                        [&](std::size_t block) {
+                            engram_signals[block].set_value();
+                            if (engram_ready) engram_ready->publish(block);
+                        },
+                        [&](std::size_t block) {
+                            std::memset(m.engram_pinned + offsets[block] * 264U, 0, (offsets[block + 1U] - offsets[block]) * 264U);
+                        });
                     const double s = seconds_since(t1);
                     start_ahead();
                     return s;
@@ -1899,16 +1958,20 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         result.engram_seconds = seconds_since(t0);
     }
-    const auto join_engram = [&](std::uint32_t layer) {  // overlap: the rows of `layer` (any other value: the whole read) in
+    const auto join_engram = [&](std::uint32_t layer) {
         if (!engram_job.valid()) return;
         const auto t0 = std::chrono::steady_clock::now();
-        if (layer == engram_first_layer && engram_first.valid()) {  // split read: this layer's block only
-            engram_first.get();
-            result.engram_wait_seconds += seconds_since(t0);
-            return;
+        if (layer != 0xFFFFFFFFU) {
+            const auto& ids = m.model.engram.layer_ids;
+            const auto li = static_cast<std::uint32_t>(std::find(ids.begin(), ids.end(), layer) - ids.begin());
+            const auto at = static_cast<std::size_t>(std::find(engram_layers.begin(), engram_layers.end(), li) - engram_layers.begin());
+            const auto block = !engram_split_read ? 0U : engram_layer_blocks ? at : std::min<std::size_t>(at, 1U);
+            if (engram_ready) engram_ready->wait(block, st);
+            else engram_futures.at(block).get();
+        } else {
+            result.engram_seconds += engram_job.get(); // propagates I/O failure before publishing run state
         }
-        result.engram_seconds += engram_job.get();  // the read's wall time into engram_seconds, the waits into engram_wait_seconds
-        result.engram_wait_seconds += seconds_since(t0);
+        result.engram_wait_seconds += seconds_since(t0); // host submission/wait only, not a device timing
     };
     const auto engram_slice = [&](std::uint32_t layer) -> const std::uint8_t* {  // [token][column] x 264 B of an Engram layer
         const auto& ids = m.model.engram.layer_ids;
@@ -2318,7 +2381,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     // so the message crosses while the indexer projections run instead of after them
                     const std::size_t entry_bytes = std::size_t{std::max(own_words, peer_words)} * 4U;
                     auto* staged_send = m.staged_gather && entry_bytes > 0U
-                                            ? static_cast<std::uint32_t*>(m.options.communicator->send_staging(entry_bytes)) : nullptr;
+                                            ? static_cast<std::uint32_t*>(prefill_wire.send_staging(entry_bytes)) : nullptr;
                     std::uint32_t* const send_words = staged_send ? staged_send : m.pack_send.p;
                     fe.packed = send_words;
                     if (own_ring + own_comp) {
@@ -2335,7 +2398,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     std::optional<PrefillStagedRawExchange> entries_exchange;
                     const std::uint32_t* recv_words = m.pack_recv.p;
                     if (staged_send) {
-                        entries_exchange.emplace(*m.options.communicator, st, staged_send, entry_bytes,
+                        entries_exchange.emplace(prefill_wire, st, staged_send, entry_bytes,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, ++exchange_seq});
                         index_projections();  // while the entries cross
                         // the first chunk's q_b too, unless the task parks at that chunk's boundary (m.q is shared)
@@ -2612,13 +2675,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             v.codes = m.olcodes.p;
                             v.deltas = m.oldeltas.p;
                             const std::size_t bytes = std::size_t{n} * H * 4U;
-                            staged_half = static_cast<float*>(m.options.communicator->send_staging(bytes));
+                            staged_half = static_cast<float*>(prefill_wire.send_staging(bytes));
                             v.out = staged_half ? staged_half : m.y_own.p;
                             if (fast_o_b) m.fast(&v, 1U, n, nullptr, 0U, m.o_low.p, st);
                             else m.dense(v,m.o_low.p,st,fp16_o_b);
                             const dist::Tag tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, r0 / C};
-                            if (staged_half) staged_halves_exchange.emplace(*m.options.communicator, st, staged_half, bytes, tag);
-                            else halves_exchange.emplace(*m.options.communicator, st, m.y_own.p, m.y_other.p, bytes, tag);
+                            if (staged_half) staged_halves_exchange.emplace(prefill_wire, st, staged_half, bytes, tag);
+                            else halves_exchange.emplace(prefill_wire, st, m.y_own.p, m.y_other.p, bytes, tag);
                             pending = r0;
                         } else if (fast_o_b) {
                             v.width = OL;  // the whole K in one GEMM
@@ -2745,10 +2808,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     result.stream_hashes.push_back(last_local ? fnv_bytes(download(stream_now() + std::size_t{Tn - 1U} * stream_row, stream_row, st).data(),
                                                                           stream_row * 4U)
                                                               : 0U);
-                if (seed_n != 0U && layer + 1U >= m.options.layers - 3U && layer + 1U < m.options.layers && seed_own != 0U)
-                    check(hipMemcpyAsync(m.seed_local[layer + 4U - m.options.layers].p, stream_now() + std::size_t{seed_l0} * stream_row,
-                                         std::size_t{seed_own} * stream_row * 4U, hipMemcpyDeviceToDevice, st),
-                          "seed rows");  // the input of layer + 1
+                if (seed_n != 0U && layer + 1U >= m.options.layers - 3U && layer + 1U < m.options.layers) {
+                    const auto j = layer + 4U - m.options.layers;
+                    if (seed_own != 0U)
+                        check(hipMemcpyAsync(m.seed_local[j].p, stream_now() + std::size_t{seed_l0} * stream_row,
+                                             std::size_t{seed_own} * stream_row * 4U, hipMemcpyDeviceToDevice, st), "seed rows");
+                    if (seed_early && !defer) assemble_seed(j, true);
+                }
             }
             break;
         }
@@ -2892,7 +2958,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     for (std::uint32_t p0 = 0; p0 < n; p0 += C) {
                         const std::uint32_t pn = std::min(C, n - p0);
                         const std::size_t at = std::size_t{r0 + p0} * H;
-                        xport::ds41_exchange_half_sum(*m.options.communicator, cs, own + at, other + at,
+                        xport::ds41_exchange_half_sum(prefill_wire, cs, own + at, other + at,
                             std::size_t{pn} * H * 4U,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, (r0 + p0) / C}, [] {});
                     }
@@ -2938,7 +3004,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     float* peer_half = m.staged_half && nmax > 0U &&
                                                (m.task == nullptr || m.moe_joint || T <= m.joint_max_rows ||
                                                 m.task->runs_through(PrefillUnitLevel::finest, pieces(np) + pieces(no) + 1U))
-                                           ? static_cast<float*>(m.options.communicator->send_staging(half_bytes))
+                                           ? static_cast<float*>(prefill_wire.send_staging(half_bytes))
                                            : nullptr;
                     const bool staged = peer_half != nullptr;
                     std::optional<xport::Ds41HalfSumStagedExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>>
@@ -2947,7 +3013,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     if (m.moe_joint || T <= m.joint_max_rows) {  // one expert pass over [peer rows; own rows], the peer rows' half sums first
                         cut(PrefillUnitLevel::finest, s.layer, "moe.joint");
                         moe.enqueue_half_joint(pin, in, moe_half, peer_half, m.half_own.p, st, m.half_ready[0]);
-                        if (staged) prefill_half_exchange.emplace(*m.options.communicator, st, peer_half, half_bytes, half_tag);
+                        if (staged) prefill_half_exchange.emplace(prefill_wire, st, peer_half, half_bytes, half_tag);
                     } else {  // task units: one per chunk pass (chunks(np) + chunks(no): the same count on both ranks)
                         for (std::uint32_t ch = 0; ch < pieces(np); ++ch) {
                             cut(PrefillUnitLevel::finest, s.layer, "moe.peer");
@@ -2955,7 +3021,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         }
                         check(hipEventRecord(m.half_ready[0], st), "peer half ready");
                         // staged: on the wire as soon as the peer rows are done, while the own rows below run
-                        if (staged) prefill_half_exchange.emplace(*m.options.communicator, st, peer_half, half_bytes, half_tag);
+                        if (staged) prefill_half_exchange.emplace(prefill_wire, st, peer_half, half_bytes, half_tag);
                         for (std::uint32_t ch = 0; ch < pieces(no); ++ch) {
                             cut(PrefillUnitLevel::finest, s.layer, "moe.own");
                             half_piece(in, ch, m.half_own.p);
@@ -2977,7 +3043,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     check(hipStreamWaitEvent(cs, m.half_ready[0], 0), "peer half ready");
                     for (std::uint32_t q0 = 0; q0 < nmax; q0 += C) {
                         const std::uint32_t qn = std::min(C, nmax - q0);
-                        xport::ds41_exchange_half_sum(*m.options.communicator, cs,
+                        xport::ds41_exchange_half_sum(prefill_wire, cs,
                             m.half_other.p + std::size_t{q0} * H, m.half_recv.p + std::size_t{q0} * H,
                             std::size_t{qn} * H * 4U,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, q0 / C}, [] {});
@@ -3027,7 +3093,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 std::vector<float> other;
                 auto sl=ds41::vocab_slice(c.vocab_size,2U,1U-m.options.rank);
                 if(m.distributed()) {
-                    m.options.communicator->exchange(st,q.out,m.quality_logits.p+std::size_t(nr)*q.count,std::size_t(nr)*q.count*4U,
+                    prefill_wire.exchange(st,q.out,m.quality_logits.p+std::size_t(nr)*q.count,std::size_t(nr)*q.count*4U,
                         dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control),4U,T-1U});
                     other=download(m.quality_logits.p+std::size_t(nr)*q.count,std::size_t(nr)*sl.count,st);
                 }
@@ -3043,7 +3109,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 ds41::enqueue_rms_norm(m.h.p, m.devf("output_norm.weight"), 1, H, H, 1e-20F, m.h.p, st);
             }
             if (split)
-                m.options.communicator->exchange(st, last_local ? m.h.p : m.h_peer.p, last_local ? m.h_peer.p : m.h.p, std::size_t{H} * 4U,
+                prefill_wire.exchange(st, last_local ? m.h.p : m.h_peer.p, last_local ? m.h_peer.p : m.h.p, std::size_t{H} * 4U,
                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 3U, T - 1U});
             ds41::enqueue_quantize_a8(m.h.p, H, 1, m.hcodes.p, m.hdeltas.p, m.hsums.p, st);
             ds41::Q8A8View v;
@@ -3061,7 +3127,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             ds41::enqueue_q8_0_a8(v, st);
             if (m.distributed() && m.options.gather_logits) {
                 const auto other = ds41::vocab_slice(c.vocab_size, 2U, 1U - m.options.rank);
-                m.options.communicator->exchange(st, m.logits.p + m.head_slice.first, m.logits.p + other.first, std::size_t{other.count} * 4U,
+                prefill_wire.exchange(st, m.logits.p + m.head_slice.first, m.logits.p + other.first, std::size_t{other.count} * 4U,
                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 1U, T - 1U});
             }
             break;
@@ -3070,7 +3136,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             if (m.distributed()) {
                 const auto& sl = m.head_slice;
                 ds41::enqueue_argmax(m.logits.p + sl.first, 1, sl.count, sl.count, sl.first, m.partial.p, m.cand_own.p, st);
-                m.options.communicator->exchange(st, m.cand_own.p, m.cand_other.p, sizeof(ds41::ArgmaxCandidate),
+                prefill_wire.exchange(st, m.cand_own.p, m.cand_other.p, sizeof(ds41::ArgmaxCandidate),
                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::argmax), 0U, T - 1U});
                 const auto* first = m.options.rank == 0U ? m.cand_own.p : m.cand_other.p;
                 const auto* second = m.options.rank == 0U ? m.cand_other.p : m.cand_own.p;
@@ -3091,26 +3157,12 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
     }
     join_engram(0xFFFFFFFFU);
-    if (seed_n != 0U && !defer) {  // every seed row on both ranks, in position order (row_split: 8-row windows alternate)
-        const std::size_t rb = std::size_t{hc} * H * 4U;
-        for (std::uint32_t j = 0; j < 3U; ++j) {
-            if (split) {
-                start_gather();
-                exchange_rows(m.seed_local[j].p, seed_own, m.seed_peer[j].p, seed_n - seed_own, rb, 1100U + j);
-                join_gather();
-            }
-            std::uint32_t own = 0, other = 0;
-            for (std::uint32_t g = seed_begin; g < T;) {  // runs of one window (or all rows without the split)
-                const std::uint32_t end = split ? std::min(T, (g / W + 1U) * W) : T;
-                const bool mine = !split || window_owner(g / W) == me;
-                auto* src = mine ? m.seed_local[j].p + std::size_t{own} * hc * H : m.seed_peer[j].p + std::size_t{other} * hc * H;
-                check(hipMemcpyAsync(m.seed[j].p + std::size_t{g - seed_begin} * hc * H, src, std::size_t{end - g} * rb, hipMemcpyDeviceToDevice, st),
-                      "seed order");
-                (mine ? own : other) += end - g;
-                g = end;
-            }
-        }
+    if (seed_n != 0U && !defer) {
+        for (std::uint32_t j = 0; j < 3U; ++j)
+            if (!seed_started[j]) assemble_seed(j, false);
+        if (seed_early) join_gather(); // all three async receive/reorder consumers complete before handoff
     }
+    prefill_wire.drain(); // validates every receipt before run state is published
     m.seed_rows = defer ? 0U : seed_n;
     m.seed_first = P0 + seed_begin;
     check(hipStreamSynchronize(st), "prefill");

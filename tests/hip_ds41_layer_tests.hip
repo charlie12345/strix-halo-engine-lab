@@ -742,7 +742,8 @@ void synthetic(std::mt19937& rng) {
                     bool nan_group = false;
                     for (const float x : rd) nan_group = nan_group || x != x;
                     if (overflow) expect(nan_group, "overflow rows give all-NaN groups (NaN deltas)");
-                    const bool expect_written = form != 41U && form != 0U;
+                    // One dense core (shared tiled core, S3): every form fuses the output A8 when buffers are given.
+                    const bool expect_written = true;
                     expect(ok && written == expect_written, "dense prefill + output A8 bitwise, form " + std::to_string(form) + " count=" + std::to_string(count) + " rows=" +
                                                                 std::to_string(many) + (overflow ? " overflow" : "") +
                                                                 (written ? " (A8 written)" : " (A8 not written)"));

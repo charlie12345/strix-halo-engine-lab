@@ -241,17 +241,16 @@ struct Q8A8DensePrefillView {
     std::uint32_t out_stride = 0;
     std::uint32_t row_width = 0, k_offset = 0;  // K-split parts, as Q8A8View
     bool accumulate = false;
-    std::uint32_t tall = 0;  // tall form RT * 10 + OT, 1 auto (the same bits); 0: STRIX_DS41_DENSE_TALL (default off)
+    std::uint32_t tall = 0;  // compatibility hint; dense execution uses shared tiled_core (G=1)
     // Optional A8 of the outputs (enqueue_quantize_a8's bits; accumulate off, count a multiple of 32): codes at
-    // r * a8_stride + o, deltas / sums at r * a8_stride / 32 + o / 32. Written by the tall forms whose blocks own whole
-    // 32-output groups; the enqueue returns whether it was written (else the caller quantizes out).
+    // r * a8_stride + o, deltas / sums at r * a8_stride / 32 + o / 32. Shared-core
+    // tiles own complete 32-output groups; the enqueue returns whether A8 was written.
     std::int8_t* a8_codes = nullptr;
     float* a8_deltas = nullptr;
     std::int32_t* a8_sums = nullptr;
     std::uint32_t a8_stride = 0;
     // 2: this K part and the next (k_offset + width, codes + width, deltas + width / 32; row_width set), every output the
-    // first part's sum + the second's, the bits of two launches with the second accumulated (one launch in the 2 x 2
-    // Lean 4 form, auto, row_width 8192 / width 4096, from 896 rows; else the two launches). No A8 output.
+    // first part's sum + the second's, using two ordered shared-core launches. No A8 output.
     std::uint32_t k_parts = 1;
 };
 // Returns true when the outputs' A8 (a8_codes) was written.

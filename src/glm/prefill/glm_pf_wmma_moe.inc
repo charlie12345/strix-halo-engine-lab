@@ -32,12 +32,14 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void l
         }
     }
 }
-template<bool Down>
+// Routed = false: the shared expert only (FAST_I4 runs the routed experts on the IU4 core).
+template<bool Down, bool Routed = true>
 void launch_linear_w(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
     const dim3 routed(N / 128U, E, Down || a.aux_act ? 1U : 2U), shared(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down || a.aux_act ? 1U : 2U);
     // Shared slices are kSharedRows = 64 rows: only routed groups take 128-row tiles.
-    if (wmma_x::tile_rows() == 128U) {
+    if constexpr (!Routed) {
+    } else if (wmma_x::tile_rows() == 128U) {
         const unsigned t128 = wmma_x::tail128(), split = wmma_x::split();
         const dim3 full_grid(N / 128U, E * split, Down || a.aux_act ? 1U : 2U);
         if (wmma_x::cols_per_wave() == 2U) linear_kernel_w<4, Down, false, 1, 2><<<full_grid, 256, 0, stream>>>(a, t128, split);
@@ -46,7 +48,7 @@ void launch_linear_w(Args a, unsigned shared_bits, hipStream_t stream) {
     } else {
         linear_kernel_w<4, Down, false><<<routed, 256, 0, stream>>>(a, 0U);
     }
-    ok(hipGetLastError(), "WMMA routed linear");
+    if constexpr (Routed) ok(hipGetLastError(), "WMMA routed linear");
     if (shared_bits == 6U) linear_kernel_w<6, Down, true><<<shared, 256, 0, stream>>>(a, 0U);
     else linear_kernel_w<4, Down, true><<<shared, 256, 0, stream>>>(a, 0U);
     ok(hipGetLastError(), "WMMA shared linear");

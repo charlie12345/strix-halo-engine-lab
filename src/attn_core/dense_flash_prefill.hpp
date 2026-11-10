@@ -162,32 +162,38 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
         }
         __syncthreads();
         if (active) {
-            float sc[16];
+            // Each half-wave owns 8 of the 16 keys of its row (j = 8 hw + i); max and presence meet over lane ^ 16.
+            float sc[8];
 #pragma unroll
-            for (unsigned j = 0; j < 16; ++j) sc[j] = 0.0F;
+            for (unsigned i = 0; i < 8; ++i) sc[i] = 0.0F;
 #pragma unroll
             for (unsigned p = 0; p < S::split; ++p) {
-                const float* pp = part + (tile * S::split + p) * 16U * SP + rr * SP;
+                const float* pp = part + (tile * S::split + p) * 16U * SP + rr * SP + 8U * hw;
 #pragma unroll
-                for (unsigned c = 0; c < 4; ++c) {
+                for (unsigned c = 0; c < 2; ++c) {
                     const float4 v = reinterpret_cast<const float4*>(pp)[c];
                     sc[4U * c] += v.x; sc[4U * c + 1] += v.y; sc[4U * c + 2] += v.z; sc[4U * c + 3] += v.w;
                 }
             }
             float m = maximum;
-            bool present = false;
+            bool mine = false;
 #pragma unroll
-            for (unsigned j = 0; j < 16; ++j) {
-                const unsigned key = kt + j;
+            for (unsigned i = 0; i < 8; ++i) {
+                const unsigned key = kt + 8U * hw + i;
                 const bool v = live && key >= my_lo && key <= my_pos;
-                sc[j] = v ? sc[j] * P::kScaleLog2 : neg_inf;
-                m = sc[j] > m ? sc[j] : m;
-                present |= v;
+                sc[i] = v ? sc[i] * P::kScaleLog2 : neg_inf;
+                m = sc[i] > m ? sc[i] : m;
+                mine |= v;
             }
+            {
+                const float other = __shfl_xor(m, 16, 32);
+                m = other > m ? other : m;
+            }
+            const bool present = mine || __shfl_xor(int(mine), 16, 32) != 0;
             const float alpha = present ? __builtin_amdgcn_exp2f(maximum - m) : 1.0F;
             float own[8];
 #pragma unroll
-            for (unsigned i = 0; i < 8; ++i) own[i] = present ? __builtin_amdgcn_exp2f(sc[8U * hw + i] - m) : 0.0F;
+            for (unsigned i = 0; i < 8; ++i) own[i] = present ? __builtin_amdgcn_exp2f(sc[i] - m) : 0.0F;
             Frag pa;
             float sum = 0.0F;
 #pragma unroll

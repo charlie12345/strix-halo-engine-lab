@@ -72,6 +72,9 @@ int main() try {
     const std::array<float, 4> a = {30.0F, 30.0F, -30.0F, 0.0F};
     same.observe(a, a);
     require(same.bf16_bands_pass() && same.mean_kl() == 0.0 && same.p99_kl() == 0.0 && same.rmse() == 0.0, "identical logits");
+    pf::Fidelity ranks;
+    for (unsigned i = 1; i <= 100; ++i) ranks.kl.push_back(double(101 - i));
+    require(ranks.p95_kl() == 95.0 && ranks.p99_kl() == 99.0 && ranks.kl_quantile(1.0) == 100.0, "nearest-rank KL quantiles");
     const std::array<float, 4> b = {29.0F, 30.0F, -30.0F, 0.0F};
     pf::Fidelity changed; changed.observe(a, b);
     require(changed.top1() == 0.0 && changed.mean_kl() > 0 && changed.maximum_error == 1.0 && !changed.same_weight_bands_pass(), "tie or KL failure");

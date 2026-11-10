@@ -229,7 +229,7 @@ void metric(const char* gate, const pf::Fidelity& m, bool same_weight = false, b
                                                      m.p99_kl() <= 0.10 && m.rmse() <= 0.30 && m.maximum_error <= 3.0
                                                : m.bf16_bands_pass());
     std::cout << "{\"gate\":\"" << gate << "\",\"positions\":" << m.positions << ",\"top1\":" << m.top1()
-              << ",\"mean_kl\":" << m.mean_kl() << ",\"p99_kl\":" << m.p99_kl() << ",\"rmse\":" << m.rmse()
+              << ",\"mean_kl\":" << m.mean_kl() << ",\"p95_kl\":" << m.p95_kl() << ",\"p99_kl\":" << m.p99_kl() << ",\"rmse\":" << m.rmse()
               << ",\"max_abs\":" << m.maximum_error << ",\"bands_pass\":" << (bands ? "true" : "false")
               << ",\"qualification\":\"INCOMPLETE\"}\n";
 }

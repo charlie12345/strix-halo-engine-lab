@@ -8,15 +8,17 @@ namespace strix::gemma4::profile {
 namespace {
 constexpr unsigned engine = unsigned(App::engine), decode_bench = unsigned(App::decode_bench),
                    prefill_bench = unsigned(App::prefill_bench), all_apps = engine | decode_bench | prefill_bench;
-// Held-out qualification receipt of g4-wmma-pf-v1 prompt prefill COMPOSED with fast's g4-a8-v1 decode, on the Q4_K_M
-// pack; the row's value "fast" applies v1 to GGUF packs of file type MOSTLY_Q4_K_M only (prefill_route). Empty =
-// pending: STRIX_G4_PREFILL_IDENTITY=fast runs prefill-exact. (Receipt 8b681be093e689fa measured v1 with g4-v1 decode,
-// not this pair.) The fast profile itself runs the a8 route below.
-[[maybe_unused]] constexpr std::string_view fast_prefill_receipt = "";
-// Receipt of fast's a8 prompt prefill: the g4-a8-v1 held-out receipt (bands 9ba0cf53) applies because a8 prefill rows
-// are byte-identical to g4-a8-v1 decode rows (byte receipt 4e914dcf: KV and per-row logits on 56/56 teacher-v2 parents;
-// served ids equal to decode-fed rows at C1/C4). Empty = pending: fast runs prefill-exact.
-constexpr std::string_view fast_a8_prefill_receipt = "g4-a8-v1 9ba0cf53 + a8 prefill byte receipt 4e914dcf";
+// Qualification of g4-wmma-pf-v1 prompt prefill COMPOSED with fast's g4-a8-v1 decode, on the Q4_K_M pack: the frozen
+// FAST gate of the v1 prompt rows (teacher-v4, 56/56 parents, bands 9ba0cf53, result 168ebaec) plus the pair receipt
+// (v1 prefill feeding g4-a8-v1 decode: same-weight KL/top-1 over chat/code/json prompts and greedy continuations).
+// The row's value "fast" applies v1 to GGUF packs of file type MOSTLY_Q4_K_M only and the a8 route (below) to other
+// non-EXL3 packs (prefill_route). Empty = pending: fast runs prefill-exact.
+constexpr std::string_view fast_prefill_receipt =
+    "g4-wmma-pf-v1 teacher-v4 FAST gate 168ebaec (bands 9ba0cf53) + v1/a8 pair receipt 380f384e";
+// Receipt of the a8 prompt prefill (fast on non-Q4_K_M packs): the g4-a8-v1 held-out receipt (bands 9ba0cf53) applies
+// because a8 prefill rows are byte-identical to g4-a8-v1 decode rows (byte receipt 4e914dcf: KV and per-row logits on
+// 56/56 teacher-v2 parents; served ids equal to decode-fed rows at C1/C4).
+[[maybe_unused]] constexpr std::string_view fast_a8_prefill_receipt = "g4-a8-v1 9ba0cf53 + a8 prefill byte receipt 4e914dcf";
 // Profile columns: default, fast, quality. One row per lever; an owner merge (or a passed gate) flips its
 // own `runnable` / `ready` column (and, if its switch name differs, `env`) on its own row.
 constexpr Lever table[] = {
@@ -87,15 +89,16 @@ constexpr Lever table[] = {
     // Prompt prefill route. DEFAULT and QUALITY run prefill-exact. STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact
     // (the OFF switch under fast); =v1 / =v2 select a WMMA route explicitly.
     // =a8 (only with STRIX_G4_IDENTITY=g4-a8-v1): g4-a8-v1 linears on 512-row chunks; prompt rows equal the a8
-    // decode of the same rows; otherwise prefill-exact runs. FAST runs a8: it is byte-identical to the g4-a8-v1 decode
-    // rows that fast_a8_prefill_receipt qualified (not bitwise vs exact prefill).
-    {.name = "prefill_route", .env = "STRIX_G4_PREFILL_IDENTITY", .value = {"exact", "a8", "exact"}, .builtin = "exact",
-     .required = {false, true, false}, .ready = {true, !fast_a8_prefill_receipt.empty(), true}, .runnable = {true, true, true},
-     .kind = Kind::bit_changing, .apps = engine, .target = "g4-a8-v1",
-     .source = "fast: a8 prompt prefill (g4-a8-v1 linears on 512-row chunks, canonical attention; prompt rows equal the "
-               "a8 decode of the same rows, so the g4-a8-v1 receipt covers it; not bitwise vs exact prefill); default and "
-               "quality run prefill-exact as many-row chunks (STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes); "
-               "=v1 / =v2 select g4-wmma-pf-v1 / -v2; =fast runs v1 on Q4_K_M packs once fast_prefill_receipt is named"},
+    // decode of the same rows; otherwise prefill-exact runs. FAST runs =fast: g4-wmma-pf-v1 (FP16 WMMA linears,
+    // canonical attention) on Q4_K_M packs, qualified by fast_prefill_receipt; a8 on other non-EXL3 packs.
+    {.name = "prefill_route", .env = "STRIX_G4_PREFILL_IDENTITY", .value = {"exact", "fast", "exact"}, .builtin = "exact",
+     .required = {false, true, false}, .ready = {true, !fast_prefill_receipt.empty(), true}, .runnable = {true, true, true},
+     .kind = Kind::bit_changing, .apps = engine, .target = "g4-wmma-pf-v1",
+     .source = "fast: g4-wmma-pf-v1 prompt prefill on Q4_K_M packs (FP16 WMMA linears, canonical attention; the last <= 8 "
+               "prompt rows and the anchor run the g4-a8-v1 decode; frozen FAST gate + v1/a8 pair receipt; not bitwise "
+               "vs exact prefill), a8 on other non-EXL3 packs; =a8 keeps the previous fast route; default and quality run "
+               "prefill-exact as many-row chunks (STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes); =v1 / =v2 select "
+               "g4-wmma-pf-v1 / -v2 on any non-EXL3 pack"},
     // EXL3 packs: the pack's held-out bands were measured on g4-exl3-wmma-pf-v1 prompts (panel WMMA linears,
     // canonical attention); QUALITY targets that identity once its receipt lands, exact runs until then.
     {.name = "exl3_prefill", .env = "STRIX_G4_EXL3_PREFILL", .value = {"", "", "wmma"}, .builtin = "exact",
@@ -344,7 +347,8 @@ std::string_view prefill_route(std::string_view requested, std::int32_t gguf_fil
     if (requested != "v1" && requested != "v2" && requested != "a8" && requested != "fast")
         throw std::invalid_argument("STRIX_G4_PREFILL_IDENTITY must be exact, v1, v2, a8 or fast");
     if (exl3_pack) return "exact"; // EXL3 packs: STRIX_G4_EXL3_PREFILL selects their route
-    if (requested == "fast") return gguf_file_type == gguf_file_type_q4_k_m ? "v1" : "exact";
+    // fast: v1 on the Q4_K_M pack its receipt covers; the a8 route (prompt rows == g4-a8-v1 decode rows) elsewhere.
+    if (requested == "fast") return gguf_file_type == gguf_file_type_q4_k_m ? "v1" : "a8";
     return requested;
 }
 PrefillRouteChoice prefill_route_for_decode(std::string_view route, std::string_view decode_identity) {

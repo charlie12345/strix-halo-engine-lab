@@ -95,13 +95,13 @@ copies nor change the bytes of its real transfers. To qualify the integration:
 Use a native console with MSVC and CUDA 13 configured:
 
 ```powershell
-cmake -S . -B build-rtx-trellis -G Ninja -DCMAKE_BUILD_TYPE=Release `
+cmake -S . -B build-cuda-trellis -G Ninja -DCMAKE_BUILD_TYPE=Release `
   -DSTRIX_CUDA_DS41_ONLY=ON -DSTRIX_ENABLE_CUDA_TRELLIS=ON `
   -DSTRIX_WARNINGS_AS_ERRORS=OFF -DCMAKE_CUDA_ARCHITECTURES=120
-cmake --build build-rtx-trellis --target strix-cuda-trellis-tests -j 2
+cmake --build build-cuda-trellis --target strix-cuda-trellis-tests -j 2
 python -m unittest discover -s tests -p test_trellis_reference.py -v
 python tools/trellis_reference.py --out <fixtures-dir>
-ctest --test-dir build-rtx-trellis -R '^strix-cuda-trellis-contract-tests$' --output-on-failure
+ctest --test-dir build-cuda-trellis -R '^strix-cuda-trellis-contract-tests$' --output-on-failure
 ```
 
 The native tests are run explicitly so that CTest does not take a shared GPU.
@@ -112,7 +112,7 @@ $env:CUDA_DEVICE_ORDER = 'PCI_BUS_ID'
 $env:CUDA_VISIBLE_DEVICES = '0'
 $env:CUDA_MODULE_LOADING = 'EAGER'
 $cases = @(Get-ChildItem <fixtures-dir>/*.trlcase | ForEach-Object FullName)
-./build-rtx-trellis/strix-cuda-trellis-tests.exe `
+./build-cuda-trellis/strix-cuda-trellis-tests.exe `
   --book <fixtures-dir>/mul1.bin @cases
 ```
 

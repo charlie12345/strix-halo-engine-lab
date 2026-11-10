@@ -65,7 +65,7 @@ sintaxis de shell, un `KEY=value` por línea, y puede editarlo. Cada nodo tiene 
 | `DEPS_DIR` | `~/.local/share/strix-pair` | biblioteca trellis, fuentes del controlador y del kernel, módulos compilados, manifiestos |
 | `PEER_REPO`, `PEER_MODEL_DIR` | las mismas rutas que aquí | el checkout y el directorio de modelos en el otro nodo |
 | `ROCM_PATH` | `hipconfig -R`, si no `/opt/rocm` | raíz de ROCm |
-| `HTTP_BIND`, `HTTP_PORT` | `127.0.0.1`, `8080` | dirección HTTP del rank 0; consulte [exponer los servidores](serving.es.md#exposing-the-servers) antes de usar otra dirección |
+| `HTTP_BIND`, `HTTP_PORT` | `127.0.0.1`, `8080` | dirección HTTP del rank 0; consulte [exponer los servidores](serving.es.md#exposición-de-los-servidores) antes de usar otra dirección |
 | `API_KEY_FILE` | | fichero con la clave de la API HTTP |
 | `CONTEXT` | valor por defecto del servidor | longitud de contexto |
 | `EXTRA_ARGS` | | más opciones de `strix-deepseek41-serve`, las mismas en ambos ranks |

@@ -315,7 +315,7 @@ window stream shared by all slots. The calibration replay runs once.
   weight-reading steps run once for all rows), with one the ordinary cycle. With five to eight requests,
   `STRIX_COHORT_ROWS=16 STRIX_COHORT_WIDE=all` runs the cycle as one group of up to 16 rows whose GDN/QSA
   projections, LM head and expert union run once for all rows (D-052,
-  [multi-request cohort](../scheduling/multi-request-cohort.md#global-row-budget-and-wide-steps-opt-in)).
+  [multi-request cohort](../scheduling/multi-request-cohort.md#global-row-budget-and-wide-steps)).
   The experimental `STRIX_MTP_BATCH_JOINT=1` replaces that fixed per-request cap
   with a joint cost-based choice and supports shared dense steps through 32
   rows; see [joint serving windows](../scheduling/joint-serving-windows.md). It is off by default.

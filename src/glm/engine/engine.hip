@@ -570,6 +570,7 @@ struct Engine::Impl {
     std::shared_ptr<Exchange> decode_xch;   // borrowed transport; only automatic plain decode uses this
     std::shared_ptr<PrefillPath> pf;
     bool pf_seqpar = false;  // ordinary decode/verify never use it
+    unsigned pf_streams = 2;  // single-stream experiment is explicit until device qualification
     bool pf_seqpar_auto_eligible = false;
     std::unique_ptr<xfer::SeqparExchange> seqpar_xch;
     struct InstallRefused : std::runtime_error { using std::runtime_error::runtime_error; };
@@ -706,6 +707,9 @@ struct Engine::Impl {
             throw std::invalid_argument("glm seqpar: requires TP2 communicator and ordinary attention cache ownership");
         pf_seqpar = seqpar_policy == "1" || (seqpar_policy == "auto" && seqpar_eligible);
         pf_seqpar_auto_eligible = seqpar_policy == "auto" && seqpar_eligible;
+        if (const char* value = std::getenv("STRIX_GLM_PF_STREAMS")) pf_streams = xfer::seqpar_compute_streams(value);
+        if (pf_streams == 1 && !pf_seqpar)
+            throw std::invalid_argument("STRIX_GLM_PF_STREAMS=1 requires seqpar TP2 prefill");
         if (seqpar_policy == "auto" && !seqpar_eligible && opt.world == 2)
             std::fprintf(stderr, "glm prefill seqpar auto declined: %s; legacy path\n",
                          kv_shard || kv_shard_auto ? "kv-shard policy" : opt.external_exchange ? "external exchange" : "no TP2 communicator");
@@ -1034,7 +1038,7 @@ struct Engine::Impl {
             // before only one rank can enter the memory-plan vote.
             const std::array<std::uint32_t, 4> policy{kv_shard_auto ? 2U : kv_shard ? 1U : 0U,
                 static_cast<std::uint32_t>(pf_policy.scratch), static_cast<std::uint32_t>(pf_policy.query_window + 1),
-                pf_seqpar ? 4U | (opt.pf_pipeline << 3U) : 0U};
+                pf_seqpar ? 4U | (opt.pf_pipeline << 3U) | (pf_streams == 1 ? 1U << 5U : 0U) : 0U};
             std::array<std::uint32_t, 4> peer_policy{};
             comm->exchange_host({reinterpret_cast<const std::byte*>(policy.data()), sizeof(policy)},
                                 {reinterpret_cast<std::byte*>(peer_policy.data()), sizeof(peer_policy)},
@@ -1321,6 +1325,8 @@ struct Engine::Impl {
     }
 
     void install_prefill(PrefillPath& p) {
+        if (pf_streams == 1 && (!p.supports_pipeline() || p.moe_by_row() || opt.max_rows < 2))
+            throw std::invalid_argument("STRIX_GLM_PF_STREAMS=1 requires row-invariant grouped prefill");
         if (pf_seqpar_auto_eligible) {
             pf_seqpar = p.supports_pipeline() && opt.max_rows >= 2;
             if (!pf_seqpar)
@@ -1350,7 +1356,7 @@ struct Engine::Impl {
             Lib::admit(xfer::SeqparExchange::workspace_bytes(opt.max_rows), p.admission_margin(), "prefill seqpar channel");
             xch->complete(stream);
             hip_ok(hipStreamSynchronize(stream), "seqpar install");
-            seqpar_xch = std::make_unique<xfer::SeqparExchange>(comm->transport(), opt.rank, opt.max_rows, stream);
+            seqpar_xch = std::make_unique<xfer::SeqparExchange>(comm->transport(), opt.rank, opt.max_rows, stream, pf_streams);
             std::fprintf(stderr, "glm prefill seqpar: on even chunks=owner-mhc-norm odd/singleton=legacy pipeline=%u\n",
                          opt.pf_pipeline);
         }
@@ -1728,12 +1734,12 @@ struct Engine::Impl {
             normed[i] = fuse;
             std::swap(tile_x[i], tile_out[i]);
         };
-        auto column = [&](unsigned i, LayerW& w, bool ffn) {
+        auto column_range = [&](unsigned i, LayerW& w, bool ffn, xfer::SeqparRows tile, unsigned piece_rows) {
             const auto half_stream = seqpar_xch->compute(i);
             seqpar_xch->column_begin(i);
-            const auto tile = xfer::seqpar_tile(R, opt.pf_pipeline, i);
-            for (unsigned first = tile.first; first < tile.first + tile.count; first += block) {
-                const CallCtx c{&lib, rows.subspan(first, block), slot_d + first, pos_d + first, flag, half_stream, false, nullptr};
+            for (unsigned first = tile.first; first < tile.first + tile.count; first += piece_rows) {
+                const unsigned count = std::min(piece_rows, tile.first + tile.count - first);
+                const CallCtx c{&lib, rows.subspan(first, count), slot_d + first, pos_d + first, flag, half_stream, false, nullptr};
                 const auto off = std::size_t{first} * kHidden;
                 const float* x = sp_xn + off;
                 if (!ffn) {
@@ -1744,12 +1750,12 @@ struct Engine::Impl {
                     auto* wt = wts + std::size_t{first} * kTopE;
                     auto* log = rlog + std::size_t{first} * kExperts;
                     // Router and matrix-specific MoE input transforms stay replicated.
-                    glm::pf::dense_rows(x, w.moew.router, D::WType::F16, kHidden, 0, kExperts, log, block, half_stream);
-                    D::route(log, w.moew.bias, id, wt, block, half_stream);
+                    glm::pf::dense_rows(x, w.moew.router, D::WType::F16, kHidden, 0, kExperts, log, count, half_stream);
+                    D::route(log, w.moew.bias, id, wt, count, half_stream);
                     if (pf->moe_by_row()) {
                         const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
-                        for (unsigned r = 0; r < block; r += B) {
-                            const CallCtx cr{&lib, c.rows.subspan(r, std::min(B, block - r)), slot_d + first + r,
+                        for (unsigned r = 0; r < count; r += B) {
+                            const CallCtx cr{&lib, c.rows.subspan(r, std::min(B, count - r)), slot_d + first + r,
                                              pos_d + first + r, flag, half_stream, false, nullptr};
                             moe->forward(w.moew, cr, x + std::size_t{r} * kHidden, id + std::size_t{r} * kTopE,
                                          wt + std::size_t{r} * kTopE, part + off + std::size_t{r} * kHidden);
@@ -1758,6 +1764,9 @@ struct Engine::Impl {
                 } else pf->dense(w.dense, c, x, dense_i, part + off);
             }
             seqpar_xch->column_end(i);
+        };
+        auto column = [&](unsigned i, LayerW& w, bool ffn) {
+            column_range(i, w, ffn, xfer::seqpar_tile(R, opt.pf_pipeline, i), block);
         };
         auto consume_column = [&](unsigned i, LayerW& w, bool ffn) {
             seqpar_xch->finish(i, seqpar_xch->compute(i));  // only this half's xn must be present
@@ -1770,6 +1779,30 @@ struct Engine::Impl {
             for (unsigned li = 0; li < n_layers; ++li) {
                 LayerW& w = layers[li];
                 cur_layer = li;
+                if (pf_streams == 1) {
+                    xfer::seqpar_single_layer(tiles, [&](xfer::SeqparStep step, unsigned i) {
+                        switch (step) {
+                        case xfer::SeqparStep::pre_attn: pre(i, w.hc_attn, w.in_norm); break;
+                        case xfer::SeqparStep::attn: consume_column(i, w, false); break;
+                        case xfer::SeqparStep::reduce_attn:
+                        case xfer::SeqparStep::reduce_ffn: start_rs(i); break;
+                        case xfer::SeqparStep::post_attn:
+                        case xfer::SeqparStep::post_ffn: post(i); break;
+                        case xfer::SeqparStep::pre_ffn: pre(i, w.hc_ffn, w.post_norm); break;
+                        case xfer::SeqparStep::ffn:
+                            // Both normalized halves must arrive before the one grouped call.
+                            // Attention/dense call sizes and recurrence order stay legacy.
+                            for (unsigned lane = 0; lane < tiles; ++lane)
+                                seqpar_xch->finish(lane, seqpar_xch->compute(lane));
+                            if (w.moe)
+                                column_range(0, w, true, {0, R}, xfer::seqpar_moe_piece(R, 0).count);
+                            else
+                                for (unsigned lane = 0; lane < tiles; ++lane) column(lane, w, true);
+                            break;
+                        }
+                    });
+                    continue;
+                }
                 pre(0, w.hc_attn, w.in_norm);
                 if (tiles == 1) {
                     consume_column(0, w, false);
@@ -1802,7 +1835,7 @@ struct Engine::Impl {
                 // Defer B's RS until AFTER next-layer AG A, so that a side
                 // stream RX wait cannot sit in front of A's next column call.
             }
-            if (tiles == 2 && n_layers != 0) {
+            if (pf_streams == 2 && tiles == 2 && n_layers != 0) {
                 start_rs(1);
                 post(1);
             }

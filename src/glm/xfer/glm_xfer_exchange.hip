@@ -61,26 +61,28 @@ strix::xport::ChannelOptions<GlmSeqparTraits> seqpar_options(unsigned rank, unsi
 }
 }
 
-SeqparExchange::SeqparExchange(dist::Transport& transport, unsigned rank, unsigned max_rows, hipStream_t stream)
-    : side_(max_rows), rank_(rank), max_rows_(max_rows), stream_(stream),
+SeqparExchange::SeqparExchange(dist::Transport& transport, unsigned rank, unsigned max_rows, hipStream_t stream,
+                             unsigned compute_streams)
+    : side_(max_rows, compute_streams), rank_(rank), max_rows_(max_rows), stream_(stream),
       channel_(transport, seqpar_options(rank, max_rows, side_.stream)) {}
 
 SeqparExchange::~SeqparExchange() {
     // Retire device users BEFORE Channel frees its RX slots, including after
     // an enqueue failure. A progress failure releases all flag wait packets.
     try { channel_.drain(); } catch (...) {}
-    for (auto s : side_.compute) (void)hipStreamSynchronize(s);
+    for (auto s : side_.compute) if (s) (void)hipStreamSynchronize(s);
     (void)hipStreamSynchronize(side_.stream);
     (void)hipStreamSynchronize(stream_);
 }
 
-SeqparExchange::Side::Side(unsigned max_rows) {
+SeqparExchange::Side::Side(unsigned max_rows, unsigned compute_streams) : streams(compute_streams) {
+    if (streams != 1 && streams != 2) throw std::invalid_argument("glm seqpar: compute streams must be 1 or 2");
     try {
         int least = 0, greatest = 0;
         ok(hipDeviceGetStreamPriorityRange(&least, &greatest), "seqpar priority range");
         ok(hipStreamCreateWithPriority(&stream, hipStreamNonBlocking, least), "seqpar transfer queue");
         for (unsigned i = 0; i < ready.size(); ++i) {
-            ok(hipStreamCreateWithFlags(&compute[i], hipStreamNonBlocking), "seqpar compute queue");
+            if (i < streams) ok(hipStreamCreateWithFlags(&compute[i], hipStreamNonBlocking), "seqpar compute queue");
             ok(hipEventCreateWithFlags(&ready[i], hipEventDisableTiming), "seqpar ready event");
             ok(hipEventCreateWithFlags(&done[i], hipEventDisableTiming), "seqpar done event");
         }

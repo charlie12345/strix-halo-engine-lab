@@ -260,6 +260,7 @@ public:
     struct DraftSeed {
         std::array<const float*, 3> streams{};
         std::uint32_t rows = 0, first = 0;
+        std::uint32_t row_elements = 0; // hc * hidden; permits byte-exact seed inspection
     };
     [[nodiscard]] DraftSeed draft_seed() const noexcept;
     // FNV of every layer's attention state after the last run (the ring's live window, the used compressed KV and

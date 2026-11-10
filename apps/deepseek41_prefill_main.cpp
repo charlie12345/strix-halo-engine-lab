@@ -29,7 +29,7 @@
 // (expert halves, half sums exchanged per chunk), or both ranks in one process (--transport emulate).
 //   strix-deepseek41-prefill MODEL.gguf --prompt FILE (comma-separated ids) [--rows N] [--layers L]
 //       [--world 1 | --rank R --transport usb4-auto | usb4-gpu | tcp-listen:PORT | tcp-connect:HOST:PORT | emulate]
-//       [--chunk C] [--window W] [--lanes N] [--moe-chunk R] [--no-tp] [--row-split | --no-row-split] [--stream-experts] [--timing] [--reference] [--repeat K] [--connect-timeout S] [--no-cone] [--warmup N] [--split-min-rows N] [--joint-max-rows N] [--state-timing] [--loads] [--loads-out CSV] [--stream-hashes-out FILE]
+//       [--chunk C] [--window W] [--lanes N] [--moe-chunk R] [--no-tp] [--row-split | --no-row-split] [--stream-experts] [--timing] [--reference] [--repeat K] [--connect-timeout S] [--no-cone] [--warmup N] [--split-min-rows N] [--joint-max-rows N] [--state-timing] [--loads] [--loads-out CSV] [--stream-hashes-out FILE] [--draft-rows N --seed-out PREFIX]
 //       [--ttft-timing [--ttft-warmup R] [--ttft-decode G]]
 //       [--task-levels whole,layer,phase,finest [--task-rows N,...] [--task-units K | --task-budget MS] [--task-moe-chunk R] [--task-table]
 //        [--interleave G [--bg-rows N]] [--mem-guard-gib G]]
@@ -62,12 +62,13 @@ void barrier(strix::dist::Communicator& comm, std::uint32_t round) {
 }
 
 struct Args {
-    std::string model, prompt_path, transport, loads_out, hashes_out;
+    std::string model, prompt_path, transport, loads_out, hashes_out, seed_out;
     std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, chunk = 1024, window = 8, lanes = 4, moe_chunk = 4096, repeat = 1, warmup = 0,
                   split_min_rows = strix::deepseek41::PrefillOptions{}.split_min_rows,
                   joint_max_rows = strix::deepseek41::PrefillOptions{}.joint_max_rows;
     unsigned connect_timeout = 60;
     bool select_ab = false;  // --select-ab: run k with the exact dense selector off (k even) / on (k odd), one load
+    std::uint32_t draft_rows = 0; // --draft-rows N, optional --seed-out PREFIX for raw seed gates
     std::uint32_t extend_check = 0;  // --extend-check S: after the runs, run() + extend() in S-row pieces == the whole run
     std::string select_pattern;  // --select-pattern OSSO...: run k off ('O') / on ('S') by the k-th letter (cyclic)
     bool timing = false, reference = false, cone = true, loads = false, tp = true, stream_experts = false, row_split = true, decode_reference = false,
@@ -238,9 +239,41 @@ void print_result(const char* who, const strix::deepseek41::PrefillResult& r, st
                 ap[0] * 1e3, ap[1] * 1e3, ap[2] * 1e3, ap[3] * 1e3, ap[4] * 1e3);
 }
 
+void write_receipts(const Args& a, const strix::deepseek41::DevicePrefill& pre,
+                    const strix::deepseek41::PrefillResult& r, unsigned rank) {
+    if (!a.hashes_out.empty()) {  // one line per layer stream, then the attention state (runs compared with diff)
+        std::FILE* f = std::fopen(a.hashes_out.c_str(), "w");
+        if (f == nullptr) throw std::runtime_error("cannot write " + a.hashes_out);
+        for (std::size_t l = 0; l < r.stream_hashes.size(); ++l)
+            std::fprintf(f, "stream@%zu %016llx\n", l, static_cast<unsigned long long>(r.stream_hashes[l]));
+        for (const auto& [name, h] : pre.state_hashes()) std::fprintf(f, "%s %016llx\n", name.c_str(), static_cast<unsigned long long>(h));
+        std::fprintf(f, "logits %016llx\n", static_cast<unsigned long long>(fnv(r.logits)));
+        std::fclose(f);
+    }
+    if (a.draft_rows != 0U) {
+        const auto seed = pre.draft_seed();
+        for (unsigned j = 0; j < seed.streams.size(); ++j) {
+            std::vector<float> data(std::size_t{seed.rows} * seed.row_elements);
+            if (!data.empty() && hipMemcpy(data.data(), seed.streams[j], data.size() * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess)
+                throw std::runtime_error("seed receipt copy failed");
+            std::printf("rank %u seed %u rows %u first %u elements %u hash %016llx\n", rank, j, seed.rows, seed.first,
+                        seed.row_elements, static_cast<unsigned long long>(fnv(data)));
+            if (!a.seed_out.empty()) {
+                const auto path = a.seed_out + "." + std::to_string(j) + ".bin";
+                std::FILE* f = std::fopen(path.c_str(), "wb");
+                if (!f) throw std::runtime_error("cannot write seed receipt " + path);
+                const auto written = std::fwrite(data.data(), sizeof(float), data.size(), f);
+                const int closed = std::fclose(f);
+                if (written != data.size() || closed) throw std::runtime_error("seed receipt write failed");
+            }
+        }
+    }
+}
+
 strix::deepseek41::PrefillOptions options(const Args& a, std::size_t rows) {
     strix::deepseek41::PrefillOptions o;
     o.layers = a.layers;
+    o.draft_rows = a.draft_rows;
     o.max_positions = static_cast<std::uint32_t>(rows);
     o.chunk_rows = a.chunk;
     o.window_rows = a.window;
@@ -563,15 +596,7 @@ int run_world1(const Args& a, const std::vector<std::uint32_t>& prompt) {
         r = pre.run(prompt);
         print_result("prefill", r, prompt.size(), a.timing, a.loads_out);
     }
-    if (!a.hashes_out.empty()) {  // one line per layer stream, then the attention state (runs compared with diff)
-        std::FILE* f = std::fopen(a.hashes_out.c_str(), "w");
-        if (f == nullptr) throw std::runtime_error("cannot write " + a.hashes_out);
-        for (std::size_t l = 0; l < r.stream_hashes.size(); ++l)
-            std::fprintf(f, "stream@%zu %016llx\n", l, static_cast<unsigned long long>(r.stream_hashes[l]));
-        for (const auto& [name, h] : pre.state_hashes()) std::fprintf(f, "%s %016llx\n", name.c_str(), static_cast<unsigned long long>(h));
-        std::fprintf(f, "logits %016llx\n", static_cast<unsigned long long>(fnv(r.logits)));
-        std::fclose(f);
-    }
+    write_receipts(a, pre, r, 0U);
     if (!a.task_levels.empty()) {
         auto lengths = a.task_rows;
         if (lengths.empty()) lengths.push_back(static_cast<std::uint32_t>(prompt.size()));
@@ -705,6 +730,7 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
                 std::fflush(stdout);
             }
         }
+        write_receipts(a, pre, r, rank);
         if (a.state_timing && print) {  // the handoff to a decode forward: the attention state to the host
             const auto t0 = std::chrono::steady_clock::now();
             const auto exported = pre.export_state();
@@ -818,6 +844,8 @@ int main(int argc, char** argv) try {
         else if (s == "--decode-reference") a.reference = a.decode_reference = true;  // emulate: also the two-rank decode
         else if (s == "--no-cone") a.cone = false;
         else if (s == "--state-timing") a.state_timing = true;
+        else if (s == "--draft-rows") a.draft_rows = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (s == "--seed-out") a.seed_out = next();
         else if (s == "--warmup") a.warmup = static_cast<std::uint32_t>(std::stoul(next()));
         else if (s == "--split-min-rows") a.split_min_rows = static_cast<std::uint32_t>(std::stoul(next()));
         else if (s == "--joint-max-rows") a.joint_max_rows = static_cast<std::uint32_t>(std::stoul(next()));

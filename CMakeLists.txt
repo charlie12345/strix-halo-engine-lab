@@ -374,11 +374,21 @@ target_include_directories(strix_xport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_compile_features(strix_xport INTERFACE cxx_std_20)
 target_sources(strix_xport INTERFACE
     src/xport/borrowed_transport.hpp include/strix/dist/transport.hpp
-    src/xport/channel.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
+    src/xport/channel.hpp src/xport/channel_communicator.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
     src/xport/transport_backend.hpp src/xport/staging.hpp src/xport/stats.hpp src/xport/backend.hpp src/xport/communicator_backend.hpp
     src/xport/ds41_adapter.hpp src/xport/kvshard_channel.hpp src/xport/kvshard_channel_hip.hpp
     include/strix/dist/host_wait.hpp include/strix/dist/transport_caps.hpp)
 if(BUILD_TESTING)
+    add_executable(strix-ds41-prefill-structure-tests tests/ds41_prefill_structure_tests.cpp)
+    target_link_libraries(strix-ds41-prefill-structure-tests PRIVATE strix_xport)
+    strix_target_warnings(strix-ds41-prefill-structure-tests)
+    if(MSVC)
+        target_compile_options(strix-ds41-prefill-structure-tests PRIVATE /WX /fp:strict)
+    else()
+        target_compile_options(strix-ds41-prefill-structure-tests PRIVATE -Werror -Wshadow -Wsign-conversion -Wunused-function)
+    endif()
+    add_test(NAME strix-ds41-prefill-structure-tests COMMAND strix-ds41-prefill-structure-tests)
+    set_tests_properties(strix-ds41-prefill-structure-tests PROPERTIES LABELS "cpu;xport;exactness")
     add_executable(strix-xport-borrowed-transport-tests tests/xport_borrowed_transport_tests.cpp)
     target_link_libraries(strix-xport-borrowed-transport-tests PRIVATE strix_xport)
     target_include_directories(strix-xport-borrowed-transport-tests PRIVATE include)
@@ -4276,7 +4286,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 endif()
 # deepseek41 device prefill: T rows of the decode plan per layer (one node or one of two ranks) and its app.
 if(STRIX_ENABLE_HIP_RUNTIME)
-    add_library(strix_ds41_device_prefill STATIC src/hip_deepseek41_prefill.hip)
+    add_library(strix_ds41_device_prefill STATIC src/hip_deepseek41_prefill.hip src/hip_deepseek41_prefill_xport.hip)
     target_link_libraries(strix_ds41_device_prefill PUBLIC strix_ds41_device_forward strix_ds41_prefill_hip strix_ds41_layer_hip
         strix_ds41_attention_hip strix_dist)
     target_include_directories(strix_ds41_device_prefill PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")

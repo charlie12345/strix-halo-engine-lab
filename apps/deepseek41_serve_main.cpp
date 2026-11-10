@@ -111,6 +111,7 @@
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
+#include "strix/deepseek41_plan.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
 #include "strix/deepseek41_cache_lease.hpp"
 #include "strix/deepseek41_session_cache.hpp"
@@ -559,6 +560,9 @@ public:
         const auto o = slot_prefill_options(a, fwd, comm, rank);
         prefill_ = std::make_unique<strix::deepseek41::DevicePrefill>(a.model, o);
         if (a.prefix_cache_mb != 0U) {
+            // Only KV sources retain compressed KV/index keys, amortized by ratio, plus the token ID.
+            // Disabled caching does not construct or validate an extra plan.
+            state_bytes_per_token_ = strix::deepseek41::build_decode_plan(fwd.model(), 0U, a.layers, false, false).state_bytes_per_token + 4U;
             strix::deepseek41::PrefixCacheOptions co;
             co.block = a.prefix_block;
             host_lease_ = std::make_unique<strix::deepseek41::PrefixHostLease>(a.prefix_cache_mb);
@@ -607,10 +611,8 @@ public:
     // Fresh observations from both nodes, before either plans a capture or exports a slot.
     bool admit(std::uint32_t tokens, bool requested = true, std::uint32_t slots = 1) {
         const std::uint64_t rings = std::uint64_t{a_.layers} * (136U * 528U + 4096U + 4096U);
-        const std::uint64_t state = std::uint64_t{tokens} * (std::uint64_t{a_.layers} * 356U + 4U) + rings;
-        // Full export + retained copy + snapshot rings and disk serialization, conservatively
-        // treating every layer as a ratio-1 KV owner. Existing retention is already in MemAvailable.
-        const std::uint64_t predicted = (host_budget_mb_ << 20U) + slots * (state * 3U + rings * 8U);
+        const std::uint64_t predicted =
+            strix::deepseek41::prefix_capture_predicted_bytes(tokens, state_bytes_per_token_, rings, host_budget_mb_, slots);
         std::array<std::uint64_t, 3> mine{mem_available_mb(), predicted, 0}, peer{};
         mine[2] = requested && cache_ && host_budget_mb_ != 0U &&
                   strix::deepseek41::prefix_memory_admitted(mine[0], a_.prefix_reserve_mb, predicted);
@@ -953,6 +955,7 @@ private:
     BatchForward& fwd_;
     std::unique_ptr<strix::deepseek41::PrefixHostLease> host_lease_;
     std::uint64_t host_budget_mb_ = 0, capture_checks_ = 0, capture_bypasses_ = 0, capture_peak_ = 0;
+    std::uint64_t state_bytes_per_token_ = 0;  // exported attention state per position, token id included (admit())
     const bool diagnostics_ = std::getenv("STRIX_DS41_PREFIX_DIAGNOSTICS") && std::string_view(std::getenv("STRIX_DS41_PREFIX_DIAGNOSTICS")) == "1";
     std::array<std::uint64_t, 4> exports_{};
     std::uint64_t export_bytes_ = 0, row_layers_ = 0, planned_splits_ = 0;

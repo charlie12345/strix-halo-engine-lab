@@ -17,6 +17,12 @@ petición, las opciones y las puertas están en [docs/engine/serving/serving.md]
 
 ## Exposición de los servidores
 
+La admisión de captura de prefijos de DeepSeek usa el plan compartido del modelo:
+solo las capas fuente de KV aportan KV e índices comprimidos, según su ratio
+(890 bytes por token en V4.1), más 4 bytes por ID de token. Los anillos y las
+copias transitorias mantienen sus márgenes conservadores. Un desbordamiento de
+la predicción satura el tamaño y no permite admitir con un cálculo reducido.
+
 Qwen y DeepSeek publican las funciones ejecutadas en `GET /v1/capabilities`; el objeto `strix` de cada respuesta
 indica la política de muestreo solicitada frente a la efectiva. En todos los servidores (Qwen, DeepSeek, MiniMax) los
 campos de generación no admitidos devuelven 400 indicando el campo. MiniMax decodifica de forma greedy: una temperatura

@@ -3382,7 +3382,8 @@ operations in the same order, so the operand rows and every downstream output ar
 - **Measured gain (TP2, GLM-5.3-Flash EXL3 4.05 bpw, one binary, unprofiled):** FAST identity 8K warm prefill ABAB,
   4 pairs in both orders: 10.55 -> 10.21 s (pair deltas -0.32, -0.31, -0.20 s and one -1.46 s outlier pair; median
   -0.31 s). Exact identity 8K: 13.195 -> 12.868 s with identical full logits files on both ranks. FAST 32K:
-  43.49 -> 42.39 s (one pair). Logits and state digests identical to the unset arm in every run. Opt-in until the
+  43.49 -> 42.39 s (one pair); exact identity 32K: 62.21 -> 56.71 s with identical full logits files.
+  Logits and state digests identical to the unset arm in every run. Opt-in until the
   default is reviewed.
 
 <a id="glm-pf-scratch"></a>

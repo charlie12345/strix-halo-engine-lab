@@ -12,10 +12,11 @@
 //            Shared expert remains on its existing WMMA-X arithmetic.
 #if STRIX_GLM_PF_IU4_LIB
 // STRIX_GLM_PF_IU4_PLAN: library IU4 plan 0 (BM32), 1 (BM64), 2 (BM128); unset = auto: plan 2 when the call averages
-// >= 128 rows per routed expert (MiniMax 8K: packed plan 2 40.4 ms vs f16 ~122 ms per layer), else plan 1.
-int iu4_plan(unsigned pairs) {
+// >= min_rows rows per routed expert, else plan 1. The unfused control uses min_rows 128; the chain passes the
+// shared moe_i4::kPlan2Rows policy (4096-row chunk calls average ~114 rows per expert and take plan 1).
+int iu4_plan(unsigned pairs, unsigned min_rows = 128) {
     const char* p = std::getenv("STRIX_GLM_PF_IU4_PLAN");
-    if (!p || !*p) return pairs >= 128U * E ? 2 : 1;
+    if (!p || !*p) return pairs >= min_rows * E ? 2 : 1;
     if (std::strcmp(p, "0") == 0) return 0;
     if (std::strcmp(p, "1") == 0) return 1;
     if (std::strcmp(p, "2") == 0) return 2;
@@ -71,7 +72,7 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
     const iu4::Scratch& s,hipStream_t stream) {
     namespace st=strix::core;
     // Plan 2 (BM128) paired gate/up spills on gfx1151: the paired call runs at most plan 1 on its own tile list.
-    const int plan=iu4_plan(a.rows*8U), pplan=plan<1 ? plan : 1;
+    const int plan=iu4_plan(a.rows*8U,strix::core::moe_i4::kPlan2Rows), pplan=plan<1 ? plan : 1;
     const auto ptiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,pplan));
     const auto dtiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,plan));
     if(a.rows>s.max_rows || ptiles>s.max_tiles || dtiles>s.max_tiles) throw std::logic_error("glm chain scratch too small");

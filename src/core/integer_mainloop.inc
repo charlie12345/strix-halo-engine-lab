@@ -1,3 +1,10 @@
+if constexpr (Operand::Plan::structure == IntegerStructure::grouped_chunk) {
+#include "integer_grouped_mainloop.inc"
+} else if constexpr (Operand::Plan::structure == IntegerStructure::dense_tall) {
+#include "integer_tall_mainloop.inc"
+} else if constexpr (Operand::Plan::structure == IntegerStructure::dense_wide) {
+#include "integer_wide_mainloop.inc"
+} else {
 // Integer specialization inside tiled_core: same Adapter tile/raster interface.
 static_assert(AD && !Fused && Probe == 0);
 static_assert((Contract::int_flush == 32 || Contract::int_flush == 1) && Contract::out_transform == OutputTransform::none);
@@ -149,3 +156,5 @@ for (int i = thread; i < BM * BN; i += G::threads) {
 __syncthreads();
 ad.finish_tile(at, exchange, BM, BN);
 __syncthreads();
+
+}

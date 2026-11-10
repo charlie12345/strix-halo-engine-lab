@@ -37,8 +37,17 @@ struct Ds41PrefillTraits {
                 Operations>>>;
 };
 
-template<WeightFormat F, bool Fast = false, bool Relaxed = false>
-using Contract = strix::core::IntegerContract<strix::core::IntegerOperand<Ds41PrefillTraits, F, Fast>, Relaxed>;
+#ifndef STRIX_DS41_SPLIT_WAVES
+#define STRIX_DS41_SPLIT_WAVES 8
+#endif
+#ifndef STRIX_DS41_SPLIT_DOWN_WAVES
+#define STRIX_DS41_SPLIT_DOWN_WAVES 8
+#endif
+template<WeightFormat F, bool Fast = false, bool Relaxed = false, bool Down = false>
+using Contract = strix::core::IntegerContract<strix::core::IntegerOperand<Ds41PrefillTraits, F, Fast,
+    std::conditional_t<!Fast && !Relaxed && F != WeightFormat::mxfp4,
+        strix::core::GroupedIntegerPlan<Down ? STRIX_DS41_SPLIT_DOWN_WAVES : STRIX_DS41_SPLIT_WAVES>,
+        strix::core::IntegerPlan>>, Relaxed>;
 // Header instantiation only: no separate archive or library device link is needed.
 template<class C, int BN, class Adapter>
 inline void launch(Adapter ad, unsigned blocks, unsigned columns, unsigned width, unsigned outputs, hipStream_t stream) {

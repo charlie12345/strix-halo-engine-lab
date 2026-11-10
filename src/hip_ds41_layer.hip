@@ -17,6 +17,7 @@
 #include <type_traits>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -2447,7 +2448,17 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                                      std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
                                      std::uint64_t{v.x_stride} >= 2ULL * v.width)),
             "Q8_0 x A8 dense prefill view");
+    const auto env_on = [](const char* name) { const char* e = std::getenv(name); return e && e[0] == '1'; };
+    static const bool staged = [] { const char* e = std::getenv("STRIX_DS41_DENSE_FORM"); return !(e && e[0] == '0'); }();
+    const bool lean_ok = std::uint64_t(v.rows) * v.x_stride < 0x7fffffffULL &&
+        std::uint64_t(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) < 0x7fffffffULL;
     if (v.k_parts == 2U) {
+        if (strix::core::integer_dense_fuse_parts(v.tall, v.rows, v.row_width, v.width, v.count, lean_ok,
+            env_on("STRIX_DS41_DENSE_TALL_ROTATE") || env_on("STRIX_DS41_DENSE_STATS"), staged)) {
+            integer_core::launch_dense<2, 2, 4, false, 2>(v, as_stream(stream));
+            check(hipGetLastError(), "Q8_0 x A8 two-part shared core");
+            return false;
+        }
         auto part = v;
         part.k_parts = 1U;
         enqueue_q8_0_a8_dense_prefill(part, stream);
@@ -2458,10 +2469,180 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         enqueue_q8_0_a8_dense_prefill(part, stream);
         return false;
     }
-    integer_core::launch<integer_core::Contract<WeightFormat::q8_0>, 32>(integer_core::DenseAdapter{v},
-        (v.rows + 15U) / 16U, (v.count + 31U) / 32U, v.width, (v.count + 31U) / 32U * 32U, as_stream(stream));
+    static const unsigned tall_env = [] {
+        const char* e = std::getenv("STRIX_DS41_DENSE_TALL");
+        return e && std::strcmp(e, "auto") == 0 ? 1U : e ? unsigned(std::strtoul(e, nullptr, 10)) : 0U;
+    }();
+    unsigned tall = v.tall ? v.tall : tall_env;
+    if (tall == 1U) {
+        tall = strix::core::integer_dense_form(v.rows, v.width, v.count, v.row_width, lean_ok);
+        if (env_on("STRIX_DS41_DENSE_TALL_ROTATE")) {
+            static std::atomic<unsigned> turn{0};
+            tall = std::array<unsigned, 3>{814, 914, 822}[turn.fetch_add(1, std::memory_order_relaxed) % 3];
+            if (!lean_ok) tall = tall == 914 ? 114 : tall == 822 ? 22 : 14;
+        }
+    }
+    // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
+    static const bool stats = [] {
+        const char* e = std::getenv("STRIX_DS41_DENSE_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (stats) {
+        struct Count { unsigned long long calls = 0, rows = 0; };
+        static std::mutex lock;
+        static std::map<std::array<unsigned, 4>, Count> counts;
+        static const bool printer = [] {
+            std::atexit([] {
+                std::lock_guard<std::mutex> g(lock);
+                for (const auto& [k, c] : counts)
+                    std::fprintf(stderr, "dense stats: form %u width %u count %u row_width %u calls %llu rows %llu\n", k[0], k[1], k[2], k[3], c.calls, c.rows);
+            });
+            return true;
+        }();
+        (void)printer;
+        std::lock_guard<std::mutex> g(lock);
+        auto& c = counts[{staged ? tall : 0U, v.width, v.count, v.row_width}];
+        ++c.calls;
+        c.rows += v.rows;
+    }
+    bool a8 = false;
+    if (staged) {
+        switch (tall) {
+        case 22:
+            integer_core::launch_dense<2, 2, 0, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 41:
+            integer_core::launch_dense<4, 1, 0, false>(v, as_stream(stream));
+            a8 = false; break;
+        case 14:
+            integer_core::launch_dense<1, 4, 0, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 114:
+            integer_core::launch_dense<1, 4, 0, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 112:
+            integer_core::launch_dense<1, 2, 0, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 214:
+            integer_core::launch_dense<1, 4, 1, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 212:
+            integer_core::launch_dense<1, 2, 1, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 314:
+            integer_core::launch_dense<1, 4, 1, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 312:
+            integer_core::launch_dense<1, 2, 1, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 414:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 2, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 412:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 2, 2, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 514:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 2, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 614:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 3, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 612:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 2, 3, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 714:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 3, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 814:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 4, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 812:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 2, 4, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 914:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 4, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 422:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 2, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 822:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 4, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 21:
+            integer_core::launch_dense<2, 1, 0, false>(v, as_stream(stream));
+            a8 = false; break;
+        case 12:
+            integer_core::launch_dense<1, 2, 0, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1514:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 5, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1522:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 5, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1614:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 5, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 1714:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 6, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1722:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 6, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1814:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 6, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 1914:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 7, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 1922:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 7, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 2014:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 7, true>(v, as_stream(stream));
+            a8 = true; break;
+        case 2114:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 8, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 2122:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<2, 2, 8, false>(v, as_stream(stream));
+            a8 = true; break;
+        case 2214:
+            require(lean_ok, "Q8_0 x A8 dense buffer form beyond 2 GiB");
+            integer_core::launch_dense<1, 4, 8, true>(v, as_stream(stream));
+            a8 = true; break;
+        default:
+            if (v.count <= 16U) integer_core::launch_dense<1, 1, 0, false, 1, true>(v, as_stream(stream));
+            else integer_core::launch_dense<1, 2, 0, false, 1, true>(v, as_stream(stream));
+        }
+    } else {
+        if (v.count <= 16U) integer_core::launch_dense<1, 1, 0, false, 1, true, false>(v, as_stream(stream));
+        else integer_core::launch_dense<1, 2, 0, false, 1, true, false>(v, as_stream(stream));
+    }
     check(hipGetLastError(), "Q8_0 x A8 dense shared core");
-    return v.a8_codes != nullptr;
+    return v.a8_codes != nullptr && staged && a8;
 }
 
 void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_norm, const float* k_norm, std::uint32_t rows,

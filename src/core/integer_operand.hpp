@@ -1,17 +1,35 @@
 #pragma once
 #include "integer_math.hpp"
+#include "integer_plan.hpp"
 #include <type_traits>
 namespace strix::core {
 // Decode original GGUF blocks; no resident weight pack or converter.
-template<class Traits, typename Traits::WeightFormat Format, bool FastI4 = false>
+template<class Traits, typename Traits::WeightFormat Format, bool FastI4 = false, class ExecutionPlan = IntegerPlan>
 struct IntegerOperand {
     using Ops = typename Traits::Operations;
+    using Plan = ExecutionPlan;
+    using Raw = typename Traits::template RawGroup<Format>;
+    using Group = typename Traits::OperandGroup;
+    static constexpr bool direct_weights = Format == Traits::WeightFormat::q8_0;
+    static constexpr unsigned block_bytes = Format == Traits::WeightFormat::iq2_xxs ? Traits::iq2_xxs_block_bytes : Traits::q2_k_block_bytes;
+    static constexpr unsigned chunk_row_bytes = 4 * block_bytes;
+    static constexpr unsigned activation_bytes = 32 * 2 * 16 * 16 + 32 * 16 * 4;
+    static constexpr unsigned sum_bytes = [] {
+        if constexpr (Format != Traits::WeightFormat::q2_k) return 0U;
+        else if constexpr (Plan::structure == IntegerStructure::grouped_chunk) return 32U * 16 * (Plan::float_half_sums ? 8 : 4);
+        else return 0U;
+    }();
+    static constexpr unsigned grouped_bytes = activation_bytes + sum_bytes + ([] {
+        if constexpr (Plan::structure == IntegerStructure::grouped_chunk) return direct_weights || !Plan::weight_lds ? 0U : 64 * chunk_row_bytes;
+        else return 0U;
+    }());
     using Int4 = typename Traits::Int4;
     using Int8 = typename Traits::Int8;
     static constexpr auto format = Format;
     static constexpr bool fast_i4 = FastI4;
     static constexpr bool affine = Format == Traits::WeightFormat::q2_k;
-    static constexpr int element_bits = FastI4 ? 4 : 8, stage_tiles = 8;
+    static constexpr int element_bits = FastI4 ? 4 : 8;
+    static constexpr int stage_tiles = Plan::structure == IntegerStructure::per_group ? 8 : 2 * Plan::chunk_groups;
     static_assert(!FastI4 || affine || Format == Traits::WeightFormat::iq2_xxs);
     static __device__ __forceinline__ auto load_raw(const unsigned char* row, unsigned group) {
         return Ops::template load_raw<Format>(row, group);
@@ -22,8 +40,8 @@ struct IntegerOperand {
     }
 };
 template<class T> struct is_integer_operand : std::false_type {};
-template<class T, typename T::WeightFormat F, bool Fast>
-struct is_integer_operand<IntegerOperand<T, F, Fast>> : std::true_type {};
+template<class T, typename T::WeightFormat F, bool Fast, class P>
+struct is_integer_operand<IntegerOperand<T, F, Fast, P>> : std::true_type {};
 // The integer fragment operation is shared with the packed IU4 core branch.
 // A/B carry signed bytes or signed nibbles; integer addition is exact.
 template<int Bits, class Fragment, class Accumulator>

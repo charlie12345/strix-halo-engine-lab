@@ -254,7 +254,7 @@ struct Api::Impl final : strix::serve::GenerationEngine {
                 stats.prompt_tokens = l.task->result.prompt_tokens; stats.generated_tokens = l.task->result.ids.size();
                 stats.finish = l.task->result.finish;
                 for (const auto& phase : l.task->result.receipts)
-                    if (const auto* cached = phase.find("serve_prefix")) stats.cached_tokens += cached->find("cached_tokens")->as_int();
+                    if (const auto* cached = phase.find("serve_prefix")) stats.cached_tokens += static_cast<std::uint64_t>(cached->find("cached_tokens")->as_int());
                 if (l.taken.job.on_tokens) (void)l.taken.job.on_tokens(l.task->result.ids);
             }
             queue.finish(l.taken,stats,error);

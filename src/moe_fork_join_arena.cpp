@@ -101,7 +101,7 @@ void hash_source(std::uint64_t& hash, const CompiledSerialExecution& source) {
     for (const auto& binding : source.bindings.bindings) {
         word(binding.step_id); word(binding.op); word(binding.family.has_value()); if (binding.family) word(*binding.family);
         word(binding.kernel_id.has_value());
-        if (binding.kernel_id) { word(binding.kernel_id->size()); for (const unsigned char byte : *binding.kernel_id) word(byte); }
+        if (binding.kernel_id) { word(binding.kernel_id->size()); for (const char byte_char : *binding.kernel_id) { const unsigned char byte = static_cast<unsigned char>(byte_char); word(byte); } }
         word(binding.host_or_runtime_step);
     }
     word(source.io.expanded_hidden_slots); word(source.io.hidden_slots); word(source.io.injection_slots);

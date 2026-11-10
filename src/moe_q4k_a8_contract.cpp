@@ -98,7 +98,7 @@ Factors decode_factors(std::span<const std::byte> packed, std::uint32_t group) {
     const auto lo = group&3U;
     const auto a = byte(packed[lo]), b = byte(packed[lo+4U]), c = byte(packed[lo+8U]);
     return group < 4U ? Factors{static_cast<std::uint32_t>(a&63U),static_cast<std::uint32_t>(b&63U)} :
-        Factors{static_cast<std::uint32_t>((c&15U)|((a>>6U)<<4U)),static_cast<std::uint32_t>((c>>4U)|((b>>6U)<<4U))};
+        Factors{static_cast<std::uint32_t>((c&15U)|static_cast<unsigned>((a>>6U)<<4U)),static_cast<std::uint32_t>((c>>4U)|((b>>6U)<<4U))};
 }
 float half_bits_to_float(std::uint16_t bits) {
     const auto exponent = (bits>>10U)&31U, fraction = bits&1023U;

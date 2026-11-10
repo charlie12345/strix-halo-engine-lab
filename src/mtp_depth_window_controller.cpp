@@ -84,7 +84,7 @@ bool MtpDepthWindowController::worth_drafting(std::span<const float> p) const {
         const auto depth=o.rows-1U;
         const auto residual=cost(o,depth);
         // A missing depth/owner is measured; it is never inferred from an easier owner.
-        if(!residual || !draft_[depth].samples())return true;
+        if(!static_cast<bool>(residual) || !draft_[depth].samples())return true;
         if(expected(o.rows,p,true)/(residual+draft_[depth].value())>best)return true;
     }
     return false;
@@ -116,8 +116,8 @@ std::size_t MtpDepthWindowController::choose(std::span<const float> p,std::size_
         }
     }
     // Cold exploration is local to the actual number of filled rows.
-    if(fits[cap] && !cost(owners_[cap],candidates))return use(cap);
-    for(std::size_t n=0;n<=cap;++n)if(fits[n] && !cost(owners_[n],candidates))return use(n);
+    if(fits[cap] && !static_cast<bool>(cost(owners_[cap],candidates)))return use(cap);
+    for(std::size_t n=0;n<=cap;++n)if(fits[n] && !static_cast<bool>(cost(owners_[n],candidates)))return use(n);
     if(want==1 && !serial_.samples())return serial;
     const auto d=noted_?current_draft_ms_:(draft_[p.size()].samples()?draft_[p.size()].value():0);
     auto best=serial;double rate=0;

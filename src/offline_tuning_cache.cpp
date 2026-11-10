@@ -146,7 +146,7 @@ void write_uint(std::vector<std::byte>& output, std::uint64_t value, unsigned wi
 }
 void write_string(std::vector<std::byte>& output, std::string_view value) {
     write_uint(output, value.size(), 4);
-    for (const unsigned char c : value) output.push_back(static_cast<std::byte>(c));
+    for (const char c_char : value) { const unsigned char c = static_cast<unsigned char>(c_char); output.push_back(static_cast<std::byte>(c)); }
 }
 std::uint64_t record_size(const OfflineTuningRecord& record, StringBudget& budget) {
     valid_tags(static_cast<std::uint32_t>(record.key.wave), static_cast<std::uint32_t>(record.key.family),

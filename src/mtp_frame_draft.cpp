@@ -45,8 +45,8 @@ void MtpFrameDraft::push(std::uint32_t token) {
     if (open_at_ != SIZE_MAX && !gate_open_ && at + 1 - open_at_ == config_.prefix_gate) {
         const std::size_t n = config_.prefix_gate;
         gate_open_ = std::any_of(frames_.begin(), frames_.end(), [&](const auto& f) {
-            return f.second - f.first + 1 > n && std::equal(context_.begin() + f.first, context_.begin() + f.first + n,
-                                                         context_.begin() + open_at_);
+            return f.second - f.first + 1 > n && std::equal(context_.begin() + static_cast<std::ptrdiff_t>(f.first), context_.begin() + static_cast<std::ptrdiff_t>(f.first) + static_cast<std::ptrdiff_t>(n),
+                                                         context_.begin() + static_cast<std::ptrdiff_t>(open_at_));
         });
     }
 }

@@ -180,7 +180,7 @@ struct GreedyServingScheduler::Impl {
             accumulate(job->metrics.inter_token_intervals,1,job->metrics.saturated);
             accumulate(job->metrics.inter_token_ns_total,interval,job->metrics.saturated);
             job->metrics.inter_token_ns_max=std::max(job->metrics.inter_token_ns_max,interval);
-            const auto bucket=interval>1?std::bit_width(interval)-1U:0U;
+            const auto bucket=interval>1?static_cast<unsigned>(std::bit_width(interval))-1U:0U;
             accumulate(job->metrics.inter_token_ns_histogram[bucket],1,job->metrics.saturated);
         }
         job->last_token=delivered; job->metrics.emitted_tokens=emitted;
@@ -312,7 +312,7 @@ struct GreedyServingScheduler::Impl {
                             accumulate(job->metrics.inter_token_intervals, 1, job->metrics.saturated);
                             accumulate(job->metrics.inter_token_ns_total, interval, job->metrics.saturated);
                             job->metrics.inter_token_ns_max = std::max(job->metrics.inter_token_ns_max, interval);
-                            const auto bucket = interval > 1 ? std::bit_width(interval) - 1U : 0U;
+                            const auto bucket = interval > 1 ? static_cast<unsigned>(std::bit_width(interval)) - 1U : 0U;
                             accumulate(job->metrics.inter_token_ns_histogram[bucket], 1, job->metrics.saturated);
                         }
                         job->last_token = delivered;

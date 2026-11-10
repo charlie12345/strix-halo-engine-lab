@@ -78,7 +78,7 @@ ConstraintSelection::Staged ConstraintSelection::select(std::span<const float> l
         const auto score = [&](std::uint32_t token) { return (static_cast<double>(logits[token]) - maximum) - normalizer; };
         staged.score.logprob = score(id);
         const auto n = std::min<std::size_t>(spec_->top_logprobs, order.size());
-        std::partial_sort(order.begin(), order.begin() + n, order.end(), [&](auto a, auto b) {
+        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(n), order.end(), [&](auto a, auto b) {
             const auto pa = score(a), pb = score(b);
             return pa != pb ? pa > pb : a < b;
         });
@@ -108,7 +108,7 @@ bool ConstraintSelection::admits(const State& state, std::uint32_t id) const {
     if (std::find(spec_->eos_ids.begin(), spec_->eos_ids.end(), id) != spec_->eos_ids.end()) return state.cursor.complete();
     if (!trie_->contains(id)) return false;
     auto cursor = state.cursor;
-    for (unsigned char b : tokenizer_->token_bytes(id)) if (!cursor.advance(b)) return false;
+    for (const char b_char : tokenizer_->token_bytes(id)) { unsigned char b = static_cast<unsigned char>(b_char); if (!cursor.advance(b)) return false; }
     return true;
 }
 std::optional<ConstraintSelection::Staged> ConstraintSelection::select_known(const State& state, std::uint32_t token, std::uint32_t status) const {

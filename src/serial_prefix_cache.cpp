@@ -199,7 +199,7 @@ std::shared_ptr<const SerialPrefixCacheEntry> SerialPrefixCache::find(
     for (std::size_t i = 0; i < slots_.size(); ++i) {
         if (!slots_[i].entry->matches(tokens, execution, compatibility, layout, history)) continue;
         auto handle = slots_[i].entry;
-        std::rotate(slots_.begin() + i, slots_.begin() + i + 1U, slots_.end());
+        std::rotate(slots_.begin() + static_cast<std::ptrdiff_t>(i), slots_.begin() + static_cast<std::ptrdiff_t>(i) + 1, slots_.end());
         return handle;
     }
     return {};
@@ -221,7 +221,7 @@ std::shared_ptr<const SerialPrefixCacheEntry> SerialPrefixCache::find_longest_gr
     }
     if(best==slots_.size()) return {};
     auto handle=slots_[best].entry;
-    std::rotate(slots_.begin()+best,slots_.begin()+best+1U,slots_.end());
+    std::rotate(slots_.begin()+static_cast<std::ptrdiff_t>(best),slots_.begin()+static_cast<std::ptrdiff_t>(best)+1,slots_.end());
     return handle;
 }
 
@@ -238,7 +238,7 @@ std::shared_ptr<const SerialPrefixCacheEntry> SerialPrefixCache::find_exact_gree
         // compiled-plan-derived recipe above proves every interval and cut.
         if(!entry.matches(tokens,execution,compatibility,layout,&entry.prefix().arithmetic_lineage)) continue;
         auto handle=slots_[i].entry;
-        std::rotate(slots_.begin()+i,slots_.begin()+i+1U,slots_.end());return handle;
+        std::rotate(slots_.begin()+static_cast<std::ptrdiff_t>(i),slots_.begin()+static_cast<std::ptrdiff_t>(i)+1,slots_.end());return handle;
     }
     return {};
 }
@@ -288,7 +288,7 @@ SerialPrefixCacheAdmission SerialPrefixCache::insert(
         (slots_.size() >= max_entries_ || snapshot_bytes_ > byte_budget_ - bytes);) {
         if (slots_[i].entry.use_count() != 1) { ++i; continue; }
         snapshot_bytes_ -= slots_[i].bytes;
-        slots_.erase(slots_.begin() + i);
+        slots_.erase(slots_.begin() + static_cast<std::ptrdiff_t>(i));
     }
     slots_.push_back({std::move(handle), bytes});
     snapshot_bytes_ += bytes;
@@ -300,7 +300,7 @@ std::size_t SerialPrefixCache::evict_unpinned() noexcept {
     for (std::size_t i = 0; i < slots_.size();) {
         if (slots_[i].entry.use_count() != 1) { ++i; continue; }
         snapshot_bytes_ -= slots_[i].bytes;
-        slots_.erase(slots_.begin() + i);
+        slots_.erase(slots_.begin() + static_cast<std::ptrdiff_t>(i));
         ++evicted;
     }
     return evicted;

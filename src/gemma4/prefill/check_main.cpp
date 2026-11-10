@@ -286,7 +286,7 @@ void canonical_ab(pf::DevicePrefill& prefill, const g4::ModelConfig& config, std
         }
         std::cout << "{\"canonical_ab\":\"" << (kernel ? "kernel" : "rows8") << "\",\"profiled\":" << (profiled ? "true" : "false")
                   << ",\"rows\":" << tokens.size() << ",\"iteration\":" << iteration << ",\"seconds\":" << seconds
-                  << ",\"tokens_per_s\":" << tokens.size() / seconds;
+                  << ",\"tokens_per_s\":" << static_cast<double>(tokens.size()) / seconds;
         if (profiled) std::cout << ",\"linear_ms\":" << now.linear_ms - before.linear_ms << ",\"attention_ms\":" << now.attention_ms - before.attention_ms;
         std::cout << "}\n";
     };
@@ -317,7 +317,7 @@ void exact_ab(pf::DevicePrefill& prefill, gpu::DeviceTarget& target, const g4::M
     }
     const auto seconds = std::chrono::duration<double>(Clock::now() - start).count();
     const auto digest = reference.digest();
-    std::cout << "{\"exact_ab\":\"rows8\",\"rows\":" << n << ",\"seconds\":" << seconds << ",\"tokens_per_s\":" << n / seconds
+    std::cout << "{\"exact_ab\":\"rows8\",\"rows\":" << n << ",\"seconds\":" << seconds << ",\"tokens_per_s\":" << static_cast<double>(n) / seconds
               << ",\"kv_digest\":\"" << digest << "\"}\n";
     for (unsigned r = 0; r < repetitions; ++r) {
         gpu::DeviceStream stream(config, unsigned(n));
@@ -326,7 +326,7 @@ void exact_ab(pf::DevicePrefill& prefill, gpu::DeviceTarget& target, const g4::M
         const auto elapsed = std::chrono::duration<double>(Clock::now() - begin).count();
         const auto state = stream.digest();
         std::cout << "{\"exact_ab\":\"manyrow\",\"rows\":" << n << ",\"iteration\":" << r << ",\"seconds\":" << elapsed
-                  << ",\"tokens_per_s\":" << n / elapsed << ",\"kv_digest\":\"" << state << "\"}\n";
+                  << ",\"tokens_per_s\":" << static_cast<double>(n) / elapsed << ",\"kv_digest\":\"" << state << "\"}\n";
         if (state != digest) throw std::runtime_error("exact prefill committed KV digest differs from the eight-row passes");
         equal(result.last_logits, logits);
         equal(result.tail_taps, taps);
@@ -419,7 +419,7 @@ int main(int argc, char** argv) try {
     const auto args = arguments(argc, argv);
     // Product profile: exported before the cached prefill switches are first read.
     const auto product = g4::profile::resolve(args.product.value_or(g4::profile::Name::standard), g4::profile::App::prefill_bench,
-                                              {.allow_pending = args.allow_pending});
+                                              {.cli = {}, .assets = {}, .env = {}, .allow_pending = args.allow_pending});
     g4::profile::apply(product);
     // DevicePrefill implements only g4-wmma-pf-v1 linears; never report another route than the one that runs.
     if (const auto* linears = product.find("prefill_linears"); linears && linears->value != "wmma")

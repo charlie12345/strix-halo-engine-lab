@@ -190,7 +190,7 @@ DirectGpuBoundaryStaging::DirectGpuBoundaryStaging(DistributedPlacementPlan plac
         std::size_t data = 0, logical = 0;
         for (std::size_t n = 0; n < placement.boundaries.size(); ++n) {
             const auto& b = placement.boundaries[n];
-            if (!b.boundary_id || std::any_of(placement.boundaries.begin(), placement.boundaries.begin() + n,
+            if (!b.boundary_id || std::any_of(placement.boundaries.begin(), placement.boundaries.begin() + static_cast<std::ptrdiff_t>(n),
                 [&](const auto& previous) {return previous.boundary_id == b.boundary_id;}))
                 throw std::invalid_argument("GPU staging canonical boundary identity is empty or duplicated");
             if (is_materialized_input_position_dependency(placement, b)) {++logical;continue;}

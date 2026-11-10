@@ -47,13 +47,13 @@ int main() {
             const auto model = tiny(aliases);
             HostTarget target(bind_host_weights(model),tables,2), single_worker(bind_host_weights(model),tables,1);
             HostStream batch(model.config), serial(model.config), one(model.config);
-            for (unsigned group = 0; group < 4; ++group) {
+            for (unsigned chunk = 0; chunk < 4; ++chunk) {
                 std::vector<float> batch_taps;
-                const auto logits = ingest(target,batch,8,group+2,true,&batch_taps);
+                const auto logits = ingest(target,batch,8,chunk+2,true,&batch_taps);
                 for (unsigned r = 0; r < 8; ++r) {
                     std::vector<float> solo_taps;
-                    const auto solo = ingest(target,serial,1,group+2+r,false,&solo_taps);
-                    const auto same = ingest(single_worker,one,1,group+2+r);
+                    const auto solo = ingest(target,serial,1,chunk+2+r,false,&solo_taps);
+                    const auto same = ingest(single_worker,one,1,chunk+2+r);
                     CHECK(std::memcmp(solo.data(),same.data(),solo.size()*4) == 0);
                     CHECK(std::memcmp(logits.data()+r*model.config.vocab,solo.data(),solo.size()*4) == 0);
                     CHECK(std::memcmp(batch_taps.data()+r*5*model.config.hidden,solo_taps.data(),solo_taps.size()*4) == 0);

@@ -18,7 +18,7 @@ void hash_u64(std::uint64_t& hash, std::uint64_t value) noexcept {
 }
 
 void hash_text(std::uint64_t& hash, std::string_view value) noexcept {
-    for (const unsigned char byte : value) {
+    for (const char byte_char : value) { const unsigned char byte = static_cast<unsigned char>(byte_char);
         hash ^= static_cast<std::uint64_t>(byte);
         hash *= fnv_prime;
     }

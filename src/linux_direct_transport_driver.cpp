@@ -114,15 +114,20 @@ LinuxDirectGpuStreamCalls LinuxDirectGpuStreamCalls::native() {
     calls.driver_build_identity = observe_linux_direct_gpu_stream_module_build_id;
     return calls;
 }
+namespace {
+// Kept at namespace scope: a nested class with default member initializers is not default-constructible until the
+// enclosing class is complete, and newer libstdc++ evaluates std::optional<T>::emplace()'s constraint that early.
+struct LinuxDirectTransportOperation {
+    DirectDriverOperation binding;
+    GpuCommitRecord commit;
+    std::uint64_t offset = 0;
+    std::uint32_t frame_count = 0, completed_frames = 0;
+    bool submitted = false, released = false, hardware_done = false, acquired = false, consumer_done = false, credited = false, reposted = false,
+        transport_ack = false, remote_consumer = false;
+};
+} // namespace
 struct LinuxDirectTransportDriverIo::Impl {
-    struct Operation {
-        DirectDriverOperation binding;
-        GpuCommitRecord commit;
-        std::uint64_t offset = 0;
-        std::uint32_t frame_count = 0, completed_frames = 0;
-        bool submitted = false, released = false, hardware_done = false, acquired = false, consumer_done = false, credited = false, reposted = false,
-            transport_ack = false, remote_consumer = false;
-    };
+    using Operation = LinuxDirectTransportOperation;
     DirectStreamDeviceIdentity route;
     DirectDriverBinding expected;
     std::shared_ptr<DirectGpuStreamGpu> gpu;

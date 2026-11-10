@@ -52,7 +52,7 @@ public:
     void text(const std::string& value) {
         if (value.empty() || value.size() > 256) throw std::invalid_argument("direct GPU control identity is empty or excessive");
         u32(static_cast<std::uint32_t>(value.size()));
-        for (unsigned char character : value) {
+        for (const char character_char : value) { unsigned char character = static_cast<unsigned char>(character_char);
             if (character < 32 || character > 126) throw std::invalid_argument("direct GPU control identity is not canonical ASCII");
             bytes_.push_back(static_cast<std::byte>(character));
         }

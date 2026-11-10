@@ -612,7 +612,7 @@ CycleResult run_cycle(Target& target, KvTxn& transaction, std::uint32_t anchor, 
         }
     }
     result.verdict = verify_greedy(std::span<const std::uint32_t>(tokens).first(k), greedy, budget, eos, stats);
-    result.committed_taps.assign(forward.taps.begin(), forward.taps.begin() + std::size_t{result.verdict.processed} * forward.tap_width);
+    result.committed_taps.assign(forward.taps.begin(), forward.taps.begin() + static_cast<std::ptrdiff_t>(std::size_t{result.verdict.processed} * forward.tap_width));
     for (std::uint32_t r = 0; r < result.verdict.processed; ++r) result.committed_positions.push_back(position + r);
     result.next_anchor = result.verdict.emitted.back();
     transaction.commit(result.verdict.processed);

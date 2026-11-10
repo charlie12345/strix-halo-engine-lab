@@ -34,7 +34,7 @@ bool shape_matches(const ShapeClass& variant, const ShapeClass& query) noexcept 
 
 void hash_bytes(std::uint64_t& hash, std::string_view value) noexcept {
     constexpr std::uint64_t prime = 1099511628211ULL;
-    for (const unsigned char byte : value) {
+    for (const char byte_char : value) { const unsigned char byte = static_cast<unsigned char>(byte_char);
         hash ^= static_cast<std::uint64_t>(byte);
         hash *= prime;
     }

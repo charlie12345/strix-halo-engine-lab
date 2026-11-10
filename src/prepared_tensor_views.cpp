@@ -397,8 +397,8 @@ const ExecutionTensorAccess& PreparedTensorViews::access(std::uint64_t identity,
     }
     // Preserve support for canonical families with non-dense slots. Current
     // production families take the constant-time indexed path above.
-    const auto first = impl_->accesses.accesses.begin() + range.begin;
-    const auto last = first + range.count;
+    const auto first = impl_->accesses.accesses.begin() + static_cast<std::ptrdiff_t>(range.begin);
+    const auto last = first + static_cast<std::ptrdiff_t>(range.count);
     const auto found = std::lower_bound(first, last, binding_slot,
         [](const ExecutionTensorAccess& entry, std::uint32_t slot) { return entry.binding_slot < slot; });
     if (found == last || found->binding_slot != binding_slot)

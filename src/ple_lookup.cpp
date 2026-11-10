@@ -23,7 +23,7 @@ constexpr std::uint64_t mask64 = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t splitmix_gamma = 0x9E3779B97F4A7C15ULL;
 constexpr std::uint64_t splitmix_m1 = 0xBF58476D1CE4E5B9ULL;
 constexpr std::uint64_t splitmix_m2 = 0x94D049BB133111EBULL;
-constexpr std::uint64_t prime_1 = 10007ULL;
+[[maybe_unused]] constexpr std::uint64_t prime_1 = 10007ULL;
 
 std::uint64_t splitmix64(std::uint64_t value) noexcept {
     value = (value + splitmix_gamma) & mask64;

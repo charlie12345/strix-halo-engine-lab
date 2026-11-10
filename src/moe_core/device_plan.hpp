@@ -176,9 +176,11 @@ template <class P> inline hipError_t enqueue(const Args<P>& a, hipStream_t strea
 // ---------------------------------------------------------------- device item queue
 // A grouped launch whose item table (cta_begin prefixes ascending, `*count` items, `*total` CTAs) was built on the
 // device. Persistent: every CTA takes virtual CTA indices from `*next` (zeroed by the planner) until `*total`; the grid
-// is the resident capacity, not the (device-only) CTA count. Direct: virtual CTA = blockIdx.x (+ k * gridDim.x), for
-// launches whose grid bound is tight. Each virtual CTA runs exactly the work of the host-planned launch's CTA of the
-// same index, so outputs are bitwise those of the host table.
+// is the resident capacity, not the (device-only) CTA count. Direct: virtual CTA = blockIdx.x, for launches whose grid
+// is a proven bound of `*total` (surplus CTAs return at once; the planner flags a total above the bound). Each virtual
+// CTA runs exactly the work of the host-planned launch's CTA of the same index, so outputs are bitwise those of the
+// host table. The virtual index is wave-uniform (readfirstlane), so the item is read with scalar loads as in the host
+// kernels and the body's register allocation is unchanged.
 template <class ItemT> struct ItemQueue {
     const ItemT* items;
     const unsigned* count;
@@ -197,6 +199,13 @@ __device__ __forceinline__ const ItemT& find_item(const ItemT* items, unsigned c
     return items[lo];
 }
 
+template <class ItemT, class Body>
+__device__ __forceinline__ void run_item(const ItemQueue<ItemT>& q, unsigned count, unsigned vb, Body&& body) {
+    const ItemT it = find_item(q.items, count, vb);
+    const unsigned local = vb - it.cta_begin;
+    body(it, local % it.gx, (local / it.gx) % it.gy, local / (it.gx * it.gy));
+}
+
 // body(item, bx, by, bz) with the host kernels' decomposition of the CTA index inside the item.
 template <bool Persistent, class ItemT, class Body>
 __device__ __forceinline__ void run_items(const ItemQueue<ItemT>& q, Body&& body) {
@@ -207,22 +216,14 @@ __device__ __forceinline__ void run_items(const ItemQueue<ItemT>& q, Body&& body
         for (;;) {
             if (threadIdx.x == 0) s_vb = atomicAdd(q.next, 1U);
             __syncthreads();
-            const unsigned vb = s_vb;
+            const unsigned vb = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(s_vb)));
             if (vb >= total) return;
-            const ItemT it = find_item(q.items, count, vb);
-            const unsigned local = vb - it.cta_begin;
-            body(it, local % it.gx, (local / it.gx) % it.gy, local / (it.gx * it.gy));
+            run_item(q, count, vb, body);
             __syncthreads();  // s_vb and the body's LDS are reused by the next virtual CTA
         }
     } else {
         if (blockIdx.x >= total) return;
-        const unsigned count = *q.count;
-        for (unsigned vb = blockIdx.x; vb < total; vb += gridDim.x) {
-            const ItemT it = find_item(q.items, count, vb);
-            const unsigned local = vb - it.cta_begin;
-            body(it, local % it.gx, (local / it.gx) % it.gy, local / (it.gx * it.gy));
-            if (vb + gridDim.x < total) __syncthreads();
-        }
+        run_item(q, *q.count, blockIdx.x, body);
     }
 }
 

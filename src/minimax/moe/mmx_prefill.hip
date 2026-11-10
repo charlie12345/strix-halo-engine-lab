@@ -1047,6 +1047,7 @@ struct DevOut {
     _Float16* at;
     float* part;
     unsigned tpairs;
+    unsigned grid7[2];  // the direct MT8 grids (grid_mt8) of the two stages
 };
 struct DevPolicy {
     static constexpr unsigned kExperts = ::strix::minimax::moe::opt::kExperts, kTopK = kTopE, kRows = 256;
@@ -1144,6 +1145,7 @@ struct DevPolicy {
             it.gx = kHidden / 128;
             append(it, 1);
         }
+        if (ctas[7] > p.out.grid7[0] || ctas[15] > p.out.grid7[1]) atomicOr(p.flag, 2U);  // above the direct MT8 grid
         for (unsigned i = 0; i < 16; ++i) {
             p.out.meta->count[i] = ncls[i];
             p.out.meta->total[i] = ctas[i];
@@ -1321,7 +1323,7 @@ void launch_dq_class(const Queue& q, unsigned cls, unsigned grid7, hipStream_t s
 }
 // MT8-class CTA bound of a stage: an MT8 item is a group's 128-row tiles (floor(n / 128)) or its remainder when that
 // is >= 113 rows, both with splits 1 (n >= 113); floor(n / 128) + [n % 128 >= 113] <= n / 113 and the groups hold 5T
-// rows, so the class has at most gx x matrices x floor(5T / 113) CTAs. The direct kernels grid-stride beyond it.
+// rows, so the class has at most gx x matrices x floor(5T / 113) CTAs (the planner flags a larger total).
 unsigned grid_mt8(unsigned stage, unsigned T) {
     const unsigned tiles = std::max(1U, 5U * T / 113U);
     return stage == 0 ? 2U * (kInter / 128) * tiles : (kHidden / 128) * tiles;
@@ -1353,6 +1355,8 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
     a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
     a.out.part = reinterpret_cast<float*>(ws + l.part);
     a.out.tpairs = l.tpairs;
+    a.out.grid7[0] = grid_mt8(0, T);
+    a.out.grid7[1] = grid_mt8(1, T);
     mark("start", stream);
     ok(dp::enqueue(a, stream), "device plan");
     Tables t{};
@@ -1548,7 +1552,8 @@ void prefill_moe_device_check() {
     ok(hipMemcpy(&flag, g_dev_flag, sizeof(flag), hipMemcpyDeviceToHost), "device plan flag read");
     if (flag != 0) {
         ok(hipMemset(g_dev_flag, 0, sizeof(unsigned)), "device plan flag reset");
-        throw std::runtime_error("minimax prefill moe: device plan saw invalid routes (expert id >= 128 or repeated in a row)");
+        throw std::runtime_error(flag & 2U ? "minimax prefill moe: device plan MT8 class above its grid bound (bug)"
+                                            : "minimax prefill moe: device plan saw invalid routes (expert id >= 128 or repeated in a row)");
     }
 }
 

@@ -20,7 +20,7 @@ repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y 
 | DeepSeek V4.1 Flash | par | 70.6 tok/s (DSpark, código) | TTFT 27.73 s a 32.5K |
 | MiniMax M3.1 Flash | par | 23.10 tok/s (1K) | TTFT 13.75 s a 8K |
 | GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | TTFT 15.15 s a 8K |
-| Nemotron 3.5 Bolt E4B | 1 nodo | 91.9 tok/s (C1) | - |
+| Nemotron 3.5 Bolt E4B | 1 nodo | 91.9 tok/s (C1) | 2,494 tok/s a 2K, 2,094 a 8K (`fast`) |
 | MiniMax H3 | par | clip de 5 s 1344x768 con audio en 405.5 s | - |
 
 <a id="hardware"></a>

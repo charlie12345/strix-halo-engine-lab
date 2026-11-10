@@ -44,7 +44,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 - [Prepared rank-local expert loading (v1)](models/deepseek-v4.1/prepared-load.md): Opt-in prepared rank-local routed-expert loading (STRIX_DS41_PREPARED_LOAD) and strix-ds41-prepare-load.
 - [DeepSeek-V4.1 two-node: production defaults (P17.2)](models/deepseek-v4.1/production-defaults.md): DeepSeek-V4.1 two-node production defaults (P17.2) from the P17.1 timing campaign.
 - [Experimental state transfer v2](models/deepseek-v4.1/state-transfer-v2.md): Experimental state transfer v2 receiver stub and proposed HTTP import contract.
-- [Numerical identity ds41-trellis-k5-v1 (QTIP-style trellis dense decode sites)](models/deepseek-v4.1/trellis-k5-v1.md): QTIP-style trellis dense decode sites, mixA/mixB identities.
+- [Numerical identity ds41-trellis-k5-v1 (trellis dense decode sites)](models/deepseek-v4.1/trellis-k5-v1.md): trellis dense decode sites, mixA/mixB identities.
 - [Trellis library adapters](models/deepseek-v4.1/trellis-library-api.md): STRIX_DS41_TRELLIS_API CMake selection of trellis library adapters (v12, tp03, splitk04).
 - [Optional single-session latency kernels](models/qwen3.8/latency-kernels.md): Optional STRIX_QKERN_* single-session latency kernel switches for Qwen decode.
 - [Qwen attention, draft and recurrent dispatch experiments](models/qwen3.8/persistence-kernels.md): STRIX_QPERSIST_* attention, draft and recurrent persistent dispatch experiments for Qwen.

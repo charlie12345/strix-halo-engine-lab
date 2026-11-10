@@ -11,10 +11,12 @@ struct IntegerPlan {
     static constexpr unsigned class_waves = 8, chunk_groups = 32;
     static constexpr unsigned waves_per_eu = 0;
 };
-template<unsigned Waves = 8> struct GroupedIntegerPlan : IntegerPlan {
+// Partial: a partial last chunk loads only its blocks. Without it every chunk loads
+// whole rows, so the launcher must keep the width a multiple of 32 groups.
+template<unsigned Waves = 8, bool Partial = true> struct GroupedIntegerPlan : IntegerPlan {
     static constexpr IntegerStructure structure = IntegerStructure::grouped_chunk;
     static constexpr unsigned waves_per_eu = Waves;
-    static constexpr bool weight_lds = true, partial_blocks = true;
+    static constexpr bool weight_lds = true, partial_blocks = Partial;
     static constexpr bool float_half_sums = true, lds_only_barriers = true;
     static constexpr bool half_exchange = true, opaque_magic = true;
 };

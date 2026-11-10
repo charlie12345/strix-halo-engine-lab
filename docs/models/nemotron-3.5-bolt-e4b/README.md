@@ -312,7 +312,7 @@ pair alternated; prefill tok/s (prompt time):
 | 32K | 1,203 (27.2 s) | **2,272 (14.42 s)** | 1.89x |
 
 The ceiling with 512-row chunks is 2C/(C+1) for C chunks (2K 1.60x, 8K 1.88x, 32K 1.97x). Decode after the prompt
-is the single-node decode on rank 1 (2K, MTP drafter, 128 tokens: 69.7 tok/s on one node and 69.8 after the pair prefill, same KV state bytes, so the drafter receives the same taps).
+is the single-node decode on rank 1 (MTP drafter, 128 tokens, 2K / 8K / 32K: one node 69.7 / 62.3 / 38.0 tok/s, after the pair prefill 69.8 / 62.7 / 37.9; same KV state bytes, so the drafter receives the same taps).
 
 `a8` prompt prefill (`fast` on non-Q4_K_M packs; `STRIX_G4_PREFILL_IDENTITY=a8`, valid only with the `g4-a8-v1` decode; with another decode
 identity exact prefill runs and one stderr line says so). The prompt runs in 512-row chunks on the same `g4-a8-v1`

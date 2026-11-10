@@ -331,7 +331,7 @@ binario, un nodo y pareja alternados; tok/s de prefill (tiempo del prompt):
 | 32K | 1,203 (27.2 s) | **2,272 (14.42 s)** | 1.89x |
 
 El techo con fragmentos de 512 filas es 2C/(C+1) para C fragmentos (2K 1.60x, 8K 1.88x, 32K 1.97x). El decode tras
-el prompt es el decode de un nodo en el rango 1 (2K, drafter MTP, 128 tokens: 69.7 tok/s en un nodo y 69.8 tras el prefill en pareja, mismos bytes del estado KV, así que el drafter recibe los mismos taps).
+el prompt es el decode de un nodo en el rango 1 (drafter MTP, 128 tokens, 2K / 8K / 32K: un nodo 69.7 / 62.3 / 38.0 tok/s, tras el prefill en pareja 69.8 / 62.7 / 37.9; mismos bytes del estado KV, así que el drafter recibe los mismos taps).
 
 Prefill de prompts `a8` (`fast` en paquetes que no son Q4_K_M; `STRIX_G4_PREFILL_IDENTITY=a8`, válido solo con el decode `g4-a8-v1`; con otra
 identidad de decode se ejecuta el prefill exacto y una línea en stderr lo indica). El prompt se procesa en bloques de

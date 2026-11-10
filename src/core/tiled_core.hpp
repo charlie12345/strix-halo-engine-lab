@@ -71,7 +71,13 @@ template<int BM, int BN, int WM, int WN, class Operand = PackedF16> struct Geome
     // IU4 row swizzle (below) avoids padding; F16 preserves the original layout.
     static constexpr int row_bytes = iu4 ? BK / 2 : (BK + 8) * 2;
     static constexpr int waves_m = BM / WM, waves_n = BN / WN, waves = waves_m * waves_n;
-    static constexpr int threads = waves * 32 * (is_integer_operand<Operand>::value ? 8 : 1);
+    static constexpr int threads = [] {
+        if constexpr (is_integer_operand<Operand>::value) {
+            if constexpr (Operand::Plan::structure == IntegerStructure::dense_tall) return 256;
+            else if constexpr (Operand::Plan::structure == IntegerStructure::dense_wide) return 128;
+            else return waves * 32 * 8;
+        } else return waves * 32;
+    }();
     static constexpr int MT = WM / 16, NT = WN / 16;
     static constexpr int chunks_per_row = BK * Operand::element_bits / 128;
     static constexpr int a_chunks = BM * chunks_per_row;     // 16-byte chunks per stage
@@ -82,6 +88,13 @@ template<int BM, int BN, int WM, int WN, class Operand = PackedF16> struct Geome
     // permuted so a lane's eight rows are contiguous) and [2][BN] weight scales.
     static constexpr int scale_bytes = iu4 ? (BM + BN) * 2 * 4 : 0;
     static constexpr int stage_bytes = is_integer_operand<Operand>::value ? 4 * BM * BN * 4 : (BM + BN) * row_bytes + scale_bytes;
+    static constexpr int lds_bytes = [] {
+        if constexpr (is_integer_operand<Operand>::value) {
+            if constexpr (Operand::Plan::structure == IntegerStructure::grouped_chunk) return int(Operand::grouped_bytes);
+            if constexpr (Operand::Plan::structure == IntegerStructure::dense_tall || Operand::Plan::structure == IntegerStructure::dense_wide) return 1;
+        }
+        return 2 * stage_bytes;
+    }();
     static_assert(BM % WM == 0 && BN % WN == 0 && WM % 16 == 0 && WN % 16 == 0);
 };
 
@@ -124,10 +137,15 @@ struct NoAdapter {
 };
 // Probe (benchmark builds only, timing decomposition, wrong outputs):
 // 1 = no Q decode/LDS store, 2 = no WMMA, 3 = WMMA + fragment reads only.
+template<class Contract> constexpr unsigned core_waves_per_eu() {
+    if constexpr (is_integer_operand<typename Contract::Operand>::value) return Contract::Operand::Plan::waves_per_eu;
+    else return 0;
+}
 template<class Contract, int BM, int BN, int WM, int WN, bool Fused, int Probe = 0,
     bool IU4Audit = false, bool IU4FullRows = false, int IU4Group = 64, bool IU4Grouped = false,
     class Adapter = NoAdapter>
-__global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operand>::threads)) void tiled_core(
+__global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operand>::threads))
+__attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_core(
     const uint32_t* __restrict__ packed, const _Float16* __restrict__ input,
     float* __restrict__ partial, int inputs, int outputs, int rows, int splits,
     const uint16_t* __restrict__ scales, const float* __restrict__ bias,
@@ -145,7 +163,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
     constexpr int CB = [] { if constexpr (Integer || IU4Pack || DenseF16) return 2; else return Operand::codebook; }();
     constexpr int KT = G::KT, STRIDE = G::row_bytes / 2;
     constexpr int MT = G::MT, NT = G::NT;
-    __shared__ __attribute__((aligned(16))) uint8_t lds[2 * G::stage_bytes];
+    __shared__ __attribute__((aligned(16))) uint8_t lds[G::lds_bytes];
     const int thread = int(threadIdx.x), lane = thread & 31;
     const int wave = __builtin_amdgcn_readfirstlane(thread / 32);
     const int spatial_wave = Integer ? wave % G::waves : wave;

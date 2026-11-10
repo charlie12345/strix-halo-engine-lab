@@ -1,9 +1,10 @@
 #pragma once
 #include "ds41_integer_operand.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "strix/ds41_layer.hpp"
 namespace strix::ds41::integer_core {
 // Dense is one group on tiled_core; row/column tails and strides are model glue.
-struct DenseAdapter {
+template<unsigned RowTiles = 1, bool ColFirst = false> struct DenseAdapter {
     static constexpr bool kActive = true, kTiles = true;
     struct Tile {
         int rows = 0, first_col = 0, split = 0, splits = 1;
@@ -11,11 +12,14 @@ struct DenseAdapter {
         unsigned begin = 0;
     };
     Q8A8DensePrefillView view;
+    __device__ auto tensor() const { return view; }
+    __device__ float half_exact(unsigned short h) const { return f16_to_float(h); }
+    __device__ float half_select(unsigned short h) const { return f16_to_float_select(h); }
     __device__ bool next(Tile& t, unsigned iter, int bn) const {
         if (iter) return false;
-        t.begin = blockIdx.x * 16U;
+        t.begin = (ColFirst ? blockIdx.y : blockIdx.x) * (16U * RowTiles);
         if (t.begin >= view.rows) return false;
-        t.rows = int(min(16U, view.rows - t.begin));
+        t.rows = int(min(16U * RowTiles, view.rows - t.begin));
         t.first_col = int(blockIdx.y) * bn;
         return true;
     }
@@ -51,4 +55,19 @@ struct DenseAdapter {
         }
     }
 };
+
+template<unsigned RT, unsigned OT, unsigned Lean = 0, bool ColFirst = false, unsigned Parts = 1,
+         bool Wide = false, bool Staged = true>
+inline void launch_dense(const Q8A8DensePrefillView& v, hipStream_t stream) {
+    using Plan = std::conditional_t<Wide, strix::core::WideIntegerPlan<Staged>, strix::core::DenseIntegerPlan<Lean, ColFirst, Parts>>;
+    using C = strix::core::IntegerContract<strix::core::IntegerOperand<Ds41PrefillTraits, WeightFormat::q8_0, false, Plan>>;
+    using Ad = DenseAdapter<RT, ColFirst>;
+    using namespace strix::core::wmma_tiled;
+    using G = Geometry<16 * RT, 16 * OT, 16 * RT, 16 * OT, typename C::Operand>;
+    const unsigned x = (v.rows + 16 * RT - 1) / (16 * RT), y = (v.count + 16 * OT - 1) / (16 * OT);
+    hipLaunchKernelGGL((tiled_core<C, 16 * RT, 16 * OT, 16 * RT, 16 * OT, false, 0, false, false, 64, false, Ad>),
+        dim3(ColFirst ? y : x, ColFirst ? x : y), dim3(G::threads), 0, stream,
+        nullptr, nullptr, nullptr, int(v.width), int(y * 16 * OT), int(v.rows), 1,
+        nullptr, nullptr, nullptr, 1.0f, 0.0f, 1, nullptr, nullptr, nullptr, nullptr, GroupedArgs{}, Ad{v});
+}
 }

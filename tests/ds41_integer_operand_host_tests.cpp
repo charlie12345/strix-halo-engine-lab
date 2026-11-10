@@ -1,5 +1,6 @@
 #include "moe_core/grouped_integer_decode.hpp"
 #include "core/integer_operand.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -148,8 +149,83 @@ void reductions() {
     expect(a4_code(1, 2.0f) == 0 && a4_code(3, 2.0f) == 2 && a4_code(-3, 2.0f) == -2, "A4 ties to even");
 }
 }
+void integer_launch_indexing() {
+    using namespace strix::core;
+    // Enumerate the intended launch order independently: full bands, then tail.
+    for (unsigned X = 1; X <= 19; ++X)
+        for (unsigned Y = 1; Y <= 9; ++Y)
+            for (unsigned band : {0U, 1U, 2U, 4U, 8U, 32U}) {
+                std::vector<IntegerBlock> expected;
+                const unsigned step = band > 1 ? band : X;
+                if (band <= 1) {
+                    for (unsigned y = 0; y < Y; ++y)
+                        for (unsigned x = 0; x < X; ++x) expected.push_back({x, y});
+                } else {
+                    for (unsigned base = 0; base < X; base += step)
+                        for (unsigned y = 0; y < Y; ++y)
+                            for (unsigned x = base; x < std::min(X, base + step); ++x)
+                                expected.push_back({x, y});
+                }
+                for (unsigned i = 0; i < X * Y; ++i) {
+                    const auto actual = integer_block(i % X, i / X, X, Y, band);
+                    expect(actual.batch == expected[i].batch && actual.column == expected[i].column, "band/tail raster");
+                }
+            }
+    std::array<unsigned, 1024> seen{};
+    for (unsigned t = 0; t < 512; ++t)
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto item = integer_stage_item(t, i);
+            expect(item.row < 16 && item.half < 2 && item.group < 32, "activation stage bounds");
+            ++seen[(item.group * 2 + item.half) * 16 + item.row];
+            const auto pos = integer_row_position(item.row);
+            expect(pos == (item.row % 2) * 8 + item.row / 2, "WMMA row/delta lane agreement");
+        }
+    for (auto count : seen) expect(count == 1, "activation stage bijection");
+    // Partial Q2_K chunks must read only resident 256-weight blocks, with
+    // both uniform weight runs covering each byte exactly once.
+    for (unsigned block_bytes : {66U, 84U}) {
+        const unsigned row_words = block_bytes;
+        for (unsigned left : {8U, 16U, 24U, 32U}) {
+            const unsigned used = (left / 8 * block_bytes + 3) / 4;
+            for (unsigned row = 0; row < 32; ++row)
+                for (unsigned word = 0; word < used; ++word) {
+                    const auto offset = integer_weight_offset(row * row_words + word, row_words, 16384);
+                    expect(offset == std::uint64_t(row) * 16384 + 4 * word, "coalesced weight offset");
+                    expect(4 * word < left / 8 * block_bytes, "partial tile load bounds");
+                }
+        }
+    }
+    struct Shape { unsigned rows, width, count, row_width, form; };
+    for (const auto c : {
+        Shape{255,5120,1024,0,0}, {256,5120,1024,0,814}, {6143,5120,1536,0,814},
+        {6144,5120,1536,0,914}, {256,1536,4096,0,814}, {256,4096,1024,0,822},
+        {512,4096,1024,0,914}, {896,4096,5120,8192,822}, {2048,2048,1024,0,14},
+        {3072,2048,512,0,14}, {256,4096,4096,0,12}}) {
+        expect(integer_dense_form(c.rows,c.width,c.count,c.row_width,true) == c.form, "dense auto shape");
+        const auto fallback = c.form == 814 ? 14 : c.form == 914 ? 114 : c.form == 822 ? 22 : c.form;
+        expect(integer_dense_form(c.rows,c.width,c.count,c.row_width,false) == fallback, "dense buffer fallback");
+    }
+    expect(!integer_dense_fuse_parts(1,895,8192,4096,5120,true,false,true), "parts threshold below");
+    expect(integer_dense_fuse_parts(1,896,8192,4096,5120,true,false,true), "parts launch collapse");
+    expect(!integer_dense_fuse_parts(1,896,8192,4096,1024,true,false,true), "o_a stays separate");
+    expect(!integer_dense_fuse_parts(1,896,8192,4096,5120,true,true,true), "diagnostic keeps two launches");
+    expect(!integer_dense_fuse_parts(1,896,8192,4096,5120,false,false,true), "parts buffer guard");
+    expect(!integer_dense_fuse_parts(1,896,8192,4096,5120,true,false,false), "parts staged guard");
+    // A col-first grid and its row-first transpose cover the same dense tiles.
+    for (unsigned rt : {1U,2U,4U}) for (unsigned ot : {1U,2U,4U})
+        for (unsigned rows : {1U,15U,16U,17U,31U,32U,33U})
+            for (unsigned count : {1U,16U,17U,32U,33U,64U,65U}) {
+                std::vector<unsigned> cover(rows * count);
+                for (unsigned x = 0; x < (count + 16*ot-1)/(16*ot); ++x)
+                    for (unsigned y = 0; y < (rows + 16*rt-1)/(16*rt); ++y)
+                        for (unsigned r = y*16*rt; r < std::min(rows,(y+1)*16*rt); ++r)
+                            for (unsigned c = x*16*ot; c < std::min(count,(x+1)*16*ot); ++c) ++cover[r*count+c];
+                for (auto n : cover) expect(n == 1, "dense tile tail coverage");
+            }
+}
 int main() try {
-    iq_cases(); q2_cases(); q8_cases(); fragments(); reductions();
+    iq_cases(); q2_cases(); q8_cases(); fragments(); reductions(); integer_launch_indexing();
+    std::cout << "PASS shared integer band/tail raster, stage bijection, weight bounds, dense selector and tile tails\n";
     std::cout << "PASS DS41 IntegerOperand host: GGUF decode, IU4 mapping, affine correction, class tree, A4 RNE\n";
     return 0;
 } catch (const std::exception& e) { std::cerr << "FAIL " << e.what() << '\n'; return 1; }

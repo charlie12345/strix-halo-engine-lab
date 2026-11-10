@@ -17,6 +17,7 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 | Model | Hardware | Decode | Prompt reading |
 |---|---|---|---|
 | Qwen3.8-Flash-Next | 1 node | 62.44 tok/s (MTP, 1K code) | 1,695 tok/s at 4K (exact) |
+| Qwen3.8-Flash-Next | 2 nodes (two replicas, server) | 158.1 tok/s total with 8 streams (68.2 with 1) | TTFT p50 0.89 s (1 stream, short chat) |
 | DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | TTFT 27.73 s at 32.5K |
 | MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | TTFT 13.75 s at 8K |
 | GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | TTFT 15.15 s at 8K |

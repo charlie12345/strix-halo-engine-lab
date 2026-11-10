@@ -17,6 +17,7 @@ repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y 
 | Modelo | Hardware | Decode | Lectura del prompt |
 |---|---|---|---|
 | Qwen3.8-Flash-Next | 1 nodo | 62.44 tok/s (MTP, código 1K) | 1,695 tok/s a 4K (exacto) |
+| Qwen3.8-Flash-Next | 2 nodos (dos réplicas, servidor) | 158.1 tok/s en total con 8 flujos (68.2 con 1) | TTFT p50 0.89 s (1 flujo, chat corto) |
 | DeepSeek V4.1 Flash | par | 70.6 tok/s (DSpark, código) | TTFT 27.73 s a 32.5K |
 | MiniMax M3.1 Flash | par | 23.10 tok/s (1K) | TTFT 13.75 s a 8K |
 | GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | TTFT 15.15 s a 8K |

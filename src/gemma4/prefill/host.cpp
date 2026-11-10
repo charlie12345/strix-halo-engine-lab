@@ -68,12 +68,14 @@ void Fidelity::observe(std::span<const float> a, std::span<const float> b) {
 double Fidelity::mean_kl() const { return positions ? sum_kl / double(positions) : std::numeric_limits<double>::infinity(); }
 double Fidelity::top1() const { return positions ? double(top1_matches) / double(positions) : 0.0; }
 double Fidelity::rmse() const { return values ? std::sqrt(squared_error / double(values)) : std::numeric_limits<double>::infinity(); }
-double Fidelity::p99_kl() const {
+double Fidelity::kl_quantile(double q) const {
     if (kl.empty()) return std::numeric_limits<double>::infinity();
     auto sorted = kl;
     std::sort(sorted.begin(), sorted.end());
-    return sorted[std::size_t(std::ceil(0.99 * double(sorted.size()))) - 1];
+    return sorted[std::size_t(std::ceil(q * double(sorted.size()))) - 1];
 }
+double Fidelity::p95_kl() const { return kl_quantile(0.95); }
+double Fidelity::p99_kl() const { return kl_quantile(0.99); }
 bool Fidelity::same_weight_bands_pass() const { return positions && top1() >= 0.995 && mean_kl() <= 1e-4; }
 bool Fidelity::bf16_bands_pass() const {
     return same_weight_bands_pass() && p99_kl() <= 1e-3 && rmse() <= 0.02 && maximum_error <= 0.25;

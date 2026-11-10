@@ -118,6 +118,8 @@ struct Fidelity {
     // Full vocabulary, capped logits, identical teacher-forced prefix. KL(ref||candidate), FP64.
     void observe(std::span<const float> reference, std::span<const float> candidate);
     [[nodiscard]] double mean_kl() const;
+    [[nodiscard]] double kl_quantile(double q) const; // nearest rank, q in (0, 1]
+    [[nodiscard]] double p95_kl() const;
     [[nodiscard]] double p99_kl() const;
     [[nodiscard]] double top1() const;
     [[nodiscard]] double rmse() const;

@@ -441,7 +441,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
     }
     Float8 acc[MT][NT] = {};
     // Fold > 0: the current chain (from +0); acc is the folded FP32 total.
-    [[maybe_unused]] Float8 chain[Fold ? MT : 1][Fold ? NT : 1] = {};
+    [[maybe_unused]] Float8 fold_acc[Fold ? MT : 1][Fold ? NT : 1] = {};
     // IU4: fresh I32 per scale group; persists across stages only when g > BK.
     using IU4Sum = int32_t __attribute__((ext_vector_type(8)));
     [[maybe_unused]] IU4Sum sum[IU4 ? MT : 1][IU4 ? NT : 1] = {};
@@ -536,8 +536,8 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                             acc[mt][nt][0] += float(x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7] +
                                                     x[8] + x[9] + x[10] + x[11] + x[12] + x[13] + x[14] + x[15]);
                         }
-                        else if constexpr (Fold > 0) chain[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            __builtin_bit_cast(Half16, left), __builtin_bit_cast(Half16, right[nt]), chain[mt][nt]);
+                        else if constexpr (Fold > 0) fold_acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            __builtin_bit_cast(Half16, left), __builtin_bit_cast(Half16, right[nt]), fold_acc[mt][nt]);
                         else acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
                             __builtin_bit_cast(Half16, left), __builtin_bit_cast(Half16, right[nt]), acc[mt][nt]);
                     }
@@ -548,7 +548,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                         #pragma unroll
                         for (int mt = 0; mt < MT; ++mt)
                             #pragma unroll
-                            for (int nt = 0; nt < NT; ++nt) { acc[mt][nt] = acc[mt][nt] + chain[mt][nt]; chain[mt][nt] = Float8{}; }
+                            for (int nt = 0; nt < NT; ++nt) { acc[mt][nt] = acc[mt][nt] + fold_acc[mt][nt]; fold_acc[mt][nt] = Float8{}; }
                     }
                 }
             }
@@ -615,7 +615,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                         #pragma unroll
                         for (int j = 0; j < 4; ++j)
                             values[j] *= __half2float(__ushort_as_half(scales[begin_col + lane + 32*j]));
-                        chain.store(map_first + uint32_t(row), begin_col, chain_pass,
+                        chain.store(map_first + uint32_t(row), uint32_t(begin_col), chain_pass,
                             mt * chain_groups + g / G::waves, values, chain_saved);
                         continue;
                     }

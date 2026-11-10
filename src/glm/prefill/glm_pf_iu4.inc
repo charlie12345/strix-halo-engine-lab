@@ -35,7 +35,7 @@ bool iu4_fuse_quant() {
 struct I4Binding {
     static constexpr unsigned H=::strix::glm::pf::exact_moe::H, I=::strix::glm::pf::exact_moe::I;
     const float* x; float* out; Args a;
-    __device__ const unsigned* map() const { return a.pairs; }
+    __host__ __device__ const unsigned* map() const { return a.pairs; }
     __device__ unsigned pair(unsigned pos) const { return a.pairs[pos]; }
     __device__ unsigned token(unsigned p) const { return p/P; }
     __device__ float weight(unsigned p) const { return a.weights[(p/P)*8+p%P]; }

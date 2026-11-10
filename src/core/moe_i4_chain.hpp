@@ -141,7 +141,7 @@ template<class Binding,bool Pair> struct Chain {
     Binding b; Weights w;
     uint8_t* aq; float* as;
     unsigned expert = 0;
-    __device__ void bind(unsigned e, int pass, const uint32_t*& q, const _Float16*& s, const uint16_t*& svh) {
+    __device__ void bind(unsigned e, int pass, const uint32_t* __restrict__& q, const _Float16*& s, const uint16_t* __restrict__& svh) {
         expert=e; const unsigned m=Pair ? unsigned(pass) : 2U;
         q=reinterpret_cast<const uint32_t*>(w.q[m]+size_t(e)*w.q_stride[m]);
         s=w.s[m]+size_t(e)*w.s_stride[m]; svh=w.svh[m][e];
@@ -159,11 +159,11 @@ template<class Binding,bool Pair> struct Chain {
         if constexpr (Pair) {
             if (!pass) {
                 #pragma unroll
-                for (unsigned j=0;j<4;++j) saved[slot*4+j]=v[j];
+                for (unsigned j=0;j<4;++j) saved[unsigned(slot)*4+j]=v[j];
             } else {
                 float g[4],a[4];
                 #pragma unroll
-                for (unsigned j=0;j<4;++j) g[j]=saved[slot*4+j];
+                for (unsigned j=0;j<4;++j) g[j]=saved[unsigned(slot)*4+j];
                 EpiloguePolicy<Binding>{b}.activation(expert,col,g,v,a);
                 iu4_quant128(a,aq+size_t(pair)*(Binding::I/2),as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
             }

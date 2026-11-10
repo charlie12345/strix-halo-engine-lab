@@ -36,7 +36,7 @@ struct I4Binding {
     __device__ unsigned slot(unsigned tok,unsigned k) const {
         return k<kTopE ? t.tok_pair[tok*kTopE+k] : t.groups[t.shared_group].pair_begin+tok;
     }
-    __device__ const unsigned* map() const { return nullptr; }
+    __host__ __device__ const unsigned* map() const { return nullptr; }
     __device__ unsigned pair(unsigned pos) const { return pos; }
     __device__ unsigned token(unsigned p) const { return t.pair_row[p]; }
     __device__ float weight(unsigned p) const {

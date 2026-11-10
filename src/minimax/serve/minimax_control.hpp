@@ -2,6 +2,7 @@
 
 #include "strix/minimax/prefill_types.hpp"
 #include <array>
+#include <cstddef>
 #include <cstring>
 #include <stdexcept>
 
@@ -41,7 +42,32 @@ Control exchange(Engine& eng, const Control& out) try {
     Control local = out;
     local.active = eng.prefill_progress();
     local.parked = eng.prefill_progress(true);
-    std::memcpy(o.data(), &local, sizeof(Control));
+    // Copy semantic fields only: Control and PfProgress padding is indeterminate,
+    // including on repeated hello calls. Every padding byte on the wire stays zero.
+    const auto put = [&](std::size_t offset, const auto& value) {
+        std::memcpy(o.data() + offset, &value, sizeof(value));
+    };
+#define STRIX_MM_CONTROL_FIELD(f) put(offsetof(Control, f), local.f)
+    STRIX_MM_CONTROL_FIELD(magic); STRIX_MM_CONTROL_FIELD(version); STRIX_MM_CONTROL_FIELD(command);
+    STRIX_MM_CONTROL_FIELD(task_id); STRIX_MM_CONTROL_FIELD(parent_task_id); STRIX_MM_CONTROL_FIELD(slot_generation);
+    const auto progress = [&](std::size_t offset, const strix::minimax::engine::PfProgress& p) {
+        using P = strix::minimax::engine::PfProgress;
+#define STRIX_MM_PROGRESS_FIELD(f) put(offset + offsetof(P, f), p.f)
+        STRIX_MM_PROGRESS_FIELD(id); STRIX_MM_PROGRESS_FIELD(parent); STRIX_MM_PROGRESS_FIELD(generation);
+        STRIX_MM_PROGRESS_FIELD(c0); STRIX_MM_PROGRESS_FIELD(chunk); STRIX_MM_PROGRESS_FIELD(rows);
+        STRIX_MM_PROGRESS_FIELD(slot); STRIX_MM_PROGRESS_FIELD(bank); STRIX_MM_PROGRESS_FIELD(layer);
+        STRIX_MM_PROGRESS_FIELD(next); STRIX_MM_PROGRESS_FIELD(open);
+#undef STRIX_MM_PROGRESS_FIELD
+    };
+    progress(offsetof(Control, active), local.active); progress(offsetof(Control, parked), local.parked);
+    STRIX_MM_CONTROL_FIELD(rows); STRIX_MM_CONTROL_FIELD(pslot); STRIX_MM_CONTROL_FIELD(plen);
+    STRIX_MM_CONTROL_FIELD(pflags); STRIX_MM_CONTROL_FIELD(bank);
+    STRIX_MM_CONTROL_FIELD(round); STRIX_MM_CONTROL_FIELD(ack_round);
+    static_assert(sizeof(strix::minimax::engine::Row) == 2 * sizeof(std::uint32_t) + sizeof(std::uint64_t));
+    STRIX_MM_CONTROL_FIELD(row); STRIX_MM_CONTROL_FIELD(layers); STRIX_MM_CONTROL_FIELD(append);
+    STRIX_MM_CONTROL_FIELD(dslots); STRIX_MM_CONTROL_FIELD(dslot); STRIX_MM_CONTROL_FIELD(danchor);
+    STRIX_MM_CONTROL_FIELD(dpos); STRIX_MM_CONTROL_FIELD(pstart);
+#undef STRIX_MM_CONTROL_FIELD
     eng.exchange_bytes(o.data(), i.data(), o.size());
     Control in;
     std::memcpy(&in, i.data(), sizeof(Control));
@@ -66,11 +92,14 @@ Control exchange(Engine& eng, const Control& out) try {
 
 // prefix: this rank's prefix-reuse vote; *prefix_agreed (when given) is true only if both ranks voted for it.
 template<class Engine>
-bool session_hello(Engine& eng, bool requested, bool prefix = false, bool* prefix_agreed = nullptr) {
+bool session_hello(Engine& eng, bool requested, bool prefix = false, bool* prefix_agreed = nullptr,
+                   std::uint64_t prefix_rows = 1) {
     Control hello;
     hello.pflags = (requested ? kHelloSessionVote : 0U) | (prefix ? kHelloPrefixVote : 0U);
+    hello.dpos[0] = prefix ? prefix_rows : 0U;  // OFF keeps the legacy frame; ON agrees group alignment too
     const auto peer = exchange(eng, hello);
-    if (prefix_agreed != nullptr) *prefix_agreed = (hello.pflags & peer.pflags & kHelloPrefixVote) != 0;
+    if (prefix_agreed != nullptr) *prefix_agreed = (hello.pflags & peer.pflags & kHelloPrefixVote) != 0 &&
+        hello.dpos[0] != 0 && hello.dpos[0] == peer.dpos[0];
     return ((hello.pflags | peer.pflags) & kHelloSessionVote) != 0;
 }
 }  // namespace strix::minimax::serve

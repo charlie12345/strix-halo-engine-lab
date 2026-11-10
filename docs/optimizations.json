@@ -1670,9 +1670,9 @@
     "name": "Prefix reuse for unnamed requests (draft, opt-in)",
     "flag_or_env": "STRIX_MM_SERVE_PREFIX",
     "default": "off",
-    "exact": "CPU: strix-minimax-lead-tests (chunk rounding, pstart / suffix on the wire, off by default, hello votes, session invalidation). Two-node: tests/minimax_prefix_cache_gpu_gate.py compares greedy token ids with reuse on and off and requires the reuse counter to show that reuse fired; no logit or state digest. One 24K-token run: identical ids with 20,480 tokens reused; without the chunk rounding it diverged at generated token 12. Draft until the complete-workload gates run on a reference pack.",
+    "exact": "CPU policy gates cover group alignment, decode-row exclusion, cancellation, legacy wire bytes, hello votes and session invalidation. The two-node gate compares matched prompt token IDs and requires reuse counters. Complete token/logit/canonical-state device validation remains pending; this is a draft opt-in feature.",
     "gain": "None claimed. The skipped work is the prefill of the shared prefix.",
-    "preconditions": "STRIX_MM_SERVE_PREFIX=1 on both ranks (hello vote; one missing vote keeps every prefill whole). A free slot whose resident tokens share at least one whole prefill chunk (--max-rows) of leading tokens with the prompt; reuse is rounded down to whole chunks. Not for a nested prompt or a request admitted as a DSpark context. Exact only with fixed-size prefill chunks (not with STRIX_MM_PF_PAIR_FROM, which sizes chunks by prompt length). A session command clears every slot's resident record.",
+    "preconditions": "STRIX_MM_SERVE_PREFIX=1 on both ranks; baseline disables the vote. Free slot with completed prefill rows sharing at least one whole --max-rows times STRIX_MM_PF_GROUP group (default 8192 tokens). Both ranks use the same chunk/group configuration. No nested prompt or DSpark context reuse. A session command clears all resident records; generated rows never extend them.",
     "off_switch": "unset STRIX_MM_SERVE_PREFIX (or any value other than 1) and restart both ranks",
     "doc_anchor": "docs/optimizations.md#mm-serve-prefix"
   },

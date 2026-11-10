@@ -898,10 +898,11 @@ int main(int argc, char** argv) {
         const bool session_explicit = session_cli || (session_switch &&
             (std::string(session_switch) == "1" || std::string(session_switch) == "on"));
         bool prefix_agreed = false;
+        const bool prefix_requested = session_config.reason != "baseline" && ms::lead::prefix_cache_requested();
         const bool session_vote = ms::session_hello(eng, session_config.reason != "baseline" &&
-            (session_config.enabled || session_explicit), ms::lead::prefix_cache_requested(), &prefix_agreed);
-        if (ms::lead::prefix_cache_requested() && !prefix_agreed)
-            std::printf("minimax serve: prefix reuse off (STRIX_MM_SERVE_PREFIX=1 here, the peer did not vote for it)\n");
+            (session_config.enabled || session_explicit), prefix_requested, &prefix_agreed, eng.prefill_reuse_rows());
+        if (prefix_requested && !prefix_agreed)
+            std::printf("minimax serve: prefix reuse off (peer vote or prefill alignment differs)\n");
         if (session_vote) {
             try {
                 if (session_cli) {

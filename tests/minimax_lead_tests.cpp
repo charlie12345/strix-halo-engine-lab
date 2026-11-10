@@ -23,12 +23,15 @@ struct FakeEngine {
     std::vector<ms::Control> controls;
     std::array<std::byte, 512> last_wire{};
     bool session_peer = false, prefix_peer = false;
+    std::uint64_t peer_alignment = 0;  // zero echoes; nonzero simulates a different peer configuration
     unsigned syncs = 0;
     bool taps = false;
     double parent_speed = 1;  // cold estimate may exceed actual service, as on native warm runs
     unsigned slots() const { return 8; }
     unsigned capacity() const { return 16384; }
     unsigned nested_rows() const { return 512; }
+    std::uint64_t reuse_alignment = 4096;
+    std::uint64_t prefill_reuse_rows() const { return reuse_alignment; }
     const char* prefill_unlimited_reason() const { return ""; }
     bool prefill_open() const { return active.open || parked.open; }
     bool prefill_active() const { return active.open; }
@@ -53,6 +56,7 @@ struct FakeEngine {
         if (c.command == static_cast<unsigned>(ms::Command::check)) c.plen = active.next;
         if (session_peer) c.pflags |= ms::kHelloSessionVote;
         if (c.command == 0) c.pflags = (c.pflags & ~ms::kHelloPrefixVote) | (prefix_peer ? ms::kHelloPrefixVote : 0U);  // the peer's own vote
+        if (c.command == 0 && peer_alignment != 0) c.dpos[0] = peer_alignment;
         std::memset(in, 0, bytes);
         std::memcpy(in, &c, sizeof(c));
     }
@@ -213,6 +217,8 @@ int main() {
         check(!ms::session_hello(px, false, false, &agreed) && !agreed, "peer prefix vote alone does not enable reuse");
         check(std::memcmp(px.last_wire.data(), legacy.data(), legacy.size()) == 0, "prefix OFF hello equals public main bytes");
         check(!ms::session_hello(px, false, true, &agreed) && agreed, "both prefix votes enable reuse");
+        px.peer_alignment = 12288;
+        check(!ms::session_hello(px, false, true, &agreed, 8192) && !agreed, "different prefill group alignment declines reuse");
     }
     const auto compare = [&](const char* name, const std::function<void(Scenario&)>& script, bool dspark = false) {
         const auto run = [&](ms::Sched mode) {
@@ -562,6 +568,40 @@ int main() {
         check(count(r, ms::Command::session) == 2 && s.tickets.at(3)->stats().cached_tokens == 0 &&
               pf != r.controls.end() && pf->pstart == 0 && pf->plen == 9003,
               "a session command invalidates every slot's reusable prefix");
+    }
+    {
+        Scenario s(ms::Sched::off);
+        s.shared.prefix_reuse = true;
+        s.engine.reuse_alignment = 8192;  // the production engine can group two chunks
+        std::vector<std::uint32_t> base(7000, 7U), warm = base;
+        warm.push_back(8U);
+        s.submit_prompt(0, 1, base, 2);
+        s.submit_prompt(80000, 2, warm, 2);
+        s.run(200000);
+        check(s.tickets.at(2)->stats().cached_tokens == 0, "partial grouped prefill units are not reused");
+    }
+    {
+        Scenario s(ms::Sched::off);
+        s.shared.prefix_reuse = true;
+        std::vector<std::uint32_t> base(4095, 7U), warm = base;
+        // FakeEngine emits 100 for slot 0. The first is then fed by decode, beyond the partial prompt chunk.
+        warm.insert(warm.end(), {100U, 100U, 9U});
+        s.submit_prompt(0, 1, base, 2);
+        s.submit_prompt(80000, 2, warm, 2);
+        s.run(200000);
+        check(s.tickets.at(2)->stats().cached_tokens == 0, "decode rows cannot complete a reusable prefill chunk");
+    }
+    {
+        Scenario s(ms::Sched::interleave);
+        s.shared.prefix_reuse = true;
+        std::vector<std::uint32_t> prompt(9000, 7U);
+        s.submit(0, 99, 10, 100);  // a protected decoder forces the long prefill to yield
+        s.submit_prompt(800, 1, prompt, 2);
+        s.cancel(1000, 1);
+        s.submit_prompt(80000, 2, prompt, 2);
+        const auto r = s.run(200000);
+        check(count(r, ms::Command::cancel) > 0 && s.tickets.at(2)->stats().cached_tokens == 0,
+              "cancelled cold prefill cannot publish reusable rows");
     }
     std::cout << "production Lead traces: " << failures << " failures\n";
     return failures == 0 ? 0 : 1;

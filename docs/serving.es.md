@@ -17,6 +17,15 @@ petición, las opciones y las puertas están en [docs/engine/serving/serving.md]
 
 ## Exposición de los servidores
 
+MiniMax permite reutilizar prefijos residentes para peticiones sin sesión mediante
+`STRIX_MM_SERVE_PREFIX=1` en ambos rangos; sigue desactivado por defecto y en baseline.
+Solo reutiliza grupos completos de prefill (`--max-rows` por `STRIX_MM_PF_GROUP`,
+8192 tokens por defecto), nunca filas producidas por decode. Ambos rangos deben usar
+la misma configuración. Las peticiones anidadas y los contextos DSpark hacen prefill
+completo; las operaciones de sesión invalidan el registro. Se informa de los tokens
+reutilizados y de `capabilities.prefix_cache` en `/api/status`. Es una opción experimental:
+quedan pendientes las puertas de dispositivo de tokens completos, logits y estado.
+
 Qwen y DeepSeek publican las funciones ejecutadas en `GET /v1/capabilities`; el objeto `strix` de cada respuesta
 indica la política de muestreo solicitada frente a la efectiva. En todos los servidores (Qwen, DeepSeek, MiniMax) los
 campos de generación no admitidos devuelven 400 indicando el campo. MiniMax decodifica de forma greedy: una temperatura

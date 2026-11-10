@@ -2819,6 +2819,9 @@ void Engine::prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t gene
                                PrefillTapSink sink) {
     auto& m = *impl_;
     if (id == 0 || m.task.open) throw std::logic_error("prefill begin: task identity");
+    if (resident > m.opt.capacity || tokens.size() > m.opt.capacity - resident ||
+        (resident != 0 && resident % prefill_reuse_rows() != 0))
+        throw std::invalid_argument("prefill begin: prefix range / alignment");
     if (parent != 0) {
         if (!m.parked.open || m.parked.id != parent || id == parent || slot == m.parked.slot ||
             tokens.empty() || tokens.size() > m.nest_rows || (m.taps_on && m.nest_bank.taps == nullptr) || resident != 0)
@@ -2852,6 +2855,10 @@ LoaderSnapshot Engine::draft_loader_snapshot() const {
 }
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
+std::uint64_t Engine::prefill_reuse_rows() const {
+    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping.
+    return std::uint64_t{impl_->opt.max_rows} * impl_->pf_group;
+}
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
 const std::uint16_t* Engine::embed_row(std::uint32_t token) const {
     if (token >= kVocab) throw std::out_of_range("embed_row");

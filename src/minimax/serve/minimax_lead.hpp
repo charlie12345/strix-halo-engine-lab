@@ -189,6 +189,8 @@ public:
           run_slots_(slots_), kv_(slots_), stop_(stop), session_(session), taps_(taps) {
         prompt_bytes_ = std::move(prompt_bytes);
         prefix_on_ = sh_.prefix_reuse;
+        reuse_rows_ = prefix_on_ ? eng_.prefill_reuse_rows() : max_rows_;
+        if (reuse_rows_ == 0) throw std::invalid_argument("prefix reuse: zero prefill alignment");
         round_ = run.control_round;
         const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
         timeline_on_ = v != nullptr && std::strcmp(v, "1") == 0;
@@ -398,10 +400,12 @@ private:
             std::lock_guard<std::mutex> l(sh_.m);
             sh_.extras[r->job.ticket.get()] = r->x;
         }
-        // Prefix reuse: positions [0, pos) of this slot stay resident for a later request to reuse. A request cut short
-        // during its own prefill left only its reused prefix reliably resident (the suffix prefill did not complete).
-        const std::size_t resident = r->prefilling ? r->reused : static_cast<std::size_t>(r->pos);
-        if (r->slot < kv_.size()) kv_[r->slot].resize(std::min<std::size_t>(kv_[r->slot].size(), resident));
+        // Keep only completed, aligned prefill rows. Decode rows can have different bits,
+        // and a cancelled prefill only guarantees its previously reused prefix.
+        if (prefix_on_) {
+            const auto resident = r->prefilling ? r->reused : r->stats.prompt_tokens;
+            kv_[r->slot].resize(static_cast<std::size_t>(resident - resident % reuse_rows_));
+        }
         queue_.finish(r->job, r->stats);
         r.reset();
     }
@@ -627,7 +631,7 @@ private:
                 // Whole prefill chunks only. A prefill tiles its rows from the chunk's first row (16-query windows), so a
                 // suffix that opens inside a chunk is tiled differently from the same rows in a full prefill and its
                 // bits differ. Opening on a max_rows boundary gives the suffix the chunks a full prefill would use.
-                match -= static_cast<std::uint32_t>(match % max_rows_);
+                match -= static_cast<std::uint32_t>(match % reuse_rows_);
                 if (match > best_n) { best_n = match; best = s; }
             }
             if (best_n != 0) { free_slot = best; reuse = best_n; }
@@ -725,12 +729,15 @@ private:
         c.plen = static_cast<std::uint32_t>(suffix.size());
         c.pflags = r.context ? 1U : 0U;
         (void)exchange(eng_, c);
-        std::vector<std::uint32_t> wire(suffix.begin(), suffix.end());
-        run_.send_prompt(wire);
+        if (reuse == 0) run_.send_prompt(prompt);
+        else {
+            std::vector<std::uint32_t> wire(suffix.begin(), suffix.end());
+            run_.send_prompt(wire);
+        }
         const auto begin0 = timeline_on_ ? Time::now() : Clock::time_point{};
         run_.prefill_begin(free_slot, suffix, r.context, c.task_id, parent_id, c.slot_generation, reuse);
         layer_.reset_pending();
-        kv_[free_slot].assign(prompt.begin(), prompt.end());  // the whole prompt is resident once this prefill completes
+        if (prefix_on_) kv_[free_slot].assign(prompt.begin(), prompt.end());
         r.job = std::move(*t);
         r.prefill_start = Time::now();
         run_slots_[free_slot] = std::move(r);
@@ -859,7 +866,6 @@ private:
         r->x.prefill_wall_ms = r->stats.prefill_ms;
         r->pos = r->stats.prompt_tokens;
         r->last = next;
-        kv_[r->slot].push_back(next);  // first generated token, position pos (pending until fed; truncated off at finish)
         {
             const auto l0 = Time::now();
             lookup_start(*r, next);
@@ -1124,7 +1130,6 @@ private:
             ++r->x.cycles;
             r->pos += v.accepted + 1;
             r->last = v.emitted.back();
-            for (const auto t : v.emitted) kv_[r->slot].push_back(t);  // committed rows: resident cache for later reuse
             (void)emit(r, v.emitted, &emitted_total);  // the tokens actually emitted (a stop / limit drops the rest)
         }
         // the gate on one boundary for both kinds of cycle: from the cycle's start (before any draft) to its completed
@@ -1246,8 +1251,9 @@ private:
     std::vector<std::optional<Running>> run_slots_;
     // Prefix reuse: the token sequence resident in each free slot's cache. A new prompt sharing a leading prefix with a
     // free slot reuses those cache rows and prefills only the suffix (opt-in: STRIX_MM_SERVE_PREFIX=1 on both ranks).
-    // Causal attention makes the reused prefix identical to prefilling it.
+    // Records contain prefill tokens only, never generated tokens.
     std::vector<std::vector<std::uint32_t>> kv_;
+    std::uint64_t reuse_rows_ = 0;
     bool prefix_on_ = false;
     std::optional<sv::TakenJob> pending_;
     bool pending_short_first_ = false;

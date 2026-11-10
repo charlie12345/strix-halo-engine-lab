@@ -2,8 +2,8 @@
 """MiniMax serve prefix-reuse exactness gate.
 
 Prefix KV reuse (opt-in: STRIX_MM_SERVE_PREFIX=1 on both ranks) lets a request that shares a leading token prefix
-with a free slot's resident cache skip prefilling that prefix and reuse its KV rows. Causal attention makes the reused
-rows the rows a full prefill writes, so the emitted tokens must not change. This gate checks that at the serve level
+with a free slot's resident cache skip aligned groups of completed prefill rows. Decode rows are excluded.
+This gate compares complete emitted token IDs; logits and state digests require separate device gates. It checks
 and that reuse actually fired (a silently skipped reuse would "pass" a plain token comparison).
 
 It needs the running two-rank MiniMax pair and a prompt text file, so it is not a CI test. The comparison logic is
@@ -17,19 +17,20 @@ Procedure (the switch is read once at startup, so each arm is a fresh pair):
     python3 tests/minimax_prefix_cache_gpu_gate.py capture --port PORT --prompt PROMPT.txt --out mm-off.json
     python3 tests/minimax_prefix_cache_gpu_gate.py compare --on mm-on.json --off mm-off.json
 
-A capture sends A = the prompt (at least one prefill chunk, 4096 tokens; use several), lets it finish (freeing its slot but keeping its resident KV), then
+A capture sends A = the prompt (at least one aligned prefill group, 8192 tokens by default; use several), lets it finish (freeing its slot but keeping its resident KV), then
 sends B = A + a short distinct suffix. In the ON arm B reuses the leading tokens it shares with A (cached delta >=
-that shared length rounded down to whole chunks); in the OFF arm B prefills everything (cached delta 0). compare requires: token_ids(A) and
-token_ids(B) identical across arms; ON reused >= the whole chunks of the shared length; OFF reused 0. Verdict EXACT, MISMATCH or NO-REFERENCE (missing diagnostics is never a pass).
+that shared length rounded down to whole groups); in the OFF arm B prefills everything (cached delta 0). compare requires: token_ids(A) and
+token_ids(B) identical across arms with matching prompt hashes and settings; ON reused the expected whole groups; OFF reused 0. Verdict EXACT, MISMATCH or NO-REFERENCE (missing diagnostics is never a pass).
 """
 import argparse
+import hashlib
 import json
 import sys
 import time
 import urllib.request
 from pathlib import Path
 
-CHUNK = 4096  # the serve's default --max-rows: reuse is rounded down to whole prefill chunks.
+CHUNK = 8192  # conservative default: --max-rows (4096) times STRIX_MM_PF_GROUP (2).
 
 
 def require(value, message):
@@ -88,8 +89,9 @@ def capture(args):
     # BPE is context-sensitive, so appending text can re-merge the tokens straddling the join; the reuse is whatever
     # leading tokens A and B genuinely share. That shared run must hold at least one whole prefill chunk for reuse to fire at all.
     shared = common_prefix(tok_a, tok_b)
-    require(shared >= CHUNK,
-            f"A and B share only {shared} leading tokens; need >= {CHUNK} (A tokenizes to {len(tok_a)}); "
+    require(args.alignment > 0 and args.generate > 0, "alignment and generate must be positive")
+    require(min(shared, len(tok_b) - 1) >= args.alignment,
+            f"A and B share only {shared} leading tokens; need >= {args.alignment} (A tokenizes to {len(tok_a)}); "
             "lengthen the prompt or pick a cleaner suffix")
 
     base0 = cached_total(args.port)
@@ -98,7 +100,9 @@ def capture(args):
     ids_b = completion(args.port, text_b, args.generate)       # shares `shared` leading tokens; reuses them when on
     reused_b = cached_total(args.port) - base1
 
+    prompt_sha256 = hashlib.sha256(json.dumps([tok_a, tok_b]).encode()).hexdigest()
     record = dict(prefix_len=shared, tokens_a=len(tok_a), tokens_b=len(tok_b), generate=args.generate,
+                  alignment=args.alignment, prompt_sha256=prompt_sha256,
                   ids_a=ids_a, ids_b=ids_b, reused_a=base1 - base0, reused_b=reused_b)
     Path(args.out).write_text(json.dumps(record, indent=2))
     print(f"captured: |A|={len(tok_a)} |B|={len(tok_b)} shared_prefix={shared} reused_A={record['reused_a']} "
@@ -109,17 +113,29 @@ def capture(args):
 def compare_records(on, off):
     """Returns (verdict, reasons). EXACT only when tokens match across arms and reuse demonstrably fired on / not off."""
     reasons = []
-    for key in ("ids_a", "ids_b", "prefix_len"):
-        require(key in on and key in off, f"NO-REFERENCE: a capture lacks {key}")
+    required = ("ids_a", "ids_b", "prefix_len", "tokens_a", "tokens_b", "generate", "alignment",
+                "prompt_sha256", "reused_a", "reused_b")
+    if any(key not in on or key not in off for key in required):
+        return "NO-REFERENCE", ["capture lacks prompt, alignment, output or reuse evidence"]
+    for key in ("prefix_len", "tokens_a", "tokens_b", "generate", "alignment", "prompt_sha256"):
+        if on[key] != off[key]:
+            return "NO-REFERENCE", [f"unmatched capture metadata: {key}"]
+    if (not isinstance(on["prompt_sha256"], str) or len(on["prompt_sha256"]) != 64 or
+            on["alignment"] <= 0 or on["generate"] <= 0 or
+            any(not isinstance(arm[key], list) or not arm[key] or len(arm[key]) > arm["generate"]
+                for arm in (on, off) for key in ("ids_a", "ids_b"))):
+        return "NO-REFERENCE", ["invalid or empty capture evidence"]
+    if on["reused_a"] != 0 or off["reused_a"] != 0:
+        return "NO-REFERENCE", ["cold request reused tokens; restart an idle pair for each arm"]
     if on["ids_a"] != off["ids_a"]:
         reasons.append("A tokens differ across arms (prompt/model/sampling not matched)")
     if on["ids_b"] != off["ids_b"]:
         reasons.append("B tokens differ: prefix reuse changed the output (exactness violation)")
-    whole = on["prefix_len"] // CHUNK * CHUNK
-    if whole == 0 or on.get("reused_b", 0) < whole:
-        reasons.append(f"ON arm reused {on.get('reused_b')} < {whole} (whole chunks of the shared {on['prefix_len']}): reuse did not fire, "
+    whole = min(on["prefix_len"], on["tokens_b"] - 1) // on["alignment"] * on["alignment"]
+    if whole <= 0 or on["reused_b"] != whole:
+        reasons.append(f"ON arm reused {on['reused_b']} != {whole} (whole groups of the shared {on['prefix_len']}): unexpected reuse, "
                        "so token equality proves nothing")
-    if off.get("reused_b", 0) != 0:
+    if off["reused_b"] != 0:
         reasons.append(f"OFF arm reused {off.get('reused_b')} != 0: the OFF arm ran with reuse on")
     if reasons:
         bad_tokens = any("exactness" in r or "tokens differ" in r for r in reasons)
@@ -134,13 +150,19 @@ def compare(args):
 
 
 def self_test():
-    base = dict(prefix_len=9000, ids_a=[5, 6, 7], ids_b=[8, 9, 10])
+    base = dict(prefix_len=9000, tokens_a=9000, tokens_b=9003, generate=3, alignment=8192,
+                prompt_sha256="a" * 64, ids_a=[5, 6, 7], ids_b=[8, 9, 10])
     on = dict(base, reused_a=0, reused_b=8192)
     off = dict(base, reused_a=0, reused_b=0)
     require(compare_records(on, off)[0] == "EXACT", "self-test: matched arms should be EXACT")
     require(compare_records(dict(on, ids_b=[8, 9, 99]), off)[0] == "MISMATCH", "self-test: changed B must be MISMATCH")
     require(compare_records(dict(on, reused_b=10), off)[0] == "NO-REFERENCE", "self-test: no-reuse ON must be NO-REFERENCE")
     require(compare_records(on, dict(off, reused_b=50))[0] == "NO-REFERENCE", "self-test: reuse-on-OFF must be NO-REFERENCE")
+    require(compare_records(dict(on, ids_a=[]), dict(off, ids_a=[]))[0] == "NO-REFERENCE", "empty outputs cannot pass")
+    require(compare_records(on, dict(off, prompt_sha256="b" * 64))[0] == "NO-REFERENCE", "different prompts cannot pass")
+    require(compare_records(on, dict(off, alignment=4096))[0] == "NO-REFERENCE", "different alignments cannot pass")
+    missing = dict(off); del missing["reused_b"]
+    require(compare_records(on, missing)[0] == "NO-REFERENCE", "missing OFF evidence cannot pass")
     print("PASS minimax prefix-cache gate self-test (comparison logic, CPU only)")
     return 0
 
@@ -150,9 +172,11 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     cap = sub.add_parser("capture", help="drive a running pair and record one arm")
     cap.add_argument("--port", type=int, required=True)
-    cap.add_argument("--prompt", required=True, help="text file for prompt A; must tokenize to at least one prefill chunk (4096 tokens)")
+    cap.add_argument("--prompt", required=True, help="text file for prompt A; must share at least one aligned prefill group with B")
     cap.add_argument("--out", required=True)
     cap.add_argument("--generate", type=int, default=32, help="tokens to generate per request (greedy)")
+    cap.add_argument("--alignment", type=int, default=CHUNK,
+                     help="--max-rows times STRIX_MM_PF_GROUP on both ranks (default 8192)")
     cap.add_argument("--suffix-text", default="\n\nIn one word, the main theme above is:",
                      help="distinct text appended to A to form B (must append at a clean token boundary)")
     cmp = sub.add_parser("compare", help="compare an ON and an OFF capture")

@@ -17,6 +17,13 @@ petición, las opciones y las puertas están en [docs/engine/serving/serving.md]
 
 ## Exposición de los servidores
 
+En DeepSeek, `--prefix-cache-disk-mb` fija el límite del nivel de disco. La cuota
+del directorio compartido es el mayor de ese límite y 4096 MiB; con valor 0 el
+nivel y la cuota no tienen límite. Se mantienen el mínimo libre de 16384 MiB y
+el máximo de 128 MiB de payloads pendientes. Un nivel lleno expulsa sus estados
+menos usados y termina sus borrados antes de reservar otra escritura; no expulsa
+otros espacios de nombres. Véase el [contrato de caché](engine/serving/prefix-state-cache.md).
+
 La admisión de captura de prefijos de DeepSeek usa el plan compartido del modelo:
 solo las capas fuente de KV aportan KV e índices comprimidos, según su ratio
 (890 bytes por token en V4.1), más 4 bytes por ID de token. Los anillos y las

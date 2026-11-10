@@ -547,74 +547,6 @@ __global__ void coop_output_kernel(LinearView w, const float* partial, unsigned 
 #pragma unroll
     for (unsigned j = 0; j < 4; ++j) out[std::size_t(row) * w.outputs + begin + lane + 32 * j] = v[j];
 }
-// Fused v2 linear: one block owns 128 outputs (eight tile columns) and all
-// S splits (8*S waves). With In it first forms the transformed FP16 rows in
-// LDS (input_body); after the cores it sums split partials in increasing s
-// and applies output_body's transform and scale. Same arithmetic as the
-// three-launch form.
-template <unsigned K, unsigned Rows, unsigned S, bool In>
-__global__ __launch_bounds__(1024) void coop_fused_kernel(LinearView w, const _Float16* x, const float* source, float* out,
-                                                          unsigned* failure) {
-    __shared__ float part[S * Rows * 128];
-    extern __shared__ Word4 dynamic_lds[];
-    const unsigned wave = threadIdx.x / 32, lane = threadIdx.x % 32, first = blockIdx.x * 128;
-    if constexpr (In) {
-        auto* transformed = reinterpret_cast<_Float16*>(dynamic_lds);
-        const unsigned groups = Rows * (w.inputs / 128), waves = blockDim.x / 32;
-        for (unsigned group = wave; group < groups; group += waves)
-            input_body(w, source, Rows, transformed, failure, nullptr, group);
-        __syncthreads();
-        x = transformed;
-    }
-    const unsigned column = wave % 8, split = wave / 8;
-    float acc[2][Rows] = {};
-    coop_body<K, Rows>(w, x, blockIdx.x * 8 + column, split, S, lane, acc);
-    if (!(lane & 3U))
-#pragma unroll
-        for (unsigned h = 0; h < 2; ++h)
-#pragma unroll
-            for (unsigned r = 0; r < Rows; ++r) part[(split * Rows + r) * 128 + column * 16 + (lane >> 2U) + 8 * h] = acc[h][r];
-    __syncthreads();
-    if (wave >= Rows) return;
-    float v[4];
-#pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-        const unsigned o = lane + 32 * j;
-        v[j] = part[wave * 128 + o];
-        for (unsigned s2 = 1; s2 < S; ++s2) v[j] = v[j] + part[(s2 * Rows + wave) * 128 + o];
-        flag(v[j], failure);
-    }
-    transform(v, failure);
-#pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-        const auto o = first + lane + 32 * j;
-        const float value = v[j] * fp16_value(load16(w.data + 2ULL * (w.inputs + o)));
-        out[std::size_t(wave) * w.outputs + o] = value; flag(value, failure);
-    }
-}
-// Returns false when In does not fit LDS (nothing launched).
-template <unsigned Rows, unsigned S>
-bool launch_coop_fused_s(LinearView w, const _Float16* x, const float* source, float* out, unsigned* failure, hipStream_t q) {
-    const dim3 blocks(w.outputs / 128), threads(256 * S);
-    const std::size_t dynamic = source ? std::size_t(Rows) * w.inputs * sizeof(_Float16) : 0;
-    if (source && S * Rows * 512 + dynamic > 64 * 1024) return false;
-    switch (bits(w)) {
-#define G4_EXL3_CF(K) case K: if (source) hipLaunchKernelGGL((coop_fused_kernel<K, Rows, S, true>), blocks, threads, dynamic, q, w, nullptr, source, out, failure); \
-                       else hipLaunchKernelGGL((coop_fused_kernel<K, Rows, S, false>), blocks, threads, 0, q, w, x, nullptr, out, failure); break
-        G4_EXL3_CF(4); G4_EXL3_CF(5); G4_EXL3_CF(6); G4_EXL3_CF(8);
-#undef G4_EXL3_CF
-    }
-    return true;
-}
-template <unsigned Rows>
-bool launch_coop_fused(LinearView w, const _Float16* x, const float* source, float* out, unsigned* failure, hipStream_t q) {
-    switch (v2_splits(w.inputs, w.outputs)) {
-    case 1: return launch_coop_fused_s<Rows, 1>(w, x, source, out, failure, q);
-    case 2: return launch_coop_fused_s<Rows, 2>(w, x, source, out, failure, q);
-    case 4: return launch_coop_fused_s<Rows, 4>(w, x, source, out, failure, q);
-    default: return false; // eight splits exceed one block; the three-launch form runs
-    }
-}
 // Grouped v2/v3 epilogue: blockIdx.y selects the member; each member's
 // partial sum and output transform are exactly coop_output_kernel /
 // output_kernel's (members with one split transform their core output in place).
@@ -1038,20 +970,6 @@ void coop_core(LinearView w, const _Float16* x, unsigned rows, float* out, float
     }
     checked();
 }
-// g4-exl3-v2 linear: v1 input transform, cooperative core, ordered split sum
-// fused into the v1 output transform. Partials live at scratch + v2_partial_offset.
-bool coop_fused(LinearView w, const _Float16* x, const float* source, unsigned rows, float* out, unsigned* failure,
-                hipStream_t q) {
-    bool launched = false;
-    switch (rows) {
-#define G4_EXL3_CFR(R) case R: launched = launch_coop_fused<R>(w, x, source, out, failure, q); break
-        G4_EXL3_CFR(1); G4_EXL3_CFR(2); G4_EXL3_CFR(3); G4_EXL3_CFR(4);
-        G4_EXL3_CFR(5); G4_EXL3_CFR(6); G4_EXL3_CFR(7); G4_EXL3_CFR(8);
-#undef G4_EXL3_CFR
-    }
-    if (launched) checked();
-    return launched;
-}
 // Grouped v2/v3 members over one input: one input-transform launch, the member
 // cores, one split-sum/output launch. STRIX_G4_EXL3_V2_GROUP=0 issues them as
 // separate linears. Returns false when partials do not fit (nothing launched).
@@ -1085,14 +1003,6 @@ bool device_group_v2(const LinearView* w, unsigned count, const float* x, unsign
 }
 void device_linear_v2(LinearView w, const float* x, unsigned rows, float* out, void* scratch, unsigned* failure,
                       bool shared, hipStream_t q) {
-    // Fused single-launch form, opt-in (STRIX_G4_EXL3_V2_FUSED=1): measured slower
-    // than the three-launch form at C1..C8 (1024-thread blocks). Same bytes. The
-    // input transform is fused only below the head's size (redundant per block).
-    static const bool fused = [] {
-        const auto* p = std::getenv("STRIX_G4_EXL3_V2_FUSED");
-        return p && std::string_view(p) == "1";
-    }();
-    if (fused && shared && w.outputs <= 65536 && coop_fused(w, nullptr, x, rows, out, failure, q)) return;
     auto* transformed = static_cast<_Float16*>(scratch);
     launch_input(w, x, rows, transformed, failure, nullptr, q);
     checked();
@@ -1115,7 +1025,6 @@ void device_linear_v2(LinearView w, const float* x, unsigned rows, float* out, v
         }
         return;
     }
-    if (fused && coop_fused(w, transformed, nullptr, rows, out, failure, q)) return;
     coop_core(w, transformed, rows, out, partial, splits, failure, q);
     if (splits > 1)
         hipLaunchKernelGGL(coop_output_kernel, dim3((rows * (w.outputs / 128) + 3) / 4), dim3(128), 0, q, w, partial, splits,

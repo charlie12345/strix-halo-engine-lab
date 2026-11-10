@@ -11,6 +11,7 @@
 #include "packed_decoder.hpp"
 #include "hadamard.hpp"
 #include <type_traits>
+#include "integer_operand.hpp"
 
 namespace strix::core {
 namespace wmma_tiled {
@@ -70,7 +71,7 @@ template<int BM, int BN, int WM, int WN, class Operand = PackedF16> struct Geome
     // IU4 row swizzle (below) avoids padding; F16 preserves the original layout.
     static constexpr int row_bytes = iu4 ? BK / 2 : (BK + 8) * 2;
     static constexpr int waves_m = BM / WM, waves_n = BN / WN, waves = waves_m * waves_n;
-    static constexpr int threads = waves * 32;
+    static constexpr int threads = waves * 32 * (is_integer_operand<Operand>::value ? 8 : 1);
     static constexpr int MT = WM / 16, NT = WN / 16;
     static constexpr int chunks_per_row = BK * Operand::element_bits / 128;
     static constexpr int a_chunks = BM * chunks_per_row;     // 16-byte chunks per stage
@@ -80,7 +81,7 @@ template<int BM, int BN, int WM, int WN, class Operand = PackedF16> struct Geome
     // IU4 stages both K64 groups' FP32 scales per stage: [2][BM] activation (rows
     // permuted so a lane's eight rows are contiguous) and [2][BN] weight scales.
     static constexpr int scale_bytes = iu4 ? (BM + BN) * 2 * 4 : 0;
-    static constexpr int stage_bytes = (BM + BN) * row_bytes + scale_bytes;
+    static constexpr int stage_bytes = is_integer_operand<Operand>::value ? 4 * BM * BN * 4 : (BM + BN) * row_bytes + scale_bytes;
     static_assert(BM % WM == 0 && BN % WN == 0 && WM % 16 == 0 && WN % 16 == 0);
 };
 
@@ -135,21 +136,23 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
     const _Float16* w_scale = nullptr, int32_t* group_sums = nullptr, GroupedArgs gp = {}, Adapter ad = {}) {
     using Operand = typename Contract::Operand;
     using G = Geometry<BM, BN, WM, WN, Operand>;
+    constexpr bool Integer = is_integer_operand<Operand>::value;
     constexpr bool IU4 = G::iu4;
     constexpr bool IU4Pack = IU4;
     constexpr bool DenseF16 = std::is_same_v<Operand, PackedF16>;
     // The trellis-only register stream is never instantiated for plain operands.
-    constexpr int Bits = [] { if constexpr (IU4Pack || DenseF16) return 4; else return Operand::bits; }();
-    constexpr int CB = [] { if constexpr (IU4Pack || DenseF16) return 2; else return Operand::codebook; }();
+    constexpr int Bits = [] { if constexpr (Integer || IU4Pack || DenseF16) return 4; else return Operand::bits; }();
+    constexpr int CB = [] { if constexpr (Integer || IU4Pack || DenseF16) return 2; else return Operand::codebook; }();
     constexpr int KT = G::KT, STRIDE = G::row_bytes / 2;
     constexpr int MT = G::MT, NT = G::NT;
     __shared__ __attribute__((aligned(16))) uint8_t lds[2 * G::stage_bytes];
     const int thread = int(threadIdx.x), lane = thread & 31;
     const int wave = __builtin_amdgcn_readfirstlane(thread / 32);
-    const int wave_m = wave / G::waves_n, wave_n = wave % G::waves_n;
+    const int spatial_wave = Integer ? wave % G::waves : wave;
+    const int wave_m = spatial_wave / G::waves_n, wave_n = spatial_wave % G::waves_n;
     constexpr int Fold = contract_fold<Contract>::value;
     constexpr bool AD = Adapter::kActive;
-    static_assert(!AD || (!IU4 && !DenseF16 && Probe == 0 && (!Fused || BN % 128 == 0)), "adapters: trellis F16 operands");
+    static_assert(!AD || (Integer || (!IU4 && !DenseF16 && Probe == 0 && (!Fused || BN % 128 == 0))), "adapters: trellis F16 operands");
     static_assert(Fold == 0 || (!IU4 && !DenseF16));
     // Adapter tile loop: one pass for library launches; kTiles adapters iterate their CTA's tiles.
     for (unsigned iter = 0;; ++iter) {
@@ -178,7 +181,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
         w_scale += size_t(expert) * gp.w_scale_expert;
         if constexpr (Fused) scales = gp.col_scale[expert];
         (void)raster_m;
-    } else {
+    } else if constexpr (!Adapter::kTiles) {
     const int blocks_m = (rows + BM - 1) / BM;
     const int pid = int(blockIdx.x), per_group = raster_m * (outputs / BN);
     const int group = pid / per_group, first_m = group * raster_m;
@@ -193,6 +196,9 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
         const uint32_t p = map_first + uint32_t(r);
         return (gp.map ? gp.map[p] : p) * mul + add;
     };
+    if constexpr (Integer) {
+#include "integer_mainloop.inc"
+    } else {
     const int tiles_n = outputs / 16, tiles_k = inputs / 16;
     // Same split bounds as wmma_core. Pinned in SGPRs so LLVM cannot rematerialise the
     // 64-bit division inside the stage loop.
@@ -458,7 +464,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                     for (int mt = 0; mt < MT; ++mt)
                         #pragma unroll
                         for (int nt = 0; nt < NT; ++nt)
-                            sum[mt][nt] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, left[mt], true, right[nt], sum[mt][nt], false);
+                            sum[mt][nt] = integer_wmma<4>(left[mt], right[nt], sum[mt][nt]);
                 }
                 // g > BK: flush only after the group's last stage (inputs % g == 0).
                 if (GK <= KT || (t0 + SEG) % GK == 0) {
@@ -600,6 +606,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
             __syncthreads();
         }
     }
+    } // non-integer operand
     }   // adapter tile loop
 }
 } // namespace wmma_tiled

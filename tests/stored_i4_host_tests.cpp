@@ -45,9 +45,9 @@ int main() {
         CHECK(iu4_unpack(q.packed[iu4_weight_byte(k, n, N)], k & 1) == k % 15 - 7);
     }
     w[0] = std::numeric_limits<float>::infinity();
-    rejected = false;
+    bool rejected = false;
     try { (void)quantise_iu4_weights(w.data(), K, N); }
     catch (const std::invalid_argument&) { rejected = true; }
     CHECK(rejected);
-    std::puts("stored-i4 host: PASS (budget peaks/reserve/overflow, layout bijection, streaming runs, signed nibbles, RNE, K64 packs)");
+    std::puts("stored-i4 host: PASS (layout bijection, streaming runs, signed nibbles, RNE, K64 packs)");
 }

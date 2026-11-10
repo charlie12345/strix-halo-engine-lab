@@ -6,7 +6,7 @@
 #else
 #define STRIX_INT_HD
 #endif
-namespace strix_trellis::integer_math {
+namespace strix::core::integer_math {
 // Explicit RN32 boundaries; compile with contraction off.
 STRIX_INT_HD inline float product(int dot, float sw, float sa) {
     return float(dot) * (sw * sa);

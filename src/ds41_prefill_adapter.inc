@@ -54,7 +54,7 @@ struct GateUpAdapter : RouteAdapter {
         for (unsigned r = threadIdx.x / 32U; r < unsigned(bm); r += waves) {
             if (r >= unsigned(t.rows)) continue; // uniform wave
             const float x = swiglu_clamped(values[r * unsigned(bn) + lane], values[r * unsigned(bn) + lane + 32U], view.limit);
-            const auto a = strix_trellis::quantize_a8_row32(x);
+            const auto a = strix::core::quantize_a8_row32(x);
             const std::uint64_t s = slot(t, int(r)), col = std::uint64_t(blockIdx.y) * 32U + lane;
             view.act_codes[s * view.inter + col] = a.code;
             if (!lane) {

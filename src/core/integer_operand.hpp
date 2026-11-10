@@ -1,7 +1,7 @@
 #pragma once
 #include "integer_math.hpp"
 #include <type_traits>
-namespace strix_trellis {
+namespace strix::core {
 // Decode original GGUF blocks; no resident weight pack or converter.
 template<class Traits, typename Traits::WeightFormat Format, bool FastI4 = false>
 struct IntegerOperand {

@@ -27,7 +27,7 @@ struct Traits {
     using Operations = strix::moe_core::GroupedIntegerDecodeOps<Traits>;
 };
 using Ops = Traits::Operations;
-using namespace strix_trellis::integer_math;
+using namespace strix::core::integer_math;
 const unsigned long long grid[256] = {
 #include "strix/ds41_iq2_xxs_grid.inc"
 };
@@ -49,7 +49,7 @@ void iq_cases() {
                 const unsigned a1 = sign | (sign << 7) | (sign << 14) | (sign << 21) | ((g % 16) << 28);
                 std::memcpy(block + 2 + (g % 8) * 8, &a0, 4);
                 std::memcpy(block + 6 + (g % 8) * 8, &a1, 4);
-                using I = strix_trellis::IntegerOperand<Traits, Format::iq2_xxs>;
+                using I = strix::core::IntegerOperand<Traits, Format::iq2_xxs>;
                 const auto w = I::decode(row, g, grid);
                 const unsigned parity = std::popcount(sign) & 1U, signs = sign | (parity << 7);
                 for (unsigned j = 0; j < 32; ++j) {
@@ -120,7 +120,7 @@ void fragments() {
             b[j / 8] |= int(nibble(bv) << (4 * (j % 8)));
             expected += av * bv;
         }
-        const auto result = strix_trellis::integer_wmma<4>(a, b, V8{});
+        const auto result = strix::core::integer_wmma<4>(a, b, V8{});
         expect(result[0] == expected, "IU4 fragment packing/sign semantics (CPU row shim)");
     }
 }

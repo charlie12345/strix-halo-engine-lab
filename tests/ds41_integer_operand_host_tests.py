@@ -37,7 +37,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ds41-integer-host-") as temp:
         build = Path(temp)
         source = ROOT / "tests/ds41_integer_operand_host_tests.cpp"
-        inc = [ROOT / p for p in ("tests/ds41_integer_host", "src", "third_party/trellis/src", "include")]
+        inc = [ROOT / p for p in ("tests/ds41_integer_host", "src", "include")]
         exe = build / ("host-tests.exe" if os.name == "nt" else "host-tests")
         if os.name == "nt":
             vs = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Microsoft Visual Studio/2022/Community/VC/Auxiliary/Build/vcvars64.bat"

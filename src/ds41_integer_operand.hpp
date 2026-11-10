@@ -38,11 +38,11 @@ struct Ds41PrefillTraits {
 };
 
 template<WeightFormat F, bool Fast = false, bool Relaxed = false>
-using Contract = strix_trellis::IntegerContract<strix_trellis::IntegerOperand<Ds41PrefillTraits, F, Fast>, Relaxed>;
+using Contract = strix::core::IntegerContract<strix::core::IntegerOperand<Ds41PrefillTraits, F, Fast>, Relaxed>;
 // Header instantiation only: no separate archive or library device link is needed.
 template<class C, int BN, class Adapter>
 inline void launch(Adapter ad, unsigned blocks, unsigned columns, unsigned width, unsigned outputs, hipStream_t stream) {
-    using namespace strix_trellis::wmma_tiled;
+    using namespace strix::core::wmma_tiled;
     using G = Geometry<16, BN, 16, 32, typename C::Operand>;
     hipLaunchKernelGGL((tiled_core<C, 16, BN, 16, 32, false, 0, false, false, 64, false, Adapter>),
         dim3(blocks, columns), dim3(G::threads), 0, stream,

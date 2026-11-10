@@ -40,7 +40,7 @@ struct DenseAdapter {
         const unsigned lane = threadIdx.x & 31U, waves = blockDim.x / 32U;
         for (unsigned r = threadIdx.x / 32U; r < unsigned(bm); r += waves) {
             if (r >= unsigned(t.rows)) continue;
-            const auto a = strix_trellis::quantize_a8_row32(values[r * unsigned(bn) + lane]);
+            const auto a = strix::core::quantize_a8_row32(values[r * unsigned(bn) + lane]);
             const auto row = std::uint64_t(t.begin + r);
             const unsigned col = unsigned(t.first_col) + lane;
             if (col < view.count) view.a8_codes[row * view.a8_stride + col] = a.code;

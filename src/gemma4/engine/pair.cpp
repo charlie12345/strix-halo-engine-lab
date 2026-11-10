@@ -26,7 +26,7 @@ unsigned env_cut(const ModelConfig& config) {
 }
 bool env_on(const char* name) { const char* v = std::getenv(name); return v && std::string_view(v) == "1"; }
 std::uint64_t fnv(std::uint64_t hash, std::string_view bytes) {
-    for (const unsigned char b : bytes) { hash ^= b; hash *= 1099511628211ULL; }
+    for (const char b : bytes) { hash ^= static_cast<unsigned char>(b); hash *= 1099511628211ULL; }
     return hash;
 }
 struct StageReset { ~StageReset() { prefill::pair_stage = {}; } };

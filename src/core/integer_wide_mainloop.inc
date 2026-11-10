@@ -105,9 +105,9 @@ auto* out = v.out;
     } else {
     // Disjoint stores of the tile. The reduction for each element is unchanged.
     for (unsigned item = threadIdx.x; item < Outputs * 8U * 32U; item += 32U * wide_waves) {
-        const unsigned t = item / (8U * 32U), e = (item / 32U) % 8U, lane = item % 32U;
-        const unsigned o = o0 + t * 16U + (lane & 15U), r = blockIdx.x * 16U + 2U * e + (lane >> 4U);
-        const float y = (part[0][t][e][lane] + part[2][t][e][lane]) + (part[1][t][e][lane] + part[3][t][e][lane]);
+        const unsigned t = item / (8U * 32U), e = (item / 32U) % 8U, ln = item % 32U;
+        const unsigned o = o0 + t * 16U + (ln & 15U), r = blockIdx.x * 16U + 2U * e + (ln >> 4U);
+        const float y = (part[0][t][e][ln] + part[2][t][e][ln]) + (part[1][t][e][ln] + part[3][t][e][ln]);
         if (o < v.count && r < v.rows) {
             float* dst = out + static_cast<std::size_t>(r) * v.out_stride + o;
             *dst = v.accumulate ? *dst + y : y;

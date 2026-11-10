@@ -17,14 +17,14 @@ __shared__ unsigned long long grid[!Q2 && !Direct ? 256 : 1];
 __shared__ unsigned sources[16], slots[Adapter::kFinish ? 16 : 1];
 __shared__ float values[Adapter::kFinish ? BM * BN : 1];
 if constexpr (!Q2 && !Direct)
-    for (unsigned i = thread; i < 256; i += G::threads) grid[i] = ad.grid()[i];
+    for (unsigned i = unsigned(thread); i < 256; i += G::threads) grid[i] = ad.grid()[i];
 if (thread < rows) {
     sources[thread] = ad.source(at, thread);
     if constexpr (Adapter::kFinish) slots[thread] = ad.slot(at, thread);
 }
 ad.bind_rows(sources, Adapter::kFinish ? slots : sources);
-const unsigned pair = wave & 1, q = wave >> 1, lo = lane & 15, h = lane >> 4;
-const unsigned groups = inputs / 32, chunks = (groups + 31) / 32;
+const unsigned pair = unsigned(wave) & 1, q = unsigned(wave) >> 1, lo = unsigned(lane) & 15, h = unsigned(lane) >> 4;
+const unsigned groups = unsigned(inputs) / 32, chunks = (groups + 31) / 32;
 const auto sync = [] {
     if constexpr (Plan::lds_only_barriers) {
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
@@ -52,7 +52,7 @@ const auto load_tile = [&](unsigned chunk) {
     if (!Plan::partial_blocks || left >= 32) {
         #pragma unroll
         for (unsigned i = 0; i < Loads; ++i) {
-            const unsigned word = thread + 512 * i;
+            const unsigned word = unsigned(thread) + 512 * i;
             if (word < RunWords) {
                 const unsigned off = integer_weight_offset(word, RowWords, rb);
                 r.w[0][i] = *reinterpret_cast<const unsigned*>(b0 + off);
@@ -62,7 +62,7 @@ const auto load_tile = [&](unsigned chunk) {
     } else {
         #pragma unroll
         for (unsigned i = 0; i < Loads; ++i) {
-            const unsigned word = thread + 512 * i;
+            const unsigned word = unsigned(thread) + 512 * i;
             if (word < RunWords && word % RowWords < used) {
                 const unsigned off = integer_weight_offset(word, RowWords, rb);
                 r.w[0][i] = *reinterpret_cast<const unsigned*>(b0 + off);
@@ -73,7 +73,7 @@ const auto load_tile = [&](unsigned chunk) {
     return r;
 };
 auto* tile = lds + StageBytes;
-const auto* own_row = ad.weight_row(at, first_col + pair * 32 + lane);
+const auto* own_row = ad.weight_row(at, first_col + int(pair * 32) + lane);
 Raw ahead{};
 TileRegs tile_next{};
 if constexpr (Direct) ahead = Operand::load_raw(own_row, q);
@@ -90,18 +90,18 @@ for (unsigned chunk = 0; chunk < chunks; ++chunk) {
     float dv[2] = {};
     #pragma unroll
     for (unsigned i = 0; i < 2; ++i) {
-        const auto item = integer_stage_item(thread, i);
+        const auto item = integer_stage_item(unsigned(thread), i);
         const unsigned r = item.row, kh = item.half, gg = item.group;
         const unsigned g = chunk * 32 + gg;
         if (g < groups && r < unsigned(rows)) {
-            av[i] = *reinterpret_cast<const V4*>(ad.code_row(at, r) + g * 32 + kh * 16);
-            if (!kh) dv[i] = ad.delta(at, r, g);
+            av[i] = *reinterpret_cast<const V4*>(ad.code_row(at, int(r)) + g * 32 + kh * 16);
+            if (!kh) dv[i] = ad.delta(at, int(r), int(g));
         }
     }
     if constexpr (!Direct) {
         #pragma unroll
         for (unsigned i = 0; i < Loads; ++i) {
-            const unsigned word = thread + 512 * i;
+            const unsigned word = unsigned(thread) + 512 * i;
             if (word < RunWords) {
                 reinterpret_cast<unsigned*>(tile)[word] = tile_next.w[0][i];
                 reinterpret_cast<unsigned*>(tile)[RunWords + word] = tile_next.w[1][i];
@@ -111,7 +111,7 @@ for (unsigned chunk = 0; chunk < chunks; ++chunk) {
     }
     #pragma unroll
     for (unsigned i = 0; i < 2; ++i) {
-        const auto item = integer_stage_item(thread, i);
+        const auto item = integer_stage_item(unsigned(thread), i);
         const unsigned r = item.row, kh = item.half, gg = item.group;
         if (chunk * 32 + gg >= groups) continue;
         reinterpret_cast<V4*>(lds)[(2 * gg + kh) * 16 + r] = av[i];
@@ -137,7 +137,7 @@ for (unsigned chunk = 0; chunk < chunks; ++chunk) {
             raw = ahead;
             const unsigned next = k < 3 ? chunk * 32 + gg + 8 : (chunk + 1) * 32 + q;
             if (next < groups) ahead = Operand::load_raw(own_row, next);
-        } else raw = Operand::load_raw(tile + (pair * 32 + lane) * Operand::chunk_row_bytes, gg);
+        } else raw = Operand::load_raw(tile + (pair * 32 + unsigned(lane)) * Operand::chunk_row_bytes, gg);
         const auto own = [&] {
             if constexpr (Direct) return Ops::decode(raw, grid);
             else return Ops::decode_lean(raw, grid);
@@ -198,7 +198,7 @@ for (unsigned s = 4; s; s /= 2) {
         #pragma unroll
         for (unsigned t = 0; t < 2; ++t)
             #pragma unroll
-            for (unsigned e = 0; e < 8; ++e) slot[(8 * t + e) * 32 + lane] = v[t][e];
+            for (unsigned e = 0; e < 8; ++e) slot[(8 * t + e) * 32 + unsigned(lane)] = v[t][e];
     }
     sync();
     if (q < s) {
@@ -206,7 +206,7 @@ for (unsigned s = 4; s; s /= 2) {
         #pragma unroll
         for (unsigned t = 0; t < 2; ++t)
             #pragma unroll
-            for (unsigned e = 0; e < 8; ++e) v[t][e] = v[t][e] + slot[(8 * t + e) * 32 + lane];
+            for (unsigned e = 0; e < 8; ++e) v[t][e] = v[t][e] + slot[(8 * t + e) * 32 + unsigned(lane)];
     }
 }
 if (q == 0) {
@@ -216,7 +216,7 @@ if (q == 0) {
         for (unsigned e = 0; e < 8; ++e) {
             const unsigned r = 2 * e + h, c = pair * 32 + t * 16 + lo;
             if (r < unsigned(rows)) {
-                ad.store_raw(at, r, first_col + c, v[t][e]);
+                ad.store_raw(at, int(r), first_col + int(c), v[t][e]);
                 if constexpr (Adapter::kFinish) values[r * BN + c] = v[t][e];
             }
         }

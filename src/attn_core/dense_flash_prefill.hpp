@@ -1,8 +1,9 @@
 #pragma once
-// Shared FAST dense causal GQA flash-attention prefill core (f16 WMMA 16x16x16 -> FP32, FP32 online softmax).
+// Shared FAST dense causal GQA flash-attention prefill core (f16/bf16 WMMA 16x16x16 -> FP32, FP32 online softmax).
+// Tile helpers (operand rounding, fragments, WMMA call) come from flash_tile.hpp (namespace tile, canonical).
 //
 // Identity: FAST, opt-in per engine (gemma4: STRIX_G4_PREFILL_ATTN=flash). Nothing here runs unless an engine
-// launches it. Lossy against exact attention: Q, K, V and the probabilities are FP16 WMMA operands, the score and
+// launches it. Lossy against exact attention: Q, K, V and the probabilities are Policy::kOp WMMA operands, the score and
 // PV sums run in WMMA order, and the softmax is the online (running max) form with exp2. Judged on end metrics.
 //
 // Shape: one work-group = one KV head x Group query heads x Positions consecutive query positions (Group *
@@ -17,33 +18,40 @@
 //   3. every wave of the row tile sums the partials (fixed order), scales by scale*log2(e), applies the causal and
 //      sliding-window mask, updates its running max/sum and builds the FP16 P fragment (the two half-waves split
 //      the exponentials), rescales O by alpha and adds P[16][16] . V[16][D/Split] on WMMA;           barrier
+// Split-K (splits > 1, grid z): work-group z walks its share of the block's key tiles and writes the unnormalised
+// O, the running max m (log2 units) and sum l to a workspace; combine<P> merges the splits per (row, head):
+// out = sum_z 2^(m_z - M) O_z / sum_z 2^(m_z - M) l_z. Fills the GPU when rows x KV heads give few work-groups.
 // Key tiles outside [lo(first row), last row] are never visited (causal + window block skip); tiles a row tile
 // cannot see are skipped per wave. Epilogue: O / l to the policy's FP32 output.
 // LDS: 16 x (D + 8) x 2 (K) + D x 32 (V^T) + waves x 16 x 20 x 4 (partials) = 53,504 B at D512 / 16 waves.
 //
 // Policy P (all __device__ static unless noted):
 //   using Args;  using Shape = dense::Shape<D, Group, Split, Positions>;  static constexpr float kScaleLog2;
+//   static constexpr tile::Operand kOp;             operand type of Q/K/V/P (K/V stored in it)
 //   bool valid(const Args&)                         geometry check (false: failure |= 2, nothing written)
 //   unsigned rows(const Args&)                      query rows (consecutive positions) - also host
 //   unsigned position(const Args&)                  absolute position of row 0
 //   unsigned window(const Args&)                    sliding window (keys p-window+1 .. p), 0 = full causal
 //   const float* query(const Args&, row, head)      FP32 [D], 16-B aligned
 //   float* out(const Args&, row, head)              FP32 [D]
-//   const _Float16* key(const Args&, pos, kv_head)  FP16 [D] of key pos, 16-B aligned (finite for every pos of a
+//   const uint16_t* key(const Args&, pos, kv_head)  kOp [D] of key pos, 16-B aligned (finite for every pos of a
 //                                                   visited 16-key tile; masked keys are multiplied by zero)
-//   const _Float16* value_t(const Args&, kv_head, d) FP16 V^T row: element pos = V[pos][d]; 16-B aligned at pos%16==0
-//   unsigned* failure(const Args&)                  bit 1 nonfinite output, bit 4 FP16 query overflow
-// rows() is __host__ __device__. Launch: launch<P>(args, heads, stream) - grid (row blocks, heads / Group), longest blocks first.
+//   const uint16_t* value_t(const Args&, kv_head, d) kOp V^T row: element pos = V[pos][d]; 16-B aligned at pos%16==0
+//   unsigned* failure(const Args&)                  bit 1 nonfinite output, bit 4 operand query overflow
+// The denominator sums the operand-rounded p (what PV accumulates), as tile::online_step.
+// rows() is __host__ __device__. Launch: launch<P>(args, heads, stream, workspace, splits) - grid (row blocks, heads / Group, splits), longest
+// blocks first; workspace_floats(rows, heads, D, splits) FP32 when splits > 1.
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 
+#include "flash_tile.hpp"
+
 namespace strix::attn_core::dense {
 
-typedef _Float16 Half16 __attribute__((ext_vector_type(16)));
-typedef float Float8 __attribute__((ext_vector_type(8)));
-typedef float Float4 __attribute__((ext_vector_type(4)));
-typedef unsigned U4 __attribute__((ext_vector_type(4)));
+using tile::Acc;
+using tile::Frag;
+using tile::U4;
 
 template <unsigned Dim, unsigned Group, unsigned Split, unsigned Positions = 16>
 struct Shape {
@@ -62,11 +70,12 @@ struct Shape {
 __device__ inline unsigned window_lo(unsigned p, unsigned window) { return window && p >= window ? p - window + 1U : 0U; }
 
 template <class P>
-__global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::Args a) {
+__device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsigned splits) {
     using S = typename P::Shape;
     constexpr unsigned D = S::dim, KP = S::kpitch, SP = S::spitch, F = S::frags, T = S::threads;
-    __shared__ __attribute__((aligned(16))) _Float16 ks[16 * KP];
-    __shared__ __attribute__((aligned(16))) _Float16 vs[D * 16];
+    constexpr auto O = P::kOp;
+    __shared__ __attribute__((aligned(16))) std::uint16_t ks[16 * KP];
+    __shared__ __attribute__((aligned(16))) std::uint16_t vs[D * 16];
     __shared__ __attribute__((aligned(16))) float part[S::waves * 16 * SP];
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5, rr = lane & 15U, hw = lane >> 4;
     const unsigned tile = wave / S::split, piece = wave % S::split;
@@ -80,6 +89,9 @@ __global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::A
     const unsigned block_rows = min(S::positions, rows - row_base);
     const unsigned pos_first = p0 + row_base, pos_last = pos_first + block_rows - 1U;
     const unsigned key_begin = window_lo(pos_first, window) & ~15U;
+    const unsigned tiles_total = (pos_last >> 4) - (key_begin >> 4) + 1U, share = (tiles_total + splits - 1U) / splits;
+    const unsigned kt_begin = key_begin + 16U * min(tiles_total, blockIdx.z * share);
+    const unsigned kt_end = key_begin + 16U * min(tiles_total, (blockIdx.z + 1U) * share); // exclusive
     // This wave's 16 rows: one query head, 16 consecutive positions.
     const unsigned head = kvh * S::group + tile % S::group, sub = tile / S::group * 16U;
     const bool wave_live = sub < block_rows;
@@ -88,21 +100,15 @@ __global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::A
     const bool live = wave_live && sub + rr < block_rows;
     const unsigned d0 = piece * S::slice;
     bool bad_half = false;
-    Half16 qf[F];
+    Frag qf[F];
     {
         const float* q = live ? P::query(a, my_row, head) + d0 : nullptr;
+        constexpr unsigned short exponent = O == tile::Operand::f16 ? 0x7c00U : 0x7f80U;
 #pragma unroll
         for (unsigned f = 0; f < F; ++f) {
+            qf[f] = live ? tile::frag_from_f32<O>(q + 16U * f) : Frag{};
 #pragma unroll
-            for (unsigned c = 0; c < 4; ++c) {
-                const Float4 x = live ? *reinterpret_cast<const Float4*>(q + 16U * f + 4U * c) : Float4{};
-#pragma unroll
-                for (unsigned i = 0; i < 4; ++i) {
-                    const _Float16 h = static_cast<_Float16>(x[i]);
-                    bad_half |= (__builtin_bit_cast(unsigned short, h) & 0x7c00U) == 0x7c00U;
-                    qf[f][4U * c + i] = h;
-                }
-            }
+            for (unsigned i = 0; i < 16; ++i) bad_half |= (qf[f][i] & exponent) == exponent;
         }
     }
     U4 kreg[S::per_thread], vreg[S::per_thread];
@@ -132,22 +138,24 @@ __global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::A
     };
     constexpr float neg_inf = -__builtin_huge_valf();
     float maximum = neg_inf, denominator = 0.0F;
-    Float8 acc[F];
+    Acc acc[F];
 #pragma unroll
-    for (unsigned f = 0; f < F; ++f) acc[f] = Float8{};
-    fetch(key_begin);
-    for (unsigned kt = key_begin; kt <= pos_last; kt += 16U) {
+    for (unsigned f = 0; f < F; ++f) acc[f] = tile::acc_zero();
+    if (kt_begin < kt_end) fetch(kt_begin);
+    for (unsigned kt = kt_begin; kt < kt_end; kt += 16U) {
         stage();
         __syncthreads();
-        if (kt + 16U <= pos_last) fetch(kt + 16U);
+        if (kt + 16U < kt_end) fetch(kt + 16U);
         const bool active = wave_live && kt <= tile_last && kt + 15U >= tile_lo; // wave-uniform
         if (active) {
-            Float8 s{};
+            // Two independent WMMA chains (even / odd 16-wide steps) halve the dependent latency.
+            Acc s = tile::acc_zero(), s1 = tile::acc_zero();
 #pragma unroll
-            for (unsigned f = 0; f < F; ++f) {
-                const Half16 b = *reinterpret_cast<const Half16*>(&ks[rr * KP + d0 + 16U * f]);
-                s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[f], b, s);
+            for (unsigned f = 0; f < F; f += 2) {
+                s = tile::mma<O>(qf[f], tile::frag32(&ks[rr * KP + d0 + 16U * f]), s);
+                if (f + 1 < F) s1 = tile::mma<O>(qf[f + 1], tile::frag32(&ks[rr * KP + d0 + 16U * f + 16U]), s1);
             }
+            s += s1;
             float* pw = part + wave * 16U * SP;
 #pragma unroll
             for (unsigned e = 0; e < 8; ++e) pw[(2U * e + hw) * SP + rr] = s[e];
@@ -162,9 +170,8 @@ __global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::A
                 const float* pp = part + (tile * S::split + p) * 16U * SP + rr * SP;
 #pragma unroll
                 for (unsigned c = 0; c < 4; ++c) {
-                    const Float4 v = *reinterpret_cast<const Float4*>(pp + 4U * c);
-#pragma unroll
-                    for (unsigned i = 0; i < 4; ++i) sc[4U * c + i] += v[i];
+                    const float4 v = reinterpret_cast<const float4*>(pp)[c];
+                    sc[4U * c] += v.x; sc[4U * c + 1] += v.y; sc[4U * c + 2] += v.z; sc[4U * c + 3] += v.w;
                 }
             }
             float m = maximum;
@@ -181,14 +188,14 @@ __global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::A
             float own[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) own[i] = present ? __builtin_amdgcn_exp2f(sc[8U * hw + i] - m) : 0.0F;
-            Half16 pa;
+            Frag pa;
             float sum = 0.0F;
 #pragma unroll
             for (unsigned j = 0; j < 16; ++j) {
                 const float other = __shfl_xor(own[j % 8U], 16, 32);
-                const float p = j / 8U == hw ? own[j % 8U] : other;
-                sum += p;
-                pa[j] = static_cast<_Float16>(p);
+                const std::uint16_t p = tile::to_operand<O>(j / 8U == hw ? own[j % 8U] : other);
+                sum += tile::operand_value<O>(p);
+                pa[j] = p;
             }
             denominator = denominator * alpha + sum;
             maximum = m;
@@ -197,16 +204,34 @@ __global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::A
             for (unsigned e = 0; e < 8; ++e) scale[e] = __shfl(alpha, int(2U * e + hw), 32);
 #pragma unroll
             for (unsigned f = 0; f < F; ++f) {
-                const Half16 b = *reinterpret_cast<const Half16*>(&vs[(d0 + 16U * f + rr) * 16U]);
-                Float8 c = acc[f];
+                Acc c = acc[f];
 #pragma unroll
                 for (unsigned e = 0; e < 8; ++e) c[e] *= scale[e];
-                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, b, c);
+                acc[f] = tile::mma<O>(pa, tile::frag32(&vs[(d0 + 16U * f + rr) * 16U]), c);
             }
         }
         __syncthreads();
     }
     bool bad_value = false;
+    const unsigned heads = gridDim.y * S::group;
+    if (splits > 1U) {
+        if (wave_live) {
+            float* acc_ws = ws + ((std::size_t(blockIdx.z) * rows + row_base + sub) * heads + head) * D + d0;
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                if (sub + 2U * e + hw >= block_rows) continue;
+                float* o = acc_ws + std::size_t(2U * e + hw) * heads * D;
+#pragma unroll
+                for (unsigned f = 0; f < F; ++f) o[16U * f + rr] = acc[f][e];
+            }
+            if (live && piece == 0U && hw == 0U) {
+                float* st = ws + std::size_t(splits) * rows * heads * D + ((std::size_t(blockIdx.z) * rows + my_row) * heads + head) * 2U;
+                st[0] = maximum; st[1] = denominator;
+            }
+        }
+        if (bad_half) atomicOr(P::failure(a), 4U);
+        return;
+    }
     if (wave_live) {
 #pragma unroll
         for (unsigned e = 0; e < 8; ++e) {
@@ -226,14 +251,59 @@ __global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::A
     if (bad_value) atomicOr(P::failure(a), 1U);
     if (bad_half) atomicOr(P::failure(a), 4U);
 }
-
 template <class P>
-inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream) {
+__global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::Args a, float* ws, unsigned splits) {
+    flash_body<P>(a, ws, splits);
+}
+// Register cap for 8 waves per SIMD (192 VGPRs): two 16-wave work-groups per WGP instead of one.
+template <class P>
+__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(8))) void flash_prefill_wpe8(
+    typename P::Args a, float* ws, unsigned splits) {
+    flash_body<P>(a, ws, splits);
+}
+
+// Split-K merge: one work-group per (row, head), D / 4 threads x 4 components.
+template <class P>
+__global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a, const float* ws, unsigned splits) {
+    constexpr unsigned D = P::Shape::dim;
+    const unsigned row = blockIdx.x, head = blockIdx.y, heads = gridDim.y, rows = P::rows(a), d = threadIdx.x * 4U;
+    const float* st = ws + std::size_t(splits) * rows * heads * D;
+    float m = -__builtin_huge_valf();
+    for (unsigned z = 0; z < splits; ++z) { const float v = st[((std::size_t(z) * rows + row) * heads + head) * 2U]; m = v > m ? v : m; }
+    float l = 0.0F, o[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    for (unsigned z = 0; z < splits; ++z) {
+        const std::size_t at = (std::size_t(z) * rows + row) * heads + head;
+        const float mz = st[at * 2U];
+        if (!(mz > -__builtin_huge_valf())) continue; // empty split
+        const float w = __builtin_amdgcn_exp2f(mz - m);
+        l += w * st[at * 2U + 1U];
+        const float4 v = *reinterpret_cast<const float4*>(ws + at * D + d);
+        o[0] += w * v.x; o[1] += w * v.y; o[2] += w * v.z; o[3] += w * v.w;
+    }
+    float* out = P::out(a, row, head) + d;
+    bool bad = false;
+#pragma unroll
+    for (unsigned i = 0; i < 4; ++i) {
+        const float value = o[i] / l;
+        bad |= (__builtin_bit_cast(unsigned, value) & 0x7f800000U) == 0x7f800000U;
+        out[i] = value;
+    }
+    if (bad) atomicOr(P::failure(a), 1U);
+}
+__host__ __device__ constexpr std::size_t workspace_floats(unsigned rows, unsigned heads, unsigned dim, unsigned splits) {
+    return splits > 1U ? std::size_t(splits) * rows * heads * (dim + 2U) : 0U;
+}
+template <class P>
+inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1,
+                   bool occupancy8 = false) {
     using S = typename P::Shape;
     const unsigned rows = P::rows(a);
     if (!rows) return;
-    hipLaunchKernelGGL(flash_prefill<P>, dim3((rows + S::positions - 1U) / S::positions, heads / S::group),
-                       dim3(S::threads), 0, stream, a);
+    if (!ws) splits = 1;
+    const dim3 grid((rows + S::positions - 1U) / S::positions, heads / S::group, splits);
+    if (occupancy8) hipLaunchKernelGGL(flash_prefill_wpe8<P>, grid, dim3(S::threads), 0, stream, a, ws, splits);
+    else hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits);
+    if (splits > 1U) hipLaunchKernelGGL(combine<P>, dim3(rows, heads), dim3(S::dim / 4U), 0, stream, a, ws, splits);
 }
 
 } // namespace strix::attn_core::dense

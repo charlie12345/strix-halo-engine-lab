@@ -192,10 +192,11 @@ __host__ __device__ constexpr unsigned split_stride(unsigned stride) { return (s
 // Split=false (flash): the V^T half holds plain FP16 V (no sign split); the negative half is unused.
 template <bool Split = true>
 __global__ __launch_bounds__(256) void pack_split(const gpu::KvRead* reads, unsigned rows, unsigned width, unsigned stride,
-                                                  _Float16* packed, unsigned* failure) {
+                                                  _Float16* packed, unsigned* failure, std::uint64_t from = 0) {
     __shared__ unsigned short positive[32][33], negative[32][33];
     const auto r = reads[0];
-    const auto first = !r.global && r.position >= r.window ? r.position - r.window + 1 : 0;
+    const auto window_first = !r.global && r.position >= r.window ? r.position - r.window + 1 : 0;
+    const auto first = window_first > from ? window_first : from; // from = 0 for every split pack
     const auto last = r.position + rows - 1;
     const unsigned tx = threadIdx.x % 32, ty = threadIdx.x / 32;
     if (last >= stride || r.width != width) { if (!threadIdx.x && !blockIdx.x && !blockIdx.y) atomicOr(failure, 2U); return; }
@@ -209,7 +210,7 @@ __global__ __launch_bounds__(256) void pack_split(const gpu::KvRead* reads, unsi
     for (unsigned i = 0; i < 4; ++i) {
         const auto p = p0 + ty + 8 * i;
         const auto d = d0 + tx;
-        if (p > end || d >= width) continue;
+        if (p > end || d >= width || (!Split && p < from)) continue;
         unsigned short bits = 0;
         _Float16 key = _Float16(0);
         if (p >= first && p <= last) {
@@ -226,7 +227,7 @@ __global__ __launch_bounds__(256) void pack_split(const gpu::KvRead* reads, unsi
     for (unsigned i = 0; i < 4; ++i) {
         const auto d = d0 + ty + 8 * i;
         const auto p = p0 + tx;
-        if (p > end || d >= width) continue;
+        if (p > end || d >= width || (!Split && p < from)) continue;
         vpos[std::size_t(d) * vstride + p] = bit_cast<_Float16>(positive[ty + 8 * i][tx]);
         if constexpr (Split) vneg[std::size_t(d) * vstride + p] = bit_cast<_Float16>(negative[ty + 8 * i][tx]);
     }
@@ -423,6 +424,12 @@ bool attention_split_enabled() {
     static const bool enabled = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_ATTN_SPLIT"); return !p || std::string_view(p) != "0"; }();
     return enabled;
 }
+std::size_t flash_workspace_bytes(unsigned rows, unsigned heads, unsigned dim) {
+    return attn_core::dense::workspace_floats(rows, heads, dim, 8U) * sizeof(float);
+}
+std::size_t flash_packed_bytes(unsigned packed_stride, unsigned width) {
+    return 2ULL * split_stride(packed_stride) * width * sizeof(std::uint16_t);
+}
 std::size_t attention_packed_bytes(unsigned packed_stride, unsigned width) {
     const auto split = 3ULL * split_stride(packed_stride) * width;
     return std::max(split, 2ULL * packed_stride * width) * sizeof(std::uint16_t);
@@ -471,6 +478,7 @@ struct FlashPolicy {
     using Args = FlashArgs;
     using Shape = attn_core::dense::Shape<D, group, D / 128U>;
     static constexpr float kScaleLog2 = attention_scale * 1.44269504088896341F;
+    static constexpr attn_core::tile::Operand kOp = attn_core::tile::Operand::f16; // pack_split<false> FP16 K/V
     __device__ static bool valid(const Args& a) {
         const auto& r = a.reads[0];
         return r.position < max_positions && a.rows <= max_positions - r.position && r.width == a.width &&
@@ -481,13 +489,18 @@ struct FlashPolicy {
     __device__ static unsigned window(const Args& a) { return a.reads[0].global ? 0U : a.reads[0].window; }
     __device__ static const float* query(const Args& a, unsigned row, unsigned h) { return a.q + (std::size_t(row) * a.heads + h) * D; }
     __device__ static float* out(const Args& a, unsigned row, unsigned h) { return a.out + (std::size_t(row) * a.heads + h) * D; }
-    __device__ static const _Float16* key(const Args& a, unsigned p, unsigned kvh) { return a.k + std::size_t(p) * a.width + kvh * D; }
-    __device__ static const _Float16* value_t(const Args& a, unsigned kvh, unsigned d) { return a.vt + std::size_t(kvh * D + d) * a.vstride; }
+    __device__ static const std::uint16_t* key(const Args& a, unsigned p, unsigned kvh) {
+        return reinterpret_cast<const std::uint16_t*>(a.k + std::size_t(p) * a.width + kvh * D);
+    }
+    __device__ static const std::uint16_t* value_t(const Args& a, unsigned kvh, unsigned d) {
+        return reinterpret_cast<const std::uint16_t*>(a.vt + std::size_t(kvh * D + d) * a.vstride);
+    }
     __device__ static unsigned* failure(const Args& a) { return a.failure; }
 };
 } // namespace
 void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned heads, unsigned dim, float* out,
-                     unsigned* failure, gpu::Queue queue, void* packed, unsigned packed_stride, unsigned key_capacity, bool repack) {
+                     unsigned* failure, gpu::Queue queue, void* packed, unsigned packed_stride, unsigned key_capacity, bool repack,
+                     std::uint64_t pack_from, unsigned context, void* workspace, std::size_t workspace_bytes) {
     if (!rows || rows > max_chunk_rows || !heads || heads % group || !q || !reads || !out || !failure || !packed)
         throw std::invalid_argument("flash attention geometry");
     if (!packed_stride || packed_stride > max_positions) throw std::invalid_argument("flash attention packed stride");
@@ -497,13 +510,26 @@ void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, un
     if (key_capacity > packed_stride) throw std::invalid_argument("flash attention key capacity");
     if (repack)
         hipLaunchKernelGGL(pack_split<false>, dim3((key_capacity + 61U) / 32U, (width + 31U) / 32U), dim3(256), 0, stream,
-                           reads, rows, width, packed_stride, static_cast<_Float16*>(packed), failure);
+                           reads, rows, width, packed_stride, static_cast<_Float16*>(packed), failure, pack_from);
     const auto* k = static_cast<const _Float16*>(packed);
     const FlashArgs a{q, reads, out, failure, k, k + std::size_t(split_stride(packed_stride)) * width, rows, heads, width,
                       split_stride(packed_stride), packed_stride};
+    // Split-K when the chunk's work-groups (16-row blocks x KV heads) cannot fill ~8 per WGP of the 20 and every
+    // split keeps >= 32 key tiles. STRIX_G4_PREFILL_FLASH_SPLITS=n forces n (1 = off).
+    unsigned splits = 1;
+    if (workspace && context) {
+        static const unsigned forced = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_FLASH_SPLITS"); return p ? unsigned(std::atoi(p)) : 0U; }();
+        const unsigned groups = (rows + 15U) / 16U * (heads / group), tiles = context / 16U;
+        splits = forced ? forced : std::max(1U, std::min({8U, (160U + groups - 1U) / groups, tiles / 32U}));
+        while (splits > 1 && attn_core::dense::workspace_floats(rows, heads, dim, splits) * sizeof(float) > workspace_bytes) --splits;
+    }
+    auto* ws = static_cast<float*>(workspace);
+    // Default: the 192-VGPR variant (8 waves/SIMD, two work-groups per WGP; 68 B/lane scratch, still 1.3x the
+    // 238-VGPR one at 32K). STRIX_G4_PREFILL_FLASH_WPE=0 selects the uncapped kernel.
+    static const bool wpe8 = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_FLASH_WPE"); return !p || std::string_view(p) != "0"; }();
     switch (dim) {
-    case 256: attn_core::dense::launch<FlashPolicy<256>>(a, heads, stream); break;
-    case 512: attn_core::dense::launch<FlashPolicy<512>>(a, heads, stream); break;
+    case 256: attn_core::dense::launch<FlashPolicy<256>>(a, heads, stream, ws, splits, wpe8); break;
+    case 512: attn_core::dense::launch<FlashPolicy<512>>(a, heads, stream, ws, splits, wpe8); break;
     default: throw std::invalid_argument("flash attention head dimension");
     }
     if (const auto e = hipGetLastError(); e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));

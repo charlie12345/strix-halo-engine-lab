@@ -37,7 +37,7 @@ int bench() {
         std::vector<std::uint64_t> tags(slots, UINT64_MAX);
         for (unsigned p = c.context > slots ? c.context - slots : 0; p < c.context; ++p) tags[c.global ? p : p % slots] = p;
         gpu::Buffer dq(q.size() * 4), dk(k.size() * 4), dv(v.size() * 4), dok(ok.size() * 4), dov(ov.size() * 4), dt(tags.size() * 8), dr(rows * sizeof(gpu::KvRead));
-        gpu::Buffer out(dq.size()), out_flash(dq.size()), failure(4);
+        gpu::Buffer out(dq.size()), out_flash(dq.size()), failure(4), ws(pf::flash_workspace_bytes(rows, head_count, c.dim));
         dq.upload(q.data(), dq.size()); dk.upload(k.data(), dk.size()); dv.upload(v.data(), dv.size()); dok.upload(ok.data(), dok.size());
         dov.upload(ov.data(), dov.size()); dt.upload(tags.data(), dt.size()); failure.zero();
         std::vector<gpu::KvRead> reads(rows);
@@ -70,7 +70,8 @@ int bench() {
         const auto wmma = [&](bool repack) { return [&, repack] { pf::attention(dq.as<float>(), dr.as<gpu::KvRead>(), rows, head_count, c.dim, out.as<float>(),
                           failure.as<unsigned>(), nullptr, packed.data(), stride, capacity, repack); }; };
         const auto flash = [&](bool repack) { return [&, repack] { pf::attention_flash(dq.as<float>(), dr.as<gpu::KvRead>(), rows, head_count, c.dim,
-                          out_flash.as<float>(), failure.as<unsigned>(), nullptr, packed_flash.data(), stride, capacity, repack); }; };
+                          out_flash.as<float>(), failure.as<unsigned>(), nullptr, packed_flash.data(), stride, capacity, repack, 0,
+                          c.global ? c.context + rows : 0U, ws.data(), ws.size()); }; };
         const double w1 = time(wmma(true)), w0 = time(wmma(false)), f1 = time(flash(true)), f0 = time(flash(false));
         std::vector<float> a(q.size()), b(q.size());
         out.download(a.data(), out.size()); out_flash.download(b.data(), out_flash.size());

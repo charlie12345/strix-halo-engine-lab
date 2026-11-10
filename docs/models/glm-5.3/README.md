@@ -118,6 +118,11 @@ and requires hits; `--selftest-prefix-long L` uses first turns of about L tokens
 admit-to-ready time from the cache and cold. The other selftests also restore repeated prompts from the
 cache; pass `--prefix-cache-gib 0` for cache-off figures.
 
+The memory watchdog's default RSS ceiling is 8 GiB plus the per-rank prefix-cache
+budget, so retained snapshots do not look like an engine leak. `STRIX_GLM_WD_RSS_GIB`
+overrides that total (0 disables the RSS check); RAM headroom, swap and GTT limits
+are unchanged. Disabling the cache restores the 8 GiB default.
+
 ## Run: one RTX PRO 6000
 
 Windows only, opt-in: build with `pwsh src/glm/rtxpf/producer/build.ps1` against a tierstream source export, build

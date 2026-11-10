@@ -271,6 +271,9 @@ void test_e1_plan() {
 
 // ---------------------------------------------------------------- watchdog thresholds: caller-budgeted host memory
 void test_watchdog_budget() {
+    const char* previous = std::getenv("STRIX_GLM_WD_RSS_GIB");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
     ::unsetenv("STRIX_GLM_WD_RSS_GIB");
     const std::uint64_t base = mem::Watchdog{}.max_rss;
     CHECK(mem::Watchdog::from_env().max_rss == base);
@@ -284,8 +287,10 @@ void test_watchdog_budget() {
     CHECK(mem::Watchdog::from_env(16 * mem::kGiB).max_rss == 0);
     ::unsetenv("STRIX_GLM_WD_RSS_GIB");
     // The other thresholds do not move.
-    const mem::Watchdog d, w = mem::Watchdog::from_env(16 * mem::kGiB);
+    const auto d = mem::Watchdog::from_env(), w = mem::Watchdog::from_env(16 * mem::kGiB);
     CHECK(w.min_ram_headroom == d.min_ram_headroom && w.max_swap_growth == d.max_swap_growth && w.max_gtt_used == d.max_gtt_used);
+    if (had_previous) ::setenv("STRIX_GLM_WD_RSS_GIB", saved.c_str(), 1);
+    else ::unsetenv("STRIX_GLM_WD_RSS_GIB");
 }
 
 // ---------------------------------------------------------------- monitor: trace + watchdog

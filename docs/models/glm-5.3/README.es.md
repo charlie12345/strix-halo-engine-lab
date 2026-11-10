@@ -127,6 +127,11 @@ conversaciones de dos turnos con repeticiones tras vaciar la caché y exige acie
 del turno 2 desde la caché y en frío. Los demás selftests también restauran prompts repetidos desde la
 caché; use `--prefix-cache-gib 0` para cifras sin caché.
 
+El límite RSS predeterminado del watchdog de memoria es 8 GiB más el presupuesto
+de caché de prefijos por rango, para no tratar los snapshots retenidos como una fuga.
+`STRIX_GLM_WD_RSS_GIB` sustituye ese límite total (0 desactiva la comprobación RSS);
+los límites de RAM libre, swap y GTT no cambian. Sin caché, el valor sigue siendo 8 GiB.
+
 ## Ejecución: una RTX PRO 6000
 
 Solo Windows, opcional (opt-in): compile con `pwsh src/glm/rtxpf/producer/build.ps1` contra una exportación del código

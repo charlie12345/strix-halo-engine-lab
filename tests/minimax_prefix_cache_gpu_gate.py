@@ -17,10 +17,10 @@ Procedure (the switch is read once at startup, so each arm is a fresh pair):
     python3 tests/minimax_prefix_cache_gpu_gate.py capture --port PORT --prompt PROMPT.txt --out mm-off.json
     python3 tests/minimax_prefix_cache_gpu_gate.py compare --on mm-on.json --off mm-off.json
 
-A capture sends A = the prompt (>= 256 tokens), lets it finish (freeing its slot but keeping its resident KV), then
+A capture sends A = the prompt (at least one prefill chunk, 4096 tokens; use several), lets it finish (freeing its slot but keeping its resident KV), then
 sends B = A + a short distinct suffix. In the ON arm B reuses the leading tokens it shares with A (cached delta >=
-that shared length); in the OFF arm B prefills everything (cached delta 0). compare requires: token_ids(A) and
-token_ids(B) identical across arms; ON reused >= the shared length; OFF reused 0. Verdict EXACT, MISMATCH or NO-REFERENCE (missing diagnostics is never a pass).
+that shared length rounded down to whole chunks); in the OFF arm B prefills everything (cached delta 0). compare requires: token_ids(A) and
+token_ids(B) identical across arms; ON reused >= the whole chunks of the shared length; OFF reused 0. Verdict EXACT, MISMATCH or NO-REFERENCE (missing diagnostics is never a pass).
 """
 import argparse
 import json
@@ -29,7 +29,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-MIN_REUSE = 256  # Lead::kMinReuse: shorter shared prefixes are not reused.
+CHUNK = 4096  # the serve's default --max-rows: reuse is rounded down to whole prefill chunks.
 
 
 def require(value, message):
@@ -86,10 +86,10 @@ def capture(args):
     text_b = text_a + args.suffix_text  # a distinct continuation appended as text
     tok_a, tok_b = tokenize(args.port, text_a), tokenize(args.port, text_b)
     # BPE is context-sensitive, so appending text can re-merge the tokens straddling the join; the reuse is whatever
-    # leading tokens A and B genuinely share. That shared run must be >= kMinReuse for reuse to fire at all.
+    # leading tokens A and B genuinely share. That shared run must hold at least one whole prefill chunk for reuse to fire at all.
     shared = common_prefix(tok_a, tok_b)
-    require(shared >= MIN_REUSE,
-            f"A and B share only {shared} leading tokens; need >= {MIN_REUSE} (A tokenizes to {len(tok_a)}); "
+    require(shared >= CHUNK,
+            f"A and B share only {shared} leading tokens; need >= {CHUNK} (A tokenizes to {len(tok_a)}); "
             "lengthen the prompt or pick a cleaner suffix")
 
     base0 = cached_total(args.port)
@@ -115,8 +115,9 @@ def compare_records(on, off):
         reasons.append("A tokens differ across arms (prompt/model/sampling not matched)")
     if on["ids_b"] != off["ids_b"]:
         reasons.append("B tokens differ: prefix reuse changed the output (exactness violation)")
-    if on.get("reused_b", 0) < on["prefix_len"]:
-        reasons.append(f"ON arm reused {on.get('reused_b')} < shared prefix {on['prefix_len']}: reuse did not fire, "
+    whole = on["prefix_len"] // CHUNK * CHUNK
+    if whole == 0 or on.get("reused_b", 0) < whole:
+        reasons.append(f"ON arm reused {on.get('reused_b')} < {whole} (whole chunks of the shared {on['prefix_len']}): reuse did not fire, "
                        "so token equality proves nothing")
     if off.get("reused_b", 0) != 0:
         reasons.append(f"OFF arm reused {off.get('reused_b')} != 0: the OFF arm ran with reuse on")
@@ -133,8 +134,8 @@ def compare(args):
 
 
 def self_test():
-    base = dict(prefix_len=300, ids_a=[5, 6, 7], ids_b=[8, 9, 10])
-    on = dict(base, reused_a=0, reused_b=300)
+    base = dict(prefix_len=9000, ids_a=[5, 6, 7], ids_b=[8, 9, 10])
+    on = dict(base, reused_a=0, reused_b=8192)
     off = dict(base, reused_a=0, reused_b=0)
     require(compare_records(on, off)[0] == "EXACT", "self-test: matched arms should be EXACT")
     require(compare_records(dict(on, ids_b=[8, 9, 99]), off)[0] == "MISMATCH", "self-test: changed B must be MISMATCH")
@@ -149,7 +150,7 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     cap = sub.add_parser("capture", help="drive a running pair and record one arm")
     cap.add_argument("--port", type=int, required=True)
-    cap.add_argument("--prompt", required=True, help="text file for prompt A; must tokenize to >= 256 tokens")
+    cap.add_argument("--prompt", required=True, help="text file for prompt A; must tokenize to at least one prefill chunk (4096 tokens)")
     cap.add_argument("--out", required=True)
     cap.add_argument("--generate", type=int, default=32, help="tokens to generate per request (greedy)")
     cap.add_argument("--suffix-text", default="\n\nIn one word, the main theme above is:",

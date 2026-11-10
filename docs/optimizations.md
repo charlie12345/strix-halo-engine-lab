@@ -2644,17 +2644,19 @@ alone is refused before anything is evicted. Unnamed requests are unchanged. The
 
 **Engine:** `minimax` (`strix-minimax-serve`). **Control:** `STRIX_MM_SERVE_PREFIX`. **Default:** off.
 
-A request without a `session` id whose prompt shares at least 256 leading tokens with the tokens still resident in a free
-slot starts in that slot and prefills only the rest: the lead keeps each slot's resident token ids, picks the free slot
-with the longest match, and the prefill command carries the first position (`pstart`) to the follower. The last prompt
-token is always prefilled. Nothing is copied or stored: the rows are the slot's own cache, so the reuse lasts until
+A request without a `session` id whose prompt shares at least one whole prefill chunk (`--max-rows`, 4096) of leading
+tokens with the tokens still resident in a free slot starts in that slot and prefills only the rest: the lead keeps
+each slot's resident token ids, picks the free slot with the longest match, rounds it down to whole chunks, and the
+prefill command carries the first position (`pstart`) to the follower. The rounding is what keeps the result exact: a
+prefill tiles its rows from the chunk's first row, so a suffix opening inside a chunk does not reproduce the bits of a
+full prefill, while one opening on a chunk boundary is split into the same chunks. Nothing is copied or stored: the rows are the slot's own cache, so the reuse lasts until
 another request takes the slot. Reused tokens are reported as `cached_tokens`, in `strix_prompt_tokens_cached_total`
 and as `capabilities.prefix_cache` in `/api/status`.
 
-- **Preconditions:** `STRIX_MM_SERVE_PREFIX=1` on both ranks (each rank votes in the hello; one missing vote keeps every prefill whole and the wire bytes unchanged). Not for a nested prompt or a request admitted as a DSpark context (both prefill in full). A session command clears every slot's resident record.
+- **Preconditions:** `STRIX_MM_SERVE_PREFIX=1` on both ranks (each rank votes in the hello; one missing vote keeps every prefill whole and the wire bytes unchanged). Not for a nested prompt or a request admitted as a DSpark context (both prefill in full). Exact only with fixed-size prefill chunks: `STRIX_MM_PF_PAIR_FROM` sizes chunks by prompt length, so with it the reused boundary is not a chunk boundary of the longer prompt and the ids can differ. A session command clears every slot's resident record.
 - **Automatic selection:** None; explicit opt-in only.
 - **Fallback notice:** Rank 0 prints `prefix reuse off` when it asked and the peer did not vote.
-- **Exactness evidence:** CPU: `strix-minimax-lead-tests` (reuse length, `pstart` / suffix on the wire, off by default, hello votes, session invalidation). Two-node: `tests/minimax_prefix_cache_gpu_gate.py` compares greedy token ids of the same two requests with reuse on and off and requires the reuse counter to show that reuse fired; it has no logit or state digest. Draft until the complete-workload gates run on a reference pack.
+- **Exactness evidence:** CPU: `strix-minimax-lead-tests` (chunk rounding, `pstart` / suffix on the wire, off by default, hello votes, session invalidation). Two-node: `tests/minimax_prefix_cache_gpu_gate.py` compares greedy token ids of the same two requests with reuse on and off and requires the reuse counter to show that reuse fired; it has no logit or state digest. One 24K-token run: identical ids with 20,480 tokens reused; the same run without the chunk rounding diverged at generated token 12. Draft until the complete-workload gates run on a reference pack.
 - **Off switch:** unset `STRIX_MM_SERVE_PREFIX` (or any value other than `1`) and restart both ranks.
 - **Measured gain:** None claimed. The skipped work is the prefill of the shared prefix.
 - **Implementation / evidence:** [lead](../src/minimax/serve/minimax_lead.hpp), [control](../src/minimax/serve/minimax_control.hpp), [gate](../tests/minimax_prefix_cache_gpu_gate.py)

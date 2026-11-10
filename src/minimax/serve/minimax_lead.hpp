@@ -612,7 +612,8 @@ private:
         }
         // Prefix reuse: among the free slots, the one sharing the longest leading prefix with this prompt reuses those
         // resident cache rows; only the suffix is prefilled. Capped at prompt.size()-1 (the last token is always
-        // prefilled, to produce its logits). A drafter-context request does not reuse (v1 archive-coverage guard, below).
+        // prefilled, to produce its logits) and rounded down to whole prefill chunks (below). A drafter-context request
+        // does not reuse (v1 archive-coverage guard, below).
         std::uint32_t reuse = 0;
         if (prefix_on_ && !nested) {
             std::uint32_t best = free_slot, best_n = 0;
@@ -623,9 +624,13 @@ private:
                 const std::uint32_t cap = static_cast<std::uint32_t>(std::min<std::size_t>(k.size(), lim));
                 std::uint32_t match = 0;
                 while (match < cap && k[match] == prompt[match]) ++match;
+                // Whole prefill chunks only. A prefill tiles its rows from the chunk's first row (16-query windows), so a
+                // suffix that opens inside a chunk is tiled differently from the same rows in a full prefill and its
+                // bits differ. Opening on a max_rows boundary gives the suffix the chunks a full prefill would use.
+                match -= static_cast<std::uint32_t>(match % max_rows_);
                 if (match > best_n) { best_n = match; best = s; }
             }
-            if (best_n >= kMinReuse) { free_slot = best; reuse = best_n; }
+            if (best_n != 0) { free_slot = best; reuse = best_n; }
         }
         Running r;
         r.policy = pol_;
@@ -1244,7 +1249,6 @@ private:
     // Causal attention makes the reused prefix identical to prefilling it.
     std::vector<std::vector<std::uint32_t>> kv_;
     bool prefix_on_ = false;
-    static constexpr std::uint32_t kMinReuse = 256;  // ignore shorter matches (the prefill of a short suffix is cheap)
     std::optional<sv::TakenJob> pending_;
     bool pending_short_first_ = false;
     bool deadline_serviced_ = false;

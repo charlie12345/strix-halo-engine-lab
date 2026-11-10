@@ -1285,9 +1285,11 @@ DevLayout dev_layout(unsigned T,bool i4=false) {
     if(i4) {
         l.xt=off;
         // Largest tile list (BM32), count word, the global down operand (A4 + FP32 scales) and the
-        // FP32 down rows of the ordered (deterministic) combine.
+        // FP32 down rows of the ordered (deterministic) combine, then the gate/up A4 image
+        // (row 2*pair+m, quantised once by the pre-pass) with its FP32 scales.
         take(align256(((5ULL*T+31)/32+kDevGroups)*12)+256+
-             align256(5ULL*T*(kInter/2))+align256(5ULL*T*(kInter/64)*4)+align256(5ULL*T*kHidden*4));
+             align256(5ULL*T*(kInter/2))+align256(5ULL*T*(kInter/64)*4)+align256(5ULL*T*kHidden*4)+
+             align256(2ULL*5ULL*T*(kHidden/2))+align256(2ULL*5ULL*T*(kHidden/64)*4));
         l.bytes=off;
         return l;
     }

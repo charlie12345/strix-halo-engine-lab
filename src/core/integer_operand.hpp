@@ -3,6 +3,15 @@
 #include "integer_plan.hpp"
 #include <type_traits>
 namespace strix::core {
+// Fixed register-array indices even when LLVM declines a pragma-unroll request.
+// Pass the closure by reference: it may refer to the accumulator register file.
+template<unsigned N, unsigned I = 0, class F>
+__device__ __forceinline__ void integer_unroll(const F& f) {
+    if constexpr (I < N) {
+        f(std::integral_constant<unsigned, I>{});
+        integer_unroll<N, I + 1>(f);
+    }
+}
 // Decode original GGUF blocks; no resident weight pack or converter.
 template<class Traits, typename Traits::WeightFormat Format, bool FastI4 = false, class ExecutionPlan = IntegerPlan>
 struct IntegerOperand {

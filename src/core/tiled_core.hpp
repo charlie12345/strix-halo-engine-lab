@@ -12,6 +12,7 @@
 #include "hadamard.hpp"
 #include <type_traits>
 #include "integer_operand.hpp"
+#include "integer_grouped_schedule.hpp"
 
 namespace strix::core {
 namespace wmma_tiled {
@@ -163,6 +164,17 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     constexpr int CB = [] { if constexpr (Integer || IU4Pack || DenseF16) return 2; else return Operand::codebook; }();
     constexpr int KT = G::KT, STRIDE = G::row_bytes / 2;
     constexpr int MT = G::MT, NT = G::NT;
+    constexpr auto structure = [] {
+        if constexpr (Integer) return Operand::Plan::structure;
+        else return IntegerStructure::per_group;
+    }();
+    // Dense plans own one CTA tile and handle their own row/output tails. Enter
+    // them directly, as their schedule requires no adapter iteration or raster.
+    if constexpr (structure == IntegerStructure::dense_tall) {
+#include "integer_tall_mainloop.inc"
+    } else if constexpr (structure == IntegerStructure::dense_wide) {
+#include "integer_wide_mainloop.inc"
+    } else {
     __shared__ __attribute__((aligned(16))) uint8_t lds[G::lds_bytes];
     const int thread = int(threadIdx.x), lane = thread & 31;
     const int wave = __builtin_amdgcn_readfirstlane(thread / 32);
@@ -625,7 +637,10 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
         }
     }
     } // non-integer operand
+    // The grouped plan owns exactly one routed tile, like its dense siblings.
+    if constexpr (structure == IntegerStructure::grouped_chunk) return;
     }   // adapter tile loop
+    }   // general tiled plans
 }
 } // namespace wmma_tiled
 } // namespace strix::core

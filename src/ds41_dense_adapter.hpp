@@ -12,10 +12,10 @@ template<unsigned RowTiles = 1, bool ColFirst = false> struct DenseAdapter {
         unsigned begin = 0;
     };
     Q8A8DensePrefillView view;
-    __device__ auto tensor() const { return view; }
-    __device__ float half_exact(unsigned short h) const { return f16_to_float(h); }
-    __device__ float half_select(unsigned short h) const { return f16_to_float_select(h); }
-    __device__ bool next(Tile& t, unsigned iter, int bn) const {
+    __device__ __forceinline__ const Q8A8DensePrefillView& tensor() const { return view; }
+    __device__ __forceinline__ float half_exact(unsigned short h) const { return f16_to_float(h); }
+    __device__ __forceinline__ float half_select(unsigned short h) const { return f16_to_float_select(h); }
+    __device__ __forceinline__ bool next(Tile& t, unsigned iter, int bn) const {
         if (iter) return false;
         t.begin = (ColFirst ? blockIdx.y : blockIdx.x) * (16U * RowTiles);
         if (t.begin >= view.rows) return false;
@@ -23,23 +23,23 @@ template<unsigned RowTiles = 1, bool ColFirst = false> struct DenseAdapter {
         t.first_col = int(blockIdx.y) * bn;
         return true;
     }
-    __device__ const signed char* code_row(const Tile& t, int r) const {
+    __device__ __forceinline__ const signed char* code_row(const Tile& t, int r) const {
         return view.codes + std::uint64_t(t.begin + unsigned(r)) * view.x_stride;
     }
-    __device__ float delta(const Tile& t, int r, int group) const {
+    __device__ __forceinline__ float delta(const Tile& t, int r, int group) const {
         return view.deltas[std::uint64_t(t.begin + unsigned(r)) * (view.x_stride / 32U) + unsigned(group)];
     }
-    __device__ const unsigned long long* grid() const { return nullptr; }
-    __device__ const unsigned char* weight_row(const Tile&, int col) const {
+    __device__ __forceinline__ const unsigned long long* grid() const { return nullptr; }
+    __device__ __forceinline__ const unsigned char* weight_row(const Tile&, int col) const {
         const unsigned row_bytes = (view.row_width ? view.row_width : view.width) / 32U * 34U;
         return view.weight + std::uint64_t(min(unsigned(col), view.count - 1U)) * row_bytes + view.k_offset / 32U * 34U;
     }
-    __device__ void store_raw(const Tile& t, int r, int col, float value) const {
+    __device__ __forceinline__ void store_raw(const Tile& t, int r, int col, float value) const {
         if (unsigned(col) >= view.count) return;
         auto* dst = view.out + std::uint64_t(t.begin + unsigned(r)) * view.out_stride + unsigned(col);
         *dst = view.accumulate ? *dst + value : value;
     }
-    __device__ void finish_tile(const Tile& t, const float* values, int bm, int bn) const {
+    __device__ __forceinline__ void finish_tile(const Tile& t, const float* values, int bm, int bn) const {
         if (!view.a8_codes) return;
         const unsigned lane = threadIdx.x & 31U, waves = blockDim.x / 32U;
         for (unsigned r = threadIdx.x / 32U; r < unsigned(bm); r += waves) {

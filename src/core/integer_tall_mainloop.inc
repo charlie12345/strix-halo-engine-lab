@@ -8,7 +8,7 @@ using v8i = typename Operand::Int8;
 constexpr unsigned RT = MT, OT = NT, Lean = Plan::lean, Parts = Plan::parts;
 constexpr bool ColFirst = Plan::column_first;
 constexpr unsigned tall_waves = 8;
-auto v0 = ad.tensor();
+const auto& v0 = ad.tensor();
     __shared__ float part[tall_waves][RT * OT][8][32];
     __shared__ float4 dsh[RT][32][2][2];
     [[maybe_unused]] float first[RT * OT];
@@ -71,7 +71,7 @@ auto v0 = ad.tensor();
     }
     // Lean >= 4: one group's weight records (OT tiles) as WMMA operands and f32 scales; Lean >= 5 keeps each scale an
     // opaque f32 VGPR, so the scale products are plain v_mul_f32 (dual-issuable) instead of v_fma_mix with the f16 scale.
-    [[maybe_unused]] const auto load_w = [&](unsigned gg, v4i (&b0)[OT], v4i (&b1)[OT], float (&sc)[OT]) {
+    [[maybe_unused]] const auto load_w = [&](unsigned gg, v4i (&b0)[OT], v4i (&b1)[OT], float (&sc)[OT]) __attribute__((always_inline)) {
 #pragma unroll
         for (unsigned t = 0; t < OT; ++t) {
             const int off = static_cast<int>(woff[t] + 34U * gg);
@@ -101,6 +101,7 @@ auto v0 = ad.tensor();
                     r < v.rows && g < groups ? v.deltas[static_cast<std::size_t>(r) * (v.x_stride / 32U) + g] : 0.0F;
         }
         __syncthreads();
+        // Plain unrolled loop with continue, as the split-v2 tall kernel: the lambda form keeps different live ranges.
 #pragma unroll
         for (unsigned j = 0; j < 4; ++j) {
             const unsigned g = s0 + w + 8U * j;

@@ -52,6 +52,10 @@ STRIX_PLAN_HD constexpr IntegerBlock integer_block(unsigned x, unsigned y, unsig
 STRIX_PLAN_HD constexpr unsigned integer_row_position(unsigned r) {
     return (r & ~15U) | ((r & 1U) << 3U) | ((r & 15U) >> 1U);
 }
+// Pair-major gate/up exchange: [gate or up][16 rows][32 columns].
+STRIX_PLAN_HD constexpr unsigned integer_pair_value_offset(unsigned pair, unsigned row, unsigned column) {
+    return pair * 512U + row * 32U + column;
+}
 STRIX_PLAN_HD constexpr bool integer_dense_fuse_parts(unsigned tall, unsigned rows, unsigned row_width,
     unsigned width, unsigned count, bool lean_ok, bool diagnostic, bool staged) {
     return tall == 1 && rows >= 896 && row_width == 8192 && width == 4096 && count != 1024 &&

@@ -93,6 +93,8 @@ void q2_cases() {
             expect(a == direct && a == int(s0 & 15U) * dots[0] + int(s1 & 15U) * dots[1], "Q2_K half-dot factor fold");
             const int m = int(s0 >> 4) * sums[0] + int(s1 >> 4) * sums[1];
             expect(w.m0 * sums[0] + w.m1 * sums[1] == m, "Q2_K minimum half-row sums");
+            const float minimum = std::fma(float(w.m1), float(sums[1]), std::fma(float(w.m0), float(sums[0]), 0.0f));
+            expect(std::bit_cast<unsigned>(minimum) == std::bit_cast<unsigned>(float(m)), "Q2_K float half-sum FMA matches exact minimum");
             expect(affine(a, m, w.d, w.dmin, 0.125f) == (0.25f * float(a) - 0.125f * float(m)) * 0.125f, "Q2_K RN32 correction order");
         }
     }
@@ -151,6 +153,30 @@ void reductions() {
 }
 void integer_launch_indexing() {
     using namespace strix::core;
+    // An uncopyable closure and template-only indices must work: register arrays
+    // cannot silently become runtime-indexed by-value closure arguments.
+    struct RegisterVisits {
+        std::array<unsigned, 4>& counts;
+        explicit RegisterVisits(std::array<unsigned, 4>& c) : counts(c) {}
+        RegisterVisits(const RegisterVisits&) = delete;
+        void operator()(std::integral_constant<unsigned, 0>) const { ++std::get<0>(counts); }
+        void operator()(std::integral_constant<unsigned, 1>) const { ++std::get<1>(counts); }
+        void operator()(std::integral_constant<unsigned, 2>) const { ++std::get<2>(counts); }
+        void operator()(std::integral_constant<unsigned, 3>) const { ++std::get<3>(counts); }
+    };
+    std::array<unsigned, 4> visits{};
+    integer_unroll<4>(RegisterVisits(visits));
+    for (auto count : visits) expect(count == 1, "compile-time register visitation without closure copies");
+    std::array<unsigned, 1024> exchanged{};
+    for (unsigned pair = 0; pair < 2; ++pair)
+        for (unsigned r = 0; r < 16; ++r)
+            for (unsigned col = 0; col < 32; ++col) {
+                const auto offset = integer_pair_value_offset(pair, r, col);
+                expect(offset < exchanged.size(), "pair-major exchange bounds");
+                ++exchanged[offset];
+                expect(offset / 512 == pair && offset % 512 / 32 == r && offset % 32 == col, "pair-major exchange coordinates");
+            }
+    for (auto count : exchanged) expect(count == 1, "pair-major exchange bijection");
     // Enumerate the intended launch order independently: full bands, then tail.
     for (unsigned X = 1; X <= 19; ++X)
         for (unsigned Y = 1; Y <= 9; ++Y)

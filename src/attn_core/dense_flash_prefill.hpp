@@ -257,13 +257,10 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     if (bad_value) atomicOr(P::failure(a), 1U);
     if (bad_half) atomicOr(P::failure(a), 4U);
 }
+// Register cap for 8 waves per SIMD (192 VGPRs on gfx1151, 44 B/lane scratch): two 16-wave work-groups per WGP;
+// 1.3x the uncapped 238-VGPR kernel (one work-group per WGP) at 32K.
 template <class P>
-__global__ __launch_bounds__(P::Shape::threads) void flash_prefill(typename P::Args a, float* ws, unsigned splits) {
-    flash_body<P>(a, ws, splits);
-}
-// Register cap for 8 waves per SIMD (192 VGPRs): two 16-wave work-groups per WGP instead of one.
-template <class P>
-__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(8))) void flash_prefill_wpe8(
+__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(8))) void flash_prefill(
     typename P::Args a, float* ws, unsigned splits) {
     flash_body<P>(a, ws, splits);
 }
@@ -300,15 +297,13 @@ __host__ __device__ constexpr std::size_t workspace_floats(unsigned rows, unsign
     return splits > 1U ? std::size_t(splits) * rows * heads * (dim + 2U) : 0U;
 }
 template <class P>
-inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1,
-                   bool occupancy8 = false) {
+inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1) {
     using S = typename P::Shape;
     const unsigned rows = P::rows(a);
     if (!rows) return;
     if (!ws) splits = 1;
     const dim3 grid((rows + S::positions - 1U) / S::positions, heads / S::group, splits);
-    if (occupancy8) hipLaunchKernelGGL(flash_prefill_wpe8<P>, grid, dim3(S::threads), 0, stream, a, ws, splits);
-    else hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits);
+    hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits);
     if (splits > 1U) hipLaunchKernelGGL(combine<P>, dim3(rows, heads), dim3(S::dim / 4U), 0, stream, a, ws, splits);
 }
 

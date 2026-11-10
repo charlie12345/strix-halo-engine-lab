@@ -1,4 +1,5 @@
 // Full-model diagnostics are an explicit CLI, never a ctest or admission token.
+#include <array>
 #include "device.hpp"
 #include "qualification.hpp"
 #include "strix/profiles/gemma4.hpp"
@@ -557,9 +558,28 @@ int main(int argc, char** argv) try {
                     for (unsigned r = 0; r < chunk.rows; r += 8) {
                         const auto n = std::min(8U, chunk.rows - r);
                         const auto reference = decode(*decoder, exact, piece.subspan(r, n));
-                        for (unsigned i = 0; i < n; ++i)
-                            m.observe(std::span(reference.logits).subspan(std::size_t(i) * model.config.vocab, model.config.vocab),
-                                      std::span(out.all_logits).subspan(std::size_t(r + i) * model.config.vocab, model.config.vocab));
+                        for (unsigned i = 0; i < n; ++i) {
+                            const auto ref = std::span(reference.logits).subspan(std::size_t(i) * model.config.vocab, model.config.vocab);
+                            const auto cand = std::span(out.all_logits).subspan(std::size_t(r + i) * model.config.vocab, model.config.vocab);
+                            m.observe(ref, cand);
+                            // Diagnostic: STRIX_G4_CHECK_TAIL_TOP2=N prints the top-2 ids/logits of the last N rows
+                            // (reference and candidate), to read greedy flips as near-ties.
+                            static const unsigned tail = [] { const auto* e = std::getenv("STRIX_G4_CHECK_TAIL_TOP2"); return e ? unsigned(std::atoi(e)) : 0U; }();
+                            const auto row = chunk.position + r + i;
+                            if (tail && row + tail >= count) {
+                                const auto top2 = [](std::span<const float> v) {
+                                    std::size_t a = 0, b = 1;
+                                    if (v[b] > v[a]) std::swap(a, b);
+                                    for (std::size_t k = 2; k < v.size(); ++k) {
+                                        if (v[k] > v[a]) { b = a; a = k; } else if (v[k] > v[b]) b = k;
+                                    }
+                                    return std::array<std::size_t, 2>{a, b};
+                                };
+                                const auto x = top2(ref), y = top2(cand);
+                                std::cout << "{\"tail_row\":" << row << ",\"ref\":[" << x[0] << "," << ref[x[0]] << "," << x[1] << "," << ref[x[1]]
+                                          << "],\"cand\":[" << y[0] << "," << cand[y[0]] << "," << y[1] << "," << cand[y[1]] << "]}\n";
+                            }
+                        }
                     }
                 }
                 metric("WMMA-same-weight-exact-path", m, true);

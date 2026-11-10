@@ -230,7 +230,7 @@ void product_table() {
         check(status(e, "prefill_route") == pr::Status::explicit_env && value(e, "prefill_route") == v,
               "explicit prefill route under fast");
     }
-    // Prompt attention of the WMMA prefill routes: fast runs g4-wmma-attn-v1 once its receipt lands (pending: canonical
+    // Prompt attention of the WMMA prefill routes: fast runs g4-flash-attn-v1 once its receipt lands (pending: canonical
     // runs, still qualified); default keeps the canonical builtin; =canonical is the OFF switch under fast.
     {
         const bool attention_ready = [] {
@@ -239,8 +239,8 @@ void product_table() {
         }();
         const auto f = pr::resolve(pr::Name::fast, pr::App::engine, in());
         if (attention_ready)
-            check(status(f, "prefill_route_attention") == pr::Status::set && value(f, "prefill_route_attention") == "wmma" &&
-                  f.active("prefill_route_attention") && f.qualification() == "qualified", "fast runs WMMA prompt attention");
+            check(status(f, "prefill_route_attention") == pr::Status::set && value(f, "prefill_route_attention") == "flash" &&
+                  f.active("prefill_route_attention") && f.qualification() == "qualified", "fast runs flash prompt attention");
         else
             check(status(f, "prefill_route_attention") == pr::Status::pending && value(f, "prefill_route_attention") == "canonical" &&
                   !f.active("prefill_route_attention") && f.qualification() == "qualified", "fast WMMA attention pending");

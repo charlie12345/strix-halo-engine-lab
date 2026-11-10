@@ -85,8 +85,8 @@ public:
         const bool a8_route = many_row && route == "a8";
         const bool wmma_route = many_row && !exl3_wmma && (route == "v1" || route == "v2");
         const bool v2 = wmma_route && route == "v2";
-        // WMMA prefill routes only: STRIX_G4_PREFILL_ATTN=canonical|wmma picks the prompt attention (the fast profile
-        // exports wmma: g4-wmma-attn-v1 on the matrix cores). Exact, a8 and EXL3 routes keep canonical attention
+        // WMMA prefill routes only: STRIX_G4_PREFILL_ATTN=canonical|wmma|flash picks the prompt attention (the fast
+        // profile exports flash: g4-flash-attn-v1, the shared dense flash core). Exact, a8 and EXL3 routes keep canonical attention
         // whatever the switch says, so the default and quality profiles stay byte-identical.
         const auto* attention_switch = std::getenv("STRIX_G4_PREFILL_ATTN");
         const auto attention = wmma_route ? prefill::resolve_attention(attention_switch ? attention_switch : "")

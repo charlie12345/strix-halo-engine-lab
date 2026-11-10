@@ -38,12 +38,6 @@ bool queue_io_enabled() {
     const auto* p = std::getenv("STRIX_G4_PREFILL_QUEUE_IO");
     return !p || std::string_view(p) != "0";
 }
-// STRIX_G4_PREFILL_FLASH_INCR (default on): global flash packs live with the stream and each pass converts only the
-// rows it adds (committed rows never change); =0 repacks [0, last] every pass into the shared buffer.
-bool flash_incremental_enabled() {
-    static const bool enabled = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_FLASH_INCR"); return !p || std::string_view(p) != "0"; }();
-    return enabled;
-}
 bool pack_reuse_enabled() {
     static const bool enabled = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_PACK_REUSE"); return !p || std::string_view(p) != "0"; }();
     return enabled;
@@ -755,7 +749,7 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             auto* q = b.q.as<float>() + std::size_t(p.first) * c.heads * d;
             auto* att = b.att.as<float>() + std::size_t(p.first) * c.heads * d;
             const auto* reads = layer_reads + p.first;
-            if (b.stats.attention == AttentionMode::flash && global && flash_incremental_enabled()) {
+            if (b.stats.attention == AttentionMode::flash && global) {
                 // Stream-owned pack of the producer: rows [0, packed) are converted committed rows; this pass adds
                 // [min(packed, start), start + rows) once, at the producer layer (sharing layers read it as is).
                 auto& stream = *p.tx->stream;
@@ -777,15 +771,12 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
                                          capacity, unsigned(p.tx->start + rows - from / 16U * 16U), pack, from,
                                          unsigned(p.tx->start + rows), b.flash_workspace.data(), b.flash_workspace.size());
             } else if (b.stats.attention == AttentionMode::flash) {
-                auto& owner = packed_producer[global ? 1 : 0];
+                // Sliding layers: the window's keys, repacked per pass into the shared buffer (cheap).
+                auto& owner = packed_producer[0];
                 const bool pack = owner != a.producer || !pack_reuse_enabled() || parts.size() > 1;
                 owner = a.producer;
-                if (global) b.grow(b.flash_workspace, flash_workspace_bytes(chunk_rows, c.heads, 512));
                 prefill::attention_flash(q, reads, rows, c.heads, d, att, b.failure.as<unsigned>(), b.queue,
-                                         (global ? b.global_halves : b.attention_halves).data(),
-                                         p.stride, global ? p.stride : std::min(p.stride, c.window + rows - 1), pack, 0,
-                                         global ? unsigned(p.tx->start + rows) : 0U, global ? b.flash_workspace.data() : nullptr,
-                                         global ? b.flash_workspace.size() : 0U);
+                                         b.attention_halves.data(), p.stride, std::min(p.stride, c.window + rows - 1), pack);
             } else if (b.stats.attention == AttentionMode::wmma) {
                 // Packs are reused across layers only within a one-segment pass: segments share the pack buffers.
                 auto& owner = packed_producer[global ? 1 : 0];

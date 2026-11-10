@@ -524,12 +524,9 @@ void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, un
         while (splits > 1 && attn_core::dense::workspace_floats(rows, heads, dim, splits) * sizeof(float) > workspace_bytes) --splits;
     }
     auto* ws = static_cast<float*>(workspace);
-    // Default: the 192-VGPR variant (8 waves/SIMD, two work-groups per WGP; 68 B/lane scratch, still 1.3x the
-    // 238-VGPR one at 32K). STRIX_G4_PREFILL_FLASH_WPE=0 selects the uncapped kernel.
-    static const bool wpe8 = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_FLASH_WPE"); return !p || std::string_view(p) != "0"; }();
     switch (dim) {
-    case 256: attn_core::dense::launch<FlashPolicy<256>>(a, heads, stream, ws, splits, wpe8); break;
-    case 512: attn_core::dense::launch<FlashPolicy<512>>(a, heads, stream, ws, splits, wpe8); break;
+    case 256: attn_core::dense::launch<FlashPolicy<256>>(a, heads, stream, ws, splits); break;
+    case 512: attn_core::dense::launch<FlashPolicy<512>>(a, heads, stream, ws, splits); break;
     default: throw std::invalid_argument("flash attention head dimension");
     }
     if (const auto e = hipGetLastError(); e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));

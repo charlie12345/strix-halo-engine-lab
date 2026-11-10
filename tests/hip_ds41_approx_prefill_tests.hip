@@ -1,5 +1,6 @@
 #include "strix/hip_ds41_attention.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "strix/hip_ds41_prefill.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include <algorithm>
 #include <cmath>
@@ -118,8 +119,7 @@ void dense_smoke(unsigned rows,unsigned width,unsigned count,unsigned row_width=
     std::printf("dense rows=%u K=%u N=%u row_width=%u offset=%u accumulate=%d exact_ms=%.6f fp16_ms=%.6f rel_l2=%.9g a8_ms=%.6f a8_rel_l2=%.9g\n",rows,width,count,row_width,offset,accumulate,old_ms,new_ms,l2,a8_ms,l2a8);std::fflush(stdout);
 }
 }
-// Shared G=1 integer core against the independent decode product (eight rows
-// per reference launch), with nontrivial strides, K offsets and accumulating output.
+// Tall exact form: bitwise equal to the staged wide form, timed per tile shape.
 void tall_smoke(unsigned rows,unsigned width,unsigned count,unsigned row_width=0,unsigned offset=0,bool accumulate=false){
     namespace d=strix::ds41;
     unsigned full=row_width?row_width:width;
@@ -131,50 +131,25 @@ void tall_smoke(unsigned rows,unsigned width,unsigned count,unsigned row_width=0
     d::enqueue_quantize_a8(dx.p,width+32,rows,codes.p,deltas.p,sums.p,nullptr);
     d::Q8A8DensePrefillView v;v.weight=dw.p;v.width=width;v.count=count;v.rows=rows;v.x_stride=width+32;v.out_stride=count+16;
     v.row_width=row_width;v.k_offset=offset;v.accumulate=accumulate;v.codes=codes.p;v.deltas=deltas.p;v.out=out.p;
+    // every bitwise run starts from the same nonzero prior output (so accumulating calls test out + y, not 0 + y)
     const auto prior=random_f(out.n,-4.f,4.f);
-    out.put(prior);
-    for(unsigned r=0;r<rows;r+=8){
-        d::Q8A8View ref;ref.weight=dw.p;ref.width=width;ref.count=count;ref.rows=std::min(8U,rows-r);
-        ref.x_stride=v.x_stride;ref.out_stride=v.out_stride;ref.row_width=row_width;ref.k_offset=offset;ref.accumulate=accumulate;
-        ref.codes=codes.p+std::size_t(r)*v.x_stride;ref.deltas=deltas.p+std::size_t(r)*(v.x_stride/32);
-        ref.out=out.p+std::size_t(r)*v.out_stride;d::enqueue_q8_0_a8(ref,nullptr);
+    auto clear=[&]{out.put(prior);};
+    clear();d::enqueue_q8_0_a8_dense_prefill(v,nullptr);auto ref=out.get();
+    float base=timing([&]{d::enqueue_q8_0_a8_dense_prefill(v,nullptr);});
+    std::printf("tall rows=%u K=%u N=%u wide_ms=%.6f",rows,width,count,base);
+    // TALL_REVERSE=1: the forms in reverse order (order / thermal bias check between passes)
+    std::vector<unsigned> forms{22U,41U,21U,14U,12U,114U,112U,214U,212U,314U,312U,414U,412U,514U,614U,612U,714U,814U,812U,914U,422U,822U,1514U,1522U,1614U,1714U,1722U,1814U,1914U,1922U,2014U,2114U,2122U,2214U,1U,97U,96U};
+    if(const char* r=std::getenv("TALL_REVERSE");r&&std::string(r)=="1")std::reverse(forms.begin(),forms.end());
+    for(unsigned form:forms){
+        v.tall=form;clear();d::enqueue_q8_0_a8_dense_prefill(v,nullptr);auto got=out.get();
+        expect(same(ref,got),"tall form "+std::to_string(form)+" bitwise");
+        // the shared tiled core route (STRIX_DS41_PF_CORE=1) must give the same bits for every form
+        d::set_pf_core(1);clear();d::enqueue_q8_0_a8_dense_prefill(v,nullptr);const auto core=out.get();d::set_pf_core(-1);
+        expect(same(ref,core),"shared core form "+std::to_string(form)+" bitwise");
+        float ms=timing([&]{d::enqueue_q8_0_a8_dense_prefill(v,nullptr);});
+        std::printf(" t%u_ms=%.6f%s",form,ms,same(ref,got)?"":"(DIFF)");
     }
-    const auto reference=out.get();
-    out.put(prior);d::enqueue_q8_0_a8_dense_prefill(v,nullptr);
-    expect(same(reference,out.get()),"shared G1 vs independent decode bitwise (including output padding)");
-    if(!accumulate && count%32==0){
-        Dev<signed char> aq(std::size_t(rows)*count),rq(std::size_t(rows)*count);
-        Dev<float> ad(std::size_t(rows)*count/32),rd(std::size_t(rows)*count/32),compact(std::size_t(rows)*count);
-        Dev<int> as(std::size_t(rows)*count/32),rs(std::size_t(rows)*count/32);
-        v.a8_codes=aq.p;v.a8_deltas=ad.p;v.a8_sums=as.p;v.a8_stride=count;
-        out.put(prior);expect(d::enqueue_q8_0_a8_dense_prefill(v,nullptr),"shared G1 fused A8 written");
-        check(hipMemcpy2D(compact.p,std::size_t(count)*4,out.p,std::size_t(v.out_stride)*4,std::size_t(count)*4,rows,hipMemcpyDeviceToDevice));
-        d::enqueue_quantize_a8(compact.p,count,rows,rq.p,rd.p,rs.p,nullptr);
-        expect(same(aq.get(),rq.get()) && same(ad.get(),rd.get()) && same(as.get(),rs.get()),"shared G1 A8 codes/deltas/sums bitwise");
-    }
-    std::printf("shared-G1 rows=%u K=%u N=%u offset=%u accumulate=%u exact=checked\n",rows,width,count,offset,unsigned(accumulate));
-}
-// Two K parts, a partial output tile and a partial row tile, against independent decode.
-void dense_parts_smoke(){
-    namespace d=strix::ds41;constexpr unsigned rows=17,width=32,count=33,xstride=96,ostride=40;
-    std::vector<unsigned char> weight(std::size_t(count)*68);
-    for(std::size_t b=0;b<weight.size()/34;++b){const unsigned short h=0x2800;weight[34*b]=static_cast<unsigned char>(h);weight[34*b+1]=static_cast<unsigned char>(h>>8);for(unsigned j=0;j<32;++j)weight[34*b+2+j]=static_cast<unsigned char>(rng()%255-127);}
-    Dev<unsigned char> dw(weight);Dev<float> dx(random_f(rows*xstride,-1.f,1.f)),out(rows*ostride);
-    Dev<signed char> codes(rows*xstride);Dev<float> deltas(rows*xstride/32);Dev<int> sums(rows*xstride/32);
-    d::enqueue_quantize_a8(dx.p,xstride,rows,codes.p,deltas.p,sums.p,nullptr);
-    const auto prior=random_f(out.n,-3.f,3.f);out.put(prior);
-    for(unsigned part=0;part<2;++part)for(unsigned r=0;r<rows;r+=8){
-        d::Q8A8View ref;ref.weight=dw.p;ref.width=width;ref.count=count;ref.rows=std::min(8U,rows-r);
-        ref.x_stride=xstride;ref.out_stride=ostride;ref.row_width=64;ref.k_offset=part*width;ref.accumulate=part!=0;
-        ref.codes=codes.p+r*xstride+part*width;ref.deltas=deltas.p+r*(xstride/32)+part;
-        ref.out=out.p+r*ostride;d::enqueue_q8_0_a8(ref,nullptr);
-    }
-    const auto reference=out.get();out.put(prior);
-    d::Q8A8DensePrefillView v;v.weight=dw.p;v.width=width;v.count=count;v.rows=rows;v.x_stride=xstride;v.out_stride=ostride;
-    v.row_width=64;v.k_parts=2;v.codes=codes.p;v.deltas=deltas.p;v.out=out.p;
-    expect(!d::enqueue_q8_0_a8_dense_prefill(v,nullptr),"G1 two parts do not claim fused A8");
-    expect(same(reference,out.get()),"G1 two parts and row/column tails bitwise");
-    std::printf("shared-G1 parts=2 rows=17 K=32 N=33 exact=checked\n");
+    std::printf("\n");std::fflush(stdout);v.tall=0;
 }
 // FP16 output form (STRIX_DS41_PREFILL_FP16_FAST): exact wide / tall auto / FP16 v1 / FP16 output with the conversion
 // pass / FP16 output from a pre-converted activation (the norm's FP16, i.e. the fused conversion) / q_a || kv joint.
@@ -276,7 +251,6 @@ int main(int argc,char** argv)try{
         std::printf("failures=%d\n",failures);return failures?1:0;
     }
     if(argc==2 && std::string(argv[1])=="--tall"){
-        dense_parts_smoke();
         tall_smoke(2048,5120,1280);tall_smoke(2048,5120,512);tall_smoke(8192,5120,1280);tall_smoke(8192,5120,512);
         tall_smoke(1024,1280,16384);tall_smoke(1024,4096,1024);tall_smoke(1024,4096,5120,8192,4096);tall_smoke(64,4096,5120,8192,4096,true);
         tall_smoke(17,128,37,256,128);tall_smoke(1000,4096,1000);

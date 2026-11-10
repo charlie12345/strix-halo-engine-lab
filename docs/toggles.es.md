@@ -124,6 +124,20 @@ Montaje del par: [pair-setup.es.md](pair-setup.es.md).
 | `--print-effective-config` | todos | off | Imprime la configuración resuelta y sale antes de tocar el dispositivo. |
 | `STRIX_DS41_BASELINE=1` | deepseek | off | Apaga todos los defaults de producción. Ejecuta el comando simple como antes. |
 
+### Núcleo compartido e INT4 (opt-in)
+
+Todos están apagados por defecto. Apagados, cada motor ejecuta los mismos kernels y lanzamientos que antes de
+llegar el núcleo en mosaico compartido (`src/core`), con los mismos bits.
+
+| Interruptor | Motor | Por defecto | Qué hace |
+|---|---|---|---|
+| `STRIX_DS41_PF_CORE=1` | deepseek | off | Prefill de expertos (gate/up, down) y el prefill denso Q8_0 x A8 en el núcleo compartido. Mismos bits que los kernels por defecto. Apagado porque hoy es más lento: TTFT 8K +0,24 s (8,35 s frente a 8,13 s, ABAB en silencio en el par), 2K en caliente +0,12 s. |
+| `STRIX_DS41_FAST_I4=1` | deepseek | off | Prefill borrador con pérdida: los pesos GGUF de los expertos se decodifican a INT4 en el kernel y la entrada A8 se recuantiza a A4. Corre en el núcleo compartido. `STRIX_DS41_FAST_I4_SCOPE=all\|gu` elige gate/up/down (por defecto) o solo gate/up. Sin cualificar en calidad. |
+| `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Formato borrador con pérdida: expertos enrutados guardados en INT4, decode W4A16. Rechaza las identidades exactas. Sin cualificar en calidad. |
+| `STRIX_GLM_PF_STREAMS=1` | glm | off | Un solo stream de cómputo para el prefill seqpar TP2. Mismos bits; no fue más rápido en las primeras muestras. |
+| `STRIX_MMX_MODEL_FORMAT=fast_i4` | minimax | `exl3` | Prefill borrador con pérdida: cada capa MoE se convierte a INT4 durante el prefill en dos buffers reutilizables (+3,6 GiB); el decode sigue en EXL3. Ver [prefill agrupado de MiniMax](minimax-grouped-prefill.md#draft-fast_i4). |
+| `STRIX_DS41_PREFILL_LEASE=1`, `STRIX_DS41_ENGRAM_DEVICE_READY=1`, `STRIX_DS41_SEED_EARLY=1` | deepseek | off | Opciones de estructura del prefill (intercambio con lease, Engram listo por capa, semilla temprana del draft). Mismos bits; sin ganancia medida todavía. |
+
 ### Solo depuración
 
 Estos flags no cambian la salida. Añaden comprobaciones, trazas o tiempos. No los uses para benchmarks.

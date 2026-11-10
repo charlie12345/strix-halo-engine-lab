@@ -1,11 +1,24 @@
 #pragma once
 
-// Device side of DS41 prefill, policy-v1 tiled_core IntegerOperand.
-// Exact: IU8 K32 dots, per-class ascending chains, class butterfly bits 4..0.
-// IQ2_XXS/Q8_0/MXFP4: dot * (scale * delta). Q2_K: the two half minima
-// are folded into integer A-row sums before (d * dot - dmin * minimum) * delta.
-// Grouped and dense share this integer Contract; no output rotation is applied.
-// Native equality remains a required qualification gate after a core change.
+// Device side of the deepseek41 prefill experts (gfx1151, wave32, v_wmma_i32_16x16x16_iu8).
+//
+// Routes are built on the device from the router's ids (ds41_prefill.hpp layout, bit-identical to
+// build_prefill_routes). The gate/up and down kernels take one batch of up to 16 or 32 entries of one
+// expert per workgroup: batches of 16 run the class-split kernels (each wave owns four lane classes,
+// so weight rows are read block by block in address order), batches of 32 the stage kernels (two
+// 16-row tiles per wave); STRIX_DS41_PREFILL_STAGE=1 sends batches of 16 to the stage kernels too
+// (comparison only). Both reproduce the decode products bitwise:
+//  - each 32-weight group's integer dot of every (entry, output) comes from two 16x16x16 iu8 WMMAs
+//    (K = 16 + 16) on an accumulator of 1.5 * 2^23, so one FP32 subtraction gives float(dot);
+//    Q2_K weights enter the WMMA as code * (scale & 15) (<= 45), so the dot is A of the declared
+//    Q2_K term, and B = sum_h (scale_h >> 4) * sum x_h is formed in integers from staged half sums;
+//  - the group's FP32 term is the declared one (IQ2_XXS / MXFP4 / Q8_0: float(dot) * (scale *
+//    delta); Q2_K: (d * float(A) - dmin * float(B)) * delta);
+//  - lane class l of the declared product (groups l, l + 32, ...) is accumulated in ascending order
+//    from 0, and the 32 class sums are combined in the butterfly's tree, the decode's v[l] += v[l ^ d],
+//    d = 16..1 (stage kernels: classes in bit-reversed order folded by a five-level carry stack;
+//    class-split kernels: levels 1-3 between waves through LDS, levels 4-5 in registers).
+// The gate/up epilogue is the decode's: clamped SwiGLU (declared exp) and A8 per 32 outputs.
 
 #include "strix/ds41_formats.hpp"
 #include "strix/hip_ds41_formats.hpp"
@@ -92,9 +105,15 @@ void set_fast_moe(int mode);
 // Draft FAST_I4: original GGUF weights decoded in-kernel to IU4, A8 input
 // requantized to A4 per K32. Default OFF. STRIX_DS41_FAST_I4=1; scope
 // STRIX_DS41_FAST_I4_SCOPE=all (default) or gu. Separate numerical identity
-// gguf-iu4-direct-v1; no pack or converter. Overrides are for test harnesses.
+// gguf-iu4-direct-v1; no pack or converter. Runs on the shared tiled core.
+// Overrides are for test harnesses.
 void set_fast_i4(int mode); // 1 on, 0 off, -1 environment
 [[nodiscard]] bool fast_i4();
+// STRIX_DS41_PF_CORE=1 (default off): the expert prefill (gate/up, down) and the dense Q8_0 x A8 prefill run on the
+// shared tiled core (src/core, policy interface v1) instead of the kernels described above. The same bits; opt-in
+// until it is at least as fast. Test override: 1 on, 0 off, -1 environment.
+void set_pf_core(int mode);
+[[nodiscard]] bool pf_core();
 
 // Down of every entry: A8 activation of slot entry_slots[i] (codes[slot * width], deltas) times the
 // batch expert's rows; out[slot * outputs + o] is the unweighted raw slot vector. Formats Q2_K,

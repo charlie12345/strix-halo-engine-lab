@@ -84,6 +84,21 @@ struct ServeCachePolicy {
     }
 };
 
+// Host bytes a prefix capture of `tokens` positions may need on one node: per slot the full export, the retained copy
+// and the disk serialization of the attention state (3 x), plus eight sets of the per-sequence rings (snapshots),
+// on top of the whole host cache budget. state_bytes_per_token is the model's exported state per position (the KV
+// sources' compressed KV and index keys amortised by their ratio, Plan::state_bytes_per_token, 890 B for V4.1) plus
+// the 4 B token id; rings_bytes the fixed per-sequence pieces. Existing retention is already in MemAvailable.
+inline std::uint64_t prefix_capture_predicted_bytes(std::uint64_t tokens, std::uint64_t state_bytes_per_token,
+                                                    std::uint64_t rings_bytes, std::uint64_t host_budget_mb,
+                                                    std::uint64_t slots = 1) {
+    constexpr auto limit = std::numeric_limits<std::uint64_t>::max();
+    const auto add = [](std::uint64_t a, std::uint64_t b) { return b > limit - a ? limit : a + b; };
+    const auto mul = [](std::uint64_t a, std::uint64_t b) { return b != 0U && a > limit / b ? limit : a * b; };
+    const auto state = add(mul(tokens, state_bytes_per_token), rings_bytes);
+    return add(mul(host_budget_mb, 1U << 20U), mul(slots, add(mul(state, 3U), mul(rings_bytes, 8U))));
+}
+
 // Subtraction avoids overflow; unknown availability fails closed even with a zero reserve.
 inline bool prefix_memory_admitted(std::uint64_t available_mb, std::uint64_t reserve_mb, std::uint64_t predicted_bytes) {
     const auto mb = predicted_bytes / (1U << 20U) + (predicted_bytes % (1U << 20U) != 0U ? 1U : 0U);

@@ -265,8 +265,11 @@ std::string LoadPlan::summary(const AllocModel& m) const {
                static_cast<double>(bytes_read) / 1e9, gib(stage_max), gib(whole_max), gib(bounce));
 }
 
-Watchdog Watchdog::from_env() {
+Watchdog Watchdog::from_env(std::uint64_t host_budget) {
     Watchdog w;
+    // The default RSS limit covers the engine alone; budgeted caller memory must not read as a leak.
+    w.max_rss = host_budget > std::numeric_limits<std::uint64_t>::max() - w.max_rss
+                    ? std::numeric_limits<std::uint64_t>::max() : w.max_rss + host_budget;
     if (const char* e = std::getenv("STRIX_GLM_WATCHDOG"); e != nullptr && std::string(e) == "0") w.enabled = false;
     w.min_ram_headroom = env_gib("STRIX_GLM_WD_MIN_FREE_GIB", w.min_ram_headroom);
     w.max_swap_growth = env_gib("STRIX_GLM_WD_SWAP_GIB", w.max_swap_growth);

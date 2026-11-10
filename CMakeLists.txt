@@ -10,6 +10,14 @@ if(STRIX_CUDA_QWEN_ONLY)
     return()
 endif()
 
+# A single-config tree configured without a build type applies no CMAKE_<LANG>_FLAGS_<CONFIG>: every host source and
+# every device kernel compiles unoptimized, and the result still links, loads and runs. An explicit type always wins.
+get_property(strix_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT strix_multi_config AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type: Debug, Release, RelWithDebInfo or MinSizeRel" FORCE)
+    message(STATUS "CMAKE_BUILD_TYPE not set: using Release")
+endif()
+
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

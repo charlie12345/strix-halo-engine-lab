@@ -2164,6 +2164,13 @@ endif()
 
 option(STRIX_DPP_REDUCE "Use exact DPP exchanges in guarded Qwen reductions (build-time lever, off unless requested)" OFF)
 
+if(BUILD_TESTING)
+    add_executable(strix-stored-i4-host-tests tests/stored_i4_host_tests.cpp)
+    target_include_directories(strix-stored-i4-host-tests PRIVATE src)
+    target_compile_features(strix-stored-i4-host-tests PRIVATE cxx_std_20)
+    add_test(NAME strix-stored-i4-host-tests COMMAND strix-stored-i4-host-tests)
+endif()
+
 if(STRIX_ENABLE_HIP_RUNTIME)
     enable_language(HIP)
 
@@ -2185,6 +2192,24 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         PATH_SUFFIXES lib lib64
         REQUIRED
     )
+    add_library(strix_stored_i4 STATIC src/core/wmma_tiled.hip)
+    target_include_directories(strix_stored_i4 PUBLIC src PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
+    target_compile_options(strix_stored_i4 PRIVATE -O3 -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        -fhip-fp32-correctly-rounded-divide-sqrt)
+    set_target_properties(strix_stored_i4 PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_link_libraries(strix_stored_i4 PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
+
+    if(BUILD_TESTING)
+        add_executable(strix-hip-iu4-convert-tests tests/hip_iu4_convert_tests.hip)
+        add_executable(strix-hip-stored-i4-decode-tests tests/hip_stored_i4_decode_tests.hip)
+        foreach(target strix-hip-iu4-convert-tests strix-hip-stored-i4-decode-tests)
+            target_link_libraries(${target} PRIVATE strix_stored_i4)
+            target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
+            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            add_test(NAME ${target} COMMAND ${target})
+        endforeach()
+    endif()
+
     add_library(strix_device_profile STATIC src/device_profile.cpp)
     target_include_directories(strix_device_profile PUBLIC include)
     target_include_directories(strix_device_profile SYSTEM PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
@@ -5062,6 +5087,10 @@ if(STRIX_FAMILY_GLM5)
                 src/glm/engine/glm_pack.cpp src/glm/engine/glm_mem.cpp
                 src/glm/xfer/glm_xfer.hip src/glm/xfer/glm_xfer_exchange.hip src/glm/xfer/glm_post_exchange.hip
                 src/glm/prefill/glm_pf_moe.hip src/glm/prefill/glm_pf_path.hip src/glm/prefill/glm_pf_exact.hip src/glm/prefill/glm_pf_exact_moe.hip)
+            target_link_libraries(strix_glm5_engine PUBLIC strix_stored_i4)
+            target_compile_definitions(strix_glm5_engine PRIVATE STRIX_GLM_PF_IU4_LIB=1)
+            target_link_libraries(strix_glm5_kernels PUBLIC strix_stored_i4)
+            target_compile_definitions(strix_glm5_kernels PRIVATE STRIX_GLM_FAST_I4_CORE=1)
             target_link_libraries(strix_glm5_engine PUBLIC strix_xport strix_glm5_kernels strix_glm5_model_description strix_dist "${strix_glm5_trellis_lib}")
             set_source_files_properties(src/glm/engine/glm_kvshard.hip PROPERTIES
                 COMPILE_OPTIONS "-Werror;-Wshadow;-Wsign-conversion;-Wunused-function;-Wcuda-compat")

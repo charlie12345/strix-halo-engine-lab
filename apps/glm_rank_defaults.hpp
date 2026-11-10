@@ -344,6 +344,12 @@ inline std::string print(const Effective& e) {
     auto line = [&](const std::string& k, const Value& v) { s += "effective " + k + "=" + v.value + " (" + v.source + ")\n"; };
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
     line("identity", e.identity);
+    {  // STRIX_GLM_MODEL_FORMAT (the load converts / refuses; inspection only reports it)
+        const char* f = std::getenv("STRIX_GLM_MODEL_FORMAT");
+        const bool i4 = f != nullptr && std::string(f) == "fast_i4";
+        s += std::string("effective model-format=") + (i4 ? "fast_i4 (identity glm-fast-i4: routed INT4 g64 W4A4 prefill / W4A16 decode, lossy; exact identities refused)"
+                                                         : "exl3 (default)") + "\n";
+    }
     if (e.kv_shard_auto) s += "effective kv-shard-policy=auto (pending calibrated load + unified prefill admission and rank vote)\n";
     if (e.kv_shard) s += std::string("effective kv-shard=") + kvshard::numerical_identity + " (draft; owned pools; bounded temporary prefill)\n";
     line("mtp", e.mtp);

@@ -82,6 +82,21 @@ struct DsaLayerWeights {
     const float* ape = nullptr;                // [4][128]
     std::uint32_t heads = 0;                   // rank MLA heads
 };
+// STRIX_GLM_MODEL_FORMAT=fast_i4: one MoE layer's routed experts as the IU4 g64 pack (strix-trellis core/iu4.hpp
+// layout, converted at load from the decoded EXL3 tiles or read from a matching STRIX_GLM_FAST_I4_PACK). The routed
+// EXL3 trellis buffers are freed (experts[e].*.raw.trellis == nullptr); suh / svh stay. One device allocation (base).
+// fast_i4 just-in-time conversion (layers without a resident pack): two reusable layer slots converted on a side
+// stream from the resident EXL3 (strix-trellis convert_exl3_iu4) - the next JIT layer is converted while the current one
+// computes. Engine-owned; the prefill path drives it (glm_pf_path.hip). order = the JIT layers in forward order.
+struct MoeLayerWeights;
+struct I4Routed {
+    std::uint8_t* wq[3] = {};                  // m 0 gate, 1 up, 2 down: [288][K/16][N/16][16][8] nibbles
+    std::uint16_t* ws[3] = {};                 // FP16 [288][N][K/64]
+    const std::uint16_t* const* svh[3] = {};   // device [288] svh pointer tables (prefill fused output transform)
+    void* base = nullptr;
+    std::uint64_t bytes = 0;
+    bool on() const { return wq[0] != nullptr; }
+};
 struct MoeLayerWeights {
     const std::uint16_t* router = nullptr;  // F16 [288][4096] replicated
     const float* bias = nullptr;            // [288] e_score_correction_bias
@@ -89,6 +104,7 @@ struct MoeLayerWeights {
     const Mlp* experts_d = nullptr;         // the same array in device memory (for one-launch kernels)
     Mlp shared;                             // rank slice
     const std::uint16_t* router_packed = nullptr;  // optional R1b v5 copy
+    I4Routed i4;                                   // fast_i4 only (else empty)
 };
 
 // ---------------------------------------------------------------- per-slot state (device memory, owned by the engine)
@@ -360,6 +376,7 @@ public:
     void set_exchange(std::shared_ptr<Exchange> p);
     [[nodiscard]] std::shared_ptr<Exchange> exchange() const;  // installed fallback, independent of the last forward
     [[nodiscard]] bool decode_xfer_enabled() const;
+    [[nodiscard]] bool model_fast_i4() const;  // STRIX_GLM_MODEL_FORMAT=fast_i4 (lossy glm-fast-i4 identity)
     [[nodiscard]] bool kv_shard_enabled() const;
     [[nodiscard]] unsigned prefill_pipeline() const;
     void set_prefill(std::shared_ptr<PrefillPath> p);

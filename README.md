@@ -18,6 +18,10 @@ default: [methodology](docs/methodology.md).
 
 <a id="models"></a>
 
+Draft MiniMax FAST_I4: INT4 is produced per layer during prefill in two reusable buffers;
+memory +3.6 GiB; context never shrinks; decode unchanged. This opt-in lossy path awaits
+[native and quality qualification](docs/models/minimax-m3.1/README.md).
+
 ## Models
 
 | Model | Runs on | Status | Highlights |

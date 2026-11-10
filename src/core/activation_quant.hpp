@@ -45,4 +45,19 @@ __device__ __forceinline__ void iu4_quant128(const float (&v)[4], std::uint8_t* 
 }
 
 // Fake-quant twin of iu4_quant128 (quality studies): v <- q * s with the same s and q, in place.
+__device__ __forceinline__ void iu4_fake128(float (&v)[4]) {
+#pragma unroll
+    for (unsigned g = 0; g < 2U; ++g) {
+        float amax = fmaxf(fabsf(v[2U * g]), fabsf(v[2U * g + 1U]));
+#pragma unroll
+        for (int delta = 16; delta > 0; delta /= 2) amax = fmaxf(amax, __shfl_xor(amax, delta));
+        const float scale = amax == 0.0F ? 1.0F : amax / 7.0F;
+#pragma unroll
+        for (unsigned jj = 0; jj < 2U; ++jj) {
+            const unsigned j = 2U * g + jj;
+            v[j] = static_cast<float>(max(-7, min(7, static_cast<int>(nearbyintf(v[j] / scale))))) * scale;
+        }
+    }
+}
+
 }  // namespace strix::core

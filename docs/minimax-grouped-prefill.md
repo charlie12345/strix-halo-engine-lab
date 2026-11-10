@@ -95,3 +95,30 @@ KV/IK state and first/continuation logits. Include resumed units, parked childre
 cancellation and bank reuse, then the complete workload. Isolate early destination
 with the late fence off before testing both changes. Keep private fixtures and
 receipts outside Git. See [communicator](engine/transport/communicator.md#minimax-grouped-async-start).
+
+## Draft FAST_I4
+
+`STRIX_MMX_MODEL_FORMAT=fast_i4` is an opt-in lossy prefill identity. INT4 is produced per layer
+during prefill in two reusable buffers; memory +3.6 GiB; context never shrinks; decode unchanged.
+Each slot includes its packed weights, FP16 group scales and reusable output-sign pointer tables;
+read-only source tables and the existing prefill workspace are accounted separately at startup.
+EXL3 weights remain resident and every decode/MTP regime uses them. Allocation failure refuses
+FAST_I4 rather than reducing configured capacity or silently falling back to a partial INT4 model.
+
+The single adopted library `convert_exl3_iu4` converter runs once per MoE layer per prefill group,
+then every chunk uses slot `L & 1`. The same rule covers ungrouped tails and paused layer ranges.
+`STRIX_MMX_FAST_I4_SCOPE=all` (default) runs gate/up/down on IU4; `gate_up` keeps the original EXL3
+FP16 down path and skips down conversion. Scope remains a quality-gated choice.
+
+Serial conversion on the engine stream is the default. `STRIX_MMX_FAST_I4_PREFETCH=1` converts
+only the next layer within the current range on a side stream, ordered by slot-free and ready
+events, without adding a host synchronization. Retain it only if 8K TTFT improves by at least
+0.4 s over serial. `STRIX_MMX_FAST_I4_STATS=1` reports event-based converter and whole-group MoE
+times per layer at the existing prompt completion fence; the latter includes inter-chunk gaps.
+Kernel-chain timing should also use the prefill timeline markers.
+
+`STRIX_MMX_PF_IU4=0` and `--ab pfi4:PROMPT.u32:128` retain the same model load and buffers while
+selecting the original EXL3 prefill arm; `STRIX_MMX_FAKEQ_A4` remains available for quality study.
+There is no resident-layer budget, replace mode, or INT4 decode policy. Exact/default arithmetic
+and anchors remain the reference. Native compiler, execution, memory, timing and model-quality
+gates are pending; predicted throughput is not qualification evidence.

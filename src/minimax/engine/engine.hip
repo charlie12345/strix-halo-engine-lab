@@ -1,4 +1,5 @@
 #include "minimax/engine/route_identity.hpp"
+#include "minimax/engine/mm_fast_i4.hpp"
 // MiniMax M3.1 Flash engine, TP2 (see include/strix/minimax/engine.hpp and qualification notes).
 //
 // Layer flow (per call of n rows), identical to the G4 harness (tests/hip_minimax_g4.hip) so the teacher-forced gate is
@@ -373,6 +374,8 @@ struct Layer {
     std::vector<mmoe::ExpertSlices> experts_raw;
     mmoe::ExpertSlices* experts_raw_d = nullptr;
     mmoe::ExpertSlices shared_raw{};
+    mmoe::I4Source i4src{};      // read-only converter tables; EXL3 remains resident
+    void* i4src_base = nullptr;
 };
 
 // decode STRIX_MM_XB_WARM: streams up to 4 byte ranges through the memory-side cache with plain cached loads (the
@@ -585,11 +588,40 @@ struct Engine::Impl {
         for (void* ptr : {static_cast<void*>(pf_scores), static_cast<void*>(pf_partial), static_cast<void*>(pf_idx),
                           static_cast<void*>(pf_cnt), static_cast<void*>(pf_ticket)})
             if (ptr != nullptr) (void)hipFree(ptr);
+        for (auto& y : layers)
+            if (y.i4src_base != nullptr) (void)hipFree(y.i4src_base);
+        for (auto& j : jit) {
+            if (j.pack != nullptr) (void)hipFree(j.pack);
+            for (hipEvent_t ev : {j.ready, j.free}) if (ev != nullptr) (void)hipEventDestroy(ev);
+        }
+        if (jit_stream != nullptr) (void)hipStreamDestroy(jit_stream);
+        for (auto& t : jit_timing)
+            for (hipEvent_t ev : {t.convert0, t.convert1, t.moe0, t.moe1})
+                if (ev != nullptr) (void)hipEventDestroy(ev);
     }
     // STRIX_MM_PREFILL_IDENTITY=fp32 (runtime, default off): prefill linears (q/k/v/o, dense MLP,
     // experts, shared) in the FP32 identity of src/minimax/rtxpf (FP32 activations, one fmaf chain per output), which the
     // RTX PRO prefill service reproduces bit for bit. Decode steps are unchanged.
     bool fp32_prefill = false;
+    bool model_fast_i4 = false;   // STRIX_MMX_MODEL_FORMAT=fast_i4
+    fast_i4::Scope i4_scope = fast_i4::Scope::all;
+    struct JitSlot {
+        std::uint8_t* pack = nullptr;
+        mmoe::I4Layer weights{};   // fixed wq/ws and reusable device svh tables
+        hipEvent_t ready = nullptr, free = nullptr;
+    };
+    std::array<JitSlot, fast_i4::Schedule::slots> jit{};
+    fast_i4::Schedule jit_schedule;
+    hipStream_t jit_stream = nullptr;
+    bool jit_prefetch = false;    // STRIX_MMX_FAST_I4_PREFETCH (default 0)
+    bool jit_stats = false;
+    struct JitTiming {
+        hipEvent_t convert0 = nullptr, convert1 = nullptr, moe0 = nullptr, moe1 = nullptr;
+        bool convert_pending = false, moe_pending = false, moe_started = false;
+        std::uint64_t converts = 0, moes = 0;
+        double convert_ms = 0, moe_ms = 0;
+    };
+    std::array<JitTiming, kLayers> jit_timing{};
     float *f32_xt = nullptr, *f32_raw = nullptr, *f32_g = nullptr, *f32_u = nullptr, *f32_ye = nullptr;
     rtxpf::F32Job *f32_jobs_h = nullptr, *f32_jobs_d = nullptr;
     std::uint32_t f32_jobs_used = 0;
@@ -714,6 +746,25 @@ struct Engine::Impl {
         const char* pid = std::getenv("STRIX_MM_PREFILL_IDENTITY");
         fp32_prefill = route::fp32_profile(pid);
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
+        // FAST_I4 is opt-in and lossy: EXL3 stays resident, with per-layer conversion into two
+        // reusable IU4 buffers during prefill. Decode, including MTP, always reads EXL3.
+        if (const char* mf = std::getenv("STRIX_MMX_MODEL_FORMAT"); mf != nullptr && *mf != '\0') {
+            const std::string m(mf);
+            if (m == "fast_i4") model_fast_i4 = true;
+            else if (m != "exl3") throw std::invalid_argument("STRIX_MMX_MODEL_FORMAT must be exl3 or fast_i4");
+        }
+        if (model_fast_i4) {
+            const char* base0 = std::getenv("STRIX_MM_BASELINE");
+            const char* why = nullptr;
+            if (!moe_opt) why = "needs the MoE kernels (STRIX_MM_MOE=off refused)";
+            else if (fp32_prefill) why = "is a FAST identity (STRIX_MM_PREFILL_IDENTITY=fp32 refused)";
+            else if (base0 != nullptr && *base0 != '\0' && std::strcmp(base0, "0") != 0) why = "is a FAST identity (STRIX_MM_BASELINE refused)";
+            else if (!mmoe::iu4_built()) why = "needs a build with the IU4 core (strix_tiled_core)";
+            if (why != nullptr) throw std::invalid_argument(std::string("STRIX_MMX_MODEL_FORMAT=fast_i4 ") + why);
+            i4_scope = fast_i4::scope(std::getenv("STRIX_MMX_FAST_I4_SCOPE"));
+            jit_prefetch = env_flag("STRIX_MMX_FAST_I4_PREFETCH", false);
+            jit_stats = env_flag("STRIX_MMX_FAST_I4_STATS", false);
+        }
     }
 
     std::size_t cache_off(std::uint32_t slot, unsigned layer, std::size_t width) const {
@@ -857,6 +908,7 @@ struct Engine::Impl {
         hip_ok(hipDeviceSynchronize(), "load head");
         lib.release_staging();
         alloc();
+        if (model_fast_i4) setup_fast_i4();
         LoadReport r;
         r.seconds = secs(t0, Clock::now());
         r.gib_read = pack.gib_read();
@@ -869,6 +921,95 @@ struct Engine::Impl {
         index_layouts_loaded = layouts;
         index_weights_ready = true;
         return r;
+    }
+
+    // Allocate once, after the ordinary context/slots/workspace. Allocation failure is fatal;
+    // FAST_I4 never reduces context, slots or the EXL3 model to fit its two reusable packs.
+    void setup_fast_i4() {
+        for (unsigned L = kFirstMoe; L < kLayers; ++L) {
+            Layer& y = layers[L];
+            hip_ok(hipMalloc(&y.i4src_base, mmoe::i4_source_bytes()), "fast_i4 source tables");
+            y.i4src = mmoe::i4_source_build(y.experts_raw.data(), y.shared_raw, y.i4src_base);
+            if (jit_stats) {
+                auto& t = jit_timing[L];
+                for (hipEvent_t* ev : {&t.convert0, &t.convert1, &t.moe0, &t.moe1})
+                    hip_ok(hipEventCreate(ev), "fast_i4 timing event");
+            }
+        }
+        const std::size_t pk = mmoe::i4_slot_bytes();
+        for (auto& j : jit) {
+            hip_ok(hipMalloc(&j.pack, pk), "fast_i4 layer slot");
+            j.weights = mmoe::i4_slot_view(j.pack);
+            for (hipEvent_t* ev : {&j.ready, &j.free})
+                hip_ok(hipEventCreateWithFlags(ev, hipEventDisableTiming), "fast_i4 slot event");
+            hip_ok(hipEventRecord(j.free, nullptr), "fast_i4 initial slot free");
+        }
+        if (jit_prefetch) hip_ok(hipStreamCreateWithFlags(&jit_stream, hipStreamNonBlocking), "fast_i4 prefetch stream");
+        std::printf("mm rank %u: fast_i4 (identity minimax-fast-i4, lossy): %zu reusable IU4 layer slots, "
+                    "%.3f GiB (%zu bytes) including slot tables; source tables %.3f MiB; prefill workspace %.3f GiB; "
+                    "scope %s, prefetch %u; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
+                    jit.size(), static_cast<double>(jit.size() * pk) / 1073741824.0, jit.size() * pk,
+                    static_cast<double>((kLayers - kFirstMoe) * mmoe::i4_source_bytes()) / 1048576.0,
+                    static_cast<double>(pf_ws_bytes) / 1073741824.0,
+                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U,
+                    static_cast<std::size_t>(opt.capacity), static_cast<std::size_t>(opt.slots));
+        std::fflush(stdout);
+    }
+    bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers; }
+    // Timing collection is nonblocking. At prompt completion the existing prefill fence makes
+    // every sample available; no host fence is introduced for conversion or prefetch.
+    void jit_collect(bool report = false) {
+        if (!jit_stats) return;
+        for (unsigned L = kFirstMoe; L < kLayers; ++L) {
+            auto& t = jit_timing[L];
+            auto collect = [&](bool& pending, hipEvent_t a, hipEvent_t b, double& total, std::uint64_t& count) {
+                if (!pending) return;
+                const auto status = hipEventQuery(b);
+                if (status == hipErrorNotReady) return;
+                hip_ok(status, "fast_i4 timing query");
+                float ms = 0;
+                hip_ok(hipEventElapsedTime(&ms, a, b), "fast_i4 timing");
+                total += ms;
+                ++count;
+                pending = false;
+            };
+            collect(t.convert_pending, t.convert0, t.convert1, t.convert_ms, t.converts);
+            collect(t.moe_pending, t.moe0, t.moe1, t.moe_ms, t.moes);
+            if (report && t.converts != 0 && t.moes != 0)
+                std::printf("rank %u fast_i4 L%u: converter %.3f ms/layer (%llu), IU4 group %.3f ms/layer (%llu)\n",
+                            opt.rank, L, t.convert_ms / static_cast<double>(t.converts), static_cast<unsigned long long>(t.converts),
+                            t.moe_ms / static_cast<double>(t.moes), static_cast<unsigned long long>(t.moes));
+        }
+    }
+    void jit_begin() { jit_collect(); jit_schedule.begin(); }
+    const mmoe::I4Layer* jit_acquire(unsigned L, unsigned end) {
+        const unsigned s = jit_schedule.acquire(L, end, jit_prefetch,
+            [&](unsigned slot, unsigned layer, bool side) {
+                auto& j = jit[slot];
+                hipStream_t stream = side ? jit_stream : nullptr;
+                if (side) hip_ok(hipStreamWaitEvent(stream, j.free, 0), "fast_i4 prefetch wait free");
+                auto& t = jit_timing[layer];
+                const bool timing = jit_stats && !t.convert_pending;
+                if (timing) hip_ok(hipEventRecord(t.convert0, stream), "fast_i4 convert begin");
+                mmoe::i4_convert(layers[layer].i4src, j.weights, stream, i4_scope == fast_i4::Scope::all);
+                if (timing) {
+                    hip_ok(hipEventRecord(t.convert1, stream), "fast_i4 convert end");
+                    t.convert_pending = true;
+                }
+                if (side) hip_ok(hipEventRecord(j.ready, stream), "fast_i4 prefetch ready");
+            },
+            [&](unsigned slot) { hip_ok(hipStreamWaitEvent(nullptr, jit[slot].ready, 0), "fast_i4 wait ready"); });
+        auto& t = jit_timing[L];
+        t.moe_started = jit_stats && !t.moe_pending;
+        if (t.moe_started) hip_ok(hipEventRecord(t.moe0, nullptr), "fast_i4 MoE begin");
+        return &jit[s].weights;
+    }
+    void jit_release(unsigned L) {
+        if (jit_timing[L].moe_started) {
+            hip_ok(hipEventRecord(jit_timing[L].moe1, nullptr), "fast_i4 MoE end");
+            jit_timing[L].moe_pending = true;
+        }
+        hip_ok(hipEventRecord(jit[L & 1U].free, nullptr), "fast_i4 slot free");
     }
 
     void alloc() {
@@ -946,6 +1087,7 @@ struct Engine::Impl {
             hip_ok(hipMalloc(&moe_ws.base, wb), "moe workspace");
             hip_ok(hipMemset(moe_ws.base, 0, wb), "moe workspace");
             pf_ws_bytes = mmoe::prefill_moe_workspace_bound(opt.max_rows);
+            if (model_fast_i4) pf_ws_bytes += mmoe::kI4GroupTableBytes;  // IU4 groups beside gate_up EXL3 down items
             hip_ok(hipMalloc(&pf_ws, pf_ws_bytes), "prefill moe workspace");
         }
         hip_ok(hipEventCreateWithFlags(&routes_ready, hipEventDisableTiming), "route event");
@@ -1421,6 +1563,8 @@ struct Engine::Impl {
         }
         xb_layers = L1;
         xb_prepped = false;
+        const bool i4_on = !gemv && model_fast_i4 && mmoe::prefill_iu4();
+        if (i4_on) jit_begin();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
             float* out = send_buffer(n);
@@ -1432,7 +1576,9 @@ struct Engine::Impl {
                 hip_ok(hipMemcpyAsync(trace_ids_d + std::size_t{L} * kMaxStepRows * kTopE, ids_d, n * kTopE * 4,
                                       hipMemcpyDeviceToDevice, nullptr), "trace ids");
             out = send_buffer(n);
-            stage_ffn(L, n, out);
+            const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            stage_ffn(L, n, out, i4);
+            if (i4 != nullptr) jit_release(L);
             exchange_post(n, L, 1, out, y.w_next, nullptr, nullptr);
             tmark(tmark_at(L, 5));
             if (taps_on) capture_tap(L, n);
@@ -1702,7 +1848,7 @@ struct Engine::Impl {
     }
 
     // Layer L's FFN on hn (after the attention exchange): dense MLP or router-routed experts + shared -> out.
-    void stage_ffn(unsigned L, std::size_t n, float* out) {
+    void stage_ffn(unsigned L, std::size_t n, float* out, const mmoe::I4Layer* prefill_i4 = nullptr) {
         {
             const bool f32 = fp32_prefill && !gemv;  // FP32 prefill identity
             const Layer& y = layers[L];
@@ -1769,6 +1915,8 @@ struct Engine::Impl {
                 pv.experts = y.experts_raw.data();
                 pv.shared = y.shared_raw;
                 pv.out = out;
+                pv.i4 = prefill_i4;
+                pv.i4_all = i4_scope == fast_i4::Scope::all;
                 // The module markers are host callbacks: record one interval
                 // from its first launch to combine, excluding host planning.
                 struct TimelineMoe {
@@ -2017,6 +2165,7 @@ struct Engine::Impl {
                 if (pf_active) pf->drain();
                 pf_active = false;
                 hip_ok(hipDeviceSynchronize(), "prefill");
+                if (model_fast_i4) jit_collect(true);
                 if (tl) tl->report(opt.rank);
                 tl = nullptr;
                 ++prof.calls;
@@ -2263,6 +2412,8 @@ struct Engine::Impl {
             embed_rows(toks.data() + c * opt.max_rows, N[c]);
             hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(N[c])), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
         }
+        const bool i4_on = model_fast_i4 && mmoe::prefill_iu4();
+        if (i4_on) jit_begin();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
             if (tl) tl->context(task.c, L);
@@ -2279,6 +2430,7 @@ struct Engine::Impl {
                 stage_attn(L, N[c], {}, slot, pos0 + c * opt.max_rows, o);
                 send(c, 0, L, o);
             }
+            const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
             for (std::size_t c = 0; c < m; ++c) {
                 use(c);
                 const auto view = recv(c);
@@ -2287,9 +2439,10 @@ struct Engine::Impl {
                 last_read(c);
                 if (tl) tl->mark("attention-post-router", false);
                 float* o = out_of(c);
-                stage_ffn(L, N[c], o);
+                stage_ffn(L, N[c], o, i4);
                 send(c, 1, L, o);
             }
+            if (i4 != nullptr) jit_release(L);
         }
         for (std::size_t c = 0; c < m; ++c) {
             use(c);
@@ -2318,6 +2471,21 @@ struct Engine::Impl {
         std::vector<float> rows(last_out.second * kHidden);
         hip_ok(hipMemcpy(rows.data(), last_out.first, rows.size() * 4, hipMemcpyDeviceToHost), "out rows copy");
         return rows;
+    }
+    // This rank's vocabulary slice of the head logits of the last `want` final normed rows ([rows][vn]; teacher-forced
+    // per-token quality comparisons). The G4 gather path's head gemm, 256 rows per chunk.
+    std::vector<float> prefill_out_logits(std::size_t want) {
+        if (last_out.first == nullptr || want == 0) return {};
+        hip_ok(hipDeviceSynchronize(), "out logits");
+        const std::size_t nr = std::min<std::size_t>(want, last_out.second);
+        const float* src = last_out.first + (last_out.second - nr) * kHidden;
+        std::vector<float> out(nr * vn);
+        for (std::size_t r0 = 0; r0 < nr; r0 += kGatherRows) {
+            const std::size_t n = std::min(kGatherRows, nr - r0);
+            lib.mm(head, src + r0 * kHidden, logits, n, false);
+            hip_ok(hipMemcpy(out.data() + r0 * vn, logits, n * vn * 4, hipMemcpyDeviceToHost), "out logits copy");
+        }
+        return out;
     }
     std::uint64_t prefill_out_fnv() {
         if (last_out.first == nullptr) return 0;
@@ -3097,6 +3265,7 @@ bool Engine::prefill_interleave() const { return impl_->pf_interleave; }
 std::uint64_t Engine::state_fnv(std::uint32_t slot, std::uint64_t positions) { return impl_->state_fnv(slot, positions); }
 std::uint64_t Engine::prefill_out_fnv() { return impl_->prefill_out_fnv(); }
 std::vector<float> Engine::prefill_out_rows() { return impl_->prefill_out_rows(); }
+std::vector<float> Engine::prefill_out_logits(std::size_t rows) { return impl_->prefill_out_logits(rows); }
 
 
 }  // namespace strix::minimax::engine

@@ -558,11 +558,11 @@ class SlotPrefill {
 public:
     SlotPrefill(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, std::uint32_t rank) : a_(a), fwd_(fwd) {
         const auto o = slot_prefill_options(a, fwd, comm, rank);
-        // The exported state per position: only the KV sources hold compressed KV and index keys, one entry per
-        // `ratio` positions (890 B for V4.1, not 356 B on every layer), plus the token id.
-        state_bytes_per_token_ = strix::deepseek41::build_decode_plan(fwd.model(), 0U, a.layers, false, false).state_bytes_per_token + 4U;
         prefill_ = std::make_unique<strix::deepseek41::DevicePrefill>(a.model, o);
         if (a.prefix_cache_mb != 0U) {
+            // Only KV sources retain compressed KV/index keys, amortized by ratio, plus the token ID.
+            // Disabled caching does not construct or validate an extra plan.
+            state_bytes_per_token_ = strix::deepseek41::build_decode_plan(fwd.model(), 0U, a.layers, false, false).state_bytes_per_token + 4U;
             strix::deepseek41::PrefixCacheOptions co;
             co.block = a.prefix_block;
             host_lease_ = std::make_unique<strix::deepseek41::PrefixHostLease>(a.prefix_cache_mb);

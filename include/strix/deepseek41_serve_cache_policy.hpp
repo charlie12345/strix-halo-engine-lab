@@ -92,8 +92,11 @@ struct ServeCachePolicy {
 inline std::uint64_t prefix_capture_predicted_bytes(std::uint64_t tokens, std::uint64_t state_bytes_per_token,
                                                     std::uint64_t rings_bytes, std::uint64_t host_budget_mb,
                                                     std::uint64_t slots = 1) {
-    const std::uint64_t state = tokens * state_bytes_per_token + rings_bytes;
-    return (host_budget_mb << 20U) + slots * (state * 3U + rings_bytes * 8U);
+    constexpr auto limit = std::numeric_limits<std::uint64_t>::max();
+    const auto add = [](std::uint64_t a, std::uint64_t b) { return b > limit - a ? limit : a + b; };
+    const auto mul = [](std::uint64_t a, std::uint64_t b) { return b != 0U && a > limit / b ? limit : a * b; };
+    const auto state = add(mul(tokens, state_bytes_per_token), rings_bytes);
+    return add(mul(host_budget_mb, 1U << 20U), mul(slots, add(mul(state, 3U), mul(rings_bytes, 8U))));
 }
 
 // Subtraction avoids overflow; unknown availability fails closed even with a zero reserve.

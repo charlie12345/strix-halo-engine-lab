@@ -73,6 +73,12 @@ int main() try {
         // 1 GiB host cache, 3 GiB reserve, ~8.1 GiB MemAvailable per node (weights, drafter and KV pool resident).
         const std::uint64_t rings = 40U * (136U * 528U + 4096U + 4096U), per_token = 890U + 4U;
         const auto p = [&](std::uint64_t tokens, std::uint64_t bpt) { return ds::prefix_capture_predicted_bytes(tokens, bpt, rings, 1024); };
+        expect(ds::prefix_capture_predicted_bytes(UINT64_MAX, 2, 0, 0) == UINT64_MAX, "token bytes saturate");
+        expect(ds::prefix_capture_predicted_bytes(0, 0, UINT64_MAX, 0) == UINT64_MAX, "ring copies saturate");
+        expect(ds::prefix_capture_predicted_bytes(0, 0, 0, UINT64_MAX) == UINT64_MAX, "host budget saturates");
+        expect(ds::prefix_capture_predicted_bytes(1, 1, 0, 0, UINT64_MAX) == UINT64_MAX, "slot copies saturate");
+        expect(!ds::prefix_memory_admitted(8100, 3072, ds::prefix_capture_predicted_bytes(UINT64_MAX, 2, 0, 0)),
+               "overflow cannot admit a capture");
         expect(p(0, per_token) == (1024ULL << 20U) + 3U * rings + 8U * rings, "empty capture: budget + state rings x3 + snapshot rings x8");
         expect(p(180000, per_token) - p(0, per_token) == 3ULL * 180000U * per_token, "three copies of the per-position state");
         expect(ds::prefix_capture_predicted_bytes(1000, per_token, rings, 0, 2) == 2U * (3U * (1000U * per_token + rings) + 8U * rings),

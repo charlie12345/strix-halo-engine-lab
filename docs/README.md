@@ -87,7 +87,6 @@ work as it stood on their date; documents marked **Superseded** name their repla
 - [Persistent HC mix for verify-window rows](engine/kernels/hc-persistent-window-rows.md): STRIX_HC_PERSISTENT: one persistent launch per HC step of a verify window.
 - [Experimental HC projection prefetch](engine/kernels/hc-projection-prefetch.md): Experimental --prefetch-hc-projection-next-tile prefetch of next HC projection tile.
 - [Experimental Q4K A8G32 native gate/up path](engine/kernels/q4k-a8g32-native-gate-up.md): Experimental opt-in Q4_K A8G32 integer gate/up decode path (--q4k-a8g32-gate-up): arithmetic, ownership, qualification.
-- [Standalone Q4_K gate/up A8G32 probe](engine/kernels/q4k-a8g32-probe.md): Contract, arithmetic, status words, build and ISA gates. *Historical.*
 - [Experimental exact grouped Q5_1 down probe](engine/kernels/q51-grouped-down-probe.md): Standalone exact grouped Q5_1 down probe: workgroup layout, shapes, host tests, build target. *Historical.*
 - [Opt-in exact grouped Q5_1 down runtime](engine/kernels/q51-grouped-down-runtime.md): Opt-in exact grouped Q5_1 down-projection runtime (--grouped-exact-q51-down): contract, identity, qualification status.
 - [Slot-parallel Q5_1 down projection](engine/kernels/q51-slot-parallel.md): Experimental slot-parallel Q5_1 down projection with ordered weighted merge.
@@ -157,7 +156,6 @@ work as it stood on their date; documents marked **Superseded** name their repla
 - [Coherent staged readiness](engine/transport/staged-readiness.md): STRIX_DIST_STAGED_READY_BYTES: coherent staged readiness host path in communicator.
 - [Cooperative controller recovery and safe domain retirement](engine/transport/usb4-controller-recovery.md): USB4 driver patch 0009: cooperative controller recovery, domain retirement, controller groups, USB4NET coexistence.
 - [Integrated USB4 multi-slot engine: build and test entrypoint](engine/transport/usb4-gpu-queue-integration.md): Entrypoint for integrated USB4 multi-slot GPU queue (strix-gpu-queue-visibility): contract, recovery, build, two-host run.
-- [GPU visibility probes — compatibility route and current multi-slot route](engine/transport/usb4-gpu-visibility-probes.md): Original PR #27/#28 C1 compatibility routes, shared probe contract, build/tests. **Superseded** by [Integrated USB4 multi-slot engine: build and test entrypoint](engine/transport/usb4-gpu-queue-integration.md).
 
 ## Operations
 
@@ -188,11 +186,6 @@ work as it stood on their date; documents marked **Superseded** name their repla
 
 - [Native runtime investigation scope](research/README.md): Short stub: native runtime investigation scope and publication boundary for research.
 - [Experimental selected dense projections](research/dense-trellis-g1.md): Experimental Hadamard/trellis K5 dense projections (dense-a8-trellis-g1) for selected Qwen projections. *Historical.*
-- [Design acceptance actions](research/history/2026-09-28-design-acceptance.md): Design-review acceptance requirements recorded 2026-09-28 plus spec v1 draft integration notes (D-015..D-020). *Historical.*
-- [Strix Halo optimization review — 2026-09-29](research/history/2026-09-29-optimization-review.md): Dated research review of optimization mechanisms, UMA, dual USB4 and partitioning, with proposed amendments. *Historical.*
-- [Platform qualification plan](research/history/platform-review.md): Short stub: platform qualification principles; defers to docs/architecture and implementation ledger. **Superseded** by [13 — Platform Discovery and Capability Negotiation](architecture/13-platform-discovery.md).
-- [Technical specification v0.4 — inference engine for Strix Halo](research/history/spec-draft-v0.4.md): Technical specification v0.4 research draft: objectives, principles, architecture, phases A0-E, decision gates. **Superseded** by [Strix Halo Architecture Guide](architecture/README.md).
 - [Phase specific packed weight and integer execution proposal](research/proposals/2026-10-11-phase-specific-low-precision.md): Draft proposal (LPE-xxx) for phase-specific packed weights and integer IU8/IU4 execution.
 - [Execution optimization gates](research/proposals/2026-10-12-execution-optimization-gates.md): Draft proposal (OPT-xxx): gates for launches, graph lifetime, caches, prefill fairness, numerics, recovery.
 - [Shared-expert row reuse diagnostic](research/shared-expert-row-diagnostic.md): Standalone shared-expert R2/R4/R8 row-reuse diagnostic component.
-- [Dated implementation notes](research/history/README.md): 35 notes from 2026-10-11 to 2026-10-15, indexed by date.

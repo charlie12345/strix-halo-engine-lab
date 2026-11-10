@@ -494,15 +494,15 @@ storage), `strix-model-manifest` (tensor roles, bytes, residency and node placem
 - [docs/reference/qualification-ledger.md](../reference/qualification-ledger.md): what has been qualified, and how.
 - [docs/decisions/decision-register.md](../decisions/decision-register.md): accepted, pending and rejected decisions with their reasons.
 - [docs/reference/implementation-status.md](../reference/implementation-status.md): implemented components and how to reproduce them.
-- [docs/research/history/spec-draft-v0.4.md](../research/history/spec-draft-v0.4.md), [docs/decisions/evidence-register.md](../decisions/evidence-register.md), [docs/research/history/2026-09-28-design-acceptance.md](../research/history/2026-09-28-design-acceptance.md):
-  specification, evidence register and acceptance criteria.
+- [docs/architecture/README.md](../architecture/README.md), [docs/decisions/evidence-register.md](../decisions/evidence-register.md):
+  architecture and evidence register.
 - [docs/operations/memory-budget.md](../operations/memory-budget.md): UMA/GTT policy and admission guards.
 - [docs/reference/gguf-reader.md](../reference/gguf-reader.md): GGUF reader contract and defenses.
 - [docs/reference/sources-ledger.md](../reference/sources-ledger.md): canonical sources, licenses and provenance.
 
 ## Working rules
 
-New observations go to `docs/decisions/evidence-register.md` first. Design changes are reflected in `docs/research/history/spec-draft-v0.4.md`, and the reason is
+New observations go to `docs/decisions/evidence-register.md` first. Design changes are reflected in `docs/architecture/`, and the reason is
 recorded in `docs/decisions/decision-register.md`. A hypothesis does not become a requirement until a measurement or an explicit
 decision supports it. Native `gfx1151` qualification is required before a HIP or direct-transport path becomes a
 default.

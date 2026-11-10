@@ -880,6 +880,7 @@ int main(int argc, char** argv) {
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(),
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
         }
+        opt.host_budget = prefix_cache_bytes;  // the prefix snapshots are this process's RSS: not a watchdog breach
         ge::Engine eng(opt, comm.get());
         const auto lr = eng.load([&](const ge::mem::LoadAdmission&) { return opt.max_rows; });
         if (prefill_mode != "ref") {

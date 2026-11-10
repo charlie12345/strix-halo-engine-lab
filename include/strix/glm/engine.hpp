@@ -295,6 +295,8 @@ struct Options {
     bool decode_xfer = true;             // TP2: Plain/Verify/MTP with 1..8 rows can borrow its transport.
                                          // STRIX_GLM_DECODE_XCH=comm|xfer overrides this option on both ranks.
                                          // STRIX_GLM_SPEC_XCH=comm keeps Verify/MTP on Comm (default xfer).
+    std::uint64_t host_budget = 0;      // host bytes the caller keeps in this process (the server's prefix cache):
+                                         // added to the watchdog's default RSS limit (STRIX_GLM_WD_RSS_GIB overrides)
     unsigned pf_pipeline = 1;           // 1: current schedule; 2: half-row whole-layer overlap
                                          // STRIX_GLM_PF_PIPELINE=1|2 overrides this option on both ranks.
 };

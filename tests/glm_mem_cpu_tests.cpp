@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -266,6 +267,25 @@ void test_e1_plan() {
         threw = true;
     }
     CHECK(!threw);
+}
+
+// ---------------------------------------------------------------- watchdog thresholds: caller-budgeted host memory
+void test_watchdog_budget() {
+    ::unsetenv("STRIX_GLM_WD_RSS_GIB");
+    const std::uint64_t base = mem::Watchdog{}.max_rss;
+    CHECK(mem::Watchdog::from_env().max_rss == base);
+    // A budgeted prefix cache is not a leak: the default limit moves with it (16 GiB of snapshots alone pass 8 GiB).
+    CHECK(mem::Watchdog::from_env(16 * mem::kGiB).max_rss == base + 16 * mem::kGiB);
+    CHECK(mem::Watchdog::from_env(std::numeric_limits<std::uint64_t>::max()).max_rss == std::numeric_limits<std::uint64_t>::max());
+    // An explicit limit is taken as given, 0 (off) included.
+    ::setenv("STRIX_GLM_WD_RSS_GIB", "12", 1);
+    CHECK(mem::Watchdog::from_env(16 * mem::kGiB).max_rss == 12 * mem::kGiB);
+    ::setenv("STRIX_GLM_WD_RSS_GIB", "0", 1);
+    CHECK(mem::Watchdog::from_env(16 * mem::kGiB).max_rss == 0);
+    ::unsetenv("STRIX_GLM_WD_RSS_GIB");
+    // The other thresholds do not move.
+    const mem::Watchdog d, w = mem::Watchdog::from_env(16 * mem::kGiB);
+    CHECK(w.min_ram_headroom == d.min_ram_headroom && w.max_swap_growth == d.max_swap_growth && w.max_gtt_used == d.max_gtt_used);
 }
 
 // ---------------------------------------------------------------- monitor: trace + watchdog
@@ -656,6 +676,7 @@ int main(int argc, char** argv) {
     test_admit();
     test_cost_model();
     test_e1_plan();
+    test_watchdog_budget();
     test_monitor(tmp);
     test_pack(tmp);
     fs::remove_all(tmp);

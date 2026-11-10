@@ -90,17 +90,8 @@ void arithmetic() {
         reference_h(ref); assert(std::memcmp(v,ref,sizeof(v))==0);
         float vs[2],rs[2]; assert(quant(v,vs)==quant(ref,rs)); assert(std::memcmp(vs,rs,sizeof(vs))==0);
     }
-    // Direct down-combine product rounding and every order on small top-4 sums.
-    for(unsigned trial=0;trial<64;++trial) {
-        float w[4],v[4],ref=0,sumabs=0;
-        for(unsigned k=0;k<4;++k) { w[k]=std::fabs(d(rng))/72;v[k]=d(rng);ref=std::fma(w[k],v[k],ref);sumabs+=std::fabs(w[k]*v[k]); }
-        std::array<unsigned,4> order{0,1,2,3};
-        do {
-            float out=0;
-            for(unsigned k:order) out+=core::moe_i4::combine_product<Ops>(w[k],v[k]);
-            assert(std::fabs(out-ref)<=8*0x1p-23f*sumabs);
-        } while(std::next_permutation(order.begin(),order.end()));
-    }
+    // The chain combine is the ordered control combine (contribution rows, then ascending top-k FMA):
+    // no product boundary or order to bound here; device digests check run-to-run equality.
     // All row/byte locations are disjoint and cover the exact core LDS image.
     for(unsigned rows:{32U,64U,128U}) {
         std::vector<bool> used(rows*64);

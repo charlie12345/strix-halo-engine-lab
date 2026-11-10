@@ -7,7 +7,8 @@
 //   activations: the transformed FP16 rows (input_kernel: suh + had128; activation_kernel: R15 + down suh + had128),
 //            per row and K64 group (library quantiser), gathered through the plan's pair map.
 //   epilogue: H128 times svh. STRIX_MOE_I4_CHAIN=1 binds the shared register-paired chain;
-//            FP16/A4 boundaries stay fixed; combine changes to RN32 product + atomic addition.
+//            FP16/A4 boundaries stay fixed; the down epilogue writes the routed rows and the control's
+//            ordered combine (aux or R16) sums them, so the chain is deterministic.
 //            Shared expert remains on its existing WMMA-X arithmetic.
 #if STRIX_GLM_PF_IU4_LIB
 // STRIX_GLM_PF_IU4_PLAN: library IU4 plan 0 (BM32), 1 (BM64), 2 (BM128); unset = auto: plan 2 when the call averages
@@ -38,6 +39,7 @@ struct I4Binding {
     __device__ unsigned pair(unsigned pos) const { return a.pairs[pos]; }
     __device__ unsigned token(unsigned p) const { return p/P; }
     __device__ float weight(unsigned p) const { return a.weights[(p/P)*8+p%P]; }
+    __device__ float* contribution(unsigned p) const { return a.output+size_t(p)*H; }
     __device__ float suh(unsigned e,unsigned m,unsigned c) const { return d::half_bits(matrix(a,e,m).suh[c]); }
     __device__ float activation(float g,float u) const {
         const float gg=g>kClamp ? kClamp : g, uu=u>kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
@@ -82,18 +84,20 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
     I4Binding b{a.x,a.out,a};
     iu4_ok(st::build_iu4_grouped_tiles(reinterpret_cast<const st::IU4Group*>(a.groups),E,plan,tiles,s.ntiles,max_tiles,stream),"chain tiles");
     iu4_ok(st::moe_i4::launch<true>(plan,b,w,tiles,s.ntiles,max_tiles,s.aq_down,s.as_down,stream),"chain paired gate/up");
-    iu4_ok(hipMemsetAsync(a.out,0,size_t(a.rows)*H*4,stream),"chain output init");
-    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,s.ntiles,max_tiles,s.aq_down,s.as_down,stream),"chain down/combine");
-    // Shared expert retains its existing exact FP16 operand and WMMA-X arithmetic.
-    a.aux_act=false; a.aux_combine=false;
+    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,s.ntiles,max_tiles,s.aq_down,s.as_down,stream),"chain down");
+    // Shared expert retains its existing exact FP16 operand and WMMA-X arithmetic; the combine is the
+    // control's ordered one (shared-down aux epilogue, or R16), not atomics.
+    a.aux_act=false; a.aux_combine=aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE");
     st::moe_i4::fp16_input_rows<<<dim3(H/1024,(a.rows+15)/16,2),256,0,stream>>>(b,a.input,a.rows,E,P,8);
     ok(hipGetLastError(),"chain shared input");
     launch_linear_w<false,false>(a,shared.gate.bits,stream);
     st::moe_i4::fp16_activation_rows<<<dim3(I/128,(a.rows+15)/16),256,0,stream>>>(b,a.gu,a.at,a.rows,E,P,8);
     ok(hipGetLastError(),"chain shared activation");
     launch_linear_w<true,false>(a,shared.down.bits,stream);
-    st::moe_i4::add_shared_rows<<<(size_t(a.rows)*H+255)/256,256,0,stream>>>(a.output,a.out,a.rows,H,P,8);
-    ok(hipGetLastError(),"chain shared add");
+    if(!a.aux_combine) {
+        combine_kernel<<<dim3(H/256,a.rows),256,0,stream>>>(a);
+        ok(hipGetLastError(),"chain R16");
+    }
 }
 
 // Routed gate/up/down on IU4; shared expert, activation and combine as the WMMA-X path (aux_act off). Runs the whole

@@ -7,9 +7,6 @@
 #define STRIX_I4_INLINE inline
 #endif
 namespace strix::core::moe_i4 {
-template<class Ops> STRIX_I4_INLINE float combine_product(float weight,float value) {
-    return Ops::materialize(weight*value);
-}
 template<class Ops,class Binding,unsigned N>
 STRIX_I4_INLINE void input_values(const Binding& b,unsigned expert,unsigned pair,unsigned m,unsigned col,float (&v)[N],const float* cached=nullptr) {
     for(unsigned j=0;j<N;++j) {

@@ -16,10 +16,6 @@ inline bool enabled() {
     if (std::strcmp(p, "1") == 0) return true;
     throw std::invalid_argument("STRIX_MOE_I4_CHAIN must be 0 or 1 (candidate, native gates pending)");
 }
-__global__ inline void add_shared_rows(const float* rows,float* out,unsigned tokens,unsigned hidden,unsigned stride,unsigned slot) {
-    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-    if(i<size_t(tokens)*hidden) out[i]+=rows[((i/hidden)*stride+slot)*hidden+i%hidden];
-}
 struct Weights {
     const uint8_t* q[3];
     const _Float16* s[3];
@@ -43,13 +39,14 @@ template<class Binding> struct EpiloguePolicy {
     __device__ void activation(unsigned e,unsigned c,const float (&g)[4],const float (&u)[4],float (&v)[4]) const {
         activation_values<WaveOps>(b,e,c,g,u,v);
     }
-    __device__ void combine(unsigned pair, unsigned col, const float (&v)[4]) const {
-        const unsigned lane = threadIdx.x & 31U, token = b.token(pair);
-        const float w = b.weight(pair);
-        // FAST only: FP32 product then unordered atomic add replaces the ordered FMA fold.
-        // A4/FP16 boundaries do not move. This arithmetic change requires the quality gate.
+    // Deterministic combine, stage 1: the down epilogue stores each routed pair's FP32 output row
+    // (the value the unfused control writes to its down image). Stage 2 is the model's existing
+    // ordered combine (ascending top-k FMA, shared expert last), so the chain adds no rounding
+    // point, no atomics and no run-to-run or cross-rank order dependence.
+    __device__ void contribution(unsigned pair, unsigned col, const float (&v)[4]) const {
+        float* row = b.contribution(pair);
         #pragma unroll
-        for (unsigned j = 0; j < 4; ++j) atomicAdd(b.out + size_t(token)*Binding::H + col+lane+32*j, combine_product<WaveOps>(w,v[j]));
+        for (unsigned j = 0; j < 4; ++j) row[col + (threadIdx.x & 31U) + 32*j] = v[j];
     }
 };
 // Unfused control uses the same policies; schedules only name rows and destinations.
@@ -170,7 +167,7 @@ template<class Binding,bool Pair> struct Chain {
                 EpiloguePolicy<Binding>{b}.activation(expert,col,g,v,a);
                 iu4_quant128(a,aq+size_t(pair)*(Binding::I/2),as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
             }
-        } else EpiloguePolicy<Binding>{b}.combine(pair,col,v);
+        } else EpiloguePolicy<Binding>{b}.contribution(pair,col,v);
     }
 };
 template<int Plan,bool Pair,class Binding> hipError_t launch(const Binding& b,const Weights& w,

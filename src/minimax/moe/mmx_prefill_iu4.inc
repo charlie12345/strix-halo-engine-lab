@@ -4,7 +4,7 @@
 // STRIX_MOE_I4_CHAIN=1: device A-load gather/H128/A4; paired gate/up with SwiGLU/down-H128/A4
 // epilogue; down epilogue accumulates weighted FP32 directly. No global GU or down FP32 image.
 // OFF: the unfused control uses the same shared arithmetic with materialized intermediates.
-// All FP16/A4 boundaries stay fixed; the candidate combine uses product RN32 + atomic addition.
+// All FP16/A4 boundaries stay fixed; the chain combine is the ordered control combine (deterministic).
 namespace {
 int g_iu4_override = -1;
 
@@ -31,7 +31,8 @@ void iu4_ok(hipError_t e, const char* what) { ok(e, what); }
 
 struct I4Binding {
     static constexpr unsigned H=kHidden, I=kInter;
-    const float* x; float* out; Tables t; bool dense_groups=true; bool reference_group_ids=false;
+    const float* x; float* out; Tables t; bool dense_groups=true; bool reference_group_ids=false; float* dn=nullptr;
+    __device__ float* contribution(unsigned p) const { return dn+size_t(p)*H; }
     __device__ unsigned slot(unsigned tok,unsigned k) const {
         return k<kTopE ? t.tok_pair[tok*kTopE+k] : t.groups[t.shared_group].pair_begin+tok;
     }
@@ -80,22 +81,27 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     const std::size_t tile_bytes=align256(max_tiles*sizeof(st::IU4GroupTile));
     const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/2));
     const std::size_t sbytes=align256(std::size_t(t.pairs)*(kInter/64)*4);
-    if(bytes<tile_bytes+256+qbytes+sbytes) throw std::logic_error("minimax fused i4 scratch too small");
+    const std::size_t dbytes=align256(std::size_t(t.pairs)*kHidden*4);
+    if(bytes<tile_bytes+256+qbytes+sbytes+dbytes) throw std::logic_error("minimax fused i4 scratch too small");
     auto* tiles=reinterpret_cast<st::IU4GroupTile*>(ws);
     auto* ntiles=reinterpret_cast<unsigned*>(ws+tile_bytes);
     auto* aq=ws+tile_bytes+256;
     auto* as=reinterpret_cast<float*>(aq+qbytes);
+    auto* dn=reinterpret_cast<float*>(aq+qbytes+sbytes);
     st::moe_i4::Weights w{};
     for(unsigned m=0;m<3;++m) {
         w.q[m]=q.wq[m]; w.s[m]=q.ws[m]; w.svh[m]=q.svh[m];
         w.q_stride[m]=kI4ExpertBytes; w.s_stride[m]=kI4ExpertBytes/2;
     }
-    I4Binding b{x,out,t,dense_groups};
+    I4Binding b{x,out,t,dense_groups,false,dn};
     iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,plan,tiles,ntiles,max_tiles,stream),"chain tiles");
     iu4_ok(st::moe_i4::launch<true>(plan,b,w,tiles,ntiles,max_tiles,aq,as,stream),"chain paired gate/up");
     mark("gate_up",stream);
-    iu4_ok(hipMemsetAsync(out,0,std::size_t(t.rows)*kHidden*4,stream),"chain output init");
-    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,max_tiles,aq,as,stream),"chain down/combine");
+    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,max_tiles,aq,as,stream),"chain down");
+    mark("down",stream);
+    // Ordered combine of the control: ascending top-k FMA, shared expert last. Deterministic.
+    hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<I4Binding>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,b,dn,t.rows,kTopE);
+    iu4_ok(hipGetLastError(),"chain combine");
     mark("combine",stream);
 }
 

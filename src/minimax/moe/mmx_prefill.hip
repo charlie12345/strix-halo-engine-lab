@@ -1284,9 +1284,10 @@ DevLayout dev_layout(unsigned T,bool i4=false) {
     l.scratch = take(dp::scratch_bytes<DevPolicy>(T));
     if(i4) {
         l.xt=off;
-        // Largest tile list (BM32), count word, and the sole global down operand (A4 + FP32 scales).
+        // Largest tile list (BM32), count word, the global down operand (A4 + FP32 scales) and the
+        // FP32 down rows of the ordered (deterministic) combine.
         take(align256(((5ULL*T+31)/32+kDevGroups)*12)+256+
-             align256(5ULL*T*(kInter/2))+align256(5ULL*T*(kInter/64)*4));
+             align256(5ULL*T*(kInter/2))+align256(5ULL*T*(kInter/64)*4)+align256(5ULL*T*kHidden*4));
         l.bytes=off;
         return l;
     }

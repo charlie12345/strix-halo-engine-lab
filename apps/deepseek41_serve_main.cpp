@@ -2861,7 +2861,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                                 serve::session_inventory_live(rows, p.session_id, p.position, p.next_token, p.session_emitted, false);
                             for (const auto& r : running) {
                                 const auto position = active && active->r == r.get() ? active->task->rows() : r->seq.position;
-                                const auto pending = r->seq.generated.empty() ? std::optional<std::uint32_t>{} : r->seq.generated.back();
+                                std::optional<std::uint32_t> pending;  // not a conditional: gcc 14 -O3 reports the empty arm as maybe-uninitialized
+                                if (!r->seq.generated.empty()) pending = r->seq.generated.back();
                                 serve::session_inventory_live(rows, r->job.job.session_id, position, pending,
                                     r->session_emitted + r->seq.generated.size(), true);
                             }

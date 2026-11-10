@@ -21,14 +21,15 @@ namespace strix::glm::xfer {
 // before entry, and drains this one before returning to head/decode.
 class SeqparExchange {
 public:
-    SeqparExchange(dist::Transport& transport, unsigned rank, unsigned max_rows, hipStream_t stream);
+    SeqparExchange(dist::Transport& transport, unsigned rank, unsigned max_rows, hipStream_t stream,
+                   unsigned compute_streams = 2);
     ~SeqparExchange();
     static std::size_t workspace_bytes(unsigned max_rows);
     void materialize_last(float* residual, unsigned rows);
-    hipStream_t compute(unsigned lane) const { return side_.compute.at(lane); }
+    hipStream_t compute(unsigned lane) const { return side_.compute.at(lane == 1 && side_.streams == 1 ? 0 : lane); }
     float* normalized() const { return side_.normalized_dev; }
-    // Column scratch and attention recurrence remain ordered A then B even
-    // though each half's row-local kernels have their own compute stream.
+    // Column scratch and attention recurrence remain ordered A then B with
+    // either one shared compute queue or the legacy per-half compute queues.
     void column_begin(unsigned lane);
     void column_end(unsigned lane);
     void join();  // both compute tails -> original engine stream
@@ -42,12 +43,13 @@ private:
     struct Side {
         hipStream_t stream = nullptr;
         std::array<hipStream_t, 2> compute{};
+        unsigned streams;
         std::array<hipEvent_t, 2> ready{}, done{};
         std::array<hipEvent_t, 64> consumed{};
         hipEvent_t column = nullptr;
         float* normalized_host = nullptr;
         float* normalized_dev = nullptr;
-        explicit Side(unsigned max_rows);
+        Side(unsigned max_rows, unsigned compute_streams);
         ~Side();
     } side_;  // destroyed after Channel has stopped its progress owner
     unsigned rank_, max_rows_;

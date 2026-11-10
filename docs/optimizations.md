@@ -1647,18 +1647,18 @@ Hides shared-expert work and attention-site HC mixes inside exchange waits.
 
 <a id="ds-prefill"></a>
 
-### Final KV ownership, prefill tiles and Engram cache
+### Final KV ownership and Engram cache
 
-**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_FINAL_KV=all; STRIX_DS41_PREFILL_TILES=1 (opt-in); STRIX_DS41_PREFILL_TILES_MIN_ROWS=2048; STRIX_DS41_ENGRAM_PAYLOAD_CACHE`. **Default:** auto.
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_FINAL_KV=all; STRIX_DS41_ENGRAM_PAYLOAD_CACHE`. **Default:** auto.
 
-Transfers final state instead of intermediate FP32 K/V and caches repeated Engram payloads; unsplit prefill tiles are available as an opt-in.
+Transfers final state instead of intermediate FP32 K/V and caches repeated Engram payloads.
 
-- **Preconditions:** Row-split prefill with final ring/compressed-state owners; tile runs at least 2048 rows by default; a cache budget that fits memory.
-- **Automatic selection:** Final KV defaults to all; prefill tiles are off (split-K kernels), and with STRIX_DS41_PREFILL_TILES=1 they apply above the row threshold; payload caching is on with STRIX_DS41_ENGRAM_PAYLOAD_CACHE_MIB controlling its cap.
-- **Fallback notice:** Subthreshold tiling silently keeps split-K. Cache misses use normal reads. No general decline line is printed for these ordinary selections.
+- **Preconditions:** Row-split prefill with final ring/compressed-state owners; a cache budget that fits memory.
+- **Automatic selection:** Final KV defaults to all; payload caching is on with STRIX_DS41_ENGRAM_PAYLOAD_CACHE_MIB controlling its cap.
+- **Fallback notice:** Cache misses use normal reads. No general decline line is printed for these ordinary selections.
 - **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms. Final KV qualification used prefill --reference and identical decode continuation.
-- **Off switch:** STRIX_DS41_PREFILL_FINAL_KV=none or STRIX_DS41_ENGRAM_PAYLOAD_CACHE=0, separately (tiles are opt-in: STRIX_DS41_PREFILL_TILES=1)
-- **Measured gain:** Final KV 8K 714.9 -> 729.4 tok/s; cache 32K TTFT -1.63%; tiles on are slower on the current kernels (TTFT 2K/8K/32K +1.0/+3.4/+1.9 %), hence off
+- **Off switch:** STRIX_DS41_PREFILL_FINAL_KV=none or STRIX_DS41_ENGRAM_PAYLOAD_CACHE=0, separately
+- **Measured gain:** Final KV 8K 714.9 -> 729.4 tok/s; cache 32K TTFT -1.63%
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
 <a id="ds-prefetch"></a>

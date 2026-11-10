@@ -1509,7 +1509,6 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     const auto& c = m.model.config;
     namespace attn = ds41::attn;
     const std::uint32_t T = static_cast<std::uint32_t>(tokens.size());  // rows of this run, at positions [P0, P0 + T)
-    ds41::prefill_tuning::set_run_rows(T);  // the tile policy's size rule (ds41_prefill_tuning.hpp)
     const std::uint32_t P0 = start;
     const std::uint32_t max_rows = m.options.max_rows != 0U ? m.options.max_rows : m.options.max_positions;
     if (T == 0U || T > max_rows || std::uint64_t{P0} + T > m.options.max_positions)

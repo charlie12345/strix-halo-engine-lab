@@ -942,7 +942,7 @@ struct Engine::Impl {
     // Watchdog (default ON, STRIX_GLM_WATCHDOG=0 off): aborts the process (exit 86) near the OOM line (glm_mem.hpp).
     void start_monitor() {
         const char* tp = std::getenv("STRIX_GLM_MEMTRACE");
-        monitor = std::make_unique<mem::Monitor>(probe, tp ? std::string(tp) : std::string(), mem::Watchdog::from_env());
+        monitor = std::make_unique<mem::Monitor>(probe, tp ? std::string(tp) : std::string(), mem::Watchdog::from_env(opt.host_budget));
         monitor->phase("plan");
     }
 

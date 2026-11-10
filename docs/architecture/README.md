@@ -77,17 +77,6 @@ The decisions behind this path (D-021 to D-031, and the measured rejections) are
 ## Draft investigations
 
 - [Current qualification ledger](../reference/qualification-ledger.md).
-- [Portable correctness and precision foundations](../research/history/implementation-2026-10-11.md).
-- [Optimization lifetime implementation](../research/history/implementation-2026-10-12-optimization-lifetimes.md).
-- [Pre-hardware experiments](../research/history/implementation-2026-10-12-prehardware-experiments.md).
-- [Reusable execution components](../research/history/implementation-2026-10-12-execution-components.md).
-- [Complete C1 graph and GPU export prerequisites](../research/history/implementation-2026-10-12-complete-graph-and-export.md).
-- [Device-dynamic GDN and indexed attention](../research/history/implementation-2026-10-12-dynamic-state-operators.md).
-- [Experimental tiled integer LM-head consumer](../research/history/implementation-2026-10-12-integer-runtime.md).
-- [Hardware campaign preparation](../research/history/implementation-2026-10-12-hardware-campaign-preparation.md).
-- [Native numerical campaign preparation](../research/history/implementation-2026-10-12-native-numerical-campaign.md).
-- [Eager RAW baseline recording](../research/history/implementation-2026-10-12-raw-baseline-recording.md).
-- [Complete-model experimental decode recording](../research/history/implementation-2026-10-12-decode-execution-modes.md).
 - [Phase specific packed weights and integer execution](../research/proposals/2026-10-11-phase-specific-low-precision.md).
 - [Execution optimization gates](../research/proposals/2026-10-12-execution-optimization-gates.md).
 

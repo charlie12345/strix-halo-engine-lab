@@ -4,6 +4,7 @@
 #include "gemma4/prefill/pair.hpp"
 #include "gemma4/prefill/prefill.hpp"
 #include "strix/pair/link.hpp"
+#include "strix/pair/regime.hpp"
 #include "xport/hip_pipe_staging.hpp"
 #include <chrono>
 #include <cstdio>
@@ -47,7 +48,20 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
     const auto rank = pair::env_rank(prefix);
     const auto cut = env_cut(config);
     const auto count = pair_chunk_count(prompt.size(), chunk);
-    if (!count) throw std::invalid_argument("pair route needs a prompt longer than one decode tail (> 9 tokens)");
+    // Per-regime selection: a prompt of one chunk has nothing to overlap, so it runs on rank 1 alone.
+    const auto mode = pair::choose({prompt.size(), count, 0, 0, true}, {});
+    if (mode != pair::Mode::pipeline) {
+        auto pair_json = Json::object();
+        pair_json.set("rank", std::uint64_t(rank)); pair_json.set("mode", std::string("single")); pair_json.set("chunks", std::uint64_t(count));
+        if (rank == 0U) { auto receipt = Json::object(); receipt.set("pair", pair_json); emit({}, receipt); return 0; }
+        Coordinator coordinator(backend, runtime.drafts);
+        auto request = options.request; request.prompt.assign(prompt.begin(), prompt.end());
+        const auto slot = coordinator.submit(std::move(request));
+        coordinator.run();
+        auto receipt = coordinator.receipt(slot); receipt.set("stream", std::uint64_t(slot)); receipt.set("pair", pair_json);
+        emit(coordinator.result(slot).ids, receipt);
+        return coordinator.result(slot).status == Status::failed ? 1 : 0;
+    }
     // Both ranks must run the same model, tables, profile and cut: their words go in every seam header.
     std::uint64_t identity = fnv(14695981039346656037ULL, backend.identity().dump());
     identity = fnv(identity, std::to_string(cut) + ":" + std::to_string(prompt.size()));
@@ -75,6 +89,7 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
     prefill::pair_stage = {&pipe, rank, cut, 0, identity, nullptr, 0, 0};
     auto pair_json = Json::object();
     pair_json.set("rank", std::uint64_t(rank)); pair_json.set("cut", std::uint64_t(cut));
+    pair_json.set("mode", std::string("pipeline"));
     pair_json.set("chunks", std::uint64_t(count)); pair_json.set("seam_bytes_per_chunk", std::uint64_t(capacity));
     if (rank == 0U) {
         // Stage A: the coordinator's chunk schedule for this prompt, layers [0, cut) only. No decode.

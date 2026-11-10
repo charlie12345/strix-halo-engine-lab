@@ -2,6 +2,9 @@
 
 [English](README.md) · [Español](README.es.md) · [Main README](../../../README.md)
 
+The separate image runner's [two-node execution candidate](image-pair.md) describes
+sequence and request parallelism, VAE tile ownership and pending qualification.
+
 **A 5 s video clip with stereo audio in 405.5 s (6.8 min) on two Strix Halo nodes.**
 
 Text to video + audio, 1344x768, 124 frames (5.17 s at 24 fps) and 2-channel 32 kHz audio, 6 sampling steps (Euler,

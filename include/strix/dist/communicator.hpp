@@ -249,6 +249,10 @@ public:
     void exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag);
     // Per-communicator opt-in, without changing other engines/process environment.
     void enable_async_start() { async_start_ = true; }
+    // Enable before the first collective. Per-communicator scheduling policy for messages above GPU ring capacity:
+    // start the first chunk before caller work; finish drains it and the tail.
+    // Same bytes, chunk identities, route table and buffer lifetime as before.
+    void enable_direct_chunk_overlap() { direct_chunk_overlap_ = true; }
     // Fatal teardown: stop and join host submission before caller events/buffers
     // can be retired. The communicator remains poisoned; caller must drain GPU work.
     void cancel_pending(const std::string& reason) noexcept;
@@ -400,6 +404,7 @@ private:
     void finish_pipeline(hipStream_t stream, void* remote);
     std::unique_ptr<DeviceExchange> direct_;
     bool direct_started_ = false;
+    bool direct_chunk_overlap_ = false;
     std::vector<Route> routes_;
     void configure_routes();
     [[nodiscard]] const Route& route(std::size_t bytes) const;

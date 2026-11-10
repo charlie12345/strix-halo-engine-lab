@@ -122,6 +122,19 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+class Bf16DeviceLinear final : public DeviceLinearOp {
+public:
+    Bf16DeviceLinear();
+    ~Bf16DeviceLinear() override;
+    void prepare(const std::shared_ptr<const BlockWeights>& b) override;
+    bool prepared(std::uint32_t block) const override;
+    void run(std::uint32_t block, LinearKind kind, const std::uint16_t* x, std::uint32_t m,
+             std::uint16_t* y, void* stream) override;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // The attn package's flash attention (split-KV partials + canonical merge over key_cuts()).
 class FlashDeviceAttention final : public DeviceAttentionOp {
 public:
@@ -169,6 +182,10 @@ public:
     StreamOutputs run(BlockSource& blocks, const PackedLayout& L, const ForwardPlan& p, const StreamInputs& in,
         DeviceLinearOp& lin, DeviceAttentionOp& att, DeviceForwardTaps* taps = nullptr, const PddContext* pdd = nullptr);
 
+    // Optional eager residency, without a model evaluation or sampler/RNG mutation.
+    // Reuses the same preparation as run(); repeated calls are no-ops.
+    void prepare(BlockSource& blocks, DeviceLinearOp& lin);
+
     // condition_proj + token refiner on the device (bf16 linears resident after the first call); text [L][5120] bf16
     // -> [L][5376] bf16 (bitwise == text_refine_host with the same attention arithmetic).
     std::vector<std::uint16_t> refine_text(const std::uint16_t* text, std::uint32_t L, DeviceAttentionOp& att);
@@ -178,6 +195,10 @@ public:
     // strict: throw when a forward flushed rotation groups (the gemm package's exact-rotation window);
     // default false: the count is returned in DeviceForwardTaps::flushed_groups.
     void set_strict_flush(bool strict);
+    // Attention admission limit on the measured max||q|| max||k|| log2(e)/sqrt(128): kAttnScoreLimit (2^14, the
+    // qualified domain, default) or kAttnScoreLimitExtended (2^15, explicit opt-in: every |score c| stays below 2^15,
+    // the kernel's bound_rows telemetry line, exp2 arguments stay <= 0 and mc rounds within 2^-10). Other values throw.
+    void set_attn_score_limit(double limit);
 
     // Accelerated forms (turbo_accel.hpp); default: none (the dense forward). Turbo needs a non-fused DeviceLinearOp
     // whose blocks come from a MergedFc2Source; it also applies to refine_text. reset_accel_run(): start of a sampling

@@ -48,7 +48,21 @@ struct Weights {
     const std::int8_t* codes = nullptr;  // device, [n][k] row-major (16-byte aligned)
     const float* scales = nullptr;       // device, [n]
     std::uint32_t n = 0, k = 0;
+    Operand operand = Operand::int8_convrot;
+    const std::uint8_t* group_fp8 = nullptr;
+    const float* group_f32 = nullptr;
+    const float* codebook = nullptr;
+    std::uint32_t group_size = 16;
+    const std::uint8_t* scale_ids = nullptr;
+    const std::uint16_t* pair_lut = nullptr;
+    unsigned group_shift = 0;
 };
+
+inline void set_operand(dev::GemmArgs& a, const Weights& w) {
+    a.operand=w.operand; a.group_fp8=w.group_fp8; a.group_f32=w.group_f32;
+    a.codebook=w.codebook; a.group_size=w.group_size;
+    a.scale_ids=w.scale_ids; a.pair_lut=w.pair_lut; a.group_shift=w.group_shift;
+}
 
 namespace detail {
 inline void hip_check(hipError_t e, const char* what) {
@@ -157,6 +171,9 @@ inline void check(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t rows
     else if (!w.k || w.k % 256U || w.k > 16384U) bad = "k must be a positive multiple of 256, at most 16384";
     else if (!w.n || w.n % (swiglu ? 512U : 256U)) bad = swiglu ? "n must be a positive multiple of 512" : "n must be a positive multiple of 256";
     else if (!w.codes || !w.scales || !aligned16(w.codes)) bad = "weights missing or not 16-byte aligned";
+    else if (w.operand==Operand::w4a8 && ((w.pair_lut ? (!w.scale_ids || w.group_shift>=32U ||
+             (1U<<w.group_shift)!=w.group_size) : (!w.group_fp8==!w.group_f32)) || w.group_size<4 ||
+             (16%w.group_size && w.group_size%16) || w.k%w.group_size)) bad="invalid packed operand scales";
     else if (static_cast<std::uint64_t>(rows) * w.k > 0xffffffffULL || static_cast<std::uint64_t>(w.n) * w.k > 0xffffffffULL)
         bad = "rows * k and n * k must stay below 2^32 (split the rows)";
     else if (!ws.codes() || rows > ws.max_rows() || w.k > ws.max_k()) bad = "workspace too small";
@@ -178,6 +195,7 @@ inline void linear(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t row
     dev::GemmArgs a;
     a.a = ws.codes(); a.b = w.codes; a.row_scale = ws.row_scale(); a.ch_scale = w.scales; a.m = rows; a.n = w.n; a.k = w.k;
     a.out.ptr[0] = y; a.out.ld = y_ld; a.out.seg_cols = w.n;
+    set_operand(a, w);
     if (detail::wide_tiles(rows, w)) launch_gemm<256U, dev::Epi::plain>(a, stream);
     else launch_gemm<128U, dev::Epi::plain>(a, stream);
     detail::launched("gemm launch");
@@ -193,6 +211,7 @@ inline void linear_fc1_swiglu(const std::uint16_t* x, std::uint64_t x_ld, std::u
     dev::GemmArgs a;
     a.a = ws.codes(); a.b = permuted.codes; a.row_scale = ws.row_scale(); a.ch_scale = permuted.scales; a.silu = table;
     a.m = rows; a.n = permuted.n; a.k = permuted.k;
+    set_operand(a, permuted);
     a.out.ptr[0] = h; a.out.ld = h_ld; a.out.seg_cols = permuted.n / 2U;
     launch_gemm<256U, dev::Epi::swiglu>(a, stream);
     detail::launched("gemm launch");

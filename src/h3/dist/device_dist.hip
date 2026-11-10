@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include "h3/dist/device_dist.hpp"
+#include "h3/gemm/dense.hpp"
 
 #include <algorithm>
 #include <map>
@@ -17,6 +18,7 @@
 
 #include "h3/attn/attn.hpp"
 #include "h3/block/glue.hpp"
+#include "h3/block/weights_device.hpp"
 #include "h3/gemm/api.hpp"
 #include "h3/dist/accel.hpp"
 #include "h3/levers/fbc/fbc.hpp"
@@ -206,7 +208,9 @@ std::uint64_t residual_digest(const std::uint16_t* x, std::uint64_t n, std::uint
 // --------------------------------------------------------------------------------------------- resident weights
 struct DeviceModel::Impl {
     struct Block {
+        bool dense_bf16 = false;
         Buf qkv_c, qkv_s, out_c, out_s, fc1_c, fc1_s, fc2_c, fc2_s, norm1, norm2, qn, kn, ada_w, ada_b;
+        std::array<Buf,3> qkv_p, out_p, fc1_p, fc2_p;
         std::uint32_t ada_n = 0;
         gemm::Weights qkv, out, fc1, fc2;
     };
@@ -239,7 +243,7 @@ double admission_bound(const block::BlockWeights& b) {
 DeviceModel::DeviceModel(const block::GlobalWeights& g, block::BlockSource& src, std::uint32_t nblocks, bool fc1_plain)
     : impl_(std::make_unique<Impl>()) {
     const std::uint32_t basis = g.basis;
-    impl_->fc1_plain = fc1_plain;
+    impl_->fc1_plain = fc1_plain || !g.audio_enabled;
     impl_->basis = basis;
     impl_->g = &g;
     impl_->final_norm = upload(g.final_norm);
@@ -257,16 +261,20 @@ DeviceModel::DeviceModel(const block::GlobalWeights& g, block::BlockSource& src,
     for (std::uint32_t i = 0; i < nblocks; ++i) {
         const auto b = src.block(i);
         auto& d = impl_->blocks[i];
-        auto q = [&](const block::QLinear& l, Buf& c, Buf& sc, gemm::Weights& w) {
-            c = upload(l.w);
+        auto q = [&](const block::QLinear& l, Buf& c, Buf& sc, gemm::Weights& w, std::array<Buf,3>& packed) {
+            if (!l.bf16.empty()) c = upload(l.bf16);
+            else c = upload(l.w);
             sc = upload(l.ws);
             w = gemm::Weights{c.as<std::int8_t>(), sc.as<float>(), l.n, l.k};
+            block::upload_operand(l,w,packed,[](const auto& v) { return upload(v); });
+            for (const auto& buf:packed) impl_->bytes+=buf.bytes();
             impl_->bytes += c.bytes() + sc.bytes();
         };
-        q(b->qkv, d.qkv_c, d.qkv_s, d.qkv);
-        q(b->out, d.out_c, d.out_s, d.out);
-        if (fc1_plain) {
-            q(b->fc1, d.fc1_c, d.fc1_s, d.fc1);
+        q(b->qkv, d.qkv_c, d.qkv_s, d.qkv, d.qkv_p);
+        d.dense_bf16 = !b->qkv.bf16.empty();
+        q(b->out, d.out_c, d.out_s, d.out, d.out_p);
+        if (fc1_plain || d.dense_bf16) {
+            q(b->fc1, d.fc1_c, d.fc1_s, d.fc1, d.fc1_p);
         } else {
             const gemm::SwiGLUWeights p = gemm::permute_fc1_for_swiglu(b->fc1.w.data(), b->fc1.ws.data(), b->fc1.n, b->fc1.k);
             d.fc1_c = upload(p.codes);
@@ -274,7 +282,7 @@ DeviceModel::DeviceModel(const block::GlobalWeights& g, block::BlockSource& src,
             d.fc1 = gemm::Weights{d.fc1_c.as<std::int8_t>(), d.fc1_s.as<float>(), b->fc1.n, b->fc1.k};
             impl_->bytes += d.fc1_c.bytes() + d.fc1_s.bytes();
         }
-        q(b->fc2, d.fc2_c, d.fc2_s, d.fc2);
+        q(b->fc2, d.fc2_c, d.fc2_s, d.fc2, d.fc2_p);
         d.norm1 = upload(b->norm1);
         d.norm2 = upload(b->norm2);
         d.qn = upload(b->q_norm);
@@ -633,7 +641,8 @@ DeviceRunResult DeviceDistRank::run_blocks(const ForwardTables& t, std::uint32_t
             // attention half: K3, QKV (local rows)
             block::gpu::launch_rmsnorm_mod(x, W.norm1.as<std::uint16_t>(), mr, mod[1], mod[0], n, kHidden, kNormEps, h, sv);
             pm(kpNorm);
-            gemm::linear(h, kHidden, n, W.qkv, I.ws, qkv, 3U * kInner, s);
+            if (W.dense_bf16) gemm::dense_bf16(h,W.qkv_c.as<std::uint16_t>(),n,3U*kInner,kHidden,qkv,sv);
+            else gemm::linear(h, kHidden, n, W.qkv, I.ws, qkv, 3U * kInner, s);
             pm(kpQkv);
             if (turbo) A->T->device().apply(lora::Site::kQkv, i, h, kHidden, n, qkv, 3U * kInner, s);
             if (turbo) pm(kpTurbo);
@@ -761,7 +770,8 @@ DeviceRunResult DeviceDistRank::run_blocks(const ForwardTables& t, std::uint32_t
             attn::launch_merge(P, 2, attn::Output{ao, nullptr, kInner}, sv);
             rec(i, 4);
             pm(kpAttnRemote);
-            gemm::linear(ao, kInner, n, W.out, I.ws, o, kHidden, s);
+            if (W.dense_bf16) gemm::dense_bf16(ao,W.out_c.as<std::uint16_t>(),n,kHidden,kInner,o,sv);
+            else gemm::linear(ao, kInner, n, W.out, I.ws, o, kHidden, s);
             pm(kpOut);
             if (turbo) A->T->device().apply(lora::Site::kOut, i, ao, kInner, n, o, kHidden, s);
             if (turbo) pm(kpTurbo);
@@ -772,7 +782,8 @@ DeviceRunResult DeviceDistRank::run_blocks(const ForwardTables& t, std::uint32_t
             pm(kpNorm);
             if (unfused) {  // fc1 in checkpoint order [rows][28672], Turbo branch, K5 SwiGLU (== the fused epilogue's bits)
                 std::uint16_t* f1 = d_f1.as<std::uint16_t>();
-                gemm::linear(h, kHidden, n, W.fc1, I.ws, f1, 2U * kFfn, s);
+                if (W.dense_bf16) gemm::dense_bf16(h,W.fc1_c.as<std::uint16_t>(),n,2U*kFfn,kHidden,f1,sv);
+                else gemm::linear(h, kHidden, n, W.fc1, I.ws, f1, 2U * kFfn, s);
                 pm(kpFc1);
                 if (turbo) A->T->device().apply(lora::Site::kFc1, i, h, kHidden, n, f1, 2U * kFfn, s);
                 if (turbo) pm(kpTurbo);
@@ -782,7 +793,8 @@ DeviceRunResult DeviceDistRank::run_blocks(const ForwardTables& t, std::uint32_t
                 gemm::linear_fc1_swiglu(h, kHidden, n, W.fc1, I.ws, sw, kFfn, s);
                 pm(kpFc1);
             }
-            gemm::linear(sw, kFfn, n, W.fc2, I.ws, o, kHidden, s);
+            if (W.dense_bf16) gemm::dense_bf16(sw,W.fc2_c.as<std::uint16_t>(),n,kHidden,kFfn,o,sv);
+            else gemm::linear(sw, kFfn, n, W.fc2, I.ws, o, kHidden, s);
             pm(kpFc2);
             if (turbo_fc2) {  // step LoRAs: run-time fc2 branch right after the int8 fc2 GEMM (local rows), before the gate
                 A->T->device().apply(lora::Site::kFc2, i, sw, kFfn, n, o, kHidden, s);
@@ -941,7 +953,7 @@ DeviceRunResult DeviceDistRank::run_blocks(const ForwardTables& t, std::uint32_t
             else ops.insert(ops.begin(), &theirs);
             rows.push_back(peer.back());
         }
-        const AdmissionResult ad = admit(ops, rows, nblocks);  // throws ContractViolation (run / forward cancel the transport)
+        const AdmissionResult ad = admit(ops, rows, nblocks, opt.score_bound);  // throws ContractViolation (run / forward cancel the transport)
         res.admission_bound = ad.worst;
         res.admission_block = ad.worst_block;
         res.v_max = ad.v_max;
@@ -984,7 +996,7 @@ bool seg_overlap(const block::PackedLayout& L, block::SegKind kind, std::uint32_
 }  // namespace
 
 DeviceDistRank::ForwardResult DeviceDistRank::forward(const block::PackedLayout& L, const block::ForwardPlan& p, const block::StreamInputs& in,
-    const ForwardTables& t, std::uint32_t nblocks, const DeviceRunOptions& opt, DistAccel* accel) {
+    const ForwardTables& t, std::uint32_t nblocks, const DeviceRunOptions& opt, DistAccel* accel, const block::PddContext* pdd) {
     if (accel && accel->impl().dead) throw std::logic_error("h3 dist accel: failed earlier (pair-wide abort): rebuild the pair and the accelerators");
     impl_->acc = accel;
     try {
@@ -994,7 +1006,7 @@ DeviceDistRank::ForwardResult DeviceDistRank::forward(const block::PackedLayout&
             A.deltas = A.T->adaln_deltas(*impl_->M.g, t.t_emb, t.n_t);
             A.last.adaln_idx = A.deltas.idx;
         }
-        ForwardResult r = forward_impl(L, p, in, t, nblocks, opt);
+        ForwardResult r = forward_impl(L, p, in, t, nblocks, opt, pdd);
         impl_->acc = nullptr;
         return r;
     } catch (const std::exception& e) {
@@ -1009,7 +1021,7 @@ DeviceDistRank::ForwardResult DeviceDistRank::forward(const block::PackedLayout&
 }
 
 DeviceDistRank::ForwardResult DeviceDistRank::forward_impl(const block::PackedLayout& L, const block::ForwardPlan& p, const block::StreamInputs& in,
-    const ForwardTables& t, std::uint32_t nblocks, const DeviceRunOptions& opt) {
+    const ForwardTables& t, std::uint32_t nblocks, const DeviceRunOptions& opt, const block::PddContext* pdd) {
     Impl& I = *impl_;
     const DeviceModel::Impl& M = I.M;
     const block::GlobalWeights& g = *M.g;
@@ -1065,7 +1077,7 @@ DeviceDistRank::ForwardResult DeviceDistRank::forward_impl(const block::PackedLa
     const auto t2 = now();
     // ---- final layer of the rank's video / audio rows (row-local), fp32 rows
     block::F32Linear vbank, abank;
-    const bool bank = block::select_heads(g, p, nullptr, vbank, abank);
+    const bool bank = block::select_heads(g, p, pdd, vbank, abank);
     Buf d_vbw, d_vbb, d_abw, d_abb;
     if (bank) {
         d_vbw = upload(vbank.w);

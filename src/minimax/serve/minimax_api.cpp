@@ -191,7 +191,7 @@ void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std
         job.session = session_id;
     }
     job.max_tokens = max_tokens;
-    job.stop_tokens = {tok_.eos_id};
+    job.stop_tokens.push_back(tok_.eos_id);  // not = {eos}: gcc 14 -O3 reports a false -Warray-bounds on the one-element list
     const bool named_session = !job.session.empty();
     const std::size_t prompt_tokens = job.prompt.size();
     auto ticket = queue_.submit(std::move(job));

@@ -1514,7 +1514,7 @@ int main() {
         std::thread runner([&] { lead.loop(); });
         std::vector<std::uint32_t> q8k;
         for (unsigned i = 0; q8k.size() < 8188; ++i) q8k.insert(q8k.end(), {11U, 100000U + i % 997U});
-        q8k.insert(q8k.end(), {102340U, 11U, 102573U, 22U});
+        for (const std::uint32_t t : {102340U, 11U, 102573U, 22U}) q8k.push_back(t);  // not insert({...}): gcc 14 -O3 reports a false -Wstringop-overflow
         auto run = [&](bool routed) {
             lead.set_route(routed);
             sv::GenerationJob j;

@@ -29,10 +29,10 @@ struct Trace {
     void cancel_all() { if (open) prefill_cancel(active); if (parked) prefill_cancel(parked); }
     void retire_contexts(unsigned mask) { calls.push_back(1300 + mask); }
     void set_taps(bool on) { calls.push_back(on ? 81 : 80); }
-    void prefill_begin(unsigned slot, std::span<const unsigned> prompt, bool context, std::uint64_t id, std::uint64_t p, std::uint64_t g) {
+    void prefill_begin(unsigned slot, std::span<const unsigned> prompt, bool context, std::uint64_t id, std::uint64_t p, std::uint64_t g, std::uint64_t resident = 0) {
         if (open || (p != 0 && (parked != p || id == p))) throw std::runtime_error("wrong begin");
         active = id; parent = p; generation = g;
-        calls.push_back(200 + slot + static_cast<unsigned>(prompt.size()) + (context ? 10 : 0)); open = true;
+        calls.push_back(200 + slot + static_cast<unsigned>(resident + prompt.size()) + (context ? 10 : 0)); open = true;
     }
     bool prefill_unit(unsigned layers, unsigned*) { calls.push_back(layers); return false; }
     void prefill_cancel(std::uint64_t id = 0) {
@@ -45,7 +45,7 @@ struct Trace {
     void step(std::span<const unsigned> rows, unsigned append) { calls.push_back(300 + static_cast<unsigned>(rows.size()) + append); }
 };
 struct Control {
-    unsigned command = 0, bank = 0, plen = 0, pslot = 0, pflags = 0, layers = 0, rows = 0, append = 0, dslots = 0;
+    unsigned command = 0, bank = 0, plen = 0, pslot = 0, pstart = 0, pflags = 0, layers = 0, rows = 0, append = 0, dslots = 0;
     unsigned row[8]{}, dslot[8]{}, danchor[8]{};
     std::uint64_t dpos[8]{}, task_id = 0, parent_task_id = 0, slot_generation = 0;
 };

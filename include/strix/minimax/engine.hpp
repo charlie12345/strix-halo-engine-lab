@@ -109,8 +109,11 @@ public:
     [[nodiscard]] unsigned nested_rows() const;
     [[nodiscard]] const char* nested_reason() const;
     [[nodiscard]] PfProgress prefill_progress(bool parked = false) const;
+    // `resident` positions of `slot`'s cache are a reused prefix that precedes `tokens`; prefill opens at that
+    // position (0 = the whole prompt). Causal attention makes the result identical to prefilling from 0.
     void prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t generation,
-                            std::uint32_t slot, std::span<const std::uint32_t> tokens, PrefillTapSink sink);
+                            std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t resident,
+                            PrefillTapSink sink);
     void prefill_park(PfTaskId id);
     void prefill_resume_parked(PfTaskId id);
     void prefill_cancel(PfTaskId id);

@@ -1364,13 +1364,19 @@ struct Engine::Impl {
     }
 
     // The post-exchange kernel on a prefill module view: rank 0's / rank 1's partials read in place from the TX / RX slots.
+    // Optional destinations (all three or none) redirect the normed rows, route ids and route weights, e.g. straight into
+    // the grouped MoE arena; the kernel and its math are unchanged, only the store addresses move.
     void post_view(std::size_t n, const strix::minimax::pfx::Exchanger::View& x, const float* norm_w, const float* router_w,
-                   const float* bias) {
+                   const float* bias, float* hn_dst = nullptr, std::uint32_t* ids_dst = nullptr, float* wts_dst = nullptr) {
         const auto* local = static_cast<const float*>(x.local);
         const auto* peer = static_cast<const float*>(x.peer);
         wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
+        const bool redirect = hn_dst != nullptr;
+        if (redirect != (ids_dst != nullptr) || redirect != (wts_dst != nullptr))
+            throw std::logic_error("minimax post_view: redirect needs all three destinations");
         enqueue_post({static_cast<std::uint32_t>(n), h, opt.rank == 0 ? local : peer, opt.rank == 0 ? peer : local,
-                                         norm_w, hn, router_w, bias, ids_d, wts4_d}, nullptr);
+                                         norm_w, redirect ? hn_dst : hn, router_w, bias, redirect ? ids_dst : ids_d,
+                                         redirect ? wts_dst : wts4_d}, nullptr);
         if (pf_active) pf->retire();  // the only consumer of both slots is enqueued
     }
 
@@ -2482,13 +2488,15 @@ struct Engine::Impl {
                 use(c);
                 const auto view = recv(c);
                 if (tl) tl->mark("attention-post-router", true);
-                post_view(N[c], view, y.w_post, y.wr, y.wb);
+                // Grouped chain: the post kernel stores normed rows, ids and weights straight into the arena (no D2D copies).
+                if(chain_group)
+                    post_view(N[c], view, y.w_post, y.wr, y.wb, i4_group_x+group_first*kHidden, i4_group_routes+group_first*kTopE,
+                              reinterpret_cast<float*>(i4_group_routes+(toks.size()+group_first)*kTopE));
+                else
+                    post_view(N[c], view, y.w_post, y.wr, y.wb);
                 last_read(c);
                 if (tl) tl->mark("attention-post-router", false);
                 if(chain_group) {
-                    hip_ok(hipMemcpyAsync(i4_group_x+group_first*kHidden,hn,N[c]*kHidden*4,hipMemcpyDeviceToDevice,nullptr),"group input");
-                    hip_ok(hipMemcpyAsync(i4_group_routes+group_first*kTopE,route_d,N[c]*kTopE*4,hipMemcpyDeviceToDevice,nullptr),"group route ids");
-                    hip_ok(hipMemcpyAsync(i4_group_routes+(toks.size()+group_first)*kTopE,route_d+N[c]*kTopE,N[c]*kTopE*4,hipMemcpyDeviceToDevice,nullptr),"group route weights");
                     group_first+=N[c];
                 } else {
                     float* o=out_of(c);

@@ -3378,8 +3378,12 @@ row's eight routed experts x two matrices and the shared expert. The default til
 per (pair, matrix), 18 times, from an x buffer that is not cache resident at 8K. Device plan only (the host plan
 keeps the tile-ordered kernel); rows the device plan rejects get only their shared-expert rows, as before. Same
 operations in the same order, so the operand rows and every downstream output are bitwise equal (test:
-`strix-hip-glm5-pf-exact-moe-tests`, device-plan arm). OFF: unset or `0`. Timing qualification: see
-`wave4/pfwhy/glm-exactfuse-log.md` in the lab notes; no production default change is claimed until it is measured.
+`strix-hip-glm5-pf-exact-moe-tests`, device-plan arm). OFF: unset or `0`.
+- **Measured gain (TP2, GLM-5.3-Flash EXL3 4.05 bpw, one binary, unprofiled):** FAST identity 8K warm prefill ABAB,
+  4 pairs in both orders: 10.55 -> 10.21 s (pair deltas -0.32, -0.31, -0.20 s and one -1.46 s outlier pair; median
+  -0.31 s). Exact identity 8K: 13.195 -> 12.868 s with identical full logits files on both ranks. FAST 32K:
+  43.49 -> 42.39 s (one pair). Logits and state digests identical to the unset arm in every run. Opt-in until the
+  default is reviewed.
 
 <a id="glm-pf-scratch"></a>
 ### Prefill scratch capacity (`STRIX_GLM_PF_SCRATCH`)

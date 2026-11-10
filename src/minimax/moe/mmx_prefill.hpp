@@ -10,7 +10,8 @@
 // partials are reduced in ascending split order before the output Hadamard, as output_transform does.
 //
 // Launches: gather+transform, gate/up (grouped WMMA), gate/up finish + SwiGLU + down transform, down (grouped WMMA,
-// one launch per row-tile class), down finish + combine. Routes come from the host (as in G4; one D2H per chunk).
+// one launch per row-tile class), down finish + combine. Routes come from the host (as in G4; one D2H per chunk), or
+// stay on the device with the device plan (enqueue_prefill_moe_device).
 #include "minimax/moe/mmx_moe.hpp"
 
 #include <array>
@@ -53,6 +54,25 @@ std::size_t prefill_moe_workspace_bytes(const PrefillMoeView& v);
 // Upper bound for any routes of T rows.
 std::size_t prefill_moe_workspace_bound(std::uint32_t rows);
 void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream);
+// Device plan (default; STRIX_MMX_PF_PLAN=host keeps the host plan above): the same tables and launches built on the
+// GPU from the device routes by the shared moe_core::device_plan, so a call needs no route download, host sync, host
+// table build or upload. Selected for the v4 core with mtfit and without gufuse (the defaults); the workspace is
+// prefill_moe_workspace_bound(rows). Same bits as enqueue_prefill_moe.
+struct PrefillMoeDeviceView {
+    std::uint32_t rows = 0;                 // T
+    const float* y = nullptr;               // T x 6144 normed hidden (device)
+    const std::uint32_t* routes = nullptr;  // device: T x 4 expert ids, then T x 4 float weights (the router layout)
+    const ExpertSlices* experts = nullptr;  // device array [128]
+    ExpertSlices shared{};
+    float* out = nullptr;                   // T x 6144 (device)
+};
+bool prefill_moe_device_plan(std::uint32_t rows);
+void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes,
+                                hipStream_t stream);
+// After the stream completed: throws (once) when a device-planned call met invalid routes (an id >= 128 or repeated
+// in a row; such a row was planned as experts 0..3 with weight 0). A failed exchange is the only known source.
+void prefill_moe_device_check();
+void cleanup_prefill_device_plan() noexcept;
 // WMMA core of the gate/up and down stages (same bits): 0 = library port, 1 = v2, 2 = v3, 3 = v4 (v3 + tile-major
 // transformed rows; mmx_prefill_core.hpp), -1 = the process default from STRIX_MMX_PREFILL_CORE (v4 = default | v3 |
 // v2 | lib). Any other value throws.

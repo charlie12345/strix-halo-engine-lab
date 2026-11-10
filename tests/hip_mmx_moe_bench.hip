@@ -1482,6 +1482,79 @@ struct Bench {
             free_prefill(q);
         }
     }
+    // Device plan (enqueue_prefill_moe_device) == host plan (enqueue_prefill_moe), bitwise, over row counts and the
+    // MT8 kernel switches; routes in the router layout with each row's slots rotated (the planner sorts them); an
+    // invalid row (repeated id) is reported by prefill_moe_device_check.
+    void test_prefill_device() {
+        struct Arm { const char* name; int pipe, pair, core8, tails; };
+        const Arm arms[] = {{"default", -1, -1, -1, -1}, {"pipe0", 0, -1, 0, -1}, {"core8.1", 0, -1, 1, -1}, {"core8.2", 0, -1, 2, -1},
+                            {"pipe.pair", 1, 1, 0, -1}, {"pipe2.pair", 2, 1, 0, -1}, {"pipe2", 2, 0, 0, -1}, {"tails0", -1, -1, -1, 0}};
+        opt::ExpertSlices* ex_d = nullptr;
+        for (unsigned T : {5U, 16U, 100U, 333U, 2048U, 4096U}) {
+            Prefill q = make_prefill(T);
+            if (ex_d == nullptr) ex_d = dalloc<opt::ExpertSlices>(opt::kExperts);
+            hip_ok(hipMemcpy(ex_d, q.ex.data(), opt::kExperts * sizeof(opt::ExpertSlices), hipMemcpyHostToDevice), "experts");
+            std::vector<std::uint32_t> routes(std::size_t{T} * 8);
+            for (unsigned t = 0; t < T; ++t)
+                for (unsigned k = 0; k < 4; ++k) {
+                    const unsigned src = (k + t) % 4U;  // rotated slots
+                    routes[std::size_t{t} * 4 + k] = q.ids[std::size_t{t} * 4 + src];
+                    std::memcpy(&routes[std::size_t{T} * 4 + std::size_t{t} * 4 + k], &q.w4[std::size_t{t} * 4 + src], 4);
+                }
+            auto* routes_d = dalloc<std::uint32_t>(routes.size());
+            hip_ok(hipMemcpy(routes_d, routes.data(), routes.size() * 4, hipMemcpyHostToDevice), "routes");
+            const std::size_t dbytes = std::max(q.ws_bytes, opt::prefill_moe_workspace_bound(T));
+            void* dws = nullptr;
+            hip_ok(hipMalloc(&dws, dbytes), "device plan ws");
+            float* outD = dalloc<float>(std::size_t{T} * H);
+            opt::PrefillMoeDeviceView dv;
+            dv.rows = T;
+            dv.y = q.yy;
+            dv.routes = routes_d;
+            dv.experts = ex_d;
+            dv.shared = L.shared;
+            dv.out = outD;
+            for (const Arm& arm : arms) {
+                if (arm.pipe >= 0) opt::set_prefill_pipe(arm.pipe);
+                if (arm.pair >= 0) opt::set_prefill_pipe_pair(arm.pair);
+                if (arm.core8 >= 0) opt::set_prefill_core8(arm.core8);
+                if (arm.tails >= 0) opt::set_prefill_tail_stream(arm.tails);
+                check(opt::prefill_moe_device_plan(T), "device plan selected");
+                prefill_B(q);
+                hip_ok(hipMemsetAsync(outD, 0xff, std::size_t{T} * H * 4, nullptr), "poison");
+                opt::enqueue_prefill_moe_device(dv, dws, dbytes, nullptr);
+                hip_ok(hipDeviceSynchronize(), "device plan");
+                opt::prefill_moe_device_check();
+                opt::set_prefill_pipe(-1);
+                opt::set_prefill_pipe_pair(-1);
+                opt::set_prefill_core8(-1);
+                opt::set_prefill_tail_stream(-1);
+                std::size_t at = 0;
+                const auto b2 = d2h(q.outB, std::size_t{T} * H), d = d2h(outD, std::size_t{T} * H);
+                const bool same = same_bits(b2, d, &at);
+                check(same, "prefill device plan T=" + std::to_string(T) + " " + arm.name + " differs at " + std::to_string(at));
+                std::printf("prefill device plan test T=%u %s: %s\n", T, arm.name, same ? "bitwise" : "DIFF");
+            }
+            {  // invalid row: repeated expert id -> flagged, no fault
+                std::vector<std::uint32_t> bad = routes;
+                bad[1] = bad[0];
+                hip_ok(hipMemcpy(routes_d, bad.data(), bad.size() * 4, hipMemcpyHostToDevice), "bad routes");
+                opt::enqueue_prefill_moe_device(dv, dws, dbytes, nullptr);
+                hip_ok(hipDeviceSynchronize(), "device plan bad");
+                bool threw = false;
+                try { opt::prefill_moe_device_check(); } catch (const std::runtime_error&) { threw = true; }
+                check(threw, "device plan flags an invalid row T=" + std::to_string(T));
+                bool again = false;
+                try { opt::prefill_moe_device_check(); } catch (const std::runtime_error&) { again = true; }
+                check(!again, "device plan flag resets after the check");
+            }
+            hip_ok(hipFree(dws), "free");
+            hip_ok(hipFree(outD), "free");
+            hip_ok(hipFree(routes_d), "free");
+            free_prefill(q);
+        }
+        if (ex_d != nullptr) hip_ok(hipFree(ex_d), "free");
+    }
     void bench_prefill() {
         for (unsigned T : {256U, 1024U}) {
             const std::string cell = "prefill_moe T" + std::to_string(T);
@@ -3085,6 +3158,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) test_section("test_diverse", [&] { b.test_diverse(); });
             if (!o.no_moe) test_section("test_router_rows", [&] { b.test_router_rows(); });
             if (!o.no_moe) test_section("test_prefill", [&] { b.test_prefill(); });
+            if (!o.no_moe) test_section("test_prefill_device", [&] { b.test_prefill_device(); });
             if (!o.no_moe) test_section("test_prefill_v2", [&] { b.test_prefill_v2(); });
             if (!o.no_moe) test_section("test_prefill_mtfit", [&] { b.test_prefill_mtfit(); });
             if (!o.no_moe) test_section("test_prefill_core8", [&] { b.test_prefill_core8(); });

@@ -4,6 +4,7 @@
 
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
+#include "moe_core/device_plan.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -1018,6 +1019,397 @@ void fill_items(Plan& p, unsigned char* ws) {
     }
 }
 
+// ---------------------------------------------------------------- device plan (STRIX_MMX_PF_PLAN, default device)
+// The v4 + mtfit tables of make_plan / fill_items_v2 built on the GPU from the device routes by the shared planner
+// (moe_core/device_plan.hpp): no route download, host sync, host table build or table upload per MoE call. Groups are
+// not compacted (group x = expert x, shared = kExperts; an absent expert has n = 0 and no pairs or items), the
+// tile-major stride `tpairs` is the bound 5T + 15 x 129, and every (stage, class) item list has a fixed slot; the pair,
+// token, group-member and item contents are those of the host plan, so every CTA does the host CTA's work.
+namespace dp = ::strix::moe_core::device_plan;
+using Queue = dp::ItemQueue<pfk::Item>;
+constexpr unsigned kDevGroups = kExperts + 1;
+constexpr unsigned kGuSlot = 2 * kDevGroups, kDnSlot = kDevGroups;  // items per class: gate+up per group / down
+constexpr unsigned kDevItems = 8 * kGuSlot + 8 * kDnSlot;
+struct DevMeta {  // [0..7] gate/up classes, [8..15] down classes
+    unsigned count[16], total[16], next[16];
+};
+struct DevOut {
+    PGroup* groups;
+    std::uint32_t* pair_row;
+    std::uint32_t* pair_group;
+    std::uint32_t* tok_pair;
+    float* tok_w;
+    pfk::Item* items;
+    DevMeta* meta;
+    const ExpertSlices* experts;  // device [kExperts]
+    ExpertSlices shared;
+    _Float16* xt;
+    _Float16* at;
+    float* part;
+    unsigned tpairs;
+};
+struct DevPolicy {
+    static constexpr unsigned kExperts = ::strix::minimax::moe::opt::kExperts, kTopK = kTopE, kRows = 256;
+    static constexpr bool kDropInvalid = false;  // keep 5T pairs: an invalid row plans experts 0..3 with weight 0
+    using Out = DevOut;
+    using A = dp::Args<DevPolicy>;
+    // The token order of make_plan: the row's 4 (id, weight) in ascending id (a sorting network; the ids of a valid row
+    // are distinct, so the order is that of the insertion sort).
+    __device__ static bool load(const A& p, unsigned r, unsigned (&e)[kTopE], float (&w)[kTopE]) {
+#pragma unroll
+        for (unsigned k = 0; k < kTopE; ++k) {
+            e[k] = p.ids[std::size_t{r} * kTopE + k];
+            w[k] = p.weights[std::size_t{r} * kTopE + k];
+        }
+        auto cs = [&](unsigned i, unsigned j) {
+            if (e[i] > e[j]) {
+                const unsigned te = e[i];
+                e[i] = e[j];
+                e[j] = te;
+                const float tw = w[i];
+                w[i] = w[j];
+                w[j] = tw;
+            }
+        };
+        cs(0, 1);
+        cs(2, 3);
+        cs(0, 2);
+        cs(1, 3);
+        cs(1, 2);
+        return e[3] >= kExperts || e[0] == e[1] || e[1] == e[2] || e[2] == e[3];
+    }
+    __device__ static void fallback(unsigned (&e)[kTopE], float (&w)[kTopE]) {
+#pragma unroll
+        for (unsigned k = 0; k < kTopE; ++k) e[k] = k, w[k] = 0.0F;
+    }
+    // The groups of make_plan and the v4 + mtfit items of fill_items_v2 (gufuse off), in their order; one thread.
+    __device__ static void finish(const A& p, const unsigned* count, const unsigned* start) {
+        if (threadIdx.x != 0) return;
+        unsigned ncls[16], ctas[16];
+        for (unsigned i = 0; i < 16; ++i) ncls[i] = ctas[i] = 0;
+        unsigned tp = 0;
+        std::size_t part = 0;
+        for (unsigned x = 0; x < kDevGroups; ++x) {
+            const unsigned n = count[x];
+            PGroup g{};
+            g.w = x < kExperts ? p.out.experts[x] : p.out.shared;
+            g.n = n;
+            g.pair_begin = start[x];
+            g.tbegin = tp;
+            tp += (n + 15U) / 16U * 16U;
+            g.s_gu = n ? route::gemm_splits(kHidden, kInter, g.w.gate.bits, n) : 0U;
+            g.s_dn = n ? route::gemm_splits(kInter, kHidden, g.w.down.bits, n) : 0U;
+            g.part_gu = part;
+            part += 2 * static_cast<std::size_t>(g.s_gu) * n * kInter;
+            g.part_dn = part;
+            part += static_cast<std::size_t>(g.s_dn) * n * kHidden;
+            p.out.groups[x] = g;
+            if (n == 0) continue;
+            auto append = [&](pfk::Item it, unsigned stage) {
+                auto emit = [&](unsigned c, unsigned row0, unsigned gy) {
+                    const unsigned q = stage * 8U + c;
+                    it.row0 = row0;
+                    it.gy = gy;
+                    it.cta_begin = ctas[q];
+                    ctas[q] += it.gx * gy * it.splits;
+                    p.out.items[(stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot) + ncls[q]++] = it;
+                };
+                const auto fit = route::mtfit(n);
+                if (fit.main != 0) emit(7, 0, fit.main);
+                if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
+            };
+            for (unsigned m = 0; m < 2U; ++m) {
+                const Exl3& w = m == 0 ? g.w.gate : g.w.up;
+                pfk::Item it{};
+                it.trellis = w.trellis;
+                it.x = p.out.xt + (static_cast<std::size_t>(m) * p.out.tpairs + g.tbegin) * kHidden;
+                it.part = p.out.part + g.part_gu + static_cast<std::size_t>(m) * g.s_gu * n * kInter;
+                it.input = kHidden;
+                it.output = kInter;
+                it.bits = w.bits;
+                it.rows = n;
+                it.splits = g.s_gu;
+                it.gx = kInter / 128;
+                append(it, 0);
+            }
+            pfk::Item it{};
+            it.trellis = g.w.down.trellis;
+            it.x = p.out.at + static_cast<std::size_t>(g.tbegin) * kInter;
+            it.part = p.out.part + g.part_dn;
+            it.input = kInter;
+            it.output = kHidden;
+            it.bits = g.w.down.bits;
+            it.rows = n;
+            it.splits = g.s_dn;
+            it.gx = kHidden / 128;
+            append(it, 1);
+        }
+        for (unsigned i = 0; i < 16; ++i) {
+            p.out.meta->count[i] = ncls[i];
+            p.out.meta->total[i] = ctas[i];
+            p.out.meta->next[i] = 0;
+        }
+    }
+    __device__ static void routed(const A& p, unsigned r, unsigned k, unsigned e, float w, unsigned pos) {
+        p.out.pair_row[pos] = r;
+        p.out.pair_group[pos] = e;
+        p.out.tok_pair[std::size_t{r} * kTopE + k] = pos;
+        p.out.tok_w[std::size_t{r} * kTopE + k] = w;
+    }
+    __device__ static void shared(const A& p, unsigned r, unsigned pos) {
+        p.out.pair_row[pos] = r;
+        p.out.pair_group[pos] = kExperts;
+    }
+};
+
+// Device-plan workspace of a T-row call (a function of T only).
+struct DevLayout {
+    unsigned tpairs = 0;
+    std::size_t groups = 0, pair_row = 0, pair_group = 0, tok_pair = 0, tok_w = 0, items = 0, meta = 0, scratch = 0, xt = 0,
+                at = 0, part = 0, bytes = 0;
+};
+// Partial floats of any routes of T rows: the sum over the 129 groups of 2 s_gu(n) n 1536 + s_dn(n) n 6144 is at most
+// 5T c + 129 max_n (f(n) - c n), c = 2 x 1536 + 6144 (the splits are 1 for large n). Bits do not enter the policy at
+// these shapes; the bound still takes the maximum over them.
+std::size_t dev_part_floats(unsigned T) {
+    static unsigned cached_t = 0;
+    static std::size_t cached = 0;
+    if (cached_t == T) return cached;
+    constexpr std::size_t c = 2ULL * kInter + kHidden;
+    std::size_t extra = 0;
+    for (unsigned n = 1; n <= T; ++n)
+        for (const unsigned bits : {3U, 4U, 5U, 6U, 8U}) {
+            const std::size_t f = 2ULL * route::gemm_splits(kHidden, kInter, bits, n) * n * kInter +
+                                  std::size_t{route::gemm_splits(kInter, kHidden, bits, n)} * n * kHidden;
+            if (f > c * n) extra = std::max(extra, f - c * n);
+        }
+    cached = 5ULL * T * c + std::size_t{kDevGroups} * extra;
+    cached_t = T;
+    return cached;
+}
+DevLayout dev_layout(unsigned T) {
+    DevLayout l;
+    l.tpairs = (5U * T + 15U * kDevGroups + 15U) / 16U * 16U;
+    std::size_t off = 0;
+    auto take = [&](std::size_t bytes) {
+        const std::size_t at = off;
+        off += align256(bytes);
+        return at;
+    };
+    l.groups = take(kDevGroups * sizeof(PGroup));
+    l.pair_row = take(5ULL * T * 4);
+    l.pair_group = take(5ULL * T * 4);
+    l.tok_pair = take(4ULL * T * 4);
+    l.tok_w = take(4ULL * T * 4);
+    l.items = take(kDevItems * sizeof(pfk::Item));
+    l.meta = take(sizeof(DevMeta));
+    l.scratch = take(dp::scratch_bytes<DevPolicy>(T));
+    l.xt = take(2ULL * l.tpairs * kHidden * 2);
+    l.at = take(std::size_t{l.tpairs} * kInter * 2);
+    l.part = take(dev_part_floats(T) * 4);
+    l.bytes = off;
+    return l;
+}
+
+unsigned* g_dev_flag = nullptr;  // sticky invalid-route flag of device-planned calls (prefill_moe_device_check)
+unsigned* dev_flag() {
+    if (g_dev_flag == nullptr) {
+        unsigned* f = nullptr;
+        ok(hipMalloc(reinterpret_cast<void**>(&f), sizeof(unsigned)), "device plan flag");
+        if (hipMemset(f, 0, sizeof(unsigned)) != hipSuccess) {
+            (void)hipFree(f);
+            throw std::runtime_error("minimax prefill moe: device plan flag init");
+        }
+        g_dev_flag = f;
+    }
+    return g_dev_flag;
+}
+
+#define STRIX_MMX_BITS_SWITCH(CALL) \
+    switch (it.bits) {              \
+        case 3: CALL(3); break;     \
+        case 4: CALL(4); break;     \
+        case 5: CALL(5); break;     \
+        case 6: CALL(6); break;     \
+        default: CALL(8); break;    \
+    }
+// Tail classes MT 1..7 (grouped_kernel<MT, 4>): persistent, resident-capacity grid.
+template <int MT> __global__ __launch_bounds__(128) void dq_v4_kernel(Queue q) {
+    dp::run_items<true>(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::item_core_v3<B, MT, 0, true>(it, bx, by, bz)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+// MT8 class (launch_class<4> class 7): direct, grid = the class bound.
+template <int MT> __global__ __launch_bounds__(128) void dq_v4_direct_kernel(Queue q) {
+    dp::run_items<false>(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::item_core_v3<B, MT, 0, true>(it, bx, by, bz)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_kernel(Queue q) {
+    dp::run_items<false>(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::pipe_or_tail<B, 8, 4, Simplify, Packed>(it, bx, by, bz)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_pair_kernel(Queue q) {
+    __shared__ pfk::Half16 exchange[128];  // as grouped_pipe_pair_kernel
+    dp::run_items<false>(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::pipe_pair_or_tail<B, Simplify, Packed>(it, bx, by, bz, exchange)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <int Core8> __global__ __launch_bounds__(128) void dq_core8_kernel(Queue q) {
+    __shared__ pfk::Half16 exchange[256];  // as grouped_core8_kernel
+    dp::run_items<false>(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::item_core8<B, Core8>(it, bx, by, bz, exchange)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+#undef STRIX_MMX_BITS_SWITCH
+
+unsigned device_cus() {
+    static const unsigned cus = [] {
+        int dev = 0, n = 0;
+        ok(hipGetDevice(&dev), "device");
+        ok(hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev), "CU count");
+        return static_cast<unsigned>(std::max(n, 1));
+    }();
+    return cus;
+}
+template <int MT> void launch_dq_tail(const Queue& q, hipStream_t stream) {
+    static const unsigned grid = [] {
+        int blocks = 0;
+        ok(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, reinterpret_cast<const void*>(&dq_v4_kernel<MT>), 128, 0),
+           "tail occupancy");
+        return static_cast<unsigned>(std::max(blocks, 1)) * device_cus();
+    }();
+    hipLaunchKernelGGL(dq_v4_kernel<MT>, dim3(grid), dim3(128), 0, stream, q);
+}
+void launch_dq_class(const Queue& q, unsigned cls, unsigned grid7, hipStream_t stream, bool pair) {
+    switch (cls) {
+        case 0: launch_dq_tail<1>(q, stream); return;
+        case 1: launch_dq_tail<2>(q, stream); return;
+        case 2: launch_dq_tail<3>(q, stream); return;
+        case 3: launch_dq_tail<4>(q, stream); return;
+        case 4: launch_dq_tail<5>(q, stream); return;
+        case 5: launch_dq_tail<6>(q, stream); return;
+        case 6: launch_dq_tail<7>(q, stream); return;
+        default: break;
+    }
+    // Class 7: the kernel that launch_class<4> selects, from the same switches.
+    const dim3 g(grid7);
+    if (prefill_pipe() != 0) {
+        const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
+        if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false>), g, dim3(128), 0, stream, q);
+        else if (pair && packed) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, true>), g, dim3(128), 0, stream, q);
+        else if (pair) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, false>), g, dim3(128), 0, stream, q);
+        else if (simplify) hipLaunchKernelGGL((dq_pipe_kernel<true, false>), g, dim3(128), 0, stream, q);
+        else if (packed) hipLaunchKernelGGL((dq_pipe_kernel<false, true>), g, dim3(128), 0, stream, q);
+        else hipLaunchKernelGGL((dq_pipe_kernel<false, false>), g, dim3(128), 0, stream, q);
+        return;
+    }
+    if (prefill_core8() == 1) hipLaunchKernelGGL((dq_core8_kernel<1>), g, dim3(128), 0, stream, q);
+    else if (prefill_core8() == 2) hipLaunchKernelGGL((dq_core8_kernel<2>), g, dim3(128), 0, stream, q);
+    else hipLaunchKernelGGL((dq_v4_direct_kernel<8>), g, dim3(128), 0, stream, q);
+}
+// MT8-class CTA bound of a stage: an MT8 item is a group's 128-row tiles (floor(n / 128)) or its remainder when that
+// is >= 113 rows, both with splits 1 (n >= 113); floor(n / 128) + [n % 128 >= 113] <= n / 113 and the groups hold 5T
+// rows, so the class has at most gx x matrices x floor(5T / 113) CTAs. The direct kernels grid-stride beyond it.
+unsigned grid_mt8(unsigned stage, unsigned T) {
+    const unsigned tiles = std::max(1U, 5U * T / 113U);
+    return stage == 0 ? 2U * (kInter / 128) * tiles : (kHidden / 128) * tiles;
+}
+
+void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+    const unsigned T = v.rows;
+    if (T == 0 || v.y == nullptr || v.routes == nullptr || v.experts == nullptr || v.out == nullptr)
+        throw std::invalid_argument("minimax prefill moe: invalid device view");
+    const DevLayout l = dev_layout(T);
+    if (workspace == nullptr || workspace_bytes < l.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
+    auto* ws = static_cast<unsigned char*>(workspace);
+    dp::Args<DevPolicy> a{};
+    a.rows = T;
+    a.ids = v.routes;
+    a.weights = reinterpret_cast<const float*>(v.routes + std::size_t{T} * kTopE);
+    dp::bind_scratch(a, ws + l.scratch, T);
+    a.flag = dev_flag();
+    a.out.groups = reinterpret_cast<PGroup*>(ws + l.groups);
+    a.out.pair_row = reinterpret_cast<std::uint32_t*>(ws + l.pair_row);
+    a.out.pair_group = reinterpret_cast<std::uint32_t*>(ws + l.pair_group);
+    a.out.tok_pair = reinterpret_cast<std::uint32_t*>(ws + l.tok_pair);
+    a.out.tok_w = reinterpret_cast<float*>(ws + l.tok_w);
+    a.out.items = reinterpret_cast<pfk::Item*>(ws + l.items);
+    a.out.meta = reinterpret_cast<DevMeta*>(ws + l.meta);
+    a.out.experts = v.experts;
+    a.out.shared = v.shared;
+    a.out.xt = reinterpret_cast<_Float16*>(ws + l.xt);
+    a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
+    a.out.part = reinterpret_cast<float*>(ws + l.part);
+    a.out.tpairs = l.tpairs;
+    mark("start", stream);
+    ok(dp::enqueue(a, stream), "device plan");
+    Tables t{};
+    t.groups = a.out.groups;
+    t.pair_row = a.out.pair_row;
+    t.pair_group = a.out.pair_group;
+    t.tok_pair = a.out.tok_pair;
+    t.tok_w = a.out.tok_w;
+    t.xt = a.out.xt;
+    t.at = a.out.at;
+    t.part = a.out.part;
+    t.pairs = 5U * T;
+    t.rows = T;
+    t.shared_group = kExperts;
+    t.tpairs = l.tpairs;
+    if (prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    launched("gather transform");
+    mark("gather", stream);
+    const bool pair = prefill_pipe_pair(T), side = prefill_tail_stream();
+    DevMeta* meta = a.out.meta;
+    auto queue = [&](unsigned stage, unsigned c) {
+        const unsigned qi = stage * 8U + c;
+        return Queue{a.out.items + (stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot), &meta->count[qi], &meta->total[qi],
+                     &meta->next[qi]};
+    };
+    // As the stage() of enqueue_prefill_moe: tails (MT 1..7) on the side stream beside MT8, joined before the consumer.
+    auto stage = [&](unsigned s, const char* const* labels) {
+        if (side) tail_fork(stream);
+        try {
+            for (unsigned c = 0; c < 7; ++c) {
+                launch_dq_class(queue(s, c), c, 0, side ? g_tail_side : stream, pair);
+                if (!side) mark(labels[c], stream);
+            }
+            launch_dq_class(queue(s, 7), 7, grid_mt8(s, T), stream, pair);
+            mark(labels[7], stream);
+        } catch (...) {
+            if (side) tail_join(stream);
+            throw;
+        }
+        if (side) {
+            tail_join(stream);
+            mark(labels[6], stream);
+        }
+    };
+    stage(0, kGuLabel);
+    launched("gate/up device plan");
+    hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, false, g_gufuse_intermediates);
+    launched("gate/up finish");
+    mark("finish", stream);
+    stage(1, kDnLabel);
+    launched("down device plan");
+    hipLaunchKernelGGL(down_combine_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
+    launched("down combine");
+    mark("combine", stream);
+}
+
 }  // namespace
 
 void set_prefill_table_ring(int on) {
@@ -1131,7 +1523,38 @@ std::size_t prefill_moe_workspace_bound(std::uint32_t rows) {
     const std::size_t PX = P + 15ULL * groups;  // v4 pads every group to 16 rows
     b += align256(2 * PX * kHidden * 2) + align256(PX * kInter * 2);
     b += align256((groups * 128 + P) * (2ULL * kInter + kHidden) * 4);
-    return b;
+    return std::max(b, dev_layout(rows).bytes);  // the device plan's fixed layout (prefill_moe_device_plan)
+}
+
+bool prefill_moe_device_plan(std::uint32_t rows) {
+    static const bool device = [] {
+        const char* e = std::getenv("STRIX_MMX_PF_PLAN");
+        if (e == nullptr || std::string(e) == "device") return true;
+        if (std::string(e) == "host") return false;
+        throw std::invalid_argument("STRIX_MMX_PF_PLAN must be device or host");
+    }();
+    return device && rows > 0 && prefill_core() == 3 && prefill_mtfit() && !(rows > 8 && prefill_gufuse());
+}
+
+void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes,
+                                hipStream_t stream) {
+    if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
+    enqueue_device_moe(v, workspace, workspace_bytes, stream);
+}
+
+void prefill_moe_device_check() {
+    if (g_dev_flag == nullptr) return;
+    unsigned flag = 0;
+    ok(hipMemcpy(&flag, g_dev_flag, sizeof(flag), hipMemcpyDeviceToHost), "device plan flag read");
+    if (flag != 0) {
+        ok(hipMemset(g_dev_flag, 0, sizeof(unsigned)), "device plan flag reset");
+        throw std::runtime_error("minimax prefill moe: device plan saw invalid routes (expert id >= 128 or repeated in a row)");
+    }
+}
+
+void cleanup_prefill_device_plan() noexcept {
+    if (g_dev_flag != nullptr) (void)hipFree(g_dev_flag);
+    g_dev_flag = nullptr;
 }
 
 void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {

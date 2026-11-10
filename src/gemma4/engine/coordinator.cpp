@@ -128,7 +128,9 @@ const char* status_name(Status s) {
 Json effective_config(const Backend& backend, const Request& request, bool drafter_available, std::size_t streams) {
     auto j = backend.identity();
     const auto* identity = j.find("identity");
-    j.set("decode_identity",identity ? *identity : Json(arithmetic_id)); j.set("prefill_identity","prefill-exact"); j.set("row_cap",8);
+    j.set("decode_identity",identity ? *identity : Json(arithmetic_id));
+    if (!j.find("prefill_identity")) j.set("prefill_identity","prefill-exact");
+    j.set("row_cap",8);
     j.set("sampling_identity","splitmix64-cdf-v1"); j.set("temperature",double(request.sampling.temperature));
     j.set("top_p",double(request.sampling.top_p)); j.set("top_k",std::uint64_t(request.sampling.top_k)); j.set("seed",request.sampling.seed);
     j.set("max_tokens",std::uint64_t(request.max_tokens)); j.set("draft_k_max",std::uint64_t(request.draft_k)); j.set("streams",std::uint64_t(streams));

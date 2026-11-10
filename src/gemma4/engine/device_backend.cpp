@@ -94,6 +94,8 @@ public:
         if (wmma_route) metadata_.set("prefill_attention",prefill::attention_name(attention));
         metadata_.set("prefill_route",exl3_wmma ? exl3::prefill_identity : v2 ? prefill::v2_identity : wmma_route ? prefill::identity
                                        : a8_route ? "a8-many-row" : many_row ? "many-row" : "rows8");
+        metadata_.set("prefill_identity",exl3_wmma ? exl3::prefill_identity : v2 ? prefill::v2_identity : wmma_route ? prefill::identity
+                                          : a8_route ? "prefill-a8" : "prefill-exact");
         if (a8_route) std::cerr << "gemma4 prefill route a8-many-row (g4-a8-v1 linears, 512-row chunks)\n";
         // Exact and a8 linears match their decode identity; WMMA routes never do.
         const auto linears = exl3_wmma || wmma_route ? prefill::Linears::wmma : a8_route ? prefill::Linears::a8 : prefill::Linears::exact;

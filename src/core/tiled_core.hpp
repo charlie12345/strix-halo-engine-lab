@@ -118,9 +118,12 @@ template<int Bits> struct WmmaXContract {
 //   void store(const Tile&, int r, int col0, float (&v)[4], int lane)
 //        - 128 outputs col0 + lane + 32 j after hadamard128 (FP32 total, no svh): svh scale,
 //          activation, combine... Fused epilogue only.
+// kPassRow: global-A row offset added per chain pass (paired gate/up reads an interleaved
+// pre-quantised image, row = map*a_mul + a_add + pass*kPassRow). NoChain: 0 (unchanged).
 struct NoChain {
-    static constexpr bool kActive = false, kInput = false;
+    static constexpr bool kActive = false;
     static constexpr int kPasses = 1;
+    static constexpr uint32_t kPassRow = 0;
 };
 struct NoAdapter {
     static constexpr bool kActive = false, kTiles = false;
@@ -243,15 +246,16 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
     // Grouped: gathered A rows, resolved once (clamped to the tile's last row).
     [[maybe_unused]] uint32_t a_src[IU4Grouped ? G::a_per_thread : 1], sa_src[IU4Grouped ? sa_per_thread : 1];
     if constexpr (IU4Grouped) {
+        const uint32_t a_add = gp.a_add + uint32_t(chain_pass) * Chain::kPassRow;
         #pragma unroll
         for (int i = 0; i < G::a_per_thread; ++i) {
             const int r = (thread + i * G::threads) / G::chunks_per_row;
-            a_src[i] = map_row(r < rows ? r : rows - 1, gp.a_mul, gp.a_add);
+            a_src[i] = map_row(r < rows ? r : rows - 1, gp.a_mul, a_add);
         }
         #pragma unroll
         for (int i = 0; i < sa_per_thread; ++i) {
             const int r = (thread + i * G::threads) / SLOTS;
-            sa_src[i] = map_row(r < rows ? r : rows - 1, gp.a_mul, gp.a_add);
+            sa_src[i] = map_row(r < rows ? r : rows - 1, gp.a_mul, a_add);
         }
     }
     // Adapter rows: the gathered row pointers, resolved once per tile.
@@ -272,7 +276,6 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
             static_assert(G::a_chunks % G::threads == 0 && b_chunks % G::threads == 0);
             const int groups = inputs / IU4Group;
             const auto* wq = reinterpret_cast<const uint8_t*>(packed);
-            if constexpr (!Chain::kInput)
             #pragma unroll
             for (int i = 0; i < G::a_per_thread; ++i) {
                 const int chunk = thread + i * G::threads;
@@ -300,7 +303,6 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                 }
             }
             
-            if constexpr (!Chain::kInput)
             #pragma unroll
             for (int i = 0; i < sa_per_thread; ++i) {
                 const int e = thread + i * G::threads;
@@ -368,7 +370,6 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
         auto* ab = lds + buffer * G::stage_bytes;
         _Float16* as = reinterpret_cast<_Float16*>(ab);
         _Float16* bs = as + BM * STRIDE;
-        if constexpr (!Chain::kInput)
         #pragma unroll
         for (int i = 0; i < G::a_per_thread; ++i) {
             const int chunk = thread + i * G::threads;
@@ -379,9 +380,6 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                     *reinterpret_cast<U2*>(ab + row_offset(r, part * 16 + 8)) = __builtin_shufflevector(a_reg[i], a_reg[i], 2, 3);
                 } else *reinterpret_cast<U4*>(ab + row_offset(r, part * 16)) = a_reg[i];
             }
-        }
-        if constexpr (Chain::kInput) {
-            chain.template stage<BM, BN, G::waves>(ab, map_first, rows, k0 * 16, chain_pass);
         }
         if constexpr (IU4 || DenseF16) {
 
@@ -400,7 +398,6 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
             
             if constexpr (IU4) {
                 float* sl = reinterpret_cast<float*>(ab + (BM + BN) * G::row_bytes);
-                if constexpr (!Chain::kInput)
                 #pragma unroll
                 for (int i = 0; i < sa_per_thread; ++i) {
                     const int e = thread + i * G::threads;

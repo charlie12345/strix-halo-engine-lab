@@ -86,23 +86,33 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     const std::size_t qbytes=align256(std::size_t(t.pairs)*(kInter/2));
     const std::size_t sbytes=align256(std::size_t(t.pairs)*(kInter/64)*4);
     const std::size_t dbytes=align256(std::size_t(t.pairs)*kHidden*4);
-    if(bytes<tile_bytes+256+qbytes+sbytes+dbytes) throw std::logic_error("minimax fused i4 scratch too small");
+    // Gate/up A4 image of the control (row 2*pair+m): quantised once, not once per N tile.
+    const std::size_t gqbytes=align256(2*std::size_t(t.pairs)*(kHidden/2));
+    const std::size_t gsbytes=align256(2*std::size_t(t.pairs)*(kHidden/64)*4);
+    if(bytes<tile_bytes+256+qbytes+sbytes+dbytes+gqbytes+gsbytes) throw std::logic_error("minimax fused i4 scratch too small");
     auto* tiles=reinterpret_cast<st::IU4GroupTile*>(ws);
     auto* ntiles=reinterpret_cast<unsigned*>(ws+tile_bytes);
     auto* aq=ws+tile_bytes+256;
     auto* as=reinterpret_cast<float*>(aq+qbytes);
     auto* dn=reinterpret_cast<float*>(aq+qbytes+sbytes);
+    auto* gq=aq+qbytes+sbytes+dbytes;
+    auto* gs=reinterpret_cast<float*>(gq+gqbytes);
     st::moe_i4::Weights w{};
     for(unsigned m=0;m<3;++m) {
         w.q[m]=q.wq[m]; w.s[m]=q.ws[m]; w.svh[m]=q.svh[m];
         w.q_stride[m]=kI4ExpertBytes; w.s_stride[m]=kI4ExpertBytes/2;
     }
     I4Binding b{x,out,t,dense_groups,false,dn};
+    // Same schedule and binding flags as the control pre-pass: bitwise-identical A4 bytes/scales.
+    hipLaunchKernelGGL((st::moe_i4::reference_input_kernel<I4ReferenceSchedule>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,
+        (I4ReferenceSchedule{{x,out,t,false,true},gq,gs}));
+    iu4_ok(hipGetLastError(),"chain gather + quantiser");
+    mark("gather",stream);
     iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,pplan,tiles,ntiles,ptiles,stream),"chain tiles");
-    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,ntiles,ptiles,aq,as,stream),"chain paired gate/up");
+    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,ntiles,ptiles,gq,gs,aq,as,stream),"chain paired gate/up");
     mark("gate_up",stream);
     if(pplan!=plan) iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,plan,tiles,ntiles,dtiles,stream),"chain down tiles");
-    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,dtiles,aq,as,stream),"chain down");
+    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,dtiles,nullptr,nullptr,aq,as,stream),"chain down");
     mark("down",stream);
     // Ordered combine of the control: ascending top-k FMA, shared expert last. Deterministic.
     hipLaunchKernelGGL((st::moe_i4::reference_combine_kernel<I4Binding>),dim3((t.rows*kHB+7)/8),dim3(256),0,stream,b,dn,t.rows,kTopE);

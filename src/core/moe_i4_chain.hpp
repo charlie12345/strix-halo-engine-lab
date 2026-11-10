@@ -126,18 +126,13 @@ template<class Binding> __global__ void fp16_activation_rows(Binding b,const flo
         for(unsigned j=0;j<4;++j) at[size_t(pair)*Binding::I+col+lane+32*j]=_Float16(v[j]);
     }
 }
-// Packed-IU4 LDS writer: same quantiser as global packed operands, different physical layout.
-template<int BM,int BN> struct StageStore {
-    uint8_t* base; unsigned row;
-    __device__ __forceinline__ void byte(unsigned c, uint8_t v) const { base[iu4_lds_offset(int(row),int(c))] = v; }
-    __device__ __forceinline__ void scale(unsigned g, float v) const {
-        auto* s = reinterpret_cast<float*>(base+(BM+BN)*64);
-        s[g*BM + (row&~15U)+(row&1U)*8+((row&15U)>>1U)] = v;
-    }
-};
+// Paired gate/up reads the interleaved pre-quantised A4 image written once by the shared input
+// pre-pass (row 2*pair+m, m=0 gate, m=1 up): the pass selects the row, so the K loop never
+// re-gathers, re-transforms or re-quantises the input. Bytes equal the LDS-staged ones.
 template<class Binding,bool Pair> struct Chain {
-    static constexpr bool kActive = true, kInput = Pair;
+    static constexpr bool kActive = true;
     static constexpr int kPasses = Pair ? 2 : 1;
+    static constexpr uint32_t kPassRow = Pair ? 1 : 0;
     Binding b; Weights w;
     uint8_t* aq; float* as;
     unsigned expert = 0;
@@ -148,14 +143,6 @@ template<class Binding,bool Pair> struct Chain {
         auto pick=[&](const auto (&v)[3]) { if constexpr (Pair) return pass==0 ? v[0] : v[1]; else return v[2]; };
         q=reinterpret_cast<const uint32_t*>(pick(w.q)+size_t(e)*pick(w.q_stride));
         s=pick(w.s)+size_t(e)*pick(w.s_stride); svh=pick(w.svh)[e];
-    }
-    template<int BM,int BN,int Waves> __device__ void stage(uint8_t* lds,unsigned first,int rows,int k,int pass) const {
-        const unsigned wave=threadIdx.x/32;
-        for (unsigned r=wave; r<BM; r+=Waves) {
-            const unsigned rr=r<unsigned(rows) ? r : unsigned(rows-1);
-            float v[4]; InputPolicy<Binding>{b}.load(expert,b.pair(first+rr),unsigned(pass),unsigned(k),v);
-            iu4_quant128_store(v,0,threadIdx.x&31U,StageStore<BM,BN>{lds,r});
-        }
     }
     __device__ __forceinline__ void store(unsigned pos,unsigned col,int pass,int slot,float (&v)[4],float* saved) const {
         const unsigned pair=b.pair(pos);
@@ -174,11 +161,15 @@ template<class Binding,bool Pair> struct Chain {
     }
 };
 template<int Plan,bool Pair,class Binding> hipError_t launch(const Binding& b,const Weights& w,
-    const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,uint8_t* aq,float* as,hipStream_t stream) {
+    const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,const uint8_t* gq,const float* gs,
+    uint8_t* aq,float* as,hipStream_t stream) {
     constexpr auto c=iu4_tiles[Plan];
     using G=wmma_tiled::Geometry<c.bm,c.bn,c.wm,c.wn,PackedIU4>;
     using C=Chain<Binding,Pair>;
     wmma_tiled::GroupedArgs gp; gp.tiles=tiles; gp.ntiles=ntiles; gp.col_scale=w.svh[0]; gp.map=b.map();
+    // Paired: A is the pre-quantised gate/up image gq/gs, row 2*pair+pass (pass offset via kPassRow).
+    // Down: A is the down image aq/as written by the paired epilogue, row = pair.
+    gp.a_mul=Pair ? 2U : 1U;
     const unsigned K=Pair ? Binding::H : Binding::I, N=Pair ? Binding::I : Binding::H;
     const auto kernel=wmma_tiled::tiled_core<TiledContract<PackedIU4>,c.bm,c.bn,c.wm,c.wn,true,0,false,false,64,true,wmma_tiled::NoAdapter,C>;
     // Reject spills/insufficient residency before launching. No token/route readback.
@@ -188,15 +179,16 @@ template<int Plan,bool Pair,class Binding> hipError_t launch(const Binding& b,co
     if (status!=hipSuccess) return status;
     if (attr.localSizeBytes || blocks*G::waves<4) return hipErrorNotSupported;
     kernel<<<dim3(max_tiles*(N/c.bn)),G::threads,0,stream>>>(reinterpret_cast<const uint32_t*>(w.q[0]),nullptr,nullptr,
-        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? nullptr : aq,Pair ? nullptr : as,w.s[0],nullptr,gp,{},C{b,w,aq,as});
+        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? gq : aq,Pair ? gs : as,w.s[0],nullptr,gp,{},C{b,w,aq,as});
     return hipGetLastError();
 }
 template<bool Pair,class Binding> hipError_t launch(int plan,const Binding& b,const Weights& w,
-    const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,uint8_t* aq,float* as,hipStream_t stream) {
+    const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,const uint8_t* gq,const float* gs,
+    uint8_t* aq,float* as,hipStream_t stream) {
     switch(plan) {
-        case 0:return launch<0,Pair>(b,w,tiles,ntiles,max_tiles,aq,as,stream);
-        case 1:return launch<1,Pair>(b,w,tiles,ntiles,max_tiles,aq,as,stream);
-        case 2:return launch<2,Pair>(b,w,tiles,ntiles,max_tiles,aq,as,stream);
+        case 0:return launch<0,Pair>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,stream);
+        case 1:return launch<1,Pair>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,stream);
+        case 2:return launch<2,Pair>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,stream);
         default:return hipErrorInvalidValue;
     }
 }

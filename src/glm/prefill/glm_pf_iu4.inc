@@ -70,7 +70,6 @@ struct I4ReferenceSchedule {
 void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,const iu4::Layer& q,
     const iu4::Scratch& s,hipStream_t stream) {
     namespace st=strix::core;
-    (void)grid_tiles;
     // Plan 2 (BM128) paired gate/up spills on gfx1151: the paired call runs at most plan 1 on its own tile list.
     const int plan=iu4_plan(a.rows*8U), pplan=plan<1 ? plan : 1;
     const auto ptiles=unsigned(st::iu4_grouped_max_tiles(size_t(a.rows)*8,E,pplan));
@@ -85,15 +84,17 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
     }
     I4Binding b{a.x,a.out,a};
     const auto* groups=reinterpret_cast<const st::IU4Group*>(a.groups);
+    // The control's own pre-pass: routed rows -> gate/up A4 image (row 2*pair+m), shared rows -> FP16
+    // input rows. Quantised once per row instead of once per N tile inside the paired K-loop.
+    st::moe_i4::reference_input_kernel<<<dim3(H/1024,grid_tiles,2),256,0,stream>>>(I4ReferenceSchedule{{a.x,a.out,a},s.aq_gu,s.as_gu});
+    ok(hipGetLastError(),"chain gate/up input transform + quantiser");
     iu4_ok(st::build_iu4_grouped_tiles(groups,E,pplan,tiles,s.ntiles,ptiles,stream),"chain tiles");
-    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,s.ntiles,ptiles,s.aq_down,s.as_down,stream),"chain paired gate/up");
+    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,s.ntiles,ptiles,s.aq_gu,s.as_gu,s.aq_down,s.as_down,stream),"chain paired gate/up");
     if(pplan!=plan) iu4_ok(st::build_iu4_grouped_tiles(groups,E,plan,tiles,s.ntiles,dtiles,stream),"chain down tiles");
-    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,s.ntiles,dtiles,s.aq_down,s.as_down,stream),"chain down");
+    iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,s.ntiles,dtiles,nullptr,nullptr,s.aq_down,s.as_down,stream),"chain down");
     // Shared expert retains its existing exact FP16 operand and WMMA-X arithmetic; the combine is the
     // control's ordered one (shared-down aux epilogue, or R16), not atomics.
     a.aux_act=false; a.aux_combine=aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE");
-    st::moe_i4::fp16_input_rows<<<dim3(H/1024,(a.rows+15)/16,2),256,0,stream>>>(b,a.input,a.rows,E,P,8);
-    ok(hipGetLastError(),"chain shared input");
     launch_linear_w<false,false>(a,shared.gate.bits,stream);
     st::moe_i4::fp16_activation_rows<<<dim3(I/128,(a.rows+15)/16),256,0,stream>>>(b,a.gu,a.at,a.rows,E,P,8);
     ok(hipGetLastError(),"chain shared activation");

@@ -64,7 +64,7 @@ public:
 #if defined(__linux__)
         for (auto entry=::environ; entry && *entry; ++entry) {
 #elif defined(_WIN32)
-        for (auto entry=::_environ; entry && *entry; ++entry) {
+        for (auto entry=_environ; entry && *entry; ++entry) {
 #endif
 #if defined(__linux__) || defined(_WIN32)
             const std::string text=*entry;
@@ -81,7 +81,7 @@ public:
 #if defined(__linux__)
         for(auto entry=::environ;entry && *entry;++entry) {
 #elif defined(_WIN32)
-        for(auto entry=::_environ;entry && *entry;++entry) {
+        for(auto entry=_environ;entry && *entry;++entry) {
 #endif
 #if defined(__linux__) || defined(_WIN32)
             const std::string text=*entry;

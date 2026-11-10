@@ -1,5 +1,7 @@
 # Decision register
 
+> Paths under `docs/research/history/` cited below were removed on 2026-11-10 as historical; they remain in the git history (for example at commit `628d6753b`).
+
 ## Accepted
 
 | ID | Decision | Reason | Evidence | Review |

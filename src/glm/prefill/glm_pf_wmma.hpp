@@ -14,5 +14,5 @@ inline bool enabled() {
     const char* p = std::getenv("STRIX_GLM_PF_WMMA");
     return p && std::strcmp(p, "1") == 0;
 }
-inline std::atomic<std::uint64_t> dense_calls{0}, moe_calls{0};
+inline std::atomic<std::uint64_t> dense_calls{0}, moe_calls{0}, iu4_moe_calls{0};
 }  // namespace strix::glm::pf::wmma_x

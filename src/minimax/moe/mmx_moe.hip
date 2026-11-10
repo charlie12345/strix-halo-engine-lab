@@ -1,3 +1,4 @@
+#include "core/w4a16.hpp"
 #include "../../moe_core/decode.hpp"
 #include "mmx_moe_traits.hpp"
 #include "minimax/engine/route_identity.hpp"
@@ -882,6 +883,16 @@ template <int MaxR>
 __device__ void split16_rows(const Exl3& w, unsigned output, unsigned kt, unsigned splits, unsigned col0, unsigned split,
                              const _Float16* xs, unsigned nrows, unsigned wave, unsigned lane, WideV4* rowbuf, float* part0,
                              std::size_t part_stride) {
+    if (w.bits == 64U) {
+        const unsigned k0 = kt * split / splits, k1 = kt * (split + 1U) / splits;
+        const auto* q = reinterpret_cast<const std::uint8_t*>(w.trellis);
+        const auto* scales = reinterpret_cast<const std::uint16_t*>(q + std::size_t{kt * 16U} * output / 2U);
+        strix::core::w4a16::wave_rows<MaxR, 24U, 6U>(q, scales, output, kt * 16U, k0, k1, col0, xs,
+            kSplitCh, lane, nrows, [&](unsigned, unsigned r, unsigned col, float v) {
+                part0[std::size_t{r} * part_stride + col] = v;
+            });
+        return;
+    }
     auto run = [&](auto bits_tag) {
         constexpr int Bits = decltype(bits_tag)::value;
         if (nrows == 1 || MaxR == 1) split16_core<Bits, 1>(w, output, kt, splits, col0, split, xs, nrows, wave, lane, rowbuf, part0, part_stride);
@@ -1076,7 +1087,7 @@ Args make_args(const MoeView& v) {
         v.ws.base == nullptr)
         throw std::invalid_argument("minimax moe: null pointer in view");
     const ExpertSlices& s = v.shared;
-    if (s.gate.bits != s.up.bits || (s.gate.bits != 3 && s.gate.bits != 5) || (s.down.bits != 3 && s.down.bits != 5) ||
+    if (s.gate.bits != s.up.bits || (s.gate.bits != 3 && s.gate.bits != 5 && s.gate.bits != 64) || (s.down.bits != 3 && s.down.bits != 5 && s.down.bits != 64) ||
         s.gate.input != kHidden || s.gate.output != kInter || s.down.input != kInter || s.down.output != kHidden)
         throw std::invalid_argument("minimax moe: shared expert must be 6144 -> 1536 -> 6144 at K3 or K5");
     if (v.h != nullptr && (v.part0 == nullptr || v.part1 == nullptr || v.norm_w == nullptr))
@@ -1279,7 +1290,7 @@ template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared = false>
 void launch_experts4w(const Args& a, hipStream_t stream, hipEvent_t* marks) {
     [[maybe_unused]] const bool single = moe_single();  // validate even when this shape uses the unchanged reader
     if constexpr (W == 4) {
-        if (wide_for(a.rows)) {
+        if (a.shared.gate.bits == 64U || wide_for(a.rows)) {
             launch_experts4_grid<MaxR, Depth, W, DepthBig, SkipShared, true>(a, stream, marks);
             return;
         }
@@ -1313,7 +1324,7 @@ int moe_overlap() {
 // Router + shared gate/up launch, then the routed gate/up (shared slot skipped) and down.
 template <int MaxR, int Depth> void launch_overlap4(const Args& a, hipStream_t stream, hipEvent_t* marks) {
     constexpr int DB = MaxR == 8 ? Depth : Depth;
-    if (wide_for(a.rows))
+    if (a.shared.gate.bits == 64U || wide_for(a.rows))
         hipLaunchKernelGGL((router_shared_kernel<MaxR, Depth, DB, true>), dim3(kExperts + 2 * (kInter / 256) * kGateSplits), dim3(128),
                            0, stream, a);
     else
@@ -1395,6 +1406,13 @@ void check_moe_single_resources() {
 void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks, hipEvent_t down_done) {
     Args a = make_args(v);
     a.down_done = down_done;
+    if (v.shared.gate.bits == 64U) {
+        if (a.rows == 1) launch_experts4_grid<1, 4, 4, 4, false, true>(a, stream, marks);
+        else if (a.rows == 2) launch_experts4_grid<2, 4, 4, 4, false, true>(a, stream, marks);
+        else if (a.rows <= 4) launch_experts4_grid<4, 4, 4, 4, false, true>(a, stream, marks);
+        else launch_experts4_grid<8, 4, 4, 4, false, true>(a, stream, marks);
+        return;
+    }
     if (moe_version() == 4) {
         if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
         switch (moe_depth3()) {

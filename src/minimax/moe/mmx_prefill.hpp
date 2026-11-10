@@ -22,6 +22,40 @@
 
 namespace strix::minimax::moe::opt {
 
+// FAST_I4 (STRIX_MMX_MODEL_FORMAT=fast_i4; lossy identity minimax-fast-i4): one MoE layer's 128 routed experts and its
+// shared expert (index kExperts) as the strix-trellis IU4 g64 pack in the had128-rotated EXL3 basis (moe_core/
+// iu4_convert.hpp). Per matrix m (0 gate, 1 up, 2 down) over kI4Experts experts, one kI4ExpertBytes block per expert:
+// nibbles [K/16][N/16][16][8] at wq[m] + e * kI4ExpertBytes, FP16 scales [N][K/64] right after them (ws[m] + e *
+// kI4ExpertBytes / 2); svh = device table [e] of the EXL3 output-sign vectors (the epilogue's had128 * svh); the EXL3
+// suh / svh themselves stay in ExpertSlices. Prefill runs W4A4 on the library's grouped IU4 core, decode (replace mode)
+// W4A16 (core/w4a16.hpp) with Exl3{trellis = the expert's block, bits = kI4Bits}.
+inline constexpr unsigned kI4Experts = kExperts + 1;
+inline constexpr std::size_t kI4Nibbles = std::size_t{kHidden} * kInter / 2U;
+inline constexpr std::size_t kI4ExpertBytes = kI4Nibbles + std::size_t{kInter} * (kHidden / 64U) * 2U;
+inline constexpr std::uint32_t kI4Bits = 64;  // Exl3::bits marker of an IU4 block (never an EXL3 width)
+struct I4Layer {
+    std::uint8_t* wq[3] = {};
+    _Float16* ws[3] = {};
+    const std::uint16_t* const* svh[3] = {};
+    bool on() const { return wq[0] != nullptr; }
+};
+inline constexpr std::size_t kI4PackBytes = 3U * kI4Experts * kI4ExpertBytes;  // one layer's pack (gate, up, down)
+// Device pointer tables of one layer's EXL3 experts (converter input): trellis[m][bits] = per-expert tiles of matrix m
+// with that width (nullptr entries for the other widths; table nullptr when no expert has it), svh[m] = per-expert svh.
+struct I4Source {
+    const std::uint32_t* const* trellis[3][9] = {};
+    const std::uint16_t** svh[3] = {};
+};
+bool iu4_built();                 // the grouped IU4 core is compiled in (STRIX_TRELLIS_IU4_DIR build)
+std::size_t i4_pack_bytes();      // kI4PackBytes
+std::size_t i4_source_bytes();    // device bytes of one I4Source (256-byte aligned base)
+// Validates the layer (every matrix 6144 x 1536 / 1536 x 6144, 2..8 bits, resident) and uploads its tables (sync).
+I4Source i4_source_build(const ExpertSlices* experts, const ExpertSlices& shared, void* base);
+// The pack at `pack` (i4_pack_bytes(), 256-byte aligned) as the layer view of `src`.
+I4Layer i4_layer_view(std::uint8_t* pack, const I4Source& src);
+// Converts src into out's pack on `stream` (asynchronous; the EXL3 tiles are only read): stored packs at load only.
+void i4_convert(const I4Source& src, const I4Layer& out, hipStream_t stream);
+
 struct PrefillMoeView {
     std::uint32_t rows = 0;                     // T
     const float* y = nullptr;                   // T x 6144 normed hidden (device)
@@ -30,6 +64,7 @@ struct PrefillMoeView {
     const ExpertSlices* experts = nullptr;      // host array [128] of device slices
     ExpertSlices shared{};
     float* out = nullptr;                       // T x 6144 (device)
+    const I4Layer* i4 = nullptr;                // FAST_I4 layer pack (null: EXL3 path)
 };
 
 // Dense prefill linears on the v4 core: jobs share one input x [rows][input] (input % 128 == 0, output % 128 == 0)

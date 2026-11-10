@@ -4,8 +4,16 @@
 
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
+#include "core/activation_quant.hpp"
+#ifndef STRIX_MMX_IU4_LIB
+#define STRIX_MMX_IU4_LIB 0
+#endif
+#if STRIX_MMX_IU4_LIB
+#include "core/wmma_tiled.hpp"  // strix-trellis grouped IU4 core (STRIX_TRELLIS_IU4_DIR/src)
+#endif
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -159,6 +167,7 @@ struct PGroup {  // one expert (or the shared expert) of the chunk
     unsigned n, pair_begin, s_gu, s_dn;
     unsigned tbegin;  // first row of the group in the tile-major (v4) xt / at layout, a multiple of 16
     std::size_t part_gu, part_dn;  // float offsets: gate [s_gu][n][1536], up right after; down [s_dn][n][6144]
+    unsigned expert;  // routed expert id, kExperts = the shared expert (FAST_I4 tile list)
 };
 struct Tables {
     const PGroup* groups;
@@ -172,6 +181,8 @@ struct Tables {
     unsigned pairs, rows, shared_group;
     unsigned tpairs;  // padded rows of the tile-major layout (v4); xt = [2][tpairs][6144], at = [tpairs][1536]
 };
+
+
 
 // Tile-major position (v4) of row R (padded row index), column ch of a K-wide matrix: [R/16][ch/16][R%16][ch%16].
 __device__ __forceinline__ std::size_t tiled_at(unsigned R, unsigned ch, unsigned K) {
@@ -543,6 +554,13 @@ struct Plan {
                 off_xt = 0, off_at = 0, off_part = 0, bytes = 0;
 };
 
+std::size_t stored_i4_workspace_bytes(std::size_t pairs) {
+    // 32 is the smallest admitted tile BM. The tile-list bound includes every expert.
+    const std::size_t tiles = (pairs + 31U) / 32U + kI4Experts;
+    auto pad = [](std::size_t n) { return (n + 255U) & ~std::size_t{255}; };
+    return pad(tiles * 12U) + pad(4U) + pad(pairs * kHidden) + pad(2U * pairs * (kHidden / 64U) * 4U) +
+           pad(2U * pairs * kInter * 4U) + pad(pairs * kInter / 2U) + pad(pairs * (kInter / 64U) * 4U) + pad(pairs * kHidden * 4U);
+}
 Plan make_plan(const PrefillMoeView& v) {
     if (v.rows == 0) throw std::invalid_argument("minimax prefill moe: rows must be > 0");
     if (v.ids == nullptr || v.weights == nullptr || v.experts == nullptr || v.y == nullptr || v.out == nullptr)
@@ -551,17 +569,21 @@ Plan make_plan(const PrefillMoeView& v) {
     Plan p;
     const auto erows = route::expert_rows(std::span<const std::uint32_t>(v.ids, std::size_t{T} * kTopE), T, kExperts, kTopE);
     std::vector<std::uint32_t> group_of(kExperts, ~0U);
-    auto add_group = [&](const ExpertSlices& w, const std::vector<std::uint32_t>& rows) {
+    auto add_group = [&](const ExpertSlices& w, const std::vector<std::uint32_t>& rows, unsigned expert) {
         PGroup g{};
         g.w = w;
+        g.expert = expert;
         g.n = static_cast<unsigned>(rows.size());
         g.pair_begin = static_cast<unsigned>(p.pair_row.size());
         g.tbegin = p.tpairs;
         p.tpairs += (g.n + 15U) / 16U * 16U;
-        g.s_gu = gemm_splits(kHidden, kInter, w.gate.bits, g.n);
-        g.s_dn = gemm_splits(kInter, kHidden, w.down.bits, g.n);
-        if (gemm_splits(kHidden, kInter, w.up.bits, g.n) != g.s_gu || gemm_tile_rows(kHidden, kInter, w.gate.bits, g.n) != 16 ||
-            gemm_tile_rows(kHidden, kInter, w.up.bits, g.n) != 16)
+        const unsigned gu_bits = w.gate.bits == kI4Bits ? 3U : w.gate.bits;
+        const unsigned up_bits = w.up.bits == kI4Bits ? 3U : w.up.bits;
+        const unsigned dn_bits = w.down.bits == kI4Bits ? 3U : w.down.bits;
+        g.s_gu = gemm_splits(kHidden, kInter, gu_bits, g.n);
+        g.s_dn = gemm_splits(kInter, kHidden, dn_bits, g.n);
+        if (gemm_splits(kHidden, kInter, up_bits, g.n) != g.s_gu || gemm_tile_rows(kHidden, kInter, gu_bits, g.n) != 16 ||
+            gemm_tile_rows(kHidden, kInter, up_bits, g.n) != 16)
             throw std::invalid_argument("minimax prefill moe: gate/up policy differs between the two matrices");
         g.part_gu = p.part_floats;
         p.part_floats += 2 * static_cast<std::size_t>(g.s_gu) * g.n * kInter;
@@ -576,10 +598,10 @@ Plan make_plan(const PrefillMoeView& v) {
         return gi;
     };
     for (unsigned e = 0; e < kExperts; ++e)
-        if (!erows[e].empty()) group_of[e] = add_group(v.experts[e], erows[e]);
+        if (!erows[e].empty()) group_of[e] = add_group(v.experts[e], erows[e], e);
     std::vector<std::uint32_t> all(T);
     for (unsigned t = 0; t < T; ++t) all[t] = t;
-    const std::uint32_t shared_group = add_group(v.shared, all);
+    const std::uint32_t shared_group = add_group(v.shared, all, kExperts);
     // Token tables: the 4 pairs of each token in ascending expert id (its position in each expert's row list).
     p.tok_pair.resize(std::size_t{T} * kTopE);
     p.tok_w.resize(std::size_t{T} * kTopE);
@@ -621,7 +643,7 @@ Plan make_plan(const PrefillMoeView& v) {
     p.off_xt = take(2 * PX * kHidden * 2);
     p.off_at = take(PX * kInter * 2);
     p.off_part = take(p.part_floats * 4);
-    p.bytes = off;
+    p.bytes = v.i4 && v.i4->on() ? std::max(off, p.off_xt + stored_i4_workspace_bytes(P)) : off;
     (void)shared_group;
     return p;
 }
@@ -1131,21 +1153,33 @@ std::size_t prefill_moe_workspace_bound(std::uint32_t rows) {
     const std::size_t PX = P + 15ULL * groups;  // v4 pads every group to 16 rows
     b += align256(2 * PX * kHidden * 2) + align256(PX * kInter * 2);
     b += align256((groups * 128 + P) * (2ULL * kInter + kHidden) * 4);
+    const char* format = std::getenv("STRIX_MMX_MODEL_FORMAT");
+    if (format && std::string(format) == "fast_i4")
+        b = std::max(b, table_bound(rows) + stored_i4_workspace_bytes(P));
     return b;
 }
+
+#include "minimax/moe/mmx_prefill_iu4.inc"
 
 void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
     Plan p = make_plan(v);
     if (workspace == nullptr || workspace_bytes < p.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
     auto* ws = static_cast<unsigned char*>(workspace);
-    const unsigned core = prefill_core();
+    const bool i4 = v.i4 != nullptr && v.i4->on();
+    if (i4 && !iu4_built()) throw std::invalid_argument("minimax prefill moe: fast_i4 layer but no IU4 core in this build");
+    const unsigned core = i4 ? 3U : prefill_core();
     const bool pair = core == 3 && prefill_pipe_pair(v.rows);
     const bool gufuse = core == 3 && v.rows > 8 && prefill_gufuse();
     const bool v2 = core != 0;  // the grouped v2 item layout (v2, v3 and the v3 diagnostics)
     V2Items v2i;
     std::vector<WItem> items;
     std::vector<pfk::Item> items2;  // gate/up classes, then down classes (same table region)
-    if (v2) {
+    std::vector<std::array<std::uint32_t, 3>> i4_groups;  // FAST_I4: strix::core::IU4Group [kI4Experts] in the items region
+    if (i4) {
+        i4_groups.resize(kI4Experts);
+        for (unsigned e = 0; e < kI4Experts; ++e) i4_groups[e] = {e, 0U, 0U};
+        for (const PGroup& g : p.groups) i4_groups[g.expert] = {g.expert, g.pair_begin, g.n};
+    } else if (v2) {
         v2i = fill_items_v2(p, ws, core == 3, core == 3 && prefill_mtfit(), gufuse);
         for (unsigned c = 0; c < 8; ++c) items2.insert(items2.end(), v2i.gu[c].begin(), v2i.gu[c].end());
         for (unsigned c = 0; c < 8; ++c) items2.insert(items2.end(), v2i.fused[c].begin(), v2i.fused[c].end());
@@ -1174,7 +1208,8 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
         copy(p.off_pair_group, p.pair_group.data(), p.pair_group.size() * 4, "pairs");
         copy(p.off_tok_pair, p.tok_pair.data(), p.tok_pair.size() * 4, "tokens");
         copy(p.off_tok_w, p.tok_w.data(), p.tok_w.size() * 4, "tokens");
-        if (v2) copy(p.off_items, items2.data(), items2.size() * sizeof(pfk::Item), "items");
+        if (i4) copy(p.off_items, i4_groups.data(), i4_groups.size() * sizeof(i4_groups[0]), "iu4 groups");
+        else if (v2) copy(p.off_items, items2.data(), items2.size() * sizeof(pfk::Item), "items");
         else copy(p.off_items, items.data(), items.size() * sizeof(WItem), "items");
         if (slot != nullptr) {
             ok(hipEventRecord(slot->copied, stream), "table copies event");
@@ -1200,6 +1235,13 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     t.rows = v.rows;
     t.shared_group = static_cast<unsigned>(p.groups.size() - 1);
     t.tpairs = p.tpairs;
+#if STRIX_MMX_IU4_LIB
+    if (i4) {
+        mark("start", stream);
+        launch_iu4(p, t, v, ws, workspace_bytes, stream);
+        return;
+    }
+#endif
     const bool tiled = core == 3;
     const auto* items_d = reinterpret_cast<const WItem*>(ws + p.off_items);
     const auto n_gu = static_cast<unsigned>(p.gu_items.size()), n16 = static_cast<unsigned>(p.dn_items16.size()),

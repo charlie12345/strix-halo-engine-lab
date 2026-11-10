@@ -23,6 +23,7 @@
 #include "minimax/pfx/pf_route.hpp"
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
+#include "core/stored_i4_plan.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 
@@ -187,6 +188,14 @@ public:
         return raw(stage_out(pk, prefix, o0, n), true);
     }
     mmoe::Exl3 raw_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return raw(stage_in(prefix, i0, n)); }
+    void reclaimable_raw(bool on) { reclaimable_raw_ = on; }
+    void release_trellis(const mmoe::Exl3& w) {
+        void* p = const_cast<std::uint32_t*>(w.trellis);
+        auto it = std::find(arenas_.begin(), arenas_.end(), p);
+        if (it == arenas_.end()) throw std::logic_error("fast_i4 trellis is not independently owned");
+        hip_ok(hipFree(p), "fast_i4 release EXL3");
+        arenas_.erase(it);
+    }
     // Raw bytes of a plain tensor to device memory through the staging buffer.
     void upload_raw(const std::string& name, void* dst) {
         const TensorInfo& t = pack_.info(name);
@@ -305,8 +314,10 @@ private:
         arena_left_ -= bytes;
         return r;
     }
+    bool reclaimable_raw_ = false;
     mmoe::Exl3 raw(const Staged& g, bool own = false) {
-        const std::uint64_t bytes = g.tr_bytes + 256 + g.suh_bytes + 256 + g.svh_bytes;
+        const std::uint64_t tr_bytes = reclaimable_raw_ ? 0 : g.tr_bytes;
+        const std::uint64_t bytes = tr_bytes + 256 + g.suh_bytes + 256 + g.svh_bytes;
         std::uint8_t* d = nullptr;
         if (own) {
             void* p = nullptr;
@@ -316,13 +327,20 @@ private:
         } else {
             d = arena(bytes);
         }
-        std::uint8_t* d_suh = d + ((g.tr_bytes + 255) & ~std::uint64_t{255});
+        std::uint8_t* d_suh = d + ((tr_bytes + 255) & ~std::uint64_t{255});
         std::uint8_t* d_svh = d_suh + ((g.suh_bytes + 255) & ~std::uint64_t{255});
-        hip_ok(hipMemcpy(d, g.tr, g.tr_bytes, hipMemcpyHostToDevice), "raw trellis");
+        std::uint8_t* tr = d;
+        if (reclaimable_raw_) {
+            void* p = nullptr;
+            hip_ok(hipMalloc(&p, g.tr_bytes), "reclaimable raw trellis");
+            arenas_.push_back(p);
+            tr = static_cast<std::uint8_t*>(p);
+        }
+        hip_ok(hipMemcpy(tr, g.tr, g.tr_bytes, hipMemcpyHostToDevice), "raw trellis");
         hip_ok(hipMemcpy(d_suh, g.suh, g.suh_bytes, hipMemcpyHostToDevice), "raw suh");
         hip_ok(hipMemcpy(d_svh, g.svh, g.svh_bytes, hipMemcpyHostToDevice), "raw svh");
         mmoe::Exl3 e;
-        e.trellis = reinterpret_cast<const std::uint32_t*>(d);
+        e.trellis = reinterpret_cast<const std::uint32_t*>(tr);
         e.suh = reinterpret_cast<const std::uint16_t*>(d_suh);
         e.svh = reinterpret_cast<const std::uint16_t*>(d_svh);
         e.input = static_cast<std::uint32_t>(g.cols);
@@ -373,6 +391,9 @@ struct Layer {
     std::vector<mmoe::ExpertSlices> experts_raw;
     mmoe::ExpertSlices* experts_raw_d = nullptr;
     mmoe::ExpertSlices shared_raw{};
+    mmoe::I4Layer i4{};          // STRIX_MMX_MODEL_FORMAT=fast_i4: IU4 pack of the routed + shared experts
+    void* i4_base = nullptr;     // its dedicated allocation (resident pack)
+    void* i4src_base = nullptr;
 };
 
 // decode STRIX_MM_XB_WARM: streams up to 4 byte ranges through the memory-side cache with plain cached loads (the
@@ -585,11 +606,17 @@ struct Engine::Impl {
         for (void* ptr : {static_cast<void*>(pf_scores), static_cast<void*>(pf_partial), static_cast<void*>(pf_idx),
                           static_cast<void*>(pf_cnt), static_cast<void*>(pf_ticket)})
             if (ptr != nullptr) (void)hipFree(ptr);
+        for (auto& y : layers)
+            for (void* ptr : {y.i4_base, y.i4src_base}) if (ptr != nullptr) (void)hipFree(ptr);  // FAST_I4 packs and tables
     }
     // STRIX_MM_PREFILL_IDENTITY=fp32 (runtime, default off): prefill linears (q/k/v/o, dense MLP,
     // experts, shared) in the FP32 identity of src/minimax/rtxpf (FP32 activations, one fmaf chain per output), which the
     // RTX PRO prefill service reproduces bit for bit. Decode steps are unchanged.
     bool fp32_prefill = false;
+    bool model_fast_i4 = false;   // STRIX_MMX_MODEL_FORMAT=fast_i4
+    int i4_layers_req = -1;       // STRIX_MMX_FAST_I4_LAYERS (resident packs; -1 = auto from the measured free memory)
+    unsigned i4_layers = 0;       // resident packs
+    double i4_convert_s = 0;
     float *f32_xt = nullptr, *f32_raw = nullptr, *f32_g = nullptr, *f32_u = nullptr, *f32_ye = nullptr;
     rtxpf::F32Job *f32_jobs_h = nullptr, *f32_jobs_d = nullptr;
     std::uint32_t f32_jobs_used = 0;
@@ -714,6 +741,45 @@ struct Engine::Impl {
         const char* pid = std::getenv("STRIX_MM_PREFILL_IDENTITY");
         fp32_prefill = route::fp32_profile(pid);
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
+        // STRIX_MMX_MODEL_FORMAT=exl3 (default) | fast_i4 (opt-in FAST identity minimax-fast-i4, lossy, judged on end
+        // metrics): at load the routed + shared experts of STRIX_MMX_FAST_I4_LAYERS MoE layers (first N, required) are
+        // converted on the GPU from EXL3 to the IU4 g64 pack (moe_core/iu4_convert.hpp) and their prefill MoE runs W4A4 on
+        // the strix-trellis grouped IU4 core; the EXL3 tiles stay resident (decode, and STRIX_MMX_PF_IU4=0 A/B arms).
+        // Prefill exchange partials stay FP32 by default (16-bit partials gave no TTFT gain and perturb the prefill state);
+        // STRIX_XPORT_HALF=bf16 is an explicit opt-in. Exact identities refuse it.
+        if (const char* mf = std::getenv("STRIX_MMX_MODEL_FORMAT"); mf != nullptr && *mf != '\0') {
+            const std::string m(mf);
+            if (m == "fast_i4") model_fast_i4 = true;
+            else if (m != "exl3") throw std::invalid_argument("STRIX_MMX_MODEL_FORMAT must be exl3 or fast_i4");
+        }
+        if (model_fast_i4) {
+            const char* base0 = std::getenv("STRIX_MM_BASELINE");
+            const char* why = nullptr;
+            if (!moe_opt) why = "needs the MoE kernels (STRIX_MM_MOE=off refused)";
+            else if (fp32_prefill) why = "is a FAST identity (STRIX_MM_PREFILL_IDENTITY=fp32 refused)";
+            else if (base0 != nullptr && *base0 != '\0' && std::strcmp(base0, "0") != 0) why = "is a FAST identity (STRIX_MM_BASELINE refused)";
+            else if (!mmoe::iu4_built()) why = "needs a build with the IU4 core (shared stored INT4 core)";
+            if (why != nullptr) throw std::invalid_argument(std::string("STRIX_MMX_MODEL_FORMAT=fast_i4 ") + why);
+            if (const char* nl = std::getenv("STRIX_MMX_FAST_I4_LAYERS"); nl != nullptr && *nl != '\0' && std::string(nl) != "auto") {
+                const unsigned long n = std::stoul(nl);
+                if (n > kLayers - kFirstMoe) throw std::invalid_argument("STRIX_MMX_FAST_I4_LAYERS must be auto or 0.." + std::to_string(kLayers - kFirstMoe));
+                i4_layers_req = static_cast<int>(n);
+            }
+            std::printf("rank %u: model format fast_i4 (stored INT4 layers admitted after KV/workspace; remaining layers EXL3 f16; lossy)\n", opt.rank);
+        }
+        {
+            const auto requested = ::strix::xport::payload_policy_from_env([](const char* k) -> const char* { return std::getenv(k); });
+            const char* base = std::getenv("STRIX_MM_BASELINE");
+            const bool baseline_env = base != nullptr && *base != '\0' && std::strcmp(base, "0") != 0;
+            const auto adm = ::strix::xport::admit_payload(requested, !fp32_prefill && !baseline_env,
+                                                           fp32_prefill ? "STRIX_MM_PREFILL_IDENTITY=fp32" : "STRIX_MM_BASELINE=1",
+                                                           true, false);
+            pf_payload = adm.policy.reduce;
+            if (!adm.notice.empty()) std::printf("rank %u: %s\n", opt.rank, adm.notice.c_str());
+            if (!requested.exact())
+                std::printf("rank %u: prefill exchange payload %s (requested %s; FAST, non-exact vs FP32 partials)\n", opt.rank,
+                            ::strix::xport::payload_name(pf_payload), requested.text().c_str());
+        }
     }
 
     std::size_t cache_off(std::uint32_t slot, unsigned layer, std::size_t width) const {
@@ -827,6 +893,7 @@ struct Engine::Impl {
                 y.wr = dupload(pack.floats(b + "gate.weight"));
                 y.wb = dupload(pack.floats(b + "e_score_correction_bias"));
                 if (moe_opt) {
+                    lib.reclaimable_raw(model_fast_i4);
                     auto raw = [&](const std::string& pre, const char* const* nm) {
                         return mmoe::ExpertSlices{lib.raw_out(pre + nm[0], rank * kExpertLocal, kExpertLocal),
                                                   lib.raw_out(pre + nm[1], rank * kExpertLocal, kExpertLocal),
@@ -835,6 +902,7 @@ struct Engine::Impl {
                     y.experts_raw.reserve(kExperts);
                     for (unsigned e = 0; e < kExperts; ++e) y.experts_raw.push_back(raw(b + "experts." + std::to_string(e) + ".", kExp));
                     y.experts_raw_d = dupload(y.experts_raw);
+                    lib.reclaimable_raw(false);
                     y.shared_raw = raw(b + "shared_experts.", kMlp);
                 } else {
                     y.experts.reserve(kExperts);
@@ -857,6 +925,7 @@ struct Engine::Impl {
         hip_ok(hipDeviceSynchronize(), "load head");
         lib.release_staging();
         alloc();
+        if (model_fast_i4) setup_fast_i4();
         LoadReport r;
         r.seconds = secs(t0, Clock::now());
         r.gib_read = pack.gib_read();
@@ -869,6 +938,65 @@ struct Engine::Impl {
         index_layouts_loaded = layouts;
         index_weights_ready = true;
         return r;
+    }
+
+    // Run after alloc(): configured KV, slots and workspace already own their memory.
+    void setup_fast_i4() {
+        const auto t0 = Clock::now();
+        const std::size_t pk = mmoe::i4_pack_bytes(), tables = mmoe::i4_source_bytes();
+        std::size_t fr = 0, total = 0;
+        hip_ok(hipMemGetInfo(&fr, &total), "fast_i4 budget");
+        const char* mg = std::getenv("STRIX_MMX_FAST_I4_MARGIN_GIB");
+        const double margin_gib = mg && *mg ? std::stod(mg) : 8.0;
+        if (!std::isfinite(margin_gib) || margin_gib < 0.0 || margin_gib > 128.0)
+            throw std::invalid_argument("STRIX_MMX_FAST_I4_MARGIN_GIB must be finite in 0..128");
+        const auto margin = static_cast<std::size_t>(margin_gib * 1073741824.0);
+        const unsigned limit = i4_layers_req < 0 ? kLayers - kFirstMoe : static_cast<unsigned>(i4_layers_req);
+        std::vector<std::size_t> released;
+        for (unsigned L = kFirstMoe; L < kLayers; ++L) {
+            std::size_t n = 0;
+            auto count = [&](const mmoe::ExpertSlices& x) {
+                for (const auto* w : {&x.gate, &x.up, &x.down})
+                    n += std::size_t{w->input / 16U} * (w->output / 16U) * w->bits * 32U;
+            };
+            for (const auto& x : layers[L].experts_raw) count(x);
+            count(layers[L].shared_raw);
+            released.push_back(n);
+        }
+        const auto plan = ::strix::core::plan_stored_i4(fr, margin, pk, tables, released, limit);
+        if (i4_layers_req >= 0 && plan.layers != limit)
+            throw std::runtime_error("fast_i4 requested layers do not fit after configured KV/workspace");
+        const double kv_gib = static_cast<double>(static_cast<std::uint64_t>(opt.slots) * kLayers * opt.capacity * (2U * kKVLocal + 128U) * 2U) / 1073741824.0;
+        std::printf("mm rank %u: fast_i4 budget: context %zu x %zu slots, KV %.2f GiB, workspace %.2f GiB, free %.2f GiB, "
+                    "margin %.2f GiB -> stored INT4 %zu/%zu layers, remaining EXL3 f16; peak load scratch %.2f GiB\n", opt.rank,
+                    static_cast<std::size_t>(opt.capacity), static_cast<std::size_t>(opt.slots), kv_gib,
+                    static_cast<double>(pf_ws_bytes) / 1073741824.0, static_cast<double>(fr) / 1073741824.0,
+                    margin_gib, plan.layers, released.size(), static_cast<double>(pk + tables) / 1073741824.0);
+        for (unsigned i = 0; i < plan.layers; ++i) {
+            Layer& y = layers[kFirstMoe + i];
+            hip_ok(hipMalloc(&y.i4src_base, tables), "fast_i4 tables");
+            const auto src = mmoe::i4_source_build(y.experts_raw.data(), y.shared_raw, y.i4src_base);
+            hip_ok(hipMalloc(&y.i4_base, pk), "fast_i4 stored pack");
+            y.i4 = mmoe::i4_layer_view(static_cast<std::uint8_t*>(y.i4_base), src);
+            mmoe::i4_convert(src, y.i4, nullptr);
+            hip_ok(hipDeviceSynchronize(), "fast_i4 load pack complete");
+            auto replace = [&](mmoe::ExpertSlices& x, unsigned e) {
+                for (unsigned m = 0; m < 3; ++m) {
+                    auto& w = (&x.gate)[m];
+                    lib.release_trellis(w);
+                    w.trellis = reinterpret_cast<const std::uint32_t*>(y.i4.wq[m] + std::size_t{e} * mmoe::kI4ExpertBytes);
+                    w.bits = mmoe::kI4Bits;
+                }
+            };
+            for (unsigned e = 0; e < kExperts; ++e) replace(y.experts_raw[e], e);
+            replace(y.shared_raw, kExperts);
+            hip_ok(hipMemcpy(y.experts_raw_d, y.experts_raw.data(), y.experts_raw.size() * sizeof(y.experts_raw[0]), hipMemcpyHostToDevice),
+                   "fast_i4 stored decode table");
+            ++i4_layers;
+        }
+        i4_convert_s = secs(t0, Clock::now());
+        std::printf("mm rank %u: fast_i4 startup: stored %u layers, EXL3 %u layers; converted at load in %.2f s; no runtime conversion\n",
+                    opt.rank, i4_layers, kLayers - kFirstMoe - i4_layers, i4_convert_s);
     }
 
     void alloc() {
@@ -1123,6 +1251,8 @@ struct Engine::Impl {
     // the shared gate / up of L (MoE layers) or the dense gate / up (L0-2); after the FFN exchange the next layer's
     // q / k / v. Cache state only (no data dependency, the main stream never waits for it).
     void xb_warm(unsigned layer, unsigned which, const std::uint64_t* flag, std::uint64_t seq) {
+        if (layers[layer].i4.on()) return;  // EXL3 byte-range planner does not describe stored INT4.
+
         WarmRanges w;
         w.sink = xb_warm_sink;
         std::size_t left = std::size_t{xb_warm_mb} << 20;
@@ -1769,6 +1899,8 @@ struct Engine::Impl {
                 pv.experts = y.experts_raw.data();
                 pv.shared = y.shared_raw;
                 pv.out = out;
+                if (y.i4.on()) pv.i4 = &y.i4;  // Stored layers cannot select an EXL3 path.
+
                 // The module markers are host callbacks: record one interval
                 // from its first launch to combine, excluding host planning.
                 struct TimelineMoe {
@@ -1777,6 +1909,7 @@ struct Engine::Impl {
                 } timeline_moe{tl != nullptr};
                 if (tl) mmoe::set_prefill_marker(PrefillTimeline::moe_mark, tl);
                 mmoe::enqueue_prefill_moe(pv, pf_ws, pf_ws_bytes, nullptr);
+
                 if (pf_table_stats) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - table_host_start).count();
                     ++pf_table_calls;

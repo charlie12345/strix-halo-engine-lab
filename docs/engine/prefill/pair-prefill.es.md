@@ -6,9 +6,10 @@ El traspaso en pareja es explícito: establezca `STRIX_QWEN_PF_PIPE=1` y
 identificadores de la petición, opciones numéricas y capacidad idénticos. El
 fragmento predeterminado de la pareja es de 4,096 filas cuando se admite. Guardar
 la sesión después de un prellenado en dos nodos requiere una longitud de petición
-que sea múltiplo del tamaño del fragmento. Este trabajo sigue pendiente de
-calificación nativa; las pruebas en el host no establecen la igualdad de tokens ni
-la velocidad.
+que sea múltiplo del tamaño del fragmento. Medido en dos nodos por USB4 (comprobación de la versión fusionada, un par nuevo por ejecución): tokens,
+logits completos y estado final iguales a la ejecución en un nodo a 32K, 128K y con un prompt impar de
+32,771 tokens. Prefill 32K **12.1-12.3 s (~2,660-2,710 tok/s)** frente a 19.2 s en un nodo; 128K
+**46.5-46.9 s (~2,800 tok/s)** frente a 79.8 s.
 
 El resolvedor ejecuta las peticiones cortas íntegramente en el rango 0, sin conexión
 ni traspaso. En otro caso, canaliza un prefijo legal, restaura la ejecución del

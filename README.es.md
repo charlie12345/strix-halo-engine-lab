@@ -18,6 +18,7 @@ repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y 
 |---|---|---|---|
 | Qwen3.8-Flash-Next | 1 nodo | 62.44 tok/s (MTP, código 1K) | 1,695 tok/s a 4K (exacto) |
 | Qwen3.8-Flash-Next | 2 nodos (dos réplicas, servidor) | 158.1 tok/s en total con 8 flujos (68.2 con 1) | - |
+| Qwen3.8-Flash-Next | 2 nodos (prefill en pipeline, opcional) | - | ~2,660 tok/s a 32K, ~2,800 a 128K (exacto) |
 | DeepSeek V4.1 Flash | par | 70.6 tok/s (DSpark, código) | 1,057 tok/s a 8.4K, 1,172 a 32.5K (exacto) |
 | MiniMax M3.1 Flash | par | 23.10 tok/s (1K) | 596 tok/s a 8K, 529 a 32K (exacto) |
 | GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | 541 tok/s a 8K, 529 a 32K (exacto) |

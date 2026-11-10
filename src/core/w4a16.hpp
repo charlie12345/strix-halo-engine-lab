@@ -3,6 +3,7 @@
 //   W tiles [K/16][N/16][column within tile][K within tile / 2] signed nibbles (low nibble = even k), per column and
 //   K64 group FP16 scale s, w = q * s. Activations FP16 (the caller's transformed rows, typically in LDS), F32
 //   accumulation: per group a v_dot2_f32_f16 chain of nibble * activation pairs, then acc = fmaf(s, group sum, acc).
+//   (v_dot2 on gfx1151 is not an exactly rounded chain: a few F32 ulps off even on integer operands.)
 // One wave covers 4 adjacent 16-column tiles (64 outputs). Lane l reads one 16-byte run per k-tile: tile l / 8,
 // columns 2 (l % 8) and 2 (l % 8) + 1, all 16 k of each (no cross-lane reduction). Rows are a static bucket R; rows
 // at or past nrows are skipped (their emitted values are 0) and the caller must not store them.

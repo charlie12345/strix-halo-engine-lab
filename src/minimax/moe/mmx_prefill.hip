@@ -1083,74 +1083,115 @@ struct DevPolicy {
 #pragma unroll
         for (unsigned k = 0; k < kTopE; ++k) e[k] = k, w[k] = 0.0F;
     }
-    // The groups of make_plan and the v4 + mtfit items of fill_items_v2 (gufuse off), in their order; one thread.
+    // The groups of make_plan and the v4 + mtfit items of fill_items_v2 (gufuse off), in their order: thread x sizes
+    // group x, exclusive scans over the groups (row tiles, partial floats, per-class item counts and CTAs), then
+    // thread x writes its group and items.
     __device__ static void finish(const A& p, const unsigned* count, const unsigned* start) {
-        if (threadIdx.x != 0) return;
-        unsigned ncls[16], ctas[16];
-        for (unsigned i = 0; i < 16; ++i) ncls[i] = ctas[i] = 0;
-        unsigned tp = 0;
-        std::size_t part = 0;
-        for (unsigned x = 0; x < kDevGroups; ++x) {
-            const unsigned n = count[x];
+        __shared__ unsigned ncls[kDevGroups + 1][16], ncta[kDevGroups + 1][16], tile_rows[kDevGroups + 1];
+        __shared__ std::size_t floats[kDevGroups + 1];
+        const unsigned x = threadIdx.x;
+        const bool mine = x < kDevGroups;
+        const unsigned n = mine ? count[x] : 0U;
+        ExpertSlices w{};
+        unsigned s_gu = 0, s_dn = 0;
+        route::MtFit fit{};
+        if (mine) {
+            w = x < kExperts ? p.out.experts[x] : p.out.shared;
+            s_gu = n ? route::gemm_splits(kHidden, kInter, w.gate.bits, n) : 0U;
+            s_dn = n ? route::gemm_splits(kInter, kHidden, w.down.bits, n) : 0U;
+            fit = route::mtfit(n);
+            for (unsigned q = 0; q < 16; ++q) ncls[x][q] = ncta[x][q] = 0;
+            tile_rows[x] = (n + 15U) / 16U * 16U;
+            floats[x] = 2 * static_cast<std::size_t>(s_gu) * n * kInter + static_cast<std::size_t>(s_dn) * n * kHidden;
+            // gate/up: 2 items per used class (gate, up); down: 1. gx = 12 / 48.
+            if (fit.main != 0) {
+                ncls[x][7] = 2, ncta[x][7] = 2 * (kInter / 128) * fit.main * s_gu;
+                ncls[x][15] = 1, ncta[x][15] = (kHidden / 128) * fit.main * s_dn;
+            }
+            if (fit.remainder != 0) {
+                ncls[x][fit.tail_class] += 2, ncta[x][fit.tail_class] += 2 * (kInter / 128) * s_gu;
+                ncls[x][8 + fit.tail_class] += 1, ncta[x][8 + fit.tail_class] += (kHidden / 128) * s_dn;
+            }
+        }
+        __syncthreads();
+        // Exclusive scans down the group columns (row kDevGroups = the totals).
+        if (x < 16) {
+            unsigned c = 0, t = 0;
+            for (unsigned g = 0; g <= kDevGroups; ++g) {
+                const unsigned dc = g < kDevGroups ? ncls[g][x] : 0U, dt = g < kDevGroups ? ncta[g][x] : 0U;
+                ncls[g][x] = c;
+                ncta[g][x] = t;
+                c += dc;
+                t += dt;
+            }
+        } else if (x == 16) {
+            unsigned t = 0;
+            for (unsigned g = 0; g <= kDevGroups; ++g) { const unsigned d = g < kDevGroups ? tile_rows[g] : 0U; tile_rows[g] = t; t += d; }
+        } else if (x == 17) {
+            std::size_t t = 0;
+            for (unsigned g = 0; g <= kDevGroups; ++g) { const std::size_t d = g < kDevGroups ? floats[g] : 0U; floats[g] = t; t += d; }
+        }
+        __syncthreads();
+        if (mine) {
             PGroup g{};
-            g.w = x < kExperts ? p.out.experts[x] : p.out.shared;
+            g.w = w;
             g.n = n;
             g.pair_begin = start[x];
-            g.tbegin = tp;
-            tp += (n + 15U) / 16U * 16U;
-            g.s_gu = n ? route::gemm_splits(kHidden, kInter, g.w.gate.bits, n) : 0U;
-            g.s_dn = n ? route::gemm_splits(kInter, kHidden, g.w.down.bits, n) : 0U;
-            g.part_gu = part;
-            part += 2 * static_cast<std::size_t>(g.s_gu) * n * kInter;
-            g.part_dn = part;
-            part += static_cast<std::size_t>(g.s_dn) * n * kHidden;
+            g.tbegin = tile_rows[x];
+            g.s_gu = s_gu;
+            g.s_dn = s_dn;
+            g.part_gu = floats[x];
+            g.part_dn = floats[x] + 2 * static_cast<std::size_t>(s_gu) * n * kInter;
             p.out.groups[x] = g;
-            if (n == 0) continue;
-            auto append = [&](pfk::Item it, unsigned stage) {
-                auto emit = [&](unsigned c, unsigned row0, unsigned gy) {
-                    const unsigned q = stage * 8U + c;
-                    it.row0 = row0;
-                    it.gy = gy;
-                    it.cta_begin = ctas[q];
-                    ctas[q] += it.gx * gy * it.splits;
-                    p.out.items[(stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot) + ncls[q]++] = it;
+            if (n != 0) {
+                unsigned at[16], cta[16];  // this group's next item slot and CTA offset per class
+                for (unsigned q = 0; q < 16; ++q) at[q] = ncls[x][q], cta[q] = ncta[x][q];
+                auto append = [&](pfk::Item it, unsigned stage) {
+                    auto emit = [&](unsigned c, unsigned row0, unsigned gy) {
+                        const unsigned q = stage * 8U + c;
+                        it.row0 = row0;
+                        it.gy = gy;
+                        it.cta_begin = cta[q];
+                        cta[q] += it.gx * gy * it.splits;
+                        p.out.items[(stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot) + at[q]++] = it;
+                    };
+                    if (fit.main != 0) emit(7, 0, fit.main);
+                    if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
                 };
-                const auto fit = route::mtfit(n);
-                if (fit.main != 0) emit(7, 0, fit.main);
-                if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
-            };
-            for (unsigned m = 0; m < 2U; ++m) {
-                const Exl3& w = m == 0 ? g.w.gate : g.w.up;
+                for (unsigned m = 0; m < 2U; ++m) {
+                    const Exl3& mw = m == 0 ? w.gate : w.up;
+                    pfk::Item it{};
+                    it.trellis = mw.trellis;
+                    it.x = p.out.xt + (static_cast<std::size_t>(m) * p.out.tpairs + g.tbegin) * kHidden;
+                    it.part = p.out.part + g.part_gu + static_cast<std::size_t>(m) * s_gu * n * kInter;
+                    it.input = kHidden;
+                    it.output = kInter;
+                    it.bits = mw.bits;
+                    it.rows = n;
+                    it.splits = s_gu;
+                    it.gx = kInter / 128;
+                    append(it, 0);
+                }
                 pfk::Item it{};
-                it.trellis = w.trellis;
-                it.x = p.out.xt + (static_cast<std::size_t>(m) * p.out.tpairs + g.tbegin) * kHidden;
-                it.part = p.out.part + g.part_gu + static_cast<std::size_t>(m) * g.s_gu * n * kInter;
-                it.input = kHidden;
-                it.output = kInter;
-                it.bits = w.bits;
+                it.trellis = w.down.trellis;
+                it.x = p.out.at + static_cast<std::size_t>(g.tbegin) * kInter;
+                it.part = p.out.part + g.part_dn;
+                it.input = kInter;
+                it.output = kHidden;
+                it.bits = w.down.bits;
                 it.rows = n;
-                it.splits = g.s_gu;
-                it.gx = kInter / 128;
-                append(it, 0);
+                it.splits = s_dn;
+                it.gx = kHidden / 128;
+                append(it, 1);
             }
-            pfk::Item it{};
-            it.trellis = g.w.down.trellis;
-            it.x = p.out.at + static_cast<std::size_t>(g.tbegin) * kInter;
-            it.part = p.out.part + g.part_dn;
-            it.input = kInter;
-            it.output = kHidden;
-            it.bits = g.w.down.bits;
-            it.rows = n;
-            it.splits = g.s_dn;
-            it.gx = kHidden / 128;
-            append(it, 1);
         }
-        if (ctas[7] > p.out.grid7[0] || ctas[15] > p.out.grid7[1]) atomicOr(p.flag, 2U);  // above the direct MT8 grid
-        for (unsigned i = 0; i < 16; ++i) {
-            p.out.meta->count[i] = ncls[i];
-            p.out.meta->total[i] = ctas[i];
-            p.out.meta->next[i] = 0;
+        if (x < 16) {
+            p.out.meta->count[x] = ncls[kDevGroups][x];
+            p.out.meta->total[x] = ncta[kDevGroups][x];
+            p.out.meta->next[x] = 0;
         }
+        if (x == 0 && (ncta[kDevGroups][7] > p.out.grid7[0] || ncta[kDevGroups][15] > p.out.grid7[1]))
+            atomicOr(p.flag, 2U);  // above the direct MT8 grid
     }
     __device__ static void routed(const A& p, unsigned r, unsigned k, unsigned e, float w, unsigned pos) {
         p.out.pair_row[pos] = r;

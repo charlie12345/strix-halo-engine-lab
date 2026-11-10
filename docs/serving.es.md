@@ -17,6 +17,12 @@ petición, las opciones y las puertas están en [docs/engine/serving/serving.md]
 
 ## Exposición de los servidores
 
+DeepSeek V4.1 usa chat sin razonamiento cuando la petición omite la elección.
+`--default-thinking on|off` cambia ese valor del servidor (por defecto `off`).
+La petición tiene prioridad mediante `enable_thinking` (también en
+`chat_template_kwargs`) o `thinking.type` en Messages; `reasoning_effort: "none"`
+desactiva el razonamiento. `GET /v1/capabilities` informa de `default_thinking`.
+
 Qwen y DeepSeek publican las funciones ejecutadas en `GET /v1/capabilities`; el objeto `strix` de cada respuesta
 indica la política de muestreo solicitada frente a la efectiva. En todos los servidores (Qwen, DeepSeek, MiniMax) los
 campos de generación no admitidos devuelven 400 indicando el campo. MiniMax decodifica de forma greedy: una temperatura

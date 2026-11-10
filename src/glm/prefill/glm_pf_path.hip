@@ -586,8 +586,6 @@ private:
     std::map<const MoeLayerWeights*, moe::ExpertSlices*> pinned_tables_;  // host-pinned [289] per MoE layer
     std::map<const MoeLayerWeights*, exact_moe::iu4::Layer> i4_views_;  // fast_i4: views of MoeLayerWeights::i4 (not owned)
     exact_moe::iu4::Scratch iu4_scratch_{};
-    std::size_t iu4_bytes_ = 0;
-    double iu4_seconds_ = 0;
     std::vector<std::uint32_t> route_ids_;
     std::vector<float> route_weights_;
     float *tq_, *tk_, *tv_, *qkv_, *f_, *g_, *b_, *ta_, *tb128_, *scr_, *beta_, *o_, *y1_;

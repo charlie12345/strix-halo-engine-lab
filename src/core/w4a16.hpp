@@ -7,6 +7,7 @@
 // columns 2 (l % 8) and 2 (l % 8) + 1, all 16 k of each (no cross-lane reduction). Rows are a static bucket R; rows
 // at or past nrows are skipped (their emitted values are 0) and the caller must not store them.
 #if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
 #include <cstddef>
 #include <cstdint>
 

@@ -1154,7 +1154,6 @@ struct Engine::Impl {
     // The load sequence, run twice: once as a dry run (lib.planning(): records every allocation, nothing read or
     // allocated) and once for real with a memory check after every step. `step` is called after each step.
     template <class Step> void load_steps(bool want_head, Step&& step) {
-        i4_slots_planned = false;
         embed = static_cast<std::uint16_t*>(lib.upload_rows(kP + "embed_tokens.weight"));
         if (lib.dtype(kP + "embed_tokens.weight") != "BF16") throw std::runtime_error("embedding must be BF16");
         step("embed");

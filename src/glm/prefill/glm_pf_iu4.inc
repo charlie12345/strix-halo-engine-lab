@@ -8,6 +8,26 @@
 //            per row and K64 group (library quantiser), gathered through the plan's pair map.
 //   epilogue: the library's fused output transform, had128 over each 128-column block times the expert's svh.
 #if STRIX_GLM_PF_IU4_LIB
+// STRIX_GLM_PF_IU4_PLAN: library IU4 plan 0 (BM32), 1 (BM64), 2 (BM128); unset = auto: plan 2 when the call averages
+// >= 128 rows per routed expert (MiniMax 8K: packed plan 2 40.4 ms vs f16 ~122 ms per layer), else plan 1.
+int iu4_plan(unsigned pairs) {
+    const char* p = std::getenv("STRIX_GLM_PF_IU4_PLAN");
+    if (!p || !*p) return pairs >= 128U * E ? 2 : 1;
+    if (std::strcmp(p, "0") == 0) return 0;
+    if (std::strcmp(p, "1") == 0) return 1;
+    if (std::strcmp(p, "2") == 0) return 2;
+    throw std::invalid_argument("STRIX_GLM_PF_IU4_PLAN must be 0, 1 or 2");
+}
+void iu4_ok(hipError_t e, const char* what) { ok(e, what); }
+// STRIX_GLM_PF_IU4_FUSEQ (default 1): quantise in the input transform / activation kernels (routed rows write packed
+// nibbles + scales instead of FP16 rows); 0 = FP16 rows then the library quantiser. Same bits either way: the fused
+// form rounds each value to FP16 first and repeats the library quantiser's arithmetic (max|x|/7, RNE, [-7, 7]).
+bool iu4_fuse_quant() {
+    const char* p = std::getenv("STRIX_GLM_PF_IU4_FUSEQ");
+    if (!p || !*p || std::strcmp(p, "1") == 0) return true;
+    if (std::strcmp(p, "0") == 0) return false;
+    throw std::invalid_argument("STRIX_GLM_PF_IU4_FUSEQ must be 0 or 1");
+}
 // input_kernel with routed rows quantised (row pair * 2 + m of aq/as); the shared expert's rows stay FP16 in a.input.
 __global__ void iu4_input_kernel(Args a, std::uint8_t* aq, float* as) {
     if (a.ntiles && blockIdx.y >= *a.ntiles) return;

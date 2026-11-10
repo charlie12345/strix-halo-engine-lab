@@ -970,6 +970,7 @@ void enqueue_device(const DeviceView& v, Plan& plan, void* ws, std::size_t bytes
 }
 namespace iu4 {
 bool built() { return STRIX_GLM_PF_IU4_LIB != 0; }
+namespace {
 template<class T> T* device_alloc(std::size_t count, std::size_t& total) {
     void* p = nullptr;
     ok(hipMalloc(&p, count * sizeof(T)), "iu4 allocation");

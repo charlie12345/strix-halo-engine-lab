@@ -1,7 +1,8 @@
 #pragma once
 // MiniMax M3.1 defaults-on resolver (optimizations are ON by default in code and are
 // switched OFF, never the other way round). Host only, no HIP: the apps and the engine call apply() before they read
-// any switch, and the CPU tests diff its output against the measured production receipt.
+// any switch, and the CPU tests diff the explicit host configuration against the measured production receipt,
+// with the new routed serve transport default checked separately.
 //
 // Optimizations and admission policies resolve ON unless their env names the off value.
 // Unqualified admission cells select plain; the item receipt distinguishes policy from measured kernels.
@@ -75,10 +76,11 @@ struct SessionConfig {
     std::string directory, reason, disk_reason, route;
 };
 // Resolve the startup vote without measuring resources or touching storage.
+// Runtime callers must set Cli::transport from the negotiated device exchange.
 SessionConfig session_policy(const Cli&, const Lookup&, bool explicit_cli = false);
 // Runtime admission measures memory/storage and may probe the cache directory.
 // Effective-config inspection uses pure policy resolution instead.
-// explicit_cli bypasses automatic qualification/switches, retaining resource checks
+// explicit_cli bypasses automatic qualification/switches (except unqualified direct serving), retaining resource checks
 // and validating explicit_directory rather than the automatic cache path.
 SessionConfig session_config(const Cli&, const Lookup&, std::uint64_t available = UINT64_MAX,
                              bool explicit_cli = false, const std::string& explicit_directory = "");

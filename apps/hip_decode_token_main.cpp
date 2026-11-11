@@ -1,3 +1,4 @@
+#include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qwen_prefill_handoff.hpp"
 #include "strix/qwen_prefill_pipe_dump.hpp"
@@ -5674,21 +5675,10 @@ static int run_decode_entry(
                 pair_rank, pair_prediction.cut, pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "default"),
                 static_cast<unsigned long long>(pair_bucket), pair_prediction.a * static_cast<double>(options.tokens.size()),
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
-            const char* pair_transport_env = std::getenv("STRIX_QWEN_PF_PIPE_TRANSPORT");
-            const std::string_view pair_transport = pair_transport_env ? pair_transport_env : "usb4auto";
-            std::unique_ptr<strix::dist::Transport> pair_link = std::move(deployment.pair_link);
-            if (pair_link) { /* Deployment already exchanged measured facts and plan IDs. */ }
-            else if (pair_transport == "usb4auto" || pair_transport == "usb4-auto") {
-                strix::dist::Usb4AutoOptions pair_usb;
-                pair_usb.rank = pair_rank;
-                pair_link = strix::dist::usb4_host_auto(pair_usb);
-            } else if (pair_transport == "tcp") {
-                const char* pair_peer = std::getenv("STRIX_QWEN_PF_PIPE_PEER");
-                if (pair_rank == 1U && !pair_peer) throw std::invalid_argument("pair prefill TCP rank 1 requires --peer HOST (port 29872)");
-                const auto pair_timeout = std::chrono::milliseconds(120000);
-                pair_link = pair_rank == 0U ? strix::dist::tcp_listen(29872, pair_timeout) :
-                    strix::dist::tcp_connect(pair_peer, 29872, pair_timeout);
-            } else throw std::invalid_argument("pair prefill transport must be usb4auto or tcp");
+            // Deployment may already have exchanged measured facts and plan IDs on its own link.
+            auto pair_link = deployment.pair_link
+                ? std::make_unique<strix::qwen_pp::PairTransport>(std::move(deployment.pair_link))
+                : std::make_unique<strix::qwen_pp::PairTransport>(pair_rank);
             strix::qwen_pp::Pipe pair_pipe(pair_rank,
                 (pair_prompt_size + known_prefill_plan->logical_rows - 1U) / known_prefill_plan->logical_rows,
                 [&](std::span<const std::byte> data) { pair_link->send(data); },
@@ -5696,7 +5686,10 @@ static int run_decode_entry(
                 [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.cut,
                 [&] { return strix::qwen_pp::make_hip_pipe_staging(
                     static_cast<std::size_t>(known_prefill_plan->logical_rows) * strix::qwen_pp::Seam::row_bytes); },
-                [](std::span<const std::byte> data) { return strix::dist::crc32c(data); });
+                [](std::span<const std::byte> data) { return strix::dist::crc32c(data); },
+                [&](bool sending, strix::qwen_pp::PipeStaging& staging, std::size_t offset, std::size_t bytes) {
+                    return pair_link->piece(sending, staging, offset, bytes);
+                });
             auto& pair_context = strix::qwen_pp::pipe_context;
             pair_context = {&pair_pipe, pair_rank, 0U, known_prefill_plan->prefill_execution_identity, pair_prediction.cut};
             pair_context.identity ^= compiled.execution_identity ^ known_prefill_plan->prefill_kernel_plan_identity;
@@ -5743,6 +5736,7 @@ static int run_decode_entry(
                 }
             }
             pair_pipe.finish(pair_context.sequence);
+            pair_link->finish();
             if (strix::qwen_pp::decode_enabled()) {
                 const auto handoff_start = std::chrono::steady_clock::now();
                 check_hip(hipDeviceSynchronize(), "pair handoff state producer fence");

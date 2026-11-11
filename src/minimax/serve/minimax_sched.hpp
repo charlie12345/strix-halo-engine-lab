@@ -125,7 +125,7 @@ bool replay_command(const Control& c, Engine& eng, Runner& run, Receive receive)
             c.bank != (c.parent_task_id != 0 ? 1U : 0U))
             throw std::runtime_error("control channel: begin bank / parent mismatch");
         const auto prompt = receive(c.plen);
-        run.prefill_begin(c.pslot, prompt, (c.pflags & 1U) != 0, c.task_id, c.parent_task_id, c.slot_generation);
+        run.prefill_begin(c.pslot, prompt, (c.pflags & 1U) != 0, c.task_id, c.parent_task_id, c.slot_generation, c.pstart);
         break;
     }
     case Command::unit: {

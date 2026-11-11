@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/serve/json.hpp"
+#include "strix/pair/balance.hpp"
 #include <array>
 #include <algorithm>
 #include <vector>
@@ -101,21 +102,16 @@ inline LayerCosts load_costs(const char* path, std::uint64_t context) {
 }
 struct CutPrediction { std::uint32_t cut = 24; double a = 0; double b = 0; };
 inline CutPrediction predict_cut(const LayerCosts& costs, std::uint32_t cut) {
-    CutPrediction prediction{cut, 0, costs.lm_head};
-    for (std::size_t layer = 0; layer < costs.layers.size(); ++layer)
-        (layer < cut ? prediction.a : prediction.b) += costs.layers[layer];
-    return prediction;
+    const auto split = pair::predict_split(costs.layers, costs.lm_head, cut);
+    return {split.cut, split.a, split.b};
 }
 inline CutPrediction choose_cut(const LayerCosts& costs, const LegalCuts& legal) {
-    CutPrediction best{};
-    double score = std::numeric_limits<double>::infinity();
-    for (std::uint32_t cut = 1; cut < 48U; ++cut) if (legal[cut]) {
-        const auto candidate = predict_cut(costs, cut);
-        const auto work = std::max(candidate.a, candidate.b);
-        if (work < score) { best = candidate; score = work; }
+    try {
+        const auto split = pair::balance_split(costs.layers, costs.lm_head, [&](std::uint32_t cut) { return legal[cut]; });
+        return {split.cut, split.a, split.b};
+    } catch (const std::invalid_argument&) {
+        throw std::invalid_argument("pair prefill model has no legal folded attention-HC cut");
     }
-    if (!std::isfinite(score)) throw std::invalid_argument("pair prefill model has no legal folded attention-HC cut");
-    return best;
 }
 // Largest prefix accepted by a full tile or a >=16 row, multiple-of-eight tail.
 inline std::uint64_t legal_prefix(std::uint64_t prompt, std::uint32_t rows) {

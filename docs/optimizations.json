@@ -1667,6 +1667,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefix reuse for unnamed requests (draft, opt-in)",
+    "flag_or_env": "STRIX_MM_SERVE_PREFIX",
+    "default": "off",
+    "exact": "CPU policy gates cover group alignment, decode-row exclusion, cancellation, legacy wire bytes, hello votes and session invalidation. The two-node gate compares matched prompt token IDs and requires reuse counters. Complete token/logit/canonical-state device validation remains pending; this is a draft opt-in feature.",
+    "gain": "None claimed. The skipped work is the prefill of the shared prefix.",
+    "preconditions": "STRIX_MM_SERVE_PREFIX=1 on both ranks; baseline disables the vote. Free slot with completed prefill rows sharing at least one whole --max-rows times STRIX_MM_PF_GROUP group (default 8192 tokens). Both ranks use the same chunk/group configuration. No nested prompt or DSpark context reuse. A session command clears all resident records; generated rows never extend them.",
+    "off_switch": "unset STRIX_MM_SERVE_PREFIX (or any value other than 1) and restart both ranks",
+    "doc_anchor": "docs/optimizations.md#mm-serve-prefix"
+  },
+  {
+    "engine": "minimax",
     "name": "o_proj warm during decode attention",
     "flag_or_env": "STRIX_MM_XB_WARM_O",
     "default": "8",

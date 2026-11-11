@@ -1,3 +1,4 @@
+#include "strix/dist/open_transport.hpp"
 // strix-minimax-serve: the MiniMax M3.1 Flash TP2 engine behind an OpenAI-compatible HTTP API (both ranks run it;
 // rank 0 serves HTTP). The DS serve recipe: rank 0 owns the queue and a continuous-batching scheduler over the
 // engine's sequence slots and sends one fixed-size control block per round (prefill / unit / step / draft / heartbeat /
@@ -110,26 +111,18 @@ double env_num(const char* name, double def) {
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
 
+std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
+
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt) {
-    const std::chrono::seconds limit(300);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4-auto") {
-        strix::dist::Usb4AutoOptions o;
-        o.transport_capabilities = 0; // preserve the qualified serving contract
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        receipt = topology.receipt();
-        return t;
-    }
-    throw std::invalid_argument("unknown transport " + spec);
+    strix::dist::OpenTransportOptions options;
+    options.spellings = strix::dist::hyphen_transport;
+    options.usb.rank = rank;
+    options.usb.timeout = std::chrono::seconds(300);
+    options.usb.transport_capabilities = 0; // preserve the serving capability contract
+    auto opened = strix::dist::open_transport(spec, options);
+    gpu_direct = std::move(opened.direct);
+    receipt = std::move(opened.receipt);
+    return std::move(opened.host);
 }
 
 // The transport shared in turn by the communicator and the exchange module (as strix-minimax-rank).
@@ -171,6 +164,8 @@ struct Runner {
     void send_prompt(std::vector<std::uint32_t>& prompt) { exchange_tokens(eng, prompt, prompt.size(), true); }
     static void synchronize() { ds::DeviceDrafter::device_synchronize(); }
     mm::Engine& eng;
+    strix::dist::Communicator& comm;
+    void quiesce() { comm.release_transport(nullptr); }
     ds::DeviceDrafter* dd = nullptr;  // DSpark drafter (both ranks), nullptr = none
     std::uint32_t v0 = 0, vn = 0;     // this rank's vocabulary half (drafter Markov steps)
 
@@ -184,15 +179,18 @@ struct Runner {
         if (dd != nullptr) for (std::uint32_t s = 0; s < eng.slots(); ++s)
             if ((mask >> s) & 1U) dd->drop_staged(s);
     }
+    // `resident` positions of the slot are a reused prefix already in the cache; only `prompt` (the suffix) is
+    // prefilled, opening at that position. The reused prefix's drafter taps stay archived (drop_staged clears only
+    // the deferred staging, not the archive); the lead only reuses when the drafter window is covered (see Lead).
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> prompt, bool context,
-                       std::uint64_t id, std::uint64_t parent = 0, std::uint64_t generation = 0) {
+                       std::uint64_t id, std::uint64_t parent = 0, std::uint64_t generation = 0, std::uint64_t resident = 0) {
         contexts = (contexts & ~(1U << slot)) | (context ? 1U << slot : 0U);
         if (dd != nullptr) dd->drop_staged(slot);  // a new sequence: the previous one's staged rows are never read
         mm::Engine::PrefillTapSink sink;
         if (dd != nullptr && context)
             sink = [this](const float* taps, std::size_t n, std::uint32_t s, std::uint64_t pos0) { if ((contexts >> s) & 1U) dd->append(s, taps, n, pos0, nullptr); };
         if (id == 0) throw std::runtime_error("prefill begin: missing task ID");
-        eng.prefill_begin_task(id, parent, generation, slot, prompt, std::move(sink));
+        eng.prefill_begin_task(id, parent, generation, slot, prompt, resident, std::move(sink));
     }
     void prefill_check(std::uint64_t id, std::uint32_t next) const {
         const auto p = eng.prefill_progress();
@@ -283,6 +281,7 @@ void follow(mm::Engine& eng, Runner& run, strix::minimax::session::Runtime* sess
             eng.abort("control channel: duplicate / stale round");
             throw std::runtime_error("control channel: duplicate / stale round");
         }
+        if (static_cast<Command>(c.command) == Command::heartbeat) run.quiesce();
         if (static_cast<Command>(c.command) == Command::session) {
             const auto body = ms::session_wire(eng, {}, c.plen);
             const auto available = eng.peer(session ? 1U : 0U);
@@ -628,6 +627,7 @@ sv::Json policy_json(Shared& shared, bool drafter) {
     b.set("dspark", sv::Json(drafter && (p.dspark_mode == ds::Mode::on || shared.dspark_contexts != 0)));
     b.set("dspark_mode", sv::Json(ds::mode_name(p.dspark_mode)));
     b.set("lookup", sv::Json(p.lookup));
+    b.set("prefix_cache", sv::Json(shared.prefix_reuse));
     b.set("dspark_effective", sv::Json(p.dspark_mode == ds::Mode::on && drafter ? "on" : p.dspark_mode == ds::Mode::automatic && p.dspark_prior == ds::Prior::structural_v1 && drafter ? "per_request" : "plain"));
     b.set("dspark_assets", sv::Json(drafter));
     b.set("dspark_live", sv::Json(static_cast<std::int64_t>(shared.dspark_live)));
@@ -764,7 +764,7 @@ int main(int argc, char** argv) {
         bool deploy_check = false;
         bool slots_given = false;
         std::shared_ptr<const strix::deploy::Plan> deployment_plan;
-        std::string transport_spec = "usb4-auto", bind = "127.0.0.1", model_id = "minimax-m3.1-flash", dspark_dir, dspark_exl3, check, check_nested;
+        std::string transport_spec = "usb4gpu", bind = "127.0.0.1", model_id = "minimax-m3.1-flash", dspark_dir, dspark_exl3, check, check_nested;
         std::uint16_t port = 8080;
         std::uint32_t max_tokens = 4096, check_tokens = 256, check_child_layers = ~0U;
         bool admin = false, check_only = false;
@@ -896,7 +896,13 @@ int main(int argc, char** argv) {
             xo.from_env();
             exchanger = std::make_unique<strix::minimax::xfer::Exchanger>(std::make_unique<Borrowed>(*transport), xo);
         }
-        strix::dist::Communicator comm(group, std::make_unique<Borrowed>(*transport), max_bytes);
+        auto comm_owner = gpu_direct
+            ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), std::move(gpu_direct), max_bytes)
+            : std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), max_bytes);
+        auto& comm = *comm_owner;
+        cli.transport = strix::dist::negotiated_transport(transport_spec,
+            comm.device_exchange() != nullptr, strix::dist::hyphen_transport);
+        if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
         std::printf("connected: rank %u transport %s\n", opt.rank, comm.transport_name().c_str());
         std::fflush(stdout);
         mm::Engine eng(opt, comm);
@@ -913,7 +919,7 @@ int main(int argc, char** argv) {
         // DSpark drafter on both ranks (both run every draft command; the target's residual taps are replicated)
         std::unique_ptr<ds::DraftFile> draft_file;
         std::unique_ptr<ds::DeviceDrafter> drafter;
-        Runner run{eng};
+        Runner run{eng, comm};
         if (!dspark_dir.empty()) {
             const auto t0 = Clock::now();
             draft_file = ds::DraftFile::open(dspark_dir, dspark_exl3.empty());
@@ -945,8 +951,12 @@ int main(int argc, char** argv) {
         const char* session_switch = std::getenv("STRIX_SESSION_CACHE");
         const bool session_explicit = session_cli || (session_switch &&
             (std::string(session_switch) == "1" || std::string(session_switch) == "on"));
+        bool prefix_agreed = false;
+        const bool prefix_requested = session_config.reason != "baseline" && ms::lead::prefix_cache_requested();
         const bool session_vote = ms::session_hello(eng, session_config.reason != "baseline" &&
-            (session_config.enabled || session_explicit));
+            (session_config.enabled || session_explicit), prefix_requested, &prefix_agreed, eng.prefill_reuse_rows());
+        if (prefix_requested && !prefix_agreed)
+            std::printf("minimax serve: prefix reuse off (peer vote or prefill alignment differs)\n");
         if (session_vote) {
             try {
                 if (session_cli) {
@@ -1007,6 +1017,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         Shared shared;
+        shared.prefix_reuse = prefix_agreed;
         {
             shared.policy.nest = env_num("STRIX_MM_SERVE_NEST", 1) != 0;
             shared.nest_rows = eng.nested_rows();
@@ -1053,6 +1064,7 @@ int main(int argc, char** argv) {
         oi.load_seconds = lr.seconds;
         oi.device_used_bytes = static_cast<std::uint64_t>(std::max(0.0, lr.device_gib) * 1073741824.0);
         oi.draft = drafter != nullptr;
+        oi.prefix_cache = prefix_agreed;
         ms::Observer observer(std::move(oi));
         ms::MinimaxApiOptions ao;
         ao.http_slots = opt.slots;
@@ -1110,6 +1122,7 @@ int main(int argc, char** argv) {
         http.listen();
         std::thread http_thread([&] { http.serve(); });
         std::printf("minimax serve policy: %s\n", policy_json(shared, drafter != nullptr).dump().c_str());
+        if (shared.prefix_reuse) std::printf("minimax serve: prefix reuse on (STRIX_MM_SERVE_PREFIX=1 on both ranks)\n");
         std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu sched %s gap %.0f ms dspark %s\n", bind.c_str(), http.port(),
                     model_id.c_str(), opt.slots, static_cast<unsigned long long>(opt.capacity),
                     shared.policy.sched == Sched::interleave ? "interleave" : "off", shared.policy.gap_ms, ds::mode_name(shared.policy.dspark_mode));

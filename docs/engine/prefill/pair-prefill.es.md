@@ -2,7 +2,10 @@
 
 El traspaso en pareja es explícito: establezca `STRIX_QWEN_PF_PIPE=1` y
 `STRIX_QWEN_PF_PIPE_DECODE=1` y, a continuación, lance un proceso por rango con
-`--rank 0|1 --transport usb4auto`. Utilice binarios, recursos del modelo,
+`--rank 0|1`. El transporte predeterminado es `usb4gpu` con el router por
+tamaño; `--transport usb4auto` (o `usb4-auto`) restaura host. Los gates nativos
+bit a bit/TTFT del seam directo están pendientes; las mediciones siguientes
+usaron host. Véase la [decisión de transporte](../../coord/transport-routing.md). Utilice binarios, recursos del modelo,
 identificadores de la petición, opciones numéricas y capacidad idénticos. El
 fragmento predeterminado de la pareja es de 4,096 filas cuando se admite. Guardar
 la sesión después de un prellenado en dos nodos requiere una longitud de petición

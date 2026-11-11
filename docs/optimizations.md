@@ -2640,6 +2640,31 @@ alone is refused before anything is evicted. Unnamed requests are unchanged. The
 - **Measured gain:** Two nodes, turn 2 of a 6,989-token conversation (6,989-token prompt): whole reply wall time 16.16 / 15.20 s -> 5.16 / 3.84 s (3-4x); the plain run prefills the prompt in 13.46 / 12.51 s (519 / 559 tok/s), the session run restores all 6,989 tokens and prefills none. Turn-2 text identical, turn 1 unchanged; 21 paired turns: no resolved slowdown in any cell.
 - **Implementation / evidence:** [session cache](minimax/session-cache.md), [serve](../apps/minimax_serve_main.cpp), [session store](../src/minimax/session/session_cache.cpp)
 
+<a id="mm-serve-prefix"></a>
+
+### Prefix reuse for unnamed requests (draft, opt-in)
+
+**Engine:** `minimax` (`strix-minimax-serve`). **Control:** `STRIX_MM_SERVE_PREFIX`. **Default:** off.
+
+A request without a `session` id whose prompt shares at least one whole prefill group of leading
+tokens with the tokens still resident in a free slot starts in that slot and prefills only the rest: the lead keeps
+each slot's resident token ids, picks the free slot with the longest match, rounds it down to whole chunks, and the
+prefill command carries the first position (`pstart`) to the follower. Reuse preserves prefill boundaries: a
+prefill tiles its rows from the chunk's first row, so a suffix opening inside a chunk does not reproduce the bits of a
+full prefill. Alignment is conservatively `--max-rows` times `STRIX_MM_PF_GROUP` (default 4096 x 2 = 8192 tokens),
+including when grouping is disabled. Only completed prefill rows are reusable; generated rows never extend the record.
+The KV rows are the slot's own cache, so the reuse lasts until
+another request takes the slot. Reused tokens are reported as `cached_tokens`, in `strix_prompt_tokens_cached_total`
+and as `capabilities.prefix_cache` in `/api/status`.
+
+- **Preconditions:** `STRIX_MM_SERVE_PREFIX=1` on both ranks (each rank votes in the hello; one missing vote keeps every prefill whole and the wire bytes unchanged). Baseline disables the vote. Not for a nested prompt or a request admitted as a DSpark context (both prefill in full). Both ranks must use the same chunk/group configuration. A session command clears every slot's resident record. Cancellation retains only a previously reused prefix.
+- **Automatic selection:** None; explicit opt-in only.
+- **Fallback notice:** Rank 0 prints `prefix reuse off` when it asked and the peer did not vote.
+- **Exactness gates:** CPU: `strix-minimax-lead-tests` covers aligned boundaries, cancellation, decode-row exclusion, `pstart` / suffix on the wire, default OFF, hello votes and session invalidation. Two-node: `tests/minimax_prefix_cache_gpu_gate.py` compares greedy token IDs of matched prompts with reuse on and off and requires reuse to fire; pass `--alignment` matching the configured group alignment. It has no logit or state digest. Device validation of complete token IDs, logits and canonical state remains pending; token equality alone does not qualify full exactness. This feature remains draft and opt-in.
+- **Off switch:** unset `STRIX_MM_SERVE_PREFIX` (or any value other than `1`) and restart both ranks.
+- **Measured gain:** None claimed. The skipped work is the prefill of the shared prefix.
+- **Implementation / evidence:** [lead](../src/minimax/serve/minimax_lead.hpp), [control](../src/minimax/serve/minimax_control.hpp), [gate](../tests/minimax_prefix_cache_gpu_gate.py)
+
 <a id="mm-serve-dspark"></a>
 
 ### DSpark automatic admission
@@ -3052,7 +3077,7 @@ Comma list of `streams`, `joint`, `ready`, `deferred-crc`, `chunks`, `crc-overla
 
 The rank app now switches on its prefill exchange module, whose copy kernels and stream waits move each prefill partial without blocking the host (previously constructed but off).
 
-- **Preconditions:** Host-path USB4 transport (unset = on only there; other transports keep it constructed but off; not built with the GPU-direct transport). The serve app does not use the module yet: it would disable nested serving.
+- **Preconditions:** Host-path USB4 transport (including the host side of `usb4gpu`; other transports keep it constructed but off). The rank app retains PFX when a GPU-direct communicator is present: modules borrow the host transport between complete communicator exchanges. The serve app does not use the module yet: it would disable nested serving.
 - **Automatic selection:** Unset = on; `load` = constructed and off; `off` = not constructed.
 - **Fallback notice:** Startup line names the module state.
 - **Exactness evidence:** Exact: prefill state, final rows and tokens identical on both ranks in-process (1K, 8K) and across fresh processes in any order.

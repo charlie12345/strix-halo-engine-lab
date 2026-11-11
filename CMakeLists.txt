@@ -370,6 +370,12 @@ strix_target_warnings(strix_core)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-dist-transport-spec-tests tests/dist_transport_spec_tests.cpp)
+    target_include_directories(strix-dist-transport-spec-tests PRIVATE include)
+    target_compile_features(strix-dist-transport-spec-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-dist-transport-spec-tests)
+    add_test(NAME strix-dist-transport-spec-tests COMMAND strix-dist-transport-spec-tests)
+
     add_executable(strix-device-profile-host-tests tests/device_profile_host_tests.cpp src/device_profile.cpp)
     target_include_directories(strix-device-profile-host-tests PRIVATE include)
     target_compile_features(strix-device-profile-host-tests PRIVATE cxx_std_20)
@@ -2604,7 +2610,8 @@ int main() { return 0; }"
             STRIX_DECODE_ENTRY=strix_hip_decode_token_entry STRIX_MTP_MODEL_QUALIFICATION_RUNNER=1)
         target_include_directories(strix-hip-mtp-model-qualification PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_assets strix_qwen_model_description)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_assets strix_qwen_model_description
+            strix_device_profile)
         # Large state snapshots are diagnostic-only. Prefer the system SHA-256
         # provider when available; the portable digest remains the fallback.
         find_package(OpenSSL QUIET COMPONENTS Crypto)
@@ -4857,6 +4864,8 @@ if(STRIX_FAMILY_MINIMAX)
             set_tests_properties(minimax-session-gate-helpers PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
             add_test(NAME minimax-session-phasing COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/minimax_session_phasing_tests.py)
             add_test(NAME minimax-session-default-observer COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/minimax_session_default_probe_tests.py)
+            # The prefix-reuse exactness gate itself needs the running pair; only its comparison logic is checked here.
+            add_test(NAME minimax-prefix-cache-gate-selftest COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/minimax_prefix_cache_gpu_gate.py self-test)
         endif()
     endif()
     # MiniMax tokenizer (tokenizer.json BPE: o200k-style split, NFC, byte level) and chat template, host only.
@@ -5324,6 +5333,11 @@ if(BUILD_TESTING)
         target_compile_options(strix-qwen-prefill-handoff-tests PRIVATE -Wall -Wextra -Werror -Wshadow -Wsign-conversion)
     endif()
     add_test(NAME qwen-prefill-handoff COMMAND strix-qwen-prefill-handoff-tests)
+    add_executable(strix-pair-regime-tests tests/pair_regime_tests.cpp)
+    target_include_directories(strix-pair-regime-tests PRIVATE include)
+    target_compile_features(strix-pair-regime-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-regime-tests)
+    add_test(NAME strix-pair-regime-tests COMMAND strix-pair-regime-tests)
     add_executable(strix-qwen-prefill-pair-tests tests/qwen_prefill_pair_tests.cpp)
     target_include_directories(strix-qwen-prefill-pair-tests PRIVATE include)
     target_compile_features(strix-qwen-prefill-pair-tests PRIVATE cxx_std_20)

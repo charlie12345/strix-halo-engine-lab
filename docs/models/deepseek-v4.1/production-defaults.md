@@ -185,6 +185,12 @@ precedence and receipts: [DeepSeek pair product profiles](../../optimizations.md
 
 ## Transport and USB4 layout (P17.4)
 
+The production opener/parser is now shared with GLM, MiniMax and Qwen pair
+prefill in [`dist/open_transport.hpp`](../../../include/strix/dist/open_transport.hpp).
+DeepSeek spellings, defaults, timeouts, size routing and fallback remain unchanged.
+Qwen pair prefill and MiniMax serve default to routed `usb4gpu`; their new native
+gates are pending ([regime decision](../../coord/transport-routing.md)).
+
 - Every app takes `--transport usb4gpu` (prefill: `usb4-gpu`); the serve manifest kind is `usb4_gpu_auto`.
   - With gpu_direct streams (layout 2bq: data0 host, data1 gpu_direct + gpu_poll=1, latency_qos_us -1) they build the device exchange. Route A is `65536:host,1048576:gpu:2,inf:mix:2:35`, with prepost.
   - Without gpu_direct streams (layout 1) they print "gpu-direct unavailable ... host path only" and run the host path. The bits are the same in both layouts.

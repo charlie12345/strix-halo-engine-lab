@@ -1,7 +1,11 @@
 # Pair prefill and rank-0 continuation
 
 Pair handoff is explicit: set `STRIX_QWEN_PF_PIPE=1` and `STRIX_QWEN_PF_PIPE_DECODE=1`,
-then launch one process per rank with `--rank 0|1 --transport usb4auto`.
+then launch one process per rank with `--rank 0|1`. The transport default is
+`usb4gpu` with the production size router; `--transport usb4auto` (or
+`usb4-auto`) restores host-only. New direct seam bitwise/TTFT gates are pending;
+the measurements below used the previous host path. See the
+[transport decision](../../coord/transport-routing.md).
 Use identical binaries, model assets, prompt IDs, numerical options and capacity.
 The default pair chunk is 4,096 rows where admitted. Session save after a
 two-node prefill requires a prompt length that is a multiple of the chunk size.
@@ -59,3 +63,11 @@ model memory. Change the prompt to 1,193 tokens only after capturing and pinning
 its own golden; a 32K golden cannot validate that prompt. Self-generated goldens
 are calibration evidence, not independent model-fidelity qualification. A pair
 golden dump is rejected; capture is single-node and replay is paired.
+
+## Shared pair modules
+
+The seam pipe (two slots, CRC32C pieces and whole-frame CRC, consumption ACK), its HIP staging, the stage-balance cut
+chooser, the `--rank/--peer/--transport` handling with the link setup, and the per-request mode selection live in
+`include/strix/pair/` (`pipe.hpp`, `balance.hpp`, `link.hpp`, `regime.hpp`) and `src/xport/hip_pipe_staging.hpp`.
+Qwen binds them with its seam-header validator; the Nemotron (gemma4) pair route (`STRIX_G4_PAIR=1`, see the model
+README) uses the same modules with its own seam layout.

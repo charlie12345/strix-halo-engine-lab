@@ -23,6 +23,7 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 | MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 596 tok/s at 8K, 529 at 32K (exact) |
 | GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 541 tok/s at 8K, 529 at 32K (exact) |
 | Nemotron 3.5 Bolt E4B | 1 node | 91.9 tok/s (C1) | 2,780 tok/s at 8K, 2,336 at 32K (`fast`) |
+| Nemotron 3.5 Bolt E4B | 2 nodes (pipelined prefill, opt-in) | - | 4,804 tok/s at 8K, 3,965 at 32K (`fast`, same bytes as 1 node) |
 | MiniMax H3 | pair | 5 s 1344x768 clip with audio in 405.5 s | - |
 | MiniMax-H3-Image (int8, 6 steps) | 1 node | 1024x1024 image in 33.6 s, 2048x2048 in 52 s | - |
 | MiniMax-H3-Image (int8, 6 steps) | pair | 1024x1024 image in 22.4 s, 2048x2048 in 44.6 s | - |
@@ -83,7 +84,7 @@ Every engine's build and launch command: [getting started](docs/getting-started/
 | DeepSeek V4.1 Flash (2-bit experts, 6.5-bit trellis dense) | pair over USB4 | exact default; `fast` | 2 x 128 GB |
 | MiniMax M3.1 Flash (EXL3 3.06 bpw) | pair TP2 | exact | 2 x 128 GB |
 | GLM-5.3 Flash (EXL3 4.05 bpw) | pair TP2 | exact; opt-in WMMA prefill | 2 x 128 GB |
-| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build | exact default; `fast`; `quality` | 128 GB node |
+| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build; opt-in pair prompt prefill (`STRIX_G4_PAIR=1`, same bytes) | exact default; `fast`; `quality` | 128 GB node |
 | MiniMax H3 (audio + video) | single or pair, opt-in build | dense reference; FAST levers each with its own flag | 128 GB per node |
 | MiniMax-H3-Image (int8 or W4A8) | single or pair (`strix-h3-image`), opt-in build | GPU VAE; `--parallel sequence` for one image, `request` for several | 128 GB per node |
 

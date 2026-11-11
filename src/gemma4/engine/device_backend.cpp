@@ -129,7 +129,19 @@ public:
         if (prefill_ && !prefill_batch_) std::cerr << "gemma4 prefill batching off on this route (one call per stream)\n";
     }
     bool prefill_batch_supported() const override { return prefill_batch_; }
-    std::size_t prefill_chunk_rows() const override { return prefill_ ? prefill::chunk_rows : 0; }
+    // STRIX_G4_PREFILL_CHUNK (64..512, a multiple of 64; default 512): prompt rows per prefill chunk. Linears are
+    // row-independent and canonical attention reads committed keys exactly as the overlay, so chunk ends do not
+    // change bytes (checked by state/logits digests); shorter chunks fill the two-node pipeline sooner.
+    std::size_t prefill_chunk_rows() const override {
+        static const std::size_t rows = [] {
+            const char* v = std::getenv("STRIX_G4_PREFILL_CHUNK");
+            if (!v || !*v) return std::size_t(prefill::chunk_rows);
+            char* end = nullptr; const auto n = std::strtoul(v,&end,10);
+            if (*end || n < 64 || n > prefill::chunk_rows || n % 64) throw std::invalid_argument("STRIX_G4_PREFILL_CHUNK must be 64..512, a multiple of 64");
+            return std::size_t(n);
+        }();
+        return prefill_ ? rows : 0;
+    }
     // With the exact decode attention: exact many-row prefill matches non-a8 decode; a8 prefill matches g4-a8-v1 decode.
     // EXL3 keeps its own core order; WMMA prefill never matches decode rows.
     bool prefill_matches_decode() const override { return prefill_matches_decode_; }

@@ -20,6 +20,14 @@ namespace strix::gemma4::engine {
 
 // Backends own cache allocation and transaction type. Scheduling knows only the frozen
 // Target/RowPlan/KvTxn contract. All assets and the backend outlive the coordinator.
+// Rows of the next prompt chunk the coordinator gives prefill_rows for one stream alone (no decode budget):
+// chunks end on multiples of `chunk`; the last 9 prompt rows (the decode tail and its anchor) never go to
+// prefill_rows. 0 = none left. The two-node route (pair.hpp) schedules its stage A with the same rule.
+[[nodiscard]] inline std::size_t prompt_chunk_rows(std::size_t prompt, std::size_t processed, std::uint64_t position,
+                                                  std::size_t chunk) {
+    if (!chunk || processed+1+8 >= prompt) return 0;
+    return std::min<std::size_t>(prompt-1-processed, chunk-position%chunk);
+}
 class StreamState {
 public:
     virtual ~StreamState() = default;
@@ -209,6 +217,9 @@ struct Result {
     Status status = Status::running;
     std::vector<std::uint32_t> ids;
     std::string error, digest; // digest is final on completion/cancellation; receipt() also supports live inspection
+    // STRIX_G4_LOGITS_DIGEST=1 (identity checks only): FNV-1a 64 chained over the raw bytes of every
+    // emitted decode row's logits, in emission order; greedy rows then export logits (same tokens).
+    std::uint64_t logits_fnv64 = 14695981039346656037ULL, logits_rows = 0;
     std::uint64_t frontier = 0, rng_draws = 0;
     dflash::Acceptance acceptance;
     double setup_ms = 0, prefill_ms = 0, decode_ms = 0, draft_ms = 0, context_ms = 0, verify_ms = 0, commit_ms = 0;

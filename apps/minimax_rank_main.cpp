@@ -1,3 +1,4 @@
+#include "strix/dist/open_transport.hpp"
 // strix-minimax-rank: one rank of the MiniMax M3.1 Flash TP2 engine (both ranks run the same command line).
 // The DS bench roles in one binary: teacher-forced gates, single-user sessions (TTFT, prefill tok/s, decode tok/s) and
 // batched decode N = 1..8 with the per-row "batch == alone" check.
@@ -119,42 +120,15 @@ std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
 
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt,
                                                      std::uint16_t capabilities) {
-    const std::chrono::seconds limit(180);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4-auto") {
-        strix::dist::Usb4AutoOptions o;
-        o.transport_capabilities = capabilities;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        receipt = topology.receipt();
-        return t;
-    }
-    if (kind == "usb4gpu") {
-        strix::dist::Usb4AutoOptions o;
-        o.transport_capabilities = capabilities;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        receipt = topology.receipt();
-        std::string why_direct, direct_receipt;
-        if (strix::dist::usb4_gpu_direct_streams(o, *t, &why_direct) == 0U) {  // both ranks agree: host path only
-            receipt += "; gpu-direct unavailable (" + why_direct + "): host path only";
-            return t;
-        }
-        gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &direct_receipt);
-        receipt += "; usb4 " + direct_receipt;
-        return t;
-    }
-    throw std::invalid_argument("unknown transport " + spec);
+    strix::dist::OpenTransportOptions options;
+    options.spellings = strix::dist::hyphen_transport;
+    options.usb.rank = rank;
+    options.usb.timeout = std::chrono::seconds(180);
+    options.usb.transport_capabilities = capabilities;
+    auto opened = strix::dist::open_transport(spec, options);
+    gpu_direct = std::move(opened.direct);
+    receipt = std::move(opened.receipt);
+    return std::move(opened.host);
 }
 
 std::vector<std::uint32_t> read_u32(const std::string& path) {
@@ -1812,7 +1786,7 @@ int main(int argc, char** argv) {
         const std::size_t max_bytes = std::max<std::size_t>(std::size_t{opt.max_rows} * kHidden, 256 * 782 * 128) * sizeof(float);
         // STRIX_MM_XFER=load|on: exchange module for decode steps (shares the host transport)
         const char* xfer_env = std::getenv("STRIX_MM_XFER");
-        const bool xfer_load = (xfer_env == nullptr || std::string(xfer_env) != "off") && !gpu_direct;  // default on (measurement: bitwise, never slower); =off; =load
+        const bool xfer_load = (xfer_env == nullptr || std::string(xfer_env) != "off");  // default on (measurement: bitwise, never slower); =off; =load
         std::unique_ptr<strix::minimax::xfer::Exchanger> exchanger;
         if (xfer_load) {
             strix::minimax::xfer::Options xo;
@@ -1826,8 +1800,8 @@ int main(int argc, char** argv) {
         // STRIX_MM_PFX=off|load|on (default on: exact, GPU-gated prefill exchange, 1K -3.5 %, 8K -1.5 %): the prefill
         // exchange module (shares the host transport)
         const char* pfx_env = std::getenv("STRIX_MM_PFX");
-        const bool pfx_load = (pfx_env == nullptr || std::string(pfx_env) != "off") && !gpu_direct;
-        // Unset = on only on the qualified host-path USB4 transport and without STRIX_MM_BASELINE=1; otherwise unset = load
+        const bool pfx_load = (pfx_env == nullptr || std::string(pfx_env) != "off");
+        // Unset = on for USB4 (also the host side of usb4gpu) without STRIX_MM_BASELINE=1; otherwise unset = load
         // (constructed, off: the previous default).
         const char* pfx_base = std::getenv("STRIX_MM_BASELINE");
         const bool pfx_default_on = std::string(argv[3]).rfind("usb4", 0) == 0 && (pfx_base == nullptr || std::string(pfx_base) != "1");
@@ -1846,7 +1820,9 @@ int main(int argc, char** argv) {
                         std::getenv("STRIX_MM_PF_INTERLEAVE") != nullptr && std::getenv("STRIX_MM_PF_INTERLEAVE")[0] == '1' ? "on" : "off");
         }
         const bool borrow = xfer_load || pfx_load;
-        auto comm_owner = gpu_direct ? std::make_unique<strix::dist::Communicator>(group, std::move(transport), std::move(gpu_direct), max_bytes)
+        // Keep the host owner alive for both modules even when direct is present.
+        // Engine module entry retires communicator work before handing it over.
+        auto comm_owner = gpu_direct ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), std::move(gpu_direct), max_bytes)
                         : borrow ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), max_bytes)
                                  : std::make_unique<strix::dist::Communicator>(group, std::move(transport), max_bytes);
         strix::dist::Communicator& comm = *comm_owner;

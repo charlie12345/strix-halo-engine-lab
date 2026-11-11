@@ -116,6 +116,8 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 |---|---|---|---|---|
 | `--transport usb4auto\|usb4gpu` (prefill: `usb4-auto`\|`usb4-gpu`) | deepseek pair | `usb4auto` | Transporte USB4. `usb4gpu` usa streams GPU-direct cuando el driver los ofrece; si no, la ruta por host. | Otras interconexiones necesitan su propio transporte. |
 | `--peer-timeout` | deepseek serve | 120 | Segundos de espera al peer. | Más alto en enlaces lentos. |
+| `--transport usb4gpu\|usb4auto\|usb4-auto\|tcp`, `STRIX_QWEN_PF_PIPE_TRANSPORT` | qwen pair prefill | `usb4gpu` | Los payloads grandes del seam usan el router del communicator; control/CRC/ACK siguen por host. `usb4auto` o `usb4-auto` fuerza host. Ambos ranks deben coincidir. Gates nativos bit a bit/TTFT pendientes. | [Evidencia de rutas](coord/transport-routing.md). |
+| `--transport usb4gpu\|usb4-auto` | minimax serve | `usb4gpu` | GPU-direct con router para mensajes grandes; host para ≤64 KiB y fallback sin streams directos. Mantiene XFER de decode; PFX solo en rank. `usb4-auto` fuerza host y conserva la ruta cualificada de caché de sesiones. | [Regímenes y límites](coord/transport-routing.md). |
 | `--tp-attention`, `--no-tp-attention` | deepseek | on | Reparte la atención entre los dos ranks. | Off cuando el enlace es lento frente al cómputo. |
 | `--engram-direct`, `--engram-mapped` | deepseek | `direct` | Acceso a la tabla engram. | `mapped` cuando falta memoria. |
 | `--decode-xch xfer\|comm`, `STRIX_GLM_DECODE_XCH` | glm | `xfer` (`comm` en baseline) | Modo de intercambio en decode. | Compara ambos en otra interconexión. |

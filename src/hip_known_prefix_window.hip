@@ -247,6 +247,7 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<const void*> preflight_memo, static_preflight_memo;
     std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>> recipe_memo;
     std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
+    KnownWindowRowsBindingCache rows_binding_cache;
     ArenaLookupIndex arena_index; // the immutable compiled window's arena views
     // Verify windows run each layer's shared expert on a second stream next to the routed experts (see
     // detach_shared). The shared expert reads only the MoE input and writes only its output,
@@ -1412,6 +1413,7 @@ struct HipKnownPrefixWindow::Impl {
         gdn_deferred=primary.gdn_deferred;
         bind_deferred();
         preflight_memo.clear(); static_preflight_memo.clear(); recipe_memo.clear(); preflight_slots.clear();
+        rows_binding_cache.clear();
     }
     void setup_head_rows() {
         if(!window.lm_head_rows_steps) return;
@@ -1730,6 +1732,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.rows_binding_cache=&rows_binding_cache;
             hooks.arena_index=&arena_index;
             hooks.preflight_only = true;
             if(static_only) {
@@ -2132,6 +2135,7 @@ struct HipKnownPrefixWindow::Impl {
                     };
                 hooks.preflight_memo = &self.preflight_memo; hooks.recipe_memo = &self.recipe_memo;
                 hooks.preflight_slots = &self.preflight_slots; hooks.arena_index = &self.arena_index;
+                hooks.rows_binding_cache = &self.rows_binding_cache;
                 hooks.after_step=self.window_observer;
             }
             auto& lead = *members[0].impl;
@@ -2428,6 +2432,7 @@ struct HipKnownPrefixWindow::Impl {
                     return prefill_fold(i,rows,full,contexts_of);
                 };
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.rows_binding_cache=&rows_binding_cache;
             hooks.arena_index=&arena_index;
             if(prefill) {
                 hooks.after_step=qrtx_step_dump_observer(prefill_observer,block_rows);
@@ -2580,6 +2585,7 @@ struct HipKnownPrefixWindow::Impl {
             };
             hooks.position_reader_implementations = position_readers;
             hooks.preflight_memo = &preflight_memo; hooks.recipe_memo = &recipe_memo; hooks.preflight_slots = &preflight_slots;
+            hooks.rows_binding_cache = &rows_binding_cache;
             hooks.arena_index = &arena_index;
             KnownPrefillSegmentHooks segment_hooks;
             const char* stage_env=std::getenv("STRIX_PLE_STAGE_SERVE");

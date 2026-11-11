@@ -292,6 +292,7 @@ struct KnownWindowRun::State {
     std::vector<std::vector<ExecutionDispatchContext>> contexts;
     std::vector<const KnownWindowR2Entry*> selected;
     std::vector<const KnownWindowRowsEntry*> selected_rows;
+    const void* binding_preflight_key = nullptr;
     std::vector<DirectLaunchDispatcher> dispatchers;
     KnownWindowResult result;
     SessionStateAddress position_state{};
@@ -344,6 +345,7 @@ KnownWindowRun::KnownWindowRun(
     // A repeat window of the same owner and launch plans re-checks only what changes per
     // window (tokens, positions, capacity, session); its static admission already passed.
     const void* preflight_key = row_launch.empty() ? nullptr : static_cast<const void*>(row_launch.front());
+    st.binding_preflight_key = preflight_key;
     const bool preflight_known = hooks.preflight_memo && preflight_key &&
         std::find(hooks.preflight_memo->begin(), hooks.preflight_memo->end(), preflight_key) != hooks.preflight_memo->end();
     const auto rows = window.logical_rows;
@@ -563,6 +565,10 @@ KnownWindowRun::KnownWindowRun(
     };
     for (std::size_t i = 0; i < steps && !preflight_known; ++i) {
         if(selected_rows[i]) {
+            const KnownWindowRowsBindingScope binding(hooks.rows_binding_cache, preflight_key,
+                hooks.preflight_slots, i, rows, steps,
+                {reinterpret_cast<std::uintptr_t>(selected_rows[i]->preflight),
+                 reinterpret_cast<std::uintptr_t>(selected_rows[i]->config)});
             if (needs(i, 0, selected_rows[i]->preflight, selected_rows[i]->config))
                 selected_rows[i]->preflight(contexts[i],selected_rows[i]->config);
         } else if (selected[i]) {
@@ -684,7 +690,13 @@ void KnownWindowRun::launch_step(std::size_t i) {
                 joint_scope.emplace(correlation);
                 joint_elapsed.emplace(ExecutionPhase::operator_step);
             }
-            if(selected_rows[i]) selected_rows[i]->launch(contexts[i],selected_rows[i]->config);
+            if(selected_rows[i]) {
+                const KnownWindowRowsBindingScope binding(hooks.rows_binding_cache, st.binding_preflight_key,
+                    hooks.preflight_slots, i, rows, steps,
+                    {reinterpret_cast<std::uintptr_t>(selected_rows[i]->preflight),
+                     reinterpret_cast<std::uintptr_t>(selected_rows[i]->config)});
+                selected_rows[i]->launch(contexts[i],selected_rows[i]->config);
+            }
             else selected[i]->launch(std::span<const ExecutionDispatchContext,2>(contexts[i].data()+first,2U),selected[i]->config);
             st.record_promoted(i, width);
         }

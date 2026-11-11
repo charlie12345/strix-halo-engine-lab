@@ -11,6 +11,7 @@
 #include "strix/qpersist.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/known_window_cohort.hpp"
+#include "strix/known_window_rows_binding.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
 #include "strix/hip_gdn_islands.hpp"
@@ -6210,12 +6211,8 @@ std::uint64_t gdn_window_retained_row_bytes(const ModelContract& model) {
 std::uint64_t gdn_window_retained_bytes(const ModelContract& model) {
     return 2ULL * gdn_window_max_rows * gdn_window_retained_row_bytes(model);
 }
-void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
+static void enqueue_bound_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
     const GdnWindowControl* control, const HipGdnLauncherConfig& config, void* stream) {
-#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
-    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
-#endif
-    validate_gdn_window(layer, rows, true, control, config, stream);
     const auto native = static_cast<hipStream_t>(stream);
     switch (rows.size()) {
     case 1: enqueue_gdn_window<1U>(layer, rows, control, config, native); break;
@@ -6227,6 +6224,15 @@ void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     case 7: enqueue_gdn_window<7U>(layer, rows, control, config, native); break;
     default: enqueue_gdn_window<8U>(layer, rows, control, config, native); break;
     }
+}
+void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
+    const GdnWindowControl* control, const HipGdnLauncherConfig& config, void* stream) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
+    // Direct callers still need admission; rows launchers already validated at bind.
+    validate_gdn_window(layer, rows, true, control, config, stream);
+    enqueue_bound_gdn_window(layer, rows, control, config, stream);
 }
 void gdn_window_commit_enqueue(const GdnWindowLayer& layer, const GdnWindowControl* control,
     const HipGdnLauncherConfig& config, void* stream) {
@@ -6303,11 +6309,17 @@ GdnWindowBinding bind_gdn_window(std::span<const ExecutionDispatchContext> rows,
 } // namespace
 
 void gdn_window_rows_preflight(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config) {
-    static_cast<void>(bind_gdn_window(rows, config, true));
+    std::optional<GdnWindowBinding> local;
+    static_cast<void>(KnownWindowRowsBindingScope::get(local, [&] { return bind_gdn_window(rows, config, true); }));
 }
 void gdn_window_rows_launch(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config) {
-    const auto bound = bind_gdn_window(rows, config, true);
-    gdn_window_enqueue(bound.layer, {bound.rows.data(), bound.count}, config.control, config.gdn, hip_execution_stream());
+    std::optional<GdnWindowBinding> local;
+    const auto& bound = KnownWindowRowsBindingScope::get(local, [&] { return bind_gdn_window(rows, config, true); });
+    // The binding contains no positions; runtime admission checks each window's positions.
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.gdn.dense_trellis_projections);
+#endif
+    enqueue_bound_gdn_window(bound.layer, {bound.rows.data(), bound.count}, config.control, config.gdn, hip_execution_stream());
 }
 void gdn_window_commit_launch(const ExecutionDispatchContext& row, const HipGdnWindowConfig& config) {
     const auto bound = bind_gdn_window({&row, 1U}, config, false);

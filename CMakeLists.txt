@@ -2203,6 +2203,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-speculative-verify-runtime-tests)
     add_test(NAME strix-speculative-verify-runtime-tests COMMAND strix-speculative-verify-runtime-tests)
 
+    add_executable(strix-known-window-rows-binding-tests tests/known_window_rows_binding_tests.cpp)
+    target_include_directories(strix-known-window-rows-binding-tests PRIVATE include)
+    target_compile_features(strix-known-window-rows-binding-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-known-window-rows-binding-tests)
+    add_test(NAME strix-known-window-rows-binding-tests COMMAND strix-known-window-rows-binding-tests)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-qwen-yarn-python-check

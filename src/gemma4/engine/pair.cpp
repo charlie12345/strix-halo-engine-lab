@@ -30,6 +30,11 @@ std::uint64_t fnv(std::uint64_t hash, std::string_view bytes) {
     return hash;
 }
 struct StageReset { ~StageReset() { prefill::pair_stage = {}; } };
+void add_breakdown(Json& pair_json) {
+    const auto& ps = prefill::pair_stage;
+    if (!env_on("STRIX_G4_PAIR_BREAKDOWN")) return;
+    pair_json.set("linear_ms", ps.linear_ms); pair_json.set("attention_ms", ps.attention_ms); pair_json.set("other_ms", ps.other_ms);
+}
 } // namespace
 bool pair_enabled() { return env_on("STRIX_G4_PAIR"); }
 std::size_t pair_chunk_count(std::size_t prompt, std::size_t chunk) {
@@ -86,7 +91,8 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
         [&] { return pair::make_hip_pipe_staging(capacity, [] { return static_cast<hipStream_t>(prefill::pair_stage.queue); }); },
         [](std::span<const std::byte> data) { return dist::crc32c(data); });
     StageReset reset;
-    prefill::pair_stage = {&pipe, rank, cut, 0, identity, nullptr, 0, 0};
+    prefill::pair_stage = {}; prefill::pair_stage.pipe = &pipe; prefill::pair_stage.rank = rank;
+    prefill::pair_stage.cut = cut; prefill::pair_stage.identity = identity;
     auto pair_json = Json::object();
     pair_json.set("rank", std::uint64_t(rank)); pair_json.set("cut", std::uint64_t(cut));
     pair_json.set("mode", std::string("pipeline"));
@@ -108,6 +114,7 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
         pipe.finish(count);
         pair_json.set("stage_ms", ms(Clock::now() - start)); pair_json.set("chunk_ms", chunks);
         pair_json.set("seal_wait_ms", prefill::pair_stage.seal_ms);
+        add_breakdown(pair_json);
         pair_json.set("link_to_done_ms", ms(Clock::now() - linked));
         auto receipt = Json::object(); receipt.set("pair", pair_json); receipt.set("prompt_tokens", std::uint64_t(prompt.size()));
         emit({}, receipt);
@@ -121,6 +128,8 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
     const auto& result = coordinator.result(slot);
     auto receipt = coordinator.receipt(slot); receipt.set("stream", std::uint64_t(slot));
     pair_json.set("seam_wait_ms", prefill::pair_stage.wait_ms);
+    { auto chunks = Json::array(); for (const auto v : prefill::pair_stage.chunk_ms) chunks.push(v); pair_json.set("chunk_ms", chunks); }
+    add_breakdown(pair_json);
     pair_json.set("link_to_done_ms", ms(Clock::now() - linked));
     receipt.set("pair", pair_json);
     emit(result.ids, receipt);

@@ -605,6 +605,9 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
     if ((stage_a || stage_b) && (parts.size() != 1 || all_logits || (stage_a && logits) || ps.cut == 0 || ps.cut >= c.layers))
         throw std::invalid_argument("pair prefill runs one stream per pass, stage A without logits, 0 < cut < layers");
     const unsigned first_layer = stage_b ? ps.cut : 0, end_layer = stage_a ? ps.cut : c.layers;
+    static const bool pair_breakdown = [] { const auto* v = std::getenv("STRIX_G4_PAIR_BREAKDOWN"); return v && std::string_view(v) == "1"; }();
+    if ((stage_a || stage_b) && pair_breakdown && !impl_->profile) set_profile(true);
+    const double waited_before = ps.wait_ms;
     // PINNED_TAPS: unconsumed taps are never copied; consumed taps and hidden
     // rows land in pinned memory through asynchronous copies. Off: as before.
     // Stage A always produces its tap columns: stage B's consumer may want them.
@@ -935,7 +938,11 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         if (taps_issued) checked(hipEventSynchronize(b.copied));
         // Stage B consumed the seam frame (its copies finished above): the slot may take the next chunk.
         if (stage_b) ps.pipe->release(ps.sequence);
-        if (stage_a || stage_b) ++ps.sequence;
+        if (stage_a || stage_b) {
+            ++ps.sequence;
+            ps.chunk_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - entered).count() - (ps.wait_ms - waited_before));
+            ps.linear_ms = b.stats.linear_ms; ps.attention_ms = b.stats.attention_ms; ps.other_ms = b.stats.other_ms;
+        }
         synced_at = Clock::now();
         unsigned failure = 0; b.get(&failure, b.failure, sizeof(failure));
         std::vector<unsigned> maxima(b.ranges.size()); b.get(maxima.data(), b.maximum, maxima.size() * sizeof(unsigned));

@@ -260,9 +260,12 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
 #pragma unroll
                 for(unsigned first=0;first<max_blocks;first+=Chunk) {
                 uint4 hd[Chunk],q[Chunk];
+                // Unconditional loads (a block past the matrix re-reads the last one and is never used): a guard
+                // around each load made the wait-count pass drain the queue after every block, so a wave kept one
+                // block in flight. Products and their order are unchanged.
 #pragma unroll
-                for(unsigned i=0;i<Chunk;++i)if(first+i<blocks) {
-                    const unsigned b=first+i;
+                for(unsigned i=0;i<Chunk;++i) {
+                    const unsigned b=min(first+i,blocks-1U);
                     hd[i]=*reinterpret_cast<const uint4*>(w+b*144U);q[i]=*reinterpret_cast<const uint4*>(w+b*144U+16U+c*16U);
                 }
 #pragma unroll
@@ -476,9 +479,21 @@ __global__ __launch_bounds__(256) void down_window(const unsigned char* weights,
     constexpr unsigned block_bytes=Q51?24U:34U;
     const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*groups*block_bytes;
     float acc[Rows]={};
-#pragma unroll 1
-    for(unsigned group=owner;group<groups;group+=4U) {
-        const auto* packed=row_weights+group*block_bytes;
+    // All of a lane's weight blocks (at most max_rows/128) are requested before the first product: one load
+    // followed by a full wait per group left a single block in flight per wave. Same words, same group order.
+    constexpr unsigned max_steps=max_rows/128U;
+    struct alignas(4) Raw {unsigned char bytes[block_bytes+(4U-block_bytes%4U)%4U];};
+    Raw raw[max_steps];
+#pragma unroll
+    for(unsigned step=0;step<max_steps;++step) {
+        const unsigned group=min(owner+4U*step,groups-1U);
+        __builtin_memcpy(raw[step].bytes,row_weights+group*block_bytes,block_bytes);
+    }
+#pragma unroll
+    for(unsigned step=0;step<max_steps;++step) {
+        const unsigned group=owner+4U*step;
+        if(group>=groups)break;
+        const auto* packed=raw[step].bytes;
         unsigned words[8];
 #pragma unroll
         for(unsigned word=0;word<8U;++word)words[word]=Q51?down_q51_word(packed,word*4U):down_u32(packed+2U+word*4U);

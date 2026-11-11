@@ -819,6 +819,7 @@ struct HipKnownPrefixWindow::Impl {
             if (save != (pair_context.rank == 0U)) throw std::logic_error("pair prefill seam direction mismatch");
             const auto pair_wait_start = std::chrono::steady_clock::now();
             pair_frame = &pair_context.pipe->acquire(pair_context.sequence);
+            if (pair_context.timeline) pair_context.timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_wait, pair_wait_start);
             std::fprintf(stderr, "qwen-pair rank=%u chunk=%llu exposed-seam-wait-ms=%.3f\n", pair_context.rank,
                 static_cast<unsigned long long>(pair_context.sequence),
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_wait_start).count());
@@ -852,7 +853,11 @@ struct HipKnownPrefixWindow::Impl {
         }
         // Fence detached producers before packing a slot. layer-split remains synchronous;
         // pair prefill copies its immutable snapshot on the separate per-slot stream.
+        auto* const pair_timeline = pair_frame ? pair_context.timeline : nullptr;
+        const auto pair_fence_start = pair_timeline ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         check(hipDeviceSynchronize(), "layer-split seam producer fence");
+        if (pair_timeline) pair_timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_fence, pair_fence_start);
+        const auto pair_pack_start = pair_timeline ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto seam_stream = hip_execution_stream();
         for (std::uint32_t seam_row = 0; seam_row < seam_rows; ++seam_row) {
             const auto hc_dispatch = hc_context(seam_row);
@@ -879,6 +884,7 @@ struct HipKnownPrefixWindow::Impl {
         }
         if (pair_frame && save) pair_frame->staging->seal(seam_size);
         else check(hipStreamSynchronize(seam_stream), "layer-split seam transfer fence");
+        if (pair_timeline) pair_timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_pack, pair_pack_start);
         const auto seam_payload = pair_frame ? std::span<const std::byte>(pair_frame->payload) : std::span<const std::byte>(pp_seam_bytes);
         if (qwen_pp::dump_enabled()) {
             const auto pp_owner = pair_context.pipe ? (pair_context.rank == 0U ? "pair-r0" : "pair-r1") : "split";

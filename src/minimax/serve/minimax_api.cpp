@@ -14,7 +14,6 @@
 #include <ctime>
 #include <optional>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
 namespace strix::minimax::serve {
@@ -216,13 +215,13 @@ void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std
         }
         return send_error(w, 503, "queue full");
     }
-    // Waits for the ticket's end (every path does, so the engine's statistics are final when recorded); a cancelled
-    // ticket wakes wait() at once, so the loop sleeps instead of spinning until the engine finishes it.
+    // Waits for the ticket's end (every path does, so the engine's statistics are final when recorded); once the
+    // ticket is cancelled, wait() no longer wakes on the cancellation, only on tokens or the finish (was a 5 ms poll).
     std::vector<std::uint32_t> ids, all_ids;
     bool delivered = true;  // every byte of the reply reached the client's socket
     auto drain = [&](auto&& on_token) {  // on_token(id) for every id but the stop token
         for (bool done = false; !done;) {
-            const auto fresh = ticket->wait(std::chrono::milliseconds(100), done);
+            const auto fresh = ticket->wait(std::chrono::milliseconds(100), done, !ticket->cancelled());
             for (const auto t : fresh) {
                 if (want_ids) all_ids.push_back(t);
                 if (t == tok_.eos_id) continue;
@@ -233,7 +232,6 @@ void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std
                 delivered = false;
                 ticket->cancel();
             }
-            if (!done && fresh.empty() && ticket->cancelled()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     };
     // The scheduler's measurements of the finished ticket, taken once on every path (nothing is left in its table).

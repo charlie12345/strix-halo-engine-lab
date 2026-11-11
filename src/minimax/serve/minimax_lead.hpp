@@ -20,6 +20,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 namespace strix::minimax::serve::lead {
@@ -27,6 +28,13 @@ namespace mm = strix::minimax::engine;
 namespace sv = strix::serve;
 namespace ms = strix::minimax::serve;
 namespace ds = strix::minimax::dspark;
+
+// Automatic prefix KV reuse is opt-in: STRIX_MM_SERVE_PREFIX=1 on both ranks (this rank's hello vote). The scheduler
+// reuses only when both ranks voted (Shared::prefix_reuse), and the reports state that same value.
+inline bool prefix_cache_requested() noexcept {
+    const char* pe = std::getenv("STRIX_MM_SERVE_PREFIX");
+    return pe != nullptr && std::string_view(pe) == "1";
+}
 using Clock = std::chrono::steady_clock;
 using ms::Command;
 using ms::Control;
@@ -82,6 +90,7 @@ struct Shared {
     unsigned nest_rows = 0;
     std::uint64_t active_id = 0, parked_id = 0;
     bool nest_taps = false;
+    bool prefix_reuse = false;  // both ranks voted for prefix reuse in the hello; fixed before the Lead starts
     std::uint32_t dspark_live = 0, dspark_contexts = 0;
     std::unordered_map<const sv::GenerationTicket*, Extra> extras;
 };
@@ -89,6 +98,7 @@ struct Shared {
 struct Running {
     sv::TakenJob job;
     std::uint32_t slot = 0;
+    std::uint32_t reused = 0;  // leading prompt tokens taken from the slot's resident cache (prefix reuse)
     std::uint64_t pos = 0;  // position of `last` (the next input token)
     std::uint32_t last = 0;
     sv::GenerationStats stats;
@@ -176,8 +186,11 @@ public:
     Lead(Engine& eng, Runner& run, sv::GenerationQueue& queue, Shared& shared, std::uint64_t max_rows, bool taps, std::atomic<bool>& stop,
          std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes = {}, ms::SessionService* session = nullptr)
         : eng_(eng), run_(run), queue_(queue), sh_(shared), slots_(eng.slots()), capacity_(eng.capacity()), max_rows_(max_rows),
-          run_slots_(slots_), stop_(stop), session_(session), taps_(taps) {
+          run_slots_(slots_), kv_(slots_), stop_(stop), session_(session), taps_(taps) {
         prompt_bytes_ = std::move(prompt_bytes);
+        prefix_on_ = sh_.prefix_reuse;
+        reuse_rows_ = prefix_on_ ? eng_.prefill_reuse_rows() : max_rows_;
+        if (reuse_rows_ == 0) throw std::invalid_argument("prefix reuse: zero prefill alignment");
         round_ = run.control_round;
         const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
         timeline_on_ = v != nullptr && std::strcmp(v, "1") == 0;
@@ -391,6 +404,12 @@ private:
             std::lock_guard<std::mutex> l(sh_.m);
             sh_.extras[r->job.ticket.get()] = r->x;
         }
+        // Keep only completed, aligned prefill rows. Decode rows can have different bits,
+        // and a cancelled prefill only guarantees its previously reused prefix.
+        if (prefix_on_) {
+            const auto resident = r->prefilling ? r->reused : r->stats.prompt_tokens;
+            kv_[r->slot].resize(static_cast<std::size_t>(resident - resident % reuse_rows_));
+        }
         queue_.finish(r->job, r->stats);
         r.reset();
     }
@@ -599,6 +618,28 @@ private:
                                       std::to_string(capacity_) + ")");
             return true;
         }
+        // Prefix reuse: among the free slots, the one sharing the longest leading prefix with this prompt reuses those
+        // resident cache rows; only the suffix is prefilled. Capped at prompt.size()-1 (the last token is always
+        // prefilled, to produce its logits) and rounded down to whole prefill chunks (below). A drafter-context request
+        // does not reuse (v1 archive-coverage guard, below).
+        std::uint32_t reuse = 0;
+        if (prefix_on_ && !nested) {
+            std::uint32_t best = free_slot, best_n = 0;
+            const std::uint32_t lim = static_cast<std::uint32_t>(prompt.size() - 1);
+            for (std::uint32_t s = 0; s < slots_; ++s) {
+                if (run_slots_[s]) continue;  // only free slots hold reusable resident state
+                const auto& k = kv_[s];
+                const std::uint32_t cap = static_cast<std::uint32_t>(std::min<std::size_t>(k.size(), lim));
+                std::uint32_t match = 0;
+                while (match < cap && k[match] == prompt[match]) ++match;
+                // Whole prefill chunks only. A prefill tiles its rows from the chunk's first row (16-query windows), so a
+                // suffix that opens inside a chunk is tiled differently from the same rows in a full prefill and its
+                // bits differ. Opening on a max_rows boundary gives the suffix the chunks a full prefill would use.
+                match -= static_cast<std::uint32_t>(match % reuse_rows_);
+                if (match > best_n) { best_n = match; best = s; }
+            }
+            if (best_n != 0) { free_slot = best; reuse = best_n; }
+        }
         Running r;
         r.policy = pol_;
         r.dspark_prior = pol_.dspark_prior;
@@ -676,6 +717,10 @@ private:
             r.x.nested = true;
             r.x.parent_request = parent_id;
         }
+        if (r.context) reuse = 0;  // v1 guard: a drafter-context request re-prefills in full (its archive must cover the window)
+        r.reused = reuse;
+        r.stats.cached_tokens = reuse;
+        const std::span<const std::uint32_t> suffix(prompt.data() + reuse, prompt.size() - reuse);
         Control c;
         c.task_id = r.request_id;
         c.parent_task_id = parent_id;
@@ -684,13 +729,19 @@ private:
         c.command = static_cast<std::uint32_t>(nested ? Command::nest : Command::prefill);
         c.round = round_++;
         c.pslot = free_slot;
-        c.plen = static_cast<std::uint32_t>(prompt.size());
+        c.pstart = reuse;
+        c.plen = static_cast<std::uint32_t>(suffix.size());
         c.pflags = r.context ? 1U : 0U;
         (void)exchange(eng_, c);
-        run_.send_prompt(prompt);
+        if (reuse == 0) run_.send_prompt(prompt);
+        else {
+            std::vector<std::uint32_t> wire(suffix.begin(), suffix.end());
+            run_.send_prompt(wire);
+        }
         const auto begin0 = timeline_on_ ? Time::now() : Clock::time_point{};
-        run_.prefill_begin(free_slot, prompt, r.context, c.task_id, parent_id, c.slot_generation);
+        run_.prefill_begin(free_slot, suffix, r.context, c.task_id, parent_id, c.slot_generation, reuse);
         layer_.reset_pending();
+        if (prefix_on_) kv_[free_slot].assign(prompt.begin(), prompt.end());
         r.job = std::move(*t);
         r.prefill_start = Time::now();
         run_slots_[free_slot] = std::move(r);
@@ -1180,6 +1231,9 @@ private:
     }
 
     sv::Json dispatch_session(const std::string& body, const ms::SessionService::Publish& publish = {}) {
+        // A session command restores, captures or generates in the slots without passing through admit / step: no
+        // slot's resident tokens are known afterwards (it runs with nothing in flight, so every slot is free here).
+        for (auto& k : kv_) k.clear();
         Control c; c.command = static_cast<std::uint32_t>(Command::session); c.plen = static_cast<std::uint32_t>(body.size());
         c.round = round_++;
         (void)exchange(eng_, c);
@@ -1199,6 +1253,12 @@ private:
     const std::uint64_t capacity_;
     const std::uint64_t max_rows_;
     std::vector<std::optional<Running>> run_slots_;
+    // Prefix reuse: the token sequence resident in each free slot's cache. A new prompt sharing a leading prefix with a
+    // free slot reuses those cache rows and prefills only the suffix (opt-in: STRIX_MM_SERVE_PREFIX=1 on both ranks).
+    // Records contain prefill tokens only, never generated tokens.
+    std::vector<std::vector<std::uint32_t>> kv_;
+    std::uint64_t reuse_rows_ = 0;
+    bool prefix_on_ = false;
     std::optional<sv::TakenJob> pending_;
     bool pending_short_first_ = false;
     bool deadline_serviced_ = false;

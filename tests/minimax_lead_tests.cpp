@@ -1,5 +1,6 @@
 // Executes the production Lead loop with due-time arrivals and a control-channel sink.
 #include "minimax/serve/minimax_lead.hpp"
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <sstream>
@@ -21,7 +22,8 @@ struct FakeEngine {
     mm::PfProgress active{}, parked{};
     std::vector<ms::Control> controls;
     std::array<std::byte, 512> last_wire{};
-    bool session_peer = false;
+    bool session_peer = false, prefix_peer = false;
+    std::uint64_t peer_alignment = 0;  // zero echoes; nonzero simulates a different peer configuration
     unsigned syncs = 0;
     unsigned quiesces = 0;
     bool taps = false;
@@ -29,6 +31,8 @@ struct FakeEngine {
     unsigned slots() const { return 8; }
     unsigned capacity() const { return 16384; }
     unsigned nested_rows() const { return 512; }
+    std::uint64_t reuse_alignment = 4096;
+    std::uint64_t prefill_reuse_rows() const { return reuse_alignment; }
     const char* prefill_unlimited_reason() const { return ""; }
     bool prefill_open() const { return active.open || parked.open; }
     bool prefill_active() const { return active.open; }
@@ -57,15 +61,17 @@ struct FakeEngine {
         // Echo checkpoints through the real exchange validation; check replies carry the child's token.
         if (c.command == static_cast<unsigned>(ms::Command::check)) c.plen = active.next;
         if (session_peer) c.pflags |= ms::kHelloSessionVote;
+        if (c.command == 0) c.pflags = (c.pflags & ~ms::kHelloPrefixVote) | (prefix_peer ? ms::kHelloPrefixVote : 0U);  // the peer's own vote
+        if (c.command == 0 && peer_alignment != 0) c.dpos[0] = peer_alignment;
         std::memset(in, 0, bytes);
         std::memcpy(in, &c, sizeof(c));
     }
     void prefill_begin(unsigned slot, std::span<const unsigned> prompt, bool,
-                       std::uint64_t id, std::uint64_t parent, std::uint64_t generation) {
+                       std::uint64_t id, std::uint64_t parent, std::uint64_t generation, std::uint64_t resident = 0) {
         if (active.open) throw std::runtime_error("already active");
         active = {};
         active.open = true; active.id = id; active.parent = parent; active.generation = generation;
-        active.slot = slot; active.bank = parent != 0 ? 1U : 0U; active.rows = prompt.size();
+        active.slot = slot; active.bank = parent != 0 ? 1U : 0U; active.rows = resident + prompt.size();
     }
     bool prefill_unit(unsigned layers, unsigned* next) {
         const auto count = std::min(layers, 60 - active.layer);
@@ -132,6 +138,14 @@ struct Scenario {
     void submit(double at, unsigned id, unsigned rows, unsigned tokens = 3, const std::string& session = "") {
         events.push_back({at, [=, this] {
             sv::GenerationJob j; j.prompt.resize(rows, id); j.max_tokens = tokens;
+            j.session = session;
+            tickets[id] = queue.submit(std::move(j));
+        }});
+    }
+    // An explicit prompt (submit() fills with the id, so its requests never share a prefix); for the reuse path.
+    void submit_prompt(double at, unsigned id, std::vector<std::uint32_t> prompt, unsigned tokens, const std::string& session = "") {
+        events.push_back({at, [=, this] {
+            sv::GenerationJob j; j.prompt = prompt; j.max_tokens = tokens;
             j.session = session;
             tickets[id] = queue.submit(std::move(j));
         }});
@@ -206,6 +220,17 @@ int main() {
         check(ms::session_hello(eng, false), "peer ON requests admission even with local OFF");
         check(std::memcmp(eng.last_wire.data(), legacy.data(), legacy.size()) == 0,
               "local OFF hello stays unchanged with peer ON");
+        // Prefix reuse needs both votes; a peer without the bit (switch off, or a build before pstart) declines it.
+        FakeEngine px;
+        bool agreed = true;
+        check(!ms::session_hello(px, false, true, &agreed) && !agreed, "prefix vote alone does not enable reuse");
+        check(px.controls.back().pflags == ms::kHelloPrefixVote, "prefix vote uses the hello flags");
+        px.prefix_peer = true;
+        check(!ms::session_hello(px, false, false, &agreed) && !agreed, "peer prefix vote alone does not enable reuse");
+        check(std::memcmp(px.last_wire.data(), legacy.data(), legacy.size()) == 0, "prefix OFF hello equals public main bytes");
+        check(!ms::session_hello(px, false, true, &agreed) && agreed, "both prefix votes enable reuse");
+        px.peer_alignment = 12288;
+        check(!ms::session_hello(px, false, true, &agreed, 8192) && !agreed, "different prefill group alignment declines reuse");
     }
     const auto compare = [&](const char* name, const std::function<void(Scenario&)>& script, bool dspark = false) {
         const auto run = [&](ms::Sched mode) {
@@ -478,6 +503,117 @@ int main() {
         std::cout << "lookup C4: windows " << ck.lookup_windows << " drafted " << ck.lookup_drafted << " accepted " << ck.lookup_accepted
                   << " rows " << rows_on << std::endl;
         check(ck.lookup_windows > 0 && rows_on > 0, "prompt lookup drafts windows with four requests in the step");
+    }
+    {
+        // Prefix reuse (both ranks voted): a second request sharing leading tokens with a finished slot's resident cache
+        // reuses whole prefill chunks of them (max_rows 4096 here: 9000 shared tokens -> 8192 reused) and prefills the
+        // rest. The cold request reuses nothing; the warm prefill carries pstart = reuse and plen = the rest.
+        Scenario s(ms::Sched::off);
+        s.shared.prefix_reuse = true;
+        std::vector<std::uint32_t> base(9000, 7U);
+        std::vector<std::uint32_t> warm = base;
+        warm.insert(warm.end(), {8U, 9U, 10U});              // prompt.size() = 9003
+        s.submit_prompt(0, 1, base, 2);
+        s.submit_prompt(80000, 2, warm, 2);
+        const auto r = s.run(200000);
+        const auto cold = s.tickets.at(1)->stats(), hot = s.tickets.at(2)->stats();
+        check(cold.cached_tokens == 0, "cold prefix request reuses nothing");
+        check(hot.cached_tokens == 8192, "warm request reuses the shared prefix in whole prefill chunks");
+        const auto cold_pf = std::find_if(r.controls.begin(), r.controls.end(),
+            [](const auto& c) { return c.command == static_cast<unsigned>(ms::Command::prefill) && c.task_id == 1; });
+        const auto hot_pf = std::find_if(r.controls.begin(), r.controls.end(),
+            [](const auto& c) { return c.command == static_cast<unsigned>(ms::Command::prefill) && c.task_id == 2; });
+        check(cold_pf != r.controls.end() && cold_pf->pstart == 0 && cold_pf->plen == 9000,
+              "cold prefill starts at 0 and sends the whole prompt");
+        check(hot_pf != r.controls.end() && hot_pf->pstart == 8192 && hot_pf->plen == 811,
+              "warm prefill opens on a chunk boundary and sends only the rest");
+    }
+    {
+        // A shared prefix shorter than one prefill chunk is not reused: its suffix could not open on a chunk boundary.
+        Scenario s(ms::Sched::off);
+        s.shared.prefix_reuse = true;
+        std::vector<std::uint32_t> base(4000, 7U), warm = base;
+        warm.insert(warm.end(), {8U, 9U, 10U});
+        s.submit_prompt(0, 1, base, 2);
+        s.submit_prompt(80000, 2, warm, 2);
+        const auto r = s.run(200000);
+        check(s.tickets.at(2)->stats().cached_tokens == 0 &&
+              std::all_of(r.controls.begin(), r.controls.end(), [](const auto& c) { return c.pstart == 0; }),
+              "a shared prefix under one prefill chunk is prefilled in full");
+    }
+    {
+        // Default (no agreed vote): the same pair prefills every token, reusing nothing; pstart stays zero on the wire.
+        Scenario s(ms::Sched::off);
+        std::vector<std::uint32_t> base(9000, 7U), warm = base;
+        warm.insert(warm.end(), {8U, 9U, 10U});
+        s.submit_prompt(0, 1, base, 2);
+        s.submit_prompt(80000, 2, warm, 2);
+        const auto r = s.run(200000);
+        check(s.tickets.at(2)->stats().cached_tokens == 0, "prefix reuse off reuses nothing");
+        const auto hot_pf = std::find_if(r.controls.begin(), r.controls.end(),
+            [](const auto& c) { return c.command == static_cast<unsigned>(ms::Command::prefill) && c.task_id == 2; });
+        check(hot_pf != r.controls.end() && hot_pf->pstart == 0 && hot_pf->plen == 9003,
+              "prefix reuse off prefills the whole warm prompt");
+        check(std::all_of(r.controls.begin(), r.controls.end(), [](const auto& c) { return c.pstart == 0; }),
+              "prefix reuse off leaves pstart zero in every control");
+    }
+    {
+        // A session command runs in the slots outside admit / step, so no slot's resident tokens are known after it:
+        // the request that follows a named one prefills in full even though its prefix matched before.
+        Scenario s(ms::Sched::off);
+        s.shared.prefix_reuse = true;
+        std::vector<std::uint32_t> base(9000, 7U), warm = base;
+        warm.insert(warm.end(), {8U, 9U, 10U});
+        s.submit_prompt(0, 1, base, 2);
+        s.submit(80000, 2, 10, 2, "conversation");
+        s.submit_prompt(160000, 3, warm, 2);
+        ms::SessionService service;
+        service.execute = [&](const std::string& body, const ms::SessionService::Publish&) {
+            auto reply = sv::Json::object();
+            if (sv::parse_json(body).find("op")->as_string() == "park_active") return reply;
+            reply.set("token_ids", sv::Json::array()); reply.set("hit", sv::Json(false));
+            return reply;
+        };
+        const auto r = s.run(400000, &service);
+        const auto pf = std::find_if(r.controls.begin(), r.controls.end(),
+            [](const auto& c) { return c.command == static_cast<unsigned>(ms::Command::prefill) && c.task_id == 2; });
+        check(count(r, ms::Command::session) == 2 && s.tickets.at(3)->stats().cached_tokens == 0 &&
+              pf != r.controls.end() && pf->pstart == 0 && pf->plen == 9003,
+              "a session command invalidates every slot's reusable prefix");
+    }
+    {
+        Scenario s(ms::Sched::off);
+        s.shared.prefix_reuse = true;
+        s.engine.reuse_alignment = 8192;  // the production engine can group two chunks
+        std::vector<std::uint32_t> base(7000, 7U), warm = base;
+        warm.push_back(8U);
+        s.submit_prompt(0, 1, base, 2);
+        s.submit_prompt(80000, 2, warm, 2);
+        s.run(200000);
+        check(s.tickets.at(2)->stats().cached_tokens == 0, "partial grouped prefill units are not reused");
+    }
+    {
+        Scenario s(ms::Sched::off);
+        s.shared.prefix_reuse = true;
+        std::vector<std::uint32_t> base(4095, 7U), warm = base;
+        // FakeEngine emits 100 for slot 0. The first is then fed by decode, beyond the partial prompt chunk.
+        warm.insert(warm.end(), {100U, 100U, 9U});
+        s.submit_prompt(0, 1, base, 2);
+        s.submit_prompt(80000, 2, warm, 2);
+        s.run(200000);
+        check(s.tickets.at(2)->stats().cached_tokens == 0, "decode rows cannot complete a reusable prefill chunk");
+    }
+    {
+        Scenario s(ms::Sched::interleave);
+        s.shared.prefix_reuse = true;
+        std::vector<std::uint32_t> prompt(9000, 7U);
+        s.submit(0, 99, 10, 100);  // a protected decoder forces the long prefill to yield
+        s.submit_prompt(800, 1, prompt, 2);
+        s.cancel(1000, 1);
+        s.submit_prompt(80000, 2, prompt, 2);
+        const auto r = s.run(200000);
+        check(count(r, ms::Command::cancel) > 0 && s.tickets.at(2)->stats().cached_tokens == 0,
+              "cancelled cold prefill cannot publish reusable rows");
     }
     std::cout << "production Lead traces: " << failures << " failures\n";
     return failures == 0 ? 0 : 1;

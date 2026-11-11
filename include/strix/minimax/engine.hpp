@@ -109,8 +109,12 @@ public:
     [[nodiscard]] unsigned nested_rows() const;
     [[nodiscard]] const char* nested_reason() const;
     [[nodiscard]] PfProgress prefill_progress(bool parked = false) const;
+    // `resident` positions of `slot`'s cache are a reused prefix that precedes `tokens`; prefill opens at that
+    // position (0 = the whole prompt). Reuse must preserve completed prefill unit boundaries;
+    // decode-produced rows are not a prefill identity.
     void prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t generation,
-                            std::uint32_t slot, std::span<const std::uint32_t> tokens, PrefillTapSink sink);
+                            std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t resident,
+                            PrefillTapSink sink);
     void prefill_park(PfTaskId id);
     void prefill_resume_parked(PfTaskId id);
     void prefill_cancel(PfTaskId id);
@@ -120,6 +124,7 @@ public:
     [[nodiscard]] const char* prefill_unlimited_reason() const;  // empty, profiling or fp32_prefill
     [[nodiscard]] unsigned prefill_layer() const;           // next layer of the open chunk / group (0: at a chunk boundary)
     [[nodiscard]] std::uint64_t prefill_unit_rows() const;  // rows of the open chunk / group (0: none open)
+    [[nodiscard]] std::uint64_t prefill_reuse_rows() const;  // conservative alignment for fixed chunk groups
     [[nodiscard]] std::uint64_t prefill_rows_left() const;  // rows from the open chunk / group to the end (0: none open)
     // Teacher-forced gate: the first `layers` layers over `tokens` (positions 0.., slot 0) in ONE call with the G4
     // harness's kernels and call order; returns the residual [T x 6144] after layer `layers - 1`.

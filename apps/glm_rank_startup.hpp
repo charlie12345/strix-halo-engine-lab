@@ -22,6 +22,7 @@ inline void fallback_without_handshake(Effective& e, const Request& r, const Env
 inline constexpr std::uint32_t kAutoRowsConfig = 1U << 11;
 inline constexpr std::uint32_t kPfWmmaConfig = 1U << 12;  // STRIX_GLM_PF_WMMA=1 (FAST prefill identity) on this rank
 inline constexpr std::uint32_t kFastI4Config = 1U << 13;  // STRIX_GLM_MODEL_FORMAT=fast_i4 on this rank
+inline constexpr std::uint32_t kPfAttnWmmaConfig = 1U << 14;  // FAST attention core (glm-pf-attn-wmma) on this rank
 
 struct StartupResult { unsigned rows; bool eligible; };
 

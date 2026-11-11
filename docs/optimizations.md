@@ -4217,6 +4217,27 @@ exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select ot
 - **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
 - **Implementation / evidence:** [core](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
+<a id="glm-pf-attn-wmma"></a>
+
+### FAST fused MLA/DSA attention core (glm-pf-attn-wmma)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_ATTN_WMMA`. **Default:** on in FAST prefill (`STRIX_GLM_PF_WMMA=1`); off in exact mode.
+
+The prefill MLA/DSA attention (scores, softmax, o-bar over each row's DSA top-k list) runs as one flash kernel on the
+shared sparse core (`src/attn_core/sparse_flash_wmma.hpp`, helpers in `src/attn_core/flash_tile.hpp`) instead of the
+exact scores / softmax / o-bar kernels: one work-group per row, 8 waves = 2 head tiles x 4 latent quarters, bf16
+WMMA for both products, FP32 online softmax (exp2, operand-rounded probabilities in the sum), no score matrix in
+memory. The absorb and out GEMMs stay on the exact v3 kernels (an f16 WMMA version measured slower and was removed).
+`STRIX_GLM_PF_ATTN_WMMA_T=32` selects 32-key blocks (default 16).
+
+- **Preconditions:** 32 MLA heads per rank (TP2); other head counts keep the exact kernels.
+- **Automatic selection:** follows the FAST prefill switch: unset means on with `STRIX_GLM_PF_WMMA=1` (including `strix-glm5-rank --profile fast`) and off without it, so exact mode keeps its bytes.
+- **Fallback notice:** each rank prints `prefill identity glm-pf-attn-wmma FAST (... T 16, calls N)` only when the fused core ran. Two ranks: the switch is part of the startup agreement (bit 14); modes without the decode handshake refuse it.
+- **Exactness evidence:** FAST identity. Synthetic: fused vs FP64 row/head rel-L2 mean 1.8e-3, worst 2.7e-3 (GLM shape and MiniMax MSA shape, hip_attn_core_sparse_tests); layer bench o-bar / MLA output vs exact rel-L2 1.9e-3 (cos 0.999998). Pair 8K, exact mode: logits equal the anchors on both ranks (`032dde66` / `4c0cb0a3`); FAST with `STRIX_GLM_PF_ATTN_WMMA=0` equals the previous FAST logits (`6f8f5af9` / `07df33f4`). Pair, against FAST without the core: prefill-logits KL 7.8e-4 nats (8K) and below 1e-5 (32K), 8 same-context decode steps mean KL 1.3e-3 (max 6.6e-3), top-1 8/8, greedy equal over 8 tokens. Teacher-forced 3 prompts x 256 positions: pending.
+- **Off switch:** STRIX_GLM_PF_ATTN_WMMA=0 (or exact mode)
+- **Measured gain:** Layer bench (C 2048 rows, gfx1151): scores+softmax+o-bar 17.3 -> 6.7 us/row at the 8K position, 22.9 -> 7.2 at 32K (2.6x / 3.2x); MLA total 21.3 -> 11.2 / 27.3 -> 11.4 us/row. Pair FAST, fresh process per arm: 8K prefill 10.600 -> 9.695 s (-0.905 s, -8.5 %, 2 ABAB pairs, with the removed WMMA GEMM); 32K 44.30 -> 40.26 s (-4.03 s, -9.1 %; one F / core / F set: 43.54, 40.26, 45.05 s). FAST_I4 not measured.
+- **Implementation / evidence:** [core](../src/attn_core/sparse_flash_wmma.hpp), [helpers](../src/attn_core/flash_tile.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_attn_core_sparse_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip)
+
 <a id="glm-serve-g2"></a>
 
 ### Server batched MTP verify

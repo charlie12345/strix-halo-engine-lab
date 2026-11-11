@@ -69,6 +69,7 @@
 #include "glm/engine/glm_fast_moe.hpp"
 #include "glm/prefill/glm_pf_path.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
+#include "glm/prefill/glm_pf_attn_wmma.hpp"
 #include "glm/spec/glm_spec_host.hpp"
 #include "glm/spec/glm_spec_run.hpp"
 #include "glm/xfer/glm_xfer_exchange.hpp"
@@ -362,6 +363,10 @@ int main(int argc, char** argv) {
         const bool startup_handshake = rd::has_startup_handshake(opt.world, xch_kind, decode_n > 0, reference_gate);
         // FAST glm-pf-wmma-x is a per-rank env switch, checked by the startup agreement (kPfWmmaConfig). Modes without
         // that handshake cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::attn_wmma::enabled())
+            throw std::invalid_argument("the FAST attention core (STRIX_GLM_PF_ATTN_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
+                                        "needs the startup agreement (--decode N, comm exchange, no reference gate) so both ranks "
+                                        "are checked to run the same prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
             throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N, comm exchange, "
                                         "no reference gate) so both ranks are checked to run the same prefill identity");
@@ -388,7 +393,8 @@ int main(int argc, char** argv) {
                 (eff.env.at("STRIX_GLM_SPEC_XCH").value == "xfer" ? 1U << 9 : 0U) |
                 (eng.decode_xfer_enabled() ? 1U << 10 : 0U) |
                 (strix::glm::pf::wmma_x::enabled() ? rd::kPfWmmaConfig : 0U) |  // FAST prefill identity must match on both ranks
-                (eng.model_fast_i4() ? rd::kFastI4Config : 0U);                 // and the model format (also in the load vote)
+                (eng.model_fast_i4() ? rd::kFastI4Config : 0U) |                 // and the model format (also in the load vote)
+                (strix::glm::pf::attn_wmma::enabled() ? rd::kPfAttnWmmaConfig : 0U);
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
                  static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},
@@ -1077,6 +1083,9 @@ int main(int argc, char** argv) {
                             wm ? wm : "unset", prefill_mode.c_str(), static_cast<unsigned long long>(wd), static_cast<unsigned long long>(wmo));
                 if (wq) std::printf(" iu4 moe %llu", static_cast<unsigned long long>(wq));  // STRIX_GLM_PF_IU4=1 only
                 std::printf("\n");
+                if (const auto ac = strix::glm::pf::attn_wmma::calls.exchange(0); ac != 0)
+                    std::printf("rank %u prefill identity glm-pf-attn-wmma FAST (fused bf16 WMMA MLA/DSA core, "
+                                "T %u, calls %llu)\n", opt.rank, strix::glm::pf::attn_wmma::block_keys(), static_cast<unsigned long long>(ac));
             }
             if (!logits_out.empty()) {
                 std::vector<float> lg(eng.vocab_slice());

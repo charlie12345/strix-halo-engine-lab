@@ -1755,17 +1755,6 @@
   },
   {
     "engine": "minimax",
-    "name": "v4 MoE prefill core",
-    "flag_or_env": "STRIX_MMX_PREFILL_CORE",
-    "default": "v4",
-    "exact": "Published same-identity qualification: Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.",
-    "gain": "Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib",
-    "preconditions": "Supported prefill expert shapes and quantized weights.",
-    "off_switch": "STRIX_MMX_PREFILL_CORE=lib",
-    "doc_anchor": "docs/optimizations.md#mm-pf-core-v4"
-  },
-  {
-    "engine": "minimax",
     "name": "MSA prefill batching",
     "flag_or_env": "STRIX_MM_PF_MSA_BATCH",
     "default": "1",

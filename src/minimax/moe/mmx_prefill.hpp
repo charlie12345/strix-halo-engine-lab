@@ -132,8 +132,8 @@ void set_prefill_core8(int value);  // -1 = environment, 0 = off (default), 1 = 
 using PrefillMarker = void (*)(const char* label, hipStream_t stream, void* user);
 void set_prefill_marker(PrefillMarker marker, void* user);
 // Tests: workspace regions of one call (transformed gate/up rows, down input, all split partials), as byte ranges.
-// xt / at are row-major [2][pairs][6144] / [pairs][1536] for the lib, v2 and v3 cores; v4 stores them tile-major
-// [2][tpairs/16][384][16][16] / [tpairs/16][96][16][16] with group g's rows at tbegin.. (xt_bytes / at_bytes cover the row-major extent).
+// The core stores xt / at tile-major [2][tpairs/16][384][16][16] / [tpairs/16][96][16][16] with group g's rows at
+// tbegin.. (xt_bytes / at_bytes cover the row-major extent [2][pairs][6144] / [pairs][1536]).
 struct PrefillDebugRegions {
     std::size_t xt_offset = 0, xt_bytes = 0, at_offset = 0, at_bytes = 0, part_offset = 0, part_bytes = 0;
     std::size_t pairs = 0, tpairs = 0;

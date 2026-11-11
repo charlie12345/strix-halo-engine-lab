@@ -360,16 +360,16 @@ int main(int argc, char** argv) {
             }
         }
         if (pf_swap_moe && (opt.world != 2 || pf_gate.empty())) throw std::invalid_argument("--pf-swap-moe needs --world 2 and --pf-gate");
-        const bool startup_handshake = rd::has_startup_handshake(opt.world, xch_kind, decode_n > 0, reference_gate);
+        const bool startup_handshake = rd::has_config_agreement(opt.world, xch_kind, decode_n > 0, reference_gate, !tf_tokens.empty());
         // FAST glm-pf-wmma-x is a per-rank env switch, checked by the startup agreement (kPfWmmaConfig). Modes without
-        // that handshake cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
+        // that handshake (or the --tf config-only agreement) cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::attn_wmma::enabled())
             throw std::invalid_argument("the FAST attention core (STRIX_GLM_PF_ATTN_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
-                                        "needs the startup agreement (--decode N, comm exchange, no reference gate) so both ranks "
+                                        "needs the startup agreement (--decode N or --tf, comm exchange) so both ranks "
                                         "are checked to run the same prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
-            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N, comm exchange, "
-                                        "no reference gate) so both ranks are checked to run the same prefill identity");
+            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N or --tf, "
+                                        "comm exchange) so both ranks are checked to run the same prefill identity");
         ge::Engine eng(opt, comm.get());
         // STRIX_GLM_MODEL_FORMAT=fast_i4 (glm-fast-i4, lossy): the routed EXL3 weights are replaced, so the exact /
         // reference identities (decode-row reference prefill, reference gates, identity checks) are refused.

@@ -8,6 +8,12 @@ namespace strix::glm::rank_defaults {
 inline bool has_startup_handshake(unsigned world, const std::string& xch, bool decode, bool reference_gate) {
     return world == 2 && xch == "comm" && decode && !reference_gate;
 }
+// Teacher-forced scoring (--tf) on two comm ranks also runs the agreement so the per-rank FAST prefill switches
+// (kPfWmmaConfig/kPfAttnWmmaConfig) are verified. Rows stay on the no-handshake fallback (fixed, never promoted),
+// so the agreement only checks config bits there; both ranks run the same --tf command and reach the same merges.
+inline bool has_config_agreement(unsigned world, const std::string& xch, bool decode, bool reference_gate, bool tf) {
+    return has_startup_handshake(world, xch, decode, reference_gate) || (world == 2 && xch == "comm" && tf);
+}
 // No new control exchange is allowed in modes without the decode handshake. Both ranks
 // independently retain the fixed 4096-row startup before constructing the engine.
 inline void fallback_without_handshake(Effective& e, bool comm, bool handshake) {

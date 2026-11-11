@@ -10,10 +10,11 @@
 #include <stdexcept>
 
 namespace strix::core::moe_i4 {
-// Chain plan policy: auto-select BM128 (plan 2) only when the call averages >= kPlan2Rows rows per group.
-// Chunk calls (MiniMax 4096 rows: ~159 rows per group) stay at BM64, where the down GEMM pads ~1.2x instead
-// of ~1.6x; the grouped 8K call (~318) and long GLM calls (>= ~228) keep BM128. The paired GEMM is BM64 always.
-inline constexpr unsigned kPlan2Rows = 200;
+// Chain plan policy: auto-select BM128 (plan 2) when the call averages >= kPlan2Rows rows per group.
+// Waves past a ragged tile's rows skip their WMMA (tiled_core), so BM128's padding no longer costs its
+// compute: grouped down on MiniMax-like routing (gfx1151) BM128 vs BM64 -4 % at ~159 rows per group and
+// equal at 64. The paired GEMM is BM64 always (BM128 paired spills).
+inline constexpr unsigned kPlan2Rows = 64;
 inline bool enabled() {
     const char* p = std::getenv("STRIX_MOE_I4_CHAIN");
     if (!p || !*p || std::strcmp(p, "0") == 0) return false;

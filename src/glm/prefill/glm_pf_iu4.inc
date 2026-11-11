@@ -13,7 +13,7 @@
 #if STRIX_GLM_PF_IU4_LIB
 // STRIX_GLM_PF_IU4_PLAN: library IU4 plan 0 (BM32), 1 (BM64), 2 (BM128); unset = auto: plan 2 when the call averages
 // >= min_rows rows per routed expert, else plan 1. The unfused control uses min_rows 128; the chain passes the
-// shared moe_i4::kPlan2Rows policy (4096-row chunk calls average ~114 rows per expert and take plan 1).
+// shared moe_i4::kPlan2Rows policy (4096-row chunk calls average ~114 rows per expert and take plan 2).
 int iu4_plan(unsigned pairs, unsigned min_rows = 128) {
     const char* p = std::getenv("STRIX_GLM_PF_IU4_PLAN");
     if (!p || !*p) return pairs >= min_rows * E ? 2 : 1;

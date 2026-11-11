@@ -63,7 +63,7 @@ __device__ __forceinline__ int q_exponent(float peak) {
     int e; (void)frexpf(peak, &e);
     return min(120, max(-120, 14 - e));
 }
-__device__ unsigned block_exclusive(unsigned v, unsigned* waves, unsigned& total) {
+[[maybe_unused]] __device__ unsigned block_exclusive(unsigned v, unsigned* waves, unsigned& total) {
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     unsigned x = v;
     for (unsigned d = 1U; d < 32U; d <<= 1U) { const unsigned y = __shfl_up(x, d, 32); if (lane >= d) x += y; }

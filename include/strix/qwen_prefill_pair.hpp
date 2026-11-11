@@ -20,6 +20,11 @@ inline bool pipe_enabled() {
     const char* value = std::getenv("STRIX_QWEN_PF_PIPE");
     return value && std::string_view(value) == "1";
 }
+// STRIX_QWEN_PF_PIPE_ROWCOPY=0 restores one seam copy call per row and component (default: one strided copy per component).
+inline bool pipe_rowcopy_enabled() {
+    const char* value = std::getenv("STRIX_QWEN_PF_PIPE_ROWCOPY");
+    return !value || std::string_view(value) != "0";
+}
 inline bool pipe_profile_enabled() {
     const char* value = std::getenv("STRIX_QWEN_PF_PIPE_PROFILE");
     return value && std::string_view(value) == "1";

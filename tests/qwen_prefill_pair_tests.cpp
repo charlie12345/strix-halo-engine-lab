@@ -283,6 +283,27 @@ void routed_piece_checks() {
 }
 
 }
+// Default strided seam copy is exactly the per-row copy sequence (offsets, device addresses, lengths).
+void copy_rows_checks() {
+    struct Recorder final : strix::qwen_pp::PipeStaging {
+        std::vector<std::array<std::size_t, 3>> calls;
+        std::span<std::byte> resize(std::size_t) override { return {}; }
+        void copy(bool, std::size_t offset, void* device, std::size_t bytes) override {
+            calls.push_back({offset, reinterpret_cast<std::uintptr_t>(device), bytes});
+        }
+        void seal(std::size_t) override {}
+        void await_piece(std::size_t) override {}
+        void received_piece(std::size_t, std::size_t) override {}
+        void finish_receive() override {}
+    } recorder;
+    std::array<std::byte, 64> device{};
+    recorder.copy_rows(true, 5U, 100U, device.data(), 12U, 7U, 4U);
+    require(recorder.calls.size() == 4U);
+    for (std::size_t row = 0; row < 4U; ++row)
+        require(recorder.calls[row][0] == 5U + row * 100U &&
+            recorder.calls[row][1] == reinterpret_cast<std::uintptr_t>(device.data()) + row * 12U && recorder.calls[row][2] == 7U);
+    require(strix::qwen_pp::pipe_rowcopy_enabled());
+}
 // Shared pair timeline: OFF records nothing; ON accumulates per step, and the pipe fills its progress columns.
 void timeline_checks() {
     strix::dist::PipelineTimeline off("t", 0, strix::qwen_pp::pair_timing_columns(), false);
@@ -329,7 +350,7 @@ void timeline_checks() {
 }
 int main() {
     try {
-        balance_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); timeline_checks();
+        balance_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); timeline_checks(); copy_rows_checks();
         Wire forward, backward;
         std::mutex received_mutex; std::condition_variable received_cv; std::uint64_t received_chunks = 0;
         const auto abort = [&] { forward.stop(); backward.stop(); };

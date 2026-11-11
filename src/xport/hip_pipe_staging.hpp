@@ -46,6 +46,13 @@ public:
         pipe_hip_check(hipMemcpyAsync(save ? packed : device, save ? device : packed, bytes,
             hipMemcpyDeviceToDevice, compute_()), "pair prefill snapshot/scatter");
     }
+    void copy_rows(bool save, std::size_t offset, std::size_t pitch, void* device, std::size_t device_pitch,
+        std::size_t bytes, std::size_t rows) override {
+        auto* packed = device_bytes_ + offset;
+        pipe_hip_check(hipMemcpy2DAsync(save ? static_cast<void*>(packed) : device, save ? pitch : device_pitch,
+            save ? device : static_cast<const void*>(packed), save ? device_pitch : pitch, bytes, rows,
+            hipMemcpyDeviceToDevice, compute_()), "pair prefill strided snapshot/scatter");
+    }
     void seal(std::size_t bytes) override {
         pipe_hip_check(hipEventRecord(snapshot_, compute_()), "pair prefill snapshot fence");
         // Detached compute streams may reuse the source arena on return. Only

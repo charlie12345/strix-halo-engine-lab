@@ -78,6 +78,13 @@ struct PipeStaging {
     virtual ~PipeStaging() = default;
     virtual std::span<std::byte> resize(std::size_t bytes) = 0;
     virtual void copy(bool save, std::size_t offset, void* device, std::size_t bytes) = 0;
+    // `rows` equal-length pieces at a constant pitch on both sides (row r: offset + r * pitch <-> device + r * device_pitch).
+    // Same bytes as `rows` copy() calls; native staging issues one strided copy instead of one call per row.
+    virtual void copy_rows(bool save, std::size_t offset, std::size_t pitch, void* device, std::size_t device_pitch,
+        std::size_t bytes, std::size_t rows) {
+        for (std::size_t row = 0; row < rows; ++row)
+            copy(save, offset + row * pitch, static_cast<std::byte*>(device) + row * device_pitch, bytes);
+    }
     virtual void seal(std::size_t bytes) = 0;
     virtual void await_piece(std::size_t offset) = 0;
     virtual void received_piece(std::size_t offset, std::size_t bytes) = 0;

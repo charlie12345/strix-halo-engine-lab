@@ -195,6 +195,8 @@ struct HipMtpWindowVerifier::Impl {
         if(sampler && sampled_decided<selected.size()) selected.resize(sampled_decided);
     }
     Owner* last=nullptr; // owner of the last prefix window; its stream carries the PLE commit
+    // Base session of the serial window being verified; reused so its lineage vector keeps capacity across cycles.
+    SerialSessionContext window_base;
     // The previous owner's PLE commit runs on its own stream: wait for it before another owner's window runs.
     void fence_previous_owner(const Owner* next) const {
         if(last && last!=next && hipStreamSynchronize(static_cast<hipStream_t>(last->captures.front()->source_stream()))!=hipSuccess)
@@ -1056,7 +1058,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             i.fence_previous_owner(owner);
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             for(std::uint32_t r=1;r<rows;++r) inputs.push_back(candidates[std::min<std::size_t>(r-1U,candidates.size()-1U)]);
-            const auto previous=session;
+            auto& previous=i.window_base;previous=session;
             host_phase_mark("4 verify prologue");
             auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},active);
             host_phase_mark("7 window launch+wait");

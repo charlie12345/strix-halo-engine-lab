@@ -413,6 +413,7 @@ struct HipKnownPrefixWindow::Impl {
         } else if (deferred_pending >= 0) (void)hipEventSynchronize(deferred_events[static_cast<unsigned>(deferred_pending)]);
         for (auto e : deferred_events) if (e) (void)hipEventDestroy(e);
         if (deferred_slots) (void)hipHostFree(deferred_slots);
+        if (wide_union_host) (void)hipHostFree(wide_union_host);
     }
     bool full_prefill_union() const noexcept {return prefill&&prefill_routed_workspace.owner;}
     // The CSR workspace of a wide cohort union of 9..32 rows enqueued on this owner's stream.
@@ -1492,6 +1493,8 @@ struct HipKnownPrefixWindow::Impl {
         std::uint32_t rows_done = 0;
     };
     DeferredCompletion* deferred_slots = nullptr;
+    // Pinned host copy of a wide cohort union summary, read on this (lead) owner's stream before it completes.
+    q51_known_rows::Summary* wide_union_host = nullptr;
     std::array<hipEvent_t, 2> deferred_events{};
     int deferred_pending = -1;
     unsigned deferred_next = 0;
@@ -2234,6 +2237,17 @@ struct HipKnownPrefixWindow::Impl {
                 struct Reset { bool& flag; ~Reset() { flag = false; } } reset{primary->cohort_member};
                 primary->complete();
             }
+            if (wide_union_rows) {
+                // The last wide union's summary, read on the lead stream; the lead's complete() below fences it.
+                if (!lead.wide_union_host) {
+                    void* p = nullptr;
+                    check(hipHostMalloc(&p, sizeof(q51_known_rows::Summary), hipHostMallocDefault), "allocate wide cohort union summary");
+                    lead.wide_union_host = static_cast<q51_known_rows::Summary*>(p);
+                }
+                check(hipMemcpyAsync(lead.wide_union_host, reinterpret_cast<const void*>(lead.cohort_union(wide_union_rows).memory.arena_base),
+                    sizeof(q51_known_rows::Summary), hipMemcpyDeviceToHost, lead.scope.stream), "read wide cohort routed union metadata");
+            }
+            const bool lead_defers = lead.defer_current; // complete() clears it; a deferred lead leaves its stream running
             for (auto& m : members) {
                 const HipLaunchScope active(m.impl->scope);
                 m.run->complete();
@@ -2241,10 +2255,8 @@ struct HipKnownPrefixWindow::Impl {
             }
             if (wide_union_rows) {
                 // The last wide union's summary (the stream is complete): its rows, assignments and status.
-                q51_known_rows::Summary s{};
-                const auto& ws = lead.cohort_union(wide_union_rows);
-                check(hipMemcpy(&s, reinterpret_cast<const void*>(ws.memory.arena_base), sizeof(s), hipMemcpyDeviceToHost),
-                    "read wide cohort routed union metadata");
+                if (lead_defers) check(hipStreamSynchronize(lead.scope.stream), "complete wide cohort union read");
+                const auto s = *lead.wide_union_host;
                 const auto assignments = wide_union_rows * lead.routed_config.top_k;
                 if (s.status || s.version != 1U || s.logical_rows != wide_union_rows || s.assignments != assignments ||
                     !s.touched || s.touched > assignments || s.batches < s.touched || s.batches > assignments ||

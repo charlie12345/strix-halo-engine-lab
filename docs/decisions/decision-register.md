@@ -1,5 +1,7 @@
 # Decision register
 
+> Paths under `docs/research/history/` cited below were removed on 2026-11-10 as historical; they remain in the git history (for example at commit `628d6753b`).
+
 ## Accepted
 
 | ID | Decision | Reason | Evidence | Review |
@@ -1178,7 +1180,7 @@ separately from host-only shadow and gated-selection counts.
 Status: exact (68 native decodes of 22 agent/code/prose prompts identical to the default, six real-cycle gates
 equal to serial decoding in tokens, full logits and committed state). Short single runs show no gain over the
 distilled draft (agent +1.9 % tokens per cycle with `ctx`, ms/token flat or worse): not adopted, default unchanged.
-See [the contract](docs/mtp-native-cli.md#context-copyn-gram-drafter-ctx-copy).
+See [the contract](../engine/speculative/mtp-native-cli.md#context-copyn-gram-drafter-ctx-copy).
 
 ## Measured and rejected
 

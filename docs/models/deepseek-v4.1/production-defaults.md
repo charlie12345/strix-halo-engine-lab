@@ -93,7 +93,7 @@ ranks: tokens, logits slices, attention states; prefill 32K / 400 rows logits + 
 | `STRIX_DS41_IDX_CAND_FILTER` | on (`=0` off) | candidate users read and select only candidate blocks (> 16K entries). 128K R1 -0.8 %, R6 -1.9 % |
 | `STRIX_DS41_ATTN_SEG_HPW` | on (`=0` off) | N8 segments share one heads-per-wave form (Hpw 4 instead of 1). With the above: N8 8K -1.1 %, 32K -1.4 %, 128K -3.3 % |
 
-Still off (measured slower or neutral): `STRIX_DS41_PREFILL_SLABS` (8K +0.76 %), `STRIX_DS41_R1FUSE_QNORM_A8`, `STRIX_DS41_GRAPHS` (only 0.21 ms/step of GPU idle waits for the host), CMake `STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT`.
+Still off (measured slower or neutral): `STRIX_DS41_PREFILL_SLABS` (8K +0.76 %), `STRIX_DS41_R1FUSE_QNORM_A8`, CMake `STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT`.
 With the trellis o_b site (below) the o_b product is the trellis plan, so the Q8 o_b ready epilogue does not run there;
 the MoE half-sum ready path does.
 The read-ahead skips trellis sites (their own pack) and runs only in the Q8 o_b exchange windows, so with the trellis

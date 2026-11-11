@@ -1,5 +1,7 @@
 # Evidence register
 
+> Paths under `docs/research/history/` cited below were removed on 2026-11-10 as historical; they remain in the git history (for example at commit `628d6753b`).
+
 Parallel HC projection diagnostic: source prototype with a distinct reassociated
 FP32 numerical identity; see `docs/research/history/implementation-2026-10-15-parallel-hc-projection.md`.
 The portable FP64 oracle passes strict GNU C++20 tests, including all 65536 half

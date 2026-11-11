@@ -1120,11 +1120,23 @@ int main() try {
     ApiService defaults_api(defaults_config, tokenizer, queue, engine.context_tokens(), true);
     auto reject_config = config; reject_config.sampling_policy = "reject"; reject_config.responses = false;
     ApiService reject_api(reject_config, tokenizer, queue, engine.context_tokens(), false);
+    std::atomic<bool> rendered_thinking{false};
+    auto thinking_config = config;
+    thinking_config.chat_renderer = [&](const ChatTemplateInput& input) {
+        rendered_thinking.store(!input.enable_thinking || *input.enable_thinking);
+        return render_chat_template(input);
+    };
+    thinking_config.default_thinking = false;
+    ApiService thinking_off_api(thinking_config, tokenizer, queue, engine.context_tokens(), false);
+    thinking_config.default_thinking = true;
+    ApiService thinking_on_api(thinking_config, tokenizer, queue, engine.context_tokens(), false);
     HttpServerConfig http_config;
     http_config.port = 0;
     HttpServer server(http_config, [&](const HttpRequest& r, HttpResponseWriter& w) {
         const auto mode = r.header("x-test-config");
-        if (r.header("x-test-sessions") == "1" && mode == "constraints") constrained_session_api.handle(r, w);
+        if (mode == "thinking-off") thinking_off_api.handle(r, w);
+        else if (mode == "thinking-on") thinking_on_api.handle(r, w);
+        else if (r.header("x-test-sessions") == "1" && mode == "constraints") constrained_session_api.handle(r, w);
         else if (r.header("x-test-sessions") == "1") session_api.handle(r, w);
         else if (mode == "constraints") constrained_api.handle(r, w);
         else if (mode == "constraints-greedy") constrained_greedy_api.handle(r, w);
@@ -1144,6 +1156,34 @@ int main() try {
     std::thread engine_thread([&] { queue.run(engine); });
     const std::string auth = "Authorization: Bearer secret\r\n";
     const auto first_choice = [](const Json& j) -> const Json& { return at(j, "choices").as_array().at(0); };
+    for (const bool server_default : {false, true}) {
+        const auto headers = auth + std::string("X-Test-Config: thinking-") + (server_default ? "on" : "off") + "\r\n";
+        const auto caps = parse_json(http(port, "GET", "/v1/capabilities", "", headers).body);
+        check(at(caps, "default_thinking").as_bool() == server_default, "thinking default is advertised");
+        for (const std::string path : {"/v1/chat/completions", "/v1/responses", "/v1/messages"}) {
+            for (const int choice : {-1, 0, 1, 2, 3}) {
+                Json body = Json::object();
+                body.set("max_tokens", Json(1));
+                if (path == "/v1/responses") body.set("input", Json("Hi"));
+                else body.set("messages", parse_json(R"([{"role":"user","content":"Hi"}])"));
+                const bool expected = choice < 0 ? server_default : choice == 1 || choice == 2;
+                if (choice >= 0) {
+                    if (path == "/v1/messages") {
+                        Json thinking = Json::object(); thinking.set("type", Json(expected ? "enabled" : "disabled"));
+                        body.set("thinking", std::move(thinking));
+                    } else if (choice == 2) {
+                        Json kwargs = Json::object(); kwargs.set("enable_thinking", Json(true));
+                        body.set("enable_thinking", Json(false)); body.set("chat_template_kwargs", std::move(kwargs));
+                    } else if (choice == 3) body.set("reasoning_effort", Json("none"));
+                    else body.set("enable_thinking", Json(expected));
+                }
+                rendered_thinking.store(!expected);
+                const auto reply = http(port, "POST", path, body.dump(), headers);
+                check(reply.status == 200 && rendered_thinking.load() == expected,
+                      "request thinking overrides server default: " + path + " choice " + std::to_string(choice));
+            }
+        }
+    }
     const auto stream_text = [](const std::string& body, std::string* reasoning, std::string* finish, bool* usage, bool* tools) {
         std::string content;
         for (const auto& event : sse_data(body)) {

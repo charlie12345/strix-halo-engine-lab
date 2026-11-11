@@ -41,8 +41,10 @@ std::string trace_json(const PrefillResult& ref, const PrefillResult& got, std::
         unsigned router = 0, router_ids = 0, index = 0, rows = 0, router_tail = 0, index_tail = 0;
         const std::size_t nr = a.row_hashes.size(), K = nr ? a.router_ids.size() / nr : 0;
         for (std::size_t r = 0; K && r < nr && a.router_ids.size() == b.router_ids.size(); ++r) {
-            std::vector<std::uint32_t> x(a.router_ids.begin() + r * K, a.router_ids.begin() + (r + 1) * K);
-            std::vector<std::uint32_t> y(b.router_ids.begin() + r * K, b.router_ids.begin() + (r + 1) * K);
+            // sized first, then copied: gcc 14 -O3 reports a false -Wfree-nonheap-object on the iterator-range form
+            std::vector<std::uint32_t> x(K), y(K);
+            std::copy_n(a.router_ids.data() + r * K, K, x.begin());
+            std::copy_n(b.router_ids.data() + r * K, K, y.begin());
             std::sort(x.begin(), x.end());
             std::sort(y.begin(), y.end());
             if (x != y) {

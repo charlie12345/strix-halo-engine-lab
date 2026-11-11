@@ -315,7 +315,7 @@ window stream shared by all slots. The calibration replay runs once.
   weight-reading steps run once for all rows), with one the ordinary cycle. With five to eight requests,
   `STRIX_COHORT_ROWS=16 STRIX_COHORT_WIDE=all` runs the cycle as one group of up to 16 rows whose GDN/QSA
   projections, LM head and expert union run once for all rows (D-052,
-  [multi-request cohort](../scheduling/multi-request-cohort.md#global-row-budget-and-wide-steps-opt-in)).
+  [multi-request cohort](../scheduling/multi-request-cohort.md#global-row-budget-and-wide-steps)).
   The experimental `STRIX_MTP_BATCH_JOINT=1` replaces that fixed per-request cap
   with a joint cost-based choice and supports shared dense steps through 32
   rows; see [joint serving windows](../scheduling/joint-serving-windows.md). It is off by default.
@@ -355,8 +355,13 @@ window stream shared by all slots. The calibration replay runs once.
 - `tools` (function tools) are rendered into the system turn the way the model was trained; assistant
   tool calls in the history are rendered from `tool_calls` (string or object `arguments`).
 - Thinking: on by default (the template default). `chat_template_kwargs.enable_thinking: false`
-  (or top-level `enable_thinking: false`) disables it; `reasoning_effort` (`low`, `medium`, `high`,
-  `xhigh`) and `preserve_thinking` are passed to the template.
+  (or top-level `enable_thinking: false`) disables it. The DeepSeek V4.1 server (`strix-deepseek41-serve`) is the
+  exception: a request that sets neither `enable_thinking` nor Messages `thinking.type` runs in chat (non-thinking)
+  mode unless the server runs with `--default-thinking on` (`off` is the default).
+  Request `enable_thinking` (including `chat_template_kwargs`) or Messages `thinking.type`
+  overrides this default; `reasoning_effort: "none"` also disables thinking.
+  `GET /v1/capabilities` reports `default_thinking`. `reasoning_effort` (`low`, `medium`, `high`, `xhigh`) and `preserve_thinking` are passed
+  to the template.
 - The reply is split into `reasoning_content` (the thinking block), `content` and `tool_calls`.
   Parameter values of a tool call are typed by the tool's JSON schema (strings stay strings, other
   types are parsed as JSON); `finish_reason` is `tool_calls` when the reply contains calls.

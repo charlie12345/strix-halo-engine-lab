@@ -2388,6 +2388,13 @@ void Communicator::start(hipStream_t stream, const void* local, std::size_t byte
             direct_->use_rings(r.rings);
             direct_->expect_next(direct_bytes_, r.rings); // the next message on the rings is likely this size again
             direct_->start(stream, direct_local_, direct_bytes_, ExchangeIdentity{group_.plan, tag.request, tag.kind, tag.layer});
+        } else if (direct_chunk_overlap_) {
+            const std::size_t chunk = direct_->capacity() & ~std::size_t{63};
+            if (!chunk) throw std::runtime_error("dist direct capacity below chunk alignment");
+            const auto after = std::min(chunk, direct_bytes_ - chunk);
+            direct_->use_rings(direct_offset_ ? mix_rings_ : route(chunk).rings);
+            direct_->expect_next(after, direct_offset_ ? mix_rings_ : route(after).rings);
+            direct_->start(stream, direct_local_, chunk, ExchangeIdentity{group_.plan, tag.request, tag.kind, tag.layer});
         }
         direct_started_ = true;
         return;
@@ -2819,16 +2826,19 @@ void Communicator::finish(hipStream_t stream, void* remote) {
         if (direct_bytes_ <= direct_->capacity()) {
             direct_->finish(stream, direct_remote);
         } else {
-            // Chunks of the capacity, one exchange each, in order (no overlap with the caller's work).
+            // Chunks in order. The optional first-chunk policy already started
+            // offset 0 before caller work; all remaining chunks start here.
             const std::size_t chunk = direct_->capacity() & ~std::size_t{63};
             for (std::size_t offset = 0; offset < direct_bytes_; offset += chunk) {
                 const std::size_t n = std::min(chunk, direct_bytes_ - offset);
                 // The next chunk exactly, after the last one the first chunk of a message of this size.
                 const std::size_t after = offset + n < direct_bytes_ ? std::min(chunk, direct_bytes_ - offset - n) : std::min(chunk, direct_bytes_);
-                direct_->use_rings(direct_offset_ ? mix_rings_ : route(n).rings);
-                direct_->expect_next(after, direct_offset_ ? mix_rings_ : route(after).rings);
-                direct_->start(stream, static_cast<const std::byte*>(direct_local_) + offset, n,
-                               ExchangeIdentity{group_.plan, tag_.request, tag_.kind, tag_.layer + static_cast<std::uint32_t>(offset / chunk)});
+                if (offset != 0 || !direct_chunk_overlap_) {
+                    direct_->use_rings(direct_offset_ ? mix_rings_ : route(n).rings);
+                    direct_->expect_next(after, direct_offset_ ? mix_rings_ : route(after).rings);
+                    direct_->start(stream, static_cast<const std::byte*>(direct_local_) + offset, n,
+                                   ExchangeIdentity{group_.plan, tag_.request, tag_.kind, tag_.layer + static_cast<std::uint32_t>(offset / chunk)});
+                }
                 direct_->finish(stream, direct_remote + offset);
             }
         }

@@ -1,4 +1,5 @@
 #include "ds41_dense_adapter.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/ds41_exact_flags.hpp"
@@ -2448,14 +2449,30 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                                      std::uint64_t{v.x_stride} >= 2ULL * v.width)),
             "Q8_0 x A8 dense prefill view");
     if (v.k_parts == 2U) {
-        auto part = v;
-        part.k_parts = 1U;
-        enqueue_q8_0_a8_dense_prefill(part, stream);
-        part.k_offset += v.width;
-        part.codes += v.width;
-        part.deltas += v.width / 32U;
-        part.accumulate = true;
-        enqueue_q8_0_a8_dense_prefill(part, stream);
+        // one launch for both parts in form 822 from 896 rows (gfx1151 bench: -2 % at 896, -5..-7 % at 1024 rows; fewer rows
+        // lose to the two launches); else the two launches (the second accumulated)
+        // (the auto rule's 822 pick: o_a's count 1024 takes 914 first; the rotation gate and the statistics see two calls)
+        const bool one = v.tall == 1U && v.rows >= 896U && v.row_width == 8192U && v.width == 4096U && v.count != 1024U &&
+                         !strix::env_flag_default_off("STRIX_DS41_DENSE_TALL_ROTATE", strix::EnvFlagMatch::first_character) &&
+                         !strix::env_flag_default_off("STRIX_DS41_DENSE_STATS", strix::EnvFlagMatch::first_character) &&
+                         static_cast<std::size_t>(v.rows) * v.x_stride < 0x7fffffffULL &&
+                         static_cast<std::size_t>(v.count) * (v.row_width / 32U * 34U) < 0x7fffffffULL &&
+                         [] { const char* e = std::getenv("STRIX_DS41_DENSE_FORM"); return !(e && e[0] == '0'); }();
+        if (one) {
+            const dim3 g((v.rows + 31U) / 32U, (v.count + 31U) / 32U);
+            hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 4U, 2U>), g, dim3(32 * tall_waves), 0, as_stream(stream), v);
+            check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
+            return false;
+        }
+        auto p0 = v;
+        p0.k_parts = 1U;
+        enqueue_q8_0_a8_dense_prefill(p0, stream);
+        auto p1 = p0;
+        p1.k_offset = v.k_offset + v.width;
+        p1.codes = v.codes + v.width;
+        p1.deltas = v.deltas + v.width / 32U;
+        p1.accumulate = true;
+        enqueue_q8_0_a8_dense_prefill(p1, stream);
         return false;
     }
     integer_core::launch<integer_core::Contract<WeightFormat::q8_0>, 32>(integer_core::DenseAdapter{v},

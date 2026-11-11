@@ -5,7 +5,7 @@
 Es un motor de inferencia en C++/HIP para AMD Strix Halo: Ryzen AI Max+ 395, Radeon 8060S (`gfx1151`), 128 GB de memoria
 unificada, Linux y ROCm. Funciona en un nodo, o en dos nodos unidos por USB4. Una RTX PRO 6000 añade rutas opcionales.
 Ejecuta Qwen3.8-Flash-Next, DeepSeek V4.1 Flash, MiniMax M3.1 Flash y GLM-5.3 Flash en producción.
-Nemotron 3.5 Bolt E4B y MiniMax H3 (audio + vídeo) son compilaciones opcionales.
+Nemotron 3.5 Bolt E4B, MiniMax H3 (audio + vídeo) y MiniMax-H3-Image (texto a imagen) son compilaciones opcionales.
 La ruta por defecto es exacta: sus tokens son idénticos a los de la ruta de referencia declarada.
 Cómo medimos y qué cubre "exacto": [metodología](docs/methodology.es.md).
 
@@ -24,8 +24,17 @@ repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y 
 | GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | 541 tok/s a 8K, 529 a 32K (exacto) |
 | Nemotron 3.5 Bolt E4B | 1 nodo | 91.9 tok/s (C1) | 2,780 tok/s a 8K, 2,336 a 32K (`fast`) |
 | MiniMax H3 | par | clip de 5 s 1344x768 con audio en 405.5 s | - |
+| MiniMax-H3-Image (int8, 6 pasos) | 1 nodo | imagen 1024x1024 en 33.6 s, 2048x2048 en 52 s | - |
+| MiniMax-H3-Image (int8, 6 pasos) | par | imagen 1024x1024 en 22.4 s, 2048x2048 en 44.6 s | - |
 
 <a id="hardware"></a>
+
+## Otro hardware
+
+El planificador reserva la memoria medida del dispositivo para KV del contexto
+solicitado, workspace y formatos/topologías compatibles antes de cargar. Consulte
+[despliegue en otro hardware](docs/deployment.es.md) para inspección, ejemplos TOML,
+API de orquestación y límites actuales, incluidos los runtimes INT4 pendientes.
 
 ## Inicio rápido
 
@@ -77,6 +86,7 @@ donde existe.
 | GLM-5.3 Flash (EXL3 4.05 bpw) | par TP2 | exacto; prefill WMMA opcional | 2 x 128 GB |
 | Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 para `quality`) | uno, compilación opcional | exacto por defecto; `fast`; `quality` | nodo de 128 GB |
 | MiniMax H3 (audio + vídeo) | uno o par, compilación opcional | referencia densa; palancas FAST, cada una con su flag | 128 GB por nodo |
+| MiniMax-H3-Image (int8 o W4A8) | uno o par (`strix-h3-image`), compilación opcional | VAE en GPU; `--parallel sequence` para una imagen, `request` para varias | 128 GB por nodo |
 
 <a id="discrete-gpu"></a>
 

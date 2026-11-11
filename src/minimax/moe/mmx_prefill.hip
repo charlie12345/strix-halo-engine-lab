@@ -1459,7 +1459,7 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
     t.tpairs = l.tpairs;
 #if STRIX_MMX_IU4_LIB
     if(v.i4) {
-        if(!v.i4_all || !strix::core::moe_i4::enabled()) throw std::invalid_argument("device i4 needs the all-scope candidate chain");
+        if(!v.i4_all || !prefill_i4_chain()) throw std::invalid_argument("device i4 needs the all-scope candidate chain");
         launch_i4_chain(t,*v.i4,v.y,v.out,reinterpret_cast<const strix::core::IU4Group*>(a.out.items),
             ws+l.xt,workspace_bytes-l.xt,stream,true);
         return;
@@ -1626,7 +1626,7 @@ std::size_t prefill_i4_workspace_bound(std::uint32_t rows) { return dev_layout(r
 
 bool prefill_i4_chain() {
 #if STRIX_MMX_IU4_LIB
-    return strix::core::moe_i4::enabled();
+    return strix::core::moe_i4::enabled(true);  // FAST_I4 scope all: the chain by default (same bits as unfused)
 #else
     return false;
 #endif

@@ -15,11 +15,13 @@ namespace strix::core::moe_i4 {
 // compute: grouped down on MiniMax-like routing (gfx1151) BM128 vs BM64 -4 % at ~159 rows per group and
 // equal at 64. The paired GEMM is BM64 always (BM128 paired spills).
 inline constexpr unsigned kPlan2Rows = 64;
-inline bool enabled() {
+// STRIX_MOE_I4_CHAIN=0|1 overrides the engine's default (def).
+inline bool enabled(bool def = false) {
     const char* p = std::getenv("STRIX_MOE_I4_CHAIN");
-    if (!p || !*p || std::strcmp(p, "0") == 0) return false;
+    if (!p || !*p) return def;
+    if (std::strcmp(p, "0") == 0) return false;
     if (std::strcmp(p, "1") == 0) return true;
-    throw std::invalid_argument("STRIX_MOE_I4_CHAIN must be 0 or 1 (candidate, native gates pending)");
+    throw std::invalid_argument("STRIX_MOE_I4_CHAIN must be 0 or 1");
 }
 struct Weights {
     const uint8_t* q[3];

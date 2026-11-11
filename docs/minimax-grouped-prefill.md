@@ -117,8 +117,10 @@ events, without adding a host synchronization. Retain it only if 8K TTFT improve
 times per layer at the existing prompt completion fence; the latter includes inter-chunk gaps.
 Kernel-chain timing should also use the prefill timeline markers.
 
-The candidate chain (`STRIX_MOE_I4_CHAIN=1`) runs once per chunk, so chunk c's MoE overlaps the
-exchange of chunk c-1. The single 8192-row call per layer is opt-in (`STRIX_MOE_I4_CHAIN_GROUP=1`):
+With scope `all`, the INT4 chain is the default (`STRIX_MOE_I4_CHAIN=0` selects the unfused calls,
+same bits). It quantises the gate/up input once, runs gate/up as one paired grouped GEMM whose
+epilogue applies SwiGLU and the down input transform, then the down GEMM and the ordered combine.
+It runs once per chunk, so chunk c's MoE overlaps the exchange of chunk c-1. The single 8192-row call per layer is opt-in (`STRIX_MOE_I4_CHAIN_GROUP=1`):
 it waits for every chunk's attention exchange and measured slower. Same bits either way.
 
 `STRIX_MMX_PF_IU4=0` and `--ab pfi4:PROMPT.u32:128` retain the same model load and buffers while

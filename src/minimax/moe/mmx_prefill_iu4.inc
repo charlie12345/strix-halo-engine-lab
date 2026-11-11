@@ -131,7 +131,7 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
 void launch_iu4(const Plan& p, const Tables& t, const PrefillMoeView& v, unsigned char* ws, std::size_t ws_bytes, hipStream_t stream) {
     namespace st = strix::core;
     const I4Layer& q = *v.i4;
-    if(v.i4_all && st::moe_i4::enabled()) {
+    if(v.i4_all && prefill_i4_chain()) {
         launch_i4_chain(t,q,v.y,v.out,reinterpret_cast<const st::IU4Group*>(ws+p.off_i4_groups),
             ws+p.off_xt,ws_bytes-p.off_xt,stream,false);
         return;

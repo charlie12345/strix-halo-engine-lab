@@ -103,6 +103,7 @@
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_state_frames.hpp"
 #include "strix/handoff.hpp"
+#include "strix/pair/lockstep.hpp"
 #include "strix/deepseek41_batch_dspark.hpp"
 
 #include "ds41_hetero_stage.hpp"
@@ -344,13 +345,20 @@ constexpr std::uint32_t kPoolRelease = 1U, kPoolReserve = 2U;
 constexpr std::size_t kImportChunk = std::size_t{64} << 10U;  // BatchForward::exchange_host's message limit
 static_assert(offsetof(Control, extra_rows) <= 512U);
 
+// Lockstep round of this rank's Control channel. Each rank runs its whole Control conversation on one thread (lead() /
+// follow(); the --emulate peer is a second thread in the same process), so the counter is per thread.
+thread_local std::uint64_t control_round = 0;
+
 Control exchange(BatchForward& fwd, const Control& out) {
     std::array<std::byte, 512> o{}, i{};
     std::memcpy(o.data(), &out, offsetof(Control, extra_rows));
+    std::memcpy(o.data() + offsetof(Control, round), &control_round, sizeof control_round);
     fwd.exchange_host(o, i);
     Control in;
     std::copy_n(i.begin(), offsetof(Control, extra_rows), std::as_writable_bytes(std::span(&in, 1)).begin());
     if (in.magic != out.magic) throw std::runtime_error("control channel: bad magic from the peer");
+    strix::pair::check_round(control_round, in.round);
+    ++control_round;
     if (std::max(out.rows, in.rows) > BatchForward::max_rows) {
         if (std::max(out.rows, in.rows) > fwd.row_limit()) throw std::runtime_error("control channel: step row limit differs");
         fwd.exchange_host(std::as_bytes(std::span(out.extra_rows)), std::as_writable_bytes(std::span(in.extra_rows)));
@@ -1238,6 +1246,7 @@ using PrefillFactory = std::function<std::unique_ptr<SlotPrefill>(std::uint32_t&
 
 // ---- rank 1: no API; runs what rank 0 sends ----
 void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage) {
+    control_round = 0;
     Args a = initial;
     const auto mine = hello(a);
     const auto first = exchange(fwd, mine);
@@ -1291,7 +1300,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
                          o.pieces, o.next_token, static_cast<unsigned long long>(o.logits), o.seconds);
     };
     for (;;) {
-        reply.round += 1U;
+        reply.round = control_round;
         std::array<std::byte, 512> out{}, in{};
         std::memcpy(out.data(), &reply, offsetof(Control, extra_rows));
         fwd.exchange_host(out, in);
@@ -1307,6 +1316,8 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         Control c;
         std::copy_n(in.begin(), offsetof(Control, extra_rows), std::as_writable_bytes(std::span(&c, 1)).begin());
         if (c.magic != reply.magic) throw std::runtime_error("control channel: bad magic from the peer");
+        strix::pair::check_round(control_round, c.round);  // draft packets above neither check nor advance the round
+        ++control_round;
         if (std::max(reply.rows, c.rows) > BatchForward::max_rows) {  // as exchange(): the rows past 8 follow
             if (std::max(reply.rows, c.rows) > fwd.row_limit()) throw std::runtime_error("control channel: step row limit differs");
             fwd.exchange_host(std::as_bytes(std::span(reply.extra_rows)), std::as_writable_bytes(std::span(c.extra_rows)));
@@ -1439,7 +1450,6 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
             if (hit.disk) {  // all or nothing: both ranks read their files
                 Control ack;
                 ack.command = static_cast<std::uint32_t>(Command::prefill);
-                ack.round = reply.round;
                 ack.pflags = ok ? 0U : 2U;
                 const auto peer = exchange(fwd, ack);
                 if (!ok || (peer.pflags & 2U) != 0U) {
@@ -1771,6 +1781,7 @@ void frames_import_session(const Args& a, ServeState& state, ImportBox& box, str
 }
 
 void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage) {
+    control_round = 0;
     Args a = initial;
     const auto mine = hello(a);
     const auto peer = exchange(fwd, mine);

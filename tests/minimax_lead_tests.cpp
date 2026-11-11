@@ -60,6 +60,7 @@ struct FakeEngine {
         controls.push_back(c);
         // Echo checkpoints through the real exchange validation; check replies carry the child's token.
         if (c.command == static_cast<unsigned>(ms::Command::check)) c.plen = active.next;
+        c.rank = 1U - c.rank;  // the peer answers as the other rank for the same round
         if (session_peer) c.pflags |= ms::kHelloSessionVote;
         if (c.command == 0) c.pflags = (c.pflags & ~ms::kHelloPrefixVote) | (prefix_peer ? ms::kHelloPrefixVote : 0U);  // the peer's own vote
         if (c.command == 0 && peer_alignment != 0) c.dpos[0] = peer_alignment;

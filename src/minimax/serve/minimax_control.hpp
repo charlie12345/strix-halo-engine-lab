@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/minimax/prefill_types.hpp"
+#include "strix/pair/lockstep.hpp"
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -23,10 +24,12 @@ struct Control {
     std::uint32_t dslots = 0;  // draft
     std::uint32_t dslot[8]{}, danchor[8]{};
     std::uint64_t dpos[8]{};
-    // prefill: first position; a reused prefix of the slot's cache precedes it (0 = the whole prompt). Last field on
-    // purpose: it lands in the 512-byte frame's former zero padding, so version-3 peers still read every prior field and
-    // a zero pstart (every command but a reusing prefill) leaves the wire bytes identical to before.
+    // prefill: first position; a reused prefix of the slot's cache precedes it (0 = the whole prompt). pstart and rank
+    // land in the 512-byte frame's former zero padding: rank 0 with a zero pstart sends the same bytes as before.
     std::uint32_t pstart = 0;
+    // The sender's pair rank. With round / ack_round it forms the strix::pair::LockstepHeader every exchange checks; a
+    // peer built before the field reports rank 0 on both ranks and is refused as "same rank" instead of misrunning.
+    std::uint32_t rank = 0;
 };
 static_assert(sizeof(Control) <= 512);
 
@@ -42,6 +45,7 @@ Control exchange(Engine& eng, const Control& out) try {
     Control local = out;
     local.active = eng.prefill_progress();
     local.parked = eng.prefill_progress(true);
+    local.rank = static_cast<std::uint32_t>(eng.rank());
     // Copy semantic fields only: Control and PfProgress padding is indeterminate,
     // including on repeated hello calls. Every padding byte on the wire stays zero.
     const auto put = [&](std::size_t offset, const auto& value) {
@@ -66,7 +70,7 @@ Control exchange(Engine& eng, const Control& out) try {
     static_assert(sizeof(strix::minimax::engine::Row) == 2 * sizeof(std::uint32_t) + sizeof(std::uint64_t));
     STRIX_MM_CONTROL_FIELD(row); STRIX_MM_CONTROL_FIELD(layers); STRIX_MM_CONTROL_FIELD(append);
     STRIX_MM_CONTROL_FIELD(dslots); STRIX_MM_CONTROL_FIELD(dslot); STRIX_MM_CONTROL_FIELD(danchor);
-    STRIX_MM_CONTROL_FIELD(dpos); STRIX_MM_CONTROL_FIELD(pstart);
+    STRIX_MM_CONTROL_FIELD(dpos); STRIX_MM_CONTROL_FIELD(pstart); STRIX_MM_CONTROL_FIELD(rank);
 #undef STRIX_MM_CONTROL_FIELD
     eng.exchange_bytes(o.data(), i.data(), o.size());
     Control in;
@@ -79,15 +83,27 @@ Control exchange(Engine& eng, const Control& out) try {
         eng.abort("control channel: protocol / task checkpoint mismatch");
         throw std::runtime_error("control channel: protocol / task checkpoint mismatch");
     }
-    if (local.command != 0 && in.command == 0 &&
-        in.ack_round != (out.round == 0 ? ~std::uint64_t{0} : out.round - 1)) {
-        eng.abort("control channel: preceding round not acknowledged");
-        throw std::runtime_error("control channel: preceding round not acknowledged");
+    try {
+        strix::pair::check_pair({local.round, local.ack_round, local.rank}, {in.round, in.ack_round, in.rank});
+    } catch (const strix::pair::ProtocolError& e) {
+        eng.abort(e.what());
+        throw;
     }
     return in;
 } catch (...) {
     eng.abort("control channel: protocol failure");
     throw;
+}
+
+// One lockstep round: stamps out's round / ack_round from lock, exchanges, then checks the peer's header and advances.
+template<class Engine>
+Control exchange(Engine& eng, Control out, strix::pair::Lockstep& lock) {
+    const auto header = lock.header();
+    out.round = header.round;
+    out.ack_round = header.ack_round;
+    Control in = exchange(eng, out);
+    lock.accept({in.round, in.ack_round, in.rank});
+    return in;
 }
 
 // prefix: this rank's prefix-reuse vote; *prefix_agreed (when given) is true only if both ranks voted for it.

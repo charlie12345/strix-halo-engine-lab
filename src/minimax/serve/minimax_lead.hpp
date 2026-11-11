@@ -192,7 +192,7 @@ public:
         prefix_on_ = sh_.prefix_reuse;
         reuse_rows_ = prefix_on_ ? eng_.prefill_reuse_rows() : max_rows_;
         if (reuse_rows_ == 0) throw std::invalid_argument("prefix reuse: zero prefill alignment");
-        round_ = run.control_round;
+        lock_ = strix::pair::Lockstep(static_cast<std::uint32_t>(eng_.rank()), run.control_round);
         const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
         timeline_on_ = v != nullptr && std::strcmp(v, "1") == 0;
         if (timeline_on_) timeline_origin_ = Time::now();
@@ -216,8 +216,7 @@ public:
                 Control c;
                 c.command = static_cast<std::uint32_t>(Command::cancel);
                 c.task_id = r->request_id;
-                c.round = round_++;
-                (void)exchange(eng_, c);
+                (void)exchange(eng_, c, lock_);
                 const auto progress = eng_.prefill_progress(eng_.prefill_progress(true).id == c.task_id);
                 run_.prefill_cancel(c.task_id);
                 if (timeline_on_) timeline("cancel", Time::now(), "ticket", slot, progress.layer, progress.layer, timeline_task(progress));
@@ -276,9 +275,8 @@ public:
             if (std::chrono::duration<double>(Time::now() - last_round).count() > 1.0) {  // keep rank 1 and the link alive
                 Control hb;
                 hb.command = static_cast<std::uint32_t>(Command::heartbeat);
-                hb.round = round_++;
                 const auto hb0 = timeline_on_ ? Time::now() : Clock::time_point{};
-                (void)exchange(eng_, hb);
+                (void)exchange(eng_, hb, lock_);
                 // Both ranks at an idle heartbeat, with no exchange in flight.
                 // Native runners retire preposted direct receives before their
                 // DMA deadline; pure host runners need no transport hook.
@@ -298,8 +296,7 @@ public:
             Control c;
             c.command = static_cast<std::uint32_t>(Command::cancel);
             c.task_id = p.id;
-            c.round = round_++;
-            (void)exchange(eng_, c);
+            (void)exchange(eng_, c, lock_);
             run_.prefill_cancel(p.id);
         }
         for (auto& r : run_slots_)
@@ -312,8 +309,7 @@ public:
         flush_timeline();
         Control bye;
         bye.command = static_cast<std::uint32_t>(Command::shutdown);
-        bye.round = round_++;
-        (void)exchange(eng_, bye);
+        (void)exchange(eng_, bye, lock_);
     } catch (...) {
         eng_.abort("control channel: protocol failure");
         throw;
@@ -348,9 +344,8 @@ private:
         if (want == taps_ || eng_.prefill_open() || parked_slot_ < slots_) return;
         Control c;
         c.command = static_cast<std::uint32_t>(Command::taps);
-        c.round = round_++;
         c.pflags = want ? 1U : 0U;
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         eng_.set_taps(want);
         taps_ = want;
     }
@@ -362,9 +357,8 @@ private:
             if (retiring != 0) {
                 Control c;
                 c.command = static_cast<std::uint32_t>(Command::retire);
-                c.round = round_++;
                 c.append = retiring;
-                (void)exchange(eng_, c);
+                (void)exchange(eng_, c, lock_);
                 run_.retire_contexts(retiring);
             }
             for (auto& r : run_slots_) if (r) {
@@ -499,10 +493,9 @@ private:
         if (slot >= slots_ || !run_slots_[slot]) throw std::runtime_error("nested parent reservation lost");
         Control c;
         c.command = static_cast<std::uint32_t>(Command::resume_parked);
-        c.round = round_++;
         c.task_id = run_slots_[slot]->request_id;
         const auto start = Time::now();
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         eng_.prefill_resume_parked(c.task_id);
         if (timeline_on_) timeline("unpark", start, "nested", slot, eng_.prefill_layer(), eng_.prefill_layer(),
             timeline_task(eng_.prefill_progress()));
@@ -674,8 +667,8 @@ private:
             }
             if (retiring) {
                 Control c; c.command = static_cast<std::uint32_t>(Command::retire);
-                c.round = round_++; c.append = retiring;
-                (void)exchange(eng_, c); run_.retire_contexts(retiring);
+                c.append = retiring;
+                (void)exchange(eng_, c, lock_); run_.retire_contexts(retiring);
                 sync_taps();
             }
         }
@@ -691,8 +684,8 @@ private:
                            pol_.dspark_prior, structure});
         const bool promoted = pol_.dspark_mode == ds::Mode::automatic && r.automatic.state == ds::AutoRequest::State::active;
         if (promoted && !taps_ && !eng_.prefill_open() && parked_slot_ >= slots_) {
-            Control c; c.command = static_cast<std::uint32_t>(Command::taps); c.round = round_++; c.pflags = 1;
-            (void)exchange(eng_, c); eng_.set_taps(true); taps_ = true;
+            Control c; c.command = static_cast<std::uint32_t>(Command::taps); c.pflags = 1;
+            (void)exchange(eng_, c, lock_); eng_.set_taps(true); taps_ = true;
         }
         r.context = run_.dd != nullptr && (pol_.dspark_mode == ds::Mode::on || promoted) && taps_ &&
                     inflight() + 1 <= pol_.inflight && prompt.size() <= max_rows_ && prompt.size() + ds::block + 1 < capacity_;
@@ -717,9 +710,8 @@ private:
             park_start_ = Time::now();
             Control park;
             park.command = static_cast<std::uint32_t>(Command::park);
-            park.round = round_++;
             park.task_id = parent_id;
-            (void)exchange(eng_, park);
+            (void)exchange(eng_, park, lock_);
             const auto progress = eng_.prefill_progress();
             eng_.prefill_park(parent_id);
             if (timeline_on_) timeline("park", park_start_, "nested", parent.slot, progress.layer, progress.layer,
@@ -737,12 +729,11 @@ private:
         c.bank = nested ? 1U : 0U;
         c.slot_generation = ++slot_generation_[free_slot];
         c.command = static_cast<std::uint32_t>(nested ? Command::nest : Command::prefill);
-        c.round = round_++;
         c.pslot = free_slot;
         c.pstart = reuse;
         c.plen = static_cast<std::uint32_t>(suffix.size());
         c.pflags = r.context ? 1U : 0U;
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         if (reuse == 0) run_.send_prompt(prompt);
         else {
             std::vector<std::uint32_t> wire(suffix.begin(), suffix.end());
@@ -817,11 +808,10 @@ private:
         if (*eng_.prefill_unlimited_reason() != 0) layers = ~0U;
         Control c;
         c.command = static_cast<std::uint32_t>(Command::unit);
-        c.round = round_++;
         c.layers = layers;
         c.bank = eng_.prefill_progress().bank;
         c.task_id = run_slots_[prefill_slot_]->request_id;
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         const std::uint64_t unit_rows = eng_.prefill_unit_rows(), left0 = eng_.prefill_rows_left();
         const unsigned layer0 = eng_.prefill_layer();
         const auto summary = timeline_on_ ? timeline_prefill(prefill_slot_, layers == ~0U) : std::string{};
@@ -864,11 +854,10 @@ private:
         if (r->x.nested) {
             Control check;
             check.command = static_cast<std::uint32_t>(Command::check);
-            check.round = round_++;
             check.task_id = r->request_id;
             check.plen = next;
             const auto checked = timeline_on_ ? Time::now() : Clock::time_point{};
-            const auto reply = exchange(eng_, check);
+            const auto reply = exchange(eng_, check, lock_);
             if (timeline_on_) timeline("check", checked, "nested", prefill_slot_, 60, 60, timeline_task(eng_.prefill_progress()));
             if (reply.plen != next) {
                 eng_.abort("nested completion token mismatch");
@@ -1024,14 +1013,13 @@ private:
             cand.resize(std::min<std::size_t>({cand.size(), static_cast<std::size_t>(budget - lk_rows), pol_.draft_slots}));
             Control c;
             c.command = static_cast<std::uint32_t>(Command::draft);
-            c.round = round_++;
             c.dslots = static_cast<std::uint32_t>(cand.size());
             for (std::size_t i = 0; i < cand.size(); ++i) {
                 c.dslot[i] = cand[i];
                 c.danchor[i] = run_slots_[cand[i]]->last;
                 c.dpos[i] = run_slots_[cand[i]]->pos;
             }
-            (void)exchange(eng_, c);
+            (void)exchange(eng_, c, lock_);
             for (auto s : cand) drafts[s] = run_.draft(s, run_slots_[s]->last, run_slots_[s]->pos);
             drafted = true;
             t_draft = secs(c0, Time::now());
@@ -1077,7 +1065,6 @@ private:
         // the step rows: every decoding slot's anchor, then its window's drafts
         Control c;
         c.command = static_cast<std::uint32_t>(Command::step);
-        c.round = round_++;
         c.append = append;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> span_of;  // slot -> (first row, rows)
         for (auto s : order) {
@@ -1094,7 +1081,7 @@ private:
         }
         const auto summary = timeline_on_ ? timeline_step(c) : std::string{};
         const auto t0 = Time::now();
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         const auto control_end = timeline_on_ ? Time::now() : Clock::time_point{};
         const auto next = run_.step(std::span(c.row, c.rows), append);
         if (append != 0) run_.synchronize();  // the context appends are part of this cycle's work
@@ -1227,7 +1214,7 @@ private:
         timeline_records_.push_back("{\"event\":\"mmserve-timeline\",\"op\":" + std::to_string(op) + ",\"epoch\":" + std::to_string(pol_.epoch) +
             ",\"kind\":\"" + kind + "\",\"t_start_us\":" + std::to_string(us(start)) + ",\"t_end_us\":" + std::to_string(us(end)) +
             ",\"control_end_us\":" + std::to_string(us(control_end)) + ",\"run_end_us\":" + std::to_string(us(run_end)) +
-            ",\"round\":" + std::to_string(round_ - 1) + ",\"layer0\":" + std::to_string(layer0) + ",\"layer1\":" + std::to_string(layer1) + ",\"reason\":\"" + reason + "\",\"age_ms\":" +
+            ",\"round\":" + std::to_string(lock_.round() - 1) + ",\"layer0\":" + std::to_string(layer0) + ",\"layer1\":" + std::to_string(layer1) + ",\"reason\":\"" + reason + "\",\"age_ms\":" +
             std::to_string(longest_wait_ms()) + ",\"slack_ms\":" + std::to_string(ms::remaining_ms(live_gap_ms(pol_.gap_ms), cycle_ms(decoding_count()), longest_wait_ms())) + "," + row + "}");
     }
     void flush_timeline() {
@@ -1245,8 +1232,7 @@ private:
         // slot's resident tokens are known afterwards (it runs with nothing in flight, so every slot is free here).
         for (auto& k : kv_) k.clear();
         Control c; c.command = static_cast<std::uint32_t>(Command::session); c.plen = static_cast<std::uint32_t>(body.size());
-        c.round = round_++;
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         const auto wire = ms::session_wire(eng_, body, body.size());
         const auto available = eng_.peer(session_ && session_->execute ? 1U : 0U);
         auto reply = available ? session_->execute(wire, publish) : sv::session_error("session_budget", "peer session precondition failed", 507);
@@ -1277,7 +1263,7 @@ private:
     Clock::time_point timeline_origin_;
     std::uint64_t timeline_op_ = 0, timeline_dropped_ = 0, request_id_ = 0;
     std::vector<std::string> timeline_records_;
-    std::uint64_t round_ = 0;
+    strix::pair::Lockstep lock_{0};
     std::uint32_t prefill_slot_ = 0;
     std::array<std::uint64_t, kStepRows> slot_generation_{};
     std::uint32_t parked_slot_ = slots_;

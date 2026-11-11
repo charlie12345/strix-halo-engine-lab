@@ -271,16 +271,11 @@ using ms::lead::Lead;
 void follow(mm::Engine& eng, Runner& run, strix::minimax::session::Runtime* session = nullptr) try {
     ms::SessionCounts counts;
     bool taps = run.dd != nullptr && env_num("STRIX_MM_SERVE_DSPARK", 0) != 0;
-    std::uint64_t round = run.control_round;
+    strix::pair::Lockstep lock(static_cast<std::uint32_t>(eng.rank()), run.control_round);
     for (;;) {
         Control mine;
-        mine.ack_round = round == 0 ? ~std::uint64_t{0} : round - 1;
         mine.plen = eng.prefill_progress().open ? 0 : run.last_next;
-        const Control c = exchange(eng, mine);
-        if (c.round != round++) {
-            eng.abort("control channel: duplicate / stale round");
-            throw std::runtime_error("control channel: duplicate / stale round");
-        }
+        const Control c = exchange(eng, mine, lock);
         if (static_cast<Command>(c.command) == Command::heartbeat) run.quiesce();
         if (static_cast<Command>(c.command) == Command::session) {
             const auto body = ms::session_wire(eng, {}, c.plen);
@@ -478,26 +473,21 @@ int resume_check(mm::Engine& eng, Runner& run, const std::string& files, unsigne
         const auto nested_arm = [&](unsigned checkpoint, bool background_step) {
             Result r;
             std::array<std::uint64_t, 3> pos{p.size(), short_prompt.size(), q.size()};
-            auto& check_round = run.control_round;
+            strix::pair::Lockstep lock(static_cast<std::uint32_t>(eng.rank()), run.control_round);
             const auto command = [&](Command op, std::uint64_t id, std::uint64_t parent = 0,
                                      unsigned slot = 0, unsigned layers = 0) {
                 Control out;
-                out.ack_round = check_round == 0 ? ~std::uint64_t{0} : check_round - 1;
                 if (eng.rank() == 0) {
                     out.command = static_cast<std::uint32_t>(op);
-                    out.round = check_round;
                     out.task_id = id; out.parent_task_id = parent; out.slot_generation = 1;
                     out.pslot = slot; out.layers = layers;
                     out.bank = op == Command::nest ? 1U : eng.prefill_progress().bank;
                     if (op == Command::check) out.plen = run.last_next;
                     if (op == Command::prefill || op == Command::nest) out.plen = static_cast<std::uint32_t>(prompts[slot].size());
                 }
-                const auto peer = exchange(eng, out);
+                const auto peer = exchange(eng, out, lock);
+                run.control_round = lock.round();
                 const auto& c = eng.rank() == 0 ? out : peer;
-                if (c.round != check_round++) {
-                    eng.abort("nested check replay round");
-                    throw std::runtime_error("nested check replay round");
-                }
                 (void)ms::replay_command(c, eng, run, [&](std::size_t n) {
                     auto prompt = eng.rank() == 0 ? prompts[slot] : std::vector<std::uint32_t>{};
                     exchange_tokens(eng, prompt, n, eng.rank() == 0);

@@ -195,6 +195,28 @@ struct HipMtpWindowVerifier::Impl {
         if(sampler && sampled_decided<selected.size()) selected.resize(sampled_decided);
     }
     Owner* last=nullptr; // owner of the last prefix window; its stream carries the PLE commit
+    // The previous owner's PLE commit runs on its own stream: wait for it before another owner's window runs.
+    void fence_previous_owner(const Owner* next) const {
+        if(last && last!=next && hipStreamSynchronize(static_cast<hipStream_t>(last->captures.front()->source_stream()))!=hipSuccess)
+            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
+    }
+    // Commits the accepted prefix of a verified window and rolls the session back past the dropped rows.
+    // Prefix owners require one consumed input at row-zero failure, so at least one row is committed.
+    std::uint32_t commit_window_prefix(Owner* owner,SerialSessionContext& session,const SerialSessionContext& previous,
+                                       std::uint32_t rows,std::uint32_t n_keep) {
+        const auto committed=std::max(1U,n_keep);
+        owner->window->commit_prefix(committed);last=owner;
+        if(resources.qsa_committed_pool) resources.qsa_committed_pool->commit(false,previous.next_position+committed);
+        if(committed<rows) {
+            const auto dropped=rows-committed;
+            session.next_position-=dropped;session.committed_tokens-=dropped;
+            const auto& tail=session.arithmetic_lineage.intervals.back();
+            session.arithmetic_lineage=prepare_known_window_chunk_lineage(previous.arithmetic_lineage,tail.begin,
+                tail.begin+committed,tail.numerical_plan_identity,tail.reduction_plan_identity,tail.state_update_identity);
+            write_position_word(resources,session.next_position-1U);
+        }
+        return committed;
+    }
     // Survival controller (STRIX_MTP_CONTROLLER=survival). An option is an owner and its active rows: with
     // STRIX_MTP_ACTIVE_ROWS=1 the R4 owner also verifies 3 active rows and the R8 owner 6 (the rest are
     // padding outside the expert union and acceptance). Costs are separated: per option the cycle time
@@ -652,12 +674,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         if(sampler) p.capture->set_row_selection(i.sampled_selection(sampler,session.next_position+1U,p.capture->source_stream(),
             q.rows,std::min(q.rows,q.budget),q.drafts,q.eos));
     }
-    for(auto& p:prepared) {
-        // The previous owner's PLE commit runs on its own stream.
-        if(p.impl->last && p.impl->last!=p.owner &&
-           hipStreamSynchronize(static_cast<hipStream_t>(p.impl->last->captures.front()->source_stream()))!=hipSuccess)
-            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
-    }
+    for(const auto& p:prepared) p.impl->fence_previous_owner(p.owner);
     for(std::size_t a=0;a<requests.size();++a){prepared[a].previous=*requests[a].session;prepared[a].impl->busy=true;}
     bool attempted=false;
     try {
@@ -683,20 +700,9 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             while(!q.transaction && k+1U<rows && k<q.candidates.size() && k+1U<q.budget && k+1U<selected.size() && p.inputs[k+1U]==selected[k] && !is_eos(selected[k])) ++k;
             const auto n_keep=q.transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):k+1U;
             if(q.transaction) k=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
-            // Prefix owners require one consumed input at row-zero failure.
-            // Never promote a ticket or emit an ID for that undecided row.
-            const auto committed=std::max(1U,n_keep);
+            // Never promote a ticket or emit an ID for an undecided row-zero failure (n_keep 0).
             if(q.transaction)result.selection_failure=provisional->selection_prefix()->selection_failure;
-            p.owner->window->commit_prefix(committed);i.last=p.owner;
-            if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,p.previous.next_position+committed);
-            if(committed<rows) {
-                const auto dropped=rows-committed;
-                session.next_position-=dropped;session.committed_tokens-=dropped;
-                const auto& last=session.arithmetic_lineage.intervals.back();
-                session.arithmetic_lineage=prepare_known_window_chunk_lineage(p.previous.arithmetic_lineage,last.begin,
-                    last.begin+committed,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
-                write_position_word(i.resources,session.next_position-1U);
-            }
+            i.commit_window_prefix(p.owner,session,p.previous,rows,n_keep);
             if(n_keep)result.committed_rows=i.target->accept_verified_prefix(provisional,*q.initial,session,n_keep);
             result.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);
             result.accepted_candidates=k;result.accepted_window=n_keep==rows;
@@ -743,9 +749,7 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpWindowVerifier::prompt_rows(SerialSe
     capture->set_row_selection({});
     i.busy=true;bool attempted=false;
     try {
-        // The previous owner's PLE commit runs on its own stream.
-        if(i.last && i.last!=owner && hipStreamSynchronize(static_cast<hipStream_t>(i.last->captures.front()->source_stream()))!=hipSuccess)
-            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
+        i.fence_previous_owner(owner);
         const std::vector<std::uint32_t> inputs(tokens.begin(),tokens.end());
         auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},rows);
         attempted=true;
@@ -833,12 +837,7 @@ std::vector<std::vector<HipMtpTargetHiddenTicket>> HipMtpWindowVerifier::prompt_
         inputs[m].assign(q.tokens.begin(),q.tokens.end());
         members.push_back({x.owner->window.get(),q.session,inputs[m],x.capture});
     }
-    for(const auto& x:items) {
-        // The previous owner's PLE commit runs on its own stream.
-        if(x.impl->last && x.impl->last!=x.owner &&
-           hipStreamSynchronize(static_cast<hipStream_t>(x.impl->last->captures.front()->source_stream()))!=hipSuccess)
-            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
-    }
+    for(const auto& x:items) x.impl->fence_previous_owner(x.owner);
     for(auto& x:items) x.impl->busy=true;
     bool attempted=false;
     try {
@@ -1054,9 +1053,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     i.busy=true;bool attempted_target=false;
     try {
         if(use_window && i.prefix) {
-            // The previous owner's PLE commit runs on its own stream.
-            if(i.last && i.last!=owner && hipStreamSynchronize(static_cast<hipStream_t>(i.last->captures.front()->source_stream()))!=hipSuccess)
-                throw std::runtime_error("MTP window owner switch could not complete the previous commit");
+            i.fence_previous_owner(owner);
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             for(std::uint32_t r=1;r<rows;++r) inputs.push_back(candidates[std::min<std::size_t>(r-1U,candidates.size()-1U)]);
             const auto previous=session;
@@ -1077,22 +1074,10 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             const auto n_keep=transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):a+1U;
             if(transaction) a=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
             host_phase_mark("7a select/accept");
-            // Prefix owners require one consumed input at row-zero failure.
-            // Never promote a ticket or emit an ID for that undecided row.
-            const auto committed=std::max(1U,n_keep);
+            // Never promote a ticket or emit an ID for an undecided row-zero failure (n_keep 0).
             if(transaction)out.selection_failure=provisional->selection_prefix()->selection_failure;
-            owner->window->commit_prefix(committed);i.last=owner;
-            if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,previous.next_position+committed);
-            host_phase_mark("7b commit prefix");
-            if(committed<rows) {
-                const auto dropped=rows-committed;
-                session.next_position-=dropped;session.committed_tokens-=dropped;
-                const auto& last=session.arithmetic_lineage.intervals.back();
-                session.arithmetic_lineage=prepare_known_window_chunk_lineage(previous.arithmetic_lineage,last.begin,
-                    last.begin+committed,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
-                write_position_word(i.resources,session.next_position-1U);
-            }
-            host_phase_mark("7c lineage");
+            i.commit_window_prefix(owner,session,previous,rows,n_keep);
+            host_phase_mark("7b commit prefix+lineage");
             if(n_keep)out.committed_rows=i.target->accept_verified_prefix(provisional,initial,session,n_keep);
             host_phase_mark("7d accept prefix");
             out.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);

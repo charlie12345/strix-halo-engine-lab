@@ -364,6 +364,7 @@ struct Fixture {
         ok(hipMemsetAsync(ws, 0xff, wsb, stream), "device poison workspace");
         ok(hipMemsetAsync(out, 0xff, std::size_t{MaxR} * H * 4, stream), "device poison output");
         ok(hipMemsetAsync(flag, 0, 4, stream), "flag");
+        in_token_env("0");  // reference arm: the tile-ordered input transform (the token-ordered one is the default)
         X::DeviceView dv;
         dv.rows = R; dv.table = device_table; dv.shared = shared; dv.x = x; dv.ids = ids; dv.weights = weights; dv.out = out;
         X::enqueue_device(dv, plan, ws, wsb, stream, flag);

@@ -84,7 +84,8 @@ __global__ void input_kernel(Args a) {
                               a.input + (std::size_t{pair} * 2U + m) * H + begin, begin, 0, lane);
     }
 }
-// Token-ordered gate/up input transform (STRIX_GLM_PF_IN_TOKEN=1, device plan): one CTA per (1024-channel chunk, row);
+// Token-ordered gate/up input transform (STRIX_GLM_PF_IN_TOKEN, default on; =0 restores input_kernel; device plan):
+// one CTA per (1024-channel chunk, row);
 // wave w owns H128 block blockIdx.x * 8 + w, loads its four x values once and writes transform_block_at's values for
 // the row's eight routed experts x two matrices and the shared expert, at the same per-(pair, matrix) destination.
 // input_kernel reads the row chunk once per (pair, matrix): 18 reads of a 16 KiB row that is not cache resident at
@@ -115,7 +116,7 @@ __global__ __launch_bounds__(256) void input_token_kernel(Args a) {
         }
     }
 }
-bool input_token_enabled() { return aux::enabled("STRIX_GLM_PF_IN_TOKEN"); }
+bool input_token_enabled() { return aux::enabled_default_on("STRIX_GLM_PF_IN_TOKEN"); }  // bitwise; 8K -0.31 s
 
 // One wave per 16-output tile, eight waves per H128 block. Each decoded operand is reused
 // across TM independent row chains by compute_slot; the helper fixes DOT2 pair order.

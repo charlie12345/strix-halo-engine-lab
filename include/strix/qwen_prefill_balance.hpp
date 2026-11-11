@@ -20,8 +20,13 @@ inline std::uint32_t validate_cut(std::uint32_t cut, const LegalCuts& legal) {
         throw std::invalid_argument("pair prefill cut requires an interior folded attention-HC boundary of the reference kind");
     return cut;
 }
+// Unset STRIX_QWEN_PF_PIPE_CUT: stage A ends after layer 22 (cut 23), measured fastest with 4,096-row chunks
+// (32K 12.08 s vs 12.44-12.51 s at 24; 128K 47.53-47.55 s vs 49.36-50.15 s; 20-22 slower), because stage A also
+// runs the embedding/PLE prelude and the seam pack. Falls back to 24 when 23 is not a legal boundary.
+// STRIX_QWEN_PF_PIPE_CUT=24 restores the even split.
+inline constexpr std::uint32_t measured_default_cut = 23U;
 inline std::uint32_t parse_cut(const char* value, const LegalCuts& legal) {
-    std::uint32_t cut = 24;
+    std::uint32_t cut = legal[measured_default_cut] ? measured_default_cut : 24U;
     if (value) {
         const std::string_view text(value);
         const auto parsed = std::from_chars(text.data(), text.data() + text.size(), cut);

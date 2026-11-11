@@ -47,7 +47,12 @@ struct MockStaging final : strix::qwen_pp::PipeStaging {
 void balance_checks() {
     using namespace strix::qwen_pp;
     LegalCuts legal{}; legal.fill(true);
-    require(parse_cut(nullptr, legal) == 24U);
+    require(parse_cut(nullptr, legal) == measured_default_cut && measured_default_cut == 23U);
+    require(parse_cut("24", legal) == 24U);
+    {
+        LegalCuts no_default = legal; no_default[measured_default_cut] = false;
+        require(parse_cut(nullptr, no_default) == 24U);
+    }
     for (const char* bad : {"0", "48", "-1", "24x", "", " 24"}) {
         bool rejected = false;
         try { (void)parse_cut(bad, legal); } catch (const std::invalid_argument&) { rejected = true; }

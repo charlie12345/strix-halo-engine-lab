@@ -133,20 +133,6 @@ std::vector<std::string> split(const std::string& s, char sep) {
     return out;
 }
 
-// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport.
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::TransportSpellings{"usb4auto", "usb4gpu"};
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(timeout);
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    if (!opened.receipt.empty()) std::fprintf(stderr, "usb4 topology: %s\n", opened.receipt.c_str());
-    return std::move(opened.host);
-}
-
 // One row's record: the request's position, the token fed, the greedy token and the logits hash.
 struct RowRecord {
     std::uint32_t fed = 0, argmax = 0;
@@ -849,11 +835,11 @@ bool spec_gate(BatchForward& fwd, strix::ds41::dspark::DeviceDrafter* drafter, c
     return differ == 0U && states == 0U;
 }
 
-void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print) {
+void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print,
+              std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
     std::unique_ptr<strix::dist::Communicator> comm;
-    if (transport && gpu_direct)
-        comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733462ULL}, std::move(transport), std::move(gpu_direct), 4U << 20U);
-    else if (transport) comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733462ULL}, std::move(transport), 4U << 20U);
+    if (transport)
+        comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733462ULL}, std::move(transport), std::move(direct), 4U << 20U);
     if (comm) {  // both ranks must run the same product profile
         auto& c = *comm;
         strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
@@ -1232,11 +1218,12 @@ int main(int argc, char** argv) try {
         return 0;
     }
     ::alarm(a.connect_timeout);
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout), strix::dist::all_transport_capabilities, true});
+    auto transport = std::move(opened.host);
     ::alarm(0);
     std::printf("connected (%s)\n", transport->name().c_str());
     std::fflush(stdout);
-    run_rank(a, a.rank, std::move(transport), true);
+    run_rank(a, a.rank, std::move(transport), true, std::move(opened.direct));
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << '\n';

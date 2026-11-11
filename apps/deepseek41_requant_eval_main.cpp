@@ -1,5 +1,6 @@
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/open_transport.hpp"
 #include "strix/ds41_layer.hpp"
 
 #include <hip/hip_runtime.h>
@@ -70,20 +71,6 @@ std::vector<std::uint32_t> read_u32(const std::string& path) {
     return v;
 }
 
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    const std::chrono::seconds limit(timeout);
-    if (spec == "usb4auto") {
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
-        return t;
-    }
-    throw std::invalid_argument("unknown transport " + spec);
-}
-
 // A verify window must not start before the first compressed entry of the attention: positions below this run as
 // single steps (the rows are bitwise the same either way).
 constexpr std::size_t warm_positions = 128;
@@ -113,10 +100,11 @@ struct Calib {
     }
 };
 
-void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print) {
+void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print,
+              std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
-    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport), 512U << 10U);
+    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport), std::move(direct), 512U << 10U);
     std::vector<std::uint32_t> seq;
     struct Prompt {
         std::string name;
@@ -389,11 +377,13 @@ int main(int argc, char** argv) try {
         return 0;
     }
     ::alarm(a.connect_timeout);  // a blocked open() of a dead link would hold both nodes
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout)});
     ::alarm(0);
+    if (!opened.receipt.empty()) std::printf("usb4 topology: %s\n", opened.receipt.c_str());
+    auto transport = std::move(opened.host);
     std::printf("connected (%s)\n", transport->name().c_str());
     std::fflush(stdout);
-    run_rank(a, a.rank, std::move(transport), true);
+    run_rank(a, a.rank, std::move(transport), true, std::move(opened.direct));
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << '\n';

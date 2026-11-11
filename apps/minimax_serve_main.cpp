@@ -111,20 +111,6 @@ double env_num(const char* name, double def) {
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
 
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::hyphen_transport;
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(300);
-    options.usb.transport_capabilities = 0; // preserve the serving capability contract
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    receipt = std::move(opened.receipt);
-    return std::move(opened.host);
-}
-
 // The transport shared in turn by the communicator and the exchange module (as strix-minimax-rank).
 using Borrowed = strix::xport::BorrowedTransport<
     strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;
@@ -858,8 +844,10 @@ int main(int argc, char** argv) {
             }
             deploy_spec = std::move(spec);
         }
-        std::string receipt;
-        auto transport = open_transport(transport_spec, opt.rank, receipt);
+        // transport_capabilities 0 preserves the serving capability contract.
+        auto opened = strix::dist::open_pair(transport_spec, opt.rank, {std::chrono::seconds(300), 0});
+        auto transport = std::move(opened.host);
+        const auto& receipt = opened.receipt;
         if (deploy_spec) {
             auto plan = strix::deploy::resolve_pair(*deploy_spec,*deploy_provider,opt.rank,strix::deploy::probe_device(),
                 [&](auto out, auto in) { transport->exchange(out,in); });
@@ -886,12 +874,11 @@ int main(int argc, char** argv) {
             xo.from_env();
             exchanger = std::make_unique<strix::minimax::xfer::Exchanger>(std::make_unique<Borrowed>(*transport), xo);
         }
-        auto comm_owner = gpu_direct
-            ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), std::move(gpu_direct), max_bytes)
-            : std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), max_bytes);
+        auto comm_owner = std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport),
+                                                                      std::move(opened.direct), max_bytes);
         auto& comm = *comm_owner;
-        cli.transport = strix::dist::negotiated_transport(transport_spec,
-            comm.device_exchange() != nullptr, strix::dist::hyphen_transport);
+        cli.transport = strix::dist::negotiated_transport(transport_spec, comm.device_exchange() != nullptr,
+                                                          strix::minimax::defaults::kRouteHost, strix::minimax::defaults::kRouteGpu);
         if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
         std::printf("connected: rank %u transport %s\n", opt.rank, comm.transport_name().c_str());
         std::fflush(stdout);

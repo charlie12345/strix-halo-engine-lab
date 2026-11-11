@@ -315,7 +315,7 @@ void test_session_defaults() {
         auto negotiated = md::parse_cli("serve", {});
         check(negotiated.transport == "usb4gpu", "serve requests GPU transport by default");
         negotiated.transport = strix::dist::negotiated_transport(negotiated.transport,
-            direct_live, strix::dist::hyphen_transport);
+            direct_live, md::kRouteHost, md::kRouteGpu);
         for (const EnvMap& request : {EnvMap{}, EnvMap{{"STRIX_SESSION_CACHE", "1"}}}) {
             for (const bool explicit_cli : {false, true}) {
                 const auto policy = md::session_policy(negotiated, lookup(request), explicit_cli);

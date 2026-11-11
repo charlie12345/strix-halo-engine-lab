@@ -1,4 +1,5 @@
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/open_transport.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -199,18 +200,8 @@ int main(int argc, char** argv) try {
         if (failure) std::rethrow_exception(failure);
         return rc0 | rc1;
     }
-    std::unique_ptr<strix::dist::Transport> t;
-    const auto limit = std::chrono::milliseconds(60000);
-    if (a.transport.rfind("tcp-listen:", 0) == 0) t = strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(a.transport.substr(11))), limit);
-    else if (a.transport.rfind("tcp-connect:", 0) == 0) {
-        const auto rest = a.transport.substr(12);
-        const auto c = rest.rfind(':');
-        t = strix::dist::tcp_connect(rest.substr(0, c), static_cast<std::uint16_t>(std::stoul(rest.substr(c + 1))), limit);
-    } else if (a.transport == "usb4auto") {
-        strix::dist::Usb4AutoOptions o;
-        o.rank = a.rank;
-        t = strix::dist::usb4_host_auto(o);
-    } else throw std::invalid_argument("--transport emulate | tcp-listen:PORT | tcp-connect:HOST:PORT | usb4auto");
+    // The host exchange is what this bench measures: a GPU-direct exchange (usb4gpu) is negotiated but not used.
+    auto t = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(60)}).host;
     std::printf("rank %u transport %s\n", a.rank, t->name().c_str());
     return bench(a, a.rank, std::move(t));
 } catch (const std::exception& e) {

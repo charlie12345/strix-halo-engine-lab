@@ -143,20 +143,6 @@ std::vector<std::uint32_t> read_prompt(const std::string& path, std::uint32_t ro
     return ids;
 }
 
-// usb4-gpu: the device exchange (GPU-direct streams) built next to the host-path control transport.
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout, std::string& receipt) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::prefill_transport;
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(timeout);
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    receipt = std::move(opened.receipt);
-    return std::move(opened.host);
-}
-
 void print_result(const char* who, const strix::deepseek41::PrefillResult& r, std::size_t rows, bool timing, const std::string& loads_out = {}) {
     std::printf("%s: %zu rows in %.3f s = %.1f tok/s (engram read %.3f s, head %.3f s; %llu row-layers); next token %u, logits_fnv %016llx\n",
                 who, rows, r.seconds, static_cast<double>(rows) / r.seconds, r.engram_seconds, r.head_seconds,
@@ -621,8 +607,9 @@ int run_world1(const Args& a, const std::vector<std::uint32_t>& prompt) {
 std::atomic<bool> task_failed{false};
 
 void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> t,
-              bool print, strix::deepseek41::PrefillResult* out, std::vector<std::pair<std::string, std::uint64_t>>* out_state = nullptr) {
-    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733450ULL}, std::move(t), std::move(gpu_direct), std::size_t{22} << 20U);
+              bool print, strix::deepseek41::PrefillResult* out, std::vector<std::pair<std::string, std::uint64_t>>* out_state = nullptr,
+              std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
+    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733450ULL}, std::move(t), std::move(direct), std::size_t{22} << 20U);
     strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
         comm.exchange_host(profile_out, profile_in, strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x70726f66U, 0U});
     });  // both ranks must run the same product profile
@@ -912,13 +899,14 @@ int main(int argc, char** argv) try {
         return equal && state_bad == 0 && stream_bad == 0 ? 0 : 1;
     }
     ::alarm(a.connect_timeout + 30U);  // a stream on a dead USB4 link blocks open(): the alarm ends the process
-    std::string receipt;
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout, receipt);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout)});
+    auto transport = std::move(opened.host);
+    const auto& receipt = opened.receipt;
     ::alarm(0);
     ttft_clock.line("transport open (peer handshake)");
     std::printf("connected (%s)%s%s\n", transport->name().c_str(), receipt.empty() ? "" : "\n", receipt.c_str());
     std::fflush(stdout);
-    run_rank(a, prompt, a.rank, std::move(transport), true, nullptr);
+    run_rank(a, prompt, a.rank, std::move(transport), true, nullptr, nullptr, std::move(opened.direct));
     return task_failed ? 1 : 0;
 } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << '\n';

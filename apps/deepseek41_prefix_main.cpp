@@ -4,6 +4,7 @@
 #include "strix/deepseek41_prefix_cache.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/open_transport.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -732,17 +733,6 @@ int run_disk(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint3
     return bad;
 }
 
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    if (spec != "usb4-auto") throw std::invalid_argument("unknown transport " + spec);
-    strix::dist::Usb4AutoOptions o;
-    o.rank = rank;
-    o.timeout = std::chrono::milliseconds(std::uint64_t{timeout} * 1000U);
-    strix::dist::Usb4Topology topology;
-    auto t = strix::dist::usb4_host_auto(o, &topology);
-    std::printf("usb4 topology: %s\n", topology.receipt().c_str());
-    return t;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) try {
@@ -820,9 +810,11 @@ int main(int argc, char** argv) try {
         return bad0 == 0 && bad1 == 0 ? 0 : 1;
     }
     ::alarm(a.connect_timeout + 30U);
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout)});
     ::alarm(0);
-    strix::dist::Communicator comm(strix::dist::Group{a.rank, 2U, 1U, 0x70726678ULL}, std::move(transport), std::size_t{22} << 20U);
+    if (!opened.receipt.empty()) std::printf("usb4 topology: %s\n", opened.receipt.c_str());
+    strix::dist::Communicator comm(strix::dist::Group{a.rank, 2U, 1U, 0x70726678ULL}, std::move(opened.host), std::move(opened.direct),
+                                   std::size_t{22} << 20U);
     std::printf("connected (rank %u of 2)\n", a.rank);  // the pair launchers' watchdog waits for this line
     std::fflush(stdout);
     return run(a, prompt, a.rank, &comm, true) == 0 ? 0 : 1;

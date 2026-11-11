@@ -2,6 +2,7 @@
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/open_transport.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -118,27 +119,6 @@ void barrier(strix::dist::Communicator* comm, std::uint32_t round) {
     check(hipStreamSynchronize(stream), "barrier");
     (void)hipStreamDestroy(stream);
     (void)hipFree(buffers);
-}
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    const std::chrono::seconds limit(timeout);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4-auto" || kind == "usb4auto") {  // every live host-mode stream, paired by handshake
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = std::chrono::milliseconds(std::uint64_t{timeout} * 1000U);
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
-        return t;
-    }
-    throw std::invalid_argument("unknown transport " + spec);
 }
 
 struct RankResult {
@@ -401,9 +381,11 @@ int main(int argc, char** argv) try {
         return same ? 0 : 1;
     }
     ::alarm(a.connect_timeout + 30U);  // a stream on a dead USB4 link blocks open(): the alarm ends the process
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout)});
     ::alarm(0);
-    strix::dist::Communicator comm(strix::dist::Group{a.rank, 2U, 1U, kPlan}, std::move(transport), std::size_t{22} << 20U);
+    if (!opened.receipt.empty()) std::printf("usb4 topology: %s\n", opened.receipt.c_str());
+    strix::dist::Communicator comm(strix::dist::Group{a.rank, 2U, 1U, kPlan}, std::move(opened.host), std::move(opened.direct),
+                                   std::size_t{22} << 20U);
     std::printf("connected (%s)\n", comm.transport_name().c_str());
     run(a, prompt, a.rank, &comm, true);
     return 0;

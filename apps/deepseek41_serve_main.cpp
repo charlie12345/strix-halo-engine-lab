@@ -3291,20 +3291,6 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     if (!failure.empty()) poisoned(0U, failure);
 }
 
-// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (null: host path).
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::TransportSpellings{"usb4auto", "usb4gpu"};
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(timeout);
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    if (!opened.receipt.empty()) std::fprintf(stderr, "usb4 topology: %s\n", opened.receipt.c_str());
-    return std::move(opened.host);
-}
-
 // --prefill-rows auto (the pair default): the largest piece of 32768 / 16384 / 8192 / 4096 rows (at most the context) that both
 // ranks admit after the batch forward's weights (sched::auto_prefill_rows: the piece's scratch, the prefill's own weights
 // from the tensor inventory, the drafter's peak on a drafting rank and a margin, against min(device free, MemAvailable)),
@@ -3347,10 +3333,11 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
 
 #include "deepseek41_deploy.inc"
 
-void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport) {
+void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport,
+              std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
     if (a.deploy_spec) resolve_live_deployment(a, rank, *transport);
     // the device prefill exchanges a chunk's MoE half sums (<= 21 MB) in one message
-    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(gpu_direct),
+    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(direct),
                                    a.device_prefill ? std::size_t{22} << 20U : std::size_t{4} << 20U);
     std::fprintf(stderr, "rank %u: dist %s\n", rank, comm.transport_name().c_str());
     strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
@@ -3683,12 +3670,13 @@ int main(int argc, char** argv) try {
         return 0;
     }
     ::alarm(a.connect_timeout);
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout), strix::dist::all_transport_capabilities, true});
+    auto transport = std::move(opened.host);
     ::alarm(0);
     std::fprintf(stderr, "connected (%s)\n", transport->name().c_str());
     std::printf("connected (%s)\n", transport->name().c_str());
     std::fflush(stdout);
-    run_rank(a, a.rank, std::move(transport));
+    run_rank(a, a.rank, std::move(transport), std::move(opened.direct));
     return 0;
 } catch (const std::exception& e) {
     serve::Json ev = serve::Json::object();

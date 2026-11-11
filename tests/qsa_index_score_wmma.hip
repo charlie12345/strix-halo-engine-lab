@@ -155,7 +155,7 @@ void run(unsigned position, bool timing, bool packed) {
         changes.add(x, y);
         for (unsigned arm = 0U; arm < 2U; ++arm) {
             const auto& ids = arm ? y : x;
-            std::copy(ids.begin(), ids.end(), want[arm].begin() + static_cast<std::size_t>(r) * topk);
+            std::copy(ids.begin(), ids.end(), want[arm].begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(r) * topk));
         }
     }
     require(maximum < 1e-3F * (1.0F + scale) && oracle_error < 1e-3F, "WMMA arithmetic/mapping sanity bound");

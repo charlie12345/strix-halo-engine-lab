@@ -151,7 +151,6 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Engine: transport, USB4 and multi-node
 
 - [Two-rank communicator](engine/transport/communicator.md): Two-rank distributed communicator: memory/TCP/USB4 transports, automatic USB4 pairing, exchange protocol.
-- [Native known-input sequence component](engine/transport/distributed-known-sequence.md): HipDistributedKnownSequence: two-peer known-input sequence over native transport with stage-owned weights/state.
 - [Stage-owned storage inventory](engine/transport/distributed-owner-inventory.md): Stage-owned storage inventory API for distributed stage resources and token participants.
 - [Coherent staged readiness](engine/transport/staged-readiness.md): STRIX_DIST_STAGED_READY_BYTES: coherent staged readiness host path in communicator.
 - [Cooperative controller recovery and safe domain retirement](engine/transport/usb4-controller-recovery.md): USB4 driver patch 0009: cooperative controller recovery, domain retirement, controller groups, USB4NET coexistence.

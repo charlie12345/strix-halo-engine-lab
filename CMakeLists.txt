@@ -207,7 +207,6 @@ add_library(strix_core STATIC
     src/host_upload.cpp
     src/qwen_moe_prepared.cpp
     src/compiled_execution.cpp
-    src/copied_stream_transport.cpp
     src/direct_transport_gpu_export.cpp
     src/direct_gpu_boundary_staging.cpp
     src/linux_direct_transport_driver.cpp
@@ -228,9 +227,6 @@ add_library(strix_core STATIC
     src/distributed_greedy_control.cpp
     src/distributed_remote_control.cpp
     src/distributed_control_wire.cpp
-    src/distributed_control_server.cpp
-    src/distributed_control_receiver.cpp
-    $<$<PLATFORM_ID:Linux,Darwin>:src/distributed_tcp_control_stream.cpp>
     src/distributed_runtime.cpp
     src/distributed_session.cpp
     src/direct_transport_completion.cpp
@@ -242,7 +238,6 @@ add_library(strix_core STATIC
     src/direct_transport_lease.cpp
     src/direct_transport_pool.cpp
     src/direct_transport_pool_memory.cpp
-    src/direct_transport_rearm.cpp
     src/dual_link_runtime.cpp
     src/dual_link_telemetry.cpp
     src/draft_proposal_state.cpp
@@ -1325,18 +1320,6 @@ if(BUILD_TESTING)
     target_link_libraries(strix-graph-operator-control-tests PRIVATE strix_core)
     strix_target_warnings(strix-graph-operator-control-tests)
     add_test(NAME strix-graph-operator-control-tests COMMAND strix-graph-operator-control-tests)
-    add_executable(strix-copied-model-retirement-tests tests/copied_model_retirement_tests.cpp)
-    target_link_libraries(strix-copied-model-retirement-tests PRIVATE strix_core)
-    strix_target_warnings(strix-copied-model-retirement-tests)
-    add_test(NAME strix-copied-model-retirement-tests COMMAND strix-copied-model-retirement-tests)
-    add_executable(strix-copied-host-channel-tests tests/copied_host_channel_tests.cpp)
-    target_link_libraries(strix-copied-host-channel-tests PRIVATE strix_core)
-    strix_target_warnings(strix-copied-host-channel-tests)
-    add_test(NAME strix-copied-host-channel-tests COMMAND strix-copied-host-channel-tests)
-    add_executable(strix-copied-stream-transport-tests tests/copied_stream_transport_tests.cpp)
-    target_link_libraries(strix-copied-stream-transport-tests PRIVATE strix_core)
-    strix_target_warnings(strix-copied-stream-transport-tests)
-    add_test(NAME strix-copied-stream-transport-tests COMMAND strix-copied-stream-transport-tests)
     add_executable(strix-integer-projection-execution-tests tests/integer_projection_execution_tests.cpp)
     target_link_libraries(strix-integer-projection-execution-tests PRIVATE strix_core)
     strix_target_warnings(strix-integer-projection-execution-tests)
@@ -1475,11 +1458,6 @@ if(BUILD_TESTING)
     target_link_libraries(strix-direct-transport-native-session-tests PRIVATE strix_core)
     strix_target_warnings(strix-direct-transport-native-session-tests)
     add_test(NAME strix-direct-transport-native-session-tests COMMAND strix-direct-transport-native-session-tests)
-
-    add_executable(strix-direct-transport-rearm-tests tests/direct_transport_rearm_tests.cpp)
-    target_link_libraries(strix-direct-transport-rearm-tests PRIVATE strix_core)
-    strix_target_warnings(strix-direct-transport-rearm-tests)
-    add_test(NAME strix-direct-transport-rearm-tests COMMAND strix-direct-transport-rearm-tests)
 
     add_executable(strix-dual-link-runtime-tests tests/dual_link_runtime_tests.cpp)
     target_link_libraries(strix-dual-link-runtime-tests PRIVATE strix_core)
@@ -1785,30 +1763,6 @@ if(BUILD_TESTING)
     target_link_libraries(strix-distributed-control-wire-tests PRIVATE strix_core)
     strix_target_warnings(strix-distributed-control-wire-tests)
     add_test(NAME strix-distributed-control-wire-tests COMMAND strix-distributed-control-wire-tests)
-
-    add_executable(strix-distributed-control-server-tests tests/distributed_control_server_tests.cpp)
-    target_link_libraries(strix-distributed-control-server-tests PRIVATE strix_core)
-    strix_target_warnings(strix-distributed-control-server-tests)
-    add_test(NAME strix-distributed-control-server-tests COMMAND strix-distributed-control-server-tests)
-
-    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
-        add_executable(strix-distributed-control-end-to-end-tests tests/distributed_control_end_to_end_tests.cpp)
-        target_link_libraries(strix-distributed-control-end-to-end-tests PRIVATE strix_core)
-        strix_target_warnings(strix-distributed-control-end-to-end-tests)
-        add_test(NAME strix-distributed-control-end-to-end-tests COMMAND strix-distributed-control-end-to-end-tests)
-    endif()
-
-    add_executable(strix-distributed-control-receiver-tests tests/distributed_control_receiver_tests.cpp)
-    target_link_libraries(strix-distributed-control-receiver-tests PRIVATE strix_core)
-    strix_target_warnings(strix-distributed-control-receiver-tests)
-    add_test(NAME strix-distributed-control-receiver-tests COMMAND strix-distributed-control-receiver-tests)
-
-    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
-        add_executable(strix-distributed-tcp-control-stream-tests tests/distributed_tcp_control_stream_tests.cpp)
-        target_link_libraries(strix-distributed-tcp-control-stream-tests PRIVATE strix_core)
-        strix_target_warnings(strix-distributed-tcp-control-stream-tests)
-        add_test(NAME strix-distributed-tcp-control-stream-tests COMMAND strix-distributed-tcp-control-stream-tests)
-    endif()
 
     add_executable(strix-distributed-session-tests tests/distributed_session_tests.cpp)
     target_link_libraries(strix-distributed-session-tests PRIVATE strix_core)
@@ -2458,11 +2412,6 @@ int main() { return 0; }"
         src/hip_serving_cohort.hip
         src/hip_serving_prefix_cache.hip
         src/hip_event_queue_trace.hip
-        src/hip_distributed_stage.hip
-        src/hip_distributed_transaction.hip
-        src/hip_distributed_sequence.hip
-        src/hip_distributed_stage_resources.hip
-        src/hip_distributed_greedy.hip
         src/hip_hyper_mix_launcher.hip
         src/hip_qwen_rotary_table.hip
         src/hip_indexed_attention_launcher.hip
@@ -3215,43 +3164,6 @@ int main() { return 0; }"
         # Explicit known-prompt/cache/continuation qualification; requires the
         # real model and ROOT-sealed inputs, so it is not an automatic CTest.
         # Explicit model-dependent serving qualification; never automatic CTest.
-        # Explicit local native stage component with a real model. This does
-        # not run transport or qualify a distributed model; never automatic CTest.
-        add_executable(strix-hip-distributed-stage-model-qualification tests/hip_distributed_stage_tests.hip)
-        set_target_properties(strix-hip-distributed-stage-model-qualification PROPERTIES
-            HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
-        target_compile_options(strix-hip-distributed-stage-model-qualification PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        target_link_libraries(strix-hip-distributed-stage-model-qualification PRIVATE strix_hip_runtime)
-        strix_target_warnings(strix-hip-distributed-stage-model-qualification)
-
-        # Callable model fixture requires injected actual peer/link ownership.
-        # No standalone bootstrap or automatic model/transport execution.
-        add_library(strix-hip-distributed-sequence-model-fixture STATIC
-            tests/hip_distributed_sequence_model_qualification.hip)
-        set_target_properties(strix-hip-distributed-sequence-model-fixture PROPERTIES
-            HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
-        target_compile_options(strix-hip-distributed-sequence-model-fixture PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        target_link_libraries(strix-hip-distributed-sequence-model-fixture PUBLIC strix_hip_runtime)
-        target_include_directories(strix-hip-distributed-sequence-model-fixture PUBLIC
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-        strix_target_warnings(strix-hip-distributed-sequence-model-fixture)
-
-        # Callable actual native generation fixture; no synthetic bootstrap,
-        # main function or automatic model/transport execution.
-        add_library(strix-hip-distributed-greedy-model-fixture STATIC
-            tests/hip_distributed_greedy_model_qualification.hip)
-        set_target_properties(strix-hip-distributed-greedy-model-fixture PROPERTIES
-            HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)
-        target_compile_options(strix-hip-distributed-greedy-model-fixture PRIVATE
-            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        target_include_directories(strix-hip-distributed-greedy-model-fixture PUBLIC
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-        target_link_libraries(strix-hip-distributed-greedy-model-fixture PUBLIC
-            strix_hip_runtime strix-hip-distributed-sequence-model-fixture)
-        strix_target_warnings(strix-hip-distributed-greedy-model-fixture)
-
         add_executable(strix-hip-serving-greedy-model-qualification tests/hip_serving_greedy_backend_tests.hip)
         set_target_properties(strix-hip-serving-greedy-model-qualification PROPERTIES
             HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}" HIP_STANDARD 20 HIP_STANDARD_REQUIRED YES)

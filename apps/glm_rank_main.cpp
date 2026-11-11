@@ -366,6 +366,14 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N, comm exchange, "
                                         "no reference gate) so both ranks are checked to run the same prefill identity");
         ge::Engine eng(opt, comm.get());
+        // STRIX_GLM_MODEL_FORMAT=fast_i4 (glm-fast-i4, lossy): the routed EXL3 weights are replaced, so the exact /
+        // reference identities (decode-row reference prefill, reference gates, identity checks) are refused.
+        // --tf scoring (no prompt prefill, verify rows only, no --tf-check) stays available for the quality comparison.
+        const bool tf_scoring = (!tf_tokens.empty() && !tf_check) || (batch_r > 0 && prompt.empty());  // no prompt prefill: scoring / batch sweeps
+        if (eng.model_fast_i4() && ((prefill_mode == "ref" && !tf_scoring) || (reference_gate && !tf_scoring) || !pf_gate.empty() || idcheck_n != 0 ||
+                                    (!tf_scoring && !strix::glm::pf::wmma_x::enabled())))
+            throw std::invalid_argument("STRIX_GLM_MODEL_FORMAT=fast_i4: exact identities are refused (needs the FAST chunked prefill "
+                                        "STRIX_GLM_PF_WMMA=1; no --prefill ref, reference gates, --pf-gate or --idcheck; --tf scoring only)");
         if (xfer_exchange) eng.set_exchange(xfer_exchange);
         bool startup_agreed = false;
         auto startup_agree = [&]() {
@@ -379,7 +387,8 @@ int main(int argc, char** argv) {
                 (static_cast<std::uint32_t>(eng.identity_mode()) << 7) |
                 (eff.env.at("STRIX_GLM_SPEC_XCH").value == "xfer" ? 1U << 9 : 0U) |
                 (eng.decode_xfer_enabled() ? 1U << 10 : 0U) |
-                (strix::glm::pf::wmma_x::enabled() ? rd::kPfWmmaConfig : 0U);  // FAST prefill identity must match on both ranks
+                (strix::glm::pf::wmma_x::enabled() ? rd::kPfWmmaConfig : 0U) |  // FAST prefill identity must match on both ranks
+                (eng.model_fast_i4() ? rd::kFastI4Config : 0U);                 // and the model format (also in the load vote)
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
                  static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},
@@ -508,8 +517,9 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(prefill_margin));
         }
         const auto load_identity = eng.identity_mode();
-        std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) identity %s decode-xch %s%s%s%s%s", opt.rank, lr.seconds,
-                    lr.gib_read, lr.device_gib, opt.layers, opt.mtp ? 1 : 0, ge::identity_mode_name(load_identity),
+        std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) model-format %s identity %s decode-xch %s%s%s%s%s",
+                    opt.rank, lr.seconds, lr.gib_read, lr.device_gib, opt.layers, opt.mtp ? 1 : 0,
+                    eng.model_fast_i4() ? "fast_i4 (glm-fast-i4, lossy)" : "exl3", ge::identity_mode_name(load_identity),
                     xfer_exchange ? "xfer (external)" : opt.world == 1 ? "local" : eng.decode_xfer_enabled() ? "xfer" : "comm",
                     std::getenv("STRIX_GLM_HC_NORM") ? " hc-norm=" : "",
                     std::getenv("STRIX_GLM_HC_NORM") ? std::getenv("STRIX_GLM_HC_NORM") : "",
@@ -1060,10 +1070,13 @@ int main(int argc, char** argv) {
                 // identity: exact for ref/gemv, the --prefill wmma route's for wmma.
                 const char* wm = std::getenv("STRIX_GLM_PF_WMMA");
                 namespace W = strix::glm::pf::wmma_x;
-                const auto wd = W::dense_calls.exchange(0), wmo = W::moe_calls.exchange(0);
-                std::printf("rank %u prefill identity %s (STRIX_GLM_PF_WMMA=%s, prefill %s, wmma calls dense %llu moe %llu)\n",
-                            opt.rank, wd + wmo ? "glm-pf-wmma-x FAST" : prefill_mode == "wmma" ? "prefill-wmma route" : "exact", wm ? wm : "unset", prefill_mode.c_str(),
-                            static_cast<unsigned long long>(wd), static_cast<unsigned long long>(wmo));
+                const auto wd = W::dense_calls.exchange(0), wmo = W::moe_calls.exchange(0), wq = W::iu4_moe_calls.exchange(0);
+                std::printf("rank %u prefill identity %s (STRIX_GLM_PF_WMMA=%s, prefill %s, wmma calls dense %llu moe %llu)",
+                            opt.rank, eng.model_fast_i4() ? "glm-fast-i4 FAST (routed W4A4 g64)" :
+                            wd + wmo ? (wq ? "glm-pf-wmma-x+iu4 FAST" : "glm-pf-wmma-x FAST") : prefill_mode == "wmma" ? "prefill-wmma route" : "exact",
+                            wm ? wm : "unset", prefill_mode.c_str(), static_cast<unsigned long long>(wd), static_cast<unsigned long long>(wmo));
+                if (wq) std::printf(" iu4 moe %llu", static_cast<unsigned long long>(wq));  // STRIX_GLM_PF_IU4=1 only
+                std::printf("\n");
             }
             if (!logits_out.empty()) {
                 std::vector<float> lg(eng.vocab_slice());

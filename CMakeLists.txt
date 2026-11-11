@@ -392,11 +392,21 @@ target_include_directories(strix_xport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_compile_features(strix_xport INTERFACE cxx_std_20)
 target_sources(strix_xport INTERFACE
     src/xport/borrowed_transport.hpp include/strix/dist/transport.hpp
-    src/xport/channel.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
+    src/xport/channel.hpp src/xport/channel_communicator.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
     src/xport/transport_backend.hpp src/xport/staging.hpp src/xport/stats.hpp src/xport/backend.hpp src/xport/communicator_backend.hpp
     src/xport/ds41_adapter.hpp src/xport/kvshard_channel.hpp src/xport/kvshard_channel_hip.hpp
     include/strix/dist/host_wait.hpp include/strix/dist/transport_caps.hpp)
 if(BUILD_TESTING)
+    add_executable(strix-ds41-prefill-structure-tests tests/ds41_prefill_structure_tests.cpp)
+    target_link_libraries(strix-ds41-prefill-structure-tests PRIVATE strix_xport)
+    strix_target_warnings(strix-ds41-prefill-structure-tests)
+    if(MSVC)
+        target_compile_options(strix-ds41-prefill-structure-tests PRIVATE /WX /fp:strict)
+    else()
+        target_compile_options(strix-ds41-prefill-structure-tests PRIVATE -Werror -Wshadow -Wsign-conversion -Wunused-function)
+    endif()
+    add_test(NAME strix-ds41-prefill-structure-tests COMMAND strix-ds41-prefill-structure-tests)
+    set_tests_properties(strix-ds41-prefill-structure-tests PROPERTIES LABELS "cpu;xport;exactness")
     add_executable(strix-xport-borrowed-transport-tests tests/xport_borrowed_transport_tests.cpp)
     target_link_libraries(strix-xport-borrowed-transport-tests PRIVATE strix_xport)
     target_include_directories(strix-xport-borrowed-transport-tests PRIVATE include)
@@ -519,6 +529,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-moe-grouped-prefill-host-tests)
     add_test(NAME strix-moe-grouped-prefill-host-tests COMMAND strix-moe-grouped-prefill-host-tests)
     set_tests_properties(strix-moe-grouped-prefill-host-tests PROPERTIES LABELS "cpu;moe;exactness")
+    add_executable(strix-minimax-fast-i4-schedule-tests tests/minimax_fast_i4_schedule_tests.cpp)
+    target_include_directories(strix-minimax-fast-i4-schedule-tests PRIVATE src)
+    target_compile_features(strix-minimax-fast-i4-schedule-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-minimax-fast-i4-schedule-tests)
+    add_test(NAME strix-minimax-fast-i4-schedule-tests COMMAND strix-minimax-fast-i4-schedule-tests)
+    set_tests_properties(strix-minimax-fast-i4-schedule-tests PROPERTIES LABELS "cpu;minimax;fast-i4")
     add_executable(strix-env-flags-tests tests/env_flags_tests.cpp)
     target_include_directories(strix-env-flags-tests PRIVATE include)
     target_compile_features(strix-env-flags-tests PRIVATE cxx_std_17)
@@ -2232,6 +2248,13 @@ endif()
 
 option(STRIX_DPP_REDUCE "Use exact DPP exchanges in guarded Qwen reductions (build-time lever, off unless requested)" OFF)
 
+if(BUILD_TESTING)
+    add_executable(strix-stored-i4-host-tests tests/stored_i4_host_tests.cpp)
+    target_include_directories(strix-stored-i4-host-tests PRIVATE src)
+    target_compile_features(strix-stored-i4-host-tests PRIVATE cxx_std_20)
+    add_test(NAME strix-stored-i4-host-tests COMMAND strix-stored-i4-host-tests)
+endif()
+
 if(STRIX_ENABLE_HIP_RUNTIME)
     enable_language(HIP)
 
@@ -2253,6 +2276,24 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         PATH_SUFFIXES lib lib64
         REQUIRED
     )
+    add_library(strix_tiled_core STATIC src/core/wmma_tiled.hip)
+    target_include_directories(strix_tiled_core PUBLIC src PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
+    target_compile_options(strix_tiled_core PRIVATE -O3 -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        -fhip-fp32-correctly-rounded-divide-sqrt)
+    set_target_properties(strix_tiled_core PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_link_libraries(strix_tiled_core PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
+
+    if(BUILD_TESTING)
+        add_executable(strix-hip-iu4-convert-tests tests/hip_iu4_convert_tests.hip)
+        add_executable(strix-hip-stored-i4-decode-tests tests/hip_stored_i4_decode_tests.hip)
+        foreach(target strix-hip-iu4-convert-tests strix-hip-stored-i4-decode-tests)
+            target_link_libraries(${target} PRIVATE strix_tiled_core)
+            target_compile_options(${target} PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
+            set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            add_test(NAME ${target} COMMAND ${target})
+        endforeach()
+    endif()
+
     add_library(strix_device_profile STATIC src/device_profile.cpp)
     target_include_directories(strix_device_profile PUBLIC include)
     target_include_directories(strix_device_profile SYSTEM PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
@@ -4144,6 +4185,16 @@ target_include_directories(strix_ds41_prefill PUBLIC include)
 target_compile_features(strix_ds41_prefill PUBLIC cxx_std_20)
 strix_target_warnings(strix_ds41_prefill)
 if(BUILD_TESTING)
+    add_executable(strix-ds41-integer-operand-host-tests tests/ds41_integer_operand_host_tests.cpp)
+    target_include_directories(strix-ds41-integer-operand-host-tests PRIVATE
+        tests/ds41_integer_host src include)
+    target_compile_features(strix-ds41-integer-operand-host-tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(strix-ds41-integer-operand-host-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-ds41-integer-operand-host-tests PRIVATE -ffp-contract=off)
+    endif()
+    add_test(NAME strix-ds41-integer-operand-host-tests COMMAND strix-ds41-integer-operand-host-tests)
     add_executable(strix-ds41-prefill-tests tests/ds41_prefill_tests.cpp)
     target_link_libraries(strix-ds41-prefill-tests PRIVATE strix_ds41_prefill)
     strix_target_warnings(strix-ds41-prefill-tests)
@@ -4355,7 +4406,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 endif()
 # deepseek41 device prefill: T rows of the decode plan per layer (one node or one of two ranks) and its app.
 if(STRIX_ENABLE_HIP_RUNTIME)
-    add_library(strix_ds41_device_prefill STATIC src/hip_deepseek41_prefill.hip)
+    add_library(strix_ds41_device_prefill STATIC src/hip_deepseek41_prefill.hip src/hip_deepseek41_prefill_xport.hip)
     target_link_libraries(strix_ds41_device_prefill PUBLIC strix_ds41_device_forward strix_ds41_prefill_hip strix_ds41_layer_hip
         strix_ds41_attention_hip strix_dist)
     target_include_directories(strix_ds41_device_prefill PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
@@ -4881,6 +4932,14 @@ if(STRIX_FAMILY_MINIMAX)
         target_include_directories(strix_minimax_moe_opt_hip PUBLIC src include "${STRIX_HIP_INCLUDE_DIR}")
         target_compile_definitions(strix_minimax_moe_opt_hip PRIVATE STRIX_MM_GU4_SCALAR=${strix_minimax_gu4})
         list(APPEND strix_minimax_msa_hip_targets strix_minimax_moe_opt_hip)
+        # The one strix-trellis tree of the MiniMax build: include/strix_trellis.h + build-qualification-v03/libstrix_trellis.a.
+        set(STRIX_MINIMAX_TRELLIS_DIR ""
+            CACHE PATH "strix-trellis 0.3 tree: include/strix_trellis.h and build-qualification-v03/libstrix_trellis.a")
+        set(strix_minimax_trellis_lib "${STRIX_MINIMAX_TRELLIS_DIR}/build-qualification-v03/libstrix_trellis.a")
+        # FAST_I4 (STRIX_MMX_MODEL_FORMAT=fast_i4, opt-in, lossy): the grouped IU4 kernel and convert_exl3_iu4 of the one
+        # shared tiled core (src/core, archive strix_tiled_core; GLM and DS41 use the same copy).
+        target_link_libraries(strix_minimax_moe_opt_hip PUBLIC strix_tiled_core)
+        set_property(SOURCE src/minimax/moe/mmx_prefill.hip APPEND PROPERTY COMPILE_DEFINITIONS STRIX_MMX_IU4_LIB=1)
         if(BUILD_TESTING)
             add_executable(strix-hip-minimax-msa-tests tests/hip_minimax_msa_tests.hip)
             target_link_libraries(strix-hip-minimax-msa-tests PRIVATE strix_minimax_msa_hip)
@@ -4897,9 +4956,6 @@ if(STRIX_FAMILY_MINIMAX)
             list(APPEND strix_minimax_msa_hip_targets strix-hip-mm-fp32id-tests)
         endif()
         # Layer gates G3 (one node) and G4 (two-rank TP): only with an external strix-trellis 0.3 tree (header + archive).
-        set(STRIX_MINIMAX_TRELLIS_DIR ""
-            CACHE PATH "strix-trellis 0.3 tree: include/strix_trellis.h and build-qualification-v03/libstrix_trellis.a")
-        set(strix_minimax_trellis_lib "${STRIX_MINIMAX_TRELLIS_DIR}/build-qualification-v03/libstrix_trellis.a")
         if(BUILD_TESTING AND EXISTS "${STRIX_MINIMAX_TRELLIS_DIR}/include/strix_trellis.h" AND EXISTS "${strix_minimax_trellis_lib}")
             add_executable(strix-hip-minimax-g3 tests/hip_minimax_g3.hip)
             target_link_libraries(strix-hip-minimax-g3 PRIVATE strix_minimax_msa_hip "${strix_minimax_trellis_lib}")
@@ -5118,6 +5174,10 @@ if(STRIX_FAMILY_GLM5)
                 src/glm/engine/glm_pack.cpp src/glm/engine/glm_mem.cpp
                 src/glm/xfer/glm_xfer.hip src/glm/xfer/glm_xfer_exchange.hip src/glm/xfer/glm_post_exchange.hip
                 src/glm/prefill/glm_pf_moe.hip src/glm/prefill/glm_pf_path.hip src/glm/prefill/glm_pf_exact.hip src/glm/prefill/glm_pf_exact_moe.hip)
+            target_link_libraries(strix_glm5_engine PUBLIC strix_tiled_core)
+            target_compile_definitions(strix_glm5_engine PRIVATE STRIX_GLM_PF_IU4_LIB=1)
+            target_link_libraries(strix_glm5_kernels PUBLIC strix_tiled_core)
+            target_compile_definitions(strix_glm5_kernels PRIVATE STRIX_GLM_FAST_I4_CORE=1)
             target_link_libraries(strix_glm5_engine PUBLIC strix_xport strix_glm5_kernels strix_glm5_model_description strix_dist strix_deploy "${strix_glm5_trellis_lib}")
             target_sources(strix_glm5_engine PRIVATE src/glm/load/glm_rank_plan.cpp)
             set_source_files_properties(src/glm/engine/glm_kvshard.hip PROPERTIES

@@ -102,6 +102,18 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
 // one expert per block; same A8 activations, weight integers and group dots. Test override: 1 on, 0 off, -1 environment.
 void set_fast_moe(int mode);
 [[nodiscard]] bool fast_moe();
+// Draft FAST_I4: original GGUF weights decoded in-kernel to IU4, A8 input
+// requantized to A4 per K32. Default OFF. STRIX_DS41_FAST_I4=1; scope
+// STRIX_DS41_FAST_I4_SCOPE=all (default) or gu. Separate numerical identity
+// gguf-iu4-direct-v1; no pack or converter. Runs on the shared tiled core.
+// Overrides are for test harnesses.
+void set_fast_i4(int mode); // 1 on, 0 off, -1 environment
+[[nodiscard]] bool fast_i4();
+// STRIX_DS41_PF_CORE=1 (default off): the expert prefill (gate/up, down) and the dense Q8_0 x A8 prefill run on the
+// shared tiled core (src/core, policy interface v1) instead of the kernels described above. The same bits; opt-in
+// until it is at least as fast. Test override: 1 on, 0 off, -1 environment.
+void set_pf_core(int mode);
+[[nodiscard]] bool pf_core();
 
 // Down of every entry: A8 activation of slot entry_slots[i] (codes[slot * width], deltas) times the
 // batch expert's rows; out[slot * outputs + o] is the unweighted raw slot vector. Formats Q2_K,

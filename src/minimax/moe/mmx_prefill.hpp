@@ -22,6 +22,51 @@
 
 namespace strix::minimax::moe::opt {
 
+// FAST_I4 (STRIX_MMX_MODEL_FORMAT=fast_i4; lossy identity minimax-fast-i4): one MoE layer's 128 routed experts and its
+// shared expert (index kExperts) as the shared core's IU4 g64 pack in the had128-rotated EXL3 basis (core/
+// activation_quant.hpp). Per matrix m (0 gate, 1 up, 2 down) over kI4Experts experts, one kI4ExpertBytes block per expert:
+// nibbles [K/16][N/16][16][8] at wq[m] + e * kI4ExpertBytes, FP16 scales [N][K/64] right after them (ws[m] + e *
+// kI4ExpertBytes / 2); svh = device table [e] of the EXL3 output-sign vectors (the epilogue's had128 * svh); the EXL3
+// suh / svh themselves stay in ExpertSlices. Two reusable slots hold per-layer prefill INT4;
+// decode always uses the original EXL3 slices, including every MTP row regime.
+inline constexpr unsigned kI4Experts = kExperts + 1;
+inline constexpr std::size_t kI4GroupTableBytes = (kI4Experts * 3U * sizeof(std::uint32_t) + 255U) & ~std::size_t{255};
+inline constexpr std::size_t kI4Nibbles = std::size_t{kHidden} * kInter / 2U;
+inline constexpr std::size_t kI4ExpertBytes = kI4Nibbles + std::size_t{kInter} * (kHidden / 64U) * 2U;
+struct I4Layer {
+    std::uint8_t* wq[3] = {};
+    _Float16* ws[3] = {};
+    const std::uint16_t* const* svh[3] = {};
+    bool on() const { return wq[0] != nullptr; }
+};
+inline constexpr std::size_t kI4PackBytes = 3U * kI4Experts * kI4ExpertBytes;  // one layer's pack (gate, up, down)
+// Device pointer tables of one layer's EXL3 experts (converter input): trellis[m][bits] = per-expert tiles of matrix m
+// with that width (nullptr entries for the other widths; table nullptr when no expert has it), svh[m] = per-expert svh.
+struct I4Source {
+    const std::uint32_t* const* trellis[3][9] = {};
+    const std::uint16_t** svh[3] = {};
+};
+bool iu4_built();                 // the grouped IU4 core is compiled in (HIP runtime build, strix_tiled_core)
+std::size_t i4_pack_bytes();      // kI4PackBytes
+std::size_t i4_source_bytes();    // device bytes of one I4Source (256-byte aligned base)
+// Validates the layer (every matrix 6144 x 1536 / 1536 x 6144, 2..8 bits, resident) and uploads its tables (sync).
+I4Source i4_source_build(const ExpertSlices* experts, const ExpertSlices& shared, void* base);
+// The pack at `pack` (i4_pack_bytes(), 256-byte aligned) as the layer view of `src`.
+I4Layer i4_layer_view(std::uint8_t* pack, const I4Source& src);
+// Slot storage includes three reusable svh device tables after the packed weights/scales.
+std::size_t i4_slot_bytes();
+I4Layer i4_slot_view(std::uint8_t* base);
+// The shared core converter (strix::core::convert_exl3_iu4); asynchronous on stream, EXL3 is read-only. gate_up
+// scope skips down conversion. The slot's svh tables are refreshed on the same stream.
+void i4_convert(const I4Source& src, const I4Layer& out, hipStream_t stream, bool all = true);
+// Prefill MoE of an I4 layer: -1 = STRIX_MMX_PF_IU4 (default 1 = on whenever the view carries a layer), 0 = off (the
+// exact EXL3 path, only while the EXL3 tiles are resident), 1 = on. STRIX_MMX_IU4_PLAN = library plan 0 | 1 | 2.
+void set_prefill_iu4(int on);
+bool prefill_iu4();
+// STRIX_MMX_FAKEQ_A4=1 (quality study only, default off): the exact v4 path with the gate/up and down inputs
+// fake-quantised to A4 g64 after their input transforms (iu4_fake128); EXL3 weights unchanged.
+bool prefill_fakeq_a4();
+
 struct PrefillMoeView {
     std::uint32_t rows = 0;                     // T
     const float* y = nullptr;                   // T x 6144 normed hidden (device)
@@ -30,6 +75,8 @@ struct PrefillMoeView {
     const ExpertSlices* experts = nullptr;      // host array [128] of device slices
     ExpertSlices shared{};
     float* out = nullptr;                       // T x 6144 (device)
+    const I4Layer* i4 = nullptr;                // FAST_I4 layer pack (null: EXL3 path)
+    bool i4_all = true;                         // false: IU4 gate/up, original EXL3 down
 };
 
 // Dense prefill linears on the v4 core: jobs share one input x [rows][input] (input % 128 == 0, output % 128 == 0)

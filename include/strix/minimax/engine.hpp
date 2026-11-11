@@ -317,6 +317,12 @@ public:
     [[nodiscard]] std::uint64_t state_fnv(std::uint32_t slot, std::uint64_t positions);
     // FNV-1a of the last prefill's final normed rows of its last chunk (the head's input), 0 before any prefill.
     [[nodiscard]] std::uint64_t prefill_out_fnv();
+    // The same rows as values (quality comparisons, e.g. FAST STRIX_XPORT_HALF vs FP32 payloads); empty before any prefill.
+    [[nodiscard]] std::vector<float> prefill_out_rows();
+    // This rank's vocabulary slice of the head logits for the last `rows` of those rows, [rows][slice] (teacher-forced
+    // per-token quality: KL / NLL / top-1 against a reference arm); empty before any prefill.
+    [[nodiscard]] std::vector<float> prefill_out_logits(std::size_t rows);
+
 
     [[nodiscard]] const dist::CommunicatorStats& comm_stats() const;
     [[nodiscard]] const Profile& profile() const;

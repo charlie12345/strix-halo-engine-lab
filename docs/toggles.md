@@ -136,6 +136,20 @@ Pair setup: [pair-setup.md](pair-setup.md).
 | `--print-effective-config` | all | off | Prints the resolved configuration and exits before device work. |
 | `STRIX_DS41_BASELINE=1` | deepseek | off | Turns off every production default. Runs the plain command as it ran before. |
 
+### Shared core and INT4 (opt-in)
+
+All of these are off by default. With them off, every engine runs the same kernels and launches as before
+the shared tiled core (`src/core`) landed, with the same bits.
+
+| Switch | Engine | Default | What it does |
+|---|---|---|---|
+| `STRIX_DS41_PF_CORE=1` | deepseek | off | Expert prefill (gate/up, down) and the dense Q8_0 x A8 prefill on the shared tiled core. Same bits as the default kernels. Off because it is still slower: 8K TTFT 8.50 s vs 8.39 s (+0.11 s, quiet ABAB on the pair, four cells each). |
+| `STRIX_DS41_FAST_I4=1` | deepseek | off | Draft lossy prefill: GGUF expert weights decoded in the kernel to INT4, A8 input requantized to A4. Runs on the shared core. `STRIX_DS41_FAST_I4_SCOPE=all\|gu` picks gate/up/down (default) or gate/up only. Not quality-qualified. |
+| `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Draft lossy format: routed experts stored as INT4, W4A16 decode. Refuses the exact identities. Not quality-qualified. |
+| `STRIX_GLM_PF_STREAMS=1` | glm | off | Single compute stream for the seqpar TP2 prefill schedule. Same bits; not faster in the first samples. |
+| `STRIX_MMX_MODEL_FORMAT=fast_i4` | minimax | `exl3` | Draft lossy prefill: each MoE layer is converted to INT4 during prefill in two reusable buffers (+3.6 GiB); decode stays on EXL3. See [MiniMax grouped prefill](minimax-grouped-prefill.md#draft-fast_i4). |
+| `STRIX_DS41_PREFILL_LEASE=1`, `STRIX_DS41_ENGRAM_DEVICE_READY=1`, `STRIX_DS41_SEED_EARLY=1` | deepseek | off | Prefill structure options (lease-fenced exchange, per-layer Engram readiness, early draft seed). Same bits; no gain measured yet. |
+
 ### Debug only
 
 These flags do not change the output. They add checks, traces or timing. Do not use them for benchmarks.

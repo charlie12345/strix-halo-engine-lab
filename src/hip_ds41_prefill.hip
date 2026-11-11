@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include "moe_core/grouped_integer_decode.hpp"
+#include "ds41_integer_operand.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1, FAST_I4)
 
 #include "strix/ds41_moe.hpp"
 #include "strix/ds41_prefill.hpp"
@@ -585,6 +586,9 @@ void require_routes(const PrefillRoutesView& r) {
         throw std::invalid_argument("ds41 prefill routes view is inconsistent");
 }
 
+// Shared tiled core route (opt-in): the same bits as the kernels above, one implementation for every MoE engine.
+#include "ds41_prefill_adapter.inc"
+
 template <WeightFormat Format, unsigned MT, unsigned J>
 void launch_gate_up_j(const PrefillGateUpView& view, const StageLayout& layout, hipStream_t stream) {
     const unsigned bytes = std::max(layout.bytes(false), 2U * 32U * 64U * 4U);
@@ -694,6 +698,21 @@ bool fast_moe() {
     static const bool env = [] { const char* e = std::getenv("STRIX_DS41_FAST_MOE"); return e != nullptr && std::strcmp(e, "1") == 0; }();
     return fast_moe_mode < 0 ? env : fast_moe_mode != 0;
 }
+int fast_i4_mode = -1;
+void set_fast_i4(int mode) { fast_i4_mode = mode; }
+bool fast_i4() {
+    const char* e = std::getenv("STRIX_DS41_FAST_I4");
+    return fast_i4_mode < 0 ? (e && std::strcmp(e, "1") == 0) : fast_i4_mode != 0;
+}
+// STRIX_DS41_PF_CORE=1 (default off) or set_pf_core(1 / 0; -1 = the environment): routed and shared expert prefill and the
+// dense Q8_0 x A8 prefill on the shared tiled core. Same bits as the default kernels; slower today, so opt-in. FAST_I4
+// runs only on the shared core and implies it for the expert products.
+int pf_core_mode = -1;
+void set_pf_core(int mode) { pf_core_mode = mode; }
+bool pf_core() {
+    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_PF_CORE"); return e != nullptr && std::strcmp(e, "1") == 0; }();
+    return pf_core_mode < 0 ? env : pf_core_mode != 0;
+}
 void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view, void* stream) {
     require_routes(view.routes);
     const auto elements = block_elements(format);
@@ -704,6 +723,14 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill gate/up view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
+    if (pf_core() || fast_i4()) {
+        if (view.hidden > 5120U) throw std::invalid_argument("ds41 prefill gate/up view: shared core width");
+        if (format == WeightFormat::iq2_xxs) launch_gate_up_core<WeightFormat::iq2_xxs>(view, queue);
+        else if (format == WeightFormat::q8_0) launch_gate_up_core<WeightFormat::q8_0>(view, queue);
+        else launch_gate_up_core<WeightFormat::mxfp4>(view, queue);
+        check(hipGetLastError(), "prefill gate/up shared core");
+        return;
+    }
     if (fast_moe() && format == WeightFormat::iq2_xxs && view.hidden % 256U == 0U && view.inter % 128U == 0U &&
         view.routes.batch_rows <= relaxed_rows) {
         if (fast_moe_order() && view.routes.max_batches <= 65535U)  // grid y limit
@@ -761,6 +788,14 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill down view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
+    if (pf_core() || fast_i4()) {
+        if (view.width > 5120U) throw std::invalid_argument("ds41 prefill down view: shared core width");
+        if (format == WeightFormat::q2_k) launch_down_core<WeightFormat::q2_k>(view, queue);
+        else if (format == WeightFormat::q8_0) launch_down_core<WeightFormat::q8_0>(view, queue);
+        else launch_down_core<WeightFormat::mxfp4>(view, queue);
+        check(hipGetLastError(), "prefill down shared core");
+        return;
+    }
     if (fast_moe() && format == WeightFormat::q2_k && view.width % 256U == 0U && view.outputs % 256U == 0U &&
         view.routes.batch_rows <= relaxed_rows) {
         // STRIX_DS41_FAST_MOE_DOWN_ROWS (read per call; default 32, =64 the previous row groups): the same bits either way
@@ -889,14 +924,14 @@ unsigned PrefillMoe::selected_batch_rows(unsigned /*rows*/) const {
 void PrefillMoe::experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, std::uint32_t rows, void* stream) {
     const std::uint32_t owned = end_ - first_;
     const auto* ids = in.ids + static_cast<std::uint64_t>(row0) * top_k_;
-    if (select_hist_) {
+    if (select_hist_ && !fast_i4()) {
         enqueue_experts_split(in, row0, rows, stream);
         return;
     }
     routes_.sparse_max = 0U;
     // FAST MoE: every entry takes the relaxed batch kernels, so its arithmetic does not depend on the chunking (rows per
     // call would otherwise move small chunks onto the exact window kernels)
-    const bool window = !fast_moe() && static_cast<double>(rows) * top_k_ <= window_mean_ * owned;
+    const bool window = !fast_moe() && !fast_i4() && static_cast<double>(rows) * top_k_ <= window_mean_ * owned;
     const std::uint32_t batch_rows = window ? 8U : selected_batch_rows(rows);
     enqueue_build_prefill_routes(ids, rows, top_k_, experts_, split_, batch_rows, routes_, stream, first_, end_);
     if (window) {
@@ -938,6 +973,7 @@ void PrefillMoe::experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, st
 // the decode window kernels and the dense experts' batches of 16 the WMMA kernels (each kernel exits at once when its
 // list is empty). Every entry is the declared product whichever kernel runs it.
 void PrefillMoe::enqueue_experts_split(const PrefillMoeInputs& in, std::uint32_t row0, std::uint32_t rows, void* stream) {
+    if (fast_i4()) { experts_rows(in, row0, rows, stream); return; }
     const std::uint32_t owned = end_ - first_;
     const auto* ids = in.ids + static_cast<std::uint64_t>(row0) * top_k_;
     routes_.sparse_max = window_mean_ > 0.0 && !fast_moe() ? static_cast<std::uint32_t>(window_mean_) : 0U;   // FAST MoE: no sparse split

@@ -2999,7 +2999,7 @@
   {
     "engine": "minimax",
     "name": "FAST_I4 INT4 MoE chain per chunk",
-    "flag_or_env": "STRIX_MOE_I4_CHAIN; STRIX_MOE_I4_CHAIN_GROUP=1 (one call per layer, opt-in, slower)",
+    "flag_or_env": "STRIX_MOE_I4_CHAIN",
     "default": "ON with draft FAST_I4 scope all",
     "exact": "Same bits as the unfused INT4 calls; 8K and 32K state, final-row and token anchors equal; ranks agree in every run. FAST_I4 itself is a lossy opt-in identity with quality gates pending.",
     "gain": "Two-node TP2: 8K prefill 12.31 s vs 12.65 s unfused (-2.7 %), 12.53 s vs 13.12 s reference binary (-4.5 %). 32K 56.47 s vs 55.79 s unfused (+1.2 %, two pairs both orders, +1.35/+1.08 %). Regime gate: chain default only for prompts of at most 8192 rows, unfused above; STRIX_MOE_I4_CHAIN=0/1 forces either way.",

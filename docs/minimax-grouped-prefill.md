@@ -120,8 +120,7 @@ Kernel-chain timing should also use the prefill timeline markers.
 With scope `all`, the INT4 chain is the default (`STRIX_MOE_I4_CHAIN=0` selects the unfused calls,
 same bits). It quantises the gate/up input once, runs gate/up as one paired grouped GEMM whose
 epilogue applies SwiGLU and the down input transform, then the down GEMM and the ordered combine.
-It runs once per chunk, so chunk c's MoE overlaps the exchange of chunk c-1. The single 8192-row call per layer is opt-in (`STRIX_MOE_I4_CHAIN_GROUP=1`):
-it waits for every chunk's attention exchange and measured slower. Same bits either way.
+It runs once per chunk, so chunk c's MoE overlaps the exchange of chunk c-1.
 Measured on the TP2 pair: 8K 12.31 s versus 12.65 s unfused (-2.7 %) and 12.53 s versus 13.12 s on the
 reference binary (-4.5 %); 32K 56.47 s versus 55.79 s unfused (+1.2 %, two pairs in both orders,
 +1.35 / +1.08 %). State, final-row and token anchors are equal and the ranks agree in every run. A regime

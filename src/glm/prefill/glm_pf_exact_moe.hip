@@ -938,13 +938,6 @@ void enqueue_device(const DeviceView& v, Plan& plan, void* ws, std::size_t bytes
     launch_grouped(a, grid_tiles, selected, v.shared, stream, v.iu4, v.iu4_scratch);
 }
 namespace iu4 {
-bool chain_enabled() {
-#if STRIX_GLM_PF_IU4_LIB
-    return strix::core::moe_i4::enabled();
-#else
-    return false;
-#endif
-}
 
 bool built() { return STRIX_GLM_PF_IU4_LIB != 0; }
 namespace {

@@ -1558,7 +1558,7 @@ bool prefill_moe_device_plan(std::uint32_t rows) {
         if (std::string(e) == "host") return false;
         throw std::invalid_argument("STRIX_MMX_PF_PLAN must be device or host");
     }();
-    return device && rows > 0 && prefill_core() == 3 && prefill_mtfit() && !(rows > 8 && prefill_gufuse());
+    return device && rows > 0 && prefill_mtfit() && !(rows > 8 && prefill_gufuse());
 }
 
 void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes,

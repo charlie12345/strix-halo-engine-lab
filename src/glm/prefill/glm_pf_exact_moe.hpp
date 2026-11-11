@@ -45,7 +45,6 @@ void enqueue(const View& v, Plan& plan, void* workspace, std::size_t bytes,
              hipStream_t stream, unsigned tm = 0);
 // FAST_I4 stored routed experts. Load-time pack builder and shared IU4 execution glue.
 namespace iu4 {
-bool chain_enabled();
 bool built();            // the library core is linked
 struct Layer {           // device: per routed matrix m (0 gate, 1 up, 2 down) x 288 experts
     std::uint8_t* wq[3] = {};

@@ -3369,6 +3369,24 @@ epilogue; other routes retain their existing combine. There is no separate fallb
 local guard; effective config reports the selector. OFF: `STRIX_GLM_PF_AUX_COMBINE=0` restores the
 separate combine; baseline sets `0`. No new timing qualification is claimed here.
 
+<a id="glm-pf-in-token"></a>
+### Prefill token-ordered MoE input transform (`STRIX_GLM_PF_IN_TOKEN`)
+
+Default `1` runs the grouped MoE gate/up input transform (suh sign scale + Hadamard-128 to FP16 operand rows) in
+token order: one CTA per (row, 1024-channel chunk) loads each x value once and writes the same FP16 rows for the
+row's eight routed experts x two matrices and the shared expert. The tile-ordered kernel reads the row once per
+(pair, matrix), 18 times, from an x buffer that is not cache resident at 8K. Device plan only (the host plan keeps
+the tile-ordered kernel); rows the device plan rejects get only their shared-expert rows, as before. Same
+operations in the same order, so the operand rows and every downstream output are bitwise equal (test:
+`strix-hip-glm5-pf-exact-moe-tests`, device-plan arm). OFF: `STRIX_GLM_PF_IN_TOKEN=0` restores the tile-ordered
+kernel; baseline sets `0`. The switch accepts only `0` or `1`.
+- **Measured gain (TP2, GLM-5.3-Flash EXL3 4.05 bpw, one binary, unprofiled):** FAST identity 8K warm prefill ABAB,
+  4 pairs in both orders: 10.55 -> 10.21 s (pair deltas -0.32, -0.31, -0.20 s and one -1.46 s outlier pair; median
+  -0.31 s). Exact identity 8K: 13.195 -> 12.868 s with identical full logits files on both ranks. FAST 32K:
+  43.49 -> 42.39 s (one pair). Exact identity 32K: 56.32 -> 53.41 s and 57.63 -> 55.52 s in two pairs (off first, on first): -2.9 / -2.1 s, mean -2.5 s (-4.5 %), identical full logits files on both ranks (an earlier single pair showed -5.5 s from a slow off arm; it did not reproduce).
+  Logits and state digests identical to the off arm in every run, and the default build reproduces the 8K exact
+  and FAST anchors of the previous default on both ranks.
+
 <a id="glm-pf-scratch"></a>
 ### Prefill scratch capacity (`STRIX_GLM_PF_SCRATCH`)
 

@@ -52,6 +52,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Guard: ordinary TP2 ownership, pipeline-capable prefill and at least two rows; auto declines to legacy", false, true},
         {"pf-aux-combine", "STRIX_GLM_PF_AUX_COMBINE", "1", "0",
          "Guard: exact MoE epilogue; off restores the separate auxiliary combine", false, true},
+        {"pf-in-token", "STRIX_GLM_PF_IN_TOKEN", "1", "0",
+         "Measurement: token-ordered MoE gate/up input transform (device plan; each x row read once, not 18x), logits and state bitwise on both ranks at 8K / 32K exact and FAST; 8K FAST TTFT 10.55 -> 10.21 s (median of 4 pairs) (=0 restores the tile-ordered transform)", false, true},
         {"pf-scratch", "STRIX_GLM_PF_SCRATCH", "auto", "full",
          "Guard: joint capacity admission; auto tries routed scratch after the original full layout", false, true},
         {"pf-attn-qwin", "STRIX_GLM_PF_ATTN_QWIN", "auto", "0",

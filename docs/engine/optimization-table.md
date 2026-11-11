@@ -19,6 +19,11 @@ environment variable, the shipped value, the value that restores the previous pa
 | glm-pair | hp-crc-overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
 | glm-pair | hp-chunk-bytes | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
 | glm-pair | pf-pipeline-2 | `STRIX_GLM_PF_PIPELINE` | 2 | 1 | Measurement: N=2 whole-layer prefill pipeline + async start, prefill gate bitwise, 8K -4.0 % (needs dist-async-start) |
+| glm-pair | pf-seqpar | `STRIX_GLM_PF_SEQPAR` | auto | 0 | Guard: ordinary TP2 ownership, pipeline-capable prefill and at least two rows; auto declines to legacy |
+| glm-pair | pf-aux-combine | `STRIX_GLM_PF_AUX_COMBINE` | 1 | 0 | Guard: exact MoE epilogue; off restores the separate auxiliary combine |
+| glm-pair | pf-in-token | `STRIX_GLM_PF_IN_TOKEN` | 1 | 0 | Measurement: token-ordered MoE gate/up input transform (device plan; each x row read once, not 18x), logits and state bitwise on both ranks at 8K / 32K exact and FAST; 8K FAST TTFT 10.55 -> 10.21 s (median of 4 pairs) (=0 restores the tile-ordered transform) |
+| glm-pair | pf-scratch | `STRIX_GLM_PF_SCRATCH` | auto | full | Guard: joint capacity admission; auto tries routed scratch after the original full layout |
+| glm-pair | pf-attn-qwin | `STRIX_GLM_PF_ATTN_QWIN` | auto | 0 | Guard: joint capacity admission; auto tries a 2048-row query window after full-chunk candidates |
 | glm-pair | dist-async-start | `STRIX_DIST_ASYNC_START` | 1 | 0 | Measurement: async exchange start (full-host chunked path; only the pipeline uses it) |
 | glm-pair | hsa-no-fragment-allocator | `HSA_DISABLE_FRAGMENT_ALLOCATOR` | 1 | 0 | Measurement: production decode and prefill configuration; allocator granules fit GTT |
 | glm-pair | r1b-dense-auto | `STRIX_GLM_R1B_DENSE` | 7 | 2 | Measurement: R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens |

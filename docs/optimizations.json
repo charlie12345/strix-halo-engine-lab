@@ -2151,6 +2151,17 @@
   },
   {
     "engine": "glm",
+    "name": "Prefill token-ordered MoE input transform",
+    "flag_or_env": "STRIX_GLM_PF_IN_TOKEN",
+    "default": "1",
+    "exact": "Same operations in the same order: FP16 operand rows and all outputs bitwise equal the tile-ordered transform (strix-hip-glm5-pf-exact-moe-tests device-plan arm); pair logits and state digests equal on both ranks at 8K and 32K, exact and FAST.",
+    "gain": "FAST 8K TTFT 10.55 -> 10.21 s (median of 4 ABAB pairs, both orders); exact 8K 13.195 -> 12.868 s; FAST 32K 43.49 -> 42.39 s (one pair); exact 32K: 56.32 -> 53.41 s and 57.63 -> 55.52 s in two pairs (off first, on first): -2.9 / -2.1 s, mean -2.5 s (-4.5 %), identical full logits files on both ranks (an earlier single pair showed -5.5 s from a slow off arm; it did not reproduce).",
+    "preconditions": "Device MoE plan (STRIX_GLM_PF_EXACTMOE_PLAN=device, the default); the host plan keeps the tile-ordered kernel.",
+    "off_switch": "STRIX_GLM_PF_IN_TOKEN=0 restores the tile-ordered transform; baseline sets 0; restart both ranks",
+    "doc_anchor": "docs/optimizations.md#glm-pf-in-token"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill scratch capacity",
     "flag_or_env": "STRIX_GLM_PF_SCRATCH",
     "default": "auto",

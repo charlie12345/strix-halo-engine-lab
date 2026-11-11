@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/file_snapshot.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 
@@ -786,9 +787,9 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
     std::unique_ptr<DirectLoader> overlay_loader;
     if (m.overlay) overlay_loader = std::make_unique<DirectLoader>(m.overlay->path());
     ds41::prepared::HipLoader prepared(gguf, m.overlay ? m.overlay->path() : std::filesystem::path{}, m.model, options.rank, options.world, m.expert_tp);
-    const auto env_on = [](const char* name) { const char* v = std::getenv(name); return !(v && *v == '0'); };
-    const bool use_router_bf16 = env_on("STRIX_DS41_ROUTER_BF16"), use_f16_as_f8 = env_on("STRIX_DS41_F16_AS_F8");
-    const bool use_packed = env_on("STRIX_DS41_BATCH_PACKED");  // P11: +4-7.5 % at N <= 4 with c-u6, same bits
+    const bool use_router_bf16 = strix::env_flag_default_on("STRIX_DS41_ROUTER_BF16", strix::EnvFlagMatch::first_character);
+    const bool use_f16_as_f8 = strix::env_flag_default_on("STRIX_DS41_F16_AS_F8", strix::EnvFlagMatch::first_character);
+    const bool use_packed = strix::env_flag_default_on("STRIX_DS41_BATCH_PACKED", strix::EnvFlagMatch::first_character);  // P11: +4-7.5 % at N <= 4 with c-u6, same bits
     for (const auto& n : names) {
         const auto* t = m.tensors.at(n);
         const auto* over = m.overlay ? m.overlay->find(n) : nullptr;

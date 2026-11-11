@@ -693,15 +693,15 @@ Apply the measured 255 bitmask for overlap, row loops, headless work and persist
 
 ### Batched MTP predictor priming
 
-**Engine:** `qwen`. **Control:** `STRIX_MTP_PRIME_ROWS`. **Default:** OFF (opt-in with `STRIX_MTP_PRIME_ROWS=1`).
+**Engine:** `qwen`. **Control:** `STRIX_MTP_PRIME_ROWS`. **Default:** ON (`STRIX_MTP_PRIME_ROWS=0` disables).
 
 The tiled MTP prompt primes the predictor cache for each finished block in batches of up to 8 rows per launch instead of one row at a time: token embedding, draft input fusion, draft attention HC mix, index-key/K/V projections, key norm/RoPE and the validated cache publish. Every row keeps the one-row kernels' arithmetic; rows read the target hidden in place and the last row of each call keeps the one-row path.
 
 - **Preconditions:** MTP route with a tiled prompt and the production draft chain (non-exact draft, Q4 input-projection copy, HC rows kernels on and persistent HC off, 16-byte aligned HC workspace). Other configurations keep the one-row loop.
-- **Automatic selection:** Only with `STRIX_MTP_PRIME_ROWS=1`. If the 8-row scratch cannot be allocated, the one-row loop runs.
+- **Automatic selection:** Enabled when unset or exactly `1`; `0` disables (other explicit values retain the one-row path). If the 8-row scratch cannot be allocated, the one-row loop runs.
 - **Fallback notice:** None; the one-row loop is the fallback.
 - **Exactness evidence:** Same binary, 262,144-token prompt: end-of-prompt state digest (target state, predictor KV/index rows, held row), terminal FP32 logits digest, generation lineage digest, generated tokens and MTP acceptance counters equal with the switch on and off. Rows are published in order, so a failing row stops the later ones as before.
-- **Off switch:** unset STRIX_MTP_PRIME_ROWS (default off)
+- **Off switch:** STRIX_MTP_PRIME_ROWS=0 (restart the process)
 - **Measured gain:** MTP-route prompt at 262,144 tokens (YaRN f2, T8192, one node): 210.9–213.2 → 202.8–203.8 s, −8.1 to −10.0 s in three pairs; decode unchanged.
 
 <a id="qwen-qsa-attend-batch"></a>
@@ -2072,6 +2072,8 @@ Expire an armed detailed serving observation after a bounded interval.
 - **Exactness evidence:** Observation lifetime changes no arithmetic or committed tokens; inference reference gates remain required.
 - **Off switch:** STRIX_SERVE_OBSERVE_EXPIRY_S=0 keeps observation armed until exit
 - **Measured gain:** No isolated measurement
+
+<a id="product-profiles-pair"></a>
 
 ### Product profiles (pair)
 
@@ -4171,7 +4173,7 @@ their checks.
 
 ### FAST WMMA prefill linear cores (glm-pf-wmma-x)
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (opt-in FAST identity).
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (`strix-glm5-rank --profile fast` enables; opt-in FAST identity).
 
 The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
 2048+ rows (X3 route) and the MoE gate/up/down of the V11/V14 route. Per (row, output) each stage of four 16-wide
@@ -4180,10 +4182,10 @@ tiles per wave (remainders on 64-row storage); the H128/svh epilogue, plan, tran
 exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits.
 
 - **Preconditions:** dense calls of 2048+ rows (`STRIX_GLM_PF_EXACT_X` auto / 4); MoE calls on V11 or V14 (auto from 128 rows). Other calls stay exact.
-- **Automatic selection:** none (opt-in).
+- **Automatic selection:** `strix-glm5-rank --profile fast` sets `STRIX_GLM_PF_WMMA=1` before device work; an explicit environment value wins. `default` exports nothing, `quality` uses default with a notice, and baseline vetoes the profile addition. The bare `--profile` keeps its timing meaning.
 - **Fallback notice:** None; each rank prints `prefill identity glm-pf-wmma-x FAST (... wmma calls dense D moe M)` only when WMMA calls ran, else `prefill identity exact` (`prefill identity prefill-wmma route` under `--prefill wmma`). Two ranks: the switch is part of the startup agreement (a mismatch stops both ranks); modes without that handshake refuse `STRIX_GLM_PF_WMMA=1`.
 - **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
-- **Off switch:** unset or STRIX_GLM_PF_WMMA=0
+- **Off switch:** STRIX_GLM_PF_WMMA=0 (also overrides `--profile fast`); without a named fast profile, unset keeps it off
 - **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
 - **Implementation / evidence:** [core](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
 

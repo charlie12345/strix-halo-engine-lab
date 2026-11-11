@@ -128,6 +128,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [modes] [--identity r1|r1b|r1b-all] [--idcheck N --prompt T.u32]\n"
                                  "--print-device-profile / STRIX_PRINT_DEVICE_PROFILE=1: HIP probe JSON, then exit (no model/peer)\n"
                                  "--deploy FILE|auto --deploy-check: host-only deployment JSON (no allocation/peer)\n"
+                                 "--profile default|fast|quality: product policy; bare --profile: kernel timing\n"
                                  "identity: r1 throughout; r1b (default) R1 prompts/R1b generation; "
                                  "r1b-all throughout (reference prefill)\n", argv[0]);
             return 2;
@@ -151,11 +152,15 @@ int main(int argc, char** argv) {
         std::vector<unsigned> pattern;
         bool mem_plan = false, profile = false, tf_check = false, print_config = false, print_graph = false;
         std::string xch_kind = "comm";  // comm = CommExchange (Communicator) | xfer = XferExchange
-        for (int i = 2; i < argc; ++i) {
-            const std::string a = argv[i];
+        namespace rd = strix::glm::rank_defaults;
+        std::vector<std::string> args(argv + 2, argv + argc);
+        strix::profile::Inputs product_inputs;
+        strix::profile::take_options(rd::product_profile_engine, args, product_inputs);
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            const std::string a = args[i];
             auto next = [&]() -> std::string {
-                if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
-                return argv[++i];
+                if (i + 1 >= args.size()) throw std::invalid_argument("missing value for " + a);
+                return args[++i];
             };
             if (a == "--deploy") { deployment.file = next(); continue; }
             if (a == "--deploy-check") { deployment.check = true; continue; }
@@ -244,7 +249,6 @@ int main(int argc, char** argv) {
         }
         if (mtp_prefill != "ref" && mtp_prefill != "chunked")
             throw std::invalid_argument("--mtp-prefill must be ref or chunked");
-        namespace rd = strix::glm::rank_defaults;
         const auto request = rd::scan(std::vector<std::string>(argv + 2, argv + argc));
         auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
         rd::fallback_without_handshake(eff, request, rd::process_env());
@@ -258,6 +262,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        if (eff.product) {
+            std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());
+            for (const auto& notice : eff.product->notices()) std::fprintf(stderr, "%s\n", notice.c_str());
+        }
         opt.mtp = eff.mtp.value == "1";
         opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
         opt.auto_rows = rd::max_rows_auto(eff);

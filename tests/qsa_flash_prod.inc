@@ -28,6 +28,10 @@
 #include <vector>
 #include <type_traits>
 
+// Shared by several test TUs, each launching a different subset of these kernels.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
 namespace strix {
 namespace {
 constexpr std::uint32_t kThreads = 256;
@@ -213,4 +217,5 @@ __device__ __forceinline__ unsigned qsa_rows_matrix(const QsaRowsInputViews<Rows
 #include "../src/hip_qsa_prefill_flash.inc"
 } // namespace
 } // namespace strix
+#pragma clang diagnostic pop
 

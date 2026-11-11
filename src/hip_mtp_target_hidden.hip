@@ -415,16 +415,16 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
             const char* mtp_digest=std::getenv("STRIX_MTP_LOGITS_DIGEST");
             const MtpSerialLogitsDigestPolicy digest_policy{
                 logits_digest,mtp_digest && mtp_digest[0]=='1',mtp_step_logits_digest_enabled()};
-            if(digest_policy.enabled() || prompt_terminal_digest_enabled()) {
+            // One read of the logits row serves the digests and the session callback (R2-18).
+            const bool digest=digest_policy.enabled() || prompt_terminal_digest_enabled();
+            if(digest || i.session_logits) {
                 std::vector<float> row;
                 read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,row);
-                lease->logits_digest=digest_policy.capture(row);
-                if(prompt_terminal_digest_enabled()) lease->terminal.capture(raw_fp32_logits_digest(row));
-            }
-            if(i.session_logits) {
-                std::vector<float> row;
-                read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,row);
-                i.session_logits(lease->position,row);
+                if(digest) {
+                    lease->logits_digest=digest_policy.capture(row);
+                    if(prompt_terminal_digest_enabled()) lease->terminal.capture(raw_fp32_logits_digest(row));
+                }
+                if(i.session_logits) i.session_logits(lease->position,row);
             }
             if(i.shadow)i.shadow->publish();
         });

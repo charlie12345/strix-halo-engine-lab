@@ -307,7 +307,6 @@ void copy_rows_checks() {
     for (std::size_t row = 0; row < 4U; ++row)
         require(recorder.calls[row][0] == 5U + row * 100U &&
             recorder.calls[row][1] == reinterpret_cast<std::uintptr_t>(device.data()) + row * 12U && recorder.calls[row][2] == 7U);
-    require(strix::qwen_pp::pipe_rowcopy_enabled());
 }
 // Shared pair timeline: OFF records nothing; ON accumulates per step, and the pipe fills its progress columns.
 void timeline_checks() {

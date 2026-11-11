@@ -58,8 +58,7 @@ de cortes (logits iguales bit a bit al prellenado en un nodo en todos los brazos
 
 El empaquetado (rango 0) y la dispersión (rango 1) de la costura movían las filas de cada
 fragmento con 3 x 4,096 copias pequeñas de dispositivo (~27 ms por fragmento en cada rango).
-Ahora usan una copia con paso por componente (los mismos bytes);
-`STRIX_QWEN_PF_PIPE_ROWCOPY=0` restaura las copias por fila.
+Ahora usan una copia con paso por componente (los mismos bytes).
 
 La distancia restante hasta 2x es estructural en una canalización de dos etapas por capas:
 el tiempo es aproximadamente (tiempo en un nodo con el tamaño de fragmento de la pareja) / 2 x

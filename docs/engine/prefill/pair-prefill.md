@@ -49,7 +49,7 @@ arm): 32K 24: 12.44/12.51/12.50 s, 23: 12.08, 22: 12.31, 21: 12.63/12.65, 20: 13
 
 The seam pack (rank 0) and scatter (rank 1) moved each chunk's rows with 3 x 4,096 small
 device copies (~27 ms per chunk on each rank). They now use one strided copy per component
-(same bytes); `STRIX_QWEN_PF_PIPE_ROWCOPY=0` restores per-row copies.
+(same bytes).
 
 The remaining distance to 2x is structural for a two-stage layer pipeline: wall time is
 about (single-node time with the pair's chunk size) / 2 x (1 + chunk / prompt), plus the

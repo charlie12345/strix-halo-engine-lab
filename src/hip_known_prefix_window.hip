@@ -862,7 +862,7 @@ struct HipKnownPrefixWindow::Impl {
         // Pair seam: resolve every row first; a component whose rows sit at one constant device stride is moved
         // with one strided copy (same bytes, same order on the stream) instead of seam_rows small copies.
         std::array<std::vector<std::uintptr_t>, 3> seam_rows_at;
-        const bool seam_batched = pair_frame && seam_rows > 1U && qwen_pp::pipe_rowcopy_enabled();
+        const bool seam_batched = pair_frame && seam_rows > 1U;
         if (seam_batched) for (auto& addresses : seam_rows_at) addresses.reserve(seam_rows);
         for (std::uint32_t seam_row = 0; seam_row < seam_rows; ++seam_row) {
             const auto hc_dispatch = hc_context(seam_row);

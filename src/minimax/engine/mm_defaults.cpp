@@ -224,6 +224,7 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
     if (app != "rank" && app != "serve") throw std::invalid_argument("parse_cli: app must be rank or serve");
     Cli c;
     c.app = app;
+    if (app == "serve") c.transport = "usb4gpu";
     std::size_t i = 0;
     if (app == "rank") {  // MODEL_DIR RANK TRANSPORT OUT_DIR [options]
         if (args.size() > 2 && args[2].rfind("--", 0) != 0) c.transport = args[2];
@@ -293,6 +294,10 @@ SessionConfig session_policy(const Cli& cli, const Lookup& env, bool explicit_cl
     else if (!explicit_cli && (mode == "0" || mode == "off")) c.reason = "switch";
     else if (cli.slots < 2) c.reason = "at least two slots required";
     else if (c.max_parked == 0) c.reason = "max parked is zero";
+    // Live direct serving is unqualified even with an explicit cache opt-in.
+    // Runtime callers supply the negotiated transport, not the request spelling.
+    else if (cli.app == "serve" && cli.transport == "usb4gpu")
+        c.reason = "route not yet GPU-qualified: " + c.route;
     else if (!explicit_cli && !qualified && mode != "1" && mode != "on")
         c.reason = "route not yet GPU-qualified: " + c.route;
     c.enabled = c.reason.empty();

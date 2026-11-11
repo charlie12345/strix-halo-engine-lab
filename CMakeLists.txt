@@ -370,6 +370,12 @@ strix_target_warnings(strix_core)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(strix-dist-transport-spec-tests tests/dist_transport_spec_tests.cpp)
+    target_include_directories(strix-dist-transport-spec-tests PRIVATE include)
+    target_compile_features(strix-dist-transport-spec-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-dist-transport-spec-tests)
+    add_test(NAME strix-dist-transport-spec-tests COMMAND strix-dist-transport-spec-tests)
+
     add_executable(strix-device-profile-host-tests tests/device_profile_host_tests.cpp src/device_profile.cpp)
     target_include_directories(strix-device-profile-host-tests PRIVATE include)
     target_compile_features(strix-device-profile-host-tests PRIVATE cxx_std_20)

@@ -80,6 +80,10 @@ struct PipeStaging {
     virtual void await_piece(std::size_t offset) = 0;
     virtual void received_piece(std::size_t offset, std::size_t bytes) = 0;
     virtual void finish_receive() = 0;
+    // Optional immutable device snapshot for a routed byte transfer. Host-only
+    // staging keeps the original send/receive path.
+    virtual void* device_piece(std::size_t) { return nullptr; }
+    virtual void read_device_piece(std::size_t, std::size_t) {}
 };
 std::shared_ptr<PipeStaging> make_hip_pipe_staging(std::size_t capacity);
 struct PipeFrame {
@@ -98,9 +102,10 @@ public:
     using Send = std::function<void(std::span<const std::byte>)>;
     using Receive = std::function<void(std::span<std::byte>)>;
     using Checksum = std::function<std::uint32_t(std::span<const std::byte>)>;
+    using TransferPiece = std::function<bool(bool, PipeStaging&, std::size_t, std::size_t)>;
     Pipe(unsigned rank, std::uint64_t count, Send send, Receive receive, std::function<void()> abort,
-        std::uint32_t cut = 24, std::function<std::shared_ptr<PipeStaging>()> staging = {}, Checksum checksum = {})
-        : rank_(rank), count_(count), send_(std::move(send)), receive_(std::move(receive)), abort_(std::move(abort)), cut_(cut), checksum_(std::move(checksum)) {
+        std::uint32_t cut = 24, std::function<std::shared_ptr<PipeStaging>()> staging = {}, Checksum checksum = {}, TransferPiece transfer_piece = {})
+        : rank_(rank), count_(count), send_(std::move(send)), receive_(std::move(receive)), abort_(std::move(abort)), cut_(cut), checksum_(std::move(checksum)), transfer_piece_(std::move(transfer_piece)) {
         if (rank_ > 1U || count_ == 0U) throw std::invalid_argument("pair prefill rank must be 0 or 1");
         if (cut_ == 0U || cut_ >= 48U) throw std::invalid_argument("pair prefill invalid cut");
         if (staging) for (auto& frame : frames_) frame.staging = staging();
@@ -151,6 +156,7 @@ private:
     std::thread worker_;
     std::uint32_t cut_;
     Checksum checksum_;
+    TransferPiece transfer_piece_;
     std::uint32_t piece_crc(std::span<const std::byte> bytes) const {
         if (checksum_) return checksum_(bytes);
         SeamCrc checksum; checksum.update(bytes); return checksum.value();
@@ -187,12 +193,15 @@ private:
                 if (frame.staging) frame.staging->await_piece(offset);
                 crc = piece_crc(piece);
                 whole.append(crc, piece.size());
-                send_(std::as_bytes(std::span(&crc, 1))); send_(piece);
+                send_(std::as_bytes(std::span(&crc, 1)));
+                if (!(frame.staging && transfer_piece_ && transfer_piece_(true, *frame.staging, offset, piece.size()))) send_(piece);
             } else {
-                receive_(std::as_writable_bytes(std::span(&crc, 1))); receive_(piece);
+                receive_(std::as_writable_bytes(std::span(&crc, 1)));
+                const bool routed = frame.staging && transfer_piece_ && transfer_piece_(false, *frame.staging, offset, piece.size());
+                if (!routed) receive_(piece);
                 if (crc != piece_crc(piece)) throw std::runtime_error("pair prefill seam piece CRC mismatch");
                 whole.append(crc, piece.size());
-                if (frame.staging) frame.staging->received_piece(offset, piece.size());
+                if (frame.staging && !routed) frame.staging->received_piece(offset, piece.size());
             }
         }
         auto crc = whole.value();

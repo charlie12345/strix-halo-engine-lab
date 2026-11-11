@@ -1,3 +1,4 @@
+#include "strix/dist/open_transport.hpp"
 // One rank of the two-node deepseek41 decode with DSpark speculative drafting and verify windows, or both ranks in
 // one process over the in-memory transport (--transport emulate, trimmed models).
 //   strix-deepseek41-dspark-rank MODEL.gguf DRAFT.gguf --rank R --transport usb4:DEV,DEV,... | usb4auto | usb4gpu | tcp-listen:PORT |
@@ -71,39 +72,14 @@ std::vector<std::uint32_t> parse_list(const std::string& s) {
 std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
 
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    const std::chrono::seconds limit(timeout);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4") {
-        std::vector<std::string> devices;
-        std::stringstream ss(rest);
-        for (std::string d; std::getline(ss, d, ',');) devices.push_back(d);
-        return strix::dist::usb4_host(devices);
-    }
-    if (kind == "usb4auto" || kind == "usb4gpu") {  // usb4gpu: GPU-direct exchanges over the gpu_direct streams
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
-        if (kind == "usb4auto") return t;
-        std::string why;
-        if (strix::dist::usb4_gpu_direct_streams(o, *t, &why) == 0U) {  // both ranks agree from the same exchanged counts
-            std::printf("gpu-direct unavailable (%s): host path only\n", why.c_str());
-            return t;
-        }
-        std::string receipt;
-        gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &receipt);
-        std::printf("usb4 %s\n", receipt.c_str());
-        return t;
-    }
-    throw std::invalid_argument("unknown or unavailable transport " + spec);
+    strix::dist::OpenTransportOptions options;
+    options.spellings = strix::dist::compact_transport;
+    options.usb.rank = rank;
+    options.usb.timeout = std::chrono::seconds(timeout);
+    auto opened = strix::dist::open_transport(spec, options);
+    gpu_direct = std::move(opened.direct);
+    if (!opened.receipt.empty()) std::fprintf(stderr, "usb4 topology: %s\n", opened.receipt.c_str());
+    return std::move(opened.host);
 }
 
 // Device scratch for the drafter's input rows and the window packet.

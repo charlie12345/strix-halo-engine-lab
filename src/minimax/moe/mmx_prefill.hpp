@@ -78,6 +78,7 @@ struct PrefillMoeView {
     float* out = nullptr;                       // T x 6144 (device)
     const I4Layer* i4 = nullptr;                // FAST_I4 layer pack (null: EXL3 path)
     bool i4_all = true;                         // false: IU4 gate/up, original EXL3 down
+    bool i4_chain = false;                      // fused candidate chain (prefill_i4_chain of the prompt)
 };
 
 // Dense prefill linears on the v4 core: jobs share one input x [rows][input] (input % 128 == 0, output % 128 == 0)
@@ -114,9 +115,13 @@ struct PrefillMoeDeviceView {
     float* out = nullptr;                   // T x 6144 (device)
     const I4Layer* i4 = nullptr;
     bool i4_all = true;
+    bool i4_chain = false;
 };
 bool prefill_moe_device_plan(std::uint32_t rows);
-bool prefill_i4_chain();
+// The fused FAST_I4 candidate chain for a prompt of total_rows rows (0: capability/opt-in checks). Default on up to
+// kI4ChainRows rows: it measured -2.7 % at 8K but +1.2 % at 32K. STRIX_MOE_I4_CHAIN=0/1 overrides. Same bits.
+inline constexpr std::size_t kI4ChainRows = 8192;
+bool prefill_i4_chain(std::size_t total_rows = 0);
 std::size_t prefill_i4_workspace_bound(std::uint32_t rows);
 void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes,
                                 hipStream_t stream);

@@ -51,7 +51,10 @@ std::size_t env_count(const char* name, std::size_t fallback, std::size_t maximu
 }
 bool serve_batched() { const auto* p = std::getenv("STRIX_G4_SERVE_BATCH"); return !p || std::string(p) != "0"; }
 }
-std::size_t serve_slots() { return serve_batched() ? std::max<std::size_t>(1,env_count("STRIX_G4_SERVE_SLOTS",8,8)) : 1; }
+std::size_t serve_slots(std::size_t requested) {
+    if (!serve_batched()) return 1;
+    return std::clamp<std::size_t>(requested != 0 ? requested : env_count("STRIX_G4_SERVE_SLOTS",8,8),1,8);
+}
 ChatRequest parse_chat_request(const Json& j, DraftMode default_mode, const Request& defaults) {
     if (!j.is_object()) throw std::invalid_argument("chat request must be an object");
     for (const auto& [key,value] : j.as_object()) {
@@ -148,7 +151,7 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     // (default 8) jobs share one Coordinator and decode together; STRIX_G4_SERVE_PREFILL_PER_STEP (default 1, 0 = all)
     // bounds the prompt chunks one step may prefill. Each job's ids equal the job run alone.
     const bool batched = serve_batched();
-    const std::size_t slots = serve_slots();
+    const std::size_t slots;
     const std::size_t prefill_per_step = env_count("STRIX_G4_SERVE_PREFILL_PER_STEP",1,8);
     // Prompt rows per prefill chunk while other requests decode (0 = whole 512-row chunks).
     const std::size_t prefill_rows = env_count("STRIX_G4_SERVE_PREFILL_ROWS",64,512);
@@ -159,9 +162,9 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     const std::size_t prefix_bytes = env_count("STRIX_G4_SERVE_PREFIX_MB",4096,1U << 20U) << 20U;
     std::thread worker;
     Impl(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request settings,
-        strix::serve::DeploymentCallbacks callbacks)
+        strix::serve::DeploymentCallbacks callbacks, std::size_t requested_slots)
         : backend(b), adapter(std::move(t)), drafts(std::move(d)), mode(m), defaults(std::move(settings)), model(std::move(name)),
-          deployment(std::move(callbacks)), worker([this] { if (batched) batch_loop(); else queue.run(*this); }) {
+          deployment(std::move(callbacks)), slots(serve_slots(requested_slots)), worker([this] { if (batched) batch_loop(); else queue.run(*this); }) {
         if (!deployment.capacity_provider) deployment.capacity_provider = [this] {
             const auto q = queue.snapshot();
             return strix::serve::ServeCapacity{batched ? slots : 1, q.running, std::nullopt, q.queued};
@@ -510,8 +513,8 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     }
 };
 Api::Api(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request defaults,
-    strix::serve::DeploymentCallbacks deployment)
-    : impl_(std::make_unique<Impl>(b,std::move(t),std::move(d),m,std::move(name),std::move(defaults),std::move(deployment))) {}
+    strix::serve::DeploymentCallbacks deployment, std::size_t slots)
+    : impl_(std::make_unique<Impl>(b,std::move(t),std::move(d),m,std::move(name),std::move(defaults),std::move(deployment),slots)) {}
 Api::~Api() = default;
 void Api::handle(const HttpRequest& r, HttpResponseWriter& w) { impl_->handle(r,w); }
 } // namespace strix::gemma4::engine

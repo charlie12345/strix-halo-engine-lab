@@ -65,11 +65,6 @@ int main(int argc, char** argv) {
             if (options.deploy_check) { std::cout << plan.to_json() << '\n'; return plan.refused ? 2 : 0; }
             strix::deploy::require_plan(plan);
             options.deployment_context = plan.chosen.context; options.streams = plan.chosen.slots;
-#ifdef _WIN32
-            _putenv_s("STRIX_G4_SERVE_SLOTS",std::to_string(options.streams).c_str());
-#else
-            ::setenv("STRIX_G4_SERVE_SLOTS",std::to_string(options.streams).c_str(),1);
-#endif
             deployment_plan = std::make_shared<const strix::deploy::Plan>(std::move(plan));
             deployment.deployment_json = [deployment_plan] { return deployment_plan->to_json(); };
             deployment.deployment_id = [deployment_plan] { return deployment_plan->hash(); };
@@ -77,7 +72,9 @@ int main(int argc, char** argv) {
         e::Runtime runtime(options);
         if (options.inspect) { std::cout << e::effective_config(*runtime.backend,options.request,bool(runtime.drafts)).dump() << '\n'; return 0; }
         if (!runtime.tokenizer) throw std::invalid_argument("serve requires --tokenizer");
-        e::Api api(*runtime.backend,runtime.tokenizer,runtime.drafts,options.request.dflash,"nemotron-bolt-e4b",options.request,deployment);
+        // The deployment plan's slot count reaches the API explicitly (0: STRIX_G4_SERVE_SLOTS as without a plan).
+        e::Api api(*runtime.backend,runtime.tokenizer,runtime.drafts,options.request.dflash,"nemotron-bolt-e4b",options.request,deployment,
+                   deployment_plan ? options.streams : 0U);
         strix::serve::HttpServerConfig config; config.bind_address = options.bind; config.port = options.port;
         strix::serve::HttpServer server(config,[&](const auto& request, auto& writer) { api.handle(request,writer); });
         server.listen(); std::cerr << "Gemma 4 service ready\n"; server.serve();

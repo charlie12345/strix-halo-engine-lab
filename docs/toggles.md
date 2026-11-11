@@ -141,7 +141,7 @@ the shared tiled core (`src/core`) landed, with the same bits.
 
 | Switch | Engine | Default | What it does |
 |---|---|---|---|
-| `STRIX_DS41_PF_CORE=1` | deepseek | off | Expert prefill (gate/up, down) and the dense Q8_0 x A8 prefill on the shared tiled core. Same bits as the default kernels. Off because it is slower today: 8K TTFT +0.24 s (8.35 s vs 8.13 s, quiet ABAB on the pair), warm 2K +0.12 s. |
+| `STRIX_DS41_PF_CORE=1` | deepseek | off | Expert prefill (gate/up, down) and the dense Q8_0 x A8 prefill on the shared tiled core. Same bits as the default kernels. Off because it is still slower: 8K TTFT 8.50 s vs 8.39 s (+0.11 s, quiet ABAB on the pair, four cells each). |
 | `STRIX_DS41_FAST_I4=1` | deepseek | off | Draft lossy prefill: GGUF expert weights decoded in the kernel to INT4, A8 input requantized to A4. Runs on the shared core. `STRIX_DS41_FAST_I4_SCOPE=all\|gu` picks gate/up/down (default) or gate/up only. Not quality-qualified. |
 | `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Draft lossy format: routed experts stored as INT4, W4A16 decode. Refuses the exact identities. Not quality-qualified. |
 | `STRIX_GLM_PF_STREAMS=1` | glm | off | Single compute stream for the seqpar TP2 prefill schedule. Same bits; not faster in the first samples. |

@@ -14,6 +14,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "../core/hadamard.hpp"
+
 namespace strix::moe_core {
 
 using Half2 = _Float16 __attribute__((ext_vector_type(2)));
@@ -23,36 +25,11 @@ __host__ __device__ constexpr unsigned vector_splits(unsigned input, unsigned ou
     return output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U);
 }
 
-// RN32 boundary before a later RN16 conversion (hadamard.hpp materialize_fp32).
-__device__ __forceinline__ float materialize(float v) {
-    asm volatile("" : "+v"(v));
-    return v;
-}
+// RN32 boundary before a later RN16 conversion: the one core/hadamard.hpp materialize_fp32.
+__device__ __forceinline__ float materialize(float v) { return strix::core::materialize_fp32(v); }
 
-// H32 over 128 values held as lane + 32 j (hadamard.hpp hadamard128): strides 1..16 across lanes, 32 and 64 in
-// registers, then one multiply by RN32(1/sqrt(128)).
-__device__ __forceinline__ void hadamard128(float (&v)[4], unsigned lane) {
-#pragma unroll
-    for (int stride = 1; stride < 32; stride *= 2) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float peer = __shfl_xor(v[j], stride, 32);
-            v[j] = (lane & static_cast<unsigned>(stride)) ? peer - v[j] : v[j] + peer;
-        }
-    }
-#pragma unroll
-    for (int stride = 1; stride < 4; stride *= 2) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            if (!(j & stride)) {
-                const float l = v[j], r = v[j + stride];
-                v[j] = l + r;
-                v[j + stride] = l - r;
-            }
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = materialize(v[j] * 0x1.6a09e6p-4F);
-}
+// H32 over 128 values held as lane + 32 j: the one core/hadamard.hpp hadamard128 (lane overload).
+using strix::core::hadamard128;
 
 __device__ __forceinline__ float half_bits(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
 

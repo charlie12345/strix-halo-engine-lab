@@ -3245,7 +3245,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                     dog.progress();
                     last_round = Clock::now();
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                // Idle: a submit wakes the loop at once (was a 2 ms poll); the cap bounds how late the drain flag and
+                // other-thread state are seen, and the heartbeat deadline keeps its 1 s cadence. Work that is queued
+                // but not admitted (draining) keeps the 2 ms poll so the loop never spins.
+                if (queue.has_queued_work()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                else (void)queue.wait_work_until(std::min(last_round + std::chrono::seconds(1), Clock::now() + std::chrono::milliseconds(20)));
                 continue;
             }
             std::vector<BatchSequence*> seqs;

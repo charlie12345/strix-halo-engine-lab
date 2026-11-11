@@ -17,6 +17,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <type_traits>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -286,7 +287,7 @@ public:
                 last_round = Time::now();
             }
             const auto idle0 = Time::now();
-            idle(std::chrono::milliseconds(2));
+            idle(std::chrono::milliseconds(2), last_round + std::chrono::seconds(1));
             add([&](Counters& c) { c.idle_s += secs(idle0, Time::now()); });
             if (timeline_on_) timeline("idle", idle0, "defer");
             flush_timeline();
@@ -320,9 +321,18 @@ public:
 
 private:
     static double elapsed(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Time::now() - start).count(); }
-    static void idle(std::chrono::milliseconds duration) {
-        if constexpr (requires { Time::sleep_for(duration); }) Time::sleep_for(duration);
-        else std::this_thread::sleep_for(duration);
+    // Idle pause. Real clock: a submit wakes the loop at once (was a 2 ms poll), capped at 20 ms so stop_ and other
+    // plain flags stay prompt and the 1 s heartbeat keeps its cadence; queued work that is not admitted keeps the
+    // short poll so the loop never spins. An injected test clock keeps its own sleep.
+    void idle(std::chrono::milliseconds duration, typename Time::time_point heartbeat_due) {
+        if constexpr (requires { Time::sleep_for(duration); }) {
+            Time::sleep_for(duration);
+        } else if constexpr (!std::is_same_v<Time, std::chrono::steady_clock>) {
+            std::this_thread::sleep_for(duration);
+        } else {
+            if (queue_.has_queued_work()) std::this_thread::sleep_for(duration);
+            else (void)queue_.wait_work_until(std::min(heartbeat_due, Time::now() + std::chrono::milliseconds(20)));
+        }
     }
     template <class F> void add(F f) {
         std::lock_guard<std::mutex> l(sh_.m);

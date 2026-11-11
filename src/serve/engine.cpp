@@ -469,6 +469,12 @@ bool GenerationQueue::has_queued_work() const {
     return !stopping_ && !entries_.empty();
 }
 
+bool GenerationQueue::wait_work_until(std::chrono::steady_clock::time_point deadline) const {
+    std::unique_lock lock(mutex_);
+    ready_.wait_until(lock, deadline, [&] { return stopping_ || !entries_.empty(); });
+    return !stopping_ && !entries_.empty();
+}
+
 QueueSnapshot GenerationQueue::snapshot() const {
     const std::lock_guard lock(mutex_);
     return totals_;

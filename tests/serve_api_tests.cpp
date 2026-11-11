@@ -421,6 +421,47 @@ void test_batched_queue() {
     check(!queue.has_queued_work(), "shutdown queue hint");
 }
 
+// I2: idle owner loops block in wait_work_until instead of a 2 ms poll. It must return at once for queued work, wake on a
+// submit or shutdown from another thread, time out at the deadline, and ignore wake_control (take(false) never clears it).
+void test_queue_wait_work_until() {
+    using namespace std::chrono_literals;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    {
+        GenerationQueue queue;
+        const auto t0 = now();
+        check(!queue.wait_work_until(t0 + 20ms) && now() - t0 >= 20ms, "wait_work_until times out on an empty queue");
+        queue.wake_control();
+        const auto t1 = now();
+        check(!queue.wait_work_until(t1 + 20ms) && now() - t1 >= 20ms, "wait_work_until ignores a control wake");
+        GenerationJob job;
+        job.prompt = {1U};
+        check(queue.submit(std::move(job)) != nullptr, "wait_work_until submit");
+        const auto t2 = now();
+        check(queue.wait_work_until(t2 + 10s) && now() - t2 < 5s, "wait_work_until returns at once for queued work");
+    }
+    {
+        GenerationQueue queue;
+        std::thread producer([&] {
+            std::this_thread::sleep_for(30ms);
+            GenerationJob job;
+            job.prompt = {2U};
+            static_cast<void>(queue.submit(std::move(job)));
+        });
+        const auto t0 = now();
+        const bool woke = queue.wait_work_until(t0 + 10s);
+        producer.join();
+        check(woke && now() - t0 < 5s, "wait_work_until wakes on a submit from another thread");
+    }
+    {
+        GenerationQueue queue;
+        std::thread stopper([&] { std::this_thread::sleep_for(30ms); queue.shutdown(); });
+        const auto t0 = now();
+        const bool woke = queue.wait_work_until(t0 + 10s);
+        stopper.join();
+        check(!woke && queue.stopping() && now() - t0 < 5s, "wait_work_until wakes on shutdown");
+    }
+}
+
 // Destroying a cancelled job's token callback acts as a deterministic producer between
 // cleanup iterations. It stays armed until take returns, with a hard cap so regressions fail.
 void test_queue_cancel_replenishment() {
@@ -1046,6 +1087,7 @@ int main() try {
         check(silent.progress().phase == GenerationPhase::queued, "no fabricated engine report");
     }
     test_batched_queue();
+    test_queue_wait_work_until();
     test_queue_caller_orders();
     test_queue_cancel_replenishment();
     const auto tokenizer = tiny_tokenizer();

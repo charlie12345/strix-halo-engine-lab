@@ -335,6 +335,10 @@ public:
     // Explicit QueueSelection calls process only the initial batch; retry nullopt until stopping.
     // The bool/default API retains upstream FIFO/DeepSeek cancellation and wait semantics.
     [[nodiscard]] bool has_queued_work() const;
+    // Idle owner loops: block until work is queued, the queue stops, or the deadline passes, instead of polling with
+    // a short sleep. A control wake (wake_control) does not end the wait: take(false) never clears it, so waking on it
+    // would spin. Returns has_queued_work() at return.
+    bool wait_work_until(std::chrono::steady_clock::time_point deadline) const;
     [[nodiscard]] bool has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& eligible) const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
@@ -367,7 +371,7 @@ private:
     void observe_locked(const ObserveDelta& d) noexcept;
     struct Entry { GenerationJob job; std::shared_ptr<GenerationTicket> ticket; std::chrono::steady_clock::time_point submitted; std::uint32_t overtakes = 0; };
     mutable std::mutex mutex_;
-    std::condition_variable ready_;
+    mutable std::condition_variable ready_;  // mutable: wait_work_until is const
     std::deque<Entry> entries_;
     std::size_t max_queued_;
     bool stopping_ = false;

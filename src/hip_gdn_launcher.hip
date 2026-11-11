@@ -5823,13 +5823,12 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     };
     Qpf2kCore16Route core16;
     const auto prepare_core16 = [&]() {
-        static const bool enabled = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16"); return v && v[0] == '1'; }();
         static const auto minimum = [] {
             const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16_MIN_ROWS");
             const int n = v ? std::atoi(v) : 2048;
             return n >= 0 ? static_cast<std::uint32_t>(n) : 2048U;
         }();
-        if (!enabled || qpf2k::suppressed(qpf2k::Item::gdn_core16) || !tiled_rows || !q8_rows::tiled::site_enabled(2U) || count < minimum ||
+        if (!tiled_rows || !q8_rows::tiled::site_enabled(2U) || count < minimum ||
             first.value_width != 6144U || first.head_dim != 128U) return false;
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
         if (hipStreamIsCapturing(stream, &capture) != hipSuccess || capture != hipStreamCaptureStatusNone) return false;

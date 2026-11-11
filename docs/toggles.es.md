@@ -242,7 +242,6 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_SUMEXP` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_WMMA` | glm | off (opt-in FAST identity) | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
 | `STRIX_INTPREFILL_DENSE_ROWS` | qwen | 512 | [qwen-intprefill-dense-rows](optimizations.md#qwen-intprefill-dense-rows) |
-| `STRIX_MMX_PREFILL_CORE` | minimax | v4 | [mm-pf-core-v4](optimizations.md#mm-pf-core-v4) |
 | `STRIX_MMX_PREFILL_GATHER_TOK` | minimax | 1 | [mm-pf-gather-tok](optimizations.md#mm-pf-gather-tok) |
 | `STRIX_MMX_PREFILL_MTFIT` | minimax | 1 | [mm-pf-mtfit](optimizations.md#mm-pf-mtfit) |
 | `STRIX_MMX_PREFILL_PIPE` | minimax | 1 | [mm-pf-moe-pipe](optimizations.md#mm-pf-moe-pipe) |
@@ -280,7 +279,6 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QPF2K_GDN` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_CHUNK16` | qwen | auto | [qwen-gdn-chunk16](optimizations.md#qwen-gdn-chunk16) |
 | `STRIX_QPF2K_GDN_COOP_LAUNCH` | qwen | 0 | [qwen-gdn](optimizations.md#qwen-gdn) |
-| `STRIX_QPF2K_GDN_CORE16` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_GATES_BATCH` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_PARTS` | qwen | opt-in (bit 128 off; normal mask 55) | [qwen-gdn-witness](optimizations.md#qwen-gdn-witness) |
 | `STRIX_QPF2K_HC` | qwen | 1 | [qwen-hc](optimizations.md#qwen-hc) |

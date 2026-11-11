@@ -10,6 +10,7 @@
 // (0998a0e5); hip_qsa_fast_prefill.inc and hip_qsa_prefill_flash.inc are included from src/.
 // Selection helpers additionally mirror the production union-cap score-preservation control (default false).
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/hip_qwen_dpp_reduce.hpp"  // qwen_dpp::xor32 used by hip_qsa_prefill_flash.inc
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "../src/hip_rounded_stage_image.hpp"
@@ -27,6 +28,10 @@
 #include <vector>
 #include <type_traits>
 
+// Shared by several test TUs, each launching a different subset of these kernels.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
 namespace strix {
 namespace {
 constexpr std::uint32_t kThreads = 256;
@@ -212,4 +217,5 @@ __device__ __forceinline__ unsigned qsa_rows_matrix(const QsaRowsInputViews<Rows
 #include "../src/hip_qsa_prefill_flash.inc"
 } // namespace
 } // namespace strix
+#pragma clang diagnostic pop
 

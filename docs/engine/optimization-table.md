@@ -86,7 +86,6 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | markov_cand_c | `STRIX_MM_MARKOV_C` | 4096 | 1024 | Markov measurement: C 4096 (offline approx1-K3: C4096/H8192 0 acceptance changes on 1857 anchors) |
 | minimax-pair | markov_cand_h | `STRIX_MM_MARKOV_H` | 8192 | 2048 | Markov measurement: \|H\| 8192 (offline approx1-K3: C4096/H8192 0 acceptance changes on 1857 anchors) |
 | minimax-pair | markov_topc_v2 | `STRIX_MM_MARKOV_TOPC` | v2 | v1 | Markov measurement: top-C v2 = v1 canonical set / scores / picks (payload gates v1/v2 vs CPU) |
-| minimax-pair | pf_core_v4 | `STRIX_MMX_PREFILL_CORE` | v4 | lib | Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib |
 | minimax-pair | pf_msa_batch | `STRIX_MM_PF_MSA_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_attend4 | `STRIX_MM_PF_ATTEND4` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_router_batch | `STRIX_MM_PF_ROUTER_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
@@ -113,7 +112,6 @@ environment variable, the shipped value, the value that restores the previous pa
 | qwen | STRIX_QPF2K_DENSE | `STRIX_QPF2K_DENSE` | 1 | 0 | STRIX_QPF2K_DENSE |
 | qwen | STRIX_QPF2K_GDN | `STRIX_QPF2K_GDN` | 1 | 0 | STRIX_QPF2K_GDN |
 | qwen | STRIX_QPF2K_GDN_GATES_BATCH | `STRIX_QPF2K_GDN_GATES_BATCH` | 1 | 0 | STRIX_QPF2K_GDN_GATES_BATCH |
-| qwen | STRIX_QPF2K_GDN_CORE16 | `STRIX_QPF2K_GDN_CORE16` | 1 | 0 | STRIX_QPF2K_GDN_CORE16 |
 | qwen | STRIX_QPF2K_QSA | `STRIX_QPF2K_QSA` | 1 | 0 | STRIX_QPF2K_QSA |
 | qwen | STRIX_QPF2K_QSA_MASK | `STRIX_QPF2K_QSA_MASK` | 0x2257 | 0 | STRIX_QPF2K_QSA_MASK |
 | qwen | STRIX_QPF2K_HC | `STRIX_QPF2K_HC` | 1 | 0 | STRIX_QPF2K_HC |

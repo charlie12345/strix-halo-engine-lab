@@ -471,7 +471,6 @@ disables only stage batching; HC mask values select folds. Use explicit tiling t
 | `STRIX_QPF2K_DENSE` | `1` | `STRIX_QPF2K_DENSE=0` | [Register-blocked dense projections](#qwen-dense) |
 | `STRIX_QPF2K_GDN` | `1` | `STRIX_QPF2K_GDN=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
 | `STRIX_QPF2K_GDN_GATES_BATCH` | `1` | `STRIX_QPF2K_GDN_GATES_BATCH=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
-| `STRIX_QPF2K_GDN_CORE16` | `1` | `STRIX_QPF2K_GDN_CORE16=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
 | `STRIX_QPF2K_QSA` | `1` | `STRIX_QPF2K_QSA=0` | [QSA stages and stage batching](#qwen-qsa) |
 | `STRIX_QPF2K_QSA_MASK` | `0x2257` | `STRIX_QPF2K_QSA_MASK=0` | [QSA stages and stage batching](#qwen-qsa) |
 | `STRIX_QPF2K_HC` | `1` | `STRIX_QPF2K_HC=0` | [HC folds, output v3 and band 16](#qwen-hc) |
@@ -534,18 +533,18 @@ Reuses dense projection tiles across prompt rows while preserving the operand im
 
 ### GDN recurrence, gates batching and core16
 
-**Engine:** `qwen`. **Control:** `STRIX_QPF2K_GDN=1; STRIX_QPF2K_GDN_PARTS=55; STRIX_QPF2K_GDN_GATES_BATCH=1; STRIX_QPF2K_GDN_CORE16=1`. **Default:** auto.
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_GDN=1; STRIX_QPF2K_GDN_PARTS=55; STRIX_QPF2K_GDN_GATES_BATCH=1`. **Default:** auto.
 
-Uses the exact recurrence forms, batches gates and feeds eligible dense output directly from FP16 core rows.
+Uses the exact recurrence forms, batches gates and feeds eligible dense output directly from FP16 core rows through the tiled kPre projection path.
 
 - **Preconditions:** Eligible GDN prefill rows and supported lane/column shapes. Core16 additionally needs dense FP16 (not dense G64), tiled rows in multiples of 32, output site enabled, at least 2048 rows by default, value width 6144, head dimension 128, uniform core/output strides and a supported dense output site; graph capture declines it. The FP16 core consumer must be admitted before the producer drops FP32 rows.
-- **Automatic selection:** The initializer enables GDN, gates batching and core16; the GDN reader defaults PARTS to 55. Shape, check-mode and consumer guards retain the older forms.
+- **Automatic selection:** The initializer enables GDN and gates batching; eligible layouts use the core16 output path automatically; the GDN reader defaults PARTS to 55. Shape, check-mode and consumer guards retain the older forms.
 - **Core launch:** Cores default to plain launches on the caller's stream instead of the cooperative queue: on Linux 7.4, an eviction/restore of the process queues while a cooperative core ran could leave it waiting forever and hang prefill. Arrival tickets form value-head pairs in arrival order, so pairing does not depend on physical dispatch order. The two halves still exchange norm sums through a pair-local wait; tickets do not establish deadlock freedom under arbitrary preemption/restore. A single-workgroup core containing both halves, with no inter-block wait, is the follow-up.
 - **Launch policy:** `STRIX_QPF2K_GDN_COOP_LAUNCH=0` (or unset) selects plain; `=1` is the cooperative OFF arm. Both retain the historical cooperative-support, per-block occupancy and whole-grid capacity admission, so the policy changes only the launch call, not variant selection. Both retain ticket pairing. The value is read once per process; use a fresh process for each arm. `--print-effective-config` reports the requested environment value and effective `plain` / `cooperative` policy under `gdn_core_launch`.
 - **Fallback notice:** Ineligible forms fall back without a general decline line. Check modes retain FP32 core rows. Diagnostic output is QPF2K GDN check: ... differ ... or GDN prefill check: ... differ ....
 - **Exactness evidence:** STRIX_QPF2K_GDN_CHECK=1 and STRIX_GDN_PREFILL_CHECK=1 compare written bytes; require zero differences. Whole-engine receipts and operand-identity checks cover the qualified special-value/NaN order.
-- **Launch-change validation:** Linux 7.4, 16K YaRN prompt: 0 hangs in 8 runs (3 in 4 with the cooperative launch); terminal-logits fnv64 and tokens equal to the previous build at 16K and 32K in both launch arms; `STRIX_QPF2K_GDN_CHECK=1` differ 0 in both launch arms; 32K prefill unchanged (ABBA, +-0.0 %). These results describe the measured scope, not arbitrary preemption/restore safety. In fresh processes, `STRIX_QPF2K_GDN_CHECK=1` compares q/k, gates, FP32 core rows, conv history and recurrent state against production from identical inputs; require `differ 0` in both launch arms. It excludes CORE16. Coverage beyond the measured scope includes 8-row and Chunk-16 dispatch, four-column, plain/pipe/lean and witness routes, NaN-triggered fallback, and separate same-profile CORE16 output/logit/state checks.
-- **Off switch:** STRIX_QPF2K_GDN=0; independently STRIX_QPF2K_GDN_GATES_BATCH=0 or STRIX_QPF2K_GDN_CORE16=0 (one at a time); STRIX_QPF2K_GDN_CHUNK16=0 keeps the 8-row core ([Chunk-16 core](#qwen-gdn-chunk16))
+- **Launch-change validation:** Linux 7.4, 16K YaRN prompt: 0 hangs in 8 runs (3 in 4 with the cooperative launch); terminal-logits fnv64 and tokens equal to the previous build at 16K and 32K in both launch arms; `STRIX_QPF2K_GDN_CHECK=1` differ 0 in both launch arms; 32K prefill unchanged (ABBA, +-0.0 %). These results describe the measured scope, not arbitrary preemption/restore safety. In fresh processes, `STRIX_QPF2K_GDN_CHECK=1` compares q/k, gates, FP32 core rows, conv history and recurrent state against production from identical inputs; require `differ 0` in both launch arms. It excludes the core16 output projection. Coverage beyond the measured scope includes 8-row and Chunk-16 dispatch, four-column, plain/pipe/lean and witness routes, NaN-triggered fallback, and separate same-profile core16 output/logit/state checks.
+- **Off switch:** STRIX_QPF2K_GDN=0; independently STRIX_QPF2K_GDN_GATES_BATCH=0 (one at a time); STRIX_QPF2K_GDN_CHUNK16=0 keeps the 8-row core ([Chunk-16 core](#qwen-gdn-chunk16))
 - **Measured gain:** -
 - **Public evidence:** [Qwen results](performance.md#qwen-prefill-and-defaults)
 
@@ -2755,19 +2754,7 @@ per draft instead of a full-vocabulary scan and host exchange per step.
 
 ### v4 MoE prefill core
 
-**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_CORE`. **Default:** v4.
-
-Use v4 register/layout scheduling.
-
-- **Preconditions:** Supported prefill expert shapes and quantized weights.
-- **Automatic selection:** Resolver supplies v4 only when unset; explicit values win. Shape/core dispatch determines actual use.
-- **Fallback notice:** Unsupported operator geometry keeps its supported dispatch without a universal decline notice; invalid explicit settings fail validation.
-- **Exactness evidence:** Published same-identity qualification: Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
-- **Off switch:** STRIX_MMX_PREFILL_CORE=lib
-- **Measured gain:** Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib
-- **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
-
-<a id="mm-pf-msa-batch"></a>
+The v4 core path is the only MiniMax MoE prefill path.
 
 ### MSA prefill batching
 

@@ -195,18 +195,7 @@ __device__ __forceinline__ std::size_t tiled_at(unsigned R, unsigned ch, unsigne
     return ((static_cast<std::size_t>(R >> 4U) * (K >> 4U) + (ch >> 4U)) << 8U) + ((R & 15U) << 4U) + (ch & 15U);
 }
 
-__global__ __launch_bounds__(256) void gather_transform_kernel(const float* y, Tables t) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * 2 * kHB) return;
-    const unsigned p = q / (2 * kHB), rem = q % (2 * kHB), m = rem / kHB, b = rem % kHB;
-    const PGroup& g = t.groups[t.pair_group[p]];
-    const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    InputTransform::input_block(y + static_cast<std::size_t>(t.pair_row[p]) * kHidden, suh,
-                       t.xt + (static_cast<std::size_t>(m) * t.pairs + p) * kHidden, b * 128U, lane);
-}
-
-// v4: gather + input transform as gather_transform_kernel (transform_block's operation order), stored tile-major.
+// v4: gather + input transform (transform_block's operation order), stored tile-major.
 __global__ __launch_bounds__(256) void gather_transform_tiled_kernel(const float* y, Tables t) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const unsigned q = blockIdx.x * 8U + wave;
@@ -279,30 +268,6 @@ __device__ __forceinline__ void finish_block(const float* part, unsigned splits,
     return Epilogue::finish_block(part, splits, rows, row, output, b, svh, lane, v);
 }
 
-__global__ __launch_bounds__(256) void gate_up_finish_kernel(Tables t) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * kIB) return;
-    const unsigned p = q / kIB, b = q % kIB;
-    const PGroup& g = t.groups[t.pair_group[p]];
-    const unsigned i = p - g.pair_begin;
-    float gv[4], uv[4];
-    finish_block(t.part + g.part_gu, g.s_gu, g.n, i, kInter, b, g.w.gate.svh, lane, gv);
-    finish_block(t.part + g.part_gu + static_cast<std::size_t>(g.s_gu) * g.n * kInter, g.s_gu, g.n, i, kInter, b, g.w.up.svh, lane, uv);
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = b * 128 + lane + 32U * static_cast<unsigned>(j);
-        const float act = swiglu(gv[j], uv[j]);
-        const float scaled = InputTransform::scale(act, g.w.down.suh[c]);
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    InputTransform::h128(v, lane);
-    _Float16* out = t.at + static_cast<std::size_t>(p) * kInter;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) out[b * 128 + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
-}
-
 // Shared epilogue: preserve output transforms, SwiGLU and both FP16 conversions.
 __device__ __forceinline__ void gate_up_tiled_store(Tables t, const PGroup& g, unsigned p, unsigned i,
                                                   unsigned b, unsigned lane, const float (&gv)[4],
@@ -330,7 +295,7 @@ __device__ __forceinline__ void gate_up_tiled_store(Tables t, const PGroup& g, u
     for (int j = 0; j < 4; ++j) t.at[tiled_at(R, b * 128 + lane + 32U * static_cast<unsigned>(j), kInter)] = static_cast<_Float16>(v[j]);
 }
 
-// v4: gate_up_finish_kernel with the down input stored tile-major.
+// v4: gate/up finish with the down input stored tile-major.
 __global__ __launch_bounds__(256) void gate_up_finish_tiled_kernel(Tables t, bool fused, float* debug) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const unsigned q = blockIdx.x * 8U + wave;
@@ -661,10 +626,7 @@ unsigned prefill_tile() {
     return t;
 }
 
-// Prefill WMMA core: 0 = the library port above (wmma_item), 1 / 2 / 3 = mmx_prefill_core.hpp v2 /
-// v3 / v4 (same bits). STRIX_MMX_PREFILL_CORE=v4 (default) | v3 | v2 | lib sets the process default; set_prefill_core
-// overrides it (tests, ABA).
-int g_core_override = -1;
+// The v4 WMMA core is the sole prefill core path.
 int g_mtfit_override = -1;
 int g_core8_override = -1;
 int g_pipe_override = -1;
@@ -680,20 +642,6 @@ void* g_marker_user = nullptr;
 void mark(const char* label, hipStream_t stream) {
     if (g_marker != nullptr) g_marker(label, stream, g_marker_user);
 }
-unsigned prefill_core() {
-    if (g_core_override >= 0) return static_cast<unsigned>(g_core_override);
-    static const unsigned c = [] {
-        const char* e = std::getenv("STRIX_MMX_PREFILL_CORE");
-        // Default v4 (measurement: bitwise everywhere incl. every split partial; whole call 0.34-0.58x lib, 0.69-0.99x v3, 0.68-0.89x v2).
-        if (e == nullptr || std::string(e) == "v4") return 3U;
-        if (std::string(e) == "lib") return 0U;
-        if (std::string(e) == "v2") return 1U;
-        if (std::string(e) == "v3") return 2U;
-        throw std::invalid_argument("STRIX_MMX_PREFILL_CORE must be lib, v2, v3 or v4");
-    }();
-    return c;
-}
-
 bool prefill_mtfit_default() {
     static const bool on = [] {
         const char* e = std::getenv("STRIX_MMX_PREFILL_MTFIT");
@@ -792,12 +740,11 @@ struct V2Items {
     std::vector<pfk::Item> gu[8], dn[8], fused[8];
     unsigned gu_ctas[8] = {}, dn_ctas[8] = {}, fused_ctas[8] = {};
 };
-V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool tiled, bool mtfit, bool gufuse) {
+V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool mtfit, bool gufuse) {
     V2Items v;
     auto* xt = reinterpret_cast<_Float16*>(ws + p.off_xt);
     auto* at = reinterpret_cast<_Float16*>(ws + p.off_at);
     auto* part = reinterpret_cast<float*>(ws + p.off_part);
-    const std::size_t P = p.pair_row.size();
     for (const PGroup& g : p.groups) {
         const unsigned cls = pfk::mt_class(g.n), tm = 16U * pfk::mt_of_class(cls);
         const bool fuse = gufuse && g.s_gu == 1;
@@ -820,20 +767,19 @@ V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool tiled, bool mtfit, 
                     lists[c].push_back(up);
                 }
             };
-            if (tiled && mtfit) {
+            if (mtfit) {
                 const auto fit = route::mtfit(g.n);
                 if (fit.main != 0) emit(7, 0, fit.main);
                 if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
             } else {
-                emit(tiled ? pfk::mt_of_class(cls) - 1 : cls, 0, (g.n + tm - 1) / tm);
+                emit(pfk::mt_of_class(cls) - 1, 0, (g.n + tm - 1) / tm);
             }
         };
         for (unsigned m = 0; m < (fuse ? 1U : 2U); ++m) {
             const Exl3& w = m == 0 ? g.w.gate : g.w.up;
             pfk::Item it{};
             it.trellis = w.trellis;
-            it.x = tiled ? xt + (static_cast<std::size_t>(m) * p.tpairs + g.tbegin) * kHidden
-                         : xt + (static_cast<std::size_t>(m) * P + g.pair_begin) * kHidden;
+            it.x = xt + (static_cast<std::size_t>(m) * p.tpairs + g.tbegin) * kHidden;
             it.part = part + g.part_gu + static_cast<std::size_t>(m) * g.s_gu * g.n * kInter;
             it.input = kHidden;
             it.output = kInter;
@@ -845,7 +791,7 @@ V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool tiled, bool mtfit, 
         }
         pfk::Item it{};
         it.trellis = g.w.down.trellis;
-        it.x = at + static_cast<std::size_t>(tiled ? g.tbegin : g.pair_begin) * kInter;
+        it.x = at + static_cast<std::size_t>(g.tbegin) * kInter;
         it.part = part + g.part_dn;
         it.input = kInter;
         it.output = kHidden;
@@ -919,56 +865,37 @@ void launch_pipe_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipS
         hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
 }
 
-template <int V>
 void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false) {
-    if constexpr (V == 4) {
-        if (cls == 7 && prefill_pipe() != 0) {
-            const bool simplify = prefill_pipe() == 2;
-            if (prefill_p1_packed())
-                launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
-            else
-                launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
-            return;
-        }
-        if (cls == 7 && prefill_core8() != 0) {
-            if (prefill_core8() == 1)
-                hipLaunchKernelGGL((pfk::grouped_core8_kernel<1>), dim3(ctas), dim3(128), 0, stream, items_d, n);
-            else
-                hipLaunchKernelGGL((pfk::grouped_core8_kernel<2>), dim3(ctas), dim3(128), 0, stream, items_d, n);
-            return;
-        }
-        switch (cls) {
-            case 0: hipLaunchKernelGGL((pfk::grouped_kernel<1, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 1: hipLaunchKernelGGL((pfk::grouped_kernel<2, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 2: hipLaunchKernelGGL((pfk::grouped_kernel<3, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 3: hipLaunchKernelGGL((pfk::grouped_kernel<4, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 4: hipLaunchKernelGGL((pfk::grouped_kernel<5, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 5: hipLaunchKernelGGL((pfk::grouped_kernel<6, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 6: hipLaunchKernelGGL((pfk::grouped_kernel<7, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 7: hipLaunchKernelGGL((pfk::grouped_kernel<8, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        }
+    if (cls == 7 && prefill_pipe() != 0) {
+        const bool simplify = prefill_pipe() == 2;
+        if (prefill_p1_packed())
+            launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
+        else
+            launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
+        return;
+    }
+    if (cls == 7 && prefill_core8() != 0) {
+        if (prefill_core8() == 1)
+            hipLaunchKernelGGL((pfk::grouped_core8_kernel<1>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        else
+            hipLaunchKernelGGL((pfk::grouped_core8_kernel<2>), dim3(ctas), dim3(128), 0, stream, items_d, n);
         return;
     }
     switch (cls) {
-        case 0: hipLaunchKernelGGL((pfk::grouped_kernel<1, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 1: hipLaunchKernelGGL((pfk::grouped_kernel<2, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 2: hipLaunchKernelGGL((pfk::grouped_kernel<4, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        default: hipLaunchKernelGGL((pfk::grouped_kernel<8, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 0: hipLaunchKernelGGL((pfk::grouped_kernel<1, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 1: hipLaunchKernelGGL((pfk::grouped_kernel<2, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 2: hipLaunchKernelGGL((pfk::grouped_kernel<3, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 3: hipLaunchKernelGGL((pfk::grouped_kernel<4, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 4: hipLaunchKernelGGL((pfk::grouped_kernel<5, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 5: hipLaunchKernelGGL((pfk::grouped_kernel<6, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 6: hipLaunchKernelGGL((pfk::grouped_kernel<7, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 7: hipLaunchKernelGGL((pfk::grouped_kernel<8, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
     }
 }
-// core: 1 = v2, 2 = v3, 3 = v4, 8 / 9 = v3 diagnostics (no A loads / no decode); pair = this MoE call's paired MT8 PIPE bands
-void launch_v2(const pfk::Item* items_d, const std::vector<pfk::Item>& list, unsigned ctas, unsigned cls, unsigned core, hipStream_t stream,
-               bool pair) {
+// pair = this MoE call's paired MT8 PIPE bands
+void launch_v2(const pfk::Item* items_d, const std::vector<pfk::Item>& list, unsigned ctas, unsigned cls, hipStream_t stream, bool pair) {
     if (list.empty()) return;
-    const auto n = static_cast<unsigned>(list.size());
-    switch (core) {
-        case 1: launch_class<2>(items_d, n, ctas, cls, stream); break;
-        case 2: launch_class<3>(items_d, n, ctas, cls, stream); break;
-        case 3: launch_class<4>(items_d, n, ctas, cls, stream, pair); break;
-        case 8: launch_class<31>(items_d, n, ctas, cls, stream); break;
-        case 9: launch_class<32>(items_d, n, ctas, cls, stream); break;
-        default: throw std::invalid_argument("minimax prefill moe: unknown core " + std::to_string(core));
-    }
+    launch_class(items_d, static_cast<unsigned>(list.size()), ctas, cls, stream, pair);
 }
 
 template <int MT>
@@ -1063,10 +990,6 @@ void cleanup_prefill_table_ring() noexcept {
     g_table_next = 0;
 }
 
-void set_prefill_core(int core) {  // exact cores only
-    if (core < -1 || core > 3) throw std::invalid_argument("set_prefill_core: core must be -1, 0, 1, 2 or 3");
-    g_core_override = core;
-}
 void set_prefill_mtfit(int on) {
     if (on < -1 || on > 1) throw std::invalid_argument("set_prefill_mtfit: value must be -1, 0 or 1");
     (void)prefill_mtfit_default();  // capture the environment once, including at Engine startup
@@ -1117,10 +1040,6 @@ void set_prefill_gufuse_debug(bool on, float* intermediates, bool producer_only)
     g_gufuse_intermediates = intermediates;
     g_gufuse_producer_only = producer_only;
 }
-void set_prefill_diagnostic_core(int core) {  // bench only: wrong outputs by design
-    if (core != 8 && core != 9) throw std::invalid_argument("set_prefill_diagnostic_core: core must be 8 or 9");
-    g_core_override = core;
-}
 void set_prefill_marker(PrefillMarker marker, void* user) {
     g_marker = marker;
     g_marker_user = user;
@@ -1164,10 +1083,8 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     auto* ws = static_cast<unsigned char*>(workspace);
     const bool i4 = v.i4 != nullptr && v.i4->on();
     if (i4 && !iu4_built()) throw std::invalid_argument("minimax prefill moe: fast_i4 layer but no IU4 core in this build");
-    const unsigned core = i4 ? 3U : prefill_core();
-    const bool pair = core == 3 && prefill_pipe_pair(v.rows);
-    const bool gufuse = core == 3 && v.rows > 8 && prefill_gufuse();
-    const bool v2 = core != 0;  // the grouped v2 item layout (v2, v3 and the v3 diagnostics)
+    const bool pair = prefill_pipe_pair(v.rows);
+    const bool gufuse = v.rows > 8 && prefill_gufuse();
     V2Items v2i;
     std::vector<WItem> items;
     std::vector<pfk::Item> items2;  // gate/up classes, then down classes (same table region)
@@ -1181,17 +1098,11 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             items = p.dn_items16;
             items.insert(items.end(), p.dn_items64.begin(), p.dn_items64.end());
         }
-    } else if (v2) {
-        v2i = fill_items_v2(p, ws, core == 3, core == 3 && prefill_mtfit(), gufuse);
+    } else {
+        v2i = fill_items_v2(p, ws, prefill_mtfit(), gufuse);
         for (unsigned c = 0; c < 8; ++c) items2.insert(items2.end(), v2i.gu[c].begin(), v2i.gu[c].end());
         for (unsigned c = 0; c < 8; ++c) items2.insert(items2.end(), v2i.fused[c].begin(), v2i.fused[c].end());
         for (unsigned c = 0; c < 8; ++c) items2.insert(items2.end(), v2i.dn[c].begin(), v2i.dn[c].end());
-    } else {
-        fill_items(p, ws);
-        // Tables: groups, pairs, tokens, items (gate/up, then down tile 16, then down tile 64).
-        items = p.gu_items;
-        items.insert(items.end(), p.dn_items16.begin(), p.dn_items16.end());
-        items.insert(items.end(), p.dn_items64.begin(), p.dn_items64.end());
     }
     TableSlot* slot = table_ring() ? &next_table_slot(v.rows, i4 && !v.i4_all ? kI4GroupTableBytes : 0U) : nullptr;
     if (slot != nullptr && p.off_xt > slot->capacity) throw std::runtime_error("minimax prefill moe: table bound exceeded");
@@ -1214,8 +1125,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             copy(p.off_i4_groups, i4_groups.data(), i4_groups.size() * sizeof(i4_groups[0]), "iu4 groups");
             if (!v.i4_all) copy(p.off_items, items.data(), items.size() * sizeof(WItem), "iu4 EXL3 down items");
         }
-        else if (v2) copy(p.off_items, items2.data(), items2.size() * sizeof(pfk::Item), "items");
-        else copy(p.off_items, items.data(), items.size() * sizeof(WItem), "items");
+        else copy(p.off_items, items2.data(), items2.size() * sizeof(pfk::Item), "items");
         if (slot != nullptr) {
             ok(hipEventRecord(slot->copied, stream), "table copies event");
             slot->pending = true;
@@ -1240,7 +1150,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     t.rows = v.rows;
     t.shared_group = static_cast<unsigned>(p.groups.size() - 1);
     t.tpairs = p.tpairs;
-    t.fakeq = !i4 && core == 3 && prefill_fakeq_a4() ? 1U : 0U;
+    t.fakeq = !i4 && prefill_fakeq_a4() ? 1U : 0U;
 #if STRIX_MMX_IU4_LIB
     if (i4) {
         mark("start", stream);
@@ -1248,21 +1158,16 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
         return;
     }
 #endif
-    const bool tiled = core == 3;
-    const auto* items_d = reinterpret_cast<const WItem*>(ws + p.off_items);
-    const auto n_gu = static_cast<unsigned>(p.gu_items.size()), n16 = static_cast<unsigned>(p.dn_items16.size()),
-               n64 = static_cast<unsigned>(p.dn_items64.size());
     mark("start", stream);
-    if (tiled && prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
-    else if (tiled) hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
-    else hipLaunchKernelGGL(gather_transform_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    if (prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     launched("gather transform");
     mark("gather", stream);
-    if (v2) {
+    {
         const auto* it_d = reinterpret_cast<const pfk::Item*>(ws + p.off_items);
         std::size_t at = 0;
         // One stage's class launches; with the tail stream, classes 0..6 go to the side stream beside class 7.
-        const bool tail_stream = core == 3 && prefill_mtfit() && prefill_tail_stream();
+        const bool tail_stream = prefill_mtfit() && prefill_tail_stream();
         auto stage = [&](const std::vector<pfk::Item>* lists, const unsigned* ctas, const char* const* labels) {
             bool tails = false;
             for (unsigned c = 0; c < 7; ++c) tails = tails || !lists[c].empty();
@@ -1271,13 +1176,13 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             std::size_t c_at = at;
             try {
                 for (unsigned c = 0; c < 7 && side; ++c) {
-                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, g_tail_side, pair);
+                    launch_v2(it_d + c_at, lists[c], ctas[c], c, g_tail_side, pair);
                     c_at += lists[c].size();
                 }
                 for (unsigned c = side ? 7U : 0U; c < 8; ++c) {
-                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, stream, pair);
+                    launch_v2(it_d + c_at, lists[c], ctas[c], c, stream, pair);
                     c_at += lists[c].size();
-                    if (!lists[c].empty()) mark(labels[core == 3 ? c : pfk::mt_of_class(c) - 1], stream);
+                    if (!lists[c].empty()) mark(labels[c], stream);
                 }
             } catch (...) {
                 if (side) tail_join(stream);  // side work stays inside the caller's completion chain
@@ -1298,8 +1203,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             at += v2i.fused[c].size();
         }
         launched("gate/up v2");
-        if (tiled) hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, gufuse && !g_gufuse_producer_only, g_gufuse_intermediates);
-        else hipLaunchKernelGGL(gate_up_finish_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t);
+        hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, gufuse && !g_gufuse_producer_only, g_gufuse_intermediates);
         launched("gate/up finish");
         mark("finish", stream);
         stage(v2i.dn, v2i.dn_ctas, kDnLabel);
@@ -1307,29 +1211,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
         hipLaunchKernelGGL(down_combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
         launched("down combine");
         mark("combine", stream);
-        return;
     }
-    const bool big = prefill_tile() == 128;  // every item then sits in the 'tile 64' list of the down stage
-    if (big) hipLaunchKernelGGL(wmma_grouped_kernel<128>, dim3(p.gu_ctas), dim3(128), 0, stream, items_d, n_gu);
-    else hipLaunchKernelGGL(wmma_grouped_kernel<16>, dim3(p.gu_ctas), dim3(128), 0, stream, items_d, n_gu);
-    launched("gate/up");
-    mark("gate_up", stream);
-    hipLaunchKernelGGL(gate_up_finish_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t);
-    launched("gate/up finish");
-    mark("finish", stream);
-    if (n16 > 0) {
-        hipLaunchKernelGGL(wmma_grouped_kernel<16>, dim3(p.dn_ctas16), dim3(128), 0, stream, items_d + n_gu, n16);
-        launched("down 16");
-    }
-    if (n64 > 0) {
-        if (big) hipLaunchKernelGGL(wmma_grouped_kernel<128>, dim3(p.dn_ctas64), dim3(128), 0, stream, items_d + n_gu + n16, n64);
-        else hipLaunchKernelGGL(wmma_grouped_kernel<64>, dim3(p.dn_ctas64), dim3(128), 0, stream, items_d + n_gu + n16, n64);
-        launched("down 64");
-    }
-    mark("down", stream);
-    hipLaunchKernelGGL(down_combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
-    launched("down combine");
-    mark("combine", stream);
 }
 
 namespace {
@@ -1458,7 +1340,7 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
     hipLaunchKernelGGL(dense_transform_kernel, dim3((rows * (p.k / 128) + 7) / 8), dim3(256), 0, stream, x, a);
     launched("dense transform");
     for (unsigned c = 0; c < 8; ++c)
-        if (!lists[c].empty()) launch_class<4>(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
+        if (!lists[c].empty()) launch_class(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
     launched("dense v4");
     hipLaunchKernelGGL(dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
     launched("dense finish");

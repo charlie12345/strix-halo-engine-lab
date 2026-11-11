@@ -462,6 +462,38 @@ void test_queue_wait_work_until() {
     }
 }
 
+// GenerationTicket::wake ends one wait() without tokens (set before the wait counts, so no lost wakeup), and a
+// cancelled ticket waited with wake_on_cancel=false blocks until the finish instead of returning at once.
+void test_ticket_wake() {
+    using namespace std::chrono_literals;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    GenerationQueue queue;
+    GenerationJob job;
+    job.prompt = {1U};
+    const auto ticket = queue.submit(std::move(job));
+    check(ticket != nullptr, "ticket wake submit");
+    bool done = true;
+    ticket->wake();
+    auto t0 = now();
+    check(ticket->wait(10s, done).empty() && !done && now() - t0 < 5s, "wake before wait ends the next wait");
+    t0 = now();
+    (void)ticket->wait(20ms, done);
+    check(!done && now() - t0 >= 20ms, "a consumed wake does not end later waits");
+    std::thread waker([&] { std::this_thread::sleep_for(30ms); ticket->wake(); });
+    t0 = now();
+    (void)ticket->wait(10s, done);
+    waker.join();
+    check(!done && now() - t0 < 5s, "wake from another thread ends the wait");
+    ticket->cancel();
+    t0 = now();
+    (void)ticket->wait(20ms, done, false);
+    check(!done && now() - t0 >= 20ms, "cancelled ticket without wake_on_cancel keeps waiting");
+    t0 = now();
+    (void)ticket->wait(10s, done);
+    check(now() - t0 < 5s, "cancelled ticket with wake_on_cancel returns at once");
+    queue.shutdown();
+}
+
 // Destroying a cancelled job's token callback acts as a deterministic producer between
 // cleanup iterations. It stays armed until take returns, with a hard cap so regressions fail.
 void test_queue_cancel_replenishment() {
@@ -1088,6 +1120,7 @@ int main() try {
     }
     test_batched_queue();
     test_queue_wait_work_until();
+    test_ticket_wake();
     test_queue_caller_orders();
     test_queue_cancel_replenishment();
     const auto tokenizer = tiny_tokenizer();

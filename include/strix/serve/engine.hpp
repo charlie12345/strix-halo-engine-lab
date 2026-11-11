@@ -211,6 +211,9 @@ public:
     // wake_on_cancel false: a cancellation does not end the wait (a caller that cancelled waits for the finish)
     std::vector<std::uint32_t> wait(std::chrono::milliseconds timeout, bool& done, bool wake_on_cancel = true);
     // Wait without consuming tokens until session admission or completion.
+    // Ends the current (or next) wait() without tokens: an engine that hands output to the HTTP thread by another
+    // path (Gemma4's batched deltas) wakes it instead of the HTTP thread polling.
+    void wake();
     bool wait_admission(std::chrono::milliseconds timeout);
     void admit();
     [[nodiscard]] GenerationProgress progress() const;
@@ -238,6 +241,7 @@ private:
     std::string error_;
     bool admitted_ = false;
     bool done_ = false;
+    bool woken_ = false;
     std::atomic<bool> cancelled_{false};
     bool observed_ = false;
     std::uint64_t submitted_queue_position_ = 0;

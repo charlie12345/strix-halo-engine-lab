@@ -123,9 +123,12 @@ struct Api::Impl final : strix::serve::GenerationEngine {
         ChatResult result;
         ChatSink sink;
         std::atomic<bool> cancelled{false};
-        // Continuous batching: deltas the batcher produced, written to the client by the handler thread.
+        // Continuous batching: deltas the batcher produced, written to the client by the handler thread, which the
+        // batcher wakes through the ticket (set under deltas_mutex once submitted; deltas buffered before are drained
+        // ahead of the first wait).
         std::mutex deltas_mutex;
         std::vector<gemma4::serve::OutputDelta> deltas;
+        std::shared_ptr<strix::serve::GenerationTicket> ticket;
     };
     Backend& backend;
     gemma4::serve::Adapter adapter;
@@ -440,8 +443,13 @@ struct Api::Impl final : strix::serve::GenerationEngine {
                 };
                 // Batched: the batcher only buffers; this thread writes, so a slow client never stalls other jobs.
                 task->sink = batched ? ChatSink([task = task.get()](const gemma4::serve::OutputDelta& delta) {
-                    std::lock_guard lock(task->deltas_mutex);
-                    task->deltas.push_back(delta);
+                    std::shared_ptr<strix::serve::GenerationTicket> ticket;
+                    {
+                        std::lock_guard lock(task->deltas_mutex);
+                        task->deltas.push_back(delta);
+                        ticket = task->ticket;
+                    }
+                    if (ticket) ticket->wake();
                     return !task->cancelled.load();
                 }) : emit;
             }
@@ -456,14 +464,17 @@ struct Api::Impl final : strix::serve::GenerationEngine {
             const auto ticket = queue.submit(std::move(job));
             if (!ticket) { failure_status = 503; throw std::runtime_error("generation queue is full or shutting down"); }
             failure_status = 500;
+            { std::lock_guard lock(task->deltas_mutex); task->ticket = ticket; }
+            // Woken by each batched delta and by the finish; the 50 ms bound only paces the client-gone check.
             bool done = false;
             for (;;) {
-                (void)ticket->wait(std::chrono::milliseconds(batched && streaming ? 5 : 50),done,false);
                 drain();
                 if (writer.client_gone() || task->cancelled) { task->cancelled = true; ticket->cancel(); }
                 if (done) break;
+                (void)ticket->wait(std::chrono::milliseconds(50),done,false);
             }
             drain();
+            { std::lock_guard lock(task->deltas_mutex); task->ticket.reset(); }
             { std::lock_guard lock(mutex); tasks.erase(task_id); }
             if (!ticket->error().empty()) throw std::runtime_error(ticket->error());
             if (writer.client_gone()) return;

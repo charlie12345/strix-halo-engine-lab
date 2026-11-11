@@ -24,10 +24,12 @@ template<class Binding> STRIX_I4_INLINE auto suh_of(const Binding& b,unsigned e,
 template<class Ops,class Binding,unsigned N>
 STRIX_I4_INLINE void input_values(const Binding& b,unsigned expert,unsigned pair,unsigned m,unsigned col,float (&v)[N],const float* cached=nullptr) {
     const auto suh=suh_of(b,expert,m);
+    float s[N];   // all scale loads first: none waits behind another value's arithmetic
+    for(unsigned j=0;j<N;++j) s[j]=suh(col+Ops::channel(j));
     for(unsigned j=0;j<N;++j) {
         const unsigned c=col+Ops::channel(j);
         const float x=cached ? cached[j] : b.x[static_cast<unsigned long long>(b.token(pair))*Binding::H+c];
-        v[j]=Ops::round16(Ops::materialize(x*suh(c)));
+        v[j]=Ops::round16(Ops::materialize(x*s[j]));
     }
     Ops::transform(v);
     for(unsigned j=0;j<N;++j) v[j]=Ops::round16(v[j]);
@@ -35,10 +37,9 @@ STRIX_I4_INLINE void input_values(const Binding& b,unsigned expert,unsigned pair
 template<class Ops,class Binding,unsigned N>
 STRIX_I4_INLINE void activation_values(const Binding& b,unsigned expert,unsigned col,const float (&g)[N],const float (&u)[N],float (&v)[N]) {
     const auto suh=suh_of(b,expert,2);
-    for(unsigned j=0;j<N;++j) {
-        const unsigned c=col+Ops::channel(j);
-        v[j]=Ops::round16(Ops::materialize(b.activation(g[j],u[j])*suh(c)));
-    }
+    float s[N];
+    for(unsigned j=0;j<N;++j) s[j]=suh(col+Ops::channel(j));
+    for(unsigned j=0;j<N;++j) v[j]=Ops::round16(Ops::materialize(b.activation(g[j],u[j])*s[j]));
     Ops::transform(v);
     for(unsigned j=0;j<N;++j) v[j]=Ops::round16(v[j]);
 }

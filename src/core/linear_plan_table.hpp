@@ -5,7 +5,7 @@
 // bucket ends) and faster at both bucket ends by at least the noise margin.
 // `gain` is the smaller of the two end speed-ups (legacy_us / tile_us).
 // Rows not listed here, and any shape not listed, run the legacy plan.
-// Device: gfx1151 (20 WGP / 40 CU), cluster1, 2026-11-10 00:00-00:07 CET, tickets fable-trsel-ptA/ptB, default fused mode, 22 launches x 2 passes per cell, margin 1.03.
+// Device: gfx1151 (20 WGP / 40 CU), 2026-11-10, default fused mode, 22 launches x 2 passes per cell, margin 1.03.
 namespace strix::core {
 struct MeasuredPlan { int input, output, bits, codebook, m_lo, m_hi, tile; float gain; };
 inline constexpr MeasuredPlan measured_plans[] = {
@@ -29,7 +29,7 @@ inline constexpr MeasuredPlan measured_plans[] = {
     {5120, 1152, 5, 2, 129, 256, 0, 1.519f},
     {5120, 1280, 4, 2, 128, 128, 3, 2.310f},
     {5120, 1280, 4, 2, 129, 256, 2, 1.507f},
-    // GLM-5.3 dense shapes (K6, tile 3 = 128x64 is legal only for unfused callers): cluster1 2026-11-10 ticket main-coreport-lt, STRIX_BENCH_REPS=12, margin 1.03.
+    // GLM-5.3 dense shapes (K6, tile 3 = 128x64 is legal only for unfused callers): gfx1151 2026-11-10, STRIX_BENCH_REPS=12, margin 1.03.
     {4096, 6144, 6, 2, 128, 128, 0, 1.393f},
     {4096, 6144, 6, 2, 129, 256, 0, 1.217f},
     {6144, 4096, 6, 2, 128, 128, 0, 1.073f},

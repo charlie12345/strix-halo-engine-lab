@@ -223,7 +223,7 @@ template<int Tile, bool Transform> hipError_t launch_grouped(const IU4GroupedOpe
     gp.a_mul = o.a_mul; gp.a_add = o.a_add; gp.o_mul = o.o_mul; gp.o_add = o.o_add;
     grouped_kernel<Tile, Transform>()<<<dim3{unsigned(blocks)}, G::threads, 0, stream>>>(
         reinterpret_cast<const uint32_t*>(o.w_q), nullptr, Transform ? nullptr : output, inputs, outputs, 0, 1,
-        nullptr, nullptr, Transform ? output : nullptr, 1.f, 0.f, 1, o.a_q, o.a_scale, o.w_scale, nullptr, gp, NoAdapter{});
+        nullptr, nullptr, Transform ? output : nullptr, 1.f, 0.f, 1, o.a_q, o.a_scale, o.w_scale, nullptr, gp, NoAdapter{}, NoChain{});
     return hipGetLastError();
 }
 // EXL3 -> IU4 g64 pack (the engines' iu4_convert_kernel with the shared requantisation).

@@ -541,6 +541,12 @@ struct Engine::Impl {
     // Only enqueue_prefill_moe uses this workspace, always on the default stream, including interleaved chunks.
     void* pf_ws = nullptr;
     std::size_t pf_ws_bytes = 0;
+    void* i4_group_arena=nullptr;
+    float *i4_group_x=nullptr,*i4_group_out=nullptr;
+    std::uint32_t* i4_group_routes=nullptr;
+    void* i4_group_ws=nullptr;
+    std::size_t i4_group_ws_bytes=0;
+    static constexpr unsigned kI4GroupRows=8192;
     //: prefill exchange module (pf_active only inside prefill()) and the chunk-interleaved schedule
     strix::minimax::pfx::Exchanger* pf = nullptr;
     bool pf_on = false, pf_active = false, pf_interleave = true;  // interleave ON by default (measurement: exact, 8K -11.5 %)
@@ -592,6 +598,8 @@ struct Engine::Impl {
         moe::opt::cleanup_prefill_table_ring();
         moe::opt::cleanup_prefill_dense();
         moe::opt::cleanup_prefill_tail_stream();
+        moe::opt::cleanup_prefill_device_plan();
+        if(i4_group_arena) (void)hipFree(i4_group_arena);
         for (auto* ptr : {nest_bank.h, nest_bank.hn, nest_bank.taps}) if (ptr) (void)hipFree(ptr);
         for (auto* events : {&idx_fork, &idx_join, &xb_attn_ev, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
             for (hipEvent_t ev : *events)
@@ -1102,6 +1110,26 @@ struct Engine::Impl {
             if (model_fast_i4) pf_ws_bytes += mmoe::kI4GroupTableBytes;  // IU4 groups beside gate_up EXL3 down items
             hip_ok(hipMalloc(&pf_ws, pf_ws_bytes), "prefill moe workspace");
         }
+        // The 8192-row grouped call is opt-in (STRIX_MOE_I4_CHAIN_GROUP=1): one call per layer waits for every chunk's
+        // attention exchange before any MoE output is sent, which exposed ~26 ms/layer of TP2 exchange wait at 8K
+        // (the per-chunk calls overlap chunk c's MoE with chunk c-1's exchange). Same bits either way.
+        if(model_fast_i4 && moe_opt && mmoe::prefill_i4_chain() && i4_scope==fast_i4::Scope::all &&
+           env_flag("STRIX_MOE_I4_CHAIN_GROUP", false) && mmoe::prefill_moe_device_plan(kI4GroupRows) && !pf_table_stats) {
+            i4_group_ws_bytes=mmoe::prefill_i4_workspace_bound(kI4GroupRows);
+            const std::size_t hidden_bytes=std::size_t(kI4GroupRows)*kHidden*4;
+            const std::size_t route_bytes=std::size_t(kI4GroupRows)*kTopE*8;
+            const auto status=hipMalloc(&i4_group_arena,2*hidden_bytes+route_bytes+i4_group_ws_bytes);
+            if(status==hipSuccess) {
+                auto* base=static_cast<unsigned char*>(i4_group_arena);
+                i4_group_x=reinterpret_cast<float*>(base);
+                i4_group_out=reinterpret_cast<float*>(base+hidden_bytes);
+                i4_group_routes=reinterpret_cast<std::uint32_t*>(base+2*hidden_bytes);
+                i4_group_ws=base+2*hidden_bytes+route_bytes;
+            } else if(status==hipErrorOutOfMemory) {
+                (void)hipGetLastError();
+                std::fprintf(stderr,"minimax i4 chain: 8192-row arena unavailable; preserving chunk calls\n");
+            } else hip_ok(status,"i4 grouped arena");
+        }
         hip_ok(hipEventCreateWithFlags(&routes_ready, hipEventDisableTiming), "route event");
         if (fp32_prefill) {  // FP32 identity workspaces: expert pairs (T x 4 rows) at the widest site
             const std::size_t pairs = T * kTopE;
@@ -1351,13 +1379,19 @@ struct Engine::Impl {
     }
 
     // The post-exchange kernel on a prefill module view: rank 0's / rank 1's partials read in place from the TX / RX slots.
+    // Optional destinations (all three or none) redirect the normed rows, route ids and route weights, e.g. straight into
+    // the grouped MoE arena; the kernel and its math are unchanged, only the store addresses move.
     void post_view(std::size_t n, const strix::minimax::pfx::Exchanger::View& x, const float* norm_w, const float* router_w,
-                   const float* bias) {
+                   const float* bias, float* hn_dst = nullptr, std::uint32_t* ids_dst = nullptr, float* wts_dst = nullptr) {
         const auto* local = static_cast<const float*>(x.local);
         const auto* peer = static_cast<const float*>(x.peer);
         wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
+        const bool redirect = hn_dst != nullptr;
+        if (redirect != (ids_dst != nullptr) || redirect != (wts_dst != nullptr))
+            throw std::logic_error("minimax post_view: redirect needs all three destinations");
         enqueue_post({static_cast<std::uint32_t>(n), h, opt.rank == 0 ? local : peer, opt.rank == 0 ? peer : local,
-                                         norm_w, hn, router_w, bias, ids_d, wts4_d}, nullptr);
+                                         norm_w, redirect ? hn_dst : hn, router_w, bias, redirect ? ids_dst : ids_d,
+                                         redirect ? wts_dst : wts4_d}, nullptr);
         if (pf_active) pf->retire();  // the only consumer of both slots is enqueued
     }
 
@@ -1907,6 +1941,25 @@ struct Engine::Impl {
                 f32_jobs_used = 0;
                 lap(prof.route_host);
                 f32_moe(y, n, out);
+            } else if (moe_opt && !pf_table_stats && (prefill_i4 == nullptr || (i4_scope == fast_i4::Scope::all && mmoe::prefill_i4_chain())) && mmoe::prefill_moe_device_plan(static_cast<std::uint32_t>(n))) {
+                // prefill, device plan (default): routes stay on the device, the shared moe_core planner builds the
+                // tables on the stream; no host sync per MoE layer. Same bits as the host plan below
+                // (STRIX_MMX_PF_PLAN=host, or profiling / STRIX_MM_PF_TABLE_STATS, which measure the host plan).
+                mmoe::PrefillMoeDeviceView pv;
+                pv.rows = static_cast<std::uint32_t>(n);
+                pv.y = hn;
+                pv.routes = route_d;
+                pv.i4 = prefill_i4;
+                pv.i4_all = i4_scope == fast_i4::Scope::all;
+                pv.experts = y.experts_raw_d;
+                pv.shared = y.shared_raw;
+                pv.out = out;
+                struct TimelineMoe {
+                    bool on;
+                    ~TimelineMoe() { if (on) mmoe::set_prefill_marker(nullptr, nullptr); }
+                } timeline_moe{tl != nullptr};
+                if (tl) mmoe::set_prefill_marker(PrefillTimeline::moe_mark, tl);
+                mmoe::enqueue_prefill_moe_device(pv, pf_ws, pf_ws_bytes, nullptr);
             } else if (moe_opt) {  // prefill / gate: grouped launches with the G4 strix_gemm identity
                 hip_ok(hipMemcpyAsync(route_h, route_d, n * kTopE * 8, hipMemcpyDeviceToHost, nullptr), "routes");
                 hip_ok(hipStreamSynchronize(nullptr), "routes");
@@ -2181,6 +2234,7 @@ struct Engine::Impl {
                 pf_active = false;
                 hip_ok(hipDeviceSynchronize(), "prefill");
                 if (model_fast_i4) jit_collect(true);
+                mmoe::prefill_moe_device_check();  // invalid routes met by a device-planned MoE call (failed exchange)
                 if (tl) tl->report(opt.rank);
                 tl = nullptr;
                 ++prof.calls;
@@ -2446,16 +2500,41 @@ struct Engine::Impl {
                 send(c, 0, L, o);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            const bool chain_group=i4!=nullptr && y.moe && i4_group_arena && toks.size()<=kI4GroupRows;
+            std::size_t group_first=0;
             for (std::size_t c = 0; c < m; ++c) {
                 use(c);
                 const auto view = recv(c);
                 if (tl) tl->mark("attention-post-router", true);
-                post_view(N[c], view, y.w_post, y.wr, y.wb);
+                // Grouped chain: the post kernel stores normed rows, ids and weights straight into the arena (no D2D copies).
+                if(chain_group)
+                    post_view(N[c], view, y.w_post, y.wr, y.wb, i4_group_x+group_first*kHidden, i4_group_routes+group_first*kTopE,
+                              reinterpret_cast<float*>(i4_group_routes+(toks.size()+group_first)*kTopE));
+                else
+                    post_view(N[c], view, y.w_post, y.wr, y.wb);
                 last_read(c);
                 if (tl) tl->mark("attention-post-router", false);
-                float* o = out_of(c);
-                stage_ffn(L, N[c], o, i4);
-                send(c, 1, L, o);
+                if(chain_group) {
+                    group_first+=N[c];
+                } else {
+                    float* o=out_of(c);
+                    stage_ffn(L,N[c],o,i4);
+                    send(c,1,L,o);
+                }
+            }
+            if(chain_group) {
+                mmoe::PrefillMoeDeviceView pv;
+                pv.rows=static_cast<unsigned>(toks.size()); pv.y=i4_group_x; pv.routes=i4_group_routes;
+                pv.experts=y.experts_raw_d; pv.shared=y.shared_raw; pv.out=i4_group_out; pv.i4=i4; pv.i4_all=true;
+                mmoe::enqueue_prefill_moe_device(pv,i4_group_ws,i4_group_ws_bytes,nullptr);
+                group_first=0;
+                for(std::size_t c=0;c<m;++c) {
+                    use(c);
+                    float* o=out_of(c);
+                    hip_ok(hipMemcpyAsync(o,i4_group_out+group_first*kHidden,N[c]*kHidden*4,hipMemcpyDeviceToDevice,nullptr),"group output");
+                    send(c,1,L,o);
+                    group_first+=N[c];
+                }
             }
             if (i4 != nullptr) jit_release(L);
         }

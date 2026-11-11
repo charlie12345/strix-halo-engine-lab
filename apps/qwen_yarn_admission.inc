@@ -9,7 +9,7 @@ inline YarnEnvironmentPath yarn_environment_path(qpf2k::Item item) {
         // hip_indexed_attention_launcher.hip:5768-5825,5885-5890,5993-6020;
         // hip_qsa_prefill_batch.inc:193-220 (batched table/norm/pool).
         return YarnEnvironmentPath::b3_rotary;
-    case sched: case dense: case gdn: case gdn_gates_batch: case gdn_core16:
+    case sched: case dense: case gdn: case gdn_gates_batch:
     case hc: case hc_mask: case hc_output3: case hc_output3_band: case hc_lowband:
     case moe_da16: case moe_route: case ple_reclaim: case dense_rows: case pipe:
     case attend_batch: case score_park: case index_rows: case cohort_lean:

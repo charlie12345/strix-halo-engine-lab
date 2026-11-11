@@ -279,7 +279,6 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QPF2K_GDN` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_CHUNK16` | qwen | auto | [qwen-gdn-chunk16](optimizations.md#qwen-gdn-chunk16) |
 | `STRIX_QPF2K_GDN_COOP_LAUNCH` | qwen | 0 | [qwen-gdn](optimizations.md#qwen-gdn) |
-| `STRIX_QPF2K_GDN_CORE16` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_GATES_BATCH` | qwen | 1 | [qwen-gdn](optimizations.md#qwen-gdn) |
 | `STRIX_QPF2K_GDN_PARTS` | qwen | opt-in (bit 128 off; normal mask 55) | [qwen-gdn-witness](optimizations.md#qwen-gdn-witness) |
 | `STRIX_QPF2K_HC` | qwen | 1 | [qwen-hc](optimizations.md#qwen-hc) |

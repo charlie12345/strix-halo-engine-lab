@@ -46,12 +46,19 @@ struct I4Binding {
         for (unsigned k=0;k<kTopE;++k) if(t.tok_pair[tok*kTopE+k]==p) return t.tok_w[tok*kTopE+k];
         return 0.f;
     }
-    __device__ __forceinline__ float suh(unsigned e,unsigned m,unsigned c) const {
+    __device__ __forceinline__ const std::uint16_t* suh_ptr(unsigned e,unsigned m) const {
         unsigned gi=e;
         if(!dense_groups && !reference_group_ids) { gi=0; while(t.groups[gi].expert!=e) ++gi; }
         const auto& w=t.groups[gi].w;
-        return strix::moe_core::half_bits((m==0 ? w.gate.suh : m==1 ? w.up.suh : w.down.suh)[c]);
+        return m==0 ? w.gate.suh : m==1 ? w.up.suh : w.down.suh;
     }
+    __device__ __forceinline__ float suh(unsigned e,unsigned m,unsigned c) const { return strix::moe_core::half_bits(suh_ptr(e,m)[c]); }
+    // One group lookup and pointer load per (expert, matrix) row instead of per channel (moe_i4::suh_of).
+    struct SuhRow {
+        const std::uint16_t* p;
+        __device__ __forceinline__ float operator()(unsigned c) const { return strix::moe_core::half_bits(p[c]); }
+    };
+    __device__ __forceinline__ SuhRow suh_row(unsigned e,unsigned m) const { return {suh_ptr(e,m)}; }
     __device__ __forceinline__ float activation(float g,float u) const { return Epilogue::swiglu(g,u); }
 };
 struct I4ReferenceSchedule {

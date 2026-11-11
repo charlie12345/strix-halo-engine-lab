@@ -470,6 +470,8 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
             // waves. It still stages its share of the operands. Live rows keep their arithmetic; the skipped
             // accumulators only cover rows that are never stored.
             if (!IU4Grouped || wave_m * WM < rows) {
+            // Same at 16-row granularity inside a live wave: tile mt computes only while it holds a live row.
+            const auto mt_live = [&](int mt) { return !IU4Grouped || mt == 0 || wave_m * WM + mt * 16 < rows; };
             #pragma unroll
             for (int seg = 0; seg < SLOTS; ++seg) {
                 const int t0 = k0 + seg * SEG;          // first K16 tile of the segment
@@ -483,16 +485,19 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                     #pragma unroll
                     for (int nt = 0; nt < NT; ++nt) right[nt] = *reinterpret_cast<const Nibbles*>(b_frag + nt * 16 * G::row_bytes + byte);
                     #pragma unroll
-                    for (int mt = 0; mt < MT; ++mt)
+                    for (int mt = 0; mt < MT; ++mt) {
+                        if (!mt_live(mt)) continue;
                         #pragma unroll
                         for (int nt = 0; nt < NT; ++nt)
                             sum[mt][nt] = integer_wmma<4>(left[mt], right[nt], sum[mt][nt]);
+                    }
                 }
                 // g > BK: flush only after the group's last stage (inputs % g == 0).
                 if (GK <= KT || (t0 + SEG) % GK == 0) {
                 const int g = t0 / GK;
                 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
+                    if (!mt_live(mt)) continue;
                     const float* sap = sl + seg * BM + wave_m * WM + mt * 16 + (lane >> 4) * 8;
                     const F4 lo = *reinterpret_cast<const F4*>(sap), hi = *reinterpret_cast<const F4*>(sap + 4);
                     const float sa[8] = {lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};

@@ -36,6 +36,39 @@ flujo de copia separado, CRC32C por pieza y una única confirmación ACK tras to
 las instalaciones H2D. Ambos rangos deben utilizar esta versión del protocolo. El
 coste de memoria es de 32 MiB de memoria del host fijada por cada traspaso activo.
 
+## Equilibrio de etapas, copias de la costura y línea temporal de la pareja
+
+`STRIX_PAIR_TIMING=1` imprime una línea `pair-timing` por fragmento y rango y una suma por
+rango (el `strix::dist::PipelineTimeline` compartido): duración del fragmento, espera para
+adquirir la costura, barrera del productor, empaquetado/carga de la costura y, en el hilo de
+progreso, espera de D2H, CRC, cable, espera de ACK, espera de cabecera y espera de H2D; el
+traspaso de estado es la última fila. Son relojes del host de llamadas bloqueantes; la
+barrera del productor es donde el host espera el trabajo de GPU del fragmento. Desactivado,
+no añade trabajo.
+
+Medido con ella (fragmentos de 4,096 filas, 32K, dos nodos, ruta de host USB4): por fragmento
+la costura cuesta 4-5 ms de CRC, ~18 ms de cable para 105 MB y ~4 ms de espera de ACK; el
+rango 0 nunca espera una ranura de trama. La costura no es el límite. Lo es la etapa A (capas
+antes del corte), que además ejecuta el preludio de incrustación/PLE, por lo que con el
+reparto par 24/24 es la etapa más lenta. El corte predeterminado es ahora **23**
+(`cut-source=measured-default`); `STRIX_QWEN_PF_PIPE_CUT=24` restaura el reparto par. Barrido
+de cortes (logits iguales bit a bit al prellenado en un nodo en todos los brazos): 32K 24:
+12.44/12.51/12.50 s, 23: 12.08, 22: 12.31, 21: 12.63/12.65, 20: 13.00; 128K 24: 49.36/50.15 s,
+23: 47.55/47.53.
+
+El empaquetado (rango 0) y la dispersión (rango 1) de la costura movían las filas de cada
+fragmento con 3 x 4,096 copias pequeñas de dispositivo (~27 ms por fragmento en cada rango).
+Ahora usan una copia con paso por componente (los mismos bytes);
+`STRIX_QWEN_PF_PIPE_ROWCOPY=0` restaura las copias por fila.
+
+La distancia restante hasta 2x es estructural en una canalización de dos etapas por capas:
+el tiempo es aproximadamente (tiempo en un nodo con el tamaño de fragmento de la pareja) / 2 x
+(1 + fragmento / petición), más el traspaso de estado (0.11 s a 32K, 0.4 s a 128K). Otro tamaño
+para el primer o el último fragmento no lo acorta (el fragmento mayor fija el llenado más el
+vaciado), y fragmentos uniformes más pequeños pierden más eficiencia por nodo de la que
+ahorran (un nodo a 32K: mosaicos de 4,096 filas 20.6-21.1 s frente a 19.0-20.0 s con 16,384,
+todos iguales bit a bit).
+
 ## Referencia MTP ligada a la petición y reproducción
 
 Conserve los argumentos calificados de recursos, procedencia y ventana en el archivo

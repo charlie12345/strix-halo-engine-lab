@@ -30,6 +30,34 @@ bytes. Final-state wire v2 uses two pinned 16 MiB slots, a separate copy stream,
 CRC32C per piece and one completion ACK after all H2D installs. Both ranks must
 use this wire version. Memory overhead is 32 MiB pinned host per active handoff.
 
+## Stage balance, seam copies and the pair timeline
+
+`STRIX_PAIR_TIMING=1` prints one `pair-timing` line per chunk and rank and a per-rank sum
+(the shared `strix::dist::PipelineTimeline`): chunk span, seam acquire wait, producer fence,
+seam pack/load, and the progress thread's D2H wait, CRC, wire, ACK wait, header wait and H2D
+wait; the state handoff is the last row. Spans are host clocks of blocking calls; the
+producer fence is where the host waits for the chunk's GPU work. Off, it adds no work.
+
+Measured with it (4,096-row chunks, 32K, two nodes, host USB4 path): per chunk the
+seam costs CRC 4-5 ms, wire ~18 ms for 105 MB and an ACK wait of ~4 ms; rank 0 never waits for
+a frame slot. The seam is therefore not the limit. What is: stage A (layers before the
+cut) also runs the embedding/PLE prelude, so with the even 24/24 split it is the slower stage.
+The default cut is now **23** (`cut-source=measured-default`); `STRIX_QWEN_PF_PIPE_CUT=24`
+restores the even split. Cut sweep (logits bitwise equal to the single-node prefill in every
+arm): 32K 24: 12.44/12.51/12.50 s, 23: 12.08, 22: 12.31, 21: 12.63/12.65, 20: 13.00;
+128K 24: 49.36/50.15 s, 23: 47.55/47.53.
+
+The seam pack (rank 0) and scatter (rank 1) moved each chunk's rows with 3 x 4,096 small
+device copies (~27 ms per chunk on each rank). They now use one strided copy per component
+(same bytes); `STRIX_QWEN_PF_PIPE_ROWCOPY=0` restores per-row copies.
+
+The remaining distance to 2x is structural for a two-stage layer pipeline: wall time is
+about (single-node time with the pair's chunk size) / 2 x (1 + chunk / prompt), plus the
+state handoff (0.11 s at 32K, 0.4 s at 128K). A different first or last chunk size does not
+shorten it (the largest chunk sets the fill plus drain), and smaller uniform chunks lose
+more per-node efficiency than they save (single node at 32K: 4,096-row tiles 20.6-21.1 s
+vs 19.0-20.0 s with 16,384-row tiles, all bitwise equal).
+
 ## Prompt-bound MTP golden and replay
 
 Keep the qualified asset/provenance/window argv in private

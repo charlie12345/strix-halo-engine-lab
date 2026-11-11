@@ -14,6 +14,7 @@
 #include "glm/prefill/glm_pf_variants.hpp"
 #include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "strix/engine_profile.hpp"
+#include "strix/glm_pair_profile_table.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -142,6 +143,7 @@ inline bool is_reference_gate(const std::string& a) {
 
 // The part of the command line the defaults depend on (args = argv[2..], i.e. without program and MODEL_DIR).
 struct Request {
+    strix::profile::Inputs product;
     std::uint32_t world = 2;
     std::optional<std::string> identity, prefill, decode_xch;
     std::optional<bool> mtp, mtp_spec;
@@ -155,8 +157,9 @@ struct Request {
     bool baseline_flag = false, print = false;
 };
 
-inline Request scan(const std::vector<std::string>& args) {
+inline Request scan(std::vector<std::string> args) {
     Request r;
+    strix::profile::take_options(product_profile_engine, args, r.product);
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         if (is_reference_gate(a)) r.reference_gate = true;
@@ -223,6 +226,7 @@ struct Value {
 };
 
 struct Effective {
+    std::optional<strix::profile::Resolution> product;
     bool baseline = false;
     std::uint32_t world = 2;
     bool kv_shard = false, kv_shard_auto = false;
@@ -239,6 +243,19 @@ struct Effective {
 inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
     Effective e;
     e.baseline = baseline_requested(r, env);
+    if (r.product.profile || r.product.allow_pending) {
+        auto inputs = r.product;
+        inputs.env = env;
+        e.product = strix::profile::resolve(product_profile_engine, inputs);
+        // Baseline vetoes profile additions; explicit environment values still win.
+        if (e.baseline) for (auto& entry : e.product->entries) {
+            if (strix::profile::applied(entry.status)) {
+                entry.value = std::string(entry.lever->off);
+                entry.status = strix::profile::Status::off;
+                entry.reason = "baseline";
+            }
+        }
+    }
     const char* src_b = e.baseline ? "baseline" : "default";
     // identity: STRIX_GLM_IDENTITY overrides --identity (engine rule)
     if (const char* v = env("STRIX_GLM_IDENTITY")) e.identity = {v, "explicit"};
@@ -340,6 +357,10 @@ inline void apply_env(const Effective& e, const std::function<void(const char*, 
         if (v.source == "explicit") continue;
         if (v.source == "baseline" || it.app_sets) setenv_if_unset(it.env, v.value.c_str());
     }
+    if (e.product) strix::profile::apply(*e.product, [&](const char* key, const char* value) {
+        setenv_if_unset(key, value);
+        return true;
+    });
 }
 
 inline std::string print(const Effective& e) {
@@ -385,6 +406,7 @@ inline std::string print(const Effective& e) {
         }
         s += std::string("effective env ") + it.env + "=" + v.value + " (" + v.source + ", item " + it.name + resolved + ")\n";
     }
+    if (e.product) s += e.product->describe();
     return s;
 }
 

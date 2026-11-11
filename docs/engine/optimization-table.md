@@ -156,7 +156,6 @@ this section for Qwen, `STRIX_QWEN_ALLON=fast` also the FAST rows. An explicit p
 | qwen | moe_down_lds_epilogue | `STRIX_QPF2K_MOE_DOWN_LDS_EPI` | 1 | exact | down LDS-backed vector stores; byte gate and timing pending |
 | qwen | moe_direct_b | `STRIX_QPF2K_MOE_DIRECT_B` | 1 | exact | Q4_K gate/up direct-B fragments (plain CLI prefill only); native gate pending |
 | qwen | qsa_kv_pair | `STRIX_QSA_FAST_KV_PAIR` | 1 | exact | single-image paired QSA attend loader; fixture byte-equal, native pending |
-| qwen | mtp_prime_rows | `STRIX_MTP_PRIME_ROWS` | 1 | exact | 262,144-token MTP prompt 210.9-213.2 -> 202.8-203.8 s, digests equal |
 | qwen | mtp_device_handoff | `STRIX_MTP_DEVICE_HANDOFF` | 1 | exact | MTP cycle without a host fence; same launches and stream order |
 | qwen | decode_fuse | `STRIX_QWEN_DECODE_FUSE` | 1 | exact | single-row GDN preparation fusion; host and fixture checks |
 | qwen | router_bf16 | `STRIX_QWEN_ROUTER_BF16` | 1 | exact | exact BF16 router weight copy (120 MiB); device gate pending |

@@ -2975,6 +2975,17 @@
     "doc_anchor": "docs/minimax-grouped-prefill.md"
   },
   {
+    "engine": "minimax",
+    "name": "FAST_I4 INT4 MoE chain per chunk",
+    "flag_or_env": "STRIX_MOE_I4_CHAIN",
+    "default": "ON with draft FAST_I4 scope all",
+    "exact": "Same bits as the unfused INT4 calls; 8K and 32K state, final-row and token anchors equal; ranks agree in every run. FAST_I4 itself is a lossy opt-in identity with quality gates pending.",
+    "gain": "Two-node TP2: 8K prefill 12.31 s vs 12.65 s unfused (-2.7 %), 12.53 s vs 13.12 s reference binary (-4.5 %). 32K 56.47 s vs 55.79 s unfused (+1.2 %, two pairs both orders, +1.35/+1.08 %). Regime gate: chain default only for prompts of at most 8192 rows, unfused above; STRIX_MOE_I4_CHAIN=0/1 forces either way.",
+    "preconditions": "STRIX_MMX_MODEL_FORMAT=fast_i4 with STRIX_MMX_FAST_I4_SCOPE=all; runs once per 4096-row pipeline chunk so chunk c MoE overlaps chunk c-1 exchange.",
+    "off_switch": "STRIX_MOE_I4_CHAIN=0 (unfused calls, same bits)",
+    "doc_anchor": "docs/optimizations.md#minimax-fast-i4-chain"
+  },
+  {
     "engine": "qwen",
     "category": "candidate",
     "name": "MoE route output BF16 storage candidate",

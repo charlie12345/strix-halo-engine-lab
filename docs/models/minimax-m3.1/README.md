@@ -15,7 +15,10 @@ resident for every decode layer and MTP row. `STRIX_MMX_FAST_I4_SCOPE=all|gate_u
 all expert projections (default) or gate/up only. Serial conversion is the default;
 `STRIX_MMX_FAST_I4_PREFETCH=1` enables event-ordered prefetch pending timing qualification.
 This is a lossy numerical identity awaiting native timing and model quality gates; it does not
-inherit the exact production path's qualification. [Implementation contract](../../minimax-grouped-prefill.md#draft-fast_i4).
+inherit the exact production path's qualification. With scope `all` the fused INT4 MoE chain runs once
+per 4096-row chunk by default (`STRIX_MOE_I4_CHAIN=0` selects the unfused calls, same bits): 8K prefill
+12.31 s versus 12.65 s unfused (-2.7 %); 32K 56.47 s versus 55.79 s (+1.2 %, both orders); anchors equal,
+ranks agree. [Implementation contract](../../minimax-grouped-prefill.md#draft-fast_i4).
 
 <a id="minimax-pair"></a>
 

@@ -3364,6 +3364,22 @@ producer overwrites it, so the copies overlap compute. Compute and scratch stay 
 - **Measured gain:** Balanced 7940-token prefill (4096+3844): -2.3 to -2.6 % in both measurement orders. Unbalanced shapes (4096+443) measured neutral and take the ordinary path through the row gate.
 - **Implementation / evidence:** [grouped prefill](minimax-grouped-prefill.md)
 
+<a id="minimax-fast-i4-chain"></a>
+
+### FAST_I4 INT4 MoE chain per chunk
+
+**Engine:** `minimax`. **Control:** `STRIX_MOE_I4_CHAIN`. **Default:** ON with draft FAST_I4 (`STRIX_MMX_MODEL_FORMAT=fast_i4`) scope `all`, for prompts of at most 8192 rows.
+
+The INT4 MoE prefill quantises the gate/up input once, runs gate/up as one paired grouped GEMM whose epilogue applies
+SwiGLU and the down input transform, then the down GEMM and the ordered combine. It runs once per 4096-row pipeline
+chunk, so chunk c's MoE overlaps the TP2 exchange of chunk c-1.
+
+- **Preconditions:** Draft FAST_I4 (`STRIX_MMX_MODEL_FORMAT=fast_i4`) with `STRIX_MMX_FAST_I4_SCOPE=all`; FAST_I4 itself is a lossy opt-in identity whose quality gates are pending.
+- **Exactness evidence:** Same bits as the unfused INT4 calls. 8K and 32K state, final-row and token anchors equal; ranks agree in every run.
+- **Off switch:** `STRIX_MOE_I4_CHAIN=0` (unfused calls, same bits)
+- **Measured gain:** 8K prefill 12.31 s vs 12.65 s unfused (-2.7 %), 12.53 s vs 13.12 s on the reference binary (-4.5 %). 32K 56.47 s vs 55.79 s unfused (+1.2 %, two pairs in both orders, +1.35 / +1.08 %). Regime gate: the chain is default only for prompts of at most 8192 rows; longer prompts take the unfused calls. `STRIX_MOE_I4_CHAIN=0/1` forces either way.
+- **Implementation / evidence:** [draft FAST_I4](minimax-grouped-prefill.md#draft-fast_i4)
+
 ## GLM
 
 <a id="glm-pf-seqpar"></a>

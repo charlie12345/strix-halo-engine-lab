@@ -592,6 +592,7 @@ struct Engine::Impl {
         moe::opt::cleanup_prefill_table_ring();
         moe::opt::cleanup_prefill_dense();
         moe::opt::cleanup_prefill_tail_stream();
+        moe::opt::cleanup_prefill_device_plan();
         for (auto* ptr : {nest_bank.h, nest_bank.hn, nest_bank.taps}) if (ptr) (void)hipFree(ptr);
         for (auto* events : {&idx_fork, &idx_join, &xb_attn_ev, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
             for (hipEvent_t ev : *events)
@@ -621,6 +622,7 @@ struct Engine::Impl {
     bool fp32_prefill = false;
     bool model_fast_i4 = false;   // STRIX_MMX_MODEL_FORMAT=fast_i4
     fast_i4::Scope i4_scope = fast_i4::Scope::all;
+    bool pf_i4_chain = mmoe::prefill_i4_chain(); // per prompt: prefill_begin sets it from the prompt rows
     struct JitSlot {
         std::uint8_t* pack = nullptr;
         mmoe::I4Layer weights{};   // fixed wq/ws and reusable device svh tables
@@ -1907,6 +1909,26 @@ struct Engine::Impl {
                 f32_jobs_used = 0;
                 lap(prof.route_host);
                 f32_moe(y, n, out);
+            } else if (moe_opt && !pf_table_stats && (prefill_i4 == nullptr || (i4_scope == fast_i4::Scope::all && pf_i4_chain)) && mmoe::prefill_moe_device_plan(static_cast<std::uint32_t>(n))) {
+                // prefill, device plan (default): routes stay on the device, the shared moe_core planner builds the
+                // tables on the stream; no host sync per MoE layer. Same bits as the host plan below
+                // (STRIX_MMX_PF_PLAN=host, or profiling / STRIX_MM_PF_TABLE_STATS, which measure the host plan).
+                mmoe::PrefillMoeDeviceView pv;
+                pv.rows = static_cast<std::uint32_t>(n);
+                pv.y = hn;
+                pv.routes = route_d;
+                pv.i4 = prefill_i4;
+                pv.i4_all = i4_scope == fast_i4::Scope::all;
+                pv.i4_chain = pf_i4_chain;
+                pv.experts = y.experts_raw_d;
+                pv.shared = y.shared_raw;
+                pv.out = out;
+                struct TimelineMoe {
+                    bool on;
+                    ~TimelineMoe() { if (on) mmoe::set_prefill_marker(nullptr, nullptr); }
+                } timeline_moe{tl != nullptr};
+                if (tl) mmoe::set_prefill_marker(PrefillTimeline::moe_mark, tl);
+                mmoe::enqueue_prefill_moe_device(pv, pf_ws, pf_ws_bytes, nullptr);
             } else if (moe_opt) {  // prefill / gate: grouped launches with the G4 strix_gemm identity
                 hip_ok(hipMemcpyAsync(route_h, route_d, n * kTopE * 8, hipMemcpyDeviceToHost, nullptr), "routes");
                 hip_ok(hipStreamSynchronize(nullptr), "routes");
@@ -1929,6 +1951,7 @@ struct Engine::Impl {
                 pv.out = out;
                 pv.i4 = prefill_i4;
                 pv.i4_all = i4_scope == fast_i4::Scope::all;
+                pv.i4_chain = pf_i4_chain;
                 // The module markers are host callbacks: record one interval
                 // from its first launch to combine, excluding host planning.
                 struct TimelineMoe {
@@ -2086,6 +2109,7 @@ struct Engine::Impl {
         task.slot = slot;
         task.toks.assign(toks.begin(), toks.end());
         task.pos0 = pos0;
+        pf_i4_chain = mmoe::prefill_i4_chain(toks.size());
         task.chunks = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
         task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
@@ -2181,6 +2205,7 @@ struct Engine::Impl {
                 pf_active = false;
                 hip_ok(hipDeviceSynchronize(), "prefill");
                 if (model_fast_i4) jit_collect(true);
+                mmoe::prefill_moe_device_check();  // invalid routes met by a device-planned MoE call (failed exchange)
                 if (tl) tl->report(opt.rank);
                 tl = nullptr;
                 ++prof.calls;

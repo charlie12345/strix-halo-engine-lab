@@ -10,7 +10,8 @@
 // partials are reduced in ascending split order before the output Hadamard, as output_transform does.
 //
 // Launches: gather+transform, gate/up (grouped WMMA), gate/up finish + SwiGLU + down transform, down (grouped WMMA,
-// one launch per row-tile class), down finish + combine. Routes come from the host (as in G4; one D2H per chunk).
+// one launch per row-tile class), down finish + combine. Routes come from the host (as in G4; one D2H per chunk), or
+// stay on the device with the device plan (enqueue_prefill_moe_device).
 #include "minimax/moe/mmx_moe.hpp"
 
 #include <array>
@@ -77,6 +78,7 @@ struct PrefillMoeView {
     float* out = nullptr;                       // T x 6144 (device)
     const I4Layer* i4 = nullptr;                // FAST_I4 layer pack (null: EXL3 path)
     bool i4_all = true;                         // false: IU4 gate/up, original EXL3 down
+    bool i4_chain = false;                      // fused candidate chain (prefill_i4_chain of the prompt)
 };
 
 // Dense prefill linears on the v4 core: jobs share one input x [rows][input] (input % 128 == 0, output % 128 == 0)
@@ -100,6 +102,33 @@ std::size_t prefill_moe_workspace_bytes(const PrefillMoeView& v);
 // Upper bound for any routes of T rows.
 std::size_t prefill_moe_workspace_bound(std::uint32_t rows);
 void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream);
+// Device plan (default; STRIX_MMX_PF_PLAN=host keeps the host plan above): the same tables and launches built on the
+// GPU from the device routes by the shared moe_core::device_plan, so a call needs no route download, host sync, host
+// table build or upload. Selected with mtfit and without gufuse (the defaults); the workspace is
+// prefill_moe_workspace_bound(rows). Same bits as enqueue_prefill_moe.
+struct PrefillMoeDeviceView {
+    std::uint32_t rows = 0;                 // T
+    const float* y = nullptr;               // T x 6144 normed hidden (device)
+    const std::uint32_t* routes = nullptr;  // device: T x 4 expert ids, then T x 4 float weights (the router layout)
+    const ExpertSlices* experts = nullptr;  // device array [128]
+    ExpertSlices shared{};
+    float* out = nullptr;                   // T x 6144 (device)
+    const I4Layer* i4 = nullptr;
+    bool i4_all = true;
+    bool i4_chain = false;
+};
+bool prefill_moe_device_plan(std::uint32_t rows);
+// The fused FAST_I4 candidate chain for a prompt of total_rows rows (0: capability/opt-in checks). Default on up to
+// kI4ChainRows rows: it measured -2.7 % at 8K but +1.2 % at 32K. STRIX_MOE_I4_CHAIN=0/1 overrides. Same bits.
+inline constexpr std::size_t kI4ChainRows = 8192;
+bool prefill_i4_chain(std::size_t total_rows = 0);
+std::size_t prefill_i4_workspace_bound(std::uint32_t rows);
+void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes,
+                                hipStream_t stream);
+// After the stream completed: throws (once) when a device-planned call met invalid routes (an id >= 128 or repeated
+// in a row; such a row was planned as experts 0..3 with weight 0). A failed exchange is the only known source.
+void prefill_moe_device_check();
+void cleanup_prefill_device_plan() noexcept;
 // v4 exact-fit row tiles; -1 = STRIX_MMX_PREFILL_MTFIT (default off), 0 = off, 1 = on.
 void set_prefill_mtfit(int on);
 // Pinned H2D table ring; -1 = STRIX_MM_PF_TABLE_RING (default off), 0 = off, 1 = on.

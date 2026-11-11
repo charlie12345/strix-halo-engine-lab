@@ -5,11 +5,11 @@ using v4i = typename Operand::Int4;
 using v8i = typename Operand::Int8;
 constexpr unsigned Outputs = NT, wide_waves = 4, wide_classes = 8;
 constexpr bool Staged = Plan::staged;
-const auto v = ad.tensor();
-const auto* weight = v.weight;
-const auto* codes = v.codes;
-const auto* deltas = v.deltas;
-auto* out = v.out;
+const auto& v = ad.tensor();
+const auto* __restrict__ weight = v.weight;
+const auto* __restrict__ codes = v.codes;
+const auto* __restrict__ deltas = v.deltas;
+auto* __restrict__ out = v.out;
     __shared__ float part[wide_waves][Outputs][8][32];
     __shared__ float4 dsh[Staged ? 32U : 1U][2][2];  // [group of the chunk][h][e / 4] = deltas of rows 2e + h
     const unsigned w = threadIdx.x / 32U, l = threadIdx.x % 32U, h = l >> 4U, lo = l & 15U;
@@ -44,6 +44,7 @@ auto* out = v.out;
             }
             __syncthreads();
         }
+        // Plain unrolled loop with continue, as the split-v2 wide kernel.
 #pragma unroll
         for (unsigned j = 0; j < wide_classes; ++j) {
             const unsigned g = s0 + w + 4U * j;

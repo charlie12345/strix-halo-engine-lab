@@ -11,10 +11,12 @@ struct IntegerPlan {
     static constexpr unsigned class_waves = 8, chunk_groups = 32;
     static constexpr unsigned waves_per_eu = 0;
 };
-template<unsigned Waves = 8> struct GroupedIntegerPlan : IntegerPlan {
+// Partial: a partial last chunk loads only its blocks. Without it every chunk loads
+// whole rows, so the launcher must keep the width a multiple of 32 groups.
+template<unsigned Waves = 8, bool Partial = true> struct GroupedIntegerPlan : IntegerPlan {
     static constexpr IntegerStructure structure = IntegerStructure::grouped_chunk;
     static constexpr unsigned waves_per_eu = Waves;
-    static constexpr bool weight_lds = true, partial_blocks = true;
+    static constexpr bool weight_lds = true, partial_blocks = Partial;
     static constexpr bool float_half_sums = true, lds_only_barriers = true;
     static constexpr bool half_exchange = true, opaque_magic = true;
 };
@@ -51,6 +53,10 @@ STRIX_PLAN_HD constexpr IntegerBlock integer_block(unsigned x, unsigned y, unsig
 }
 STRIX_PLAN_HD constexpr unsigned integer_row_position(unsigned r) {
     return (r & ~15U) | ((r & 1U) << 3U) | ((r & 15U) >> 1U);
+}
+// Pair-major gate/up exchange: [gate or up][16 rows][32 columns].
+STRIX_PLAN_HD constexpr unsigned integer_pair_value_offset(unsigned pair, unsigned row, unsigned column) {
+    return pair * 512U + row * 32U + column;
 }
 STRIX_PLAN_HD constexpr bool integer_dense_fuse_parts(unsigned tall, unsigned rows, unsigned row_width,
     unsigned width, unsigned count, bool lean_ok, bool diagnostic, bool staged) {

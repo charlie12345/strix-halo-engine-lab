@@ -6,6 +6,8 @@ struct IntegerTile {
 };
 struct RouteAdapter {
     static constexpr bool kActive = true, kTiles = true;
+    // next() yields one tile per CTA (iteration 0 only).
+    static constexpr bool kSingleTile = true;
     using Tile = IntegerTile;
     PrefillRoutesView routes;
     const signed char* codes;
@@ -13,9 +15,7 @@ struct RouteAdapter {
     unsigned width;
     bool input_slots;
     unsigned band = 0;
-    const unsigned* staged_sources = nullptr;
-    const unsigned* staged_slots = nullptr;
-    __device__ bool next(Tile& t, unsigned iter, int bn) const {
+    __device__ __forceinline__ bool next(Tile& t, unsigned iter, int bn) const {
         if (iter) return false;
         const unsigned halves = routes.batch_rows == 32U ? 2U : 1U;
         const auto block = strix::core::integer_block(blockIdx.x, blockIdx.y, gridDim.x, gridDim.y, band);
@@ -28,45 +28,59 @@ struct RouteAdapter {
         t.base_col = block.column;
         return true;
     }
-    __device__ void bind_rows(const unsigned* src, const unsigned* dst) { staged_sources = src; staged_slots = dst; }
-    __device__ unsigned slot(const Tile& t, int r) const {
-        return staged_slots ? staged_slots[r] : routes.entry_slots[t.begin + unsigned(r)];
-    }
-    __device__ unsigned source(const Tile& t, int r) const {
-        if (staged_sources) return staged_sources[r];
+    __device__ __forceinline__ const signed char* activation_codes() const { return codes; }
+    __device__ __forceinline__ const float* activation_deltas() const { return deltas; }
+    __device__ __forceinline__ unsigned slot(const Tile& t, int r) const { return routes.entry_slots[t.begin + unsigned(r)]; }
+    __device__ __forceinline__ unsigned source(const Tile& t, int r) const {
         return input_slots ? slot(t, r) : routes.entry_rows[t.begin + unsigned(r)];
     }
-    __device__ const signed char* code_row(const Tile& t, int r) const {
-        return codes + std::uint64_t(source(t, r)) * width;
-    }
-    __device__ float delta(const Tile& t, int r, int g) const {
-        return deltas[std::uint64_t(source(t, r)) * (width / 32U) + unsigned(g)];
-    }
+    // Rows by staged source index: a core that stages source() in LDS passes the value back.
+    __device__ __forceinline__ const signed char* code_row_of(unsigned src) const { return codes + std::uint64_t(src) * width; }
+    __device__ __forceinline__ float delta_of(unsigned src, unsigned g) const { return deltas[std::uint64_t(src) * (width / 32U) + g]; }
+    __device__ __forceinline__ const signed char* code_row(const Tile& t, int r) const { return code_row_of(source(t, r)); }
+    __device__ __forceinline__ float delta(const Tile& t, int r, int g) const { return delta_of(source(t, r), unsigned(g)); }
 };
 struct GateUpAdapter : RouteAdapter {
     static constexpr bool kFinish = true;
     PrefillGateUpView view;
-    __device__ unsigned row_bytes() const { return unsigned(view.row_bytes); }
-    __device__ const unsigned long long* grid() const { return prefill_iq2_grid; }
-    __device__ const unsigned char* weight_row(const Tile& t, int col) const {
+    __device__ __forceinline__ unsigned row_bytes() const { return unsigned(view.row_bytes); }
+    __device__ __forceinline__ const unsigned long long* grid() const { return prefill_iq2_grid; }
+    __device__ __forceinline__ const unsigned char* weight_row(const Tile& t, int col) const {
         const unsigned local = unsigned(col - t.first_col);
         const void* matrix = local < 32U ? view.gate : view.up;
         return static_cast<const unsigned char*>(matrix) + std::uint64_t(t.expert) * view.expert_stride_bytes +
                std::uint64_t(t.base_col * 32U + local % 32U) * view.row_bytes;
     }
-    __device__ void store_raw(const Tile& t, int r, int col, float v) const {
+    __device__ __forceinline__ void store_raw_at(const Tile& t, unsigned dst, int col, float v) const {
         if (!view.gate_out) return;
         const unsigned local = unsigned(col - t.first_col);
         float* out = local < 32U ? view.gate_out : view.up_out;
-        out[std::uint64_t(slot(t, r)) * view.inter + t.base_col * 32U + local % 32U] = v;
+        out[std::uint64_t(dst) * view.inter + t.base_col * 32U + local % 32U] = v;
     }
-    __device__ void finish_tile(const Tile& t, const float* values, int bm, int bn) const {
+    __device__ __forceinline__ void store_raw(const Tile& t, int r, int col, float v) const { store_raw_at(t, slot(t, r), col, v); }
+    template<bool PairMajor = false>
+    __device__ __forceinline__ void finish_tile(const Tile& t, const float* values, int bm, int bn) const {
+        finish_rows<PairMajor>(t, values, nullptr, bm, bn);
+    }
+    // finish_tile with the destination slots staged by the core (nullptr: read the routes).
+    template<bool PairMajor = false>
+    __device__ __forceinline__ void finish_rows(const Tile& t, const float* values, const unsigned* staged, int bm, int bn) const {
+        const auto slot_of = [&](unsigned r) { return staged ? staged[r] : slot(t, int(r)); };
         const unsigned lane = threadIdx.x & 31U, waves = blockDim.x / 32U;
         for (unsigned r = threadIdx.x / 32U; r < unsigned(bm); r += waves) {
             if (r >= unsigned(t.rows)) continue; // uniform wave
-            const float x = swiglu_clamped(values[r * unsigned(bn) + lane], values[r * unsigned(bn) + lane + 32U], view.limit);
+            const float gate = values[PairMajor ? strix::core::integer_pair_value_offset(0, r, lane) : r * unsigned(bn) + lane];
+            const float up = values[PairMajor ? strix::core::integer_pair_value_offset(1, r, lane) : r * unsigned(bn) + lane + 32U];
+            if constexpr (PairMajor) {
+                if (view.gate_out) {
+                    const auto dst = std::uint64_t(slot_of(r)) * view.inter + t.base_col * 32U + lane;
+                    view.gate_out[dst] = gate;
+                    view.up_out[dst] = up;
+                }
+            }
+            const float x = swiglu_clamped(gate, up, view.limit);
             const auto a = strix::core::quantize_a8_row32(x);
-            const std::uint64_t s = slot(t, int(r)), col = std::uint64_t(t.base_col) * 32U + lane;
+            const std::uint64_t s = slot_of(r), col = std::uint64_t(t.base_col) * 32U + lane;
             view.act_codes[s * view.inter + col] = a.code;
             if (!lane) {
                 const auto g = s * (view.inter / 32U) + t.base_col;
@@ -78,16 +92,18 @@ struct GateUpAdapter : RouteAdapter {
 struct DownAdapter : RouteAdapter {
     static constexpr bool kFinish = false;
     PrefillDownView view;
-    __device__ unsigned row_bytes() const { return unsigned(view.row_bytes); }
-    __device__ const unsigned long long* grid() const { return nullptr; }
-    __device__ const unsigned char* weight_row(const Tile& t, int col) const {
+    __device__ __forceinline__ unsigned row_bytes() const { return unsigned(view.row_bytes); }
+    __device__ __forceinline__ const unsigned long long* grid() const { return nullptr; }
+    __device__ __forceinline__ const unsigned char* weight_row(const Tile& t, int col) const {
         return static_cast<const unsigned char*>(view.weights) + std::uint64_t(t.expert) * view.expert_stride_bytes +
                std::uint64_t(col) * view.row_bytes;
     }
-    __device__ void store_raw(const Tile& t, int r, int col, float v) const {
-        view.out[std::uint64_t(slot(t, r)) * view.outputs + unsigned(col)] = v;
+    __device__ __forceinline__ void store_raw_at(const Tile&, unsigned dst, int col, float v) const {
+        view.out[std::uint64_t(dst) * view.outputs + unsigned(col)] = v;
     }
-    __device__ void finish_tile(const Tile&, const float*, int, int) const {}
+    __device__ __forceinline__ void store_raw(const Tile& t, int r, int col, float v) const { store_raw_at(t, slot(t, r), col, v); }
+    __device__ __forceinline__ void finish_tile(const Tile&, const float*, int, int) const {}
+    template<bool = false> __device__ __forceinline__ void finish_rows(const Tile&, const float*, const unsigned*, int, int) const {}
 };
 bool fast_i4_down() {
     const char* scope = std::getenv("STRIX_DS41_FAST_I4_SCOPE");
@@ -115,6 +131,9 @@ void launch_gate_up_core(const PrefillGateUpView& view, hipStream_t queue) {
         integer_core::launch<integer_core::Contract<F, false, true>, 64>(ad, blocks, view.inter / 32U, view.hidden, 2U * view.inter, queue);
     else {
         if constexpr (F != WeightFormat::mxfp4) ad.band = integer_prefill_band();
+        // The grouped gate/up plan loads whole chunks (no partial-chunk path).
+        if (F == WeightFormat::iq2_xxs && view.hidden % 1024U != 0U)
+            throw std::invalid_argument("grouped IQ2_XXS gate/up needs a hidden width that is a multiple of 1024");
         integer_core::launch<integer_core::Contract<F>, 64>(ad, blocks, view.inter / 32U, view.hidden, 2U * view.inter, queue);
     }
 }

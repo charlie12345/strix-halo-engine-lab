@@ -2,6 +2,9 @@
 // routing, GGUF decoding and epilogues remain operand/adapter policies.
 static_assert(AD && !Fused && Probe == 0 && BM == 16 && BN == 64);
 static_assert(!Operand::fast_i4 && !Contract::relaxed);
+// One tile per CTA: the body returns instead of looping back to next(), so the
+// staged row tables stay LDS pointers and nothing is carried around the tile loop.
+static_assert(Adapter::kSingleTile);
 using Plan = typename Operand::Plan;
 using Ops = typename Operand::Ops;
 using V4 = typename Operand::Int4;
@@ -22,7 +25,8 @@ if (thread < rows) {
     sources[thread] = ad.source(at, thread);
     if constexpr (Adapter::kFinish) slots[thread] = ad.slot(at, thread);
 }
-ad.bind_rows(sources, Adapter::kFinish ? slots : sources);
+// Staged row tables (LDS): source row of tile row r, and its destination slot.
+const unsigned* const dst_rows = Adapter::kFinish ? slots : sources;
 const unsigned pair = unsigned(wave) & 1, q = unsigned(wave) >> 1, lo = unsigned(lane) & 15, h = unsigned(lane) >> 4;
 const unsigned groups = unsigned(inputs) / 32, chunks = (groups + 31) / 32;
 const auto sync = [] {
@@ -94,8 +98,9 @@ for (unsigned chunk = 0; chunk < chunks; ++chunk) {
         const unsigned r = item.row, kh = item.half, gg = item.group;
         const unsigned g = chunk * 32 + gg;
         if (g < groups && r < unsigned(rows)) {
-            av[i] = *reinterpret_cast<const V4*>(ad.code_row(at, int(r)) + g * 32 + kh * 16);
-            if (!kh) dv[i] = ad.delta(at, int(r), int(g));
+            const unsigned src = sources[r];
+            av[i] = *reinterpret_cast<const V4*>(ad.code_row_of(src) + g * 32 + kh * 16);
+            if (!kh) dv[i] = ad.delta_of(src, g);
         }
     }
     if constexpr (!Direct) {
@@ -216,12 +221,13 @@ if (q == 0) {
         for (unsigned e = 0; e < 8; ++e) {
             const unsigned r = 2 * e + h, c = pair * 32 + t * 16 + lo;
             if (r < unsigned(rows)) {
-                ad.store_raw(at, int(r), first_col + int(c), v[t][e]);
+                ad.store_raw_at(at, dst_rows[r], first_col + int(c), v[t][e]);
                 if constexpr (Adapter::kFinish) values[r * BN + c] = v[t][e];
             }
         }
 }
 if constexpr (Adapter::kFinish) {
     __syncthreads();
-    ad.finish_tile(at, values, BM, BN);
+    ad.finish_rows(at, values, slots, BM, BN);
 }
+return;

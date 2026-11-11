@@ -2754,19 +2754,7 @@ per draft instead of a full-vocabulary scan and host exchange per step.
 
 ### v4 MoE prefill core
 
-**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_CORE`. **Default:** v4.
-
-Use v4 register/layout scheduling.
-
-- **Preconditions:** Supported prefill expert shapes and quantized weights.
-- **Automatic selection:** Resolver supplies v4 only when unset; explicit values win. Shape/core dispatch determines actual use.
-- **Fallback notice:** Unsupported operator geometry keeps its supported dispatch without a universal decline notice; invalid explicit settings fail validation.
-- **Exactness evidence:** Published same-identity qualification: Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
-- **Off switch:** STRIX_MMX_PREFILL_CORE=lib
-- **Measured gain:** Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib
-- **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
-
-<a id="mm-pf-msa-batch"></a>
+The v4 core path is the only MiniMax MoE prefill path.
 
 ### MSA prefill batching
 

@@ -19,6 +19,26 @@ repository history as part of ordinary documentation editing. Numerical proposal
 drafts until their compiler, native execution, model fidelity and complete-workload gates
 pass; theoretical throughput and external results do not establish local qualification.
 
+# Shared code first (all engines)
+
+Every improvement that can apply to more than one engine is implemented once, in shared code, and
+each engine only adapts it. This is the default for new work, not a later refactor.
+
+- Shared homes: `src/core` (linear/integer/IU4 kernels and plans), `src/moe_core` (MoE routing,
+  grouped GEMM, activation quantisation policies), `src/attn_core` (attention kernels),
+  `include/strix/session` and `include/strix/serve` (engine contract, KV/prefix/conversation
+  caches, scheduling, batching, fanout, receipts), `include/strix/pair` and `include/strix/dist`
+  (two-node pipelines, transports, exchange overlap).
+- Engine code holds only what is truly model-specific: tensor layouts and names, numerics the model
+  requires, its family adapter (hooks the shared layer calls) and `models/<model>.toml` settings.
+- A variant is a policy or trait on the existing shared kernel, never a parallel copy. If a shared
+  path is slower for one engine, fix it inside the shared code until it matches, then make it that
+  engine's default and delete the engine-local copy, its switches and dead tests.
+- Prototyping inside one engine is allowed only as a step: the same change set (or its PR description)
+  states what moves to shared code and which engines adopt it next.
+- Reviews reject new engine-local copies of logic that already exists, or obviously belongs, in a
+  shared home.
+
 # Production defaults for humans and coding agents
 
 The fast path is the default for all five public engines. Start with the plain command; let the

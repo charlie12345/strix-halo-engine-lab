@@ -222,10 +222,70 @@ void fault_checks() {
     }
 }
 
+void routed_piece_checks() {
+    using namespace strix::qwen_pp;
+    struct Staging final : PipeStaging {
+        std::vector<std::byte> host, device;
+        unsigned uploads = 0;
+        std::span<std::byte> resize(std::size_t size) override { host.resize(size); device.resize(size); return host; }
+        void copy(bool, std::size_t, void*, std::size_t) override {}
+        void seal(std::size_t) override { device = host; }
+        void await_piece(std::size_t) override {}
+        void received_piece(std::size_t offset, std::size_t bytes) override {
+            ++uploads; std::copy_n(host.data() + offset, bytes, device.data() + offset);
+        }
+        void finish_receive() override { require(host == device); }
+        void* device_piece(std::size_t offset) override { return device.data() + offset; }
+        void read_device_piece(std::size_t offset, std::size_t bytes) override {
+            std::copy_n(device.data() + offset, bytes, host.data() + offset);
+        }
+    };
+    // Same framing and CRC checks through a separate payload channel. Exercise
+    // a full piece + tail, callback decline, corruption, and callback failure.
+    for (unsigned mode = 0; mode < 4U; ++mode) {
+        Wire forward, backward, payload;
+        const auto abort = [&] { forward.stop(); backward.stop(); payload.stop(); };
+        std::atomic<unsigned> sent_pieces{0}, received_pieces{0};
+        const auto routed = [&](bool sending, PipeStaging& staging, std::size_t offset, std::size_t size) {
+            if (mode == 1U) return false;
+            if (mode == 3U) throw std::runtime_error("injected routed exchange failure");
+            auto bytes = std::span(static_cast<std::byte*>(staging.device_piece(offset)), size);
+            if (sending) {
+                ++sent_pieces;
+                if (mode == 2U && offset != 0U) bytes[0] ^= std::byte{1};
+                payload.send(bytes);
+            } else {
+                ++received_pieces; payload.receive(bytes); staging.read_device_piece(offset, size);
+            }
+            return true;
+        };
+        Pipe producer(0, 1, [&](auto bytes) { forward.send(bytes); }, [&](auto bytes) { backward.receive(bytes); }, abort,
+            24, [] { return std::make_shared<Staging>(); }, {}, routed);
+        Pipe consumer(1, 1, [&](auto bytes) { backward.send(bytes); }, [&](auto bytes) { forward.receive(bytes); }, abort,
+            24, [] { return std::make_shared<Staging>(); }, {}, routed);
+        auto& sent = producer.acquire(0);
+        sent.header[0] = Seam::magic; sent.header[1] = 0; sent.header[3] = 700; sent.header[4] = 24; sent.header[41] = 1;
+        sent.resize(700U * Seam::row_bytes);
+        std::fill(sent.payload.begin(), sent.payload.end(), std::byte{71});
+        sent.staging->seal(sent.payload.size()); producer.release(0);
+        bool rejected = false;
+        try {
+            auto& received = consumer.acquire(0);
+            require(received.payload.size() == sent.payload.size());
+            require(std::all_of(received.payload.begin(), received.payload.end(), [](auto b) { return b == std::byte{71}; }));
+            const auto& staging = static_cast<const Staging&>(*received.staging);
+            require(staging.uploads == (mode == 1U ? 2U : 0U));
+            consumer.release(0); consumer.finish(1); producer.finish(1);
+        } catch (const std::exception&) { rejected = true; }
+        require(rejected == (mode >= 2U));
+        if (mode == 0U) require(sent_pieces == 2U && received_pieces == 2U);
+    }
+}
+
 }
 int main() {
     try {
-        balance_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks();
+        balance_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks();
         Wire forward, backward;
         std::mutex received_mutex; std::condition_variable received_cv; std::uint64_t received_chunks = 0;
         const auto abort = [&] { forward.stop(); backward.stop(); };

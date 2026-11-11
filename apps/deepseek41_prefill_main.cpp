@@ -1,3 +1,4 @@
+#include "strix/dist/open_transport.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
@@ -145,40 +146,14 @@ std::vector<std::uint32_t> read_prompt(const std::string& path, std::uint32_t ro
 std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
 
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout, std::string& receipt) {
-    const std::chrono::seconds limit(timeout);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4-auto") {
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = std::chrono::milliseconds(std::uint64_t{timeout} * 1000U);
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        receipt = topology.receipt();
-        return t;
-    }
-    if (kind == "usb4-gpu") {  // GPU-direct exchanges over the gpu_direct streams, control over the host-path ones
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = std::chrono::milliseconds(std::uint64_t{timeout} * 1000U);
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::string direct;
-        std::string why_direct;
-        if (strix::dist::usb4_gpu_direct_streams(o, *t, &why_direct) == 0U) {  // both ranks agree: host path only
-            std::printf("gpu-direct unavailable (%s): host path only\n", why_direct.c_str());
-            return t;
-        }
-        gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &direct);
-        receipt = topology.receipt() + "\n" + direct;
-        return t;
-    }
-    throw std::invalid_argument("unknown transport " + spec);
+    strix::dist::OpenTransportOptions options;
+    options.spellings = strix::dist::prefill_transport;
+    options.usb.rank = rank;
+    options.usb.timeout = std::chrono::seconds(timeout);
+    auto opened = strix::dist::open_transport(spec, options);
+    gpu_direct = std::move(opened.direct);
+    receipt = std::move(opened.receipt);
+    return std::move(opened.host);
 }
 
 void print_result(const char* who, const strix::deepseek41::PrefillResult& r, std::size_t rows, bool timing, const std::string& loads_out = {}) {

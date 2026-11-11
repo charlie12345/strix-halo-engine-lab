@@ -278,6 +278,10 @@ public:
                 hb.round = round_++;
                 const auto hb0 = timeline_on_ ? Time::now() : Clock::time_point{};
                 (void)exchange(eng_, hb);
+                // Both ranks at an idle heartbeat, with no exchange in flight.
+                // Native runners retire preposted direct receives before their
+                // DMA deadline; pure host runners need no transport hook.
+                if constexpr (requires { run_.quiesce(); }) run_.quiesce();
                 if (timeline_on_) timeline("heartbeat", hb0, "deadline");
                 last_round = Time::now();
             }

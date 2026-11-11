@@ -63,12 +63,19 @@ preallocated. Explicit larger host ceilings are accepted but effective retention
 1024 MiB; a failed lease disables new retention on both ranks. The host accounting includes
 per-layer vector descriptors and allocator allowances; it is not an allocator/RSS hard limit.
 The conservative transient prediction includes retained copies, whole-prefix exports, serialization
-and snapshot rings. Unsupported host locking fails closed.
+and snapshot rings. Its per-token attention term comes from the shared decode plan:
+only KV-source layers contribute compressed KV and index keys, amortized by their
+compression ratio (890 bytes/token for V4.1), plus 4 bytes/token for token IDs.
+Fixed rings remain conservatively bounded; arithmetic overflow saturates the
+prediction instead of allowing an undersized admission. Unsupported host locking fails closed.
 
 An explicit directory gets a 4096 MiB tier ceiling unless overridden. Its namespaces and service
-processes share a 4096 MiB directory quota, a 128 MiB outstanding-payload limit and a 16384 MiB
-filesystem free-space floor. Queue reservations precede serialization; payloads remain charged
-through the active write. Files pending deletion and temporary files count physically until gone.
+processes share a directory quota of 4096 MiB or the tier ceiling, whichever is larger (none for an
+unlimited tier, `--prefix-cache-disk-mb 0`), a 128 MiB outstanding-payload limit and a 16384 MiB
+filesystem free-space floor. A full tier evicts its least recently used states before the quota is
+checked, and those deletions finish first, so it keeps persisting new states. Queue reservations
+precede serialization; payloads remain charged through the active write. Files pending deletion and
+temporary files count physically until gone.
 Quota/space/peer refusal keeps RAM when possible. Each namespace/rank directory has one exclusive
 service owner; a second writer is refused, and no sibling namespace is evicted. Inactive writer
 reservations are ignored after a crash. Disk reads retain all-or-nothing peer restore and do not

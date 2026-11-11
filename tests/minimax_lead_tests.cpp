@@ -25,6 +25,7 @@ struct FakeEngine {
     bool session_peer = false, prefix_peer = false;
     std::uint64_t peer_alignment = 0;  // zero echoes; nonzero simulates a different peer configuration
     unsigned syncs = 0;
+    unsigned quiesces = 0;
     bool taps = false;
     double parent_speed = 1;  // cold estimate may exceed actual service, as on native warm runs
     unsigned slots() const { return 8; }
@@ -45,6 +46,11 @@ struct FakeEngine {
     unsigned peer(unsigned value) const { return value; }
     void send_prompt(std::vector<unsigned>&) {}
     void synchronize() { ++syncs; }
+    void quiesce() {
+        if (controls.empty() || controls.back().command != static_cast<unsigned>(ms::Command::heartbeat))
+            throw std::runtime_error("quiesce outside paired idle heartbeat");
+        ++quiesces;
+    }
     void retire_contexts(unsigned) {}
     void exchange_bytes(const void* out, void* in, std::size_t bytes) {
         if (bytes != 512) { std::memcpy(in, out, bytes); return; }
@@ -192,6 +198,12 @@ int main() {
     const auto check = [&](bool ok, const char* name) {
         std::cout << (ok ? "PASS " : "FAIL ") << name << '\n'; failures += ok ? 0U : 1U;
     };
+    {
+        Scenario idle(ms::Sched::interleave);
+        const auto r = idle.run(2500);
+        check(idle.engine.quiesces == count(r, ms::Command::heartbeat) && idle.engine.quiesces >= 2,
+              "paired idle heartbeats retire direct receives");
+    }
     {
         // Frozen version-3 hello encoding of public main (control version 3), including zero padding.
         std::array<unsigned char, 512> legacy{};

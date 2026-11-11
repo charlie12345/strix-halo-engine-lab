@@ -10,7 +10,6 @@ namespace strix::h3::te {
 namespace {
 
 constexpr int kPatch = 16, kMerge = 2, kTemporal = 2, kFactor = kPatch * kMerge;
-constexpr double kMinPixels = 3136, kMaxPixels = 12845056;
 
 struct Taps { std::vector<int> i0, i1; std::vector<float> w0, w1; };
 
@@ -33,16 +32,18 @@ Taps taps(int in, int out) {
 
 }  // namespace
 
-void smart_resize(int h, int w, int& h_bar, int& w_bar) {
+void smart_resize(int h, int w, int& h_bar, int& w_bar, double min_pixels, double max_pixels) {
+    if(h<=0 || w<=0 || min_pixels<=0 || max_pixels<min_pixels || !std::isfinite(max_pixels))
+        throw std::invalid_argument("vision: invalid image dimensions or processor bounds");
     // Python round(): half to even on the double quotient
     h_bar = int(std::nearbyint(double(h) / kFactor)) * kFactor;
     w_bar = int(std::nearbyint(double(w) / kFactor)) * kFactor;
-    if (double(h_bar) * w_bar > kMaxPixels) {
-        const double beta = std::sqrt(double(h) * w / kMaxPixels);
+    if (double(h_bar) * w_bar > max_pixels) {
+        const double beta = std::sqrt(double(h) * w / max_pixels);
         h_bar = std::max(kFactor, int(std::floor(h / beta / kFactor)) * kFactor);
         w_bar = std::max(kFactor, int(std::floor(w / beta / kFactor)) * kFactor);
-    } else if (double(h_bar) * w_bar < kMinPixels) {
-        const double beta = std::sqrt(kMinPixels / (double(h) * w));
+    } else if (double(h_bar) * w_bar < min_pixels) {
+        const double beta = std::sqrt(min_pixels / (double(h) * w));
         h_bar = int(std::ceil(h * beta / kFactor)) * kFactor;
         w_bar = int(std::ceil(w * beta / kFactor)) * kFactor;
     }
@@ -66,7 +67,7 @@ Patches make_patches(const Frames& f) {
     if ((f.t != 1 && f.t != 2) || f.h <= 0 || f.w <= 0 || f.rgb.size() != std::size_t(f.t) * f.h * f.w * 3)
         throw std::invalid_argument("make_patches: frames");
     int hb = 0, wb = 0;
-    smart_resize(f.h, f.w, hb, wb);
+    smart_resize(f.h, f.w, hb, wb, f.min_pixels, f.max_pixels);
     std::vector<std::vector<float>> frames;
     for (int t = 0; t < f.t; ++t) {
         auto r = resize_bilinear(f.rgb.data() + std::size_t(t) * f.h * f.w * 3, f.h, f.w, hb, wb);

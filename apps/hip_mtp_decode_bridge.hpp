@@ -1,5 +1,6 @@
 #include "strix/startup_markers.hpp"
 #pragma once
+#include "qwen_pair_transport.hpp"
 #include "rtx_state_import_routes.hpp"
 #include "qwen_yarn_memory.hpp"
 #include "mtp_asset_verification.hpp"

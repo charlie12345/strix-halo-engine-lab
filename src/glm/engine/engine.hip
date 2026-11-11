@@ -2688,31 +2688,44 @@ struct Engine::Impl {
         if (rf) throw std::runtime_error("non-finite value in a committed KDA row (C2) at flush");
     }
 
-    std::vector<std::uint8_t> state_bytes(std::uint32_t slot, std::uint64_t frontier = ~std::uint64_t{0}) {
-        std::vector<std::uint8_t> out;
-        if (kv_shard) out.resize(sizeof(kvshard::SnapshotKey));
-        auto grab = [&](const void* p, std::size_t bytes) {
-            const std::size_t o = out.size();
-            out.resize(o + bytes);
-            hip_ok(hipMemcpy(out.data() + o, p, bytes, hipMemcpyDeviceToHost), "state");
-        };
+    // Device regions of one slot's snapshot, in serialization order (frontier caps the DSA prefix).
+    template <typename F> void for_each_state_region(std::uint32_t slot, std::uint64_t frontier, F&& f) const {
         for (const LayerW& w : layers) {
             if (w.kda) {
                 const std::size_t s = static_cast<std::size_t>(kda_heads) * kKdaDim * kKdaDim, c = 3ULL * kda_heads * kKdaDim * 3;
-                grab(w.kst.S + slot * s, s * 4);
-                grab(w.kst.conv + slot * c, c * 4);
+                f(w.kst.S + slot * s, s * 4);
+                f(w.kst.conv + slot * c, c * 4);
             } else {
                 const std::size_t cap = static_cast<std::size_t>(w.dst.shard ? kvshard::storage_tokens(w.dst.cap) : w.dst.cap);
                 const auto global_n = std::min<std::uint64_t>(w.dst.cap, frontier);
                 const std::size_t n = static_cast<std::size_t>(w.dst.shard ? kvshard::owned_prefix(global_n, opt.rank) : global_n);
-                grab(w.dst.latent + slot * cap * kKvLora, n * kKvLora * 2);
-                grab(w.dst.ikey + slot * cap * kIdxDim, n * kIdxDim * 2);
-                grab(w.dst.igate + slot * cap * kIdxDim, n * kIdxDim * 2);
-                grab(w.dst.pooled + slot * (cap / kKpool) * kIdxDim, (n / kKpool) * kIdxDim * 4);
+                f(w.dst.latent + slot * cap * kKvLora, n * kKvLora * 2);
+                f(w.dst.ikey + slot * cap * kIdxDim, n * kIdxDim * 2);
+                f(w.dst.igate + slot * cap * kIdxDim, n * kIdxDim * 2);
+                f(w.dst.pooled + slot * (cap / kKpool) * kIdxDim, (n / kKpool) * kIdxDim * 4);
             }
         }
+    }
+
+    std::size_t state_payload_bytes(std::uint32_t slot, std::uint64_t frontier) const {
+        std::size_t total = 0;
+        for_each_state_region(slot, frontier, [&](const void*, std::size_t bytes) { total += bytes; });
+        return total;
+    }
+
+    // One sized buffer, copies queued on the engine stream (ordered after its pending work), one sync.
+    std::vector<std::uint8_t> state_bytes(std::uint32_t slot, std::uint64_t frontier = ~std::uint64_t{0}) {
+        const std::size_t head = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
+        const std::size_t payload = state_payload_bytes(slot, frontier);
+        std::vector<std::uint8_t> out(head + payload);
+        std::size_t o = head;
+        for_each_state_region(slot, frontier, [&](const void* p, std::size_t bytes) {
+            if (bytes) hip_ok(hipMemcpyAsync(out.data() + o, p, bytes, hipMemcpyDeviceToHost, stream), "state");
+            o += bytes;
+        });
+        hip_ok(hipStreamSynchronize(stream), "state sync");
         if (kv_shard) {
-            const auto key = kvshard::snapshot_key(opt.capacity, opt.rank, std::min(opt.capacity, frontier), out.size() - sizeof(kvshard::SnapshotKey));
+            const auto key = kvshard::snapshot_key(opt.capacity, opt.rank, std::min(opt.capacity, frontier), payload);
             std::memcpy(out.data(), key.data(), sizeof(key));
         }
         return out;
@@ -2720,39 +2733,21 @@ struct Engine::Impl {
 
     void restore_state(std::uint32_t slot, std::span<const std::uint8_t> in, std::uint64_t frontier) {
         if (slot >= opt.slots) throw std::out_of_range("restore_state: slot");
-        if (kv_shard) {
-            const auto global_n = std::min(opt.capacity, frontier);
-            const auto n = kvshard::owned_prefix(global_n, opt.rank);
-            std::uint64_t bytes = 0;
-            for (const LayerW& w : layers) {
-                if (w.kda) bytes += static_cast<std::uint64_t>(kda_heads) * kKdaDim * kKdaDim * 4 + 3ULL * kda_heads * kKdaDim * 3 * 4;
-                else bytes += n * (kKvLora + 2 * kIdxDim) * 2 + (n / kKpool) * kIdxDim * 4;
-            }
-            kvshard::validate_snapshot(in.data(), in.size(), true, kvshard::snapshot_key(opt.capacity, opt.rank, global_n, bytes));
-        } else kvshard::validate_snapshot(in.data(), in.size(), false);
-        reset(slot);
-        std::size_t o = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
-        auto put = [&](void* p, std::size_t bytes) {
-            if (o + bytes > in.size()) throw std::invalid_argument("restore_state: state shorter than this engine's layout");
-            hip_ok(hipMemcpy(p, in.data() + o, bytes, hipMemcpyHostToDevice), "restore");
+        const std::size_t head = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
+        const std::size_t payload = state_payload_bytes(slot, frontier);
+        if (kv_shard)
+            kvshard::validate_snapshot(in.data(), in.size(), true,
+                                       kvshard::snapshot_key(opt.capacity, opt.rank, std::min(opt.capacity, frontier), payload));
+        else kvshard::validate_snapshot(in.data(), in.size(), false);
+        if (in.size() < head + payload) throw std::invalid_argument("restore_state: state shorter than this engine's layout");
+        if (in.size() > head + payload) throw std::invalid_argument("restore_state: state longer than this engine's layout");
+        reset(slot);  // memsets on the stream; the copies below are queued after them
+        std::size_t o = head;
+        for_each_state_region(slot, frontier, [&](const void* p, std::size_t bytes) {
+            if (bytes) hip_ok(hipMemcpyAsync(const_cast<void*>(p), in.data() + o, bytes, hipMemcpyHostToDevice, stream), "restore");
             o += bytes;
-        };
-        for (LayerW& w : layers) {
-            if (w.kda) {
-                const std::size_t s = static_cast<std::size_t>(kda_heads) * kKdaDim * kKdaDim, c = 3ULL * kda_heads * kKdaDim * 3;
-                put(w.kst.S + slot * s, s * 4);
-                put(w.kst.conv + slot * c, c * 4);
-            } else {
-                const std::size_t cap = static_cast<std::size_t>(w.dst.shard ? kvshard::storage_tokens(w.dst.cap) : w.dst.cap);
-                const auto global_n = std::min<std::uint64_t>(w.dst.cap, frontier);
-                const std::size_t n = static_cast<std::size_t>(w.dst.shard ? kvshard::owned_prefix(global_n, opt.rank) : global_n);
-                put(w.dst.latent + slot * cap * kKvLora, n * kKvLora * 2);
-                put(w.dst.ikey + slot * cap * kIdxDim, n * kIdxDim * 2);
-                put(w.dst.igate + slot * cap * kIdxDim, n * kIdxDim * 2);
-                put(w.dst.pooled + slot * (cap / kKpool) * kIdxDim, (n / kKpool) * kIdxDim * 4);
-            }
-        }
-        if (o != in.size()) throw std::invalid_argument("restore_state: state longer than this engine's layout");
+        });
+        hip_ok(hipStreamSynchronize(stream), "restore sync");
     }
 };
 

@@ -20,13 +20,12 @@
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
-//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfcore | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
+//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
 //                                                    (pfidxconc: 0 vs STRIX_MM_AB_IDXCONC=1|2, default 2; 7 hashed prefills)
 //                                                    (pfkvtile: off vs STRIX_MM_AB_KVTILE=auto|<index>, default auto; 7 hashed prefills)
 //                                                    (pftxuc: PFX copy-to-host-coherent vs producer-to-uncached TX; 7 hashed prefills)
 //   --sel-check PROMPT.u32:K:N[:v]               selection-once check: decode logits with STRIX_MM_SELECT_ONCE off / on bitwise equal at >= 16K (STRIX_MM_SEL_CHECK_LEN)
 //   --xb-check PROMPT.u32:K:N[:v]                exchange boundary check: decode logits of the 4 (wait, inplace) configurations bitwise == 00 (N slots, or :v one N-row verify window)
-//                                                    (pfcore: prefill MoE WMMA core, off = lib, on = STRIX_MM_AB_PFCORE, default 3 = v4)
 //                                                    (pfgufuse: single-split gate/up fusion off/on; 7 prefills with state and final-row hashes)
 //                                                    (pftails: MoE tail classes on the caller's stream vs beside MT8 on a side stream; 7 hashed prefills)
 //                                                    (pfpair: paired MT8 PIPE bands off vs auto (calls >= 2048 rows); 7 hashed prefills)
@@ -1049,7 +1048,6 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             const char* e = std::getenv("STRIX_MM_AB_CORE8");
             const std::string value = e != nullptr ? e : "2";
             if (value != "1" && value != "2") throw std::invalid_argument("STRIX_MM_AB_CORE8 must be 1 or 2");
-            strix::minimax::moe::opt::set_prefill_core(3);
             eng.set_prefill_mtfit(1);
             eng.set_prefill_pipe(on ? 0 : -1);
             eng.set_prefill_core8(on ? (value == "1" ? 1 : 2) : -1);
@@ -1070,12 +1068,10 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             const char* e = std::getenv("STRIX_MM_AB_CORE8");
             const std::string value = e != nullptr ? e : "1";
             if (value != "1" && value != "2") throw std::invalid_argument("STRIX_MM_AB_CORE8 must be 1 or 2");
-            strix::minimax::moe::opt::set_prefill_core(3);
             eng.set_prefill_mtfit(1);
             eng.set_prefill_core8(on ? (value == "1" ? 1 : 2) : 0);
         }
         else if (flag == "mtfit") {
-            strix::minimax::moe::opt::set_prefill_core(3);
             eng.set_prefill_mtfit(on ? 1 : 0);
         }
         else if (flag == "pfi4") strix::minimax::moe::opt::set_prefill_iu4(on ? 1 : 0);  // FAST_I4 layers: EXL3 (A) / W4A4 IU4 (B), lossy
@@ -1088,15 +1084,8 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             eng.set_prefill_msa_batch(on);
             eng.set_prefill_attend4(on);
             eng.set_prefill_router_batch(on);
-            strix::minimax::moe::opt::set_prefill_core(3);
             eng.set_prefill_mtfit(on ? 1 : 0);
             strix_trellis_lab_set_wmma_tiled(on ? 1 : 0);
-        }
-        else if (flag == "pfcore") {  //: prefill MoE core, lib (off) vs STRIX_MM_AB_PFCORE (on)
-            const char* c = std::getenv("STRIX_MM_AB_PFCORE");
-            const int core = c != nullptr ? std::atoi(c) : 3;
-            if (core < 1 || core > 3) throw std::invalid_argument("STRIX_MM_AB_PFCORE must be 1, 2 or 3 (v2, v3, v4)");
-            strix::minimax::moe::opt::set_prefill_core(on ? core : 0);
         } else throw std::invalid_argument("--ab: unknown flag " + flag);
     };
     const bool start_arm = flag == "staging" ? eng.fused_staging() : flag == "attn" ? eng.fused_attention()
@@ -1131,9 +1120,9 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = (flag != "pfcore" && (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || flag == "pfcore" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
-    // pfcore / pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
-    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
+    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
+    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
@@ -1198,19 +1187,15 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         eng.set_prefill_core8(-1);
         eng.set_prefill_pipe(-1);
         eng.set_prefill_mtfit(-1);
-        strix::minimax::moe::opt::set_prefill_core(-1);
     }
     else if (flag == "pfpipe") eng.set_prefill_pipe(pipe0);
     else if (flag == "core8") {
         eng.set_prefill_core8(-1);
         eng.set_prefill_mtfit(-1);
-        strix::minimax::moe::opt::set_prefill_core(-1);
     }
     else if (flag == "mtfit") {
         eng.set_prefill_mtfit(-1);
-        strix::minimax::moe::opt::set_prefill_core(-1);
     }
-    else if (flag == "pfcore") strix::minimax::moe::opt::set_prefill_core(-1);  // back to the process default
     else if (flag == "pfidx") {
         eng.set_prefill_index_tile(start_arm);
         eng.set_prefill_msa_batch(msa0);
@@ -1224,7 +1209,6 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         eng.set_prefill_attend4(att0);
         eng.set_prefill_router_batch(rtr0);
         eng.set_prefill_mtfit(-1);
-        strix::minimax::moe::opt::set_prefill_core(-1);
         strix_trellis_lab_set_wmma_tiled(-1);
     }
     else if (xb) {

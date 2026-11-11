@@ -40,9 +40,9 @@ struct Args {
     bool inspect=false,fast_vae=false,fast_sparse=false,dist=false,attn_2p15=false,latent_only=false;
     bool eager_prepare=true,vae_parallel=true;
     // sequence pair: tail row share of the split K/V schedule (0: one message per block), per-block exposure
-    // receipts, TE before (not alongside) DiT residency
+    // receipts; TE before (not alongside) DiT residency; VAE loaded after (not during) sampling
     std::uint32_t split_tail=kSplitAuto;
-    bool pair_timing=false,serial_te=false;
+    bool pair_timing=false,serial_te=false,serial_vae=false;
     d::ImageParallel parallel=d::ImageParallel::automatic;
     d::ImageWork work;
     std::vector<std::string> refs;
@@ -71,12 +71,12 @@ Args parse(int argc,char** argv) {
         else if(k=="--vae-parallel") { const auto p=val(); if(p!="auto" && p!="off") throw std::invalid_argument("vae parallel must be auto or off"); a.vae_parallel=p=="auto"; }
         else if(k=="--lazy-prepare") a.eager_prepare=false;
         else if(k=="--pair-split-tail") { const auto v=val(); if(v=="auto") a.split_tail=kSplitAuto; else { a.split_tail=integer(v); if(a.split_tail>=100) throw std::invalid_argument("--pair-split-tail must be auto or 0..99"); } }
-        else if(k=="--pair-timing") a.pair_timing=true; else if(k=="--serial-te") a.serial_te=true;
+        else if(k=="--pair-timing") a.pair_timing=true; else if(k=="--serial-te") a.serial_te=true; else if(k=="--serial-vae") a.serial_vae=true;
         else if(k=="--transport") { a.transport=val(); if(a.transport!="usb4auto" && a.transport!="usb4gpu" && a.transport!="usb4-host") throw std::invalid_argument("image transport must be usb4auto, usb4gpu or usb4-host"); }
         else if(k=="--print-config") a.inspect=true; else if(k=="--decode-latent") a.decode_latent=val(); else if(k=="--latent-only") a.latent_only=true;
         else if(k=="--fast-vae-fp16") a.fast_vae=true; else if(k=="--fast-sparse") a.fast_sparse=true;
         else if(k=="--dist") a.dist=true; else if(k=="--attn-score-2p15") a.attn_2p15=true;
-        else if(k=="--help") { std::cout<<"strix-h3-image --model MODEL_DIR_OR_FILE [--dit FILE] --prompt TEXT --te-pack TE_PACK [--tokenizer DIR] [--pdd-fused-heads FILE] --width W --height H --seed N [--ref PNG] [--vae FILE] [--output PNG] [--world 2 --rank R --transport usb4gpu|usb4auto|usb4-host] [--parallel auto|sequence|request] [--requests N (same prompt; seed+index)] [--vae-parallel auto|off] [--pair-split-tail auto|PCT (0..99; auto: 20 up to 2048 packed rows, else 30; 0 = one K/V message per block)] [--pair-timing] [--serial-te] [--lazy-prepare] [--dist] [--fast-vae-fp16] [--fast-sparse] [--attn-score-2p15] [--print-config] [--latent-only] [--decode-latent LATENT.f32 (host VAE only)]\n"; std::exit(0); }
+        else if(k=="--help") { std::cout<<"strix-h3-image --model MODEL_DIR_OR_FILE [--dit FILE] --prompt TEXT --te-pack TE_PACK [--tokenizer DIR] [--pdd-fused-heads FILE] --width W --height H --seed N [--ref PNG] [--vae FILE] [--output PNG] [--world 2 --rank R --transport usb4gpu|usb4auto|usb4-host] [--parallel auto|sequence|request] [--requests N (same prompt; seed+index)] [--vae-parallel auto|off] [--pair-split-tail auto|PCT (0..99; auto: 20 up to 2048 packed rows, else 30; 0 = one K/V message per block)] [--pair-timing] [--serial-te] [--serial-vae] [--lazy-prepare] [--dist] [--fast-vae-fp16] [--fast-sparse] [--attn-score-2p15] [--print-config] [--latent-only] [--decode-latent LATENT.f32 (host VAE only)]\n"; std::exit(0); }
         else throw std::invalid_argument("unknown image option");
     }
     a.work=d::image_work(a.parallel,a.requests,a.seed,a.world,a.rank);
@@ -205,9 +205,11 @@ int run(const Args& a,const b::ImageConfig& cfg) {
         const auto layout=te::expand_layout(pres.ids,patches);
         tags.assign(layout.tags.begin(),layout.tags.end());
     }; // TE and vision residency end inside run_te.
-    // Sequence pair: TE runs on its own thread while the DiT checkpoint is read and made resident (the same TE and
-    // DiT arithmetic; peak memory holds both). The admission check keeps the free memory seen before both.
-    const bool te_alongside=a.work.sequence && !a.serial_te;
+    // Sequence pair and eager single node: TE runs on its own thread while the DiT checkpoint is read and made resident
+    // (the same TE and DiT arithmetic; peak memory holds both). The admission check keeps the free memory seen before
+    // both. The single-node block weights do not depend on the row count, which needs the TE's text length.
+    const bool single_eager=!a.work.sequence && !a.dist && a.eager_prepare;
+    const bool te_alongside=(a.work.sequence || single_eager) && !a.serial_te;
     std::size_t free_before=0,total_before=0;
     std::future<double> te_job;
     if(te_alongside) {
@@ -230,9 +232,16 @@ int run(const Args& a,const b::ImageConfig& cfg) {
     }
     b::ImageBlockSource source(st,g,cfg);
     std::unique_ptr<d::DeviceModel> early_model;
+    std::unique_ptr<b::DeviceForward> forward_owner;  // single node: driver and resident linear weights
+    std::unique_ptr<b::GemmDeviceLinear> linear_owner;
     if(te_alongside) {
         const auto residency_start=std::chrono::steady_clock::now();
-        early_model=std::make_unique<d::DeviceModel>(g,source,50,true);
+        if(a.work.sequence) early_model=std::make_unique<d::DeviceModel>(g,source,50,true);
+        else {
+            forward_owner=std::make_unique<b::DeviceForward>(g);
+            linear_owner=std::make_unique<b::GemmDeviceLinear>(0); // rows set once the text length is known
+            forward_owner->prepare(source,*linear_owner);
+        }
         stage("dit_residency_alongside_te",residency_start);
         const auto te_seconds=te_job.get();
         refs.clear(); refs.shrink_to_fit();
@@ -262,13 +271,24 @@ int run(const Args& a,const b::ImageConfig& cfg) {
     const std::uint64_t latent_hold=a.latent_only?0:std::uint64_t(a.work.requests.size())*24*(a.height/16)*(a.width/16)*sizeof(float);
     if(L.seq_len>(1U<<20) || b::ImageConfig::conservative_bytes(L.seq_len)+latent_hold>free_bytes)
         throw std::runtime_error("image: packed sequence exceeds conservative memory/attention admission; reduce reference area explicitly");
+    // VAE (host head + FAST decoder) loads on a thread during sampling; decoding waits for it (--serial-vae: after
+    // the DiT is released, as before). Off in the sequence pair until measured there.
+    struct VaeSet { std::unique_ptr<v::ImageVae> host; std::unique_ptr<v::GpuDecoder> fast; double seconds=0; };
+    auto load_vae=[&a] { const auto t0=std::chrono::steady_clock::now();VaeSet s;s.host=std::make_unique<v::ImageVae>(a.vae);
+        if(a.fast_vae) s.fast=std::make_unique<v::GpuDecoder>(a.vae,24,true,true);
+        s.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();return s; };
+    const bool vae_alongside=!a.latent_only && !a.work.sequence && !a.serial_vae;
+    std::future<VaeSet> vae_job;
     {
-        b::DeviceForward forward(g);
+        if(!forward_owner) forward_owner=std::make_unique<b::DeviceForward>(g);
+        auto& forward=*forward_owner;
         if(a.attn_2p15) forward.set_attn_score_limit(b::kAttnScoreLimitExtended);
         text=forward.refine_text(text.data(),text_len,attention);
         std::unique_ptr<b::SparseAccel> sparse;
         if(a.fast_sparse) { sparse=std::make_unique<b::SparseAccel>(0.75F,3,2,"39-42"); b::AccelOptions opt; opt.sparse=sparse.get();forward.set_accel(opt);forward.reset_accel_run(); }
-        b::GemmDeviceLinear linear(L.seq_len); // fused fc1+SwiGLU where the operand allows (int8_convrot), else fc1+K5
+        // fused fc1+SwiGLU where the operand allows (int8_convrot), else fc1+K5
+        if(linear_owner) linear_owner->set_max_rows(L.seq_len); else linear_owner=std::make_unique<b::GemmDeviceLinear>(L.seq_len);
+        auto& linear=*linear_owner;
         std::unique_ptr<d::DeviceModel> model;
         std::unique_ptr<d::DeviceDistRank> rank;
         const auto prepare_start=std::chrono::steady_clock::now();
@@ -318,9 +338,10 @@ int run(const Args& a,const b::ImageConfig& cfg) {
             }
             rank=std::make_unique<d::DeviceDistRank>(*model,split,d::Role{a.work.sequence?a.rank:0U,a.work.sequence?2U:1U,false},comm.get());
         } else if(a.eager_prepare) {
-            forward.prepare(source,linear);
+            forward.prepare(source,linear); // no-op for blocks already made resident alongside the TE
         }
         stage("dit_residency_and_pair",prepare_start);
+        if(vae_alongside) vae_job=std::async(std::launch::async,load_vae);
         d::DeviceRunOptions run_options;
         run_options.hashes=false; // retain mandatory device digests/admission; avoid per-block host residual downloads
         run_options.score_bound=a.attn_2p15?d::kScoreBoundExtended:d::kScoreBound;
@@ -366,12 +387,18 @@ int run(const Args& a,const b::ImageConfig& cfg) {
             write_f32(output+".latent.f32",result.video);
             if(!a.latent_only) latents.push_back(result.video);
         }
-    } // DiT residency ends before VAE loading.
+    }
+    linear_owner.reset();forward_owner.reset(); // DiT residency ends before decoding (and before VAE loading with --serial-vae or in the pair)
     stage("dit_load_prepare_refiner_sample",stage_start);stage_start=std::chrono::steady_clock::now();
     if(a.latent_only) { std::cout<<"{\"image_complete\":\"latent-only\",\"seconds\":"<<std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()<<"}"<<std::endl; return 0; }
-    v::ImageVae vae(a.vae);
-    std::unique_ptr<v::GpuDecoder> fast;
-    if(a.fast_vae) fast=std::make_unique<v::GpuDecoder>(a.vae,24,true,true);
+    auto vae_set=vae_job.valid()?vae_job.get():load_vae();
+    v::ImageVae& vae=*vae_set.host;
+    std::unique_ptr<v::GpuDecoder> fast=std::move(vae_set.fast);
+    // nested in vae_and_png (same start); decode+PNG = vae_and_png - vae_load. Alongside sampling: vae_load is the
+    // load itself (hidden) and vae_load_wait the part left on the critical path.
+    if(vae_alongside) { std::cout<<"{\"image_stage\":\"vae_load\",\"rank\":"<<a.rank<<",\"seconds\":"<<vae_set.seconds<<",\"alongside_dit\":true}\n";
+        stage("vae_load_wait",stage_start); }
+    else stage("vae_load",stage_start);
     v::ImageVae::TileFn fn;
     if(fast) fn=[&](const auto& pq,int h,int w) { v::H16 x(pq.size());for(std::size_t i=0;i<x.size();++i)x[i]=v::f2h(pq[i]);const auto p=fast->decode_call(x,1,h,w);std::vector<float> f(p.size());for(std::size_t i=0;i<f.size();++i)f[i]=v::h2f(p[i]);return f; };
     v::ImageVae::TileDispatch dispatch;

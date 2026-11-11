@@ -6,7 +6,6 @@
 #include "h3/gemm/dense.hpp"
 
 #include <algorithm>
-#include <future>
 #include <map>
 #include <thread>
 #include <chrono>
@@ -259,13 +258,13 @@ DeviceModel::DeviceModel(const block::GlobalWeights& g, block::BlockSource& src,
     impl_->aproj_w = upload(g.audio_patch_proj.w);
     impl_->aproj_b = upload(g.audio_patch_proj.b);
     impl_->blocks.resize(nblocks);
-    // Host preparation of block i + 1 (checkpoint read, adaLN folding) on a worker while block i uploads. Only one
-    // thread calls the source at a time (sequential hand-off); the uploaded bytes are unchanged.
-    std::future<std::shared_ptr<const block::BlockWeights>> ahead;
-    if (nblocks) ahead = std::async(std::launch::async, [&src] { return src.block(0); });
+    // Host preparation of block i + 1 (checkpoint read, adaLN folding) on a worker while block i uploads; the uploaded
+    // bytes are unchanged.
+    std::vector<std::uint32_t> order(nblocks);
+    for (std::uint32_t i = 0; i < nblocks; ++i) order[i] = i;
+    block::BlockReadAhead ahead(src, std::move(order));
     for (std::uint32_t i = 0; i < nblocks; ++i) {
-        const auto b = ahead.get();
-        if (i + 1U < nblocks) ahead = std::async(std::launch::async, [&src, i] { return src.block(i + 1U); });
+        const auto b = ahead.next();
         auto& d = impl_->blocks[i];
         auto q = [&](const block::QLinear& l, Buf& c, Buf& sc, gemm::Weights& w, std::array<Buf,3>& packed) {
             if (!l.bf16.empty()) c = upload(l.bf16);

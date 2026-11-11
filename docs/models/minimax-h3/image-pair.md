@@ -91,9 +91,21 @@ hash verification by the operator. Both ranks write complete identical outputs.
 ## Preparation and VAE
 
 Block preparation happens before sampling through the existing uploader and
-finite adaLN preparation. `--lazy-prepare` restores first-use preparation on the
-single-node route. Timings separate residency/pairing from sampling; moving work
-to startup does not establish a cold wall-time improvement.
+finite adaLN preparation. Both routes read block i+1 from the checkpoint on a
+worker while block i is uploaded (the same bytes as a serial loop). The eager
+single-node route also runs the TE on a thread while the DiT is made resident,
+as sequence mode does (`--serial-te` restores TE first; peak memory holds both,
+about +13 GiB). The activation workspace is sized once the TE gives the text
+length. `--lazy-prepare` restores first-use preparation on the single-node route
+(TE first). Timings separate residency/pairing from sampling; moving work to
+startup does not establish a cold wall-time improvement.
+
+Off the sequence pair, the VAE (host head and `--fast-vae-fp16` decoder) loads
+on a thread during sampling and decoding waits for it (`--serial-vae` loads it
+after the DiT is released, as before). The receipts are `vae_load` (the load,
+with `alongside_dit`) and `vae_load_wait` (what is left on the critical path).
+The FAST decoder uploads its weights on its own stream, so loading does not wait
+for or stall the sampling stream.
 
 `--vae-parallel auto|off` controls tile dispatch in sequence mode. The canonical
 spatial tiles, including overlap, are split into two contiguous ranges. Each rank

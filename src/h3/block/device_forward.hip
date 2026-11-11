@@ -170,7 +170,7 @@ struct GemmDeviceLinear::Impl {
     std::uint32_t max_rows = 0;
     DevBuf f1;      // [max_rows][2 * kFfn] bf16: plain fc1 output of blocks the epilogue cannot fuse (allocated on first use)
     DevBuf silu;    // K5 table for those blocks
-    explicit Impl(std::uint32_t rows) : ws(rows, kFfn), max_rows(rows) {}
+    explicit Impl(std::uint32_t rows) : max_rows(rows) { if (rows) ws = gemm::Workspace(rows, kFfn); }
     void up(DevW& d, const std::int8_t* codes, const float* scales, std::uint32_t n, std::uint32_t k) {
         d.codes.alloc(static_cast<std::size_t>(n) * k);
         d.scales.alloc(static_cast<std::size_t>(n) * 4U);
@@ -210,6 +210,13 @@ void GemmDeviceLinear::prepare(const std::shared_ptr<const BlockWeights>& b) {
     impl_->up(d.fc2, b->fc2);
 }
 bool GemmDeviceLinear::prepared(std::uint32_t block) const { return impl_->blocks.count(block) != 0; }
+void GemmDeviceLinear::set_max_rows(std::uint32_t max_rows) {
+    if (!max_rows) throw std::invalid_argument("device linear: empty workspace");
+    if (max_rows == impl_->max_rows && impl_->ws.max_rows()) return;
+    impl_->ws = gemm::Workspace(max_rows, kFfn);
+    impl_->max_rows = max_rows;
+    impl_->f1 = DevBuf{};  // sized by max_rows on first use
+}
 void GemmDeviceLinear::run(std::uint32_t block, LinearKind kind, const std::uint16_t* d_x, std::uint32_t m, std::uint16_t* d_y, void* stream) {
     const Impl::BlockW& d = impl_->blocks.at(block);
     hipStream_t s = static_cast<hipStream_t>(stream);
@@ -366,12 +373,14 @@ struct DeviceForward::Impl {
 DeviceForward::DeviceForward(const GlobalWeights& g) : impl_(std::make_unique<Impl>(g)) {}
 DeviceForward::~DeviceForward() = default;
 void DeviceForward::prepare(BlockSource& blocks, DeviceLinearOp& lin) {
-    for (std::uint32_t i=0;i<blocks.num_blocks();++i) {
-        if (!lin.prepared(i) || impl_->blocks.count(i)==0) {
-            const auto b=blocks.block(i);
-            lin.prepare(b);
-            impl_->block_dev(*b);
-        }
+    // Block i + 1 is read and folded on a worker while block i is permuted and uploaded (the same bytes as a serial loop).
+    std::vector<std::uint32_t> todo;
+    for (std::uint32_t i=0;i<blocks.num_blocks();++i)
+        if (!lin.prepared(i) || impl_->blocks.count(i)==0) todo.push_back(i);
+    BlockReadAhead ahead(blocks, std::move(todo));
+    while (const auto b=ahead.next()) {
+        lin.prepare(b);
+        impl_->block_dev(*b);
     }
     hip_check(hipStreamSynchronize(impl_->stream), "prepare blocks");
 }

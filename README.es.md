@@ -23,7 +23,7 @@ repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y 
 | MiniMax M3.1 Flash | par | 23.10 tok/s (1K) | 596 tok/s a 8K, 529 a 32K (exacto) |
 | GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | 541 tok/s a 8K, 529 a 32K (exacto) |
 | Nemotron 3.5 Bolt E4B | 1 nodo | 91.9 tok/s (C1) | 2,780 tok/s a 8K, 2,336 a 32K (`fast`) |
-| Nemotron 3.5 Bolt E4B | 2 nodos (prefill en pipeline, opcional) | - | @PAIR_ES@ |
+| Nemotron 3.5 Bolt E4B | 2 nodos (prefill en pipeline, opcional) | - | 4,804 tok/s a 8K, 3,965 a 32K (`fast`, mismos bytes que 1 nodo) |
 | MiniMax H3 | par | clip de 5 s 1344x768 con audio en 405.5 s | - |
 | MiniMax-H3-Image (int8, 6 pasos) | 1 nodo | imagen 1024x1024 en 33.6 s, 2048x2048 en 52 s | - |
 | MiniMax-H3-Image (int8, 6 pasos) | par | imagen 1024x1024 en 22.4 s, 2048x2048 en 44.6 s | - |

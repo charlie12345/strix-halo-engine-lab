@@ -39,6 +39,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1671,18 +1672,14 @@ template <class Site> bool q6_site(const Site& site, Site& result) {
 // project_wide_rows_kernel), 1 (shared coefficients, C++ FMA chains) or 2 (default:
 // the VOPD kernels where the site allows them); STRIX_Q8_ROWS_WIDE_SUB = 2/4/8/16 rows
 // per wave for kernels 0 and 1; STRIX_Q8_ROWS_WIDE_STAGE=1 the LDS-staged kernel.
-inline unsigned env_unsigned(const char* name, unsigned fallback) {
-    const char* v = std::getenv(name);
-    return v ? static_cast<unsigned>(std::atoi(v)) : fallback;
-}
-inline unsigned wide_sub() { static const unsigned sub = env_unsigned("STRIX_Q8_ROWS_WIDE_SUB", 0U); return sub; }
-inline unsigned wide_kernel() { static const unsigned kernel = env_unsigned("STRIX_Q8_ROWS_WIDE_KERNEL", 2U); return kernel; }
-inline bool wide_stage() { static const bool stage = env_unsigned("STRIX_Q8_ROWS_WIDE_STAGE", 0U) == 1U; return stage; }
-inline unsigned narrow_vopd() { static const unsigned vopd = env_unsigned("STRIX_Q8_ROWS_VOPD", 1U); return vopd; }
+inline unsigned wide_sub() { static const unsigned sub = strix::env_number<unsigned>("STRIX_Q8_ROWS_WIDE_SUB", 0U); return sub; }
+inline unsigned wide_kernel() { static const unsigned kernel = strix::env_number<unsigned>("STRIX_Q8_ROWS_WIDE_KERNEL", 2U); return kernel; }
+inline bool wide_stage() { static const bool stage = strix::env_number<unsigned>("STRIX_Q8_ROWS_WIDE_STAGE", 0U) == 1U; return stage; }
+inline unsigned narrow_vopd() { static const unsigned vopd = strix::env_number<unsigned>("STRIX_Q8_ROWS_VOPD", 1U); return vopd; }
 // STRIX_Q8_ROWS_WIDE_FP32_MIN: narrowest FP32 input the wide (T >= 16) VOPD coefficient kernel takes.
 // 512 includes the shared down projection (640 wide): 130 -> 100 us per T=64 call after reduce_wide.
-inline unsigned wide_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_WIDE_FP32_MIN", 512U); return w; }
-inline unsigned narrow_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_VOPD_FP32_MIN", 1024U); return w; }
+inline unsigned wide_fp32_min_width() { static const unsigned w = strix::env_number<unsigned>("STRIX_Q8_ROWS_WIDE_FP32_MIN", 512U); return w; }
+inline unsigned narrow_fp32_min_width() { static const unsigned w = strix::env_number<unsigned>("STRIX_Q8_ROWS_VOPD_FP32_MIN", 1024U); return w; }
 // Rows <= 8 whose quantized activations and chain slots fit one block's LDS quantize them in
 // the projection kernel (no quantizer launch; measured faster in 8-row MTP windows even at one
 // block per CU). STRIX_DENSE_A8_STAGE=0 never stages, =1 stages only up to kDenseA8StageBytes.
@@ -1703,18 +1700,18 @@ template <class Site> void launch_dense_a8_projection(const Site& site, const De
     };
     constexpr unsigned TM = Site::rows >= 64U ? 4U : Site::rows / 16U;
     // STRIX_DENSE_A8_TILE=11/12/21/22/41/42 (TM TN) forces one tile shape for every site (tuning).
-    static const unsigned forced = env_unsigned("STRIX_DENSE_A8_TILE", 0U);
+    static const unsigned forced = strix::env_number<unsigned>("STRIX_DENSE_A8_TILE", 0U);
     // Launches of 64k rows take the LDS-staged 4 x 2 form when it still has at least 40 blocks of 8
     // waves (one per CU): GDN/QSA input and the 256-row output launches; narrower launches (shared
     // expert gate/up, 64-row QSA output) keep the 4 x 1 form.
     // STRIX_DENSE_A8_LDS=0 never stages, =2 stages every 64k-row launch; STRIX_DENSE_A8_LDS_WAVES=4|8.
-    static const unsigned lds = env_unsigned("STRIX_DENSE_A8_LDS", 1U);
+    static const unsigned lds = strix::env_number<unsigned>("STRIX_DENSE_A8_LDS", 1U);
     if constexpr (Site::rows % 64U == 0U) {
         const auto lds_blocks = Site::rows / 64U * ((site.outputs + 255U) / 256U);
         if (!forced && (lds == 2U || (lds == 1U && lds_blocks >= 40U))) {
-            static const unsigned lds_waves = env_unsigned("STRIX_DENSE_A8_LDS_WAVES", 8U);
+            static const unsigned lds_waves = strix::env_number<unsigned>("STRIX_DENSE_A8_LDS_WAVES", 8U);
             const auto staged = [&]<unsigned Waves>() {
-                static const unsigned single = env_unsigned("STRIX_INTPREFILL_DENSE_A8_SINGLE_LDS", 0U);
+                static const unsigned single = strix::env_number<unsigned>("STRIX_INTPREFILL_DENSE_A8_SINGLE_LDS", 0U);
                 const auto launch = [&]<bool Single>() {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>),
                         dim3(Site::rows / 64U * ((site.outputs + 32U * Waves - 1U) / (32U * Waves))), dim3(32U * Waves), 0, stream,
@@ -1943,7 +1940,7 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
 // pointers and shape: an engine's weights never change, and a prefill block runs a site's launches of
 // one layer back to back, so each matrix is repacked once per (layer, block). Code that rewrites weight
 // bytes in place (the projection probes) calls invalidate_lane_weights() first.
-inline bool lane_enabled() { static const bool on = env_unsigned("STRIX_Q8_ROWS_LANE", 1U) != 0U; return on; }
+inline bool lane_enabled() { static const bool on = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE", 1U) != 0U; return on; }
 inline std::atomic<unsigned>& lane_epoch() { static std::atomic<unsigned> epoch{0U}; return epoch; }
 inline void invalidate_lane_weights() { lane_epoch().fetch_add(1U, std::memory_order_relaxed); }
 template <class Site> constexpr bool lane_site() {
@@ -1952,7 +1949,7 @@ template <class Site> constexpr bool lane_site() {
 // Even chunk counts (two steps per asm block) and at least 32 output groups (one block per group: the
 // 1280-output shared gate/up launch, 20 blocks, is slower than the VOPD kernel; STRIX_Q8_ROWS_LANE_MIN_OUTPUTS).
 template <class Site> bool lane_admits(const Site& site) {
-    static const unsigned min_outputs = env_unsigned("STRIX_Q8_ROWS_LANE_MIN_OUTPUTS", 2048U);
+    static const unsigned min_outputs = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_MIN_OUTPUTS", 2048U);
     return lane_enabled() && site.width % 512U == 0U && site.outputs >= min_outputs;
 }
 struct LaneBuffer {
@@ -2011,8 +2008,8 @@ template <class Site, unsigned W> void launch_lane_waves(const Site& site, hipSt
     const unsigned blocks = (site.outputs + kLaneOutputs - 1U) / kLaneOutputs * (Site::rows / (kLaneRows * W));
     // STRIX_Q8_ROWS_LANE_STAGE = 2 | 4 | 8 (default) steps per barrier; STRIX_Q8_ROWS_LANE_PREFETCH=0 drops the
     // scalar-cache prefetch; STRIX_Q8_ROWS_LANE_EXP: timing ablations of builds with -DSTRIX_Q8_ROWS_LANE_ABLATIONS.
-    static const unsigned stage = env_unsigned("STRIX_Q8_ROWS_LANE_STAGE", 8U), prefetch = env_unsigned("STRIX_Q8_ROWS_LANE_PREFETCH", 1U);
-    static const unsigned exp = env_unsigned("STRIX_Q8_ROWS_LANE_EXP", 0U);
+    static const unsigned stage = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_STAGE", 8U), prefetch = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_PREFETCH", 1U);
+    static const unsigned exp = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_EXP", 0U);
     const auto run = [&]<unsigned Exp>() {
         if (stage == 2U)
             hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 2U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
@@ -2041,7 +2038,7 @@ template <class Site, unsigned W> void launch_lane_waves(const Site& site, hipSt
 }
 // STRIX_Q8_ROWS_LANE_WAVES = 8 | 16 (default): waves per block (4 rows each) when the launch has rows for them.
 template <class Site> void launch_lane(const Site& site, hipStream_t stream) {
-    static const unsigned waves = env_unsigned("STRIX_Q8_ROWS_LANE_WAVES", 16U);
+    static const unsigned waves = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_WAVES", 16U);
     if constexpr (Site::rows >= 64U) {
         if (waves == 8U) { launch_lane_waves<Site, 8U>(site, stream); return; }
     }

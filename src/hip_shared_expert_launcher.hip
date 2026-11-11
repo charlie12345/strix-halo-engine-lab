@@ -2791,7 +2791,7 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
     const auto rows = static_cast<std::uint32_t>(input.size());
     // The fixture rewrites weights in place between calls (STRIX_Q8_ROWS_LANE_PROBE_CACHE=1 keeps the
     // lane kernel's repacked weights, for timing one unchanged matrix).
-    if (!q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
+    if (!strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
     const bool down = role == HipSharedQ8ProjectionRole::down;
     if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows || gate.size() != (down ? rows : 0U) ||
         (!down && role != HipSharedQ8ProjectionRole::gate_up) ||

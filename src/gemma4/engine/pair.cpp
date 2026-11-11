@@ -4,6 +4,7 @@
 #include "gemma4/prefill/pair.hpp"
 #include "gemma4/prefill/prefill.hpp"
 #include "strix/dist/pipeline_timeline.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/pair/link.hpp"
 #include "strix/pair/regime.hpp"
 #include "xport/hip_pipe_staging.hpp"
@@ -26,7 +27,6 @@ unsigned env_cut(const ModelConfig& config) {
     if (*end || cut == 0 || cut >= config.layers) throw std::invalid_argument("STRIX_G4_PAIR_CUT must be in [1, layers)");
     return unsigned(cut);
 }
-bool env_on(const char* name) { const char* v = std::getenv(name); return v && std::string_view(v) == "1"; }
 std::uint64_t fnv(std::uint64_t hash, std::string_view bytes) {
     for (const char b : bytes) { hash ^= static_cast<unsigned char>(b); hash *= 1099511628211ULL; }
     return hash;
@@ -34,11 +34,11 @@ std::uint64_t fnv(std::uint64_t hash, std::string_view bytes) {
 struct StageReset { ~StageReset() { prefill::pair_stage = {}; } };
 void add_breakdown(Json& pair_json) {
     const auto& ps = prefill::pair_stage;
-    if (!env_on("STRIX_G4_PAIR_BREAKDOWN")) return;
+    if (!strix::env_flag_default_off("STRIX_G4_PAIR_BREAKDOWN")) return;
     pair_json.set("linear_ms", ps.linear_ms); pair_json.set("attention_ms", ps.attention_ms); pair_json.set("other_ms", ps.other_ms);
 }
 } // namespace
-bool pair_enabled() { return env_on("STRIX_G4_PAIR"); }
+bool pair_enabled() { return strix::env_flag_default_off("STRIX_G4_PAIR"); }
 std::size_t pair_chunk_count(std::size_t prompt, std::size_t chunk) {
     std::size_t count = 0, processed = 0;
     while (const auto n = prompt_chunk_rows(prompt, processed, processed, chunk)) { processed += n; ++count; }
@@ -77,7 +77,7 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
     const auto capacity = prefill::pair_seam_bytes(config, cut, unsigned(chunk));
     pair::PipeOptions pipe_options;
     pipe_options.profile_label = "g4-pair-profile";
-    pipe_options.profile = env_on("STRIX_G4_PAIR_PROFILE");
+    pipe_options.profile = strix::env_flag_default_off("STRIX_G4_PAIR_PROFILE");
     pipe_options.validate = [&, identity, count, cut](const pair::PipeHeader& h, std::uint64_t sequence) {
         using W = prefill::PairWord;
         if (h[W::magic] != prefill::pair_seam_magic || h[1] != sequence || h[42] != 3U || h[41] != count ||

@@ -1,5 +1,6 @@
 #include "api.hpp"
 #include "gemma4/features/features.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -43,13 +44,11 @@ Json output_message(const gemma4::serve::Output& output) {
     if (output.tool_calls.size()) message.set("tool_calls",wire_calls(output.tool_calls,false));
     return message;
 }
+// A count from the environment, clamped to `maximum` (larger values have always meant "the most").
 std::size_t env_count(const char* name, std::size_t fallback, std::size_t maximum) {
-    const auto* p = std::getenv(name);
-    if (!p) return fallback;
-    const auto n = std::strtoull(p,nullptr,10);
-    return n > maximum ? maximum : std::size_t(n);
+    return std::min(strix::env_number<std::size_t>(name, fallback), maximum);
 }
-bool serve_batched() { const auto* p = std::getenv("STRIX_G4_SERVE_BATCH"); return !p || std::string(p) != "0"; }
+bool serve_batched() { return strix::env_flag_default_on("STRIX_G4_SERVE_BATCH"); }
 }
 std::size_t serve_slots(std::size_t requested) {
     if (!serve_batched()) return 1;
@@ -158,7 +157,7 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     // Prompt prefix cache (STRIX_G4_SERVE_PREFIX=0 off): committed states at the end of each prompt and of each
     // finished request, reused by a later prompt that starts with exactly those tokens (a conversation's next turn).
     // LRU within STRIX_G4_SERVE_PREFIX_MB (default 4096) of KV and 16 entries.
-    const bool prefix_cache = batched && [] { const auto* p = std::getenv("STRIX_G4_SERVE_PREFIX"); return !p || std::string(p) != "0"; }();
+    const bool prefix_cache = batched && strix::env_flag_default_on("STRIX_G4_SERVE_PREFIX");
     const std::size_t prefix_bytes = env_count("STRIX_G4_SERVE_PREFIX_MB",4096,1U << 20U) << 20U;
     std::thread worker;
     Impl(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request settings,

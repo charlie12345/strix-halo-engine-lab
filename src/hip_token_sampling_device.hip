@@ -2,6 +2,7 @@
 #include "strix/hip_token_sampling.hpp"
 
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1092,18 +1093,16 @@ Result* pinned_results(std::uint32_t count) {
     check(hipHostMalloc(reinterpret_cast<void**>(&out), sizeof(Result) * count, hipHostMallocDefault), "device token sampler results");
     return out;
 }
-bool env_is(const char* name, const char* value) {
-    const char* v = std::getenv(name);
-    return v && std::strcmp(v, value) == 0;
-}
 
 } // namespace
 
 TokenSamplingPath token_sampling_path(const TokenSamplingPolicy& policy) noexcept {
     // -1 auto, else the forced path.
     static const int forced = [] {
-        if (env_is("STRIX_SAMPLE_HOST", "1") || env_is("STRIX_SAMPLE_PATH", "host")) return 1;
-        if (env_is("STRIX_SAMPLE_PATH", "device")) return 0;
+        // unknown STRIX_SAMPLE_PATH throws (std::terminate here: noexcept); 2 = auto (also unset)
+        const std::size_t path = strix::env_choice("STRIX_SAMPLE_PATH", 2, {"device", "host", "auto"});
+        if (strix::env_flag_default_off("STRIX_SAMPLE_HOST") || path == 1) return 1;
+        if (path == 0) return 0;
         return -1;
     }();
     if (forced >= 0) return forced ? TokenSamplingPath::host : TokenSamplingPath::device;
@@ -1114,7 +1113,7 @@ TokenSamplingPath token_sampling_path(const TokenSamplingPolicy& policy) noexcep
     return TokenSamplingPath::device;
 }
 bool device_draft_sampling_enabled(const TokenSamplingPolicy& policy) noexcept {
-    static const bool draft_host = env_is("STRIX_SAMPLE_DRAFT_HOST", "1");
+    static const bool draft_host = strix::env_flag_default_off("STRIX_SAMPLE_DRAFT_HOST");
     return !draft_host && device_token_sampling_enabled(policy);
 }
 

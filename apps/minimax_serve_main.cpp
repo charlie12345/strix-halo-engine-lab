@@ -1,4 +1,5 @@
 #include "strix/dist/open_transport.hpp"
+#include "strix/env_flags.hpp"
 // strix-minimax-serve: the MiniMax M3.1 Flash TP2 engine behind an OpenAI-compatible HTTP API (both ranks run it;
 // rank 0 serves HTTP). The DS serve recipe: rank 0 owns the queue and a continuous-batching scheduler over the
 // engine's sequence slots and sends one fixed-size control block per round (prefill / unit / step / draft / heartbeat /
@@ -103,10 +104,6 @@ std::string hex(std::uint64_t v) {
     std::snprintf(b, sizeof b, "%016llx", static_cast<unsigned long long>(v));
     return b;
 }
-double env_num(const char* name, double def) {
-    const char* v = std::getenv(name);
-    return v == nullptr || *v == 0 ? def : std::atof(v);
-}
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
@@ -158,8 +155,8 @@ struct Runner {
     std::uint64_t local_id = 0, control_round = 0;
     std::uint32_t last_next = 0, contexts = 0;
     // STRIX_MM_SERVE_DSPARK_STAGE=0 (or STRIX_MM_BASELINE=1 when unset) appends every cycle's rows at once (previous form).
-    const bool stage = std::getenv("STRIX_MM_SERVE_DSPARK_STAGE") != nullptr ? env_num("STRIX_MM_SERVE_DSPARK_STAGE", 1) != 0
-                                                                     : env_num("STRIX_MM_BASELINE", 0) != 1;
+    const bool stage = std::getenv("STRIX_MM_SERVE_DSPARK_STAGE") != nullptr ? strix::env_number<double>("STRIX_MM_SERVE_DSPARK_STAGE", 1) != 0
+                                                                     : strix::env_number<double>("STRIX_MM_BASELINE", 0) != 1;
     void retire_contexts(std::uint32_t mask) {
         contexts &= ~mask;
         if (dd != nullptr) for (std::uint32_t s = 0; s < eng.slots(); ++s)
@@ -256,7 +253,8 @@ using ms::lead::Lead;
 
 void follow(mm::Engine& eng, Runner& run, strix::minimax::session::Runtime* session = nullptr) try {
     ms::SessionCounts counts;
-    bool taps = run.dd != nullptr && env_num("STRIX_MM_SERVE_DSPARK", 0) != 0;
+    // STRIX_MM_SERVE_DSPARK is off|auto|on|0|1 (ds::parse_mode); the follower starts taps only for an exact "1".
+    bool taps = run.dd != nullptr && strix::env_flag_default_off("STRIX_MM_SERVE_DSPARK");
     strix::pair::Lockstep lock(static_cast<std::uint32_t>(eng.rank()), run.control_round);
     for (;;) {
         Control mine;
@@ -996,13 +994,13 @@ int main(int argc, char** argv) {
         Shared shared;
         shared.prefix_reuse = prefix_agreed;
         {
-            shared.policy.nest = env_num("STRIX_MM_SERVE_NEST", 1) != 0;
+            shared.policy.nest = strix::env_number<double>("STRIX_MM_SERVE_NEST", 1) != 0;
             shared.nest_rows = eng.nested_rows();
             shared.nest_reason = eng.nested_reason();
             shared.nest_taps = drafter != nullptr;
             shared.policy.sched = ms::sched_mode(std::getenv("STRIX_MM_SERVE_SCHED"));
             shared.policy.service_ms = ms::service_ms(std::getenv("STRIX_MM_SERVE_SERVICE_MS"));
-            shared.policy.short_first = env_num("STRIX_MM_SERVE_SHORT_FIRST", 1) != 0;
+            shared.policy.short_first = strix::env_number<double>("STRIX_MM_SERVE_SHORT_FIRST", 1) != 0;
             shared.unlimited_reason = eng.prefill_unlimited_reason();
             shared.policy.gap_ms = ms::gap_ms(std::getenv("STRIX_MM_SERVE_GAP_MS"));
             shared.policy.dspark_mode = dspark_mode;
@@ -1010,7 +1008,7 @@ int main(int argc, char** argv) {
             shared.policy.lookup = lookup_env == nullptr || std::strcmp(lookup_env, "0") != 0;
             shared.policy.dspark_prior = dspark_prior;
             shared.policy.inflight = dspark_inflight;
-            shared.policy.draft_slots = static_cast<std::uint32_t>(std::clamp(env_num("STRIX_MM_SERVE_DRAFT_SLOTS", 8), 1.0, 8.0));
+            shared.policy.draft_slots = static_cast<std::uint32_t>(std::clamp(strix::env_number<double>("STRIX_MM_SERVE_DRAFT_SLOTS", 8), 1.0, 8.0));
         }
         sv::GenerationQueue queue(64);
         ms::SessionService session_service;

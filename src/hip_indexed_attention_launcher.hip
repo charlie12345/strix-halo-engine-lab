@@ -49,6 +49,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -194,10 +195,9 @@ constexpr std::uint64_t fnv_prime =
 // STRIX_QSA_COHORT_POOL (item 3): cohort windows score blocks from each owner's persistent pool
 // (only with STRIX_QSA_POOL_SLAB: per-layer pool allocations during decode lose 4-15 % at N8);
 // STRIX_QSA_COHORT_TAIL (item 8): cohort windows run the fused softmax + value/gate tail.
-bool qsa_env_default_on(const char* name) { const char* v = std::getenv(name); return !v || v[0] != '0'; }
-bool qsa_skip_index_q_enabled() { static const bool on = qsa_env_default_on("STRIX_QSA_SKIP_INDEX_Q"); return on; }
-bool qsa_cohort_pool_enabled() { static const bool on = qsa_env_default_on("STRIX_QSA_COHORT_POOL"); return on; }
-bool qsa_cohort_tail_enabled() { static const bool on = qsa_env_default_on("STRIX_QSA_COHORT_TAIL"); return on; }
+bool qsa_skip_index_q_enabled() { static const bool on = strix::env_flag_default_on("STRIX_QSA_SKIP_INDEX_Q"); return on; }
+bool qsa_cohort_pool_enabled() { static const bool on = strix::env_flag_default_on("STRIX_QSA_COHORT_POOL"); return on; }
+bool qsa_cohort_tail_enabled() { static const bool on = strix::env_flag_default_on("STRIX_QSA_COHORT_TAIL"); return on; }
 
 struct Q8Block {
     __half scale;
@@ -7793,7 +7793,7 @@ class HipQsaWindowPool {
     std::uint32_t maxima_capacity_ = 0;
     hipStream_t stream_ = nullptr;
     int device_ = -1;
-    static bool slab_enabled() { static const bool on = qsa_env_default_on("STRIX_QSA_POOL_SLAB"); return on; }
+    static bool slab_enabled() { static const bool on = strix::env_flag_default_on("STRIX_QSA_POOL_SLAB"); return on; }
 public:
     HipQsaWindowPool() = default;
     explicit HipQsaWindowPool(bool slab_allowed, bool bf16_keys) : slab_allowed_(slab_allowed), bf16_keys_(bf16_keys) {}
@@ -8725,7 +8725,7 @@ void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQs
     const auto rows = static_cast<std::uint32_t>(input.size());
     // The fixture rewrites weights in place between calls (STRIX_Q8_ROWS_LANE_PROBE_CACHE=1 keeps the
     // lane kernel's repacked weights, for timing one unchanged matrix).
-    if (!q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
+    if (!strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
     const bool input_side = projection == HipQsaRowsProjection::input;
     if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows ||
         (!input_side && projection != HipQsaRowsProjection::output) ||

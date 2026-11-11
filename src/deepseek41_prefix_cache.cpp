@@ -1,6 +1,7 @@
 #include "strix/deepseek41_prefix_cache.hpp"
 
 #include "strix/ds41_attention.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
@@ -574,7 +575,7 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     std::string t = "ds41-prefix-ns=1;";
     const auto overlay = env_or("STRIX_DS41_OVERLAY");
     t += "overlay=" + (overlay.empty() ? std::string("-") : path_digest(overlay)) + ";";
-    t += "cb4=" + std::string(!overlay.empty() && env_or("STRIX_DS41_CB4") == "1" ? "1" : "0") + ";";
+    t += "cb4=" + std::string(!overlay.empty() && strix::env_flag_default_off("STRIX_DS41_CB4") ? "1" : "0") + ";";
     const auto trellis = env_or("STRIX_DS41_TRELLIS");
     const auto sites = env_or("STRIX_DS41_TRELLIS_SITES");
     const auto mix = env_or("STRIX_DS41_TRELLIS_MIX");
@@ -582,32 +583,32 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     t += "trellis=" + (trellis_on ? path_digest(trellis) : std::string("-")) + ";";
     t += "trellis_sites=" + (trellis_on ? sites : std::string("-")) + ";";
     t += "trellis_mix=" + (trellis_on && !mix.empty() ? (fs::exists(mix) ? path_digest(mix) : mix) : std::string("-")) + ";";
-    t += "shexp_tp=" + std::string(trellis_on && env_or("STRIX_DS41_SHEXP_TP") == "1" ? "1" : "0") + ";";
+    t += "shexp_tp=" + std::string(trellis_on && strix::env_flag_default_off("STRIX_DS41_SHEXP_TP") ? "1" : "0") + ";";
     const auto ep_map = env_or("STRIX_DS41_EP_MAP");
     t += "ep_map=" + (ep_map.empty() ? std::string("-") : path_digest(ep_map)) + ";";
     t += "prefill=ep;";
     // Approximate prefill states must never alias the incumbent namespace.
-    if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1") t += "prefill_attention=bf16-hilo-v1;";
-    else if (env_or("STRIX_DS41_FAST_ATTN") == "1") t += "prefill_attention=f16wmma-v1;";
+    if (strix::env_flag_default_off("STRIX_DS41_PREFILL_BF16_ATTN")) t += "prefill_attention=bf16-hilo-v1;";
+    else if (strix::env_flag_default_off("STRIX_DS41_FAST_ATTN")) t += "prefill_attention=f16wmma-v1;";
     // FAST MoE: every routed entry takes the relaxed kernels whatever the chunking and route selectors (window / sparse
     // paths are off under the lever), so its arithmetic is one identity
-    if (env_or("STRIX_DS41_FAST_MOE") == "1") t += "prefill_moe=relaxed-v1;";
-    if (env_or("STRIX_DS41_FAST_I4") == "1") {
-        if (env_or("STRIX_DS41_FAST_MOE") == "1")
+    if (strix::env_flag_default_off("STRIX_DS41_FAST_MOE")) t += "prefill_moe=relaxed-v1;";
+    if (strix::env_flag_default_off("STRIX_DS41_FAST_I4")) {
+        if (strix::env_flag_default_off("STRIX_DS41_FAST_MOE"))
             throw std::invalid_argument("FAST_I4 and FAST_MOE are distinct policies");
         const auto scope = env_or("STRIX_DS41_FAST_I4_SCOPE");
         if (!scope.empty() && scope != "all" && scope != "gu")
             throw std::invalid_argument("STRIX_DS41_FAST_I4_SCOPE must be all or gu");
         t += "prefill_moe=gguf-iu4-direct-v1:" + (scope.empty() ? std::string("all") : scope) + ";";
     }
-    if (env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1") {
+    if (strix::env_flag_default_off("STRIX_DS41_PREFILL_FP16_DENSE")) {
         const auto picks = env_or("STRIX_DS41_FP16_CACHE");
-        if (picks.empty() || env_or("STRIX_DS41_FP16_CACHE_READONLY") != "1")
+        if (picks.empty() || !strix::env_flag_default_off("STRIX_DS41_FP16_CACHE_READONLY"))
             throw std::invalid_argument("FP16 prefill prefix cache requires a frozen solution cache (STRIX_DS41_FP16_CACHE_READONLY=1)");
         t += "prefill_dense=fp16-lt-v1:" + path_digest(picks) + ";";
     }
     // every knob that changes an approximate prefill's arithmetic (unset in the exact default: no change to its namespace)
-    if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1" || env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1" || env_or("STRIX_DS41_FAST_ATTN") == "1")
+    if (strix::env_flag_default_off("STRIX_DS41_PREFILL_BF16_ATTN") || strix::env_flag_default_off("STRIX_DS41_PREFILL_FP16_DENSE") || strix::env_flag_default_off("STRIX_DS41_FAST_ATTN"))
         for (const char* k : {"STRIX_DS41_PREFILL_APPROX_LAYERS", "STRIX_DS41_BF16_ATTN_VARIANT", "STRIX_DS41_PREFILL_FP16_PROJ",
                               "STRIX_DS41_PREFILL_FP16_MIN_ROWS", "STRIX_DS41_PREFILL_FP16_A8", "STRIX_DS41_PREFILL_FP16_FAST",
                               "STRIX_DS41_PREFILL_FP16_WSPLIT"})

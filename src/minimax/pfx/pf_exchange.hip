@@ -1,6 +1,7 @@
 // MiniMax M3.1 TP2 prefill exchange module: the engine (see pf_exchange.hpp).
 #include "pf_exchange.hpp"
 #include "minimax/xfer/minimax_xfer_device.hpp"
+#include "strix/env_flags.hpp"
 
 #include <immintrin.h>
 #include <pthread.h>
@@ -45,11 +46,6 @@ __global__ __launch_bounds__(kCopyThreads) void copy_publish_kernel(std::byte* d
     xfer::mmx_publish(target, gridDim.x);
 }
 
-std::uint64_t env_u64(const char* name, std::uint64_t fallback) {
-    const char* v = std::getenv(name);
-    return v != nullptr && *v != '\0' ? std::stoull(v) : fallback;
-}
-
 void pin(std::thread& t, int cpu) {
     if (cpu < 0) return;
     cpu_set_t set;
@@ -71,8 +67,8 @@ std::string describe(const Header& h) {
 }  // namespace
 
 void Options::from_env() {
-    depth = static_cast<unsigned>(env_u64("STRIX_MM_PFX_DEPTH", depth));
-    chunk = static_cast<std::size_t>(env_u64("STRIX_MM_PFX_CHUNK", chunk));
+    depth = static_cast<unsigned>(strix::env_number<std::uint64_t>("STRIX_MM_PFX_DEPTH", depth));
+    chunk = static_cast<std::size_t>(strix::env_number<std::uint64_t>("STRIX_MM_PFX_CHUNK", chunk));
     if (const char* v = std::getenv("STRIX_MM_PFX_CRC"); v != nullptr && v[0] == '0') crc = false;
     if (const char* v = std::getenv("STRIX_MM_PFX_PROGRESS_CPU"); v != nullptr && *v != '\0') progress_cpu = std::atoi(v);
     if (const char* v = std::getenv("STRIX_MM_PFX_CRC_CPUS"); v != nullptr && *v != '\0') {
@@ -84,7 +80,7 @@ void Options::from_env() {
         crc_tx_cpu = std::stoi(a);
         crc_rx_cpu = std::stoi(b);
     }
-    timeout = std::chrono::milliseconds(env_u64("STRIX_MM_PFX_TIMEOUT_MS", static_cast<std::uint64_t>(timeout.count())));
+    timeout = std::chrono::milliseconds(strix::env_number<std::uint64_t>("STRIX_MM_PFX_TIMEOUT_MS", static_cast<std::uint64_t>(timeout.count())));
 }
 
 Exchanger::Exchanger(dist::Transport& borrowed, Options options) : transport_(&borrowed), options_(options) {

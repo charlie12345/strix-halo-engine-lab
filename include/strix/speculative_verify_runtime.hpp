@@ -20,6 +20,7 @@
 namespace strix {
 
 struct CompiledLaunchPlan;
+class KnownWindowRunCache;
 
 // The caller retains all row registries/configs and every resource owner until
 // completion or quiesce_or_fail_stop. The runtime invokes each selected R1
@@ -84,6 +85,10 @@ struct KnownWindowExecutionHooks {
     // Optional immutable rows bindings, with the same owner lifetime/invalidation as
     // preflight_memo/preflight_slots. Position-dependent data must be refreshed by launch.
     KnownWindowRowsBindingCache* rows_binding_cache = nullptr;
+    // Optional owner-local storage, also one per cohort member's owner. Immutable plans,
+    // entry tables and resource bindings have the same lifetime/invalidation contract as
+    // preflight_memo/preflight_slots. Never share a cache between simultaneous runs.
+    KnownWindowRunCache* run_cache = nullptr;
     // Owner-held index of the compiled window's row arena views (alive and unmodified as long as
     // the owner): their buffer lookups are answered from it instead of being indexed per window.
     const ArenaLookupIndex* arena_index = nullptr;
@@ -218,8 +223,22 @@ public:
     void fail();
     [[nodiscard]] KnownWindowResult publish();
 private:
+    friend class KnownWindowRunCache;
     struct State;
     std::unique_ptr<State> state_;
+};
+
+// Keeps admitted host contexts/entry selections across runs, never an active scope,
+// session borrow or callback. A missing/cleared preflight key forces a fresh State.
+class KnownWindowRunCache final {
+public:
+    KnownWindowRunCache();
+    ~KnownWindowRunCache();
+    KnownWindowRunCache(const KnownWindowRunCache&) = delete;
+    KnownWindowRunCache& operator=(const KnownWindowRunCache&) = delete;
+private:
+    friend class KnownWindowRun;
+    std::unique_ptr<KnownWindowRun::State> state_;
 };
 
 struct SpeculativeVerifyExecutionResult {

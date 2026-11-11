@@ -248,6 +248,7 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>> recipe_memo;
     std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
     KnownWindowRowsBindingCache rows_binding_cache;
+    KnownWindowRunCache run_cache; // one idle State per owner, including each cohort member
     ArenaLookupIndex arena_index; // the immutable compiled window's arena views
     // Verify windows run each layer's shared expert on a second stream next to the routed experts (see
     // detach_shared). The shared expert reads only the MoE input and writes only its output,
@@ -2136,6 +2137,7 @@ struct HipKnownPrefixWindow::Impl {
                 hooks.preflight_memo = &self.preflight_memo; hooks.recipe_memo = &self.recipe_memo;
                 hooks.preflight_slots = &self.preflight_slots; hooks.arena_index = &self.arena_index;
                 hooks.rows_binding_cache = &self.rows_binding_cache;
+                hooks.run_cache = &self.run_cache;
                 hooks.after_step=self.window_observer;
             }
             auto& lead = *members[0].impl;
@@ -2468,6 +2470,7 @@ struct HipKnownPrefixWindow::Impl {
             }
             // a window step observer only for windows without a tiled prefill (as 0998a0e5: never over the prefill observer)
             if(!prefill && window_observer) hooks.after_step=window_observer;
+            if(!prefill) hooks.run_cache = &run_cache;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :

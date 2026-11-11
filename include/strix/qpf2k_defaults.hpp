@@ -13,7 +13,7 @@
 namespace strix::qpf2k {
 
 enum class Item : unsigned {
-    sched, dense, gdn, gdn_gates_batch, gdn_core16, qsa, qsa_mask,
+    sched, dense, gdn, gdn_gates_batch, qsa, qsa_mask,
     hc, hc_mask, hc_output3, hc_output3_band, moe_da16, moe_route, ple_reclaim, dense_rows, pipe, attend_batch, score_park,
     norm_group, index_rows, cohort_lean, rows_lean, dispatch_fuse, score_rows, ple_batch, shared_pre, moe_mc, moe_hdr,
     moe_xor64, hc_lowband,
@@ -30,7 +30,6 @@ inline constexpr std::array defaults{
     Default{Item::dense, "STRIX_QPF2K_DENSE", "1"},
     Default{Item::gdn, "STRIX_QPF2K_GDN", "1"},
     Default{Item::gdn_gates_batch, "STRIX_QPF2K_GDN_GATES_BATCH", "1"},
-    Default{Item::gdn_core16, "STRIX_QPF2K_GDN_CORE16", "1"},
     Default{Item::qsa, "STRIX_QPF2K_QSA", "1"},
     Default{Item::qsa_mask, "STRIX_QPF2K_QSA_MASK", "0x2257"},
     Default{Item::hc, "STRIX_QPF2K_HC", "1"},
@@ -164,7 +163,7 @@ unsigned initialize(Get get, Put put, unsigned allowed = ~0U) {
 }
 // The historical set is restricted to known-input tiled kernels/scheduling:
 // SCHED selects tile/tail owners; DENSE batches tiled projections; GDN,
-// GATES_BATCH and CORE16 group tiled recurrence/gates; QSA/MASK select tiled
+// GATES_BATCH groups tiled recurrence/gates; QSA/MASK select tiled
 // attention; HC/MASK/OUTPUT3/BAND select tiled hyper-mix; MOE_DA16/ROUTE
 // select tiled expert work. Each reader filters injected values per GSQ owner.
 inline constexpr unsigned historical_items = bit(Item::moe_route) * 2U - 1U;

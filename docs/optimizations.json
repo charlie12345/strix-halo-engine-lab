@@ -435,17 +435,6 @@
   },
   {
     "engine": "qwen",
-    "name": "QPF2K_GDN_CORE16",
-    "flag_or_env": "STRIX_QPF2K_GDN_CORE16",
-    "default": "1",
-    "exact": "STRIX_QPF2K_GDN_CHECK=1 and STRIX_GDN_PREFILL_CHECK=1 compare written bytes; require zero differences. Whole-engine receipts and operand-identity checks cover the qualified special-value/NaN order.",
-    "gain": "-",
-    "preconditions": "Eligible GDN prefill rows and supported lane/column shapes. Core16 additionally needs dense FP16 (not dense G64), tiled rows in multiples of 32, output site enabled, at least 2048 rows by default, value width 6144, head dimension 128, uniform core/output strides and a supported dense output site; graph capture declines it. The FP16 core consumer must be admitted before the producer drops FP32 rows.",
-    "off_switch": "STRIX_QPF2K_GDN_CORE16=0",
-    "doc_anchor": "docs/optimizations.md#qwen-gdn"
-  },
-  {
-    "engine": "qwen",
     "name": "QPF2K GDN Chunk-16 core (length-gated)",
     "flag_or_env": "STRIX_QPF2K_GDN_CHUNK16",
     "default": "auto",
@@ -1763,17 +1752,6 @@
     "preconditions": "Attached DSpark drafter on the pair.",
     "off_switch": "STRIX_MM_MARKOV=full",
     "doc_anchor": "docs/optimizations.md#mm-markov-cand"
-  },
-  {
-    "engine": "minimax",
-    "name": "v4 MoE prefill core",
-    "flag_or_env": "STRIX_MMX_PREFILL_CORE",
-    "default": "v4",
-    "exact": "Published same-identity qualification: Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.",
-    "gain": "Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib",
-    "preconditions": "Supported prefill expert shapes and quantized weights.",
-    "off_switch": "STRIX_MMX_PREFILL_CORE=lib",
-    "doc_anchor": "docs/optimizations.md#mm-pf-core-v4"
   },
   {
     "engine": "minimax",

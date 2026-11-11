@@ -1660,6 +1660,7 @@ struct Bench {
         std::vector<std::uint8_t> xt, at, part;
     };
     PfDump run_dump(Prefill& q, int core, int mtfit = -1, bool raw_tiled = false, int core8 = 0, int gufuse = 0, bool debug_partials = false, float* intermediates = nullptr, bool producer_only = false, int pipe = 0) {
+        (void)core;  // all dumps execute the sole v4 core path
         const int saved_pipe = opt::prefill_pipe_override();
         struct RestorePipe { int value; ~RestorePipe() { opt::set_prefill_pipe(value); } } restore_pipe{saved_pipe};
         opt::set_prefill_pipe(pipe);
@@ -1667,13 +1668,11 @@ struct Bench {
         hip_ok(hipMalloc(&ws, q.ws_bytes), "dump ws");
         hip_ok(hipMemset(ws, 0xff, q.ws_bytes), "poison ws");
         hip_ok(hipMemset(q.outB, 0xff, std::size_t{q.T} * H * 4), "poison out");
-        opt::set_prefill_core(core);
         opt::set_prefill_mtfit(mtfit);
         opt::set_prefill_core8(core8);
         opt::set_prefill_gufuse(gufuse);
         opt::set_prefill_gufuse_debug(debug_partials, intermediates, producer_only);
         opt::enqueue_prefill_moe(view_prefill(q), ws, q.ws_bytes, nullptr);
-        opt::set_prefill_core(-1);
         opt::set_prefill_mtfit(-1);
         opt::set_prefill_core8(-1);
         opt::set_prefill_gufuse(-1);
@@ -1686,7 +1685,7 @@ struct Bench {
             return v;
         };
         PfDump d{d2h(q.outB, std::size_t{q.T} * H), {}, {}, bytes(r.part_offset, r.part_bytes)};
-        if (core == 3) {  // v4: xt / at are tile-major; un-tile into the row-major layout of the other cores
+        {  // v4 tile-major xt / at
             const std::size_t tx = 2 * r.tpairs * H * 2, ta = r.tpairs * IR * 2;
             const auto xt = bytes(r.xt_offset, tx), at = bytes(r.at_offset, ta);
             if (raw_tiled) {
@@ -1709,46 +1708,11 @@ struct Bench {
                     for (unsigned mat = 0; mat < 2; ++mat) untile(xt, r.tpairs, d.xt, r.pairs, H, g[1] + i, g[0] + i, mat);
                     untile(at, r.tpairs, d.at, r.pairs, IR, g[1] + i, g[0] + i, 0);
                 }
-        } else {
-            d.xt = bytes(r.xt_offset, r.xt_bytes);
-            d.at = bytes(r.at_offset, r.at_bytes);
         }
         hip_ok(hipFree(ws), "free");
         return d;
     }
-    void check_prefill_v2(Prefill& q, const std::string& name) {
-        prefill_A(q);  // the G4 chain: one strix_gemm per expert, ascending fmaf combine, + shared
-        hip_ok(hipDeviceSynchronize(), "prefill A");
-        const auto a = d2h(q.outA, std::size_t{q.T} * H);
-        const PfDump dl = run_dump(q, 0);
-        const bool ok_lib_a = same_bits(a, dl.out);
-        check(ok_lib_a, "prefill lib core " + name + " differs from the G4 chain");
-        for (int core : {1, 2, 3}) {  // v2, v3, v4: every intermediate region and the output vs the lib core, output vs G4
-            const PfDump dv = run_dump(q, core);
-            std::size_t at = 0;
-            const bool ok_part = dl.part == dv.part, ok_xt = dl.xt == dv.xt, ok_at = dl.at == dv.at;
-            const bool ok_out = same_bits(dl.out, dv.out, &at), ok_a = same_bits(a, dv.out, &at);
-            const bool ok = ok_part && ok_xt && ok_at && ok_out && ok_a;
-            const char* cn = core == 1 ? "v2" : core == 2 ? "v3" : "v4";
-            check(ok, std::string("prefill ") + cn + " " + name + " differs (part " + std::to_string(ok_part) + " xt " + std::to_string(ok_xt) +
-                          " at " + std::to_string(ok_at) + " out " + std::to_string(ok_out) + " G4 " + std::to_string(ok_a) + ")");
-            std::printf("prefill %s test %s: partials %s (%.1f MB), xt %s, at %s, out ==lib %s, ==G4 %s, lib==G4 %s; %s\n", cn, name.c_str(),
-                        ok_part ? "bitwise" : "DIFF", static_cast<double>(dl.part.size()) / 1e6, ok_xt ? "bitwise" : "DIFF",
-                        ok_at ? "bitwise" : "DIFF", ok_out ? "bitwise" : "DIFF", ok_a ? "bitwise" : "DIFF", ok_lib_a ? "bitwise" : "DIFF",
-                        rows_summary(q).c_str());
-            std::fflush(stdout);
-        }
-    }
-    void test_prefill_v2() {
-        for (unsigned T : {16U, 100U, 333U, 1024U, 4096U}) {
-            Prefill q = make_prefill_routes(T);
-            check_prefill_v2(q, "T=" + std::to_string(T) + (o.routes.empty() ? " (router routes)" : " (file routes)"));
-            free_prefill(q);
-        }
-        Prefill q = make_prefill_crafted();
-        check_prefill_v2(q, "crafted T=640 (class boundaries)");
-        free_prefill(q);
-    }
+
     // Per-launch GPU times of one call through the labelled markers.
     struct Marks {
         std::vector<hipEvent_t> pool;
@@ -1768,20 +1732,17 @@ struct Bench {
     }
     void stage_split(Prefill& q, const std::string& cell, int mtfit = -1, int core8 = 0) {
         const double fl = prefill_flops(q);
-        for (int core : (mtfit < 0 ? std::vector<int>{0, 1, 2, 3, 8, 9} : std::vector<int>{3})) {  // lib, v2, v3, v4, v3 without A loads, v3 without decode (8, 9: timing only)
+        {
             Marks mk;
             std::vector<std::pair<std::string, double>> acc;
             const int n = 3;
             for (int r = 0; r < n; ++r) {
                 mk.used = 0;
-                if (core >= 8) opt::set_prefill_diagnostic_core(core);
-                else opt::set_prefill_core(core);
                 opt::set_prefill_mtfit(mtfit);
                 opt::set_prefill_core8(core8);
                 opt::set_prefill_marker(&Bench::marker_cb, &mk);
                 prefill_B(q);
                 opt::set_prefill_marker(nullptr, nullptr);
-                opt::set_prefill_core(-1);
                 opt::set_prefill_mtfit(-1);
                 opt::set_prefill_core8(-1);
                 hip_ok(hipDeviceSynchronize(), "sync");
@@ -1793,7 +1754,7 @@ struct Bench {
                 }
             }
             double total = 0, gemm = 0;
-            const char* cn = core == 0 ? "lib" : core == 1 ? "v2 " : core == 2 ? "v3 " : core == 3 ? "v4 " : core == 8 ? "v3-noA" : "v3-nodec";
+            const char* cn = "v4 ";
             std::printf("stages %s %s ms:", cell.c_str(), cn);
             for (const auto& [l, ms] : acc) {
                 std::printf(" %s %.3f", l.c_str(), ms);
@@ -1807,7 +1768,7 @@ struct Bench {
     }
     void check_prefill_mtfit(Prefill& q, const std::string& name) {
         check(q.ws_bytes <= opt::prefill_moe_workspace_bound(q.T), "mtfit workspace bound " + name);
-        const PfDump off = run_dump(q, 3, 0, true), on = run_dump(q, 3, 1, true);
+        const PfDump off = run_dump(q, 0, true), on = run_dump(q, 1, true);
         const bool part = off.part == on.part, xt = off.xt == on.xt, at = off.at == on.at;
         const bool out = same_bits(off.out, on.out);
         check(part && xt && at && out, "mtfit " + name + " differs (part " + std::to_string(part) + " xt " +
@@ -1819,9 +1780,9 @@ struct Bench {
     void check_prefill_core8(Prefill& q, const std::string& name) {
         check(q.ws_bytes <= opt::prefill_moe_workspace_bound(q.T), "core8 workspace bound " + name);
         for (int mtfit : {0, 1}) {
-            const PfDump off = run_dump(q, 3, mtfit, true, 0);
+            const PfDump off = run_dump(q, mtfit, true, 0);
             for (int pipe : {1, 2}) {
-                const PfDump on = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                const PfDump on = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
                 const bool exact = off.part == on.part && off.xt == on.xt && off.at == on.at && same_bits(off.out, on.out);
                 const std::string cell = "PIPE=" + std::to_string(pipe) + " mtfit=" + std::to_string(mtfit) + " " + name;
                 check(exact, cell + " raw partials/transformed inputs/down inputs/output");
@@ -1832,9 +1793,9 @@ struct Bench {
                 struct RestoreTails { ~RestoreTails() { opt::set_prefill_tail_stream(-1); } } restore_tails;
                 for (int pipe : {1, 2}) {
                     opt::set_prefill_tail_stream(0);
-                    const PfDump serial = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    const PfDump serial = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
                     opt::set_prefill_tail_stream(1);
-                    const PfDump side = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    const PfDump side = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
                     const bool exact = serial.part == side.part && serial.xt == side.xt && serial.at == side.at &&
                                        same_bits(serial.out, side.out) && off.part == side.part && same_bits(off.out, side.out);
                     const std::string cell = "tail stream PIPE=" + std::to_string(pipe) + " mtfit=" + std::to_string(mtfit) + " " + name;
@@ -1847,9 +1808,9 @@ struct Bench {
                 struct RestorePair { ~RestorePair() { opt::set_prefill_pipe_pair(-1); } } restore_pair;
                 for (int pipe : {1, 2}) {
                     opt::set_prefill_pipe_pair(0);
-                    const PfDump plain = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    const PfDump plain = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
                     opt::set_prefill_pipe_pair(1);
-                    const PfDump paired = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    const PfDump paired = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
                     const bool exact = plain.part == paired.part && plain.xt == paired.xt && plain.at == paired.at &&
                                        same_bits(plain.out, paired.out) && off.part == paired.part && same_bits(off.out, paired.out);
                     const std::string cell = "pipe pair PIPE=" + std::to_string(pipe) + " mtfit=" + std::to_string(mtfit) + " " + name;
@@ -1859,7 +1820,7 @@ struct Bench {
                 }
             }
             for (int core8 : {1, 2}) {
-                const PfDump on = run_dump(q, 3, mtfit, true, core8);
+                const PfDump on = run_dump(q, mtfit, true, core8);
                 const bool part = off.part == on.part, xt = off.xt == on.xt, at = off.at == on.at;
                 const bool out = same_bits(off.out, on.out);
                 const std::string cell = "core8=" + std::to_string(core8) + " mtfit=" + std::to_string(mtfit) + " " + name;
@@ -1890,7 +1851,7 @@ struct Bench {
                     if (hipStreamSynchronize(stream) != hipSuccess) std::abort();
                     opt::cleanup_prefill_table_ring();
                     opt::set_prefill_table_ring(-1);
-                    opt::set_prefill_core(-1);
+                    
                     opt::set_prefill_mtfit(-1);
                     opt::set_prefill_core8(-1);
                     if (results != nullptr) (void)hipFree(results);
@@ -1910,7 +1871,7 @@ struct Bench {
             opt::set_prefill_marker(nullptr, nullptr);
             opt::set_prefill_core8(0);
             for (int core : {0, 1, 2, 3}) {
-                opt::set_prefill_core(core);
+                
                 for (int mtfit : {0, 1}) {
                     if (mtfit != 0 && core != 3) continue;
                     opt::set_prefill_mtfit(mtfit);
@@ -1967,11 +1928,11 @@ struct Bench {
             }
         } restore{trace};
         for (int mtfit : {0, 1}) {
-            const PfDump off = run_dump(q, 3, mtfit, true, 0, 0, true, trace);
+            const PfDump off = run_dump(q, mtfit, true, 0, 0, true, trace);
             const auto reference = d2h(trace, elements);
             for (int core8 : {0, 1, 2}) {
                 hip_ok(hipMemset(trace, 0xff, elements * sizeof(float)), "gufuse poison trace");
-                const PfDump on = run_dump(q, 3, mtfit, true, core8, 1, true, trace);
+                const PfDump on = run_dump(q, mtfit, true, core8, 1, true, trace);
                 const auto actual = d2h(trace, elements);
                 const bool exact = off.part == on.part && off.xt == on.xt && off.at == on.at &&
                     same_bits(off.out, on.out) && std::memcmp(reference.data(), actual.data(), elements * sizeof(float)) == 0;
@@ -1979,11 +1940,11 @@ struct Bench {
                 check(exact, cell + " partials/xt/at/output/epilogue");
                 if (!exact) throw std::runtime_error(cell + " failed bitwise qualification");
             }
-            const PfDump paired = run_dump(q, 3, mtfit, true, 0, 1, true, nullptr, true);
+            const PfDump paired = run_dump(q, mtfit, true, 0, 1, true, nullptr, true);
             check(off.part == paired.part && off.xt == paired.xt && off.at == paired.at && same_bits(off.out, paired.out),
                   "gufuse paired producer " + name);
             // Production mode omits fused partial writes; down partials and all outputs must still match.
-            const PfDump production = run_dump(q, 3, mtfit, true, 0, 1);
+            const PfDump production = run_dump(q, mtfit, true, 0, 1);
             check(off.xt == production.xt && off.at == production.at && same_bits(off.out, production.out),
                   "gufuse production " + name);
             std::vector<opt::ExpertSlices> group_weights;
@@ -2031,7 +1992,7 @@ struct Bench {
                 layer.shared = shared;
                 opt::set_prefill_gufuse_debug(false);
                 opt::set_prefill_gufuse(-1);
-                opt::set_prefill_core(-1);
+                
                 opt::set_prefill_mtfit(-1);
                 opt::set_prefill_core8(-1);
                 for (void* ptr : buffers) (void)hipFree(ptr);
@@ -2163,7 +2124,7 @@ struct Bench {
                 opt::set_prefill_marker(nullptr, nullptr);
                 opt::set_prefill_pipe(pipe);
                 opt::set_prefill_tail_stream(-1);
-                opt::set_prefill_core(-1);
+                
                 opt::set_prefill_core8(-1);
                 opt::set_prefill_mtfit(-1);
                 opt::set_prefill_gufuse(-1);
@@ -2178,7 +2139,7 @@ struct Bench {
             for (int rep = -1; rep < 5; ++rep) {
                 for (int arm = 0; arm < kArms; ++arm) {
                     Marks mk;
-                    opt::set_prefill_core(3);
+                    
                     opt::set_prefill_core8(0);
                     opt::set_prefill_gufuse(0);
                     opt::set_prefill_mtfit(mtfit);
@@ -2214,7 +2175,7 @@ struct Bench {
     // M4 auto-select receipt: whole MoE call, production PIPE (A) vs paired bands (B), 10 A B B A blocks per T, real
     // routes. Per block delta = mean(B) / mean(A) - 1; mean and a normal 95 % interval over the blocks.
     void bench_pair_abba() {
-        struct Restore { ~Restore() { opt::set_prefill_pipe_pair(-1); opt::set_prefill_core(-1); opt::set_prefill_mtfit(-1); } } restore;
+        struct Restore { ~Restore() { opt::set_prefill_pipe_pair(-1);  opt::set_prefill_mtfit(-1); } } restore;
         for (unsigned T : {1024U, 2048U, 4096U}) {
             const std::string cell = "pairabba T" + std::to_string(T);
             if (!wanted(cell)) continue;
@@ -2223,7 +2184,7 @@ struct Bench {
             hip_ok(hipEventCreate(&e0), "abba event");
             hip_ok(hipEventCreate(&e1), "abba event");
             auto call = [&](int pair) {
-                opt::set_prefill_core(3);
+                
                 opt::set_prefill_mtfit(1);
                 opt::set_prefill_pipe_pair(pair);
                 hip_ok(hipDeviceSynchronize(), "abba idle");
@@ -2276,9 +2237,9 @@ struct Bench {
         auto run = [&](Prefill& q, const std::string& name) {
             for (int gufuse : {0, 1}) {
                 opt::set_prefill_gather_tok(0);
-                const PfDump off = run_dump(q, 3, -1, true, 0, gufuse);
+                const PfDump off = run_dump(q, -1, true, 0, gufuse);
                 opt::set_prefill_gather_tok(1);
-                const PfDump on = run_dump(q, 3, -1, true, 0, gufuse);
+                const PfDump on = run_dump(q, -1, true, 0, gufuse);
                 const bool part = off.part == on.part, xt = off.xt == on.xt, at = off.at == on.at, out = same_bits(off.out, on.out);
                 const std::string cell = "gather_tok " + name + " gufuse=" + std::to_string(gufuse);
                 check(part && xt && at && out, cell + " differs (part " + std::to_string(part) + " xt " + std::to_string(xt) +
@@ -2326,7 +2287,6 @@ struct Bench {
             ~Restore() {
                 layer.shared = shared;
                 opt::set_prefill_marker(nullptr, nullptr);
-                opt::set_prefill_core(-1);
                 opt::set_prefill_mtfit(-1);
                 opt::set_prefill_core8(-1);
                 for (void* ptr : buffers) (void)hipFree(ptr);
@@ -2414,7 +2374,7 @@ struct Bench {
                 opt::set_prefill_marker(nullptr, nullptr);
                 opt::set_prefill_gufuse_debug(false);
                 opt::set_prefill_gufuse(-1);
-                opt::set_prefill_core(-1);
+                
                 opt::set_prefill_mtfit(-1);
                 opt::set_prefill_core8(-1);
                 bench.free_prefill(prefill);
@@ -2430,7 +2390,7 @@ struct Bench {
             for (int arm = -2; arm < 7; ++arm) {
                 const int on = arm < 0 ? arm + 2 : arm % 2;
                 Marks mk;
-                opt::set_prefill_core(3);
+                
                 opt::set_prefill_core8(0);
                 opt::set_prefill_mtfit(1);
                 opt::set_prefill_gufuse(on);
@@ -2459,27 +2419,7 @@ struct Bench {
             check(b <= a, producer_only ? "gufuse paired GEMM throughput regressed" : "gufuse producer+finish regressed");
         }
     }
-    void bench_prefill_v2() {
-        for (unsigned T : {256U, 1024U, 4096U, 640U}) {
-            const std::string cell = T == 640 ? std::string("pf2 crafted640") : "pf2 T" + std::to_string(T);
-            if (!wanted(cell)) continue;
-            Prefill q = T == 640 ? make_prefill_crafted() : make_prefill_routes(T);
-            std::printf("%s: %s\n", cell.c_str(), rows_summary(q).c_str());
-            std::uint64_t bytes = L.sg.bytes + L.su.bytes + L.sd.bytes;
-            for (unsigned e = 0; e < opt::kExperts; ++e)
-                if (!q.routes.rows[e].empty()) bytes += L.gate[e].bytes + L.up[e].bytes + L.down[e].bytes;
-            const int saved = o.iters;
-            o.iters = std::max(2, o.iters / 8);
-            // Whole calls (host plan + table upload + launches): lib/v4, v2/v4, v3/v4 (A/B).
-            aba(cell + " lib/v4", bytes, [&](int) { opt::set_prefill_core(0); prefill_B(q); }, [&](int) { opt::set_prefill_core(3); prefill_B(q); });
-            aba(cell + " v2/v4", bytes, [&](int) { opt::set_prefill_core(1); prefill_B(q); }, [&](int) { opt::set_prefill_core(3); prefill_B(q); });
-            aba(cell + " v3/v4", bytes, [&](int) { opt::set_prefill_core(2); prefill_B(q); }, [&](int) { opt::set_prefill_core(3); prefill_B(q); });
-            o.iters = saved;
-            opt::set_prefill_core(-1);
-            stage_split(q, cell);
-            free_prefill(q);
-        }
-    }
+
     // Dense prefill sites through strix_gemm (the engine's prefill identity) at T rows: us and TFLOPS.
     // Dense prefill linears on the v4 core (opt::enqueue_prefill_dense) == the library strix_gemm, bitwise, for the
     // attention sites alone and k+v in one call; outputs start poisoned.
@@ -3159,7 +3099,6 @@ int main(int argc, char** argv) {
             if (!o.no_moe) test_section("test_router_rows", [&] { b.test_router_rows(); });
             if (!o.no_moe) test_section("test_prefill", [&] { b.test_prefill(); });
             if (!o.no_moe) test_section("test_prefill_device", [&] { b.test_prefill_device(); });
-            if (!o.no_moe) test_section("test_prefill_v2", [&] { b.test_prefill_v2(); });
             if (!o.no_moe) test_section("test_prefill_mtfit", [&] { b.test_prefill_mtfit(); });
             if (!o.no_moe) test_section("test_prefill_core8", [&] { b.test_prefill_core8(); });
             if (!o.no_moe && o.tests == "test_prefill_pipe") test_section("test_prefill_pipe", [&] { b.test_prefill_pipe(); });
@@ -3178,7 +3117,6 @@ int main(int argc, char** argv) {
             if (!o.no_moe) section("bench_prefill", [&] { b.bench_prefill(); });
             if (!o.no_moe) section("bench_prefill_gufuse", [&] { b.bench_prefill_gufuse(); });
             if (!o.no_moe) section("bench_pair_abba", [&] { b.bench_pair_abba(); });
-            if (!o.no_moe) section("bench_prefill_v2", [&] { b.bench_prefill_v2(); });
             if (!o.no_moe) section("bench_prefill_gather", [&] { b.bench_prefill_gather(); });
             section("bench_prefill_dense", [&] { b.bench_prefill_dense(); });
             section("bench_dense_prefill", [&] { b.bench_dense_prefill(); });

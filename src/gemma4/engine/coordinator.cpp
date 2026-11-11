@@ -46,6 +46,10 @@ void Sampling::validate() const {
     require(std::isfinite(temperature) && temperature >= 0 && std::isfinite(top_p) && top_p > 0 && top_p <= 1,
             "invalid temperature/top_p");
 }
+bool logits_digest_enabled() {
+    static const bool enabled = [] { const auto* v = std::getenv("STRIX_G4_LOGITS_DIGEST"); return v && std::string_view(v) == "1"; }();
+    return enabled;
+}
 std::vector<std::uint32_t> candidate_order(std::span<const float> logits, std::uint32_t top_k) {
     // One 64-bit key per id, ascending in better() order: the logit's order-preserving bits inverted (descending
     // logit, -0 == +0), then the id (low id first on ties). Keys are distinct, so any correct sort gives this order.
@@ -374,10 +378,11 @@ bool Coordinator::step() {
             for (std::size_t j = 0; j < slots_.size(); ++j) {
                 const auto i = (prefill_cursor_+j)%slots_.size();
                 auto& s = *slots_[i];
-                if (s.out.status != Status::running || s.prompt_processed+1+8 >= s.request.prompt.size()) continue;
+                if (s.out.status != Status::running ||
+                    !prompt_chunk_rows(s.request.prompt.size(),s.prompt_processed,s.state->frontier(),chunk)) continue;
                 s.out.peak_streams = std::max(s.out.peak_streams,live);
                 const std::uint64_t position = s.state->frontier();
-                auto n = std::min<std::size_t>(s.request.prompt.size()-1-s.prompt_processed, chunk-position%chunk);
+                auto n = prompt_chunk_rows(s.request.prompt.size(),s.prompt_processed,position,chunk);
                 // While other streams decode, a shorter chunk bounds their wait. Only when prefill rows equal decode
                 // rows: otherwise where a chunk ends decides which prompt rows a decode pass writes (a short tail goes
                 // through forward_rows), so chunk ends stay those of the stream alone.
@@ -547,7 +552,8 @@ bool Coordinator::step() {
             const bool hidden = s.draft && s.draft->wants_hidden();
             // Logits leave the device only for sampled decode rows (greedy rows use
             // the backend's device winners), taps only for a drafter that reads them.
-            const bool logits = !w.prefill && s.request.sampling.temperature != 0, taps = s.draft && s.draft->wants_taps();
+            const bool logits = !w.prefill && (s.request.sampling.temperature != 0 || logits_digest_enabled()),
+                taps = s.draft && s.draft->wants_taps();
             for (std::size_t r = 0; r < w.rows; ++r) {
                 const auto token = w.prefill ? s.request.prompt[s.prompt_processed+r] :
                     (r ? w.proposals[r-1] : (s.out.ids.empty() ? s.request.prompt.back() : s.out.ids.back()));
@@ -592,6 +598,12 @@ bool Coordinator::step() {
                 verdict = dflash::verify_greedy({w.proposals.data(),w.k},selected,
                     s.request.max_tokens-s.out.ids.size(),s.request.stop_ids,&w.delta);
                 processed = verdict.processed;
+                if (logits_digest_enabled() && !out.logits.empty())
+                    for (std::size_t r = 0; r < verdict.emitted.size() && r < w.rows; ++r) {
+                        const auto* bytes = reinterpret_cast<const unsigned char*>(out.logits.data()+(w.start+r)*out.vocab);
+                        for (std::size_t b = 0; b < out.vocab*sizeof(float); ++b) { s.out.logits_fnv64 ^= bytes[b]; s.out.logits_fnv64 *= 1099511628211ULL; }
+                        ++s.out.logits_rows;
+                    }
             }
             if (s.draft) {
                 const auto begin = Clock::now();
@@ -699,6 +711,7 @@ Json Coordinator::receipt(std::size_t slot) const {
     switches.set("STRIX_G4_DFLASH",s.dflash_enabled);
     j.set("off_switches",switches); j.set("finish_reason",status_name(r.status)); j.set("frontier",r.frontier);
     j.set("state_digest",r.status == Status::running ? s.state->digest() : r.digest);
+    if (logits_digest_enabled()) { j.set("logits_fnv64",std::to_string(r.logits_fnv64)); j.set("logits_rows",r.logits_rows); }
     j.set("target_calls",r.target_calls); j.set("target_rows",r.target_rows);
     const auto& a = r.acceptance;
     acceptance.set("cycles",a.cycles); acceptance.set("attempted",a.attempted); acceptance.set("eligible",a.eligible);

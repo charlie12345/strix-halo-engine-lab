@@ -63,3 +63,11 @@ model memory. Change the prompt to 1,193 tokens only after capturing and pinning
 its own golden; a 32K golden cannot validate that prompt. Self-generated goldens
 are calibration evidence, not independent model-fidelity qualification. A pair
 golden dump is rejected; capture is single-node and replay is paired.
+
+## Shared pair modules
+
+The seam pipe (two slots, CRC32C pieces and whole-frame CRC, consumption ACK), its HIP staging, the stage-balance cut
+chooser, the `--rank/--peer/--transport` handling with the link setup, and the per-request mode selection live in
+`include/strix/pair/` (`pipe.hpp`, `balance.hpp`, `link.hpp`, `regime.hpp`) and `src/xport/hip_pipe_staging.hpp`.
+Qwen binds them with its seam-header validator; the Nemotron (gemma4) pair route (`STRIX_G4_PAIR=1`, see the model
+README) uses the same modules with its own seam layout.

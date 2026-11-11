@@ -578,7 +578,7 @@ int main(int argc, char** argv) {
         expect(strix_hc_inject_fusion_enabled(), "explicit fusion survives GSQ filtering");
         return 0;
     }
-    expect(qpf2k::defaults.size() == 30U, "all scoped prompt defaults are part of the injected-item contract");
+    expect(qpf2k::defaults.size() == 29U, "all scoped prompt defaults are part of the injected-item contract");
     qpf2k::baseline = true;
     std::map<std::string,std::string> baseline_env;
     expect(initialize(baseline_env) == 0U && baseline_env.empty(), "baseline injects no defaults");

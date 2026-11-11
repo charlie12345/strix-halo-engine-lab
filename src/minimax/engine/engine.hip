@@ -1110,8 +1110,11 @@ struct Engine::Impl {
             if (model_fast_i4) pf_ws_bytes += mmoe::kI4GroupTableBytes;  // IU4 groups beside gate_up EXL3 down items
             hip_ok(hipMalloc(&pf_ws, pf_ws_bytes), "prefill moe workspace");
         }
+        // The 8192-row grouped call is opt-in (STRIX_MOE_I4_CHAIN_GROUP=1): one call per layer waits for every chunk's
+        // attention exchange before any MoE output is sent, which exposed ~26 ms/layer of TP2 exchange wait at 8K
+        // (the per-chunk calls overlap chunk c's MoE with chunk c-1's exchange). Same bits either way.
         if(model_fast_i4 && moe_opt && mmoe::prefill_i4_chain() && i4_scope==fast_i4::Scope::all &&
-           mmoe::prefill_moe_device_plan(kI4GroupRows) && !pf_table_stats) {
+           env_flag("STRIX_MOE_I4_CHAIN_GROUP", false) && mmoe::prefill_moe_device_plan(kI4GroupRows) && !pf_table_stats) {
             i4_group_ws_bytes=mmoe::prefill_i4_workspace_bound(kI4GroupRows);
             const std::size_t hidden_bytes=std::size_t(kI4GroupRows)*kHidden*4;
             const std::size_t route_bytes=std::size_t(kI4GroupRows)*kTopE*8;

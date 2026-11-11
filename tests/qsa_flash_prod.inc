@@ -10,6 +10,7 @@
 // (0998a0e5); hip_qsa_fast_prefill.inc and hip_qsa_prefill_flash.inc are included from src/.
 // Selection helpers additionally mirror the production union-cap score-preservation control (default false).
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/hip_qwen_dpp_reduce.hpp"  // qwen_dpp::xor32 used by hip_qsa_prefill_flash.inc
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "../src/hip_rounded_stage_image.hpp"

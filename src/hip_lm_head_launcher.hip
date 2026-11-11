@@ -1493,15 +1493,26 @@ void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> 
     check_hip(hipGetLastError(), "known-window LM head rows launch");
 }
 
+void lm_head_rows_with_greedy(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config, std::span<const HipLmHeadGreedyRows> greedy,
+    bool window_rows_only) {
+    lm_head_known_window_rows_launch(rows, config);
+    if (window_rows_only) {
+        if (rows.size() > lm_head_window_max_rows) throw std::invalid_argument("known-window greedy LM head supports two to eight rows");
+    }
+    for (const auto& segment : greedy) {
+        std::array<ExecutionBufferAddress, hip_greedy_rows_max> logits{};
+        for (std::size_t r = 0; r < segment.rows.size(); ++r) logits[r] = resolve_dispatch_write(segment.rows[r], 0);
+        enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), segment.rows.size()), config.vocab_size,
+            segment.partials, segment.replies, hip_execution_stream());
+    }
+}
+
 void lm_head_known_window_rows_launch_greedy(std::span<const ExecutionDispatchContext> rows,
     const HipLmHeadLauncherConfig& config, ExecutionBufferAddress partials, HipGreedyRowsReply* replies) {
     if (!lean_rows_admitted(config, rows.size())) {
-        lm_head_known_window_rows_launch(rows, config);
-        if (rows.size() > lm_head_window_max_rows) throw std::invalid_argument("known-window greedy LM head supports two to eight rows");
-        std::array<ExecutionBufferAddress, lm_head_window_max_rows> logits{};
-        for (std::size_t r = 0; r < rows.size(); ++r) logits[r] = resolve_dispatch_write(rows[r], 0);
-        enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), rows.size()), config.vocab_size,
-            partials, replies, hip_execution_stream());
+        const HipLmHeadGreedyRows greedy{rows, partials, replies};
+        lm_head_rows_with_greedy(rows, config, std::span<const HipLmHeadGreedyRows>(&greedy, 1), true);
         return;
     }
     std::optional<PreparedLmHeadRows> local;

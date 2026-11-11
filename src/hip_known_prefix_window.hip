@@ -122,6 +122,12 @@ strix::HipKnownPrefixWindow::PrefillStepObserver qrtx_step_dump_observer(strix::
 
 namespace strix {
 namespace {
+struct ExecutionLease {
+    bool& active;
+    explicit ExecutionLease(bool& value):active(value){active=true;}
+    ~ExecutionLease(){active=false;}
+};
+
 void check(hipError_t error, const char* operation) {
     if (error != hipSuccess)
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(error));
@@ -1470,12 +1476,9 @@ struct HipKnownPrefixWindow::Impl {
                     lm_head_known_window_rows_launch_greedy(rows,self.head_config,self.greedy_partials,self.greedy_replies);
                     return;
                 }
-                lm_head_known_window_rows_launch(rows,self.head_config);
-                if(!self.greedy_replies) return;
-                std::array<ExecutionBufferAddress,hip_greedy_rows_max> logits{};
-                for(std::size_t r=0;r<rows.size();++r) logits[r]=resolve_dispatch_write(rows[r],0);
-                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(),rows.size()),
-                    self.head_config.vocab_size,self.greedy_partials,self.greedy_replies,hip_execution_stream());
+                const HipLmHeadGreedyRows greedy{rows,self.greedy_partials,self.greedy_replies};
+                lm_head_rows_with_greedy(rows,self.head_config,
+                    std::span<const HipLmHeadGreedyRows>(&greedy,self.greedy_replies?1U:0U));
             }});
     }
     void attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
@@ -1749,11 +1752,7 @@ struct HipKnownPrefixWindow::Impl {
     void preflight_admission(SerialSessionContext session, std::span<const std::uint32_t> tokens, bool static_only=false) {
         if (failed || (static_only ? (!prefill || !tokens.empty()) : (prefill || tokens.size() != logical_rows())) || executing || current_hip_launch_context())
             throw std::invalid_argument("known-window setup admission requires an idle closed window owner");
-        struct ExecutionLease {
-            bool& active;
-            explicit ExecutionLease(bool& value):active(value){active=true;}
-            ~ExecutionLease(){active=false;}
-        } execution_lease(executing);
+        ExecutionLease execution_lease(executing);
         try {
             validate_metadata();
             const HipLaunchScope active(scope);
@@ -1910,6 +1909,40 @@ struct HipKnownPrefixWindow::Impl {
         }
         return total >= 9U && total <= 32U;
     }
+    // Only these segment launches are identical for wide and shared cohorts. The
+    // head config belongs to the lead owner for wide, and the primary for shared.
+    void launch_cohort_segment_step(std::size_t i, std::span<CohortMember> members,
+        std::span<const ExecutionDispatchContext> rows = {}) {
+        switch (window.mode[i]) {
+        case KnownWindowStepMode::gdn_deferred_rows: {
+            std::vector<HipGdnWindowCohortSegment> segments;
+            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->gdn_window_config});
+            gdn_window_cohort_rows_launch(segments);
+            for (const auto& m : members) m.impl->remember_gdn_layer(m.run->step_rows(i)[0]);
+            break;
+        }
+        case KnownWindowStepMode::qsa_rows: {
+            std::vector<HipQsaCohortSegment> segments;
+            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
+            indexed_attention_known_window_cohort_launch(segments);
+            break;
+        }
+        case KnownWindowStepMode::lm_head_rows: {
+            std::vector<ExecutionDispatchContext> all;
+            if (rows.empty()) {
+                for (const auto& m : members) { const auto own = m.run->step_rows(i); all.insert(all.end(), own.begin(), own.end()); }
+                rows = std::span<const ExecutionDispatchContext>(all);
+            }
+            // Each session's argmax rows land in its own owner's replies, read by its own capture.
+            std::vector<HipLmHeadGreedyRows> greedy;
+            for (const auto& m : members)
+                greedy.push_back({m.run->step_rows(i), m.impl->greedy_partials, m.impl->greedy_replies});
+            lm_head_rows_with_greedy(rows, head_config, greedy);
+            break;
+        }
+        default: throw std::logic_error("known-window cohort step has no common segment implementation");
+        }
+    }
     static void launch_cohort_wide(std::size_t i, std::span<CohortMember> members) {
         const KnownWindowCohortScope cohort;
         switch (members[0].impl->window.mode[i]) {
@@ -1940,19 +1973,6 @@ struct HipKnownPrefixWindow::Impl {
             moe_experts_known_window_rows_launch(all, lead.routed_config, lead.cohort_union(static_cast<std::uint32_t>(all.size())), 0U);
             break;
         }
-        case KnownWindowStepMode::gdn_deferred_rows: {
-            std::vector<HipGdnWindowCohortSegment> segments;
-            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->gdn_window_config});
-            gdn_window_cohort_rows_launch(segments);
-            for (const auto& m : members) m.impl->remember_gdn_layer(m.run->step_rows(i)[0]);
-            break;
-        }
-        case KnownWindowStepMode::qsa_rows: {
-            std::vector<HipQsaCohortSegment> segments;
-            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
-            indexed_attention_known_window_cohort_launch(segments);
-            break;
-        }
         case KnownWindowStepMode::inject_rows:
         case KnownWindowStepMode::moe_combine_rows: {
             std::vector<std::span<const ExecutionDispatchContext>> segments;
@@ -1962,20 +1982,11 @@ struct HipKnownPrefixWindow::Impl {
             else moe_combine_known_window_cohort_rows_launch(segments, members[0].impl->elementwise_config);
             break;
         }
-        case KnownWindowStepMode::lm_head_rows: {
-            std::vector<ExecutionDispatchContext> all;
-            for (const auto& m : members) { const auto rows = m.run->step_rows(i); all.insert(all.end(), rows.begin(), rows.end()); }
-            lm_head_known_window_rows_launch(all, members[0].impl->head_config);
-            // Each session's argmax rows land in its own owner's replies, read by its own capture.
-            for (const auto& m : members) {
-                const auto own = m.run->step_rows(i);
-                std::array<ExecutionBufferAddress, hip_greedy_rows_max> logits{};
-                for (std::size_t r = 0; r < own.size(); ++r) logits[r] = resolve_dispatch_write(own[r], 0);
-                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), own.size()),
-                    members[0].impl->head_config.vocab_size, m.impl->greedy_partials, m.impl->greedy_replies, hip_execution_stream());
-            }
+        case KnownWindowStepMode::gdn_deferred_rows:
+        case KnownWindowStepMode::qsa_rows:
+        case KnownWindowStepMode::lm_head_rows:
+            members[0].impl->launch_cohort_segment_step(i, members);
             break;
-        }
         default: throw std::logic_error("known-window cohort step has no wide implementation");
         }
     }
@@ -2029,31 +2040,11 @@ struct HipKnownPrefixWindow::Impl {
             hyper_mix_known_window_rows_launch(rows, hyper_for(rows)); break;
         case KnownWindowStepMode::moe_route_rows:
             moe_route_known_window_rows_launch(rows, route_config); break;
-        case KnownWindowStepMode::lm_head_rows: {
-            lm_head_known_window_rows_launch(rows, head_config);
-            // Each session's argmax rows land in its own owner's replies, read by its own capture.
-            for (const auto& m : members) {
-                const auto own = m.run->step_rows(i);
-                std::array<ExecutionBufferAddress, hip_greedy_rows_max> logits{};
-                for (std::size_t r = 0; r < own.size(); ++r) logits[r] = resolve_dispatch_write(own[r], 0);
-                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), own.size()),
-                    head_config.vocab_size, m.impl->greedy_partials, m.impl->greedy_replies, hip_execution_stream());
-            }
+        case KnownWindowStepMode::gdn_deferred_rows:
+        case KnownWindowStepMode::qsa_rows:
+        case KnownWindowStepMode::lm_head_rows:
+            launch_cohort_segment_step(i, members, rows);
             break;
-        }
-        case KnownWindowStepMode::gdn_deferred_rows: {
-            std::vector<HipGdnWindowCohortSegment> segments;
-            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->gdn_window_config});
-            gdn_window_cohort_rows_launch(segments);
-            for (const auto& m : members) m.impl->remember_gdn_layer(m.run->step_rows(i)[0]);
-            break;
-        }
-        case KnownWindowStepMode::qsa_rows: {
-            std::vector<HipQsaCohortSegment> segments;
-            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
-            indexed_attention_known_window_cohort_launch(segments);
-            break;
-        }
         default: throw std::logic_error("known-window cohort step has no shared implementation");
         }
     }
@@ -2362,11 +2353,7 @@ struct HipKnownPrefixWindow::Impl {
         if (skip_head && (!prefill || capture || before_publish))
             throw std::invalid_argument("known-window headless execution is a plain tiled prefill block only");
         if(executing)throw std::logic_error("known-window native owner cannot execute recursively");
-        struct ExecutionLease {
-            bool& active;
-            explicit ExecutionLease(bool& value):active(value){active=true;}
-            ~ExecutionLease(){active=false;}
-        } execution_lease(executing);
+        ExecutionLease execution_lease(executing);
         bool owned_eager_scope_admitted=false,actual_window_committed=false;
         const PreparedCapture* observed=nullptr;
         // STRIX_PREFILL_TIMING=1: host milliseconds of the owner's own phases around a tiled block (stderr).
@@ -2572,11 +2559,7 @@ struct HipKnownPrefixWindow::Impl {
         if (executing) throw std::logic_error("known-window native owner cannot execute recursively");
         if (!prefill || requests.empty() || prefill->output_policy == KnownWindowOutputPolicy::all_rows)
             throw std::invalid_argument("segmented prefill runs on a terminal-row or state-only tiled prefill owner");
-        struct ExecutionLease {
-            bool& active;
-            explicit ExecutionLease(bool& value):active(value){active=true;}
-            ~ExecutionLease(){active=false;}
-        } execution_lease(executing);
+        ExecutionLease execution_lease(executing);
         bool owned_eager_scope_admitted = false, committed = false;
         std::vector<KnownPrefillSegment> segments(requests.size());
         try {

@@ -1,7 +1,11 @@
 # Pair prefill and rank-0 continuation
 
 Pair handoff is explicit: set `STRIX_QWEN_PF_PIPE=1` and `STRIX_QWEN_PF_PIPE_DECODE=1`,
-then launch one process per rank with `--rank 0|1 --transport usb4auto`.
+then launch one process per rank with `--rank 0|1`. The transport default is
+`usb4gpu` with the production size router; `--transport usb4auto` (or
+`usb4-auto`) restores host-only. New direct seam bitwise/TTFT gates are pending;
+the measurements below used the previous host path. See the
+[transport decision](../../coord/transport-routing.md).
 Use identical binaries, model assets, prompt IDs, numerical options and capacity.
 The default pair chunk is 4,096 rows where admitted. Session save after a
 two-node prefill requires a prompt length that is a multiple of the chunk size.

@@ -56,6 +56,16 @@ int main() {
         const auto before = stress(true);
         const auto after = stress(false);
         require(before > 0U && after == 0U);
+        // Direct receive installs the immutable snapshot first. CPU CRC must
+        // see the received bytes through the system-release readback event.
+        for (const auto size : {std::size_t{65537}, strix::qwen_pp::seam_piece_bytes + 17U}) {
+            auto slot = strix::qwen_pp::make_hip_pipe_staging(size);
+            auto host = slot->resize(size);
+            std::memset(slot->device_piece(0), 0x37, size);
+            for (std::size_t offset = 0; offset < size; offset += strix::qwen_pp::seam_piece_bytes)
+                slot->read_device_piece(offset, std::min(strix::qwen_pp::seam_piece_bytes, size - offset));
+            require(std::all_of(host.begin(), host.end(), [](auto byte) { return byte == std::byte{0x37}; }));
+        }
         std::cout << "PASS: 24 seeded sizes x 2 slots; shuffled copy/fence order, source reuse and partial tails; device-only mismatches="
             << before << ", system-release mismatches=" << after << " (host model, not device qualification)\n";
         return 0;

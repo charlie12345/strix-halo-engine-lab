@@ -90,22 +90,15 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
     if(::setenv("STRIX_QWEN_PF_LAYER_RANGE",range.c_str(),1)!=0)
 #endif
         throw std::runtime_error("pair handoff MTP layer range update failed");
-    const char* transport_env=std::getenv("STRIX_QWEN_PF_PIPE_TRANSPORT");
-    const std::string_view transport=transport_env?transport_env:"usb4auto";
-    std::unique_ptr<dist::Transport> link;
-    if(transport=="usb4auto" || transport=="usb4-auto") {
-        dist::Usb4AutoOptions usb;usb.rank=rank;link=dist::usb4_host_auto(usb);
-    } else if(transport=="tcp") {
-        const char* peer=std::getenv("STRIX_QWEN_PF_PIPE_PEER");
-        if(rank==1U && !peer) throw std::invalid_argument("pair handoff MTP TCP rank 1 requires --peer HOST");
-        const auto timeout=std::chrono::milliseconds(120000);
-        link=rank==0U?dist::tcp_listen(29872,timeout):dist::tcp_connect(peer,29872,timeout);
-    } else throw std::invalid_argument("pair handoff MTP transport must be usb4auto or tcp");
+    auto link=std::make_unique<qwen_pp::PairTransport>(rank);
     qwen_pp::Pipe pipe(rank,(tokens.size()+tiled.rows-1U)/tiled.rows,
         [&](std::span<const std::byte> data){link->send(data);},
         [&](std::span<std::byte> data){link->receive(data);},[&]{link->abort("pair handoff MTP stopped");},prediction.cut,
         [&]{return qwen_pp::make_hip_pipe_staging(static_cast<std::size_t>(tiled.rows)*qwen_pp::Seam::row_bytes);},
-        [](std::span<const std::byte> data){return dist::crc32c(data);});
+        [](std::span<const std::byte> data){return dist::crc32c(data);},
+        [&](bool sending, qwen_pp::PipeStaging& staging, std::size_t offset, std::size_t bytes) {
+            return link->piece(sending, staging, offset, bytes);
+        });
     auto& context=qwen_pp::pipe_context;
     context={&pipe,rank,0U,compiled.execution_identity^tiled.numerical_plan.block.execution^
         tiled.numerical_plan.block.kernel,prediction.cut};
@@ -126,6 +119,7 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
         ++context.sequence;
     }
     pipe.finish(context.sequence); // join the seam worker before one-shot state transfer
+    link->finish();
     HipMtpTargetHiddenTicket pending;
     if(rank==1U) pending=prompt.finish(receipt); // drains all tap/predictor work
     const auto check_copy=[](hipError_t status) {

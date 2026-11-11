@@ -3052,7 +3052,7 @@ Comma list of `streams`, `joint`, `ready`, `deferred-crc`, `chunks`, `crc-overla
 
 The rank app now switches on its prefill exchange module, whose copy kernels and stream waits move each prefill partial without blocking the host (previously constructed but off).
 
-- **Preconditions:** Host-path USB4 transport (unset = on only there; other transports keep it constructed but off; not built with the GPU-direct transport). The serve app does not use the module yet: it would disable nested serving.
+- **Preconditions:** Host-path USB4 transport (including the host side of `usb4gpu`; other transports keep it constructed but off). The rank app retains PFX when a GPU-direct communicator is present: modules borrow the host transport between complete communicator exchanges. The serve app does not use the module yet: it would disable nested serving.
 - **Automatic selection:** Unset = on; `load` = constructed and off; `off` = not constructed.
 - **Fallback notice:** Startup line names the module state.
 - **Exactness evidence:** Exact: prefill state, final rows and tokens identical on both ranks in-process (1K, 8K) and across fresh processes in any order.

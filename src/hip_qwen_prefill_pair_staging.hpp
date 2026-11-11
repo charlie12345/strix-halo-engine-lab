@@ -65,6 +65,14 @@ public:
         select_device();
         pair_hip_check(hipStreamSynchronize(stream_), "pair prefill authenticated H2D complete");
     }
+    void* device_piece(std::size_t offset) override { return device_bytes_ + offset; }
+    void read_device_piece(std::size_t offset, std::size_t bytes) override {
+        select_device();
+        pair_hip_check(hipMemcpyAsync(host_bytes_ + offset, device_bytes_ + offset, bytes,
+            hipMemcpyDeviceToHost, stream_), "pair prefill routed CRC readback");
+        pair_hip_check(hipEventRecord(pieces_[offset / seam_piece_bytes], stream_), "pair prefill routed publication");
+        pair_hip_check(hipEventSynchronize(pieces_[offset / seam_piece_bytes]), "pair prefill routed bytes ready");
+    }
 private:
     int device_ = 0;
     std::size_t capacity_ = 0;

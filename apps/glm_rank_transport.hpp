@@ -1,7 +1,7 @@
 #pragma once
 // TP2 transport and Communicator setup shared by strix-glm5-rank and strix-glm5-serve.
 #include "strix/dist/communicator.hpp"
-#include "strix/dist/gpu_direct.hpp"
+#include "strix/dist/open_transport.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -20,33 +20,14 @@ inline std::unique_ptr<strix::dist::DeviceExchange>& gpu_direct() {
 
 // The MiniMax rank app's transport setup (usb4-auto host path, usb4gpu GPU-direct when both ranks agree, tcp).
 inline std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt) {
-    const std::chrono::seconds limit(180);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4-auto" || kind == "usb4gpu") {
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        receipt = topology.receipt();
-        if (kind == "usb4gpu") {
-            std::string why_direct, direct_receipt;
-            if (strix::dist::usb4_gpu_direct_streams(o, *t, &why_direct) == 0U) {
-                receipt += "; gpu-direct unavailable (" + why_direct + "): host path only";
-                return t;
-            }
-            gpu_direct() = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &direct_receipt);
-            receipt += "; usb4 " + direct_receipt;
-        }
-        return t;
-    }
-    throw std::invalid_argument("unknown transport " + spec);
+    strix::dist::OpenTransportOptions options;
+    options.spellings = strix::dist::hyphen_transport;
+    options.usb.rank = rank;
+    options.usb.timeout = std::chrono::seconds(180);
+    auto opened = strix::dist::open_transport(spec, options);
+    gpu_direct() = std::move(opened.direct);
+    receipt = std::move(opened.receipt);
+    return std::move(opened.host);
 }
 
 // The engine's Communicator: one exchange carries up to max(8, exchange_rows) rows of 4096 floats.

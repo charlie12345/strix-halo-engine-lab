@@ -1,3 +1,4 @@
+#include "strix/dist/open_transport.hpp"
 // strix-deepseek41-serve: DeepSeek V4.1 Flash served by a two-node engine group (EP experts, TP attention).
 // Rank 0 runs the OpenAI/Anthropic-compatible HTTP front end (strix_serve) and the continuous-batching scheduler; rank
 // 1 has no API and is driven by rank 0 over the communicator: before every step rank 0 sends a control block (the
@@ -3279,41 +3280,14 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
 std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
 
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    const std::chrono::seconds limit(timeout);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4auto") {
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::fprintf(stderr, "usb4 topology: %s\n", topology.receipt().c_str());
-        return t;
-    }
-    if (kind == "usb4gpu") {  // GPU-direct exchanges over the gpu_direct streams, control over the host-path ones
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::fprintf(stderr, "usb4 topology: %s\n", topology.receipt().c_str());
-        std::string why;
-        if (strix::dist::usb4_gpu_direct_streams(o, *t, &why) == 0U) {  // both ranks agree from the same exchanged counts
-            std::fprintf(stderr, "gpu-direct unavailable (%s): host path only\n", why.c_str());
-            return t;
-        }
-        std::string receipt;
-        gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &receipt);
-        std::fprintf(stderr, "usb4 %s\n", receipt.c_str());
-        return t;
-    }
-    throw std::invalid_argument("unknown or unavailable transport " + spec);
+    strix::dist::OpenTransportOptions options;
+    options.spellings = strix::dist::TransportSpellings{"usb4auto", "usb4gpu"};
+    options.usb.rank = rank;
+    options.usb.timeout = std::chrono::seconds(timeout);
+    auto opened = strix::dist::open_transport(spec, options);
+    gpu_direct = std::move(opened.direct);
+    if (!opened.receipt.empty()) std::fprintf(stderr, "usb4 topology: %s\n", opened.receipt.c_str());
+    return std::move(opened.host);
 }
 
 // --prefill-rows auto (the pair default): the largest piece of 32768 / 16384 / 8192 / 4096 rows (at most the context) that both

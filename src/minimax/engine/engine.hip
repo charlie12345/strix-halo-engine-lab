@@ -1971,6 +1971,9 @@ struct Engine::Impl {
         } active{*this};
         pf_active = pf != nullptr && pf_on;
         if (pf_force_comm) pf_active = false;
+        // Modules share the host transport with the routed communicator. A
+        // previous direct collective may still own preposted receives/readers.
+        if (pf_active && comm.device_exchange()) comm.release_transport(nullptr);
         try {
             const std::span<const std::uint32_t> toks(task.toks);
             if (task.saved) restore_rows();
@@ -2416,6 +2419,8 @@ struct Engine::Impl {
             toks[r] = rows[r].token;
         }
         gemv = true;
+        // Decide from this step, not gemv left by the preceding prefill.
+        if (use_xfer() && comm.device_exchange()) comm.release_transport(nullptr);
         const auto layout = route::step_layout(rows);
         step_seqs = layout.seqs;
         step_rows_per_seq = layout.rows_per_seq;

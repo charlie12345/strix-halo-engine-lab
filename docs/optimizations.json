@@ -435,17 +435,6 @@
   },
   {
     "engine": "qwen",
-    "name": "QPF2K_GDN_CORE16",
-    "flag_or_env": "STRIX_QPF2K_GDN_CORE16",
-    "default": "1",
-    "exact": "STRIX_QPF2K_GDN_CHECK=1 and STRIX_GDN_PREFILL_CHECK=1 compare written bytes; require zero differences. Whole-engine receipts and operand-identity checks cover the qualified special-value/NaN order.",
-    "gain": "-",
-    "preconditions": "Eligible GDN prefill rows and supported lane/column shapes. Core16 additionally needs dense FP16 (not dense G64), tiled rows in multiples of 32, output site enabled, at least 2048 rows by default, value width 6144, head dimension 128, uniform core/output strides and a supported dense output site; graph capture declines it. The FP16 core consumer must be admitted before the producer drops FP32 rows.",
-    "off_switch": "STRIX_QPF2K_GDN_CORE16=0",
-    "doc_anchor": "docs/optimizations.md#qwen-gdn"
-  },
-  {
-    "engine": "qwen",
     "name": "QPF2K GDN Chunk-16 core (length-gated)",
     "flag_or_env": "STRIX_QPF2K_GDN_CHUNK16",
     "default": "auto",
@@ -1766,17 +1755,6 @@
   },
   {
     "engine": "minimax",
-    "name": "v4 MoE prefill core",
-    "flag_or_env": "STRIX_MMX_PREFILL_CORE",
-    "default": "v4",
-    "exact": "Published same-identity qualification: Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.",
-    "gain": "Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib",
-    "preconditions": "Supported prefill expert shapes and quantized weights.",
-    "off_switch": "STRIX_MMX_PREFILL_CORE=lib",
-    "doc_anchor": "docs/optimizations.md#mm-pf-core-v4"
-  },
-  {
-    "engine": "minimax",
     "name": "MSA prefill batching",
     "flag_or_env": "STRIX_MM_PF_MSA_BATCH",
     "default": "1",
@@ -2995,6 +2973,17 @@
     "preconditions": "Wait before the next producer overwrites its member partial; requires successful async start; compute scratch remains serialized. Per grouped call, EVERY member must have at least STRIX_MM_PF_ASYNC_MIN_ROWS rows (default 2048; 0 removes the row gate). Otherwise ordinary comm.start, byte-identical scheduling to STRIX_MM_PF_ASYNC_START=0. Deterministic member-row decision on both ranks; global off always wins.",
     "off_switch": "STRIX_MM_PF_LATE_SRC_FENCE=0 (also STRIX_MM_BASELINE=1 unless explicitly overridden)",
     "doc_anchor": "docs/minimax-grouped-prefill.md"
+  },
+  {
+    "engine": "minimax",
+    "name": "FAST_I4 INT4 MoE chain per chunk",
+    "flag_or_env": "STRIX_MOE_I4_CHAIN",
+    "default": "ON with draft FAST_I4 scope all",
+    "exact": "Same bits as the unfused INT4 calls; 8K and 32K state, final-row and token anchors equal; ranks agree in every run. FAST_I4 itself is a lossy opt-in identity with quality gates pending.",
+    "gain": "Two-node TP2: 8K prefill 12.31 s vs 12.65 s unfused (-2.7 %), 12.53 s vs 13.12 s reference binary (-4.5 %). 32K 56.47 s vs 55.79 s unfused (+1.2 %, two pairs both orders, +1.35/+1.08 %). Regime gate: chain default only for prompts of at most 8192 rows, unfused above; STRIX_MOE_I4_CHAIN=0/1 forces either way.",
+    "preconditions": "STRIX_MMX_MODEL_FORMAT=fast_i4 with STRIX_MMX_FAST_I4_SCOPE=all; runs once per 4096-row pipeline chunk so chunk c MoE overlaps chunk c-1 exchange.",
+    "off_switch": "STRIX_MOE_I4_CHAIN=0 (unfused calls, same bits)",
+    "doc_anchor": "docs/optimizations.md#minimax-fast-i4-chain"
   },
   {
     "engine": "qwen",

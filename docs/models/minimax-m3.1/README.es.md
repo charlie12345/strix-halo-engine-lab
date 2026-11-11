@@ -9,6 +9,17 @@ condiciones y el comando de lanzamiento. Cómo se leen las tablas y qué cubre "
 [metodología](../../methodology.es.md). Instrucciones de compilación (biblioteca trellis incluida):
 [primeros pasos](../../getting-started/README.es.md); el par en sí: [dos nodos por USB4](../../pair.es.md).
 
+FAST_I4 opcional en borrador (`STRIX_MMX_MODEL_FORMAT=fast_i4`): el INT4 se produce por capa durante el prefill
+en dos búferes reutilizables; memoria +3.6 GiB; el contexto nunca se reduce; decode sin cambios. Los pesos EXL3
+siguen residentes para cada capa de decode y fila MTP. `STRIX_MMX_FAST_I4_SCOPE=all|gate_up` selecciona INT4 para
+todas las proyecciones de expertos (predeterminado) o solo gate/up. La conversión en serie es la predeterminada;
+`STRIX_MMX_FAST_I4_PREFETCH=1` activa la precarga ordenada por eventos, pendiente de cualificación de tiempos. Es una
+identidad numérica con pérdida pendiente de las puertas nativas de tiempo y calidad; no hereda la cualificación de la
+ruta exacta de producción. Con el alcance `all`, la cadena MoE INT4 fusionada se ejecuta una vez por chunk de 4096
+filas por defecto (`STRIX_MOE_I4_CHAIN=0` selecciona las llamadas sin fusionar, mismos bits): prefill 8K 12.31 s
+frente a 12.65 s sin fusionar (−2.7 %); 32K 56.47 s frente a 55.79 s (+1.2 %, en ambos órdenes); anclas iguales,
+los ranks coinciden. [Contrato de implementación](../../minimax-grouped-prefill.md#draft-fast_i4).
+
 <a id="minimax-pair"></a>
 
 ## Ejecución

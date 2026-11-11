@@ -135,7 +135,6 @@ subject to their normal kernel/shape/resource checks.
 | `STRIX_QPF2K_DENSE` | No | Dense projections |
 | `STRIX_QPF2K_GDN` | No | Gated recurrence |
 | `STRIX_QPF2K_GDN_GATES_BATCH` | No | Batched recurrence gates |
-| `STRIX_QPF2K_GDN_CORE16` | No | Recurrence core |
 | `STRIX_QPF2K_HC` | No | Hyper-connection mix |
 | `STRIX_QPF2K_HC_MASK` | No | Hyper-connection selection |
 | `STRIX_QPF2K_HC_OUTPUT3` | No | Hyper-connection output |

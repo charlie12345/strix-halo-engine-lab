@@ -1841,7 +1841,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     }, qpf2k::startup_items);
     const Environment recorded_startup{
         {"STRIX_PLE_RECLAIMABLE","auto"}, {"STRIX_QPF2K_DENSE","1"},
-        {"STRIX_QPF2K_GDN","1"}, {"STRIX_QPF2K_GDN_CORE16","1"},
+        {"STRIX_QPF2K_GDN","1"},
         {"STRIX_QPF2K_GDN_GATES_BATCH","1"}, {"STRIX_QPF2K_HC","1"},
         {"STRIX_QPF2K_HC_MASK","14"}, {"STRIX_QPF2K_HC_OUTPUT3","1"},
         {"STRIX_QPF2K_HC_OUTPUT3_BAND","16"}, {"STRIX_QPF2K_MOE_DA16","1"},

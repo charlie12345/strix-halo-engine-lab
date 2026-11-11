@@ -132,6 +132,13 @@ template<int Bits> struct WmmaXContract {
 //   void store(const Tile&, int r, int col0, float (&v)[4], int lane)
 //        - 128 outputs col0 + lane + 32 j after hadamard128 (FP32 total, no svh): svh scale,
 //          activation, combine... Fused epilogue only.
+// kPassRow: global-A row offset added per chain pass (paired gate/up reads an interleaved
+// pre-quantised image, row = map*a_mul + a_add + pass*kPassRow). NoChain: 0 (unchanged).
+struct NoChain {
+    static constexpr bool kActive = false;
+    static constexpr int kPasses = 1;
+    static constexpr uint32_t kPassRow = 0;
+};
 struct NoAdapter {
     static constexpr bool kActive = false, kTiles = false;
     struct Tile {};
@@ -144,7 +151,7 @@ template<class Contract> constexpr unsigned core_waves_per_eu() {
 }
 template<class Contract, int BM, int BN, int WM, int WN, bool Fused, int Probe = 0,
     bool IU4Audit = false, bool IU4FullRows = false, int IU4Group = 64, bool IU4Grouped = false,
-    class Adapter = NoAdapter>
+    class Adapter = NoAdapter, class Chain = NoChain>
 __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operand>::threads))
 __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_core(
     const uint32_t* __restrict__ packed, const _Float16* __restrict__ input,
@@ -152,7 +159,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     const uint16_t* __restrict__ scales, const float* __restrict__ bias,
     float* __restrict__ output, float alpha, float beta, int raster_m,
     const uint8_t* a_q = nullptr, const float* a_scale = nullptr,
-    const _Float16* w_scale = nullptr, int32_t* group_sums = nullptr, GroupedArgs gp = {}, Adapter ad = {}) {
+    const _Float16* w_scale = nullptr, int32_t* group_sums = nullptr, GroupedArgs gp = {}, Adapter ad = {}, Chain chain = {}) {
     using Operand = typename Contract::Operand;
     using G = Geometry<BM, BN, WM, WN, Operand>;
     constexpr bool Integer = is_integer_operand<Operand>::value;
@@ -184,13 +191,21 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     constexpr bool AD = Adapter::kActive;
     static_assert(!AD || (Integer || (!IU4 && !DenseF16 && Probe == 0 && (!Fused || BN % 128 == 0))), "adapters: trellis F16 operands");
     static_assert(Fold == 0 || (!IU4 && !DenseF16));
+    static_assert(!Chain::kActive || (IU4Grouped && Fused && IU4Group == 64 && !AD));
+    // Gate values stay in each lane's registers across the paired gate/up mainloops.
+    constexpr int chain_groups = (G::waves_m * 16 * (BN / 128) + G::waves - 1) / G::waves;
+    float chain_saved[Chain::kPasses == 2 ? MT * chain_groups * 4 : 1];
+    const auto* chain_packed = packed;
+    const auto* chain_wscale = w_scale;
+    for (int chain_pass = 0; chain_pass < Chain::kPasses; ++chain_pass) {
+    if constexpr (Chain::kActive) { packed = chain_packed; w_scale = chain_wscale; }
     // Adapter tile loop: one pass for library launches; kTiles adapters iterate their CTA's tiles.
     for (unsigned iter = 0;; ++iter) {
     [[maybe_unused]] typename Adapter::Tile at{};
     if constexpr (Adapter::kTiles) {
         if (!ad.next(at, iter, BN)) return;   // uniform
         rows = at.rows; packed = at.packed; splits = at.splits;
-    } else if (iter) return;
+    } else if (iter) { if constexpr (Chain::kActive) break; else return; }
     // Grouped rasterisation: consecutive blocks cover raster_m row blocks of one column
     // block, then the next column block, so resident blocks share A rows and Q slabs.
     // Only the block -> tile mapping changes; every tile is computed exactly as before.
@@ -210,6 +225,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
         packed += size_t(expert) * (gp.w_expert_bytes / 4U);
         w_scale += size_t(expert) * gp.w_scale_expert;
         if constexpr (Fused) scales = gp.col_scale[expert];
+        if constexpr (Chain::kActive) chain.bind(expert, chain_pass, packed, w_scale, scales);
         (void)raster_m;
     } else if constexpr (!Adapter::kTiles) {
     const int blocks_m = (rows + BM - 1) / BM;
@@ -260,15 +276,16 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     // Grouped: gathered A rows, resolved once (clamped to the tile's last row).
     [[maybe_unused]] uint32_t a_src[IU4Grouped ? G::a_per_thread : 1], sa_src[IU4Grouped ? sa_per_thread : 1];
     if constexpr (IU4Grouped) {
+        const uint32_t a_add = gp.a_add + uint32_t(chain_pass) * Chain::kPassRow;
         #pragma unroll
         for (int i = 0; i < G::a_per_thread; ++i) {
             const int r = (thread + i * G::threads) / G::chunks_per_row;
-            a_src[i] = map_row(r < rows ? r : rows - 1, gp.a_mul, gp.a_add);
+            a_src[i] = map_row(r < rows ? r : rows - 1, gp.a_mul, a_add);
         }
         #pragma unroll
         for (int i = 0; i < sa_per_thread; ++i) {
             const int r = (thread + i * G::threads) / SLOTS;
-            sa_src[i] = map_row(r < rows ? r : rows - 1, gp.a_mul, gp.a_add);
+            sa_src[i] = map_row(r < rows ? r : rows - 1, gp.a_mul, a_add);
         }
     }
     // Adapter rows: the gathered row pointers, resolved once per tile.
@@ -451,7 +468,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     }
     Float8 acc[MT][NT] = {};
     // Fold > 0: the current chain (from +0); acc is the folded FP32 total.
-    [[maybe_unused]] Float8 chain[Fold ? MT : 1][Fold ? NT : 1] = {};
+    [[maybe_unused]] Float8 fold_acc[Fold ? MT : 1][Fold ? NT : 1] = {};
     // IU4: fresh I32 per scale group; persists across stages only when g > BK.
     using IU4Sum = int32_t __attribute__((ext_vector_type(8)));
     [[maybe_unused]] IU4Sum sum[IU4 ? MT : 1][IU4 ? NT : 1] = {};
@@ -478,6 +495,13 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             const auto* a_frag = ab + (wave_m * WM + (lane & 15)) * G::row_bytes;
             const auto* b_frag = ab + (BM + wave_n * WN + (lane & 15)) * G::row_bytes;
             static_assert(KT % 4 == 0 && WM % 16 == 0 && WN % 16 == 0);
+            // Grouped tiles are ragged (a group's last tile holds its remaining rows): a wave whose WM rows all
+            // lie past the tile's rows skips its WMMA and flush (wave-uniform), leaving the SIMD to resident
+            // waves. It still stages its share of the operands. Live rows keep their arithmetic; the skipped
+            // accumulators only cover rows that are never stored.
+            if (!IU4Grouped || wave_m * WM < rows) {
+            // Same at 16-row granularity inside a live wave: tile mt computes only while it holds a live row.
+            const auto mt_live = [&](int mt) { return !IU4Grouped || mt == 0 || wave_m * WM + mt * 16 < rows; };
             #pragma unroll
             for (int seg = 0; seg < SLOTS; ++seg) {
                 const int t0 = k0 + seg * SEG;          // first K16 tile of the segment
@@ -491,16 +515,19 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                     #pragma unroll
                     for (int nt = 0; nt < NT; ++nt) right[nt] = *reinterpret_cast<const Nibbles*>(b_frag + nt * 16 * G::row_bytes + byte);
                     #pragma unroll
-                    for (int mt = 0; mt < MT; ++mt)
+                    for (int mt = 0; mt < MT; ++mt) {
+                        if (!mt_live(mt)) continue;
                         #pragma unroll
                         for (int nt = 0; nt < NT; ++nt)
                             sum[mt][nt] = integer_wmma<4>(left[mt], right[nt], sum[mt][nt]);
+                    }
                 }
                 // g > BK: flush only after the group's last stage (inputs % g == 0).
                 if (GK <= KT || (t0 + SEG) % GK == 0) {
                 const int g = t0 / GK;
                 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
+                    if (!mt_live(mt)) continue;
                     const float* sap = sl + seg * BM + wave_m * WM + mt * 16 + (lane >> 4) * 8;
                     const F4 lo = *reinterpret_cast<const F4*>(sap), hi = *reinterpret_cast<const F4*>(sap + 4);
                     const float sa[8] = {lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
@@ -525,6 +552,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                 }
                 }
             }
+            }
         } else {
         #pragma unroll
         for (int kt = 0; kt < KT; ++kt) {
@@ -546,8 +574,8 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                             acc[mt][nt][0] += float(x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7] +
                                                     x[8] + x[9] + x[10] + x[11] + x[12] + x[13] + x[14] + x[15]);
                         }
-                        else if constexpr (Fold > 0) chain[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            __builtin_bit_cast(Half16, left), __builtin_bit_cast(Half16, right[nt]), chain[mt][nt]);
+                        else if constexpr (Fold > 0) fold_acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                            __builtin_bit_cast(Half16, left), __builtin_bit_cast(Half16, right[nt]), fold_acc[mt][nt]);
                         else acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
                             __builtin_bit_cast(Half16, left), __builtin_bit_cast(Half16, right[nt]), acc[mt][nt]);
                     }
@@ -558,7 +586,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                         #pragma unroll
                         for (int mt = 0; mt < MT; ++mt)
                             #pragma unroll
-                            for (int nt = 0; nt < NT; ++nt) { acc[mt][nt] = acc[mt][nt] + chain[mt][nt]; chain[mt][nt] = Float8{}; }
+                            for (int nt = 0; nt < NT; ++nt) { acc[mt][nt] = acc[mt][nt] + fold_acc[mt][nt]; fold_acc[mt][nt] = Float8{}; }
                     }
                 }
             }
@@ -603,7 +631,9 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                     f[(wave_m * 16 + 2 * j + lane / 16) * FSTRIDE + wave_n * WN + nt * 16 + lane % 16] = acc[mt][nt][j];
             __syncthreads();
             constexpr int groups = SLICE * (BN / 128);
-            for (int g = wave; g < groups; g += G::waves) {
+            // One epilogue group; gi = its step in this wave (compile-time in the unrolled chain loop,
+            // so the paired chain's saved gate registers never need a dynamic index / scratch).
+            auto epilogue_group = [&](const int g, [[maybe_unused]] const int gi) {
                 const int slice_row = g / (BN / 128), col_group = g % (BN / 128);
                 const int row = first_row + (slice_row / 16) * WM + mt * 16 + slice_row % 16;
                 if (row < rows) {
@@ -616,11 +646,19 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                         for (int j = 0; j < 4; ++j) values[j] = f[slice_row * FSTRIDE + col_group * 128 + lane + 32 * j];
                         hadamard128(values);
                         ad.store(at, row, begin_col, values, lane);
-                        continue;
+                        return;
                     }
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) values[j] += f[slice_row * FSTRIDE + col_group * 128 + lane + 32 * j];
                     hadamard128(values);
+                    if constexpr (Chain::kActive) {
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            values[j] *= __half2float(__ushort_as_half(scales[begin_col + lane + 32*j]));
+                        chain.store(map_first + uint32_t(row), uint32_t(begin_col), chain_pass,
+                            mt * chain_groups + gi, values, chain_saved);
+                        return;
+                    }
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
                         const int channel = begin_col + lane + 32 * j;
@@ -632,6 +670,14 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                         output[index] = value;
                     }
                 }
+            };
+            if constexpr (Chain::kActive) {
+                constexpr int gsteps = (groups + G::waves - 1) / G::waves;
+                #pragma unroll
+                for (int gi = 0; gi < gsteps; ++gi)
+                    if (wave + gi * G::waves < groups) epilogue_group(wave + gi * G::waves, gi);
+            } else {
+                for (int g = wave; g < groups; g += G::waves) epilogue_group(g, 0);
             }
             __syncthreads();
         }
@@ -640,6 +686,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     // The grouped plan owns exactly one routed tile, like its dense siblings.
     if constexpr (structure == IntegerStructure::grouped_chunk) return;
     }   // adapter tile loop
+    }   // paired chain passes
     }   // general tiled plans
 }
 } // namespace wmma_tiled

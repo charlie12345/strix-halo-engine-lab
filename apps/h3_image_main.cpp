@@ -4,6 +4,7 @@
 #include "h3/common/png.hpp"
 #include "h3/vae/image.hpp"
 #include "h3/dist/image_parallel.hpp"
+#include "h3/common/alongside.hpp"
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #ifdef STRIX_H3_IMAGE_HIP
 #include "h3/block/device_forward.hpp"
 #include "h3/dist/device_dist.hpp"
+#include "h3/dist/pair_link.hpp"
 #include "h3/te/te_gpu.hpp"
 #include "h3/vae/vae_decoder.hpp"
 #include "h3/vae/enc_gpu.hpp"
@@ -153,10 +155,9 @@ int run(const Args& a,const b::ImageConfig& cfg) {
     auto stage_start=started;
     // Sequence pair: USB4 pairing (stream discovery, cable measurement) runs alongside TE and DiT residency; the
     // input/policy agreement and direct setup still happen after both, before any collective.
-    struct Link { std::unique_ptr<strix::dist::Transport> transport; strix::dist::Usb4Topology topology; };
-    strix::dist::Usb4AutoOptions link_opt;link_opt.rank=a.rank;link_opt.timeout=std::chrono::milliseconds(240000);
-    std::future<Link> link;
-    if(a.work.sequence) link=std::async(std::launch::async,[link_opt] { Link l;l.transport=strix::dist::usb4_host_auto(link_opt,&l.topology);return l; });
+    const auto link_opt=d::pair_link_options(a.rank);
+    d::PairLinkJob link;
+    if(a.work.sequence) link=d::start_pair_link(link_opt);
     std::vector<Pixels> refs; std::vector<b::RefBlock> shapes;
     for(const auto& file:a.refs) { refs.push_back(read_png(file)); const auto& p=refs.back();shapes.push_back({b::RefBlock::image,1,unsigned(p.h/16),unsigned(p.w/16),0}); }
     std::vector<float> conditions;
@@ -211,11 +212,10 @@ int run(const Args& a,const b::ImageConfig& cfg) {
     const bool single_eager=!a.work.sequence && !a.dist && a.eager_prepare;
     const bool te_alongside=(a.work.sequence || single_eager) && !a.serial_te;
     std::size_t free_before=0,total_before=0;
-    std::future<double> te_job;
+    std::future<strix::h3::Timed<void>> te_job;
     if(te_alongside) {
         if(hipMemGetInfo(&free_before,&total_before)!=hipSuccess) throw std::runtime_error("image: memory inspection failed");
-        te_job=std::async(std::launch::async,[&run_te] { const auto t0=std::chrono::steady_clock::now();run_te();
-            return std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count(); });
+        te_job=strix::h3::start_alongside([&run_te] { run_te(); });
     } else {
         run_te();
         refs.clear(); refs.shrink_to_fit();
@@ -243,7 +243,7 @@ int run(const Args& a,const b::ImageConfig& cfg) {
             forward_owner->prepare(source,*linear_owner);
         }
         stage("dit_residency_alongside_te",residency_start);
-        const auto te_seconds=te_job.get();
+        const auto te_seconds=te_job.get().seconds;
         refs.clear(); refs.shrink_to_fit();
         std::cout<<"{\"image_stage\":\"text_encoder\",\"rank\":"<<a.rank<<",\"seconds\":"<<te_seconds<<",\"alongside_dit\":true}\n";
         stage("te_and_dit_residency",stage_start);
@@ -273,12 +273,12 @@ int run(const Args& a,const b::ImageConfig& cfg) {
         throw std::runtime_error("image: packed sequence exceeds conservative memory/attention admission; reduce reference area explicitly");
     // VAE (host head + FAST decoder) loads on a thread during sampling; decoding waits for it (--serial-vae: after
     // the DiT is released, as before). Off in the sequence pair until measured there.
-    struct VaeSet { std::unique_ptr<v::ImageVae> host; std::unique_ptr<v::GpuDecoder> fast; double seconds=0; };
-    auto load_vae=[&a] { const auto t0=std::chrono::steady_clock::now();VaeSet s;s.host=std::make_unique<v::ImageVae>(a.vae);
+    struct VaeSet { std::unique_ptr<v::ImageVae> host; std::unique_ptr<v::GpuDecoder> fast; };
+    auto load_vae=[&a] { VaeSet s;s.host=std::make_unique<v::ImageVae>(a.vae);
         if(a.fast_vae) s.fast=std::make_unique<v::GpuDecoder>(a.vae,24,true,true);
-        s.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();return s; };
+        return s; };
     const bool vae_alongside=!a.latent_only && !a.work.sequence && !a.serial_vae;
-    std::future<VaeSet> vae_job;
+    std::future<strix::h3::Timed<VaeSet>> vae_job;
     {
         if(!forward_owner) forward_owner=std::make_unique<b::DeviceForward>(g);
         auto& forward=*forward_owner;
@@ -298,7 +298,7 @@ int run(const Args& a,const b::ImageConfig& cfg) {
             model=early_model?std::move(early_model):std::make_unique<d::DeviceModel>(g,source,50,true);
             if(a.work.sequence) {
                 const auto link_start=std::chrono::steady_clock::now();
-                auto paired=link.get();
+                auto paired=std::move(link.get().value);
                 stage("pair_link_wait",link_start);
                 const auto& opt=link_opt;
                 const auto& topology=paired.topology;
@@ -341,7 +341,7 @@ int run(const Args& a,const b::ImageConfig& cfg) {
             forward.prepare(source,linear); // no-op for blocks already made resident alongside the TE
         }
         stage("dit_residency_and_pair",prepare_start);
-        if(vae_alongside) vae_job=std::async(std::launch::async,load_vae);
+        if(vae_alongside) vae_job=strix::h3::start_alongside(load_vae);
         d::DeviceRunOptions run_options;
         run_options.hashes=false; // retain mandatory device digests/admission; avoid per-block host residual downloads
         run_options.score_bound=a.attn_2p15?d::kScoreBoundExtended:d::kScoreBound;
@@ -391,9 +391,9 @@ int run(const Args& a,const b::ImageConfig& cfg) {
     linear_owner.reset();forward_owner.reset(); // DiT residency ends before decoding (and before VAE loading with --serial-vae or in the pair)
     stage("dit_load_prepare_refiner_sample",stage_start);stage_start=std::chrono::steady_clock::now();
     if(a.latent_only) { std::cout<<"{\"image_complete\":\"latent-only\",\"seconds\":"<<std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()<<"}"<<std::endl; return 0; }
-    auto vae_set=vae_job.valid()?vae_job.get():load_vae();
-    v::ImageVae& vae=*vae_set.host;
-    std::unique_ptr<v::GpuDecoder> fast=std::move(vae_set.fast);
+    auto vae_set=(vae_job.valid()?std::move(vae_job):strix::h3::start_alongside(load_vae)).get();
+    v::ImageVae& vae=*vae_set.value.host;
+    std::unique_ptr<v::GpuDecoder> fast=std::move(vae_set.value.fast);
     // nested in vae_and_png (same start); decode+PNG = vae_and_png - vae_load. Alongside sampling: vae_load is the
     // load itself (hidden) and vae_load_wait the part left on the critical path.
     if(vae_alongside) { std::cout<<"{\"image_stage\":\"vae_load\",\"rank\":"<<a.rank<<",\"seconds\":"<<vae_set.seconds<<",\"alongside_dit\":true}\n";

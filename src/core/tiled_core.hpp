@@ -465,6 +465,11 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
             const auto* a_frag = ab + (wave_m * WM + (lane & 15)) * G::row_bytes;
             const auto* b_frag = ab + (BM + wave_n * WN + (lane & 15)) * G::row_bytes;
             static_assert(KT % 4 == 0 && WM % 16 == 0 && WN % 16 == 0);
+            // Grouped tiles are ragged (a group's last tile holds its remaining rows): a wave whose WM rows all
+            // lie past the tile's rows skips its WMMA and flush (wave-uniform), leaving the SIMD to resident
+            // waves. It still stages its share of the operands. Live rows keep their arithmetic; the skipped
+            // accumulators only cover rows that are never stored.
+            if (!IU4Grouped || wave_m * WM < rows) {
             #pragma unroll
             for (int seg = 0; seg < SLOTS; ++seg) {
                 const int t0 = k0 + seg * SEG;          // first K16 tile of the segment
@@ -511,6 +516,7 @@ __global__ __launch_bounds__((Geometry<BM, BN, WM, WN, typename Contract::Operan
                     }
                 }
                 }
+            }
             }
         } else {
         #pragma unroll

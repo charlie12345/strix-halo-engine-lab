@@ -2991,7 +2991,7 @@
     "flag_or_env": "STRIX_MOE_I4_CHAIN",
     "default": "ON with draft FAST_I4 scope all",
     "exact": "Same bits as the unfused INT4 calls; 8K and 32K state, final-row and token anchors equal; ranks agree in every run. FAST_I4 itself is a lossy opt-in identity with quality gates pending.",
-    "gain": "Two-node TP2: 8K prefill 12.31 s vs 12.65 s unfused (-2.7 %), 12.53 s vs 13.12 s reference binary (-4.5 %). 32K 56.47 s vs 55.79 s unfused (+1.2 %, two pairs both orders, +1.35/+1.08 %). Regime gate: chain default only for prompts of at most 8192 rows, unfused above; STRIX_MOE_I4_CHAIN=0/1 forces either way.",
+    "gain": "Two-node TP2: 8K prefill 12.12 s vs 12.34 s unfused and 12.76 s vs 12.98 s (-1.7 %, both orders). 32K 55.23 s vs 55.74 s unfused (-0.9 %, mean of six n9 pairs, three in each order: -0.6 % S-first, -1.2 % X-first; single runs vary ±3 %). Gate/up keeps the free plan choice via FP32 gate save to global scratch (STRIX_MOE_I4_CHAIN_GSAVE, default on); the register save forced plan 1 (BM64) and cost +1.2 % at 32K. Chain GEMMs reach 31 % (8K) / 32 % (32K) of the iu4 WMMA peak.",
     "preconditions": "STRIX_MMX_MODEL_FORMAT=fast_i4 with STRIX_MMX_FAST_I4_SCOPE=all; runs once per 4096-row pipeline chunk so chunk c MoE overlaps chunk c-1 exchange.",
     "off_switch": "STRIX_MOE_I4_CHAIN=0 (unfused calls, same bits)",
     "doc_anchor": "docs/optimizations.md#minimax-fast-i4-chain"

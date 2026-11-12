@@ -1216,7 +1216,8 @@ DevLayout dev_layout(unsigned T,bool i4=false) {
         // (row 2*pair+m, quantised once by the pre-pass) with its FP32 scales.
         take(align256(((5ULL*T+31)/32+kDevGroups)*12)+256+
              align256(5ULL*T*(kInter/2))+align256(5ULL*T*(kInter/64)*4)+align256(5ULL*T*kHidden*4)+
-             align256(2ULL*5ULL*T*(kHidden/2))+align256(2ULL*5ULL*T*(kHidden/64)*4));
+             align256(2ULL*5ULL*T*(kHidden/2))+align256(2ULL*5ULL*T*(kHidden/64)*4)+
+             (strix::core::moe_i4::gsave_enabled() ? align256(5ULL*T*kInter*4) : 0));  // GSave: FP32 pass-0 gate of the paired chain GEMM
         l.bytes=off;
         return l;
     }
@@ -1384,6 +1385,9 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
     t.rows = T;
     t.shared_group = kExperts;
     t.tpairs = l.tpairs;
+    // The device planner historically ignores the environment fakeq switch.
+    // Only an explicit per-call override changes its arithmetic.
+    t.fakeq = v.i4 == nullptr && v.fakeq_a4 == PrefillFakeq::on ? 1U : 0U;
 #if STRIX_MMX_IU4_LIB
     if(v.i4) {
         if(!v.i4_all || !v.i4_chain) throw std::invalid_argument("device i4 needs the all-scope candidate chain");
@@ -1392,7 +1396,7 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
         return;
     }
 #endif
-    if (prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    if (v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     launched("gather transform");
     mark("gather", stream);
@@ -1543,9 +1547,9 @@ std::size_t prefill_moe_workspace_bound(std::uint32_t rows) {
 
 std::size_t prefill_i4_workspace_bound(std::uint32_t rows) { return dev_layout(rows,true).bytes; }
 
-bool prefill_i4_chain(std::size_t total_rows) {
+bool prefill_i4_chain(std::size_t) {
 #if STRIX_MMX_IU4_LIB
-    return strix::core::moe_i4::enabled(total_rows <= kI4ChainRows);  // FAST_I4 scope all; same bits as unfused
+    return strix::core::moe_i4::enabled(true);  // FAST_I4 scope all; same bits as unfused
 #else
     return false;
 #endif
@@ -1658,7 +1662,8 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     t.rows = v.rows;
     t.shared_group = static_cast<unsigned>(p.groups.size() - 1);
     t.tpairs = p.tpairs;
-    t.fakeq = !i4 && prefill_fakeq_a4() ? 1U : 0U;
+    t.fakeq = !i4 && (v.fakeq_a4 == PrefillFakeq::on ||
+                     (v.fakeq_a4 == PrefillFakeq::environment && prefill_fakeq_a4())) ? 1U : 0U;
 #if STRIX_MMX_IU4_LIB
     if (i4) {
         mark("start", stream);
@@ -1667,7 +1672,9 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     }
 #endif
     mark("start", stream);
-    if (prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    // The token gather implements A4 fake quant; force it for the shadow call
+    // even when the ordinary path selected the tiled gather.
+    if (v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     launched("gather transform");
     mark("gather", stream);

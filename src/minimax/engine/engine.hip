@@ -1,4 +1,6 @@
 #include "minimax/engine/route_identity.hpp"
+#include "core/layer_set.hpp"
+#include "core/i4_shadow.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
 // MiniMax M3.1 Flash engine, TP2 (see include/strix/minimax/engine.hpp and qualification notes).
 //
@@ -10,6 +12,7 @@
 // Linears: strix_gemm for prefill / gate calls, strix_gemv for decode steps (<= 8 rows).
 #include "strix/minimax/engine.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/pair/prefill_group.hpp"
 
 #include "mm_kernels.hpp"
 #include "strix/hip_minimax_moe.hpp"
@@ -554,14 +557,17 @@ struct Engine::Impl {
     std::size_t pf_async_min_rows = 2048;
     // Persistent per-member/per-activation-bank fences. Children currently fit
     // one chunk, but must never alias the parked parent's event generations.
+    static constexpr unsigned kPfGroupMax = strix::pair::prefill_group::kMax;  // one 32K prompt (8 x 4096 rows) as one group
     struct PfFences {
-        std::array<hipEvent_t, 4> last_r_use{}, p_free{};
-        std::array<bool, 4> destination_untracked{};
-        std::array<bool, 4> source_pending{};
+        std::array<hipEvent_t, kPfGroupMax> last_r_use{}, p_free{};
+        std::array<bool, kPfGroupMax> destination_untracked{};
+        std::array<bool, kPfGroupMax> source_pending{};
     };
     std::array<PfFences, 2> pf_fences{};
     bool pf_comm_inflight = false;
-    unsigned pf_group = 2;                     // STRIX_MM_PF_GROUP: chunks interleaved together (2..4)
+    bool pf_group_explicit = false;            // STRIX_MM_PF_GROUP given (then a narrower exchange depth is an error)
+    unsigned pf_group = strix::pair::prefill_group::kDefault;  // STRIX_MM_PF_GROUP: chunks interleaved together (2..8;
+                                               // clamped to the prompt's chunk count, and to the exchange depth)
     std::vector<float*> grp_h, grp_hn;         // residual / normed rows of group members 1.. (member 0 uses h / hn)
     std::vector<float*> grp_part, grp_remote;  // communicator backend: each member's local / peer partials (member 0: part / remote)
     bool pf_comm_interleave = true;            // the communicator backend is available (start/finish; used when the module is off)
@@ -612,6 +618,8 @@ struct Engine::Impl {
             for (hipEvent_t ev : {j.ready, j.free}) if (ev != nullptr) (void)hipEventDestroy(ev);
         }
         if (jit_stream != nullptr) (void)hipStreamDestroy(jit_stream);
+        if (i4_shadow_outputs != nullptr) (void)hipFree(i4_shadow_outputs);
+        if (i4_shadow_sums != nullptr) (void)hipFree(i4_shadow_sums);
         for (auto& t : jit_timing)
             for (hipEvent_t ev : {t.convert0, t.convert1, t.moe0, t.moe1})
                 if (ev != nullptr) (void)hipEventDestroy(ev);
@@ -621,8 +629,16 @@ struct Engine::Impl {
     // RTX PRO prefill service reproduces bit for bit. Decode steps are unchanged.
     bool fp32_prefill = false;
     bool model_fast_i4 = false;   // STRIX_MMX_MODEL_FORMAT=fast_i4
+    bool i4_shadow = false;      // STRIX_MMX_FAST_I4_SHADOW (measurement only)
+    float* i4_shadow_outputs = nullptr;  // two max_rows x kHidden buffers: exact and fakeq
+    float* i4_shadow_sums = nullptr;     // two pairs of {squared error, exact energy}
     fast_i4::Scope i4_scope = fast_i4::Scope::all;
+    strix::core::LayerSet i4_exl3_layers;  // STRIX_MMX_FAST_I4_EXL3_LAYERS: MoE layers that keep the EXL3 operator
+    unsigned i4_a8 = 0;                    // STRIX_MMX_FAST_I4_A8: bit 0 gate/up input, bit 1 down input as two A4 planes
+    strix::core::LayerSet i4_a8_layers;    // STRIX_MMX_FAST_I4_A8_LAYERS: the layers it applies to (unset: all MoE layers)
     bool pf_i4_chain = mmoe::prefill_i4_chain(); // per prompt: prefill_begin sets it from the prompt rows
+    std::size_t i4_min_rows = fast_i4::kMinRows;  // STRIX_MMX_FAST_I4_MIN_ROWS: shorter prompts prefill on EXL3
+    bool pf_i4_rows = true;                       // per prompt: prefill_begin, prompt rows >= i4_min_rows
     struct JitSlot {
         std::uint8_t* pack = nullptr;
         mmoe::I4Layer weights{};   // fixed wq/ws and reusable device svh tables
@@ -757,10 +773,11 @@ struct Engine::Impl {
         }
         pf_inplace = env_flag("STRIX_MM_PFX_INPLACE", false);
         pf_tx_uncached = env_flag("STRIX_MM_PF_TX_UNCACHED", true);  // ON (measurement: exact, send 0.23 -> 0.002 s); =0
-        if (const char* g = std::getenv("STRIX_MM_PF_GROUP"); g != nullptr && *g != '\0') {
-            pf_group = static_cast<unsigned>(std::stoul(g));
-            if (pf_group < 2 || pf_group > 4) throw std::invalid_argument("STRIX_MM_PF_GROUP must be 2..4");
-        }
+        // Default 4 (was 2): the FAST_I4 slots convert a layer once per group, so a 32K prompt pays 2 instead of
+        // 4 conversion episodes per layer (group 4 vs 2: 32K TTFT -5.1 %, bitwise; 8 is not better than 4). The
+        // width is clamped to the prompt's chunk count at run time; an explicit value is honoured as given.
+        pf_group_explicit = std::getenv("STRIX_MM_PF_GROUP") != nullptr && *std::getenv("STRIX_MM_PF_GROUP") != '\0';
+        pf_group = strix::pair::prefill_group::width_from_env(std::getenv("STRIX_MM_PF_GROUP"), "STRIX_MM_PF_GROUP");
         const char* pid = std::getenv("STRIX_MM_PREFILL_IDENTITY");
         fp32_prefill = route::fp32_profile(pid);
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
@@ -771,6 +788,9 @@ struct Engine::Impl {
             if (m == "fast_i4") model_fast_i4 = true;
             else if (m != "exl3") throw std::invalid_argument("STRIX_MMX_MODEL_FORMAT must be exl3 or fast_i4");
         }
+        i4_shadow = env_flag("STRIX_MMX_FAST_I4_SHADOW", false);
+        if (i4_shadow && !model_fast_i4)
+            throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
         if (model_fast_i4) {
             const char* base0 = std::getenv("STRIX_MM_BASELINE");
             const char* why = nullptr;
@@ -780,6 +800,25 @@ struct Engine::Impl {
             else if (!mmoe::iu4_built()) why = "needs a build with the IU4 core (strix_tiled_core)";
             if (why != nullptr) throw std::invalid_argument(std::string("STRIX_MMX_MODEL_FORMAT=fast_i4 ") + why);
             i4_scope = fast_i4::scope(std::getenv("STRIX_MMX_FAST_I4_SCOPE"));
+            {
+                const char* keep = std::getenv("STRIX_MMX_FAST_I4_EXL3_LAYERS");
+                i4_exl3_layers = strix::core::parse_layer_set(keep == nullptr || keep[0] == 0 ? fast_i4::kQualityExl3Layers : keep,
+                                                              kFirstMoe, kLayers, "STRIX_MMX_FAST_I4_EXL3_LAYERS");
+            }
+            {
+                const char* a8 = std::getenv("STRIX_MMX_FAST_I4_A8");
+                const std::string_view s = a8 == nullptr ? "" : a8;
+                if (s.empty() || s == "0") i4_a8 = 0U;
+                else if (s == "gate_up") i4_a8 = 1U;
+                else if (s == "down") i4_a8 = 2U;
+                else if (s == "all") i4_a8 = 3U;
+                else throw std::invalid_argument("STRIX_MMX_FAST_I4_A8 must be 0, gate_up, down or all");
+                if (i4_scope != fast_i4::Scope::all) i4_a8 &= 1U;
+                const char* al = std::getenv("STRIX_MMX_FAST_I4_A8_LAYERS");
+                i4_a8_layers = strix::core::parse_layer_set(al == nullptr || al[0] == 0 ? "!" : al, kFirstMoe, kLayers,
+                                                            "STRIX_MMX_FAST_I4_A8_LAYERS");
+            }
+            i4_min_rows = fast_i4::min_rows(std::getenv("STRIX_MMX_FAST_I4_MIN_ROWS"));
             jit_prefetch = env_flag("STRIX_MMX_FAST_I4_PREFETCH", false);
             jit_stats = env_flag("STRIX_MMX_FAST_I4_STATS", false);
         }
@@ -961,15 +1000,15 @@ struct Engine::Impl {
         if (jit_prefetch) hip_ok(hipStreamCreateWithFlags(&jit_stream, hipStreamNonBlocking), "fast_i4 prefetch stream");
         std::printf("mm rank %u: fast_i4 (identity minimax-fast-i4, lossy): %zu reusable IU4 layer slots, "
                     "%.3f GiB (%zu bytes) including slot tables; source tables %.3f MiB; prefill workspace %.3f GiB; "
-                    "scope %s, prefetch %u; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
+                    "scope %s, prefetch %u, EXL3 layers %u, min rows %zu; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
                     jit.size(), static_cast<double>(jit.size() * pk) / 1073741824.0, jit.size() * pk,
                     static_cast<double>((kLayers - kFirstMoe) * mmoe::i4_source_bytes()) / 1048576.0,
                     static_cast<double>(pf_ws_bytes) / 1073741824.0,
-                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U,
+                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U, i4_exl3_layers.count(), i4_min_rows,
                     static_cast<std::size_t>(opt.capacity), static_cast<std::size_t>(opt.slots));
         std::fflush(stdout);
     }
-    bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers; }
+    bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers && !i4_exl3_layers.test(L); }
     // Timing collection is nonblocking. At prompt completion the existing prefill fence makes
     // every sample available; no host fence is introduced for conversion or prefetch.
     void jit_collect(bool report = false) {
@@ -1103,6 +1142,10 @@ struct Engine::Impl {
             pf_ws_bytes = mmoe::prefill_moe_workspace_bound(opt.max_rows);
             if (model_fast_i4) pf_ws_bytes += mmoe::kI4GroupTableBytes;  // IU4 groups beside gate_up EXL3 down items
             hip_ok(hipMalloc(&pf_ws, pf_ws_bytes), "prefill moe workspace");
+            if (i4_shadow) {
+                i4_shadow_outputs = dalloc<float>(2U * T * kHidden);
+                i4_shadow_sums = dalloc<float>(4);
+            }
         }
         hip_ok(hipEventCreateWithFlags(&routes_ready, hipEventDisableTiming), "route event");
         if (fp32_prefill) {  // FP32 identity workspaces: expert pairs (T x 4 rows) at the widest site
@@ -1130,8 +1173,13 @@ struct Engine::Impl {
         router_scratch = dalloc<float>(moe::hip::router_tiled_scratch_floats(static_cast<std::uint32_t>(T)));  // any router form can be selected later
         part = dalloc<float>(T * kHidden);
         remote = dalloc<float>(T * kHidden);
-        if (pf != nullptr && pf->options().depth < pf_group)
-            throw std::invalid_argument("STRIX_MM_PFX_DEPTH must be >= STRIX_MM_PF_GROUP (slot reuse of the interleaved schedule)");
+        if (pf != nullptr && pf->options().depth < pf_group) {
+            if (pf_group_explicit)
+                throw std::invalid_argument("STRIX_MM_PFX_DEPTH must be >= STRIX_MM_PF_GROUP (slot reuse of the interleaved schedule)");
+            // The default width follows a narrower explicit exchange depth (one TX / RX slot per interleaved chunk).
+            pf_group = strix::pair::prefill_group::width_for_depth(pf_group, pf->options().depth);
+            std::fprintf(stderr, "mm rank %u: prefill group width %u (STRIX_MM_PFX_DEPTH)\n", static_cast<unsigned>(opt.rank), pf_group);
+        }
         if (pf != nullptr || pf_comm_interleave) {  // at start-up: no multi-GB allocation inside a prefill (KFD queue eviction)
             for (unsigned g = 1; g < pf_group; ++g) {
                 grp_h.push_back(dalloc<float>(T * kHidden));
@@ -1577,7 +1625,7 @@ struct Engine::Impl {
         }
         xb_layers = L1;
         xb_prepped = false;
-        const bool i4_on = !gemv && model_fast_i4 && mmoe::prefill_iu4();
+        const bool i4_on = !gemv && model_fast_i4 && pf_i4_rows && mmoe::prefill_iu4();
         if (i4_on) jit_begin();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
@@ -1863,10 +1911,33 @@ struct Engine::Impl {
 
     // Layer L's FFN on hn (after the attention exchange): dense MLP or router-routed experts + shared -> out.
     void stage_ffn(unsigned L, std::size_t n, float* out, const mmoe::I4Layer* prefill_i4 = nullptr) {
+        stage_ffn_impl(L, n, out, prefill_i4);
+        if (!i4_shadow || prefill_i4 == nullptr || !prefill_i4->on()) return;
+        // hn and route_d are read-only. Each enqueue rebuilds its tables and joins
+        // tail-stream work before the next call reuses pf_ws. out is a pure MoE
+        // contribution, before rank exchange / residual add, and stays INT4.
+        float* exact = i4_shadow_outputs;
+        float* fakeq = exact + std::size_t{opt.max_rows} * kHidden;
+        stage_ffn_impl(L, n, exact, nullptr, mmoe::PrefillFakeq::off);
+        hip_ok(strix::core::i4_shadow::reduce(out, exact, n * kHidden, i4_shadow_sums, nullptr), "i4 shadow W4A4");
+        stage_ffn_impl(L, n, fakeq, nullptr, mmoe::PrefillFakeq::on);
+        hip_ok(strix::core::i4_shadow::reduce(fakeq, exact, n * kHidden, i4_shadow_sums + 2, nullptr), "i4 shadow A4");
+        std::array<float, 4> sums{};
+        hip_ok(hipMemcpyAsync(sums.data(), i4_shadow_sums, sizeof(sums), hipMemcpyDeviceToHost, nullptr), "i4 shadow sums");
+        hip_ok(hipStreamSynchronize(nullptr), "i4 shadow sums");
+        if (!task.shadow) throw std::logic_error("i4 shadow: no active prefill task");
+        task.shadow->add(L, n, sums);
+    }
+
+    void stage_ffn_impl(unsigned L, std::size_t n, float* out, const mmoe::I4Layer* prefill_i4,
+                        mmoe::PrefillFakeq fakeq_a4 = mmoe::PrefillFakeq::environment) {
         {
             const bool f32 = fp32_prefill && !gemv;  // FP32 prefill identity
             const Layer& y = layers[L];
             const bool lin_opt = gemv && linears_opt;
+            // W4A8 layers run the unfused IU4 path (two A4 planes per GEMM); every other layer keeps the prompt's chain.
+            const unsigned a8 = prefill_i4 != nullptr && i4_a8_layers.test(L) ? i4_a8 : 0U;
+            const bool i4_chain = pf_i4_chain && a8 == 0U;
             const bool moe_marks = y.moe && moe_opt && !gemv && !f32;
             if (tl && !moe_marks) tl->mark(y.moe ? "moe" : "dense-mlp", true);
             if (!y.moe) {
@@ -1909,7 +1980,7 @@ struct Engine::Impl {
                 f32_jobs_used = 0;
                 lap(prof.route_host);
                 f32_moe(y, n, out);
-            } else if (moe_opt && !pf_table_stats && (prefill_i4 == nullptr || (i4_scope == fast_i4::Scope::all && pf_i4_chain)) && mmoe::prefill_moe_device_plan(static_cast<std::uint32_t>(n))) {
+            } else if (moe_opt && !pf_table_stats && (prefill_i4 == nullptr || (i4_scope == fast_i4::Scope::all && i4_chain)) && mmoe::prefill_moe_device_plan(static_cast<std::uint32_t>(n))) {
                 // prefill, device plan (default): routes stay on the device, the shared moe_core planner builds the
                 // tables on the stream; no host sync per MoE layer. Same bits as the host plan below
                 // (STRIX_MMX_PF_PLAN=host, or profiling / STRIX_MM_PF_TABLE_STATS, which measure the host plan).
@@ -1920,6 +1991,7 @@ struct Engine::Impl {
                 pv.i4 = prefill_i4;
                 pv.i4_all = i4_scope == fast_i4::Scope::all;
                 pv.i4_chain = pf_i4_chain;
+                pv.fakeq_a4 = fakeq_a4;
                 pv.experts = y.experts_raw_d;
                 pv.shared = y.shared_raw;
                 pv.out = out;
@@ -1951,7 +2023,9 @@ struct Engine::Impl {
                 pv.out = out;
                 pv.i4 = prefill_i4;
                 pv.i4_all = i4_scope == fast_i4::Scope::all;
-                pv.i4_chain = pf_i4_chain;
+                pv.i4_chain = i4_chain;
+                pv.i4_a8 = a8;
+                pv.fakeq_a4 = fakeq_a4;
                 // The module markers are host callbacks: record one interval
                 // from its first launch to combine, excluding host planning.
                 struct TimelineMoe {
@@ -2083,6 +2157,7 @@ struct Engine::Impl {
         std::uint64_t output_fnv = 14695981039346656037ULL;
         Engine::PfTaskId id = 0, parent = 0;
         std::uint64_t generation = 0;
+        std::unique_ptr<strix::core::i4_shadow::Accumulator<kLayers>> shadow;
     } task, parked;
     struct ActivationBank { float *h = nullptr, *hn = nullptr, *taps = nullptr; } base_bank, nest_bank;
     bool child_bank = false;
@@ -2104,12 +2179,14 @@ struct Engine::Impl {
         if (task.open) throw std::logic_error("prefill: active task");
         if (slot >= opt.slots || toks.empty() || pos0 + toks.size() > opt.capacity) throw std::invalid_argument("prefill: bad slot / range");
         task = PfTask{};
+        if (i4_shadow) task.shadow = std::make_unique<strix::core::i4_shadow::Accumulator<kLayers>>();
         last_out = {};
         last_result = {};
         task.slot = slot;
         task.toks.assign(toks.begin(), toks.end());
         task.pos0 = pos0;
         pf_i4_chain = mmoe::prefill_i4_chain(toks.size());
+        pf_i4_rows = toks.size() >= i4_min_rows;
         task.chunks = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
         task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
@@ -2206,6 +2283,7 @@ struct Engine::Impl {
                 hip_ok(hipDeviceSynchronize(), "prefill");
                 if (model_fast_i4) jit_collect(true);
                 mmoe::prefill_moe_device_check();  // invalid routes met by a device-planned MoE call (failed exchange)
+                if (task.shadow) task.shadow->print("mm", opt.rank);
                 if (tl) tl->report(opt.rank);
                 tl = nullptr;
                 ++prof.calls;
@@ -2330,8 +2408,8 @@ struct Engine::Impl {
         const std::size_t m = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         float* const h0 = h;
         float* const hn0 = hn;
-        std::array<float*, 4> H{}, HN{}, P{}, R{};
-        std::array<std::size_t, 4> N{};
+        std::array<float*, kPfGroupMax> H{}, HN{}, P{}, R{};
+        std::array<std::size_t, kPfGroupMax> N{};
         auto& fences = pf_fences[child_bank ? 1U : 0U];
         const double pipeline_reuse_before = comm.stats().pipeline_reuse_wait;
         const double host_reuse_before = comm.stats().host_reuse_wait;
@@ -2452,7 +2530,7 @@ struct Engine::Impl {
             embed_rows(toks.data() + c * opt.max_rows, N[c]);
             hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(N[c])), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
         }
-        const bool i4_on = model_fast_i4 && mmoe::prefill_iu4();
+        const bool i4_on = model_fast_i4 && pf_i4_rows && mmoe::prefill_iu4();
         if (i4_on) jit_begin();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
@@ -3073,8 +3151,10 @@ LoaderSnapshot Engine::draft_loader_snapshot() const {
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
 std::uint64_t Engine::prefill_reuse_rows() const {
-    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping.
-    return std::uint64_t{impl_->opt.max_rows} * impl_->pf_group;
+    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping. The alignment stays at
+    // the width the default used to have (2 chunks): a wider group changes the schedule, not the chunk bits
+    // (group 2 and 4 give identical state hashes), and a resumed prefill's first group is already narrower.
+    return std::uint64_t{impl_->opt.max_rows} * std::min(impl_->pf_group, strix::pair::prefill_group::kReuseChunks);
 }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
 const std::uint16_t* Engine::embed_row(std::uint32_t token) const {

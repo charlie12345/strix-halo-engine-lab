@@ -70,6 +70,7 @@
 #include "glm/prefill/glm_pf_path.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/prefill/glm_pf_attn_wmma.hpp"
+#include "attn_core/index_score_mode.hpp"
 #include "glm/spec/glm_spec_host.hpp"
 #include "glm/spec/glm_spec_run.hpp"
 #include "glm/xfer/glm_xfer_exchange.hpp"
@@ -371,6 +372,16 @@ int main(int argc, char** argv) {
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
             throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N or --tf, "
                                         "comm exchange) so both ranks are checked to run the same prefill identity");
+        // FAST indexer scores (STRIX_IDX_WMMA) change the DSA selection: the same agreement rule as glm-pf-wmma-x.
+        const unsigned idx_wmma = strix::attn_core::idx::wmma_mode();
+        if (idx_wmma > strix::attn_core::idx::kModeF16)
+            throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes bf16 or f16 (bf16x2 and exact need BF16 keys)");
+        if (opt.world == 2 && !startup_handshake && idx_wmma != 0)
+            throw std::invalid_argument("STRIX_IDX_WMMA with --world 2 needs the startup agreement (--decode N or --tf, comm exchange) "
+                                        "so both ranks are checked to run the same indexer identity");
+        if (idx_wmma != 0)
+            std::printf("rank %u prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=%s, DSA indexer scores on WMMA)\n", opt.rank,
+                        strix::attn_core::idx::wmma_mode_name(idx_wmma));
         ge::Engine eng(opt, comm.get());
         // STRIX_GLM_MODEL_FORMAT=fast_i4 (glm-fast-i4, lossy): the routed EXL3 weights are replaced, so the exact /
         // reference identities (decode-row reference prefill, reference gates, identity checks) are refused.
@@ -395,7 +406,8 @@ int main(int argc, char** argv) {
                 (eng.decode_xfer_enabled() ? 1U << 10 : 0U) |
                 (strix::glm::pf::wmma_x::enabled() ? rd::kPfWmmaConfig : 0U) |  // FAST prefill identity must match on both ranks
                 (eng.model_fast_i4() ? rd::kFastI4Config : 0U) |                 // and the model format (also in the load vote)
-                (strix::glm::pf::attn_wmma::enabled() ? rd::kPfAttnWmmaConfig : 0U);
+                (strix::glm::pf::attn_wmma::enabled() ? rd::kPfAttnWmmaConfig : 0U) |
+                (idx_wmma << rd::kIdxWmmaShift);                                   // FAST indexer identity, ditto
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
                  static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},

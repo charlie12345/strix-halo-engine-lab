@@ -8,16 +8,19 @@
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm/prefill/glm_pf_attn_wmma.hpp"
 #include "attn_core/sparse_flash_wmma.hpp"
+#include "attn_core/index_score_wmma.hpp"
 
 #include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace strix::glm::pf {
 
 namespace {
+namespace aidx = strix::attn_core::idx;
 
 using dev::DsaSlot;
 using dev::IndexerDev;
@@ -559,6 +562,86 @@ __global__ __launch_bounds__(32 * kIs3Rows) void idx_score_rows_v3_kernel(const 
         if (p < P) keys[static_cast<std::size_t>(r) * cap + (p - pool_begin)] = ordered_key(a2);
     }
 }
+
+// FAST index scores (STRIX_IDX_WMMA=1 bf16 / =f16): adapter of the shared core (src/attn_core/index_score_wmma.hpp).
+// Work-group = 4 rows x 32 index heads (query vector q = row * 32 + head; wave = one row, its two fragments = heads
+// 0..15 / 16..31), key tile = 128 pools. Both FP32 operands are rounded to the operand type; per (row, pool) the
+// epilogue is v3's head chain acc = fmaf(w[h], relu(dot * kInvSqrt128), acc) in the fragment order, then the two
+// 16-lane halves are added. Rows with P_t <= 512 and pools p >= P_t are skipped as in v3; the select is unchanged.
+struct IdxWmmaArgs {
+    const float* pooled;
+    const float* qI;
+    const float* wh;
+    std::uint32_t* keys;
+    unsigned t0, C, cap, pool_begin, pool_end, pool_base;
+};
+template <aidx::Operand O> struct IdxWmmaPolicy {
+    using Args = IdxWmmaArgs;
+    static constexpr aidx::Operand kOp = O;
+    static constexpr unsigned kRows = aidx::kQueries / kIdxHeads;
+    struct Ctx {
+        unsigned r0, pend;  // first row, end of the pools the tile's last row sees in this window
+    };
+    struct State {
+        float w[aidx::kFrags][8];
+        unsigned row, pend;  // this wave's row and its pool end (0 when the row needs no scores)
+    };
+    __device__ static bool begin(const Args& a, Ctx& c) {
+        c.r0 = blockIdx.y * kRows;
+        if (c.r0 >= a.C) return false;
+        const unsigned rlast = (c.r0 + kRows < a.C ? c.r0 + kRows : a.C) - 1;
+        const unsigned pmax = (a.t0 + rlast + 1) / kKpool;
+        c.pend = pmax < a.pool_end ? pmax : a.pool_end;
+        return pmax > kIdxPools && a.pool_begin < c.pend;
+    }
+    __device__ static void stage_queries(const Args& a, const Ctx& c, std::uint16_t* tile) {
+        auto* t4 = reinterpret_cast<uint4*>(tile);
+        for (unsigned e = threadIdx.x; e < aidx::kQueries * aidx::kPieces; e += aidx::kThreads) {
+            const unsigned q = e / aidx::kPieces, piece = e % aidx::kPieces, r = c.r0 + q / kIdxHeads;
+            uint4 v = make_uint4(0U, 0U, 0U, 0U);
+            if (r < a.C) {
+                const float* src = a.qI + (static_cast<std::size_t>(r) * kIdxHeads + q % kIdxHeads) * kIdxDim + piece * 8U;
+                v = aidx::pack8<O>(*reinterpret_cast<const float4*>(src), *reinterpret_cast<const float4*>(src + 4));
+            }
+            t4[aidx::piece_slot(q, piece)] = v;
+        }
+    }
+    __device__ static void init(const Args& a, const Ctx& c, State& st) {
+        const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
+        st.row = c.r0 + wave;
+        const unsigned P = (a.t0 + st.row + 1) / kKpool;
+        st.pend = st.row < a.C && P > kIdxPools ? (P < a.pool_end ? P : a.pool_end) : 0U;
+#pragma unroll
+        for (unsigned f = 0; f < aidx::kFrags; ++f)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e)
+                st.w[f][e] = st.row < a.C ? a.wh[static_cast<std::size_t>(st.row) * kIdxHeads + f * 16U + 2U * e + lane / 16U] : 0.0F;
+    }
+    __device__ static unsigned tiles(const Args& a, const Ctx&) { return (a.pool_end - a.pool_begin + aidx::kKeys - 1) / aidx::kKeys; }
+    __device__ static bool live(const Args& a, const Ctx& c, unsigned kt) { return a.pool_begin + kt * aidx::kKeys < c.pend; }
+    __device__ static uint4 key_piece(const Args& a, const Ctx& c, unsigned kt, unsigned key, unsigned piece) {
+        const unsigned p = a.pool_begin + kt * aidx::kKeys + key;
+        if (p >= c.pend) return make_uint4(0U, 0U, 0U, 0U);
+        const float* src = a.pooled + static_cast<std::size_t>(p - a.pool_base) * kIdxDim + piece * 8U;
+        return aidx::pack8<O>(*reinterpret_cast<const float4*>(src), *reinterpret_cast<const float4*>(src + 4));
+    }
+    __device__ static void tile_begin(const Args&, const Ctx&, State&, unsigned) {}
+    __device__ static void fragment(const Args& a, const Ctx&, State& st, unsigned kt, unsigned kf, const aidx::Acc (&acc)[aidx::kFrags]) {
+        float sum = 0.0F;
+#pragma unroll
+        for (unsigned f = 0; f < aidx::kFrags; ++f)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                const float sc = acc[f][e] * kInvSqrt128;
+                sum = __builtin_fmaf(st.w[f][e], sc > 0.0F ? sc : 0.0F, sum);
+            }
+        sum = sum + __shfl_xor(sum, 16, 32);
+        const unsigned lane = threadIdx.x % 32U, p = a.pool_begin + kt * aidx::kKeys + kf * 16U + lane;
+        if (lane < 16U && p < st.pend) a.keys[static_cast<std::size_t>(st.row) * a.cap + (p - a.pool_begin)] = ordered_key(sum);
+    }
+    __device__ static void tile_end(const Args&, const Ctx&, State&, unsigned) {}
+};
+static_assert(aidx::kQueries % kIdxHeads == 0);
 
 // idx_select_kernel per row (blockIdx.x = row, t = t0 + row). P <= 512: every pool is selected, the list is 0 .. t.
 __global__ __launch_bounds__(1024) void idx_select_rows_kernel(const std::uint32_t* keys_all, unsigned cap, unsigned t0,
@@ -2788,6 +2871,46 @@ void indexer_select_rows(const DsaSlot& slot, unsigned t0, const float* qI, floa
 }
 
 
+namespace {
+// FAST WMMA index scores for pools [pool_begin, pool_end) (keys at p - pool_begin); STRIX_IDX_WMMA_AUDIT=1 also
+// rescores with v3 into scratch and compares each row's top-512 pool set (diagnostic, synchronous).
+void idx_score_wmma(unsigned mode, const float* pooled, unsigned t0, unsigned C, const float* qI, const float* wh,
+                    std::uint32_t* keys, unsigned cap, unsigned pool_begin, unsigned pool_end, unsigned pool_base, hipStream_t s) {
+    using P16 = IdxWmmaPolicy<aidx::Operand::f16>;
+    using PB = IdxWmmaPolicy<aidx::Operand::bf16>;
+    const IdxWmmaArgs a{pooled, qI, wh, keys, t0, C, cap, pool_begin, pool_end, pool_base};
+    const unsigned tiles = (pool_end - pool_begin + aidx::kKeys - 1) / aidx::kKeys, groups = (C + PB::kRows - 1) / PB::kRows;
+    if (groups > 65535U) throw std::invalid_argument("glm pf idx wmma: too many rows");
+    if (mode > aidx::kModeF16) throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes bf16 or f16 (bf16x2 and exact need BF16 keys)");
+    if (mode == static_cast<unsigned>(aidx::Operand::f16)) aidx::launch<P16>(a, aidx::wmma_split(tiles), groups, s);
+    else aidx::launch<PB>(a, aidx::wmma_split(tiles), groups, s);
+    ok(hipGetLastError(), "glm pf idx wmma");
+    if (!aidx::audit_enabled()) return;
+    static aidx::Audit audit;
+    static unsigned calls = 0;
+    const unsigned pools = pool_end - pool_begin;
+    const std::size_t n = std::size_t{C - 1} * cap + pools;  // the keys of the last row end at its pool count
+    std::uint32_t* exact = nullptr;
+    ok(hipMalloc(&exact, n * sizeof(std::uint32_t)), "glm idx audit alloc");
+    idx_score_rows_v3_kernel<<<dim3((pools + kIs3Pools - 1) / kIs3Pools, (C + kIs3Rows - 1) / kIs3Rows), 32 * kIs3Rows, 0, s>>>(
+        pooled, t0, C, qI, wh, exact, cap, pool_begin, pool_base);
+    ok(hipGetLastError(), "glm idx audit exact");
+    std::vector<std::uint32_t> ea(n), fb(n);
+    ok(hipStreamSynchronize(s), "glm idx audit sync");
+    ok(hipMemcpy(ea.data(), exact, n * sizeof(std::uint32_t), hipMemcpyDeviceToHost), "glm idx audit copy exact");
+    ok(hipMemcpy(fb.data(), keys, n * sizeof(std::uint32_t), hipMemcpyDeviceToHost), "glm idx audit copy fast");
+    ok(hipFree(exact), "glm idx audit free");
+    for (unsigned r = 0; r < C; ++r) {
+        const unsigned P = (t0 + r + 1) / kKpool;
+        if (P <= kIdxPools) continue;
+        const unsigned end = (P < pool_end ? P : pool_end) - pool_begin;
+        audit.add(ea.data() + std::size_t{r} * cap, fb.data() + std::size_t{r} * cap, end, kIdxPools,
+                  [](std::size_t) { return true; });
+    }
+    std::fprintf(stderr, "%s (call %u)\n", audit.line("glm").c_str(), ++calls);
+}
+}  // namespace
+
 void indexer_select_rows_bounded(const DsaSlot& slot, unsigned t0, const float* qI, float* wh, std::uint32_t* keys,
                                  std::uint32_t* tokens, std::uint32_t* n, unsigned C, hipStream_t s, unsigned score_v,
                                  const std::function<const float*(unsigned, unsigned)>& pool_window) {
@@ -2818,7 +2941,9 @@ void indexer_select_rows_bounded(const DsaSlot& slot, unsigned t0, const float* 
             const float* pooled = pool_window ? pool_window(begin, pools) : slot.pooled;
             const unsigned base = pool_window ? begin : 0U;
             auto* out = keys + kIdxPools;
-            if (score_v == 1)
+            if (const unsigned wm = aidx::wmma_mode(); wm != 0)
+                idx_score_wmma(wm, pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, begin + pools, base, s);
+            else if (score_v == 1)
                 idx_score_rows_kernel<<<dim3((pools + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
                     pooled, t0, C, qI, wh, out, kIndexerKeyStride, begin, base);
             else if (score_v == 3)
@@ -2848,7 +2973,9 @@ void indexer_select_rows_versions(const DsaSlot& slot, unsigned t0, const float*
     if (Pmax > kIdxPools) {
         scale_kernel<<<(C * kIdxHeads + 255) / 256, 256, 0, s>>>(wh, C * kIdxHeads, kInvSqrt32);
         ok(hipGetLastError(), "glm pf scale");
-        if (score_v == 1)
+        if (const unsigned wm = aidx::wmma_mode(); wm != 0)
+            idx_score_wmma(wm, slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0, Pmax, 0, s);
+        else if (score_v == 1)
             idx_score_rows_kernel<<<dim3((Pmax + 127) / 128, (C + kScoreRows - 1) / kScoreRows), 128, 0, s>>>(
                 slot.pooled, t0, C, qI, wh, keys, kpool_cap, 0);
         else if (score_v == 3)

@@ -135,6 +135,7 @@ struct DraftHeadRows {
     Partial* partials[max_batch];
     std::uint32_t* slots[max_batch];
     Reply* reply[max_batch];
+    std::uint32_t* done[max_batch];
 };
 template<unsigned Count>
 __global__ __launch_bounds__(256) void draft_q4_head_shared(DraftHeadRows h,std::uint32_t blocks,std::uint32_t shared) {
@@ -251,6 +252,7 @@ struct HipMtpDraftHead::Impl {
     std::uint32_t* host_ids=nullptr;
     float* logits=nullptr;
     Partial* partials=nullptr;
+    std::uint32_t* done=nullptr; // argmax ticket: the last block to finish folds the partials
     std::uint32_t* slots=nullptr;
     Reply* reply=nullptr;
     Reply* device_reply=nullptr;
@@ -303,24 +305,26 @@ HipMtpDraftHead::HipMtpDraftHead(const void* q8_head,HipMtpDraftHeadConfig confi
     try {
         p.logits=p.device<float>(p.capacity);
         p.partials=p.device<Partial>((p.capacity-1U)/threads+1U);
+        p.done=p.device<std::uint32_t>(1);
+        hip_check(hipMemsetAsync(p.done,0,sizeof(std::uint32_t),p.stream),"MTP draft argmax ticket init");
         p.slots=p.device<std::uint32_t>(max_slots);
-        check(hipMemsetAsync(p.slots,0,max_slots*sizeof(std::uint32_t),p.stream),"MTP draft slot init");
-        check(hipHostMalloc(reinterpret_cast<void**>(&p.reply),sizeof(Reply),hipHostMallocMapped|hipHostMallocCoherent),"MTP draft mapped reply");
-        check(hipHostGetDevicePointer(reinterpret_cast<void**>(&p.device_reply),p.reply,0),"MTP draft mapped reply view");
+        hip_check(hipMemsetAsync(p.slots,0,max_slots*sizeof(std::uint32_t),p.stream),"MTP draft slot init");
+        hip_check(hipHostMalloc(reinterpret_cast<void**>(&p.reply),sizeof(Reply),hipHostMallocMapped|hipHostMallocCoherent),"MTP draft mapped reply");
+        hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&p.device_reply),p.reply,0),"MTP draft mapped reply view");
         *p.reply=Reply{};
         if(!p.config.full) {
             p.seen.assign(p.config.vocab_size,0U);
             p.compact=p.device<std::uint8_t>(static_cast<std::uint64_t>(p.capacity)*(p.config.q4?p.config.hidden_size/32U*18U:p.row_bytes));
             p.ids=p.device<std::uint32_t>(p.capacity);
-            check(hipHostMalloc(reinterpret_cast<void**>(&p.host_ids),p.capacity*sizeof(std::uint32_t),hipHostMallocDefault),"MTP draft pinned ids");
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&p.host_ids),p.capacity*sizeof(std::uint32_t),hipHostMallocDefault),"MTP draft pinned ids");
             p.base_rows=p.admit(p.config.base_tokens,static_cast<std::uint32_t>(p.config.base_tokens.size()));
             p.context_dropped=0;
             require(p.base_rows || p.config.context_capacity,"MTP draft base vocabulary has no valid id");
         }
         if(const char* v=std::getenv("STRIX_MTP_DRAFT_TOP2");v && v[0]!='0')
-            check(hipHostMalloc(reinterpret_cast<void**>(&p.runner_logits),static_cast<std::size_t>(max_slots)*p.capacity*sizeof(float),
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&p.runner_logits),static_cast<std::size_t>(max_slots)*p.capacity*sizeof(float),
                 hipHostMallocDefault),"MTP draft runner-up logits");
-        check(hipStreamSynchronize(p.stream),"MTP draft head setup");
+        hip_check(hipStreamSynchronize(p.stream),"MTP draft head setup");
     } catch(...) {impl_.reset();throw;}
 }
 HipMtpDraftHead::~HipMtpDraftHead()=default;
@@ -334,24 +338,20 @@ void HipMtpDraftHead::launch(const std::uint16_t* hidden,std::uint32_t step,void
     require(step<p.config.max_depth && stream==p.stream && p.rows,"MTP draft head step/stream is invalid");
     if(p.config.q4) {
         hipLaunchKernelGGL(draft_q4_head,dim3((p.rows+7U)/8U),dim3(256),0,p.stream,hidden,p.compact,p.config.hidden_size/32U,p.rows,p.logits);
-        check(hipGetLastError(),"MTP draft Q4 head");
+        hip_check(hipGetLastError(),"MTP draft Q4 head");
     } else launch_hip_q8_head_rows(hidden,p.config.full?static_cast<const void*>(p.head):p.compact,p.config.hidden_size,p.rows,p.logits,stream);
     if(p.runner_logits) {
         p.runner_rows[step]=p.rows;
-        check(hipMemcpyAsync(p.runner_logits+static_cast<std::uint64_t>(step)*p.capacity,p.logits,p.rows*sizeof(float),
+        hip_check(hipMemcpyAsync(p.runner_logits+static_cast<std::uint64_t>(step)*p.capacity,p.logits,p.rows*sizeof(float),
             hipMemcpyDeviceToHost,p.stream),"MTP draft runner-up logits copy");
     }
     const auto blocks=(p.rows-1U)/threads+1U;
-    if(p.config.runner_up) {
-        hipLaunchKernelGGL(draft_argmax_partials<true>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials);
-        check(hipGetLastError(),"MTP draft argmax partials");
-        hipLaunchKernelGGL(draft_argmax_finish<true>,dim3(1),dim3(threads),0,p.stream,p.partials,blocks,step,p.slots,p.device_reply);
-    } else {
-        hipLaunchKernelGGL(draft_argmax_partials<false>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials);
-        check(hipGetLastError(),"MTP draft argmax partials");
-        hipLaunchKernelGGL(draft_argmax_finish<false>,dim3(1),dim3(threads),0,p.stream,p.partials,blocks,step,p.slots,p.device_reply);
-    }
-    check(hipGetLastError(),"MTP draft argmax finish");
+    // One launch: every block writes its partial, the last block to take the ticket folds them.
+    if(p.config.runner_up)
+        hipLaunchKernelGGL(draft_argmax<true>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials,p.done,step,p.slots,p.device_reply);
+    else
+        hipLaunchKernelGGL(draft_argmax<false>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials,p.done,step,p.slots,p.device_reply);
+    hip_check(hipGetLastError(),"MTP draft argmax");
 }
 std::uint32_t HipMtpDraftHead::shared_rows(std::span<HipMtpDraftHead* const> heads) {
     require(!heads.empty() && heads.size()<=max_batch,"MTP draft head batch size is invalid");
@@ -378,7 +378,7 @@ void HipMtpDraftHead::launch_rows(std::span<HipMtpDraftHead* const> heads,std::s
             p.config.hidden_size==a.config.hidden_size && p.config.runner_up==a.config.runner_up && shared<=p.rows && hidden[t],
             "MTP draft head batch member is incompatible");
         h.hidden[t]=hidden[t];h.compact[t]=p.compact;h.logits[t]=p.logits;h.rows[t]=p.rows;h.ids[t]=p.ids;
-        h.partials[t]=p.partials;h.slots[t]=p.slots;h.reply[t]=p.device_reply;
+        h.partials[t]=p.partials;h.done[t]=p.done;h.slots[t]=p.slots;h.reply[t]=p.device_reply;
         tail_blocks=std::max(tail_blocks,(p.rows-shared+7U)/8U);partial_blocks=std::max(partial_blocks,(p.rows-1U)/threads+1U);
     }
     const auto s=static_cast<hipStream_t>(stream);const auto n=static_cast<unsigned>(heads.size());
@@ -395,22 +395,17 @@ void HipMtpDraftHead::launch_rows(std::span<HipMtpDraftHead* const> heads,std::s
         case 7:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<7U>),grid,dim3(256),0,s,h,blocks,shared);break;
         default:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<8U>),grid,dim3(256),0,s,h,blocks,shared);break;
         }
-        check(hipGetLastError(),"MTP draft Q4 head batch (shared rows)");
+        hip_check(hipGetLastError(),"MTP draft Q4 head batch (shared rows)");
     }
     if(tail_blocks) {
         hipLaunchKernelGGL(draft_q4_head_tails,dim3(tail_blocks,n),dim3(256),0,s,h,blocks,shared);
-        check(hipGetLastError(),"MTP draft Q4 head batch (own rows)");
+        hip_check(hipGetLastError(),"MTP draft Q4 head batch (own rows)");
     }
-    if(a.config.runner_up) {
-        hipLaunchKernelGGL(draft_argmax_partials_rows<true>,dim3(partial_blocks,n),dim3(threads),0,s,h);
-        check(hipGetLastError(),"MTP draft argmax partials batch");
-        hipLaunchKernelGGL(draft_argmax_finish_rows<true>,dim3(1,n),dim3(threads),0,s,h,step);
-    } else {
-        hipLaunchKernelGGL(draft_argmax_partials_rows<false>,dim3(partial_blocks,n),dim3(threads),0,s,h);
-        check(hipGetLastError(),"MTP draft argmax partials batch");
-        hipLaunchKernelGGL(draft_argmax_finish_rows<false>,dim3(1,n),dim3(threads),0,s,h,step);
-    }
-    check(hipGetLastError(),"MTP draft argmax finish batch");
+    if(a.config.runner_up)
+        hipLaunchKernelGGL(draft_argmax_rows<true>,dim3(partial_blocks,n),dim3(threads),0,s,h,step);
+    else
+        hipLaunchKernelGGL(draft_argmax_rows<false>,dim3(partial_blocks,n),dim3(threads),0,s,h,step);
+    hip_check(hipGetLastError(),"MTP draft argmax batch");
 }
 const std::uint32_t* HipMtpDraftHead::device_token(std::uint32_t step) const {
     require(step<impl_->config.max_depth,"MTP draft token slot is invalid");return impl_->slots+step;

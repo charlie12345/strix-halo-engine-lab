@@ -44,7 +44,7 @@ int socket_option(TestSocket fd,int level,int option,const void* value,socklen_t
 }
 struct SocketRuntime {};
 #endif
-void set_receive_timeout(TestSocket fd,unsigned seconds) {
+[[maybe_unused]] void set_receive_timeout(TestSocket fd,unsigned seconds) {
 #ifdef _WIN32
     const DWORD timeout=seconds*1000;
 #else

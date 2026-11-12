@@ -1,5 +1,8 @@
 #include "strix/serve/json_constraint.hpp"
 
+#include <memory>
+#include <thread>
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1372,7 +1375,168 @@ void literal_reference_chain() {
     }
 }
 
-int main() {
+// The shared program cache: one program per (schema, limits), masks equal to a per-request compilation,
+// bounded, errors not kept, one compilation for concurrent identical requests.
+void program_cache() {
+    const char* text = R"({"type":"object","properties":{"name":{"type":"string","maxLength":40},"kind":{"enum":["alpha","beta","gamma"]},
+        "count":{"type":"integer"},"tags":{"type":"array","items":{"type":"string","maxLength":12},"maxItems":4},
+        "nested":{"type":"object","properties":{"ok":{"type":"boolean"},"score":{"type":"number"}},"required":["ok"],"additionalProperties":false}},
+        "required":["name","kind"],"additionalProperties":false})";
+    const Json spec = parse_json(text);
+    std::vector<std::string> vocabulary;
+    for (unsigned byte = 0; byte < 256; ++byte) vocabulary.emplace_back(1, static_cast<char>(byte));
+    for (const char* piece : {"{\"", "\":", "\",\"", "name", "kind", "alpha", "true", "false", "},", "\"}"}) vocabulary.emplace_back(piece);
+    const TokenByteTrie trie(vocabulary), other(vocabulary);
+    const std::vector<std::uint32_t> eos{static_cast<std::uint32_t>(vocabulary.size() - 1U)};
+    {
+        ConstraintProgramCache cache;
+        const auto a = cache.json_schema(spec), b = cache.json_schema(parse_json(text));
+        check(a && a == b, "same schema shares one program");
+        ConstraintLimits tighter; tighter.max_output_bytes = 4096;
+        const auto c = cache.json_schema(spec, tighter);
+        check(c != a && cache.json_schema(spec, tighter) == c, "limits are part of the key");
+        const auto reordered = cache.json_schema(parse_json(R"({"additionalProperties":false,"type":"object"})"));
+        const auto ordered = cache.json_schema(parse_json(R"({"type":"object","additionalProperties":false})"));
+        check(reordered != ordered, "member order is part of the key");
+        check(cache.json_object() == cache.json_object(), "json_object shares one program");
+        auto stats = cache.stats();
+        check(stats.misses == 5 && stats.hits == 3 && stats.programs == 5 && stats.failures == 0, "program cache counts");
+        // Masks: the shared program (mask memo on, second pass served from it) against a compilation per request.
+        const auto plain = compile_json_schema(spec);
+        std::size_t masks = 0;
+        const std::vector<std::string> prefixes{"", "{", "{\"", "{\"name", "{\"name\":", "{\"name\":\"", "{\"name\":\"a", "{\"name\":\"a\",",
+            "{\"kind\":\"", "{\"kind\":\"al", "{\"kind\":\"alpha\",\"name\":\"x\"", "{\"kind\":\"beta\",\"name\":\"x\",\"count\":1",
+            "{\"name\":\"x\",\"kind\":\"gamma\",\"tags\":[", "{\"name\":\"x\",\"kind\":\"gamma\",\"tags\":[\"a\",",
+            "{\"name\":\"x\",\"kind\":\"gamma\",\"nested\":{\"ok\":tr", "{\"name\":\"x\",\"kind\":\"gamma\"}"};
+        for (int pass = 0; pass < 3; ++pass)
+            for (const auto& prefix : prefixes)
+                for (const TokenByteTrie* t : {&trie, &other})
+                    for (const std::vector<std::uint32_t>& stop : {std::vector<std::uint32_t>{}, eos}) {
+                        const auto shared = prefix.empty() ? ConstraintCursor(*a) : advance_token(ConstraintCursor(*a), prefix);
+                        const auto fresh = prefix.empty() ? ConstraintCursor(plain) : advance_token(ConstraintCursor(plain), prefix);
+                        check(allowed(*a, shared, *t, stop).words == allowed(plain, fresh, *t, stop).words, "shared program mask differs");
+                        check(shared.complete() == fresh.complete(), "shared program completion differs");
+                        ++masks;
+                    }
+        // Cursors of two requests on one program do not see each other.
+        ConstraintCursor first(*a), second(*a);
+        first = advance_token(first, "{\"name\":\"a\"");
+        check(allowed(*a, second, trie).words == allowed(plain, ConstraintCursor(plain), trie).words, "cursor state leaked between requests");
+        // A schema that does not compile throws the compiler's error every time and leaves no entry.
+        const Json invalid = parse_json(R"({"type":"object","properties":{"a":{"$ref":"#/$defs/missing"}}})");
+        for (int i = 0; i < 2; ++i) {
+            bool threw = false;
+            try { (void)cache.json_schema(invalid); } catch (const SchemaError&) { threw = true; }
+            check(threw, "invalid schema must throw SchemaError");
+        }
+        stats = cache.stats();
+        check(stats.failures == 2 && stats.programs == 5, "failed compilation was kept");
+        cache.clear();
+        check(cache.stats().programs == 0 && cache.json_schema(spec) != a, "clear drops entries");
+        check(allowed(*a, ConstraintCursor(*a), trie).words == allowed(plain, ConstraintCursor(plain), trie).words, "held program after clear");
+        std::cout << "program cache masks=" << masks << " (two tries, EOS overlay, three passes)\n";
+    }
+    {
+        ConstraintProgramCacheConfig small; small.max_programs = 3;
+        ConstraintProgramCache cache(small);
+        std::vector<std::shared_ptr<const ConstraintProgram>> held;
+        for (int i = 0; i < 5; ++i) held.push_back(cache.json_schema(parse_json("{\"const\":" + std::to_string(i) + "}")));
+        auto stats = cache.stats();
+        check(stats.programs == 3 && stats.evictions == 2, "entry bound");
+        check(cache.json_schema(parse_json("{\"const\":4}")) == held[4] && cache.json_schema(parse_json("{\"const\":0}")) != held[0], "least recently used leaves first");
+        check(accepts(*held[0], "0") && !accepts(*held[0], "1"), "evicted program still valid for its holder");
+        ConstraintProgramCacheConfig off; off.max_programs = 0;
+        ConstraintProgramCache none(off);
+        check(none.json_schema(spec) != none.json_schema(spec) && none.stats().uncached == 2 && none.stats().programs == 0, "sharing off");
+        ConstraintProgramCacheConfig narrow; narrow.key_bytes = 256;
+        ConstraintProgramCache bypass(narrow);
+        check(bypass.json_schema(spec) != bypass.json_schema(spec) && bypass.stats().uncached == 2, "oversized schema text bypasses the cache");
+        ConstraintLimits tiny; tiny.schema_bytes = 8;
+        bool refused = false;
+        try { (void)bypass.json_schema(spec, tiny); } catch (const SchemaError&) { refused = true; }
+        check(refused, "schema size limit applies before the cache");
+    }
+    {
+        // Eight requests for one new schema at once: one compilation, one program.
+        ConstraintProgramCache cache;
+        std::vector<std::shared_ptr<const ConstraintProgram>> got(8);
+        std::vector<std::thread> threads;
+        std::atomic<int> ready{0};
+        for (std::size_t i = 0; i < got.size(); ++i)
+            threads.emplace_back([&, i] {
+                ++ready;
+                while (ready.load() < 8) std::this_thread::yield();
+                got[i] = cache.json_schema(spec);
+                (void)allowed(*got[i], ConstraintCursor(*got[i]), trie, eos); // the mask memo under concurrent use
+            });
+        for (auto& thread : threads) thread.join();
+        const auto stats = cache.stats();
+        bool same = true;
+        for (const auto& program : got) same = same && program == got[0];
+        check(same && stats.misses == 1 && stats.hits + stats.joined == 7, "concurrent identical requests compiled more than once");
+    }
+}
+// --bench-program-cache: compile + cursor + first mask per request for repeated identical-schema requests,
+// per request (previous) against the shared cache, with a 151000-token vocabulary. Not a test.
+int program_cache_bench() {
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    std::vector<std::string> bytes; bytes.reserve(151000);
+    for (unsigned i = 0; i < 151000; ++i) {
+        switch (i % 4) {
+        case 0: bytes.push_back(std::to_string(i)); break;
+        case 1: bytes.push_back(" word" + std::to_string(i)); break;
+        case 2: bytes.push_back("\"key" + std::to_string(i) + "\":"); break;
+        default: bytes.push_back(i < 1024 ? std::string(1, static_cast<char>(i / 4)) : "}" + std::to_string(i)); break;
+        }
+    }
+    const TokenByteTrie trie(bytes);
+    Json properties = Json::object(), required = Json::array();
+    for (unsigned i = 0; i < 24; ++i) {
+        const std::string name = "field_" + std::to_string(i);
+        properties.set(name, parse_json(i % 3 == 0 ? R"({"type":"string","maxLength":64})"
+                                        : i % 3 == 1 ? R"({"enum":["low","medium","high","critical"]})"
+                                                     : R"({"type":"object","properties":{"id":{"type":"integer"},"ok":{"type":"boolean"}},"required":["id"],"additionalProperties":false})"));
+        if (i % 2 == 0) required.push(Json(name));
+    }
+    Json spec = Json::object();
+    spec.set("type", Json("object")); spec.set("properties", properties); spec.set("required", required); spec.set("additionalProperties", Json(false));
+    const std::vector<std::uint32_t> eos{7};
+    constexpr int requests = 20;
+    bool identical = true;
+    std::vector<std::uint64_t> reference, string_reference;
+    for (const bool shared : {false, true, false, true}) {
+        ConstraintProgramCache cache;
+        double compile_first = 0, mask_first = 0, string_first = 0, compile_rest = 0, mask_rest = 0, string_rest = 0;
+        for (int request = 0; request < requests; ++request) {
+            const auto begin = Clock::now();
+            const std::shared_ptr<const ConstraintProgram> program =
+                shared ? cache.json_schema(spec) : std::make_shared<const ConstraintProgram>(compile_json_schema(spec));
+            const auto compiled = Clock::now();
+            const auto mask = allowed(*program, ConstraintCursor(*program), trie, eos);
+            const auto done = Clock::now();
+            // The first mask inside a string value: the state whose walk visits most of the vocabulary.
+            const auto in_string = allowed(*program, advance_token(ConstraintCursor(*program), "{\"field_0\":\""), trie, eos);
+            const auto string_done = Clock::now();
+            if (reference.empty()) { reference = mask.words; string_reference = in_string.words; }
+            identical = identical && mask.words == reference && in_string.words == string_reference;
+            (request == 0 ? string_first : string_rest) += ms(string_done - done);
+            (request == 0 ? compile_first : compile_rest) += ms(compiled - begin);
+            (request == 0 ? mask_first : mask_rest) += ms(done - compiled);
+        }
+        const auto stats = cache.stats();
+        std::cout << "program cache bench " << (shared ? "shared     " : "per-request") << " schema_bytes " << spec.dump().size()
+                  << " request1 compile_ms " << compile_first << " first_mask_ms " << mask_first << " string_mask_ms " << string_first
+                  << " | requests2.." << requests << " mean compile_ms " << compile_rest / (requests - 1) << " first_mask_ms "
+                  << mask_rest / (requests - 1) << " string_mask_ms " << string_rest / (requests - 1) << " total_ms "
+                  << (compile_rest + mask_rest + string_rest) / (requests - 1) << " | hits " << stats.hits << " misses " << stats.misses << '\n';
+    }
+    std::cout << "first and string-state masks " << (identical ? "identical" : "DIFFER") << " in every arm\n";
+    return identical ? 0 : 1;
+}
+int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--bench-program-cache") return program_cache_bench();
+    program_cache();
     branching_expansion(); literal_reference_chain(); adversarial_compilation(); profile(); language(); tokens(); raw_oracle(); random_walks(); equivalence(); limits(); productivity(); exhaustive_lexemes(); cache_exactness(); benchmark();
     std::cout << "json constraint tests: " << failures << " failures\n"; return failures ? 1 : 0;
 }

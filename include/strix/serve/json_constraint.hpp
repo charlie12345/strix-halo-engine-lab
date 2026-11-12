@@ -66,6 +66,56 @@ private:
 // states with additional names or oversized keys bypass it. It defaults off.
 ConstraintProgram compile_json_schema(const Json&, const ConstraintLimits& = {}, ConstraintCompilationStats* = nullptr);
 ConstraintProgram compile_json_object();
+
+// Programs shared between requests. A compiled program is immutable and does not depend on the request, so
+// requests with the same schema and limits share one: the schema is compiled once, and the masks of the
+// program's bounded mask memo (exact serialized cursor state plus the identity of the token trie, see
+// walk rules above) are reused by every request that reaches the same state with the same tokenizer.
+// Per-request state (cursor, output budget, EOS overlay) stays with the request.
+//   key    : semantics_version, every field of the limits, and Json::dump() of the schema, compared in full
+//            (a hash only selects the bucket). Two schemas that differ in member order are two entries.
+//   bound  : at most max_programs entries and key_bytes of retained schema text, least recently used out
+//            first; each cached program has a mask memo of mask_cache_bytes unless the caller's limits
+//            name their own. A schema whose text exceeds a quarter of key_bytes is compiled and not kept.
+//   errors : a failed compilation throws what compile_json_schema() throws and is not kept.
+// Concurrent requests for a schema that is being compiled wait for that one compilation.
+struct ConstraintProgramCacheConfig {
+    std::size_t max_programs = 16;            // 0: no sharing, every call compiles (previous behaviour)
+    std::size_t key_bytes = 4U << 20U;
+    std::size_t mask_cache_bytes = 8U << 20U; // per cached program; 0 leaves the mask memo off
+};
+struct ConstraintProgramCacheStats {
+    std::uint64_t hits = 0;       // served from a finished entry
+    std::uint64_t joined = 0;     // waited for a compilation another request had started
+    std::uint64_t misses = 0;     // compiled here
+    std::uint64_t failures = 0;   // compilations that threw
+    std::uint64_t evictions = 0;
+    std::uint64_t uncached = 0;   // compiled without an entry (sharing off or schema text too large)
+    std::uint64_t compile_ns = 0; // time in compile_json_schema() over all misses
+    std::size_t programs = 0, key_bytes = 0;
+};
+class ConstraintProgramCache {
+public:
+    // Part of every key: raise it with any change to what a schema compiles to.
+    static constexpr std::uint32_t semantics_version = 1;
+    explicit ConstraintProgramCache(ConstraintProgramCacheConfig = {});
+    ~ConstraintProgramCache();
+    ConstraintProgramCache(const ConstraintProgramCache&) = delete;
+    ConstraintProgramCache& operator=(const ConstraintProgramCache&) = delete;
+    std::shared_ptr<const ConstraintProgram> json_schema(const Json& schema, const ConstraintLimits& limits = {});
+    std::shared_ptr<const ConstraintProgram> json_object();
+    ConstraintProgramCacheStats stats() const;
+    const ConstraintProgramCacheConfig& config() const;
+    void clear(); // drops finished entries; requests keep the programs they hold
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+// The process-wide cache used by the serving layer of every engine.
+//   STRIX_CONSTRAINT_PROGRAM_CACHE=0        compile per request (previous behaviour)
+//   STRIX_CONSTRAINT_MASK_MEMO_BYTES=8M     mask memo of each cached program; 0 turns the memo off
+ConstraintProgramCache& shared_constraint_program_cache();
+
 class ConstraintCursor {
 public:
     explicit ConstraintCursor(const ConstraintProgram&);

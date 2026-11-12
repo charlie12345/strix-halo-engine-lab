@@ -769,13 +769,13 @@ struct ApiService::Impl {
         if (!envelope || !envelope->is_object()) bad(prefix, "json_schema must be an object");
         if (const auto* strict = envelope->find("strict"); strict && !strict->is_bool()) bad(prefix + ".strict", "strict must be a boolean");
         try {
-            if (kind == "json_object") spec->program = std::make_shared<ConstraintProgram>(compile_json_object());
+            if (kind == "json_object") spec->program = shared_constraint_program_cache().json_object();
             else {
                 const auto* name = envelope->find("name");
                 if (!name || !name->is_string() || name->as_string().empty()) bad(prefix + ".name", "name must be a nonempty string");
                 const auto* schema = envelope->find("schema");
                 if (!schema) bad(prefix + ".schema", "schema is required");
-                spec->program = std::make_shared<ConstraintProgram>(compile_json_schema(*schema));
+                spec->program = shared_constraint_program_cache().json_schema(*schema);
             }
         } catch (const SchemaError& e) {
             throw ApiError(400, "invalid_request_error", e.what(), prefix + ".schema" + (e.path.empty() ? "" : "." + e.path),

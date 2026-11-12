@@ -3796,6 +3796,22 @@ Fuse exchange reduction and its dependent boundary work.
 - **Measured gain:** Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise
 - **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
 
+<a id="glm-xfer-producer-publish"></a>
+
+### Producer exchange publish (GLM decode)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_XB_PUBLISH`. **Default:** 1.
+
+The kernel that stores the last bytes of a rank's exchanged partial (the attention output projection and the MoE down kernel) writes it straight into the exchange TX slot and raises the TX flag itself, through the shared helper `include/strix/pair/producer_publish.hpp`. The copy-and-publish launch between the producer and the post-exchange kernel is gone, and the latency-bound exchange starts at the end of the producer instead of one launch later (about 8 us per exchange in a kernel trace, 90 exchanges per token).
+
+- **Preconditions:** Pair decode and speculative verify rows on the Xfer exchange with the fused boundary (`STRIX_GLM_BOUNDARY`), fast attention and fast MoE seams. Dense FFN layers and prefill keep the copy.
+- **Automatic selection:** Unset resolves to 1. Seams that do not publish, or exchanges without a producer slot, keep the copy path.
+- **Fallback notice:** None; an output projection that does not write the whole partial in one launch is followed by one publish launch.
+- **Exactness evidence:** In-process A B A over the switch, 1K prompt: tokens, last logits and state digests identical in every run; fresh-process arms at 8K (plain and speculative): identical token digests.
+- **Off switch:** STRIX_GLM_XB_PUBLISH=0
+- **Measured gain:** GLM-5.3 TP2 USB4 plain decode, 1K, in-process A B A: 39.06 / 39.05 -> 38.42 ms/token (-1.6 %); MoE producer alone 39.05 / 39.04 -> 38.74 (-0.8 %). Fresh processes at 8K: plain 40.01 / 39.75 -> 39.33 ms/token (-1.4 %), speculative default 23.05 / 23.51 -> 22.84 ms/token (-1.9 %).
+- **Implementation / evidence:** [shared helper](../include/strix/pair/producer_publish.hpp), [exchange slot](../src/glm/xfer/glm_xfer_exchange.hpp)
+
 <a id="glm-moe-fast"></a>
 
 ### Fast raw-expert MoE

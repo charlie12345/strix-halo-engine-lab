@@ -1,5 +1,6 @@
 // Exercise the production host scheduler with independently interleaved device
 // queues. Consumers must see their own layer even when the side queue runs first.
+#include "core/layer_set.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -71,6 +72,29 @@ int main() {
         bool refused = false;
         try { (void)fi::scope(bad); } catch (const std::invalid_argument&) { refused = true; }
         require(refused);
+    }
+    require(fi::min_rows(nullptr) == fi::kMinRows && fi::min_rows("") == fi::kMinRows && fi::min_rows("0") == 0 && fi::min_rows("8192") == 8192);
+    for (const char* bad : {"-1", "4k", " 1", "1e3"}) {
+        bool refused = false;
+        try { (void)fi::min_rows(bad); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused);
+    }
+    {   // Shared per-layer policy set (core/layer_set.hpp): the keep-EXL3 / W4A8 layer lists of the FAST_I4 engines.
+        namespace sc = strix::core;
+        auto set = [](const char* v) { return sc::parse_layer_set(v, 3, 60, "TEST"); };
+        require(set(nullptr).count() == 0 && set("").count() == 0 && set("none").count() == 0);
+        const auto a = set("3,7-9,59");
+        require(a.count() == 5 && a.test(3) && a.test(7) && a.test(8) && a.test(9) && a.test(59) && !a.test(4) && !a.test(60));
+        const auto b = set("!3-32");
+        require(b.count() == 27 && !b.test(3) && !b.test(32) && b.test(33) && b.test(59) && !b.test(2) && !b.test(60));
+        require(set("!").count() == 57 && set("3-59").count() == 57 && set("!3-59").count() == 0);
+        const auto keep = set(fi::kQualityExl3Layers);   // default: MoE layers 3-37 exact, 38-59 INT4
+        require(keep.count() == 35 && keep.test(3) && keep.test(37) && !keep.test(38) && !keep.test(59));
+        for (const char* bad : {"2", "60", "9-7", "3,", ",3", "3--4", "a", "3 ", "!none", "1000"}) {
+            bool refused = false;
+            try { (void)set(bad); } catch (const std::invalid_argument&) { refused = true; }
+            require(refused);
+        }
     }
     for (bool prefetch : {false, true}) for (unsigned chunks : {1U, 2U, 4U}) {
         Queues q;

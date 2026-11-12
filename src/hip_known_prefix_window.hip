@@ -122,6 +122,12 @@ strix::HipKnownPrefixWindow::PrefillStepObserver qrtx_step_dump_observer(strix::
 
 namespace strix {
 namespace {
+struct ExecutionLease {
+    bool& active;
+    explicit ExecutionLease(bool& value):active(value){active=true;}
+    ~ExecutionLease(){active=false;}
+};
+
 void check(hipError_t error, const char* operation) {
     if (error != hipSuccess)
         throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(error));
@@ -1470,12 +1476,9 @@ struct HipKnownPrefixWindow::Impl {
                     lm_head_known_window_rows_launch_greedy(rows,self.head_config,self.greedy_partials,self.greedy_replies);
                     return;
                 }
-                lm_head_known_window_rows_launch(rows,self.head_config);
-                if(!self.greedy_replies) return;
-                std::array<ExecutionBufferAddress,hip_greedy_rows_max> logits{};
-                for(std::size_t r=0;r<rows.size();++r) logits[r]=resolve_dispatch_write(rows[r],0);
-                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(),rows.size()),
-                    self.head_config.vocab_size,self.greedy_partials,self.greedy_replies,hip_execution_stream());
+                const HipLmHeadGreedyRows greedy{rows,self.greedy_partials,self.greedy_replies};
+                lm_head_rows_with_greedy(rows,self.head_config,
+                    std::span<const HipLmHeadGreedyRows>(&greedy,self.greedy_replies?1U:0U));
             }});
     }
     void attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
@@ -1749,11 +1752,7 @@ struct HipKnownPrefixWindow::Impl {
     void preflight_admission(SerialSessionContext session, std::span<const std::uint32_t> tokens, bool static_only=false) {
         if (failed || (static_only ? (!prefill || !tokens.empty()) : (prefill || tokens.size() != logical_rows())) || executing || current_hip_launch_context())
             throw std::invalid_argument("known-window setup admission requires an idle closed window owner");
-        struct ExecutionLease {
-            bool& active;
-            explicit ExecutionLease(bool& value):active(value){active=true;}
-            ~ExecutionLease(){active=false;}
-        } execution_lease(executing);
+        ExecutionLease execution_lease(executing);
         try {
             validate_metadata();
             const HipLaunchScope active(scope);
@@ -1809,6 +1808,11 @@ struct HipKnownPrefixWindow::Impl {
         static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }();
         return on;
     }
+    // STRIX_COHORT_SHARED_ELEMENTWISE=0: the inject and MoE-combine rows of a chunk run per session again.
+    static bool cohort_shared_elementwise_enabled() {
+        static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED_ELEMENTWISE"); return !v || v[0] != '0'; }();
+        return on;
+    }
     static bool cohort_shared_expert_enabled() {
         static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED_EXPERT"); return !v || v[0] != '0'; }();
         return on;
@@ -1826,27 +1830,38 @@ struct HipKnownPrefixWindow::Impl {
             }
             return detachable_shared(i);
         }
-        if (!cohort_shared_mode(mode)) return false;
+        const bool elementwise = mode == KnownWindowStepMode::inject_rows || mode == KnownWindowStepMode::moe_combine_rows;
+        // In-process A/B: STRIX_COHORT_AB_OFF=elementwise.
+        if (elementwise ? !cohort_shared_elementwise_enabled() || known_window_cohort_feature_off("elementwise") : !cohort_shared_mode(mode))
+            return false;
         for (const auto& m : members) {
             if (!m.run->wide_step(i) || m.impl->window.mode[i] != mode) return false;
             if (mode == KnownWindowStepMode::qsa_rows && m.run->rows() != 2U && m.run->rows() != 4U && m.run->rows() != 8U) return false;
         }
         return true;
     }
-    // STRIX_COHORT_WIDE=gdn,qsa,head,moe,combine,inject (comma list, or "all"): with two or more chunks, the
-    // listed steps run once for the rows of every chunk (9..32 rows) instead of once per chunk. Per-row
-    // arithmetic as in the chunk.
-    static bool cohort_wide_enabled(const char* family) {
-        static const std::string list = [] { const char* v = std::getenv("STRIX_COHORT_WIDE"); return std::string(v ? v : ""); }();
+    // Wide cohort steps (one launch for the rows of every chunk, 9..32 rows, per-row arithmetic as in the chunk)
+    // are the default: cohort_step_rows() is 16 unless STRIX_COHORT_AUTO=0 or STRIX_COHORT_STEP_ROWS says otherwise.
+    // With 8-row steps, STRIX_COHORT_WIDE=gdn,qsa,head,moe,combine,inject,router,hyper,shared (comma list, or
+    // "all") still selects families; the list is resolved once.
+    static bool cohort_wide_enabled(std::string_view family) {
+        static constexpr std::array<std::string_view, 9> families{"gdn", "qsa", "head", "moe", "combine", "inject", "router", "hyper",
+            "shared"};
+        static const std::uint32_t listed = [] {
+            if (cohort_step_rows() == 16U) return ~0U;
+            const char* v = std::getenv("STRIX_COHORT_WIDE");
+            const std::string_view list(v ? v : "");
+            if (list == "all") return ~0U;
+            std::uint32_t mask = 0;
+            for (std::size_t at = 0; at <= list.size();) {
+                const auto end = std::min(list.find(',', at), list.size());
+                for (std::size_t f = 0; f < families.size(); ++f) if (list.substr(at, end - at) == families[f]) mask |= 1U << f;
+                at = end + 1U;
+            }
+            return mask;
+        }();
         if (known_window_cohort_feature_off(family)) return false;
-        if (cohort_step_rows()==16U) return true;
-        if (list == "all") return true;
-        std::size_t at = 0;
-        while (at <= list.size()) {
-            const auto end = std::min(list.find(',', at), list.size());
-            if (list.compare(at, end - at, family) == 0) return true;
-            at = end + 1U;
-        }
+        for (std::size_t f = 0; f < families.size(); ++f) if (family == families[f]) return (listed >> f & 1U) != 0U;
         return false;
     }
     static bool cohort_wide_step(std::size_t i, std::span<CohortMember> members, bool all_chunked) {
@@ -1910,6 +1925,40 @@ struct HipKnownPrefixWindow::Impl {
         }
         return total >= 9U && total <= 32U;
     }
+    // Only these segment launches are identical for wide and shared cohorts. The
+    // head config belongs to the lead owner for wide, and the primary for shared.
+    void launch_cohort_segment_step(std::size_t i, std::span<CohortMember> members,
+        std::span<const ExecutionDispatchContext> rows = {}) {
+        switch (window.mode[i]) {
+        case KnownWindowStepMode::gdn_deferred_rows: {
+            std::vector<HipGdnWindowCohortSegment> segments;
+            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->gdn_window_config});
+            gdn_window_cohort_rows_launch(segments);
+            for (const auto& m : members) m.impl->remember_gdn_layer(m.run->step_rows(i)[0]);
+            break;
+        }
+        case KnownWindowStepMode::qsa_rows: {
+            std::vector<HipQsaCohortSegment> segments;
+            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
+            indexed_attention_known_window_cohort_launch(segments);
+            break;
+        }
+        case KnownWindowStepMode::lm_head_rows: {
+            std::vector<ExecutionDispatchContext> all;
+            if (rows.empty()) {
+                for (const auto& m : members) { const auto own = m.run->step_rows(i); all.insert(all.end(), own.begin(), own.end()); }
+                rows = std::span<const ExecutionDispatchContext>(all);
+            }
+            // Each session's argmax rows land in its own owner's replies, read by its own capture.
+            std::vector<HipLmHeadGreedyRows> greedy;
+            for (const auto& m : members)
+                greedy.push_back({m.run->step_rows(i), m.impl->greedy_partials, m.impl->greedy_replies});
+            lm_head_rows_with_greedy(rows, head_config, greedy);
+            break;
+        }
+        default: throw std::logic_error("known-window cohort step has no common segment implementation");
+        }
+    }
     static void launch_cohort_wide(std::size_t i, std::span<CohortMember> members) {
         const KnownWindowCohortScope cohort;
         switch (members[0].impl->window.mode[i]) {
@@ -1940,19 +1989,6 @@ struct HipKnownPrefixWindow::Impl {
             moe_experts_known_window_rows_launch(all, lead.routed_config, lead.cohort_union(static_cast<std::uint32_t>(all.size())), 0U);
             break;
         }
-        case KnownWindowStepMode::gdn_deferred_rows: {
-            std::vector<HipGdnWindowCohortSegment> segments;
-            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->gdn_window_config});
-            gdn_window_cohort_rows_launch(segments);
-            for (const auto& m : members) m.impl->remember_gdn_layer(m.run->step_rows(i)[0]);
-            break;
-        }
-        case KnownWindowStepMode::qsa_rows: {
-            std::vector<HipQsaCohortSegment> segments;
-            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
-            indexed_attention_known_window_cohort_launch(segments);
-            break;
-        }
         case KnownWindowStepMode::inject_rows:
         case KnownWindowStepMode::moe_combine_rows: {
             std::vector<std::span<const ExecutionDispatchContext>> segments;
@@ -1962,20 +1998,11 @@ struct HipKnownPrefixWindow::Impl {
             else moe_combine_known_window_cohort_rows_launch(segments, members[0].impl->elementwise_config);
             break;
         }
-        case KnownWindowStepMode::lm_head_rows: {
-            std::vector<ExecutionDispatchContext> all;
-            for (const auto& m : members) { const auto rows = m.run->step_rows(i); all.insert(all.end(), rows.begin(), rows.end()); }
-            lm_head_known_window_rows_launch(all, members[0].impl->head_config);
-            // Each session's argmax rows land in its own owner's replies, read by its own capture.
-            for (const auto& m : members) {
-                const auto own = m.run->step_rows(i);
-                std::array<ExecutionBufferAddress, hip_greedy_rows_max> logits{};
-                for (std::size_t r = 0; r < own.size(); ++r) logits[r] = resolve_dispatch_write(own[r], 0);
-                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), own.size()),
-                    members[0].impl->head_config.vocab_size, m.impl->greedy_partials, m.impl->greedy_replies, hip_execution_stream());
-            }
+        case KnownWindowStepMode::gdn_deferred_rows:
+        case KnownWindowStepMode::qsa_rows:
+        case KnownWindowStepMode::lm_head_rows:
+            members[0].impl->launch_cohort_segment_step(i, members);
             break;
-        }
         default: throw std::logic_error("known-window cohort step has no wide implementation");
         }
     }
@@ -2029,31 +2056,20 @@ struct HipKnownPrefixWindow::Impl {
             hyper_mix_known_window_rows_launch(rows, hyper_for(rows)); break;
         case KnownWindowStepMode::moe_route_rows:
             moe_route_known_window_rows_launch(rows, route_config); break;
-        case KnownWindowStepMode::lm_head_rows: {
-            lm_head_known_window_rows_launch(rows, head_config);
-            // Each session's argmax rows land in its own owner's replies, read by its own capture.
-            for (const auto& m : members) {
-                const auto own = m.run->step_rows(i);
-                std::array<ExecutionBufferAddress, hip_greedy_rows_max> logits{};
-                for (std::size_t r = 0; r < own.size(); ++r) logits[r] = resolve_dispatch_write(own[r], 0);
-                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), own.size()),
-                    head_config.vocab_size, m.impl->greedy_partials, m.impl->greedy_replies, hip_execution_stream());
-            }
+        case KnownWindowStepMode::inject_rows:
+        case KnownWindowStepMode::moe_combine_rows: {
+            // One launch for the chunk; every session's rows stay their own admitted window (per-row arithmetic).
+            std::vector<std::span<const ExecutionDispatchContext>> segments;
+            for (const auto& m : members) segments.push_back(m.run->step_rows(i));
+            if (window.mode[i] == KnownWindowStepMode::inject_rows) inject_known_window_cohort_rows_launch(segments, elementwise_config);
+            else moe_combine_known_window_cohort_rows_launch(segments, elementwise_config);
             break;
         }
-        case KnownWindowStepMode::gdn_deferred_rows: {
-            std::vector<HipGdnWindowCohortSegment> segments;
-            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->gdn_window_config});
-            gdn_window_cohort_rows_launch(segments);
-            for (const auto& m : members) m.impl->remember_gdn_layer(m.run->step_rows(i)[0]);
+        case KnownWindowStepMode::gdn_deferred_rows:
+        case KnownWindowStepMode::qsa_rows:
+        case KnownWindowStepMode::lm_head_rows:
+            launch_cohort_segment_step(i, members, rows);
             break;
-        }
-        case KnownWindowStepMode::qsa_rows: {
-            std::vector<HipQsaCohortSegment> segments;
-            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
-            indexed_attention_known_window_cohort_launch(segments);
-            break;
-        }
         default: throw std::logic_error("known-window cohort step has no shared implementation");
         }
     }
@@ -2237,6 +2253,8 @@ struct HipKnownPrefixWindow::Impl {
                             const HipLaunchScope active(primary->scope);
                             primary_launched[c] = 1;
                             if (primary->window.mode[i] == KnownWindowStepMode::routed_expert_union) union_ran[c] = 1;
+                            // The chunk's MoE combine waits for its detached shared expert, as before the members' own steps.
+                            if (primary->shared_detach) primary->join_cohort_shared(i);
                             primary->launch_cohort_shared(i, chunk.members);
                         }
                         for (auto& m : chunk.members) {m.run->record_external_step(i);observe(m,i);}
@@ -2362,11 +2380,7 @@ struct HipKnownPrefixWindow::Impl {
         if (skip_head && (!prefill || capture || before_publish))
             throw std::invalid_argument("known-window headless execution is a plain tiled prefill block only");
         if(executing)throw std::logic_error("known-window native owner cannot execute recursively");
-        struct ExecutionLease {
-            bool& active;
-            explicit ExecutionLease(bool& value):active(value){active=true;}
-            ~ExecutionLease(){active=false;}
-        } execution_lease(executing);
+        ExecutionLease execution_lease(executing);
         bool owned_eager_scope_admitted=false,actual_window_committed=false;
         const PreparedCapture* observed=nullptr;
         // STRIX_PREFILL_TIMING=1: host milliseconds of the owner's own phases around a tiled block (stderr).
@@ -2572,11 +2586,7 @@ struct HipKnownPrefixWindow::Impl {
         if (executing) throw std::logic_error("known-window native owner cannot execute recursively");
         if (!prefill || requests.empty() || prefill->output_policy == KnownWindowOutputPolicy::all_rows)
             throw std::invalid_argument("segmented prefill runs on a terminal-row or state-only tiled prefill owner");
-        struct ExecutionLease {
-            bool& active;
-            explicit ExecutionLease(bool& value):active(value){active=true;}
-            ~ExecutionLease(){active=false;}
-        } execution_lease(executing);
+        ExecutionLease execution_lease(executing);
         bool owned_eager_scope_admitted = false, committed = false;
         std::vector<KnownPrefillSegment> segments(requests.size());
         try {

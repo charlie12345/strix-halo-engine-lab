@@ -33,8 +33,11 @@ See [HTTP prefill](../../engine/serving/serving.md#default-prompt-prefill). See 
 [auto route and off switches](../../getting-started/engine-reference.md#command-line).
 
 `prompt.ids` holds the prompt as token IDs from the model's tokenizer; the engine prints a JSON receipt with
-`generated_tokens` and timings. For the speeds above add the speculative options (MTP sidecar, verify windows
-2/4/8, draft vocabulary): the complete command is in **[docs/getting-started/engine-reference.md → Command line](../../getting-started/engine-reference.md#command-line)**
+`generated_tokens` and timings. The plain command decodes with exact MTP speculation when the
+[drafter bundle](../../engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle) (bundle JSON, distilled
+sidecar, draft vocabulary) is beside the model; `--no-mtp` or `STRIX_MTP=0` gives plain decode with the same
+tokens, and a missing bundle gives plain decode with one notice. Same binary, one node, plain (`--no-mtp`) against the default command, identical tokens: 22.1 -> 73.3 tok/s after a 1K prompt (300 tokens; 81.3 tok/s over 1,200 tokens) and 16.9 -> 62.8 tok/s after an 8K prompt (300 tokens). The explicit
+speculative command (every option spelled out) is in **[docs/getting-started/engine-reference.md → Command line](../../getting-started/engine-reference.md#command-line)**
 and [docs/engine/speculative/mtp-native-cli.md](../../engine/speculative/mtp-native-cli.md). The HTTP server, batched slots (`--http-batch`) and the
 prefix cache are in [docs/engine/serving/serving.md](../../engine/serving/serving.md); several requests in one process in
 [docs/engine/scheduling/multi-request-cohort.md](../../engine/scheduling/multi-request-cohort.md) (automatic per-cycle policy, on by default: 8 requests 69.3 tok/s aggregate, 62.9 tok/s before); sampling in

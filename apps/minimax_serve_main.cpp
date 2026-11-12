@@ -1,5 +1,6 @@
 #include "strix/dist/open_transport.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/session/speculation_default.hpp"
 // strix-minimax-serve: the MiniMax M3.1 Flash TP2 engine behind an OpenAI-compatible HTTP API (both ranks run it;
 // rank 0 serves HTTP). The DS serve recipe: rank 0 owns the queue and a continuous-batching scheduler over the
 // engine's sequence slots and sends one fixed-size control block per round (prefill / unit / step / draft / heartbeat /
@@ -743,6 +744,7 @@ int main(int argc, char** argv) {
         std::uint32_t max_tokens = 4096, check_tokens = 256, check_child_layers = ~0U;
         bool admin = false, check_only = false;
         std::string dspark_mode_value, dspark_prior_value;
+        bool no_mtp = false;
         bool print_graph = strix::minimax::graph::requested("STRIX_PRINT_MODEL_GRAPH");
         bool print_plan = strix::minimax::graph::requested("STRIX_PRINT_EXEC_PLAN");
         const auto dspark_inflight = ds::parse_inflight(std::getenv("STRIX_MM_SERVE_DSPARK_INFLIGHT"));
@@ -768,6 +770,7 @@ int main(int argc, char** argv) {
             else if (a == "--dspark") dspark_dir = next();
             else if (a == "--dspark-prior") dspark_prior_value = next();
             else if (a == "--dspark-mode") dspark_mode_value = next();
+            else if (strix::session::speculation_opt_out_argument(a)) no_mtp = true;
             else if (a == "--dspark-exl3") dspark_exl3 = next();
             else if (a == "--admin") admin = true;
             else if (a == "--resume-check-child-layers") check_child_layers = static_cast<unsigned>(std::stoul(next()));
@@ -781,6 +784,7 @@ int main(int argc, char** argv) {
             else if (strix::minimax::session::parse_option(session_options,a,next)) {}
             else throw std::invalid_argument("unknown option " + a);
         }
+        if (no_mtp && dspark_mode_value.empty()) dspark_mode_value = "off";  // shared opt-out; --dspark-mode wins
         const auto dspark_prior = ds::parse_prior(dspark_prior_value.empty() ? std::getenv("STRIX_MM_DSPARK_PRIOR") : dspark_prior_value.c_str());
         const auto dspark_mode = ds::parse_mode(dspark_mode_value.empty() ? std::getenv("STRIX_MM_SERVE_DSPARK") : dspark_mode_value.c_str());
         if (check_child_layers == 0 || (check_child_layers != ~0U && check_child_layers >= 60))

@@ -104,6 +104,8 @@ void test_plain_equals_receipt() {
     if (!why.empty()) std::fprintf(stderr, "  ttft receipt diff: %s\n", why.c_str());
     // the old code's default (--mtp 1) sent the plain decode command to the row-by-row reference prefill
     CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--mtp", "1", "--mtp-spec", "0"}), {}).prefill == "ref");
+    // shared opt-out: --no-mtp is plain decode, like --mtp-spec 0
+    CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--no-mtp"}), {}).mtp_spec.value == "0");
     // Host-independent candidate; startup memory admission and the rank minimum may reduce it.
     CHECK(plain.max_rows.value == "8192" && plain.max_rows.source == "auto-8192");
     CHECK(resolve(cat(kDeploy, kTtftWork), {}).max_rows.source == "explicit");

@@ -78,6 +78,11 @@ device: id=main vendor=nvidia uuid=GPU-... pci=0000:01:00.0 name="..." arch=sm_1
 
 `strix-cuda-qwen-serve` también la muestra en `device` dentro de `/api/status`.
 
+Los binarios AMD (HIP) de un nodo pasan por la misma comprobación y aceptan las mismas opciones, con el dispositivo
+identificado por su dirección PCI (`pci = "0000:c5:00.0"`, `vendor = "amd"`). Sin declaración, la única GPU integrada
+del nodo sigue funcionando y la línea indica `declared=implicit`; una GPU AMD discreta o una segunda GPU siempre
+necesitan el archivo.
+
 Las herramientas de GLM de esta página aún no leen la declaración. Para ellas, y para cualquier otro programa CUDA,
 seleccione la tarjeta por UUID en la consola:
 

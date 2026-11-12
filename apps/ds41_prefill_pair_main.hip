@@ -11,6 +11,7 @@
 // single-node prefill on this rank (all experts) and compares y bitwise. Inputs are synthetic and
 // identical on both ranks (fixed seeds); the output is a JSON line per rank.
 
+#include "strix/device/hip_gate.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/ds41_formats.hpp"
@@ -328,6 +329,10 @@ std::string run_rank(const Options& o, std::unique_ptr<strix::dist::Transport> t
 } // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     try {
         auto o = parse(argc, argv);
         if (o.transport == "memory") {

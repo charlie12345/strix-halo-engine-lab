@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "gemma4/engine/api.hpp"
 #include "gemma4/engine/runtime.hpp"
 #include "gemma4/engine/deployment.hpp"
@@ -6,6 +7,10 @@
 #include <string_view>
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     namespace e = strix::gemma4::engine;
     try {
         auto prepared=e::prepare_serve(argc,argv);

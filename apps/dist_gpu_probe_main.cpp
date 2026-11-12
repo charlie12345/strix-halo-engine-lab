@@ -16,6 +16,7 @@
 // GPU-direct, the breakdown of the progress thread (witness->submit, submit->RX complete, ->TX complete) and of the
 // stream (scatter, wait, gather).
 
+#include "strix/device/hip_gate.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/env_flags.hpp"
@@ -85,6 +86,10 @@ struct Load {
 } // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     if (argc < 2) { std::cerr << "usage: strix-dist-gpu-probe RANK [SIZES...]\n"; return 2; }
     const auto rank = static_cast<std::uint32_t>(std::stoul(argv[1]));
     std::vector<std::size_t> sizes;

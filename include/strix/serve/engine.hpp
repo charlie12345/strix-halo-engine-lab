@@ -147,6 +147,15 @@ private:
     std::vector<Delta> deltas_;
 };
 
+// The rest of a prompt that is still being tokenized (GenerationJob::prompt_tail). `prompt` must hold exactly the
+// first prompt.size() ids; take() appends every further id that is final and returns true once the prompt is complete.
+// wait: block until at least one more id is final or the prompt is complete. Ids never change once appended.
+class PromptTail {
+public:
+    virtual ~PromptTail() = default;
+    virtual bool take(std::vector<std::uint32_t>& prompt, bool wait) = 0;
+};
+
 struct GenerationJob {
     std::function<void()> on_admitted; // optional: session preflight passed, before execution
     std::function<void(GenerationProgress)> on_progress; // optional, host-only completed prefill units
@@ -154,6 +163,11 @@ struct GenerationJob {
     CacheRetention cache_retention = CacheRetention::server_policy;
     std::string session_id;
     std::vector<std::uint32_t> prompt;
+    // Optional early admission: the prompt is still being tokenized. `prompt` holds the ids final so far (the first
+    // chunk at least) and the session runtime appends the rest from here; it runs prefill only on ids it holds and
+    // never treats the prompt as complete before the stream is. Queue selection sees the current size. Null: the
+    // prompt is complete (every existing caller).
+    std::shared_ptr<PromptTail> prompt_tail;
     // chat requests: the prompt's first tokens that render the system prompt and the tools (a prefix every turn of the
     // conversation, and often other conversations, repeat: a prefix cache may snapshot there); 0: none known
     std::uint32_t stable_prefix = 0;

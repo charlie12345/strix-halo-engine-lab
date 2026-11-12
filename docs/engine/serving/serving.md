@@ -1149,6 +1149,18 @@ budget to rank 1. While no request decodes and no other admitted prompt waits, r
 budget 0 instead: both ranks run the rest of the current piece at once (same bits; up to
 16384 rows with `--prefill-rows auto`), so a request that arrives meanwhile, an abort or an
 import waits for that piece. `STRIX_DS41_SERVE_IDLE_WHOLE=0` restores bounded units while idle.
+
+**Admit-first order.** While admitted prompts still wait for their prefill, a decode step runs with fewer rows and
+pays its fixed cost for them. From five live requests (admitted or queued) the lead therefore prefills the waiting
+prompts before the next decode step, and the decoding requests wait at most one second. Below five live requests the
+order is unchanged: drafting fills the spare rows there, so an early step is as productive as a late one. Every prompt
+keeps its prefill path, pieces and units, so the generated tokens are the same in either order. Eight concurrent chat
+prompts of 128 tokens: 92.3 to 94.2 tokens/s against 91.0 to 93.4 (+1.0 to +1.5 %, four pairs), median time to first
+token 1.6 s against 1.8 s; one to four concurrent requests run the same order (no held step).
+`STRIX_SERVE_ADMIT_FIRST=0` keeps decode first at every concurrency, `=1` forces admit-first,
+`STRIX_SERVE_ADMIT_FIRST_MIN_LIVE` moves the crossover and `STRIX_SERVE_ADMIT_FIRST_GAP_MS` the wait bound.
+`STRIX_DS41_SERVE_STEP_TRACE=1` prints one line per decode step, device prefill and held step. The rule is
+`serve::AdmitFirst` in `include/strix/serve/prompt_service.hpp`, engine neutral.
 The ordinary piece endpoints and cache snapshots stay unchanged. Arrivals, status
 and cancellation are inspected between resumes. One indivisible unit, decode sweep,
 state import or allocation can exceed the target; it is not a latency guarantee.

@@ -1808,6 +1808,11 @@ struct HipKnownPrefixWindow::Impl {
         static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }();
         return on;
     }
+    // STRIX_COHORT_SHARED_ELEMENTWISE=0: the inject and MoE-combine rows of a chunk run per session again.
+    static bool cohort_shared_elementwise_enabled() {
+        static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED_ELEMENTWISE"); return !v || v[0] != '0'; }();
+        return on;
+    }
     static bool cohort_shared_expert_enabled() {
         static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED_EXPERT"); return !v || v[0] != '0'; }();
         return on;
@@ -1825,7 +1830,10 @@ struct HipKnownPrefixWindow::Impl {
             }
             return detachable_shared(i);
         }
-        if (!cohort_shared_mode(mode)) return false;
+        const bool elementwise = mode == KnownWindowStepMode::inject_rows || mode == KnownWindowStepMode::moe_combine_rows;
+        // In-process A/B: STRIX_COHORT_AB_OFF=elementwise.
+        if (elementwise ? !cohort_shared_elementwise_enabled() || known_window_cohort_feature_off("elementwise") : !cohort_shared_mode(mode))
+            return false;
         for (const auto& m : members) {
             if (!m.run->wide_step(i) || m.impl->window.mode[i] != mode) return false;
             if (mode == KnownWindowStepMode::qsa_rows && m.run->rows() != 2U && m.run->rows() != 4U && m.run->rows() != 8U) return false;
@@ -2040,6 +2048,15 @@ struct HipKnownPrefixWindow::Impl {
             hyper_mix_known_window_rows_launch(rows, hyper_for(rows)); break;
         case KnownWindowStepMode::moe_route_rows:
             moe_route_known_window_rows_launch(rows, route_config); break;
+        case KnownWindowStepMode::inject_rows:
+        case KnownWindowStepMode::moe_combine_rows: {
+            // One launch for the chunk; every session's rows stay their own admitted window (per-row arithmetic).
+            std::vector<std::span<const ExecutionDispatchContext>> segments;
+            for (const auto& m : members) segments.push_back(m.run->step_rows(i));
+            if (window.mode[i] == KnownWindowStepMode::inject_rows) inject_known_window_cohort_rows_launch(segments, elementwise_config);
+            else moe_combine_known_window_cohort_rows_launch(segments, elementwise_config);
+            break;
+        }
         case KnownWindowStepMode::gdn_deferred_rows:
         case KnownWindowStepMode::qsa_rows:
         case KnownWindowStepMode::lm_head_rows:
@@ -2228,6 +2245,8 @@ struct HipKnownPrefixWindow::Impl {
                             const HipLaunchScope active(primary->scope);
                             primary_launched[c] = 1;
                             if (primary->window.mode[i] == KnownWindowStepMode::routed_expert_union) union_ran[c] = 1;
+                            // The chunk's MoE combine waits for its detached shared expert, as before the members' own steps.
+                            if (primary->shared_detach) primary->join_cohort_shared(i);
                             primary->launch_cohort_shared(i, chunk.members);
                         }
                         for (auto& m : chunk.members) {m.run->record_external_step(i);observe(m,i);}

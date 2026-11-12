@@ -39,6 +39,13 @@ struct SessionLease {
     GenerationStats& stats;
     session::KvHandle state;
 };
+// Taken request held by this owner without a logical lease or physical slot.
+// Generations are never reused within an owner. Copies convey no ownership.
+struct PendingSession {
+    std::uint64_t generation = 0, owner = 0;
+    [[nodiscard]] bool valid() const noexcept { return generation && owner; }
+    bool operator==(const PendingSession&) const = default;
+};
 struct SessionCacheStats {
     std::uint64_t entries = 0, bytes = 0, hits = 0, misses = 0;
     std::uint64_t turn_admitted = 0, turn_refused = 0, turn_failed = 0, restore_failed = 0;
@@ -102,6 +109,23 @@ struct SessionHooks {
     // This turn must return after bounded native work; it must never run a
     // request loop or call the queue/output callbacks itself.
     std::function<void(SessionRuntime&)> control_turn;
+    // Native protocols may validate their richer request ABI instead of the
+    // scalar SamplerState admission contract. Never used by generic execution.
+    std::function<void(const GenerationJob&)> native_validate;
+    // Some native runners must drain accepted/reserved work after queue stop.
+    // Default preserves the immediate-close MiniMax control protocol.
+    bool drain_native_on_shutdown = false;
+    // Required for draining protocols: true only AFTER their final bounded
+    // native shutdown turn, including native growth/admission boundaries.
+    std::function<bool()> native_drained;
+    // A request-only adopter has no shared retaining-cache facade at all.
+    // Requires owner_control and a disabled retention policy.
+    bool disable_native_cache = false;
+    // Opt-in generate() protocol: cancelled FIFO entries reach the observer;
+    // TTFT is entry-relative, and escaping idle/observer callbacks do not close
+    // the queue. Existing native/batched owners retain their prior protocol.
+    bool serial_queue_protocol = false;
+    std::function<void(const GenerationStats&)> serial_observe;
     std::function<void()> closing;
     // Notify a native protocol of an escaping owner failure before cleanup.
     std::function<void()> failed;
@@ -155,17 +179,46 @@ public:
         const std::function<bool(std::chrono::steady_clock::time_point)>& reorder = {},
         const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& eligible = {},
         const std::function<void()>& overtake_blocked = {});
+    // Native legacy FIFO uses the queue's original cancellation sweep (the
+    // bool take API), including arrivals during cancelled-entry cleanup.
+    // wait=true preserves the legacy blocking FIFO take, including its repeated
+    // cancellation sweep and control wake. step(false) remains nonblocking.
+    bool reserve_fifo(bool wait = false, bool short_first = false);
+    bool reserve_serial(bool wait = false);
     void refuse(GenerationStats = {}, std::string error = {});
-    SessionLease activate(std::uint64_t resident_alignment = 0);
+    SessionLease activate(std::uint64_t resident_alignment = 0, bool preserve_take_time = false);
+    // Request-only native protocols may hold multiple taken candidates while
+    // their native planner defers admission. No queue/accounting operation or
+    // KvStore acquire/reset occurs here. Inspection is borrowed and stable
+    // across other pending operations AND promotion, until terminal completion.
+    // Callbacks must be invoked through the owner operations below.
+    PendingSession hold_reservation();
+    [[nodiscard]] const TakenJob& inspect(PendingSession) const;
+    [[nodiscard]] const TakenJob& inspect(session::KvHandle) const;
+    [[nodiscard]] bool pending_cancelled(PendingSession) const noexcept;
+    [[nodiscard]] std::size_t pending_count() const noexcept;
+    SessionLease promote(PendingSession);
+    void refuse_pending(PendingSession, GenerationStats = {}, std::string error = {});
     // Native planner only. Invalidate before session/admin work outside leases.
     void invalidate_residents() noexcept;
     void abandon_resident(session::KvHandle);
     bool has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>&) const;
     // Accounts before callback, catches callback errors per lane, and preserves
     // already-published peer commits. Family supplies stop/commit semantics.
-    bool publish(session::KvHandle, std::span<const std::uint32_t>, bool deliver = true);
+    bool publish(session::KvHandle, std::span<const std::uint32_t>, bool deliver = true,
+                 bool propagate_callback_error = false);
+    // Owner-thread native callback. Retired/foreign generations are cancelled;
+    // never borrow a raw ticket beyond the activation call or observe its reuse.
+    [[nodiscard]] bool ticket_cancelled(session::KvHandle) const noexcept;
+    // Native protocol events at their existing admission/progress boundaries.
+    // The runtime retains the ticket callbacks; native metadata keeps handles.
+    void notify_admitted(session::KvHandle);
+    void publish_progress(session::KvHandle, GenerationProgress);
     void complete(session::KvHandle, std::string error = {}, std::uint64_t safe_prefill_rows = 0);
-    void wait_for(std::chrono::milliseconds);
+    // Native protocol already formed its complete terminal receipt. Replace,
+    // never merge/add its output accounting; completion still owns the lease.
+    void complete_native(session::KvHandle, GenerationStats, std::string error = {});
+    void wait_for(std::chrono::milliseconds, bool generation_ready = false);
     bool stopping() const;
 private:
     struct Impl;

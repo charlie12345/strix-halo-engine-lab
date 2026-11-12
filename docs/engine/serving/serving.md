@@ -365,7 +365,13 @@ window stream shared by all slots. The calibration replay runs once.
 - The reply is split into `reasoning_content` (the thinking block), `content` and `tool_calls`.
   Parameter values of a tool call are typed by the tool's JSON schema (strings stay strings, other
   types are parsed as JSON); `finish_reason` is `tool_calls` when the reply contains calls.
-- `tool_choice: "none"` renders no tools.
+- `tool_choice: "none"` (Anthropic: `{"type":"none"}`) renders no tool definitions and returns no tool call, on
+  Chat Completions, Responses and Messages alike. Earlier calls and their results stay in the prompt. When the
+  history holds a tool call or a tool result, a closing instruction ("Tools are disabled for this reply. ...") is
+  appended to the last user message, or added as a user message after a closing tool result, so the model does not
+  imitate the earlier calls. A call the model still emits is withheld: the reply keeps the text before it and ends
+  with `[tool call to <name> withheld: tool_choice is "none"]` (streamed as a final text delta), with finish reason
+  `stop` / `end_turn` and no call item. Requests without `tool_choice: "none"` are not affected.
 - Other fields: `max_tokens` / `max_completion_tokens`, `stop` (string or list), `stream`,
   `stream_options.include_usage`, `n` (only 1), `temperature`, `top_p`, `top_k`, `seed`.
 - Generation fields the server does not execute yet are refused with a 400 naming the field, on every route:

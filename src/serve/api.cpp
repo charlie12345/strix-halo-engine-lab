@@ -681,7 +681,21 @@ struct ApiService::Impl {
 
     // ---- chat ----
     using ChatPrompt = ApiChatPrompt;
+    // tool_choice "none": the history stays renderable, a closing instruction replaces the removed definitions when
+    // the history holds tool activity, and a call the model still emits is withheld (parsed_output). Requests
+    // without tool_choice "none" take render_chat_prompt unchanged.
     ChatPrompt chat_prompt(const Json& body) const {
+        if (!tool_choice_is_none(body)) return render_chat_prompt(body);
+        const auto* messages = body.find("messages");
+        auto hinted = messages ? messages_with_no_tools_hint(*messages, config.no_tools_hint ? std::string_view(*config.no_tools_hint) : std::string_view(no_tools_hint))
+                               : std::optional<Json>{};
+        ChatPrompt out;
+        if (hinted) { Json copy = body; copy.set("messages", std::move(*hinted)); out = render_chat_prompt(copy); }
+        else out = render_chat_prompt(body);
+        out.tools_off = true;
+        return out;
+    }
+    ChatPrompt render_chat_prompt(const Json& body) const {
         if (!tokenizer) throw ApiError(503, "server_error", "tokenizer is unavailable");
         if (config.prepare_chat) return family_call([&] { return config.prepare_chat(body); });
         const auto* messages = body.find("messages");
@@ -696,8 +710,7 @@ struct ApiService::Impl {
             normalized.push(std::move(copy));
         }
         input.messages = normalized;
-        const auto* tool_choice = body.find("tool_choice");
-        const bool tools_off = tool_choice && tool_choice->is_string() && tool_choice->as_string() == "none";
+        const bool tools_off = tool_choice_is_none(body);
         if (const auto* tools = body.find("tools"); tools && tools->is_array() && !tools_off) input.tools = *tools;
         const auto* kwargs = body.find("chat_template_kwargs");
         const auto kwarg = [&](std::string_view key) -> const Json* {
@@ -1344,6 +1357,16 @@ struct ApiService::Impl {
     }
 
     AssistantOutput parsed_output(const Outcome& o, const ChatPrompt& prompt) const {
+        if (o.constraint && (o.constraint->program || o.constraint->thinking)) return parsed_turn(o, prompt);
+        auto parsed = parsed_turn(o, prompt);
+        if (prompt.tools_off) withhold_tool_calls(parsed, withheld_marker(prompt));
+        return parsed;
+    }
+    // The marker the stream splitter holds the text from: with tool_choice "none" the family's withhold marker.
+    const std::string& withheld_marker(const ChatPrompt& prompt) const {
+        return prompt.tools_off && !config.tools_off_marker.empty() ? config.tools_off_marker : config.tool_call_marker;
+    }
+    AssistantOutput parsed_turn(const Outcome& o, const ChatPrompt& prompt) const {
         if (o.family) {
             auto parsed = o.family->parsed;
             parsed.content = o.text; parsed.reasoning = o.reasoning;
@@ -1486,12 +1509,13 @@ struct ApiService::Impl {
             return chunk(std::move(first), Json());
         };
         if (!config.compact_chat_envelope) start_stream();  // existing default event after headers
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         std::int64_t streamed_tool_index=0;
         const auto send_deltas = [&](const std::vector<ChatSplitter::Delta>& deltas) {
             if (!config.compact_chat_envelope && !start_stream()) return false;
             for (const auto& d : deltas) {
                 Json delta = Json::object();
+                if (d.tool_calls.size() && prompt.tools_off) continue;
                 if (d.tool_calls.size()) {
                     auto calls=tool_calls_json(d.tool_calls);
                     for(auto& call:calls.as_array())call.set("index",Json(streamed_tool_index++));
@@ -1502,7 +1526,7 @@ struct ApiService::Impl {
             return true;
         };
         auto outcome = drive(ticket, stops, [&](const std::string& text) {
-                if (!config.timed_completion_envelope) return send_deltas(splitter.push(text));
+                if (!config.timed_completion_envelope || prompt.tools_off) return send_deltas(splitter.push(text));
                 std::vector<ChatSplitter::Delta> one;
                 one.push_back(ChatSplitter::Delta{false,text});
                 return send_deltas(one); },
@@ -1515,7 +1539,8 @@ struct ApiService::Impl {
             finish_entry(entry, outcome);
             return;
         }
-        if (!config.timed_completion_envelope && !outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if ((!config.timed_completion_envelope || prompt.tools_off) && !outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if (prompt.tools_off && outcome.error.empty()) if (const auto held = parsed_output(outcome, prompt).withheld; !held.empty()) send_deltas({{false, held}});
         std::string finish = public_finish(outcome);
         if (!outcome.error.empty()) {
             Json error = Json::object();
@@ -1844,7 +1869,7 @@ struct ApiService::Impl {
             auto p = fields(); p.set("part", part(reasoning, "")); event("response.content_part.added", std::move(p));
         };
         start_stream();  // the first event right after the headers, as before; keepalive comments follow it
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         const auto deltas = [&](const std::vector<ChatSplitter::Delta>& values) {
             if (!start_stream()) return false;
             for (const auto& d : values) {
@@ -1866,6 +1891,7 @@ struct ApiService::Impl {
         const std::string status = spec ? response_status(o) : !o.error.empty() ? "failed" : o.finish == "length" || cut_call(parsed) ? "incomplete" : "completed";
         // items end completed or incomplete; a failure is the response's status
         const std::string item_status = status == "completed" ? "completed" : "incomplete";
+        if (!parsed.withheld.empty() && o.error.empty()) deltas({{false, parsed.withheld}});
         if (pending_scores.size()) deltas({{false, ""}});
         close(item_status);
         if (!saw_message && o.error.empty()) { add(false); close(item_status); }
@@ -2187,7 +2213,7 @@ struct ApiService::Impl {
             event("content_block_start", start);
         };
         start_stream();  // the first event right after the headers, as before; keepalive comments follow it
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         const auto send_deltas = [&](const std::vector<ChatSplitter::Delta>& deltas) {
             if (!start_stream()) return false;
             for (const auto& d : deltas) {
@@ -2217,6 +2243,7 @@ struct ApiService::Impl {
             return;
         }
         if (!outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if (prompt.tools_off && outcome.error.empty()) if (const auto held = parsed_output(outcome, prompt).withheld; !held.empty()) send_deltas({{false, held}});
         bool tools = false;
         if (splitter.saw_tools() || (outcome.family && outcome.family->parsed.tool_calls.size())) {
             const auto parsed = parsed_output(outcome, prompt);

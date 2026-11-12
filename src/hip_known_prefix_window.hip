@@ -819,6 +819,7 @@ struct HipKnownPrefixWindow::Impl {
             if (save != (pair_context.rank == 0U)) throw std::logic_error("pair prefill seam direction mismatch");
             const auto pair_wait_start = std::chrono::steady_clock::now();
             pair_frame = &pair_context.pipe->acquire(pair_context.sequence);
+            if (pair_context.timeline) pair_context.timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_wait, pair_wait_start);
             std::fprintf(stderr, "qwen-pair rank=%u chunk=%llu exposed-seam-wait-ms=%.3f\n", pair_context.rank,
                 static_cast<unsigned long long>(pair_context.sequence),
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_wait_start).count());
@@ -852,8 +853,17 @@ struct HipKnownPrefixWindow::Impl {
         }
         // Fence detached producers before packing a slot. layer-split remains synchronous;
         // pair prefill copies its immutable snapshot on the separate per-slot stream.
+        auto* const pair_timeline = pair_frame ? pair_context.timeline : nullptr;
+        const auto pair_fence_start = pair_timeline ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         check(hipDeviceSynchronize(), "layer-split seam producer fence");
+        if (pair_timeline) pair_timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_fence, pair_fence_start);
+        const auto pair_pack_start = pair_timeline ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto seam_stream = hip_execution_stream();
+        // Pair seam: resolve every row first; a component whose rows sit at one constant device stride is moved
+        // with one strided copy (same bytes, same order on the stream) instead of seam_rows small copies.
+        std::array<std::vector<std::uintptr_t>, 3> seam_rows_at;
+        const bool seam_batched = pair_frame && seam_rows > 1U;
+        if (seam_batched) for (auto& addresses : seam_rows_at) addresses.reserve(seam_rows);
         for (std::uint32_t seam_row = 0; seam_row < seam_rows; ++seam_row) {
             const auto hc_dispatch = hc_context(seam_row);
             const auto inject_dispatch = inject_context(seam_row);
@@ -871,14 +881,35 @@ struct HipKnownPrefixWindow::Impl {
                     throw std::invalid_argument("layer-split seam buffer is smaller than its wire component");
                 auto* seam_host = (pair_frame ? pair_frame->payload.data() : pp_seam_bytes.data()) + seam_offset;
                 auto* seam_device = reinterpret_cast<void*>(seam_source.address);
-                if (pair_frame) pair_frame->staging->copy(save, seam_offset, seam_device, seam_lengths[seam_part]);
+                if (seam_batched) seam_rows_at[seam_part].push_back(seam_source.address);
+                else if (pair_frame) pair_frame->staging->copy(save, seam_offset, seam_device, seam_lengths[seam_part]);
                 else if (save) check(hipMemcpyAsync(seam_host, seam_device, seam_lengths[seam_part], hipMemcpyDeviceToHost, seam_stream), "layer-split save seam");
                 else check(hipMemcpyAsync(seam_device, seam_host, seam_lengths[seam_part], hipMemcpyHostToDevice, seam_stream), "layer-split load seam");
                 seam_offset += seam_lengths[seam_part];
             }
         }
+        if (seam_batched) {
+            const std::array<std::size_t, 3> seam_lengths{
+                qwen_pp::Seam::hc_bytes, qwen_pp::Seam::attention_bytes, qwen_pp::Seam::coefficient_bytes};
+            std::size_t seam_part_offset = 0;
+            for (std::size_t seam_part = 0; seam_part < seam_rows_at.size(); ++seam_part) {
+                const auto& addresses = seam_rows_at[seam_part];
+                const auto length = seam_lengths[seam_part];
+                const auto stride = addresses[1] > addresses[0] ? addresses[1] - addresses[0] : std::uintptr_t{0};
+                bool uniform = stride >= length;
+                for (std::size_t row = 1; uniform && row < addresses.size(); ++row)
+                    uniform = addresses[row] > addresses[row - 1U] && addresses[row] - addresses[row - 1U] == stride;
+                if (uniform) pair_frame->staging->copy_rows(save, seam_part_offset, qwen_pp::Seam::row_bytes,
+                    reinterpret_cast<void*>(addresses[0]), static_cast<std::size_t>(stride), length, addresses.size());
+                else for (std::size_t row = 0; row < addresses.size(); ++row)
+                    pair_frame->staging->copy(save, row * qwen_pp::Seam::row_bytes + seam_part_offset,
+                        reinterpret_cast<void*>(addresses[row]), length);
+                seam_part_offset += length;
+            }
+        }
         if (pair_frame && save) pair_frame->staging->seal(seam_size);
         else check(hipStreamSynchronize(seam_stream), "layer-split seam transfer fence");
+        if (pair_timeline) pair_timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_pack, pair_pack_start);
         const auto seam_payload = pair_frame ? std::span<const std::byte>(pair_frame->payload) : std::span<const std::byte>(pp_seam_bytes);
         if (qwen_pp::dump_enabled()) {
             const auto pp_owner = pair_context.pipe ? (pair_context.rank == 0U ? "pair-r0" : "pair-r1") : "split";

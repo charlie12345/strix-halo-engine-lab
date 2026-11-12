@@ -3,10 +3,12 @@
 #include "pair.hpp"
 #include "gemma4/prefill/pair.hpp"
 #include "gemma4/prefill/prefill.hpp"
+#include "strix/dist/pipeline_timeline.hpp"
 #include "strix/pair/link.hpp"
 #include "strix/pair/regime.hpp"
 #include "xport/hip_pipe_staging.hpp"
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
@@ -84,6 +86,10 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
             throw std::runtime_error("gemma4 pair seam header mismatch (model, profile, cut, prompt or chunk)");
         return std::size_t(h[W::bytes]);
     };
+    // STRIX_PAIR_TIMING=1: per-chunk compute + seam phases on the shared timeline (same columns as Qwen).
+    dist::PipelineTimeline timeline("g4-prefill", unsigned(rank),
+        {"chunk", "d2h-wait", "crc", "wire", "ack-wait", "header-wait", "h2d-wait"});
+    if (timeline.enabled()) { pipe_options.timeline = &timeline; pipe_options.timing = {1, 2, 3, 4, 5, 6}; }
     pair::Pipe pipe(rank, count,
         [&](std::span<const std::byte> data) { link->send(data); },
         [&](std::span<std::byte> data) { link->receive(data); },
@@ -103,19 +109,24 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
         std::size_t processed = 0;
         auto chunks = Json::array();
         const auto start = Clock::now();
+        std::uint64_t step = 0;
         while (const auto n = prompt_chunk_rows(prompt.size(), processed, state->frontier(), chunk)) {
             const auto begin = Clock::now();
             auto tx = state->begin();
             (void)backend.prefill_rows(*tx, prompt.subspan(processed, n), false, false);
             tx->commit(n);
             processed += n;
-            chunks.push(ms(Clock::now() - begin));
+            const auto end = Clock::now();
+            chunks.push(ms(end - begin));
+            if (timeline.enabled()) { timeline.add(step, 0, begin, end); timeline.mark(step, begin, end); }
+            ++step;
         }
         pipe.finish(count);
         pair_json.set("stage_ms", ms(Clock::now() - start)); pair_json.set("chunk_ms", chunks);
         pair_json.set("seal_wait_ms", prefill::pair_stage.seal_ms);
         add_breakdown(pair_json);
         pair_json.set("link_to_done_ms", ms(Clock::now() - linked));
+        timeline.report(ms(Clock::now() - linked));
         auto receipt = Json::object(); receipt.set("pair", pair_json); receipt.set("prompt_tokens", std::uint64_t(prompt.size()));
         emit({}, receipt);
         return 0;
@@ -131,6 +142,7 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
     { auto chunks = Json::array(); for (const auto v : prefill::pair_stage.chunk_ms) chunks.push(v); pair_json.set("chunk_ms", chunks); }
     add_breakdown(pair_json);
     pair_json.set("link_to_done_ms", ms(Clock::now() - linked));
+    timeline.report(ms(Clock::now() - linked));
     receipt.set("pair", pair_json);
     emit(result.ids, receipt);
     return result.status == Status::failed ? 1 : 0;

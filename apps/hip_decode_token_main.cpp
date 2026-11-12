@@ -5672,13 +5672,14 @@ static int run_decode_entry(
 #endif
                 throw std::runtime_error("pair prefill layer range update failed");
             std::fprintf(stderr, "qwen-pair rank=%u cut=%u cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
-                pair_rank, pair_prediction.cut, pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "default"),
+                pair_rank, pair_prediction.cut, pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "measured-default"),
                 static_cast<unsigned long long>(pair_bucket), pair_prediction.a * static_cast<double>(options.tokens.size()),
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
             // Deployment may already have exchanged measured facts and plan IDs on its own link.
             auto pair_link = deployment.pair_link
                 ? std::make_unique<strix::qwen_pp::PairTransport>(std::move(deployment.pair_link))
                 : std::make_unique<strix::qwen_pp::PairTransport>(pair_rank);
+            strix::dist::PipelineTimeline pair_timeline("qwen-prefill", pair_rank, strix::qwen_pp::pair_timing_columns());
             strix::qwen_pp::Pipe pair_pipe(pair_rank,
                 (pair_prompt_size + known_prefill_plan->logical_rows - 1U) / known_prefill_plan->logical_rows,
                 [&](std::span<const std::byte> data) { pair_link->send(data); },
@@ -5689,9 +5690,10 @@ static int run_decode_entry(
                 [](std::span<const std::byte> data) { return strix::dist::crc32c(data); },
                 [&](bool sending, strix::qwen_pp::PipeStaging& staging, std::size_t offset, std::size_t bytes) {
                     return pair_link->piece(sending, staging, offset, bytes);
-                });
+                }, &pair_timeline);
             auto& pair_context = strix::qwen_pp::pipe_context;
-            pair_context = {&pair_pipe, pair_rank, 0U, known_prefill_plan->prefill_execution_identity, pair_prediction.cut};
+            pair_context = {&pair_pipe, pair_rank, 0U, known_prefill_plan->prefill_execution_identity, pair_prediction.cut,
+                pair_timeline.enabled() ? &pair_timeline : nullptr};
             pair_context.identity ^= compiled.execution_identity ^ known_prefill_plan->prefill_kernel_plan_identity;
             for (const char pair_byte : strix::model_content_identity_hex(mapped.file_sha256()))
                 pair_context.identity = (pair_context.identity ^ static_cast<unsigned char>(pair_byte)) * 1099511628211ULL;
@@ -5721,6 +5723,11 @@ static int run_decode_entry(
                     if (!pair_chunks.advance()) break;
                     const auto pair_rows = std::min<std::size_t>(known_prefill_plan->logical_rows, static_cast<std::size_t>(pair_prompt_size) - pair_position);
                     if (pair_rank == 1U) pair_pipe.release(pair_context.sequence);
+                    if (pair_timeline.enabled()) {
+                        const auto pair_chunk_end = std::chrono::steady_clock::now();
+                        pair_timeline.add(pair_context.sequence, strix::qwen_pp::pt_chunk, pair_chunk_start, pair_chunk_end);
+                        pair_timeline.mark(pair_context.sequence, pair_chunk_start, pair_chunk_end);
+                    }
                     std::fprintf(stderr, "qwen-pair rank=%u chunk=%llu position=%llu rows=%llu seam-bytes=%llu chunk-ms=%.3f\n",
                         pair_rank, static_cast<unsigned long long>(pair_context.sequence), static_cast<unsigned long long>(pair_position),
                         static_cast<unsigned long long>(pair_rows), static_cast<unsigned long long>(pair_rows * strix::qwen_pp::Seam::row_bytes),
@@ -5768,6 +5775,10 @@ static int run_decode_entry(
                     pair_rank, static_cast<unsigned long long>(handoff_bytes),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - handoff_start).count(),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - pair_start).count());
+                if (pair_timeline.enabled()) {
+                    pair_timeline.add_since(pair_context.sequence, strix::qwen_pp::pt_handoff, handoff_start);
+                    pair_timeline.mark(pair_context.sequence, handoff_start, std::chrono::steady_clock::now());
+                }
                 if (pair_rank == 0U) pair_decode_logits = std::move(pair_final_logits);
                 pair_context = {};
 #if defined(_WIN32)
@@ -5795,6 +5806,7 @@ static int run_decode_entry(
                     raw_require_identity();
                 });
             }
+            pair_timeline.report(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_start).count());
             std::fprintf(stderr, "qwen-pair rank=%u prefill-wall-ms=%.3f decode=%s\n", pair_rank,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_start).count(),
                 strix::qwen_pp::decode_enabled() ? "rank0" : "out-of-scope");

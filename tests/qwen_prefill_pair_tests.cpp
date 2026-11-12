@@ -47,7 +47,12 @@ struct MockStaging final : strix::qwen_pp::PipeStaging {
 void balance_checks() {
     using namespace strix::qwen_pp;
     LegalCuts legal{}; legal.fill(true);
-    require(parse_cut(nullptr, legal) == 24U);
+    require(parse_cut(nullptr, legal) == measured_default_cut && measured_default_cut == 23U);
+    require(parse_cut("24", legal) == 24U);
+    {
+        LegalCuts no_default = legal; no_default[measured_default_cut] = false;
+        require(parse_cut(nullptr, no_default) == 24U);
+    }
     for (const char* bad : {"0", "48", "-1", "24x", "", " 24"}) {
         bool rejected = false;
         try { (void)parse_cut(bad, legal); } catch (const std::invalid_argument&) { rejected = true; }
@@ -283,9 +288,73 @@ void routed_piece_checks() {
 }
 
 }
+// Default strided seam copy is exactly the per-row copy sequence (offsets, device addresses, lengths).
+void copy_rows_checks() {
+    struct Recorder final : strix::qwen_pp::PipeStaging {
+        std::vector<std::array<std::size_t, 3>> calls;
+        std::span<std::byte> resize(std::size_t) override { return {}; }
+        void copy(bool, std::size_t offset, void* device, std::size_t bytes) override {
+            calls.push_back({offset, reinterpret_cast<std::uintptr_t>(device), bytes});
+        }
+        void seal(std::size_t) override {}
+        void await_piece(std::size_t) override {}
+        void received_piece(std::size_t, std::size_t) override {}
+        void finish_receive() override {}
+    } recorder;
+    std::array<std::byte, 64> device{};
+    recorder.copy_rows(true, 5U, 100U, device.data(), 12U, 7U, 4U);
+    require(recorder.calls.size() == 4U);
+    for (std::size_t row = 0; row < 4U; ++row)
+        require(recorder.calls[row][0] == 5U + row * 100U &&
+            recorder.calls[row][1] == reinterpret_cast<std::uintptr_t>(device.data()) + row * 12U && recorder.calls[row][2] == 7U);
+}
+// Shared pair timeline: OFF records nothing; ON accumulates per step, and the pipe fills its progress columns.
+void timeline_checks() {
+    strix::dist::PipelineTimeline off("t", 0, strix::qwen_pp::pair_timing_columns(), false);
+    off.add_ms(3, strix::qwen_pp::pt_wire, 1.0);
+    require(!off.enabled() && off.measure(0, 0, [] { return 7; }) == 7);
+    strix::dist::PipelineTimeline on("t", 0, strix::qwen_pp::pair_timing_columns(), true);
+    on.add_ms(1, strix::qwen_pp::pt_wire, 1.5); on.add_ms(1, strix::qwen_pp::pt_wire, 0.5);
+    on.add_ms(1, 999U, 1.0); // unknown column ignored
+    std::FILE* file = std::tmpfile(); require(file != nullptr);
+    on.report(10.0, file); std::rewind(file);
+    std::string text; char buffer[512];
+    while (std::fgets(buffer, sizeof buffer, file)) text += buffer;
+    std::fclose(file);
+    require(text.find("step=1 ") != std::string::npos && text.find("step=0 ") == std::string::npos);
+    require(text.find("sum steps=1 wall-ms=10.000") != std::string::npos && text.find(" wire=2.000") != std::string::npos);
+    Wire forward, backward;
+    const auto abort = [&] { forward.stop(); backward.stop(); };
+    strix::dist::PipelineTimeline t0("t", 0, strix::qwen_pp::pair_timing_columns(), true);
+    strix::dist::PipelineTimeline t1("t", 1, strix::qwen_pp::pair_timing_columns(), true);
+    strix::qwen_pp::Pipe producer(0, 3, [&](auto bytes) { forward.send(bytes); }, [&](auto bytes) { backward.receive(bytes); }, abort,
+        24, {}, {}, {}, &t0);
+    strix::qwen_pp::Pipe consumer(1, 3, [&](auto bytes) { backward.send(bytes); }, [&](auto bytes) { forward.receive(bytes); }, abort,
+        24, {}, {}, {}, &t1);
+    std::thread stage_a([&] {
+        for (std::uint64_t sequence = 0; sequence < 3U; ++sequence) {
+            auto& frame = producer.acquire(sequence);
+            frame.header[0] = strix::qwen_pp::Seam::magic; frame.header[1] = sequence; frame.header[41] = 3U;
+            frame.header[2] = sequence * 16U; frame.header[3] = 1U; frame.header[4] = 24U;
+            frame.bytes.assign(strix::qwen_pp::Seam::row_bytes, std::byte{1});
+            producer.release(sequence);
+        }
+        producer.finish(3);
+    });
+    for (std::uint64_t sequence = 0; sequence < 3U; ++sequence) { consumer.acquire(sequence); consumer.release(sequence); }
+    consumer.finish(3);
+    stage_a.join();
+    std::FILE* rows = std::tmpfile(); require(rows != nullptr);
+    t0.report(-1.0, rows); t1.report(-1.0, rows); std::rewind(rows);
+    std::string lines;
+    while (std::fgets(buffer, sizeof buffer, rows)) lines += buffer;
+    std::fclose(rows);
+    for (const char* needle : {"rank=0 step=2 ", "rank=1 step=2 ", "rank=0 sum steps=3", "rank=1 sum steps=3"})
+        require(lines.find(needle) != std::string::npos);
+}
 int main() {
     try {
-        balance_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks();
+        balance_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); timeline_checks(); copy_rows_checks();
         Wire forward, backward;
         std::mutex received_mutex; std::condition_variable received_cv; std::uint64_t received_chunks = 0;
         const auto abort = [&] { forward.stop(); backward.stop(); };

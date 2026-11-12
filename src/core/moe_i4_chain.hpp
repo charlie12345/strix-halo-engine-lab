@@ -156,7 +156,10 @@ template<class Binding> __global__ void fp16_activation_rows(Binding b,const flo
 // GSave: the paired pass-0 gate values (FP32, exact) go to a per-pair global scratch row
 // (gsave[pair*I + col]) instead of registers, so BM128 paired does not spill; the same thread
 // reads its own stores back in pass 1 (program order, L2-resident), no barrier needed.
-template<class Binding,bool Pair,bool GSave=false> struct Chain {
+// Fp16 (paired only): the SwiGLU epilogue stores the down input as FP16 rows (at16[pair*I + col], the
+// values reference_store / fp16_activation_rows write) instead of the A4 image, for a routed down that
+// keeps FP16 activations (gate/up-only INT4 layers). Same activation arithmetic, no quantiser.
+template<class Binding,bool Pair,bool GSave=false,bool Fp16=false> struct Chain {
     static constexpr bool kActive = true;
     static constexpr int kPasses = Pair ? 2 : 1;
     static constexpr uint32_t kPassRow = Pair ? 1 : 0;
@@ -164,6 +167,7 @@ template<class Binding,bool Pair,bool GSave=false> struct Chain {
     Binding b; Weights w;
     uint8_t* aq; float* as;
     float* gsave = nullptr;
+    _Float16* at16 = nullptr;
     unsigned expert = 0;
     __device__ __forceinline__ void bind(unsigned e, int pass, const uint32_t* __restrict__& q, const _Float16*& s, const uint16_t* __restrict__& svh) {
         expert=e;
@@ -186,17 +190,22 @@ template<class Binding,bool Pair,bool GSave=false> struct Chain {
                 #pragma unroll
                 for (unsigned j=0;j<4;++j) { if constexpr (GSave) g[j]=gp[32*j]; else g[j]=saved[unsigned(slot)*4+j]; }
                 EpiloguePolicy<Binding>{b}.activation(expert,col,g,v,a);
-                iu4_quant128(a,aq+size_t(pair)*(Binding::I/2),as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
+                if constexpr (Fp16) {
+                    _Float16* row=at16+size_t(pair)*Binding::I+col+(threadIdx.x&31U);
+                    #pragma unroll
+                    for (unsigned j=0;j<4;++j) row[32*j]=_Float16(a[j]);
+                } else iu4_quant128(a,aq+size_t(pair)*(Binding::I/2),as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
             }
         } else EpiloguePolicy<Binding>{b}.contribution(pair,col,v);
     }
 };
-template<int Plan,bool Pair,bool GSave,class Binding> hipError_t launch(const Binding& b,const Weights& w,
+template<int Plan,bool Pair,bool GSave,class Binding,bool Fp16=false> hipError_t launch(const Binding& b,const Weights& w,
     const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,const uint8_t* gq,const float* gs,
-    uint8_t* aq,float* as,float* gsave,hipStream_t stream) {
+    uint8_t* aq,float* as,float* gsave,hipStream_t stream,_Float16* at16=nullptr) {
+    static_assert(!Fp16 || Pair, "FP16 down input is the paired epilogue's output");
     constexpr auto c=iu4_tiles[Plan];
     using G=wmma_tiled::Geometry<c.bm,c.bn,c.wm,c.wn,PackedIU4>;
-    using C=Chain<Binding,Pair,GSave>;
+    using C=Chain<Binding,Pair,GSave,Fp16>;
     wmma_tiled::GroupedArgs gp; gp.tiles=tiles; gp.ntiles=ntiles; gp.col_scale=w.svh[0]; gp.map=b.map();
     // Paired: A is the pre-quantised gate/up image gq/gs, row 2*pair+pass (pass offset via kPassRow).
     // Down: A is the down image aq/as written by the paired epilogue, row = pair.
@@ -210,7 +219,7 @@ template<int Plan,bool Pair,bool GSave,class Binding> hipError_t launch(const Bi
     if (status!=hipSuccess) return status;
     if (attr.localSizeBytes || blocks*G::waves<4) return hipErrorNotSupported;
     kernel<<<dim3(max_tiles*(N/c.bn)),G::threads,0,stream>>>(reinterpret_cast<const uint32_t*>(w.q[0]),nullptr,nullptr,
-        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? gq : aq,Pair ? gs : as,w.s[0],nullptr,gp,{},C{b,w,aq,as,gsave});
+        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? gq : aq,Pair ? gs : as,w.s[0],nullptr,gp,{},C{b,w,aq,as,gsave,at16});
     return hipGetLastError();
 }
 // gsave != nullptr (paired only): pass-0 gate values go to global scratch (pairs*I floats),
@@ -229,6 +238,23 @@ template<bool Pair,class Binding> hipError_t launch(int plan,const Binding& b,co
         case 1:return launch<1,Pair,false>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,nullptr,stream);
         case 2:return launch<2,Pair,false>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,nullptr,stream);
         default:return hipErrorInvalidValue;
+    }
+}
+// Paired gate/up whose epilogue writes the FP16 down input rows at16[pair*I] (no A4 image, no down call):
+// one kernel reads the gate and up INT4 weights and applies the SwiGLU/down-transform epilogue.
+template<class Binding> hipError_t launch_paired_fp16(int plan,const Binding& b,const Weights& w,
+    const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,const uint8_t* gq,const float* gs,
+    _Float16* at16,hipStream_t stream,float* gsave=nullptr) {
+    if (gsave) switch(plan) {
+        case 0:return launch<0,true,true,Binding,true>(b,w,tiles,ntiles,max_tiles,gq,gs,nullptr,nullptr,gsave,stream,at16);
+        case 1:return launch<1,true,true,Binding,true>(b,w,tiles,ntiles,max_tiles,gq,gs,nullptr,nullptr,gsave,stream,at16);
+        case 2:return launch<2,true,true,Binding,true>(b,w,tiles,ntiles,max_tiles,gq,gs,nullptr,nullptr,gsave,stream,at16);
+        default:return hipErrorInvalidValue;
+    }
+    switch(plan) {
+        case 0:return launch<0,true,false,Binding,true>(b,w,tiles,ntiles,max_tiles,gq,gs,nullptr,nullptr,nullptr,stream,at16);
+        case 1:return launch<1,true,false,Binding,true>(b,w,tiles,ntiles,max_tiles,gq,gs,nullptr,nullptr,nullptr,stream,at16);
+        default:return hipErrorInvalidValue;  // register save: BM64 max
     }
 }
 } // namespace strix::core::moe_i4

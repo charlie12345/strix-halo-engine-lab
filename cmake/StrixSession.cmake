@@ -21,6 +21,14 @@ function(strix_session_warnings target)
     endif()
 endfunction()
 
+# Host fixtures are written densely; keep their style out of the error set
+# while every other warning stays an error.
+function(strix_session_test_style target)
+    if(NOT MSVC)
+        target_compile_options(${target} PRIVATE -Wno-misleading-indentation -Wno-unused-function)
+    endif()
+endfunction()
+
 add_library(strix_session STATIC
     "${_strix_session_root}/src/session/backend_cpu.cpp"
     "${_strix_session_root}/src/session/kv.cpp"
@@ -49,6 +57,7 @@ function(strix_session_add_contract_tests)
         add_executable(session_${test}_tests "${_strix_session_root}/tests/session_${test}_tests.cpp")
         target_link_libraries(session_${test}_tests PRIVATE strix_session)
         strix_session_warnings(session_${test}_tests)
+        strix_session_test_style(session_${test}_tests)
         if(MSVC)
             target_compile_options(session_${test}_tests PRIVATE /UNDEBUG)
         else()
@@ -73,6 +82,7 @@ function(strix_session_add_runtime)
             add_executable(session_${test}_tests "${_strix_session_root}/tests/session_${test}_tests.cpp")
             target_link_libraries(session_${test}_tests PRIVATE strix_session_shell)
             strix_session_warnings(session_${test}_tests)
+            strix_session_test_style(session_${test}_tests)
             add_test(NAME session_${test} COMMAND session_${test}_tests "${_strix_session_root}")
             set_tests_properties(session_${test} PROPERTIES LABELS "cpu;session" TIMEOUT 30)
         endforeach()

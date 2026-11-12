@@ -13,6 +13,7 @@
 #include "core/wmma_tiled.hpp"  // shared tiled core: grouped IU4 kernel and convert_exl3_iu4 (strix_tiled_core)
 #endif
 #include "moe_core/device_plan.hpp"
+#include "strix/env_flags.hpp"
 
 
 #include <algorithm>
@@ -634,6 +635,7 @@ int g_mtfit_override = -1;
 int g_core8_override = -1;
 int g_pipe_override = -1;
 int g_pipe_pair_override = -1;
+int g_dense_band_override = -1;
 int g_tail_stream_override = -1;
 int g_gufuse_override = -1;
 int g_gather_tok_override = -1;
@@ -698,6 +700,17 @@ int prefill_pipe_pair_default() {  // 2 = auto
 bool prefill_pipe_pair(unsigned rows) {
     const int mode = g_pipe_pair_override < 0 ? prefill_pipe_pair_default() : g_pipe_pair_override;
     return mode == 1 || (mode == 2 && rows >= kPairMinRows);
+}
+// STRIX_MMX_PREFILL_DENSE_BAND (dense linears under PIPE): 0 (default) = MT8 PIPE CTAs, 4 / 8 = tall bands of that many
+// waves over 512 / 1024 rows (one weight decode per band); rows beyond the last full band keep PIPE / the tail. Same bits.
+int prefill_dense_band_default() {
+    static const int value = static_cast<int>(
+        4 * strix::env_choice("STRIX_MMX_PREFILL_DENSE_BAND", 0, {"0", "4", "8"}));  // 0 / 4 / 8
+    return value;
+}
+unsigned prefill_dense_band() {
+    if (prefill_pipe() == 0) return 0;
+    return static_cast<unsigned>(g_dense_band_override < 0 ? prefill_dense_band_default() : g_dense_band_override);
 }
 
 // STRIX_MMX_PREFILL_TAIL_STREAM (v4 + mtfit): 1 (default) = the tail-class launches (MT 1..7) of each stage run on a side
@@ -866,6 +879,16 @@ void launch_pipe_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipS
         hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else
         hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+}
+
+template <int W>
+void launch_band_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream) {
+    if (prefill_pipe() == 2)
+        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, true>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
+    else if (prefill_p1_packed())
+        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, false, true>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
+    else
+        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, false, false>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
 }
 
 void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false) {
@@ -1471,6 +1494,12 @@ void set_prefill_pipe_pair(int value) {
     (void)prefill_pipe_pair_default();  // capture once, including at Engine startup
     g_pipe_pair_override = value;
 }
+void set_prefill_dense_band(int value) {
+    if (value != -1 && value != 0 && value != 4 && value != 8)
+        throw std::invalid_argument("set_prefill_dense_band: value must be -1, 0, 4 or 8");
+    (void)prefill_dense_band_default();  // capture once, including at Engine startup
+    g_dense_band_override = value;
+}
 void set_prefill_pipe(int value) {
     if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_pipe: value must be -1, 0, 1 or 2");
     (void)prefill_pipe_default();
@@ -1730,8 +1759,8 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
 }
 
 namespace {
-// Item list of one dense call: at most kMaxDenseJobs jobs x (main + tail) items.
-constexpr std::size_t kDenseItems = 2 * kMaxDenseJobs;
+// Item list of one dense call: at most kMaxDenseJobs jobs x (bands + main + tail) items.
+constexpr std::size_t kDenseItems = 3 * kMaxDenseJobs;
 struct DensePlan {
     unsigned k = 0, tpad = 0;
     unsigned splits[kMaxDenseJobs] = {};
@@ -1801,8 +1830,10 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
     if (x == nullptr || workspace == nullptr || workspace_bytes < p.bytes)
         throw std::invalid_argument("minimax prefill dense: null input or workspace too small");
     auto* ws = static_cast<unsigned char*>(workspace);
-    std::vector<pfk::Item> lists[8];
-    unsigned ctas[8] = {};
+    constexpr unsigned kBandClass = 8;  // tall bands (STRIX_MMX_PREFILL_DENSE_BAND), beside the eight row-tile classes
+    const unsigned band = prefill_dense_band();
+    std::vector<pfk::Item> lists[kBandClass + 1];
+    unsigned ctas[kBandClass + 1] = {};
     for (unsigned m = 0; m < count; ++m) {
         const Exl3& w = jobs[m].w;
         pfk::Item it{};
@@ -1823,13 +1854,19 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
             lists[c].push_back(it);
         };
         const auto fit = route::mtfit(rows);  // the production v4 + mtfit item shapes
-        if (fit.main != 0) emit(7, 0, fit.main);
+        const unsigned banded = band != 0 ? fit.main / band * band : 0U;  // 128-row tiles in full bands
+        if (banded != 0) {
+            it.gx = w.output / 32;
+            emit(kBandClass, 0, banded / band);
+            it.gx = w.output / 128;
+        }
+        if (fit.main != banded) emit(7, banded * 128, fit.main - banded);
         if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
     }
     std::lock_guard<std::mutex> staging(g_dense_mutex);
     DenseSlot& slot = next_dense_slot();
-    unsigned at[8] = {}, used = 0;
-    for (unsigned c = 0; c < 8; ++c) {
+    unsigned at[kBandClass + 1] = {}, used = 0;
+    for (unsigned c = 0; c <= kBandClass; ++c) {
         at[c] = used;
         for (const pfk::Item& it : lists[c]) slot.host[used++] = it;
     }
@@ -1854,6 +1891,11 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
     }
     hipLaunchKernelGGL(dense_transform_kernel, dim3((rows * (p.k / 128) + 7) / 8), dim3(256), 0, stream, x, a);
     launched("dense transform");
+    if (!lists[kBandClass].empty()) {
+        const auto n = static_cast<unsigned>(lists[kBandClass].size());
+        if (band == 8) launch_band_class<8>(items_d + at[kBandClass], n, ctas[kBandClass], stream);
+        else launch_band_class<4>(items_d + at[kBandClass], n, ctas[kBandClass], stream);
+    }
     for (unsigned c = 0; c < 8; ++c)
         if (!lists[c].empty()) launch_class(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
     launched("dense v4");

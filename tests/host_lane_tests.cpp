@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -228,9 +229,15 @@ void lane_pins_to_declared_cores() {
             "background threads must stay off the critical core");
 #endif
 }
+volatile std::sig_atomic_t load_stop = 0;
+extern "C" void stop_load(int) { load_stop = 1; }
+
 // --load SECONDS THREADS CAP_GBPS [BUFFER_MIB]: background lane jobs that read memory under the byte budget with
-// decode marked active (CAP_GBPS 0: uncapped). Prints the achieved rate; a load generator, not a test.
+// decode marked active (CAP_GBPS 0: uncapped). Stops after SECONDS or on SIGTERM/SIGINT and prints the achieved rate;
+// a load generator, not a test.
 int load(double seconds, unsigned threads, double cap_gbps, std::size_t buffer_mib) {
+    std::signal(SIGTERM, stop_load);
+    std::signal(SIGINT, stop_load);
     HostLaneConfig config;
     config.critical_threads = 0;
     config.background_threads = threads;
@@ -245,9 +252,9 @@ int load(double seconds, unsigned threads, double cap_gbps, std::size_t buffer_m
         jobs.push_back(lane.submit(HostPriority::background, [&, t] {
             std::vector<std::uint64_t> buffer(buffer_mib * (std::size_t{1} << 17U), 0x9E3779B97F4A7C15ULL * (t + 1U));
             const std::uint64_t total = buffer.size() * sizeof(std::uint64_t);
-            while (Clock::now() < until)
+            while (Clock::now() < until && !load_stop)
                 strix::core::governed_slices(lane.budget(), total, std::uint64_t{4} << 20U, [&](std::uint64_t offset, std::uint64_t length) {
-                    if (Clock::now() >= until) return;
+                    if (Clock::now() >= until || load_stop) return;
                     std::uint64_t x = 0;
                     const std::uint64_t* p = buffer.data() + offset / sizeof(std::uint64_t);
                     for (std::uint64_t i = 0; i < length / sizeof(std::uint64_t); ++i) x ^= p[i];

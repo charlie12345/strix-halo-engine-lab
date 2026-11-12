@@ -4568,6 +4568,25 @@ by the IOMMU.
 - **Measured gain:** Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within +/-1 % with one node on PerfOpt, both-node run pending
 - **Implementation / evidence:** [driver repo: PerfOpt](https://github.com/hyukudan/strix-halo-usb4-driver/blob/main/docs/PERFOPT.md)
 
+<a id="platform-power-receipt"></a>
+
+### Shared power and energy receipt
+
+**Engine:** platform. **Control:** `STRIX_POWER_SAMPLER`. **Default:** ON when a power source is readable.
+
+One host sampler thread reads what the machine exposes without elevated rights (amdgpu hwmon power, clock and
+temperature; the powercap package energy counter when readable; cpufreq) and every engine reports the same block,
+`strix-power-receipt-v1`: `energy_j`, `avg_w`, `peak_w` and `tok_per_j` for prefill and decode, the median GPU
+clock, the maximum temperature, the sample count and the sources used. See
+[engine/power-receipt.md](engine/power-receipt.md).
+
+- **Preconditions:** A readable source. A missing or unreadable source is reported as unavailable with the reason; the run continues.
+- **Automatic selection:** Started by the device gate and by the HTTP server; an engine adds nothing.
+- **Fallback notice:** `"available":false` with the reason per source in the receipt block.
+- **Exactness evidence:** Host-only measurement: no device call, no arithmetic. Qwen 8K prefill, sampler on vs off: logits file and generated tokens byte-identical.
+- **Measured:** Measurement, not a speed lever: makes tok/J comparable across engines and runs.
+- **Off switch:** `STRIX_POWER_SAMPLER=0`.
+
 <a id="qwen-moe-route-bf16"></a>
 
 ### MoE route output BF16 storage candidate

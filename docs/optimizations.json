@@ -2986,6 +2986,17 @@
     "doc_anchor": "docs/optimizations.md#platform-perfopt"
   },
   {
+    "engine": "platform",
+    "name": "Shared power and energy receipt",
+    "flag_or_env": "STRIX_POWER_SAMPLER",
+    "default": "ON when a power source is readable (sampler thread at 100 ms, STRIX_POWER_SAMPLE_MS); every engine CLI and the server report the block strix-power-receipt-v1",
+    "exact": "Host-only measurement: no device call, no arithmetic. Qwen 8K prefill, sampler on vs off: logits file and generated tokens byte-identical.",
+    "gain": "Measurement, not a speed lever: makes tok/J comparable across engines and runs.",
+    "preconditions": "A readable source: amdgpu hwmon (power, clock, temperature), a readable powercap package energy counter, cpufreq. A missing or unreadable source is reported as unavailable with the reason; the run continues.",
+    "off_switch": "STRIX_POWER_SAMPLER=0",
+    "doc_anchor": "docs/optimizations.md#platform-power-receipt"
+  },
+  {
     "engine": "minimax",
     "name": "Nested short-prompt admission",
     "flag_or_env": "STRIX_MM_SERVE_NEST; /admin/sched nest",

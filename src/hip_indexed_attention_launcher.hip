@@ -1035,9 +1035,10 @@ void linear_prefetch8_wave8_q8_float_to_bf16_kernel(
     }
 }
 
-// Shared by the C1 kernel and its known-window rows wrapper (one row per grid.y).
+// RMS norm + partial RoPE of one head (one block, one thread per feature); the callers choose the head.
 template <SmallWeightKind Kind, class... Source>
-__device__ __forceinline__ void norm_rope_body(
+__device__ __forceinline__ void norm_rope_head_body(
+    std::uint32_t head,
     float* values,
     std::uint32_t head_count,
     std::uint32_t head_dim,
@@ -1060,9 +1061,6 @@ __device__ __forceinline__ void norm_rope_body(
         __syncthreads();
         if (graph_reject != 0) return;
     }
-    const auto head =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
     const auto feature =
         static_cast<std::uint32_t>(
             threadIdx.x);
@@ -1197,6 +1195,15 @@ __device__ __forceinline__ void norm_rope_body(
         return;
     }
     values[index] = rounded;
+}
+
+// One head per block (grid.x): the C1 kernel and its known-window rows wrapper.
+template <SmallWeightKind Kind, class... Source>
+__device__ __forceinline__ void norm_rope_body(float* values, std::uint32_t head_count, std::uint32_t head_dim,
+    std::uint32_t head_stride, const void* norm_weights, float epsilon, std::uint32_t rotary_dim, float theta,
+    std::uint64_t position, GraphPositionKernelArguments dynamic, Source... rotary_source) {
+    norm_rope_head_body<Kind, Source...>(static_cast<std::uint32_t>(blockIdx.x), values, head_count, head_dim, head_stride,
+        norm_weights, epsilon, rotary_dim, theta, position, dynamic, rotary_source...);
 }
 
 template <SmallWeightKind Kind, class... Source>
@@ -4274,7 +4281,46 @@ __global__ void norm_rope_rows_kernel(QsaRowsNormViews<Rows> views, std::uint32_
         epsilon, rotary_dim, theta, views.position[blockIdx.y], GraphPositionKernelArguments{}, rotary_source...);
 }
 
+// Known-window rows (Rows <= 8): the index-q, q and k norm/RoPE of a QSA layer in one launch. Grid (heads of the three
+// sets, Rows); every block runs norm_rope_head_body for its (set, head, row), so each value is the separate launches' value.
+template <unsigned Rows> struct QsaRowsNormSetViews {
+    float* values[3][Rows];
+    std::uint64_t position[Rows];
+    const void* weights[3];
+    std::uint32_t first[4]; // set s owns blocks [first[s], first[s + 1])
+    std::uint32_t dim[3], stride[3];
+};
+template <SmallWeightKind Kind, unsigned Rows, class... Source>
+__global__ void norm_rope_rows_sets_kernel(QsaRowsNormSetViews<Rows> views, float epsilon, std::uint32_t rotary_dim, float theta,
+    Source... rotary_source) {
+    const auto block = static_cast<std::uint32_t>(blockIdx.x);
+    const unsigned set = block < views.first[1] ? 0U : block < views.first[2] ? 1U : 2U;
+    norm_rope_head_body<Kind, Source...>(block - views.first[set], views.values[set][blockIdx.y],
+        views.first[set + 1U] - views.first[set], views.dim[set], views.stride[set], views.weights[set], epsilon, rotary_dim,
+        theta, views.position[blockIdx.y], GraphPositionKernelArguments{}, rotary_source...);
+}
+
 #include "hip_qsa_prefill_stages.inc"
+
+// Known-window rows with kv-int8-tok-v1 storage: the raw index key append (store_rows_kernel's statements, blocks
+// [0, index_blocks)) and the int8 K/V append (store_rows_kv_int8_kernel's blocks, after them) in one launch.
+template <unsigned Rows>
+__global__ void store_rows_index_kv_int8_kernel(QsaRowsStoreViews<Rows> views, std::uint16_t* raw_state, void* kv_state,
+    std::uint32_t index_dim, std::uint32_t index_blocks, std::uint32_t kv_width, std::uint32_t kv_heads, std::uint32_t head_dim) {
+    const auto r = blockIdx.y;
+    const auto block = static_cast<std::uint32_t>(blockIdx.x);
+    if (block < index_blocks) {
+        const auto feature = block * blockDim.x + threadIdx.x;
+        if (feature >= index_dim) return;
+        const auto bits = float_to_bf16(views.index_key[r][feature]);
+        raw_state[views.position[r] * static_cast<std::uint64_t>(index_dim) + feature] = bits;
+        if (views.journal) views.journal[static_cast<std::uint64_t>(r) * index_dim + feature] = bits;
+        return;
+    }
+    const auto slot = block - index_blocks, half = slot / kv_heads;
+    kv_int8_store_head(half ? views.v[r] : views.k[r], kv_state, views.position[r], kv_width, kv_heads, half, slot % kv_heads,
+        head_dim);
+}
 
 // kv-int8-tok-v1 rows append: grid (kv_heads, 2, Rows), block (h, half, r) quantizes KV head
 // h of row r's K (half 0) or V (half 1) with the decode writer's statements.
@@ -5817,6 +5863,12 @@ bool qsa_norm_group_enabled() {
     static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_NORM_GROUP"); return v && v[0] == '1'; }();
     return !qpf2k::suppressed(qpf2k::Item::norm_group) && enabled;
 }
+// Known-window rows (Rows <= 8): one norm/RoPE launch for the index-q, q and k heads and, with int8 KV storage, one
+// append launch (same values). STRIX_QSA_WINDOW_FUSED=0 restores the separate launches.
+bool qsa_window_fused_enabled() {
+    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_FUSED"); return !(v && v[0] == '0'); }();
+    return enabled && !known_window_cohort_feature_off("qsafused"); // in-process A/B: STRIX_COHORT_AB_OFF=qsafused
+}
 // ggml type of a weight kind (GSQ dense A8 typed segments).
 std::uint32_t kind_ggml_type(WeightKind kind) {
     return kind == WeightKind::q8_0 ? 8U : kind == WeightKind::iq4_xs ? 23U : ggml_type_of(kind);
@@ -6483,6 +6535,37 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             norm_grouped = true;
         }
     }
+    if constexpr (Rows <= 8U) if ((subparts & 1U) && qsa_window_fused_enabled()) {
+        const std::array<const TensorPair*, 3> set_tensors{&tensors.index_q_norm, &tensors.q_norm, &tensors.k_norm};
+        const std::array<float* WorkspacePointers::*, 3> set_targets{&WorkspacePointers::index_query, &WorkspacePointers::q_gate,
+            &WorkspacePointers::current_k};
+        const std::array<std::uint32_t, 3> set_heads{skip_index_q || cache_only ? 0U : index_heads, cache_only ? 0U : a.attention_heads,
+            a.kv_heads}, set_dims{a.index_dim, a.head_dim, a.head_dim}, set_strides{a.index_dim, a.head_dim * 2U, a.head_dim};
+        const auto type = set_tensors[0]->manifest->ggml_type;
+        // One set left (cache-only) is already one launch.
+        bool fits = set_heads[0] + set_heads[1] != 0U;
+        for (unsigned s = 0; s < 3U; ++s) fits = fits && set_tensors[s]->manifest->ggml_type == type;
+        if (fits) {
+            QsaRowsNormSetViews<Rows> sets{};
+            std::uint32_t block_dim = 0;
+            for (unsigned s = 0; s < 3U; ++s) {
+                for (unsigned r = 0; r < Rows; ++r) sets.values[s][r] = prepared.row[r].workspace.*set_targets[s];
+                sets.weights[s] = reinterpret_cast<const void*>(set_tensors[s]->runtime->address);
+                sets.first[s + 1U] = sets.first[s] + set_heads[s]; sets.dim[s] = set_dims[s]; sets.stride[s] = set_strides[s];
+                if (set_heads[s] != 0U) block_dim = std::max(block_dim, set_dims[s]);
+            }
+            for (unsigned r = 0; r < Rows; ++r) sets.position[r] = prepared.position[r];
+            dispatch_small_kind(type, [&](auto kind) {
+                with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_sets_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>),
+                        dim3(sets.first[3], Rows), dim3(block_dim), 2ULL * block_dim * sizeof(float), stream, sets,
+                        model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
+                });
+            });
+            check_hip(hipGetLastError(), "QSA known-window fused norm/rope launch");
+            norm_grouped = true;
+        }
+    }
     if ((subparts & 1U) && !norm_grouped) {
     if (!skip_index_q && !cache_only) norm(tensors.index_q_norm, &WorkspacePointers::index_query, index_heads, a.index_dim, a.index_dim, false);
     // Without the index norm the q norm is the barrier-ordered one (it follows the input projections).
@@ -6500,7 +6583,16 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     store.journal = prepared.journal;
     const bool kv_int8 = model.attention_kv_storage == AttentionKvStorage::int8_token;
     const auto bf16_kv_width = kv_int8 ? 0U : a.kv_width; // 0: store_rows_kernel writes only the raw index keys
-    if (subparts & 2U) {
+    bool stored = false;
+    if constexpr (Rows <= 8U) if ((subparts & 2U) && kv_int8 && qsa_window_fused_enabled()) {
+        const auto index_blocks = (a.index_dim + kThreads - 1U) / kThreads;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_index_kv_int8_kernel<Rows>), dim3(index_blocks + 2U * a.kv_heads, Rows),
+            dim3(kThreads), 0, stream, store, reinterpret_cast<std::uint16_t*>(a.raw_state.address),
+            reinterpret_cast<void*>(a.kv_state.address), a.index_dim, index_blocks, a.kv_width, a.kv_heads, a.head_dim);
+        check_hip(hipGetLastError(), "QSA known-window raw-index/int8 KV append");
+        stored = true;
+    }
+    if ((subparts & 2U) && !stored) {
     hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3((std::max(bf16_kv_width, a.index_dim) + kThreads - 1U) / kThreads, Rows),
         dim3(kThreads), 0, stream, store, reinterpret_cast<std::uint16_t*>(a.raw_state.address),
         reinterpret_cast<std::uint16_t*>(a.kv_state.address), a.index_dim, bf16_kv_width);

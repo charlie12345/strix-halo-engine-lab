@@ -27,9 +27,10 @@ std::string lower(std::string_view text) {
 }
 bool hex(char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }
 
-const Table& table(const Value& v, const std::string& key) {
+// The key is taken by value: a reference parameter bound to a temporary makes GCC flag the returned reference.
+const Table& table(const Value& v, std::string_view key) {
     if (const auto* t = std::get_if<Table>(&v.data)) return *t;
-    bad(key, "expected a table");
+    bad(std::string(key), "expected a table");
 }
 std::string string(const Value& v, const std::string& key) {
     if (const auto* s = std::get_if<std::string>(&v.data)) return *s;

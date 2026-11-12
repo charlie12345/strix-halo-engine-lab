@@ -747,6 +747,18 @@ endif()
 strix_target_warnings(strix_serve)
 strix_session_add_runtime()
 
+# Example family for docs/adding-an-engine.md: served by the shared shell with the CPU reference backend.
+add_executable(strix-skeleton-serve examples/skeleton_engine/main.cpp)
+target_link_libraries(strix-skeleton-serve PRIVATE strix_session_shell)
+strix_target_warnings(strix-skeleton-serve)
+if(BUILD_TESTING)
+    add_executable(skeleton_engine_tests tests/skeleton_engine_tests.cpp)
+    target_link_libraries(skeleton_engine_tests PRIVATE strix_session_shell)
+    strix_target_warnings(skeleton_engine_tests)
+    add_test(NAME skeleton_engine COMMAND skeleton_engine_tests "${CMAKE_CURRENT_SOURCE_DIR}/examples/skeleton_engine")
+    set_tests_properties(skeleton_engine PROPERTIES LABELS "cpu;session" TIMEOUT 30)
+endif()
+
 add_executable(strix-tokenize apps/tokenize_main.cpp)
 target_link_libraries(strix-tokenize PRIVATE strix_serve)
 strix_target_warnings(strix-tokenize)

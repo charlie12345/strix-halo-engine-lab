@@ -427,7 +427,11 @@ public:
     }
     // SHA-256 of the state a session holds after `position` prompt rows: every row component's rows
     // [0, position - shift) and every fixed range (diagnostic, STRIX_PREFIX_CACHE_DIGEST=1).
-    [[nodiscard]] ModelContentIdentity state_digest(std::uint64_t position,std::optional<std::uint64_t> predictor={}) {
+    // target_only: the target components alone (those registered before any add_rows / add_fixed_device
+    // extension). That digest is a function of the committed tokens only; the proposer extensions also
+    // record how the request was split into cycles (see docs/engine/speculative/mtp-depth-controller.md).
+    [[nodiscard]] ModelContentIdentity state_digest(std::uint64_t position,std::optional<std::uint64_t> predictor={},
+        bool target_only=false) {
         check(hipDeviceSynchronize(), "prefix digest fence");
         std::vector<std::byte> frame;
         std::vector<std::byte> chunk;
@@ -439,11 +443,15 @@ public:
             frame.insert(frame.end(), reinterpret_cast<const std::byte*>(digest.bytes.data()),
                 reinterpret_cast<const std::byte*>(digest.bytes.data()) + 32);
         };
-        for (const auto& row : rows_) {
+        const auto row_count = target_only ? target_rows_ : rows_.size();
+        const auto fixed_count = target_only ? target_fixed_ : fixed_.size();
+        for (std::size_t j = 0; j < row_count; ++j) {
+            const auto& row = rows_[j];
             const auto count = predictor && row.shift ? *predictor : position > row.shift ? position - row.shift : 0U;
             if (count) append(reinterpret_cast<const void*>(row.address), count * row.bytes, true);
         }
-        for (const auto& fixed : fixed_) append(reinterpret_cast<const void*>(fixed.address), fixed.bytes, fixed.device);
+        for (std::size_t j = 0; j < fixed_count; ++j)
+            append(reinterpret_cast<const void*>(fixed_[j].address), fixed_[j].bytes, fixed_[j].device);
         return sha256_bytes(frame);
     }
     // Cross-route numerical digest: frozen target registry, occupied ranges,

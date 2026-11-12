@@ -140,6 +140,8 @@ public:
         stats.sampling = job.constraint && job.constraint->transform.active() ? "greedy-logit-transform-v1" : "greedy";
         if (!result.final_state_digest.empty()) {
             stats.engine_extra.push_back({"final_state_digest", "\"" + result.final_state_digest + "\""});
+            if (!result.final_target_state_digest.empty())
+                stats.engine_extra.push_back({"final_target_state_digest", "\"" + result.final_target_state_digest + "\""});
             stats.engine_extra.push_back({"final_state_position", std::to_string(result.final_state_position)});
             if (!result.final_state_components.empty()) stats.engine_extra.push_back({"final_state_components", result.final_state_components});
         }
@@ -526,6 +528,8 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 stats.engine_extra.push_back({"shared_execution",result.shared_execution.json()});
                 if(!result.final_state_digest.empty()) {
                     stats.engine_extra.push_back({"final_state_digest","\""+result.final_state_digest+"\""});
+                    if(!result.final_target_state_digest.empty())
+                        stats.engine_extra.push_back({"final_target_state_digest","\""+result.final_target_state_digest+"\""});
                     if(!result.final_state_components.empty()) stats.engine_extra.push_back({"final_state_components",result.final_state_components});
                     stats.engine_extra.push_back({"final_state_position",std::to_string(result.final_state_position)});
                 }

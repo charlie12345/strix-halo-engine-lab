@@ -1,6 +1,9 @@
 #include "strix/session/backend_hip.hpp"
 
 #include <hip/hip_runtime.h>
+#ifdef STRIX_SESSION_DEVICE_GATE
+#include "strix/device/hip_gate.hpp"
+#endif
 #ifdef STRIX_SESSION_HIP_ADD
 #include "strix/ds41_shexp_tp.hpp"
 #endif
@@ -93,6 +96,10 @@ struct HipBackend::State {
     void healthy() const { if (failed) throw std::runtime_error("HIP backend completion is unknown"); }
 };
 HipBackend::HipBackend(std::size_t budget_bytes) : state_(std::make_shared<State>()) {
+#ifdef STRIX_SESSION_DEVICE_GATE
+    // Start gate: the backend only ever runs on the declared device (a no-op when the main already bound it).
+    (void)strix::device::bind_hip();
+#endif
     check(hipGetDevice(&state_->device), "HIP bind device");
     state_->limit = budget_bytes;
 #ifdef STRIX_SESSION_HIP_ADD

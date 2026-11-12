@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -54,6 +55,8 @@
 #include "hip_q6p_weights.hpp"
 #include "strix/q6p_registry.hpp"
 #include "strix/hip_gsq_a8_groups.hpp"
+#include "moe_core/dense_a8_small_layout.hpp"
+#include "strix/known_window_cohort.hpp"
 
 namespace strix {
 // Launches that drop the AQL barrier bit for kernels proven independent of the one queued
@@ -1838,6 +1841,8 @@ template <class Site> void launch_dense_a8_gsq(const Site& site, const DenseA8Sl
 // scratch slot (any-order when the caller allows it; it writes only the slot no queued
 // projection reads) and one barrier-ordered projection launch (dot4 rows <= 8, WMMA
 // 16/32/64).
+#include "moe_core/dense_a8_small.inc"
+
 template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream, bool any_order) {
     static_assert(Site::rows <= 8U || (Site::rows % 16U == 0U && Site::rows <= kDenseA8WideRows));
     if constexpr (dense_a8_width_of<Site>())
@@ -1868,6 +1873,20 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
     // Rows <= 8 read the segments' Q6P32 copies when every one has a copy (same bits).
     Site q6 = site;
     const bool use_q6 = Site::rows <= 8U && q6_site(site, q6);
+    if constexpr (Site::rows >= 2U && Site::rows <= 8U) {
+        if (dense_a8_small_enabled()) {
+            const auto slot = dense_a8_slot(a8_family_of<Site>());
+            const auto items = Site::rows * (site.width / 8U);
+            // Match the existing direct path: the dependent projection is ordered.
+            if (any_order)
+                hipExtLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
+                    dim3(kThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site, slot.codes, slot.deltas);
+            else hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
+                dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
+            launch_dense_a8_small(site, slot, stream);
+            return;
+        }
+    }
     if constexpr (Site::rows <= 8U) {
         constexpr unsigned Outs = dense_a8_outs_of<Site>();
         const unsigned groups = (site.outputs + Outs - 1U) / Outs;
@@ -1921,6 +1940,9 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
     if (gsq_segments(site.segments)) {
         if constexpr (Site::rows <= 8U) { launch_dense_a8_gsq(site, slot, stream); return; }
         else throw std::invalid_argument("q8_rows: GSQ dense A8 supports 1..8 rows");
+    }
+    if constexpr (Site::rows >= 2U && Site::rows <= 8U) {
+        if (dense_a8_small_enabled()) { launch_dense_a8_small(site, slot, stream); return; }
     }
     if constexpr (Site::rows > 8U) { launch_dense_a8_projection(site, slot, stream); return; } else {
     constexpr unsigned Outs = dense_a8_outs_of<Site>();

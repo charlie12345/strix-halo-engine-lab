@@ -20,6 +20,7 @@
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
 #include "hip_rounded_stage_image.hpp"
+#include "attn_core/selected_flash_prefill.hpp"
 #include "strix/hip_compact_qsa_diagnostic.hpp"
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/qpersist.hpp"
@@ -8257,6 +8258,8 @@ QsaCohortPrepared prepare_qsa_cohort(std::span<const HipQsaCohortSegment> segmen
     }
     return out;
 }
+#include "hip_qsa_cohort_part2.inc"
+
 // Shared sink of the padding rows of cohort projections (workspace and output; grown on demand).
 std::uintptr_t qsa_cohort_pad_sink(std::uint64_t bytes) {
     static void* memory = nullptr;
@@ -8358,7 +8361,23 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
         else if (prepared.count <= 16U) enqueue_qsa_known_rows<16U>(qsa_cohort_rows<16U>(prepared), config, 2U, nullptr, 0U, &slot, 0U, subparts);
         else enqueue_qsa_known_rows<32U>(qsa_cohort_rows<32U>(prepared), config, 2U, nullptr, 0U, &slot, 0U, subparts);
     };
-    if (merge) {
+    static const bool merge_part2 = [] { const char* v = std::getenv("STRIX_COHORT_QSA2_MERGED"); return v && v[0] == '1'; }();
+    // Keep the diagnostic scorer/selection witnesses on their established route.
+    const bool pool_checks = [] {
+        for (const char* name : {"STRIX_QSA_POOLED_CHECK", "STRIX_QSA_MTP_POOL_CHECK"}) {
+            const char* v = std::getenv(name); if (v && v[0] == '1') return true;
+        }
+        return false;
+    }();
+    // In-process A/B: STRIX_COHORT_AB_OFF=qsa2 (this lever alone) or qsaseg (every part 2 merge).
+    if (merge_part2 && !pool_checks && !known_window_cohort_feature_off("qsaseg") && !known_window_cohort_feature_off("qsa2")) {
+        static const bool noted = [&] {
+            std::fprintf(stderr, "lever active: STRIX_COHORT_QSA2_MERGED (first launch: %zu segments)\n", segments.size());
+            return true;
+        }();
+        static_cast<void>(noted);
+        enqueue_qsa_cohort_part2(prepared, segments, pools, slot);
+    } else if (merge) {
         all_rows(1U); per_session(2U | 4U); all_rows(8U); per_session(16U); all_rows(32U); per_session(64U);
     } else per_session(127U);
     // As enqueue_qsa_window_rows: keep only the blocks committed before this window (its rows may be rejected).

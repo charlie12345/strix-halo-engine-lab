@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 // One rank of the two-node deepseek41 decode with DSpark speculative drafting and verify windows, or both ranks in
 // one process over the in-memory transport (--transport emulate, trimmed models).
@@ -741,6 +742,10 @@ void run_single(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];

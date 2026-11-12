@@ -44,6 +44,7 @@
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
+#include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
 #include "glm_rank_startup.hpp"
 #include "glm_rank_transport.hpp"
@@ -729,6 +730,10 @@ static int import_gate_empty(const std::string& list) {
 }
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     try {

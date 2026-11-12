@@ -132,6 +132,16 @@ headroom, and rechecks available memory before lazy growth; a larger shared pref
 reduce admitted slot capacity. The default context remains 8192; longer contexts require the
 existing explicit context contract and do not acquire a new qualification claim.
 
+The slot arithmetic is shared by every serving family (`include/strix/serve/slot_capacity.hpp`):
+a slot has retained bytes (persistent state, paid by every built slot) and an active peak
+(scratch while it runs); each memory pool gives a slot count and the smallest one is the limiting
+term. Two opt-in switches, both off by default (slot counts and outputs are unchanged without them):
+
+| Switch | Effect |
+|---|---|
+| `STRIX_SERVE_CENSUS=1` | With `--http-serve`, prints `serve-census point=before_load\|after_load\|probe` lines to stderr: host total/available, device-visible limit/used/free, kernel counters (`MemFree`, `Cached`, `Shmem`, `AnonPages`, `Mapped`, `Unevictable`, `Mlocked`, slab), the process (`self_VmRSS`, `self_RssAnon`, `self_RssFile`, `self_RssShmem`, `self_VmLck`, `self_VmPin`), registered model bytes and what the slot fit charged. `serve-census-delta` lines give the signed change between points, and one `serve-capacity` line gives the slot count each pool allows and the limiting term. All values are bytes. Use it to see where host memory goes between startup and the slot probe. |
+| `STRIX_SERVE_SLOT_EXACT=1` | Charges the prompt tap buffers a slot really allocates (one, or two with `STRIX_PREFILL_PIPE` bit 1) instead of always two. The measured probe and the headroom rule still bound the slot count. Not yet qualified on device. |
+
 For a configured prefix cache, omitted `--prefix-cache-block-rows` selects 1024 when it divides T.
 This changes checkpoint granularity, not automatic cache-budget qualification (which remains
 off). `--prefix-cache-block-rows 0` restores T-sized checkpoints; another valid explicit divisor

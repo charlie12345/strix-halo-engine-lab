@@ -745,6 +745,7 @@ add_library(strix_serve STATIC
     src/serve/deployment.cpp
     src/serve/request_fields.cpp
     src/serve/health.cpp
+    src/serve/media.cpp
 )
 target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
@@ -932,6 +933,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serve-json-constraint-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-json-constraint-tests)
     add_test(NAME strix-serve-json-constraint-tests COMMAND strix-serve-json-constraint-tests)
+
+    add_executable(strix-serve-media-tests tests/serve_media_tests.cpp)
+    target_link_libraries(strix-serve-media-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-media-tests)
+    add_test(NAME strix-serve-media-tests COMMAND strix-serve-media-tests)
     add_executable(strix-serve-observe-tests tests/serve_observe_tests.cpp)
     target_link_libraries(strix-serve-observe-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-observe-tests)

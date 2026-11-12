@@ -1,5 +1,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
+#include "strix/prefill_moe_policy.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_arch_caps.hpp"

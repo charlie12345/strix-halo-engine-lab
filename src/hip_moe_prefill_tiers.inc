@@ -13,14 +13,12 @@
 // kernel; neither the tier split nor the LDS epilogue reproduces its stores, so
 // both controls stand down whenever it is requested.
 inline bool prefill_route_ctrl_requested() {
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_ROUTE_CTRL");return v&&v[0]=='1'&&v[1]=='\0';}();
-    return env;
+    return strix::prefill_moe_policy().route_ctrl;
 }
 inline int& prefill_tiers_override(){static int v=-1;return v;}
 inline int prefill_tiers() {
     if(prefill_route_ctrl_requested())return 0;
-    static const int env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_TIERS");
-        return v&&(v[0]=='1'||v[0]=='2')&&v[1]=='\0'?v[0]-'0':0;}();
+    const int env=strix::prefill_moe_policy().tiers;
     return prefill_tiers_override()<0?env:prefill_tiers_override();
 }
 inline int& prefill_tiers_flag(){static thread_local int v=0;return v;}
@@ -34,7 +32,7 @@ inline void prefill_da16_mark(unsigned index,hipStream_t stream) {
     if(const auto* events=prefill_test_events())hip_check(hipEventRecord(events[index],stream),"DA16 tile64 timing event");
 }
 inline bool prefill_down_lds() {
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DOWN_LDS_EPI");return v&&v[0]=='1'&&v[1]=='\0';}();
+    const bool env=strix::prefill_moe_policy().down_lds;
     if(prefill_route_ctrl_requested())return false;
     return prefill_down_lds_override()<0?env:prefill_down_lds_override()==1;
 }
@@ -45,8 +43,7 @@ inline bool prefill_down_lds_admitted(const PrefillRows& rows) {
 }
 template<auto Kernel> void prefill_tier_resources() {
     static const bool once=[] {
-        const char* v=std::getenv("STRIX_INTPREFILL_RESOURCES");
-        if(v&&v[0]=='1') {
+        if(strix::prefill_moe_policy().resources) {
             hipFuncAttributes a{};
             hip_check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(Kernel)),"DA16 tier resources");
             std::fprintf(stderr,"DA16 tier resource %s: vgpr=%d lds=%zu scratch=%zu\n",__PRETTY_FUNCTION__,a.numRegs,a.sharedSizeBytes,a.localSizeBytes);

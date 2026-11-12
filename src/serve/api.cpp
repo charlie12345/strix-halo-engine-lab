@@ -557,6 +557,8 @@ struct ApiService::Impl {
                 ApiMediaSpan span;
                 try { span = adapter.encode(req.items[i], budget); }
                 catch (const media::MediaError& e) { throw ApiError(e.status, "invalid_request_error", e.what(), e.param.empty() ? req.items[i].param : e.param); }
+                // an adapter refuses content it cannot represent with std::invalid_argument: the client's fault
+                catch (const std::invalid_argument& e) { throw ApiError(400, "invalid_request_error", e.what(), req.items[i].param); }
                 std::uint64_t rows = 0;
                 bool valid = static_cast<bool>(span.lease) && !span.layout.empty();
                 for (const auto id : span.layout) {

@@ -81,6 +81,7 @@ struct FakeAdapter : sv::ApiMediaAdapter {
         last_budget = row_budget;
         const auto rows = item.width * item.height;
         if (rows > row_budget) throw sv::media::MediaError(400, "image needs more rows than the request may spend", "");
+        if (item.width == 5) throw std::invalid_argument("image shape is not representable");
         ss::EmbedRows r;
         r.digest = item.digest;
         r.rows = rows;
@@ -465,6 +466,9 @@ void refusals() {
     const auto big = s.post("/v1/chat/completions", chat_body(image_part(8, 9))); // 72 rows > max_rows 64
     CHECK(big.status == 400 && big.body.find("more rows") != std::string::npos);
     CHECK(adapter->last_budget == 64U);
+    const auto shape = s.post("/v1/chat/completions", chat_body(image_part(5, 1)));
+    CHECK(shape.status == 400 && shape.body.find("not representable") != std::string::npos &&
+          shape.body.find("messages[0].content[0]") != std::string::npos);
     CHECK(status(chat_body(image_part(8, 8) + "," + image_part(8, 8))) == 200); // one digest, 2 x 66 ids fit
     const std::string filler(120, 'x');
     const auto full = s.post("/v1/chat/completions", chat_body(R"({"type":"text","text":")" + filler + R"("},)" + image_part(8, 8) + "," + image_part(7, 9) + "," + image_part(9, 7)));

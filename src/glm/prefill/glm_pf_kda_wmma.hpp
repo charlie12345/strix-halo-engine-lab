@@ -1,10 +1,12 @@
 #pragma once
 // GLM prefill FAST identity glm-pf-kda-wmma-v1: the KDA plain-weight projections of a chunk (f_a / g_a / b of x, then
 // f_b and g_b) on the shared dense FP16 WMMA core (core/f16_dense_tall.hpp) instead of the exact FP32 fma chains of
-// dense_rows. Opt-in: STRIX_GLM_PF_KDA_WMMA=1 (unset or 0 = exact, the same bits as before). The router and the
+// dense_rows. Default with the FAST prefill route (STRIX_GLM_PF_WMMA=1); STRIX_GLM_PF_KDA_WMMA=0 opts out, =1 forces
+// it; the exact route keeps the exact chains (same bits as before). Switch: glm_pf_wmma.hpp. The router and the
 // indexer projections stay on the exact kernels (they select experts / tokens).
 // Adapter only: column-tile mapping of up to kDenseGroupMax projections of the same x, and the launches.
 #include "core/f16_dense_tall.hpp"
+#include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 
 #include <atomic>
@@ -15,14 +17,6 @@
 #include <string>
 
 namespace strix::glm::pf::kda_wmma {
-
-inline bool enabled() {
-    const char* p = std::getenv("STRIX_GLM_PF_KDA_WMMA");
-    if (p && std::strcmp(p, "0") != 0 && std::strcmp(p, "1") != 0)
-        throw std::invalid_argument("STRIX_GLM_PF_KDA_WMMA must be 0 or 1");
-    return p && std::strcmp(p, "1") == 0;
-}
-inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA core (identity reporting)
 
 struct Segment {
     const _Float16* w;  // [n][in] row-major

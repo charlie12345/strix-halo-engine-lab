@@ -864,16 +864,16 @@ AttentionState PrefixCache::load(std::span<const std::uint32_t> tokens, std::uin
         const auto expect_table = layout_table(layout_);
         parallel_for(reads.size(), options_.io_threads, [&](std::size_t i) {
             auto& r = reads[i];
-            const bool snap = r.depth == 0U;
-            const DiskEntry& e = snap ? *dleaf : *dsk[r.depth - 1U];
-            if (!read_file(snap ? snapshot_path(e.key) : block_path(e.key), r.data, r.size, options_.drop_page_cache)) return;
+            const bool is_snap = r.depth == 0U;
+            const DiskEntry& e = is_snap ? *dleaf : *dsk[r.depth - 1U];
+            if (!read_file(is_snap ? snapshot_path(e.key) : block_path(e.key), r.data, r.size, options_.drop_page_cache)) return;
             Header h{};
-            if (!parse_header(r.data, r.size, snap ? kKindSnapshot : kKindBlock, h)) return;
+            if (!parse_header(r.data, r.size, is_snap ? kKindSnapshot : kKindBlock, h)) return;
             if (std::memcmp(h.model_id, options_.model_id.data(), 32) != 0 || h.layout_hash != layout_hash || h.block != B || h.layers != layers ||
                 h.key != e.key || h.depth != e.depth || h.parent != e.parent)
                 return;
             if (h.payload_bytes < table || std::memcmp(r.data.data() + kHeaderBytes, expect_table.data(), table) != 0) return;
-            if (!snap) {
+            if (!is_snap) {
                 if (r.size != e.block_bytes) return;
                 if (std::memcmp(r.data.data() + kHeaderBytes + table, e.tokens.data(), std::size_t{B} * 4U) != 0) return;
                 if (h.payload_checksum != e.block_digest) return;

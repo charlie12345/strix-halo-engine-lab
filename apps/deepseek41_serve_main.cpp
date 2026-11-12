@@ -2136,11 +2136,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     http.max_connections = a.max_connections;
     ImportBox imports;
     SessionBox session_jobs;
-    serve::HttpServer server(http, [&](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
-        if (strix::deepseek41::sched::session_admin_route(a.session_ram_bytes != 0, request.path))
-            return handle_session(a, config, session_jobs, request, response);
-        if (request.path == "/admin/import-state") return handle_import(a, config, state, imports, request, response);
-        api.handle(request, response);
+    serve::HttpServer server(http, [&](const serve::HttpRequest& http_request, serve::HttpResponseWriter& response) {
+        if (strix::deepseek41::sched::session_admin_route(a.session_ram_bytes != 0, http_request.path))
+            return handle_session(a, config, session_jobs, http_request, response);
+        if (http_request.path == "/admin/import-state") return handle_import(a, config, state, imports, http_request, response);
+        api.handle(http_request, response);
     });
     bool http_stopped = false;
     native_stop_http = [&] {

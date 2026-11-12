@@ -69,7 +69,8 @@ static bool directory_alias(const fs::path& target,const fs::path& link) {
 // Operation faults execute inside actual shared IO, through actual Disk publication.
 static std::uint64_t physical_bytes(const fs::path& dir) {
     std::uint64_t n=0;for(const auto& e:fs::recursive_directory_iterator(dir))
-        if(!e.is_symlink()&&e.is_regular_file())n+=e.file_size();return n;
+        if(!e.is_symlink()&&e.is_regular_file())n+=e.file_size();
+    return n;
 }
 static void shared_fault_matrix(const fs::path& root) {
     Snapshot old;old.compat=sha(bytes("fault-compat"));old.lineage="0123456789abcdef0123456789abcdef";

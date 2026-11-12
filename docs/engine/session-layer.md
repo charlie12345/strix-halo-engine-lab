@@ -319,6 +319,11 @@ remain held until production adoption. Their frozen fanout contracts are retaine
 | DS41 | Lead/follower request ownership in `apps/deepseek41_serve_main.cpp`; cache policy/IO in `src/deepseek41_prefix_cache.cpp`, `src/deepseek41_session_cache.cpp`, `apps/cuda_ds41_session_cache.hpp` | Both-rank scheduling/transport replay, block alignment, complete logits/state equality, RAM/disk budgets and existing checkpoint/disk-tier compatibility |
 | GLM | Request ownership in `src/glm/serve/glm_serve_lead.hpp`; cache policy in `src/glm/serve/glm_serve_prefix_cache.hpp` | Preserve R1/R1b identity, prefill boundaries and speculative-oracle equality; qualify partial-prefix restore before widening whole-snapshot reuse; preserve supported on-disk schemas |
 
+Qwen HIP HTTP request ownership is adopted for both entries: the batched entry
+through [`qwen::HttpSessionOwner`](session-qwen-owner-adoption.md) and the serial
+entry through [`serve::SerialSessionOwner`](session-qwen-serial-adoption.md). The
+CUDA serve entry and cache-policy consolidation remain Qwen migration work.
+
 These deletions concern migrated policy/ownership and IO, preserving adopted
 code attribution and family arithmetic. Family compute adapters remain. `PrefixCache` and `NamedStateCache` now delegate RAM retention to the existing
 pooled owner. Their separate owning list/map, clocks, byte sums and victim loops

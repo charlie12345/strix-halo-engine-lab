@@ -736,6 +736,7 @@ add_library(strix_serve STATIC
     src/serve/json_constraint.cpp
     src/serve/constraint_selection.cpp
     src/serve/bpe_tokenizer.cpp
+    src/serve/prompt_stream.cpp
     src/serve/chat_template.cpp
     src/serve/deepseek_chat.cpp
     src/serve/glm_chat.cpp
@@ -747,7 +748,7 @@ add_library(strix_serve STATIC
     src/serve/health.cpp
     src/serve/media.cpp
 )
-target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
+target_include_directories(strix_serve PUBLIC include PRIVATE src/serve src)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
 target_link_libraries(strix_serve PUBLIC Threads::Threads strix_core strix_serve_json)
 if(WIN32)
@@ -907,6 +908,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-frontend-tests)
     add_test(NAME strix-serve-frontend-tests COMMAND strix-serve-frontend-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/chat_template_cases.json)
+    # Incremental encoding: ids equal to the one-shot encoding at every slice end, for every pre-tokenizer, and the
+    # prompt stream that runs it on the host lane.
+    add_executable(strix-incremental-tokenizer-tests tests/incremental_tokenizer_tests.cpp)
+    target_link_libraries(strix-incremental-tokenizer-tests PRIVATE strix_serve)
+    target_include_directories(strix-incremental-tokenizer-tests PRIVATE src)
+    strix_target_warnings(strix-incremental-tokenizer-tests)
+    add_test(NAME strix-incremental-tokenizer-tests COMMAND strix-incremental-tokenizer-tests)
+    set_tests_properties(strix-incremental-tokenizer-tests PROPERTIES LABELS "cpu" TIMEOUT 300)
     add_executable(strix-glm-tokenizer-tests tests/glm_tokenizer_tests.cpp)
     target_link_libraries(strix-glm-tokenizer-tests PRIVATE strix_serve)
     strix_target_warnings(strix-glm-tokenizer-tests)

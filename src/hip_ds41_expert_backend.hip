@@ -1,5 +1,6 @@
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_ds41_expert_backend.hpp"
+#include "strix/hip_check.hpp"
 
 #include "strix/ds41_formats.hpp"
 #include "strix/gguf_reader.hpp"
@@ -29,7 +30,7 @@ using Clock = std::chrono::steady_clock;
 namespace x = xrpc;
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("hip expert backend: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("hip expert backend: ", e, what);
 }
 
 template <typename T>

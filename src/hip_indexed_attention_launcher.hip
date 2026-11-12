@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/qsa_prefill_stage_plan.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/known_prefill_limits.hpp"
@@ -75,10 +77,15 @@
 
 namespace strix {
 namespace {
+// R2-13: diagnostic switch read once (was up to 4 getenv scans per QSA layer per window).
+bool qsa_mtp_pool_check() {
+    static const bool on = envcfg::flag("STRIX_QSA_MTP_POOL_CHECK", false);
+    return on;
+}
 struct HipQsaScratchBackend {
     using Event=hipEvent_t;
     static void check(hipError_t e) {
-        if(e!=hipSuccess) throw std::runtime_error(std::string("QSA scratch: ")+hipGetErrorString(e));
+        ::strix::hip_check(e, "QSA scratch");
     }
     int device() const { int d=-1;check(hipGetDevice(&d));return d; }
     void activate(int d) { check(hipSetDevice(d)); }
@@ -3140,8 +3147,7 @@ class MtpPoolSelectionCheck {
 public:
     MtpPoolSelectionCheck(std::shared_ptr<HipQsaCommittedPool> owner,HipQsaPoolRowDescriptor row,hipStream_t stream)
         :owner_(std::move(owner)),row_(row),stream_(stream) {
-        const char* v=std::getenv("STRIX_QSA_MTP_POOL_CHECK");
-        if (!owner_ || !v || v[0]!='1' || row.complete_blocks<=row.topk) {owner_.reset();return;}
+        if (!owner_ || !qsa_mtp_pool_check() || row.complete_blocks<=row.topk) {owner_.reset();return;}
         before_.resize(row.complete_blocks);
         check_hip(hipMemcpyAsync(before_.data(),row.scores,before_.size()*sizeof(float),hipMemcpyDeviceToHost,stream_),"MTP selection check before");
         check_hip(hipStreamSynchronize(stream_),"MTP selection check before completion");
@@ -5372,7 +5378,7 @@ bool qsa_window_attn_v2_enabled() {
 }
 // STRIX_QSA_WINDOW_GROUPED=1 (opt-in KV-head-grouped window score) and STRIX_QSA_SCORE_SLOTS=1|2|4|8 (default 4).
 bool qsa_window_grouped_requested() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_GROUPED"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QSA_WINDOW_GROUPED", false);
     return on;
 }
 unsigned qsa_score_slots_per_wave() {
@@ -5647,7 +5653,7 @@ uint2* qpf2k_key_ranges(std::uint32_t capacity, bool allow_allocation_failure = 
 // prefill group row's block scores before / after selection, its selected tokens and its attention output
 // (qsa_flash::trace_kernel), cumulative per process, printed after every prefill call ("qpf2k qsa trace ...").
 bool qpf2k_trace_enabled() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_QSA_TRACE"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_QSA_TRACE", false);
     return on;
 }
 struct Qpf2kTrace {
@@ -5854,13 +5860,13 @@ unsigned qpf2k_qsa_mask() {
 // STRIX_QSA_INDEX_ROWS=1: BF16 input matrices of prefill groups (the indexer q/k projections) run
 // qsa_index::rows_kernel (the same chains and tree as linear_to_float_rows_kernel, all rows of the group per launch).
 bool qsa_index_rows_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_INDEX_ROWS"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_INDEX_ROWS", false);
     return !qpf2k::suppressed(qpf2k::Item::index_rows) && enabled;
 }
 // STRIX_QSA_NORM_GROUP=1: the three norm/RoPE launches of a prefill group as rope_table_kernel +
 // norm_rope_group_kernel (same values).
 bool qsa_norm_group_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_NORM_GROUP"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_NORM_GROUP", false);
     return !qpf2k::suppressed(qpf2k::Item::norm_group) && enabled;
 }
 // Known-window rows (Rows <= 8): one norm/RoPE launch for the index-q, q and k heads and, with int8 KV storage, one
@@ -6062,7 +6068,7 @@ struct QsaFastBatch {
 };
 QsaFastBatch& qsa_fast_batch() { static QsaFastBatch batch; return batch; }
 bool qsa_union_stats_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QPF2K_QSA_UNION_STATS"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QPF2K_QSA_UNION_STATS", false);
     return enabled;
 }
 struct QsaUnionDiagnostic {
@@ -6107,7 +6113,7 @@ unsigned qsa_union_cap_for_launch() {
     return cap;
 }
 bool qsa_attend_batch_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_ATTEND_BATCH"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_ATTEND_BATCH", false);
     return !qpf2k::suppressed(qpf2k::Item::attend_batch) && enabled;
 }
 // STRIX_QSA_UNION_MERGE (default on; =0 or the baseline keeps the range form): the attend union of a row tile
@@ -6126,7 +6132,7 @@ struct QsaLaunchStats {
     }
 };
 QsaLaunchStats* qsa_launch_stats() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_FAST_STATS"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_FAST_STATS", false);
     if (!enabled) return nullptr;
     static QsaLaunchStats stats;   // printed by its destructor at exit
     return &stats;
@@ -6136,7 +6142,7 @@ void count_qsa_launch(std::atomic<std::uint64_t> QsaLaunchStats::* kind) {
 }
 // Draft organization only: do not trade resident query-head capacity for fewer KV requests.
 bool qsa_fast_kv_pair_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_FAST_KV_PAIR"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_FAST_KV_PAIR", false);
     return enabled;
 }
 bool qsa_fast_kv_pair_admitted(bool occ) {
@@ -6377,7 +6383,7 @@ void bind_qwen_pool(QsaPrefillPool* pool, const ModelContract& model) {
     pool->rotary_table = model.qwen_rotary_table;
 }
 bool qsa_pool_packed_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_POOL_PACKED"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_POOL_PACKED", false);
     return !qpf2k::baseline && enabled;
 }
 
@@ -6661,7 +6667,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 return n == 1 || n == 2 || n == 8 ? static_cast<unsigned>(n) : 4U;
             }();
             // STRIX_QSA_SCORE_PARK=1 (prefill groups): qsa_index::block_score_parked_kernel, the same scores.
-            static const bool park = [] { const char* v = std::getenv("STRIX_QSA_SCORE_PARK"); return v && v[0] == '1'; }();
+            static const bool park = strix::envcfg::flag("STRIX_QSA_SCORE_PARK", false);
             const auto score = [&]<unsigned Wanted>() {
                 constexpr unsigned R = Wanted < Rows ? Wanted : Rows; // a 2-row window scores both rows per wave
                 const auto waves = static_cast<std::uint64_t>(Rows / R) * ((scored_blocks + 31U) / 32U);
@@ -6767,8 +6773,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             else score.template operator()<4U>();
             check_hip(hipGetLastError(), "QSA prefill pooled block-score launch");
             // STRIX_QSA_POOLED_CHECK=1: compare every row's block scores with block_score_rows_kernel's.
-            static const bool check = [] { const char* v = std::getenv("STRIX_QSA_POOLED_CHECK"); return v && v[0] == '1'; }();
-            const bool mtp_check=config.committed_pool && std::getenv("STRIX_QSA_MTP_POOL_CHECK") && std::getenv("STRIX_QSA_MTP_POOL_CHECK")[0]=='1';
+            static const bool check = strix::envcfg::flag("STRIX_QSA_POOLED_CHECK", false);
+            const bool mtp_check=config.committed_pool && qsa_mtp_pool_check();
             if (check || mtp_check) {
                 const auto copy = [&] {
                     check_hip(hipStreamSynchronize(stream), "QSA pooled check sync");
@@ -6830,8 +6836,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     if (qpf2k_trace_group && scored_blocks)
         qpf2k_trace_rows<Rows>(0U, prepared.position, [&](unsigned r) { return scores.block_scores[r]; }, [&](unsigned r) { return scores.blocks[r]; }, stream);
     std::vector<std::unique_ptr<MtpPoolSelectionCheck>> mtp_selection_checks;
-    if(config.committed_pool && (subparts & 8U) && std::getenv("STRIX_QSA_MTP_POOL_CHECK") &&
-        std::getenv("STRIX_QSA_MTP_POOL_CHECK")[0]=='1') for(unsigned r=0;r<Rows;++r) {
+    if(config.committed_pool && (subparts & 8U) && qsa_mtp_pool_check()) for(unsigned r=0;r<Rows;++r) {
         const auto& w=prepared.row[r].workspace;const auto& sr=prepared.selection[r];
         mtp_selection_checks.push_back(std::make_unique<MtpPoolSelectionCheck>(config.committed_pool,
             HipQsaPoolRowDescriptor{w.index_query,w.block_scores,w.selected_indices,sr.visible,sr.complete_blocks,sr.block_topk,0U,nullptr},stream));
@@ -6874,7 +6879,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     // STRIX_QSA_UNION_DUMP=1 (diagnostic, synchronizes; prefill groups only): how many distinct tokens the
     // selections of 8/16/32/64 consecutive rows cover, against the per-row count (stderr, every 16th group).
     if constexpr (Rows > 8U) {
-        static const bool union_dump = [] { const char* v = std::getenv("STRIX_QSA_UNION_DUMP"); return v && v[0] == '1'; }();
+        static const bool union_dump = strix::envcfg::flag("STRIX_QSA_UNION_DUMP", false);
         static std::atomic<std::uint64_t> union_groups{0};
         if (union_dump && union_groups.fetch_add(1U) % 16U == 0U) {
             qpf2k_select_flush(stream);
@@ -6988,9 +6993,9 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         } else if (grouped_score) {
             {
                 static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
-                static const bool scatter = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_SCATTER"); return !v || v[0] != '0'; }();
+                static const bool scatter = strix::envcfg::flag("STRIX_QSA_PREFILL_SCATTER", true);
                 // STRIX_QSA_SCORE_PREFETCH=0 keeps the generic kernel for head_dim 256.
-                static const bool prefetch = [] { const char* v = std::getenv("STRIX_QSA_SCORE_PREFETCH"); return !v || v[0] != '0'; }();
+                static const bool prefetch = strix::envcfg::flag("STRIX_QSA_SCORE_PREFETCH", true);
                 const auto score = [&]<unsigned G, unsigned S>() {
                     const auto waves = static_cast<std::uint64_t>(Rows) * (a.attention_heads / G) * ((maximum_count + S - 1U) / S);
                     const auto blocks = dim3(static_cast<std::uint32_t>((waves + 7U) / 8U));
@@ -7065,7 +7070,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         } else if (grouped) {
             if constexpr (Rows > 8U) {
                 // STRIX_QSA_OUTPUT_PREFETCH=0 keeps the 4-slot kernel without value prefetch.
-                static const bool output_prefetch = [] { const char* v = std::getenv("STRIX_QSA_OUTPUT_PREFETCH"); return !v || v[0] != '0'; }();
+                static const bool output_prefetch = strix::envcfg::flag("STRIX_QSA_OUTPUT_PREFETCH", true);
                 const auto output = [&]<unsigned G>() {
                     if (output_prefetch) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<Rows, G, Int8>),
                         dim3(a.attention_heads / G, Rows), dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads,
@@ -7282,7 +7287,7 @@ std::vector<QsaKnownRows<8U>> prepare_qsa_prefill_rows(std::span<const Execution
     std::vector<QsaKnownRows<8U>> tiles;
     tiles.reserve(rows.size() / 8U);
     // STRIX_QSA_PREFILL_SHARED_ADMISSION=0: every row runs the full serial admission.
-    static const bool shared = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_SHARED_ADMISSION"); return !v || v[0] != '0'; }();
+    static const bool shared = strix::envcfg::flag("STRIX_QSA_PREFILL_SHARED_ADMISSION", true);
     for (std::size_t t = 0; t < rows.size() / 8U; ++t) {
         const QsaHeadRow head = !shared ? QsaHeadRow{} : t ? QsaHeadRow{&rows[0], &tiles.front().row[0], true} : QsaHeadRow{nullptr, nullptr, true};
         // Only prompt prefill reduces top-k. Window verification and decode retain the model budget.
@@ -7432,7 +7437,7 @@ std::uint32_t enqueue_qsa_prefill_tiled_output_storage(const std::vector<QsaKnow
     std::uint64_t chunk = ((1ULL << 32U) - 1U - row_bytes) / si + 1U;  // rows n with (n - 1) * si + row_bytes < 2^32
     if (chunk < rows) chunk = chunk / 256U * 256U;
     chunk = std::min<std::uint64_t>(chunk, rows);
-    static const bool trace = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE_TRACE"); return v && v[0] == '1'; }();
+    static const bool trace = strix::envcfg::flag("STRIX_QPF2K_DENSE_TRACE", false);
     static std::atomic<unsigned> traced{0};
     if (trace && traced.fetch_add(1U) == 0U)
         std::fprintf(stderr, "qpf2k dense QSA out rows %u input stride %llu output stride %llu chunk %llu\n", rows,
@@ -7569,7 +7574,7 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
     static_cast<void>(qsa_group_rope_table());
     // Pooled block keys (STRIX_QSA_PREFILL_POOLED=0 keeps block_score_rows_kernel): one device
     // buffer for the context's blocks, reused by every layer's call on the execution stream.
-    static const bool pooled = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_POOLED"); return !v || v[0] != '0'; }();
+    static const bool pooled = strix::envcfg::flag("STRIX_QSA_PREFILL_POOLED", true);
     auto& pool_mutex=qsa_prefill_pool_mutex();
     auto& pool_storage=qsa_prefill_pool_storage();
     std::unique_lock<std::mutex> pool_lock(pool_mutex, std::defer_lock);
@@ -8058,8 +8063,8 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
             views, static_cast<const float*>(pool->keys), complete_blocks, a.index_dim);
     }
     check_hip(hipGetLastError(), "QSA decode pooled block-score launch");
-    static const bool check = [] { const char* v = std::getenv("STRIX_QSA_DECODE_POOL_CHECK"); return v && v[0] == '1'; }();
-    const bool mtp_check=committed_owner && std::getenv("STRIX_QSA_MTP_POOL_CHECK") && std::getenv("STRIX_QSA_MTP_POOL_CHECK")[0]=='1';
+    static const bool check = strix::envcfg::flag("STRIX_QSA_DECODE_POOL_CHECK", false);
+    const bool mtp_check=committed_owner && qsa_mtp_pool_check();
     if (check || mtp_check) {
         std::vector<float> pooled(complete_blocks), reference(complete_blocks);
         check_hip(hipMemcpyAsync(pooled.data(), a.workspace.block_scores, complete_blocks * sizeof(float), hipMemcpyDeviceToHost, stream),
@@ -8097,7 +8102,7 @@ bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAtte
     if (!maxima || (fused_maxima && fused_maxima != maxima)) return false;
     // STRIX_QSA_DECODE_POOL_CHECK=1 also runs select_blocks_kernel on a copy of the scores and compares the selected list
     // and the post-selection scores bitwise (synchronizes per layer-step).
-    static const bool check = [] { const char* v = std::getenv("STRIX_QSA_DECODE_POOL_CHECK"); return v && v[0] == '1'; }();
+    static const bool check = strix::envcfg::flag("STRIX_QSA_DECODE_POOL_CHECK", false);
     const auto blocks = selection.complete_blocks, count = selection.selected_count;
     std::vector<float> before;
     if (check) {
@@ -8147,7 +8152,7 @@ void invalidate_hip_qsa_window_pool(const std::shared_ptr<HipQsaWindowPool>& poo
 namespace {
 QsaPrefillPool* qsa_window_pool(const PreparedIndexedLaunch& a, std::uint32_t ratio,
     const HipIndexedAttentionLauncherConfig& config, std::uint64_t position) {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_POOLED"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QSA_WINDOW_POOLED", false);
     if (!enabled || a.index_dim != 128U || !ratio) return nullptr;
     // Only the owner's own pool (R2-17): a process-wide fallback buffer was shared by every owner and
     // resized with a sync of the current stream only, so two owners on different streams could
@@ -8316,7 +8321,7 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
     merged(1U);
     // Part 2: STRIX_COHORT_QSA_SEGMENTS=1 runs the state-free sub-parts (norms, selection, softmax) once for every
     // row (measured neutral at eight sessions: 148.0 against 147.0 ms per cycle); default: the part per session.
-    static const bool merge_free = [] { const char* v = std::getenv("STRIX_COHORT_QSA_SEGMENTS"); return v && v[0] == '1'; }();
+    static const bool merge_free = strix::envcfg::flag("STRIX_COHORT_QSA_SEGMENTS", false);
     const bool merge = merge_free && !known_window_cohort_feature_off("qsaseg");
     // STRIX_QSA_COHORT_POOL=1: each session scores its blocks from its own owner's persistent pool, as
     // its single-session window does (enqueue_qsa_window_rows): the same pooled keys and scoring kernels
@@ -9651,8 +9656,7 @@ void mtp_pool_scores(const MtpNativeContext& c,const MtpAttentionPrepared& p,Hip
     hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1,1,std::uint16_t>),dim3((waves+7U)/8U),dim3(kThreads),0,stream,
         views,static_cast<const std::uint16_t*>(pool.packed),p.blocks,p.index_dim);
     check_hip(hipGetLastError(),"MTP predictor packed pool score");
-    const char* check=std::getenv("STRIX_QSA_MTP_POOL_CHECK");
-    if (check && check[0]=='1') {
+    if (qsa_mtp_pool_check()) {
         std::vector<float> pooled(p.blocks),reference(p.blocks);
         check_hip(hipMemcpyAsync(pooled.data(),p.workspace.block_scores,p.blocks*sizeof(float),hipMemcpyDeviceToHost,stream),"MTP pool check copy");
         check_hip(hipStreamSynchronize(stream),"MTP pool check copy completion");
@@ -10277,7 +10281,7 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
             check_hip(hipGetLastError(), "MTP batch block score validation enqueue");
         }
         std::vector<std::unique_ptr<MtpPoolSelectionCheck>> selection_checks;
-        if(any_pool && std::getenv("STRIX_QSA_MTP_POOL_CHECK") && std::getenv("STRIX_QSA_MTP_POOL_CHECK")[0]=='1') for(const auto r:select) {
+        if(any_pool && qsa_mtp_pool_check()) for(const auto r:select) {
             const auto& p=rows[r];const auto& w=p.workspace;
             selection_checks.push_back(std::make_unique<MtpPoolSelectionCheck>(contexts[r].resources->qsa_pool(),
                 HipQsaPoolRowDescriptor{w.index_query,w.block_scores,w.selected_indices,p.visible,p.blocks,p.topk,0U,nullptr},stream));

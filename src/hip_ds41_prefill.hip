@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
+#include "strix/hip_check.hpp"
 #pragma clang fp contract(off)
 #include "strix/hip_ds41_prefill.hpp"
 
@@ -22,7 +24,7 @@ namespace strix::ds41 {
 namespace {
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("ds41 prefill: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("ds41 prefill: ", status, what);
 }
 
 // ---- Format helpers (the decode kernels' integer forms, hip_ds41_formats.hip) ----
@@ -666,7 +668,7 @@ void enqueue_prefill_router(const RouterView& view, void* stream) {
         view.top_k > view.experts || (view.image_rows && !view.bias_image))
         throw std::invalid_argument("ds41 prefill router view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    static const bool wide = [] { const char* e = std::getenv("STRIX_DS41_PREFILL_ROUTER_WIDE"); return !(e && e[0] == '0'); }();
+    static const bool wide = strix::envcfg::flag("STRIX_DS41_PREFILL_ROUTER_WIDE", true);
     RouterView v = view;
     v.wide_stage = wide && view.wide_stage && view.hidden % 4U == 0U && reinterpret_cast<std::uintptr_t>(view.x) % 16U == 0U &&
                    reinterpret_cast<std::uintptr_t>(view.weight) % 16U == 0U;

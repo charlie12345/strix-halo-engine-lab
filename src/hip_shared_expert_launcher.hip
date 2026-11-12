@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -1643,10 +1644,7 @@ struct SharedDownR8NarrowSite : SharedDownRowsSite<8U> {
 template <unsigned Rows>
 void launch_shared_down_rows(const SharedDownRowsSite<Rows>& site, bool a8, hipStream_t stream, int forced = -1) {
     if constexpr (Rows == 8U) {
-        static const bool enabled = [] {
-            const char* v = std::getenv("STRIX_QWEN_SHARED_DOWN_NARROW");
-            return v && v[0] == '1';
-        }();
+        static const bool enabled = strix::envcfg::flag("STRIX_QWEN_SHARED_DOWN_NARROW", false);
         if (a8 && site.width == 640U && (forced < 0 ? enabled : forced != 0)) {
             SharedDownR8NarrowSite narrow{};
             static_cast<SharedDownRowsSite<8U>&>(narrow) = site;
@@ -2207,10 +2205,7 @@ bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
     // q8_rows::tiled launch per projection, same bits; the 16/8-row remainder keeps its launches.
     const std::uint64_t tiled_rows = config.dense_f16_prefill && !config.dense_g64_prefill && rows.size() / 32U * 32U >= q8_rows::tiled::min_rows()
         ? rows.size() / 32U * 32U : 0U;
-    static const bool shared_pre_env = [] {
-        const char* v = std::getenv("STRIX_QPF2K_SHARED_PRE");
-        return v && v[0] == '1' && v[1] == '\0';
-    }();
+    static const bool shared_pre_env = strix::envcfg::flag("STRIX_QPF2K_SHARED_PRE", false, strix::EnvFlagMatch::exact);
     SharedDownTiledSite pre_site{};
     _Float16* pre_image = nullptr;
     unsigned* pre_overflow = nullptr;

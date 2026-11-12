@@ -24,7 +24,7 @@ unsigned qpf2k_hc_mask() {
     return qpf2k::suppressed(qpf2k::Item::hc) ? 0U : mask;
 }
 bool qpf2k_hc_check() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_CHECK"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_HC_CHECK", false);
     return on;
 }
 
@@ -32,10 +32,7 @@ bool qpf2k_hc_check() {
 // establishes no slowdown, the resolver may enable the default; zero always restores
 // the image. This exact organization does not participate in the numerical identity.
 bool qpf2k_hc_recompute_norm() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRIX_QPF2K_HC_RECOMPUTE_NORM");
-        return v && v[0] == '1';
-    }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_HC_RECOMPUTE_NORM", false);
     return on;
 }
 
@@ -269,7 +266,7 @@ __device__ __forceinline__ float qpf2k_cvt_ubyte(unsigned w, unsigned b) {
     }
 }
 bool qpf2k_hc_output3() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_OUTPUT3"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_HC_OUTPUT3", false);
     return on && !qpf2k::suppressed(qpf2k::Item::hc_output3) && qpf2k_hc_mask() != 0U;
 }
 // STRIX_QPF2K_HC_OUTPUT3_BAND (0 default, 1..8, 12, 16, 24, 32, 48, 64): CTA permutation only; identical chains/epilogue.
@@ -324,11 +321,11 @@ __device__ __forceinline__ std::uint64_t qpf2k_low_band_index(std::uint32_t k, s
 // call into a cached per-stream scratch, read by the output kernel; the bytes are identical.
 // STRIX_QPF2K_HC_UPCOPY_BASE=1 (with STRIX_QPF2K_HC=1): the base lane-chain output reads the copy too (attribution arm).
 bool qpf2k_hc_upcopy() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_UPCOPY"); return !v || v[0] != '0'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_HC_UPCOPY", true);
     return on;
 }
 bool qpf2k_hc_upcopy_base() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_UPCOPY_BASE"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_HC_UPCOPY_BASE", false);
     return on && qpf2k_hc_mask() != 0U;
 }
 __global__ __launch_bounds__(256) void qpf2k_hc_up_copy_kernel(const uint4* __restrict__ from, uint4* __restrict__ to, std::uint64_t n) {
@@ -377,6 +374,7 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output3_kernel(HyperWideRows row
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, row0 = blockIdx.x * R;
     const std::uint64_t feature = (static_cast<std::uint64_t>(blockIdx.y) * kWide2OutputWaves + wave) * 32U + lane;
     const unsigned low0 = row0;
+#include "strix/env_flags.hpp"
 #include "hip_qpf2k_hc_output3_body.inc"
 }
 

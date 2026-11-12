@@ -533,7 +533,7 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     }, result.options.prefill_exact_fp16, result.options.prefill_disabled);
     // Automatic YaRN MTP profiles and verified bundles retain upstream arithmetic.
     // Governed candidates remain excluded until their MTP gates pass.
-    if (result.options.mtp.enabled && (!result.options.mtp_bundle_path.empty() ||
+    if (result.options.mtp.enabled && ((!result.options.mtp_bundle_path.empty() && !result.options.mtp_native_bundle) ||
         (result.options.rotary.mode() == RotaryMode::yarn && !result.options.prefill_numerical_profile))) {
         const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
             prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
@@ -669,6 +669,9 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
     }
     const bool single_session_mtp = single_session_mtp_route(o, request.environment, manifest, verified_content, capabilities);
     const auto decline = [&](std::string reason) {
+        // The default drafter bundle exists only on the automatic prompt route; the caller falls back to plain decode.
+        if (o.mtp_native_bundle && o.mtp.enabled && !o.known_prefix_window)
+            throw std::invalid_argument("automatic prompt route declined with the drafter bundle (" + reason + ")");
         result.reason = std::move(reason);
         if (!baseline) inject(qpf2k::historical_items |
             (single_session_mtp ? qpf2k::bit(qpf2k::Item::dispatch_fuse) : 0U));
@@ -721,8 +724,11 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
     };
     if (ctx_exact_memory_enabled(exact_environment,"STRIX_QSA_SCORE_RING"))
         (void)qsa_score_ring_rows_override(exact_environment("STRIX_QSA_SCORE_RING_ROWS"));
-    if (o.route_owned || o.any_low_level_flag || o.known_prefix_window || o.prompt_lookup || o.http_serve ||
-        o.prefix_cache_roundtrip || !o.serving_prefix_files.empty() || o.mtp.supplied || o.mtp.enabled || !o.mtp.cohort.empty() || o.teacher_forced_score ||
+    // A drafter bundle found beside the model keeps the automatic prompt route: it adds exact MTP decode to it.
+    const bool bundle_default = o.mtp_native_bundle && !o.route_owned_beyond_mtp;
+    if ((o.route_owned && !bundle_default) || o.any_low_level_flag || o.known_prefix_window || o.prompt_lookup || o.http_serve ||
+        o.prefix_cache_roundtrip || !o.serving_prefix_files.empty() || ((o.mtp.supplied || o.mtp.enabled) && !bundle_default) ||
+        !o.mtp.cohort.empty() || o.teacher_forced_score ||
         !o.raw_recording_path.empty() || !o.validation_final_state_path.empty()) return decline("explicit-route");
     if (explicit_execution_control(request.environment)) return decline("explicit-diagnostic-or-execution-control");
     for (const auto& entry : qpf2k::defaults)
@@ -912,14 +918,19 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
             } catch (const std::overflow_error&) { throw; }
               catch (const KnownPrefillBudgetExceeded&) { failed_reason = "insufficient-memory"; }
               catch (const std::runtime_error&) { failed_reason = "insufficient-memory"; }
-              catch (const std::exception&) { failed_reason = "candidate-not-admitted"; }
+              catch (const std::exception& error) {
+                  failed_reason = "candidate-not-admitted";
+                  if (bundle_default) failed_reason += std::string(": ") + error.what();
+              }
             if (!result.tile_fallback.empty()) result.tile_fallback += ',';
             result.tile_fallback += "T" + std::to_string(rows) + ':' + failed_reason;
         }
         return decline(failed_reason);
     } catch (const std::overflow_error&) { return decline("memory-overflow"); }
       catch (const std::runtime_error&) { return decline("insufficient-memory"); }
-      catch (const std::exception&) { return decline("candidate-not-admitted"); }
+      catch (const std::exception& error) {
+          return decline(bundle_default ? std::string("candidate-not-admitted: ") + error.what() : "candidate-not-admitted");
+      }
     return result;
 }
 // Single admission registry: flip a serving entry only after its native exactness gate passes.

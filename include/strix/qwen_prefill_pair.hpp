@@ -42,16 +42,16 @@ std::shared_ptr<PipeStaging> make_hip_pipe_staging(std::size_t capacity);
 class Pipe : public pair::Pipe {
 public:
     Pipe(unsigned rank, std::uint64_t count, Send send, Receive receive, std::function<void()> abort,
-        std::uint32_t cut = 24, std::function<std::shared_ptr<PipeStaging>()> staging = {}, Checksum checksum = {},
+        pair::StageCut cut = 24U, std::function<std::shared_ptr<PipeStaging>()> staging = {}, Checksum checksum = {},
         TransferPiece transfer_piece = {}, dist::PipelineTimeline* timeline = nullptr)
         : pair::Pipe(rank, count, std::move(send), std::move(receive), std::move(abort),
               options(checked_cut(cut), count, timeline), std::move(staging), std::move(checksum), std::move(transfer_piece)) {}
 private:
-    static std::uint32_t checked_cut(std::uint32_t cut) {
-        if (cut == 0U || cut >= 48U) throw std::invalid_argument("pair prefill invalid cut");
-        return cut;
+    static std::uint64_t checked_cut(pair::StageCut cut) {
+        if (cut.layer == 0U || cut.layer >= 48U) throw std::invalid_argument("pair prefill invalid cut");
+        return cut.wire();
     }
-    static pair::PipeOptions options(std::uint32_t cut, std::uint64_t count, dist::PipelineTimeline* timeline) {
+    static pair::PipeOptions options(std::uint64_t cut, std::uint64_t count, dist::PipelineTimeline* timeline) {
         pair::PipeOptions value;
         value.timeline = timeline;
         value.timing = {pt_d2h_wait, pt_crc, pt_wire, pt_ack_wait, pt_header_wait, pt_h2d_wait};
@@ -75,6 +75,7 @@ struct PipeContext {
     std::uint64_t identity = 0;
     std::uint32_t cut = 24;
     dist::PipelineTimeline* timeline = nullptr; // STRIX_PAIR_TIMING=1 only
+    bool half = false; // half-layer cut: stage A also runs the attention sub-block of layer `cut`
 };
 inline PipeContext pipe_context;
 inline std::uint64_t token_hash(std::span<const std::uint32_t> tokens) {

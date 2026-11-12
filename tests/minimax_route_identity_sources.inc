@@ -1,6 +1,6 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0x609bd102438b0483ULL},
+{"CMakeLists.txt", 0xefe7078b8feafe32ULL},
 {"apps/minimax_rank_main.cpp", 0x8ed1583275894e9dULL},
 {"apps/minimax_serve_main.cpp", 0x32dfafeb546e923eULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
@@ -22,9 +22,9 @@
 {"src/minimax/attn/index_proj.hip", 0x5b96fbe79f1e4152ULL},
 {"src/minimax/attn/index_proj.hpp", 0x393a96aa17edfaddULL},
 {"src/minimax/attn/index_proj_tests.hip", 0x6ea8470ed347627aULL},
-{"src/minimax/attn/msa_fused.hip", 0xf5e28ef8a0542b7cULL},
+{"src/minimax/attn/msa_fused.hip", 0xf8cf4f5f52cad4cbULL},
 {"src/minimax/attn/msa_fused.hpp", 0x6f81fec3acf34cfcULL},
-{"src/minimax/attn/msa_fused_tests.hip", 0x73ee3ca3d0ccf824ULL},
+{"src/minimax/attn/msa_fused_tests.hip", 0xd3778b6cb4cd72f7ULL},
 {"src/minimax/attn/msa_inblock_layout.hpp", 0x617784020ff4b04fULL},
 {"src/minimax/dspark/hip_minimax_dspark.hip", 0xe782acce2a794867ULL},
 {"src/minimax/dspark/hip_minimax_dspark.hpp", 0x07abbf09ee18c203ULL},

@@ -84,6 +84,31 @@ int main() {
     with("4G", [&] { check(rejects([&] { return strix::env_bytes(key, 0, 0, std::uint64_t{1} << 30U); })); });
     with("b", [&] { check(strix::env_choice(key, 0, {"a", "b", "c"}) == 1U); });
     with("B", [&] { check(rejects([&] { return strix::env_choice(key, 0, {"a", "b"}); })); });
+    // envcfg:: registry helpers (R2-15).
+    if (put(nullptr) != 0) return 2;
+    check(strix::envcfg::flag(key, true) == true);
+    check(strix::envcfg::flag(key, false) == false);
+    check(strix::envcfg::integer(key, 7) == 7);
+    check(strix::envcfg::text(key) == nullptr);
+    check(strix::envcfg::choice(key, {"a", "b"}, 5) == 5);
+    if (put("b") != 0) return 2;
+    check(strix::envcfg::choice(key, {"a", "b"}, 5) == 1);
+    check(strix::envcfg::flag(key, true) == true);
+    check(strix::envcfg::flag(key, false) == false);
+    if (put("0") != 0) return 2;
+    check(strix::envcfg::flag(key, true) == false);
+    check(strix::envcfg::integer(key, 7) == 0);
+    if (put("12") != 0) return 2;
+    check(strix::envcfg::integer(key, 7) == 12);
+    check(strix::envcfg::flag(key, false) == true);  // first-character '1'
+    check(std::string(strix::envcfg::text(key)) == "12");
+    {
+        int hits = 0;
+        for (const auto& e : strix::envcfg::registered())
+            if (e.name == key) { ++hits; check(e.set && e.value == "12"); }
+        check(hits == 1);  // one entry per name, last value wins
+        check(strix::envcfg::describe().find(std::string("env ") + key + " 12 (set)\n") != std::string::npos);
+    }
     if (put(had_old ? saved.c_str() : nullptr) != 0) return 2;
     std::printf("env flags: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

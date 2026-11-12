@@ -10,6 +10,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/session_api.hpp"
 #include "../src/qwen/http_session_owner.hpp"
+#include "../src/core/host_lane.hpp"
 #include "qwen_service_health.hpp"
 #include "qwen_rotary_capabilities.hpp"
 #include "qwen_moe_route_bf16.hpp"
@@ -57,7 +58,19 @@ inline void add_prefill_stats(serve::GenerationStats& stats) {
 class HttpConstraintRequests {
 public:
     HttpConstraintRequests(std::shared_ptr<const serve::BpeTokenizer> tokenizer,bool argmax_first)
-        : tokenizer_(std::move(tokenizer)),argmax_first_(argmax_first) {}
+        : tokenizer_(std::move(tokenizer)),argmax_first_(argmax_first) {
+        // Masks one step ahead (exact): on by default, STRIX_CONSTRAINT_MASK_AHEAD=0 builds every mask on the
+        // selecting thread as before. The walks run on the host lane's background threads: one walk can take far
+        // longer than a decode step, which the lane's critical threads (row folds) must never wait for. A lane that
+        // runs jobs inline (STRIX_HOST_LANE=0, no background threads) gives nothing to run ahead on.
+        const char* ahead=std::getenv("STRIX_CONSTRAINT_MASK_AHEAD");
+        const auto& lane=core::shared_host_lane().config();
+        ahead_=(!ahead || std::string_view(ahead)!="0") && lane.enabled && lane.background_threads>0;
+        // Ranked membership (exact, part of --http-selection-fast): STRIX_CONSTRAINT_RANKED=N checks the N next-best
+        // logits of a refused row before walking a mask (default 32, 0 = always walk).
+        if(const char* ranked=std::getenv("STRIX_CONSTRAINT_RANKED")) ranked_=static_cast<unsigned>(std::min(std::strtoul(ranked,nullptr,10),4096UL));
+        std::fprintf(stderr,"constraint mask ahead: %s, ranked membership: %u\n",ahead_?"on":"off",argmax_first_?ranked_:0U);
+    }
     bool available(std::span<const std::uint32_t> stops) const {
         const auto id=tokenizer_->find("</think>");
         return id!=UINT32_MAX && tokenizer_->token_bytes(id)=="</think>" &&
@@ -70,12 +83,18 @@ public:
         if(!trie_) trie_=std::make_shared<serve::TokenByteTrie>(*tokenizer_,spec->eos_ids);
         auto selection=std::make_shared<serve::ConstraintSelection>(spec,trie_,tokenizer_);
         selection->set_argmax_first(argmax_first_);
+        selection->set_ranked(ranked_);
+        if(ahead_) selection->set_mask_ahead([](std::function<void()> job) {
+            (void)core::shared_host_lane().submit(core::HostPriority::background,std::move(job));
+        });
         return std::make_shared<MtpConstraintRow>(std::move(selection));
     }
 private:
     std::shared_ptr<const serve::BpeTokenizer> tokenizer_;
     std::shared_ptr<const serve::TokenByteTrie> trie_;
     bool argmax_first_;
+    unsigned ranked_=32;
+    bool ahead_=false;
 };
 // Execution failures stop the server; constraint refusals carry request-local receipts.
 class MtpBridgeEngine final : public serve::GenerationEngine {

@@ -579,6 +579,30 @@ selected on the full row; token IDs are identical either way. One difference to 
 off` (every row walks the full mask): a full walk can stop a request on a mask-walk evaluation limit
 reached by another token, which a membership check does not walk; all routes of one setting behave the same.
 
+Ranked membership extends argmax-first to rows whose maximum is refused. Masked greedy is the first
+admitted token in the order "logit descending, lowest ID among equals", so the row checks the next-best
+logits in that order with the same one-token membership test and takes the first admitted one; no mask is
+walked. `STRIX_CONSTRAINT_RANKED=N` sets how many next-best logits are checked (default 32, 0 = always
+walk the mask); a row whose N next-best tokens are all refused walks the full mask as before. It applies
+where argmax-first applies (finite row, answer phase, no scores or transforms) and has the same single
+difference to a full walk: an evaluation limit reached by a token the row never checks does not stop the
+request. A full mask walk visits the whole token trie, which in a permissive state (inside a string)
+costs far more than a decode step, so this is what keeps schema output at plain decode speed. The profile
+reports these rows as `ranked_rows`.
+
+Masks one step ahead (default on; `STRIX_CONSTRAINT_MASK_AHEAD=0` turns it off) covers the requests that
+still walk one mask per answer row: scores (`logprobs`), logit transforms, and `--http-selection-fast
+off`. A mask depends only on the schema program, the cursor, the token trie and the stop IDs, and the
+cursors a step can reach are known before its logits are: the committed state for a serial row, the
+committed state advanced over drafts 0..r-1 for row r of an MTP window. When the step is launched those
+walks are handed to a host worker and run while the GPU executes; the row takes the finished mask, waits
+for the one in progress, or walks an unstarted one itself, and a walk whose step is over is abandoned.
+The mask words, the refusals and where they surface are those of the walk on the selecting thread, so
+token IDs and receipts are identical with the switch on or off. Requests in the argmax-first regime do
+not use the worker: their rows almost never walk a mask, and walks nobody takes only load the host. The
+profile adds `ahead_rows` (rows served by the worker; their `mask_ms` is only the wait), `ahead_masks`
+and `ahead_ms` (every mask the worker walked and its own time, including masks no row needed).
+
 Every policy response reports `strix.selection_execution` (`mtp-host` or
 `serial-host`) and `strix.selection_fallback` (null when admitted). Fallbacks are
 `selection-mtp-off`, `no-window-owner` and `window-arithmetic-not-serial`, in that

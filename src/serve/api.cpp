@@ -987,6 +987,9 @@ struct ApiService::Impl {
         profile.set("rows", Json(verdict.profile_rows)); profile.set("mask_ms", Json(verdict.profile_mask_ms));
         profile.set("select_ms", Json(verdict.profile_select_ms)); profile.set("window_rows", Json(verdict.profile_window_rows));
         profile.set("window_row_ms", Json(verdict.profile_window_row_ms)); profile.set("known_rows", Json(verdict.profile_known_rows));
+        profile.set("ranked_rows", Json(verdict.profile_ranked_rows));
+        profile.set("ahead_rows", Json(verdict.profile_ahead_rows)); profile.set("ahead_masks", Json(verdict.profile_ahead_masks));
+        profile.set("ahead_ms", Json(verdict.profile_ahead_ms));
         out.set("host_profile", std::move(profile)); return out;
     }
     ConstraintVerdict initial_verdict(const ConstraintSpec& spec) const {

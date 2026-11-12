@@ -12,7 +12,10 @@ condiciones y el comando de lanzamiento. Cómo se leen las tablas y qué cubre "
 FAST_I4 opcional en borrador (`STRIX_MMX_MODEL_FORMAT=fast_i4`): el INT4 se produce por capa durante el prefill
 en dos búferes reutilizables; memoria +3.6 GiB; el contexto nunca se reduce; decode sin cambios. Los pesos EXL3
 siguen residentes para cada capa de decode y fila MTP. `STRIX_MMX_FAST_I4_SCOPE=all|gate_up` selecciona INT4 para
-todas las proyecciones de expertos (predeterminado) o solo gate/up. La conversión en serie es la predeterminada;
+todas las proyecciones de expertos (predeterminado) o solo gate/up. Por defecto INT4 se ejecuta en las capas MoE
+38-59 y las capas 3-37 siguen en EXL3 (`STRIX_MMX_FAST_I4_EXL3_LAYERS`, `none` = todas las capas), y los prompts de
+menos de 4096 filas hacen el prefill en EXL3 (`STRIX_MMX_FAST_I4_MIN_ROWS`): a 2K, KL 0.0139, coincidencia top-1
+96.5 %, dNLL +0.006 frente al formato exacto en cuatro prompts de chat. La conversión en serie es la predeterminada;
 `STRIX_MMX_FAST_I4_PREFETCH=1` activa la precarga ordenada por eventos, pendiente de cualificación de tiempos. Es una
 identidad numérica con pérdida pendiente de las puertas nativas de tiempo y calidad; no hereda la cualificación de la
 ruta exacta de producción. Con el alcance `all`, la cadena MoE INT4 fusionada se ejecuta una vez por chunk de 4096

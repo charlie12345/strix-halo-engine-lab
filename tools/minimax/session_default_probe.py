@@ -94,7 +94,7 @@ private: strix::dist::Transport& t_; unsigned rank_;
         }'''.replace('\n+','\n'),'runner generation witness')
     replace_once(control,'    eng.exchange_bytes(o.data(), i.data(), o.size());','    eng.exchange_bytes(o.data(), i.data(), o.size());\n    if (!mm_probe::startup.load()) { mm_probe::bytes(eng.rank(), "send", o.data(), o.size()); mm_probe::bytes(eng.rank(), "receive", i.data(), i.size()); }','ordinary control witness')
     replace_once(shared,'        (void)impl_->store.consumed(h); // validate generation even at publication','        (void)impl_->store.consumed(h); // validate generation even at publication\n        mm_probe::bytes(0, "emitted", ids.data(), ids.size() * sizeof(std::uint32_t));','shared publication witness')
-    replace_once(shared,'        queue.finish(l.taken, std::move(l.stats), std::move(error));','        queue.finish(l.taken, std::move(l.stats), std::move(error));\n        if (mm_probe::enabled()) queue.shutdown();','one-request observer shutdown')
+    replace_once(shared,'            hooks.serial_queue_protocol ? QueueCompletion::serial : QueueCompletion::taken);','            hooks.serial_queue_protocol ? QueueCompletion::serial : QueueCompletion::taken);\n        if (mm_probe::enabled()) queue.shutdown();','one-request observer shutdown')
     rank = root/'apps/minimax_rank_main.cpp'
     rank_source=rank.read_text()
     if 'mm_default_probe.hpp' in rank_source: raise RuntimeError('overlay already applied to rank main')

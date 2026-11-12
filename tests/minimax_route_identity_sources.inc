@@ -12,7 +12,7 @@
 {"CMakeLists.txt", 0x84cec7dee306da7aULL},
 {"apps/minimax_rank_main.cpp", 0x38254f78be4c8facULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
-{"cmake/StrixSession.cmake", 0x23f6e9aa6e1a4e33ULL},
+{"cmake/StrixSession.cmake", 0x013e65a3501ef1d9ULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
 {"include/strix/hip_minimax_moe.hpp", 0xafeacaf792657053ULL},
 {"include/strix/hip_minimax_msa.hpp", 0x52145037fe615f8dULL},

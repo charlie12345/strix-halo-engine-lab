@@ -208,7 +208,7 @@ return 4;
         subprocess.run([str(refusal_exe)],env=dict(os.environ, MM_DEFAULT_REQUIRE_SESSION='1'),check=True)
         shared=(tree/'src/serve/session_runtime.cpp').read_text()
         completion='queue.finish(l.taken, std::move(l.stats), std::move(error));'
-        finish=shared.index(completion)
+        finish=shared.index('queue.finish(l.taken, std::move(l.stats), std::move(error),')
         shutdown=shared.index('if (mm_probe::enabled()) queue.shutdown();',finish)
         assert shared[shutdown:shutdown+len('if (mm_probe::enabled()) queue.shutdown();')].startswith('if ')
         lifecycle=r'''#include "apps/mm_default_probe.hpp"

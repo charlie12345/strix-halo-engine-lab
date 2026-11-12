@@ -98,6 +98,16 @@ function(strix_session_link_services)
         if(TARGET session_registry_tests)
             target_compile_definitions(session_registry_tests PRIVATE STRIX_EXPECT_GEMMA4_SERVICE=1)
         endif()
+        # A device-backed service makes HIP the link language of every shell
+        # consumer; these targets were declared before the HIP target list.
+        if(STRIX_ENABLE_HIP_RUNTIME AND DEFINED STRIX_HIP_ARCHS)
+            foreach(_t strix_session_shell strix-serve session_runtime_tests session_http_replay_tests
+                    session_registry_tests session_turn_cache_tests)
+                if(TARGET ${_t})
+                    set_target_properties(${_t} PROPERTIES HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+                endif()
+            endforeach()
+        endif()
     endif()
 endfunction()
 cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL strix_session_link_services)

@@ -1,5 +1,5 @@
 // strix-skeleton-serve: the shared serve shell with only the skeleton family.
-//   strix-skeleton-serve --registry-root examples/skeleton_engine --registry models/registry.toml \
+//   strix-skeleton-serve --registry-root examples/skeleton_engine --registry models/registry.toml
 //       --model skeleton --port 8080
 #include "skeleton_engine.hpp"
 

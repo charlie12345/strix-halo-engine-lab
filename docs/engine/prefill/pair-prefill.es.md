@@ -56,6 +56,36 @@ de cortes (logits iguales bit a bit al prellenado en un nodo en todos los brazos
 12.44/12.51/12.50 s, 23: 12.08, 22: 12.31, 21: 12.63/12.65, 20: 13.00; 128K 24: 49.36/50.15 s,
 23: 47.55/47.53.
 
+Contabilidad de etapas. El hilo de host de la etapa B vuelve de cada fragmento antes que el
+dispositivo, y la cola de dispositivo de cada fragmento (150-170 ms con fragmentos de 4,096
+filas) se vaciaba dentro de la espera de la trama siguiente. La etapa B parecía por ello
+alrededor de 1.1 s más barata por prompt de 32K de lo que es, y la tubería parecía
+desequilibrada, con una segunda etapa ociosa. Una traza de kernels de la etapa B con cortes 22
+y 23 muestra el mismo tiempo para cada kernel, incluida la primera capa tras la costura: una
+capa más le cuesta a la etapa B exactamente una capa. Ahora la etapa B vacía el dispositivo
+antes de esperar una trama: `exposed-seam-wait-ms` es tiempo ocioso real, `gpu-drain-ms` en la
+misma línea (la columna `seam-fence` de `STRIX_PAIR_TIMING=1`) es la cola de dispositivo, y el
+tiempo de fragmento es el trabajo real de la etapa. El total no cambia (ambas cosas debían
+terminar antes de dispersar las filas): 32K 11.61/11.68 s frente a 11.60/11.69 s, logits
+iguales bit a bit. Con los números reales las etapas con corte 23 son 10.0-10.1 s (A) y 10.2 s
+(B) a 32K: el corte predeterminado está a menos del 1 % de un reparto ideal, así que el tiempo
+restante del par es la latencia de tubería de un fragmento, no el equilibrio.
+
+Corte de media capa. `STRIX_QWEN_PF_PIPE_CUT=N.5` corta dentro de la capa N, tras su
+subbloque de atención: la etapa A ejecuta la atención de la capa N y la etapa B su mitad de
+expertos. La fila de costura es el mismo objeto (cuatro flujos, la salida de la mezcla, cuatro
+coeficientes; 25,616 bytes), tomada en la mezcla de hiperconexión de la mitad feed-forward en
+lugar de la de atención, y el estado de secuencia de la capa N se queda en la etapa A en el
+traspaso. Los logits y los tokens generados tras el traspaso son iguales bit a bit a los de
+los cortes de capa entera. Medido a 32K: 22.5: 11.82/11.85 s, 23: 11.61-11.69 s, 23.5:
+11.84 s, 22: 12.08 s, por lo que el predeterminado sigue siendo 23; el medio paso sirve para
+prompts y modelos cuyos costes por capa sitúan el punto de equilibrio dentro de una capa. Un
+archivo de costes (`STRIX_QWEN_PF_PIPE_COSTS`) puede añadir un objeto `attention` junto a
+`layers` (coste por capa del subbloque de atención, mismas unidades); solo entonces el modelo
+de costes ofrece también cortes de media capa. El tipo de corte y el equilibrio de media capa
+son código compartido (`strix/pair/pipe.hpp`, `strix/pair/balance.hpp`) para cualquier motor
+cuyas capas tengan dos subbloques residuales.
+
 El empaquetado (rango 0) y la dispersión (rango 1) de la costura movían las filas de cada
 fragmento con 3 x 4,096 copias pequeñas de dispositivo (~27 ms por fragmento en cada rango).
 Ahora usan una copia con paso por componente (los mismos bytes).

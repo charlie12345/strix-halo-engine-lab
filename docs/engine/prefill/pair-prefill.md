@@ -47,6 +47,32 @@ restores the even split. Cut sweep (logits bitwise equal to the single-node pref
 arm): 32K 24: 12.44/12.51/12.50 s, 23: 12.08, 22: 12.31, 21: 12.63/12.65, 20: 13.00;
 128K 24: 49.36/50.15 s, 23: 47.55/47.53.
 
+Stage accounting. Stage B's host thread returns from a chunk ahead of the device, and the
+device tail of each chunk (150-170 ms with 4,096-row chunks) used to drain inside the wait for
+the next frame. Stage B therefore looked about 1.1 s cheaper per 32K prompt than it is, and the
+pipeline looked unbalanced with an idle second stage. A kernel trace of stage B at cuts 22 and
+23 shows the same time for every kernel, including the first layer after the seam: one more
+layer costs stage B exactly one layer. Stage B now drains before it waits for a frame:
+`exposed-seam-wait-ms` is true idle time, `gpu-drain-ms` on the same line (the `seam-fence`
+column of `STRIX_PAIR_TIMING=1`) is the device tail, and the chunk time is the stage's real
+work. The total is unchanged (both had to finish before the rows are scattered): 32K
+11.61/11.68 s against 11.60/11.69 s, logits bitwise equal. With the honest numbers the stages
+at cut 23 are 10.0-10.1 s (A) and 10.2 s (B) at 32K: the default cut is within 1 % of an
+ideal split, so the remaining pair time is the pipeline latency of one chunk, not balance.
+
+Half-layer cut. `STRIX_QWEN_PF_PIPE_CUT=N.5` cuts inside layer N, after its attention
+sub-block: stage A runs the attention of layer N and stage B its expert half. The seam row is
+the same object (four streams, the mix output, four coefficients; 25,616 bytes), taken at the
+feed-forward hyperconnection mix instead of the attention mix, and the sequence state of
+layer N stays with stage A in the handoff. Logits and the tokens generated after the handoff
+are bitwise equal to the whole-layer cuts. Measured at 32K: 22.5: 11.82/11.85 s, 23:
+11.61-11.69 s, 23.5: 11.84 s, 22: 12.08 s, so the default stays 23; the half step is for
+prompts and models whose layer costs put the balance point inside a layer. A costs file
+(`STRIX_QWEN_PF_PIPE_COSTS`) may add an `attention` object next to `layers` (per-layer cost
+of the attention sub-block, same units); only then does the cost model also offer half-layer
+cuts. The cut type and the half-layer balance are shared code (`strix/pair/pipe.hpp`,
+`strix/pair/balance.hpp`) for any engine whose layers have two residual sub-blocks.
+
 The seam pack (rank 0) and scatter (rank 1) moved each chunk's rows with 3 x 4,096 small
 device copies (~27 ms per chunk on each rank). They now use one strided copy per component
 (same bytes).

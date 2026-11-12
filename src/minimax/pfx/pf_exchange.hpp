@@ -45,7 +45,7 @@ struct Options {
     std::uint64_t epoch = 1;
     std::uint64_t plan = 0x5846504dULL;  // "MPFX"
     std::size_t capacity = 0;            // largest payload in bytes
-    unsigned depth = 4;                  // TX / RX slots
+    unsigned depth = 4;                  // TX / RX slots (one per chunk of the prefill group: strix/pair/prefill_group.hpp)
     std::size_t chunk = std::size_t{1} << 22;  // 4 MiB: TTFT -1.5 % at 4K, -1.9 % at 1K vs 1 MiB, bytes identical
     hipStream_t stream = nullptr;
     bool crc = true;

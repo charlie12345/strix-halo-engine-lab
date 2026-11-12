@@ -2650,8 +2650,9 @@ tokens with the tokens still resident in a free slot starts in that slot and pre
 each slot's resident token ids, picks the free slot with the longest match, rounds it down to whole chunks, and the
 prefill command carries the first position (`pstart`) to the follower. Reuse preserves prefill boundaries: a
 prefill tiles its rows from the chunk's first row, so a suffix opening inside a chunk does not reproduce the bits of a
-full prefill. Alignment is conservatively `--max-rows` times `STRIX_MM_PF_GROUP` (default 4096 x 2 = 8192 tokens),
-including when grouping is disabled. Only completed prefill rows are reusable; generated rows never extend the record.
+full prefill. Alignment is conservatively `--max-rows` times 2 chunks (default 4096 x 2 = 8192 tokens; narrower than
+the default prefill group of 4 chunks, which changes the schedule but not the chunk bits), including when grouping is
+disabled. Only completed prefill rows are reusable; generated rows never extend the record.
 The KV rows are the slot's own cache, so the reuse lasts until
 another request takes the slot. Reused tokens are reported as `cached_tokens`, in `strix_prompt_tokens_cached_total`
 and as `capabilities.prefix_cache` in `/api/status`.
@@ -3333,6 +3334,19 @@ Use the host-path decode exchange module, load the prefill exchange module, and 
 - **Exactness evidence:** Same token IDs, K/V/index state and terminal rows in prefill qualification; retain protocol integrity gates.
 - **Off switch:** STRIX_MM_XFER=off; STRIX_MM_PFX=off; STRIX_MM_PF_INTERLEAVE=off (one at a time)
 - **Measured gain:** Interleaving: 8K TTFT 40.0 -> 35.4 s; 1K inert
+
+### Prefill group width
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_GROUP` (2..8), `STRIX_MM_PFX_DEPTH`. **Default:** group 4, exchange depth 4 (shared policy `include/strix/pair/prefill_group.hpp`).
+
+Interleave up to 8 forward chunks (`--max-rows` 4096 each) of one prompt as one layer-major group, so per-layer work that does not depend on the rows (the FAST_I4 layer-slot conversion) runs once per group: at the default a 32K prompt converts each MoE layer twice instead of four times; `STRIX_MM_PF_GROUP=8 STRIX_MM_PFX_DEPTH=8` makes it once.
+
+- **Preconditions:** The width is clamped to the prompt's chunk count (an 8K prompt is a group of 2 as before) and to the prefill exchange depth; each extra chunk of width costs four `--max-rows` x hidden FP32 row buffers per rank (0.8 GiB at width 4, 2.4 GiB at width 8) and one TX / RX exchange slot.
+- **Automatic selection:** Unset = 4. An explicit narrower `STRIX_MM_PFX_DEPTH` lowers the default width with a notice; an explicit `STRIX_MM_PF_GROUP` above the depth is an error.
+- **Fallback notice:** `mm rank N: prefill group width W (STRIX_MM_PFX_DEPTH)` when the depth narrows the default.
+- **Exactness evidence:** 32K FAST_I4 chain, group 4 vs 2: identical state / final-rows / result hashes, ranks agree, same tokens; prefix-cache reuse alignment stays 2 chunks.
+- **Off switch:** STRIX_MM_PF_GROUP=2 (previous default)
+- **Measured gain:** MiniMax M3.1 FAST_I4 32K TTFT, TP2 USB4, ABAB both orders: group 4 vs 2: 55.0 / 54.5 s -> 52.2 / 51.7 s (-5.1 %); group 8 vs 2: 55.5 / 55.2 s -> 52.5 / 51.4 s (-6.1 %, not distinguishable from 4, hence the default 4); 8K unchanged by construction; decode unchanged (46.1-46.5 ms/token at 32K ctx in all arms).
 
 <a id="mm-gu4"></a>
 

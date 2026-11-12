@@ -2,7 +2,7 @@
 {"decode-layout", 'a', "model+slot+position+prefix", "msa_fused_tests.hip:run_case fused vs current; rows == alone hardware gate for 1..8 rows", ""},
 // src/minimax/engine/engine.hip:1456
 {"msa-dense", 'a', "model+position+prefix; 128-key blocks", "msa_fused_tests.hip:run_case dense v3/v4 and n4-mixed/n8-mixed; prefill_batch_cases", ""},
-// src/minimax/attn/index_proj.hip:341
+// src/minimax/attn/index_proj.hip:399
 {"index-proj", 'a', "index projection FP32 chain", "index_proj_tests.hip; split/ring/LDS bitwise gates", ""},
 // src/minimax/engine/engine.hip:1372
 {"index-fallback", 'a', "index projection FP32 chain", "mm_kernels.hpp dense_t16 contract; engine index fallback contract; index_proj_tests.hip; minimax_index_layout_tests.cpp ownership/admission/refusal (native load-change equality pending)", ""},

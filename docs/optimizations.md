@@ -2650,8 +2650,9 @@ tokens with the tokens still resident in a free slot starts in that slot and pre
 each slot's resident token ids, picks the free slot with the longest match, rounds it down to whole chunks, and the
 prefill command carries the first position (`pstart`) to the follower. Reuse preserves prefill boundaries: a
 prefill tiles its rows from the chunk's first row, so a suffix opening inside a chunk does not reproduce the bits of a
-full prefill. Alignment is conservatively `--max-rows` times `STRIX_MM_PF_GROUP` (default 4096 x 2 = 8192 tokens),
-including when grouping is disabled. Only completed prefill rows are reusable; generated rows never extend the record.
+full prefill. Alignment is conservatively `--max-rows` times 2 chunks (default 4096 x 2 = 8192 tokens; narrower than
+the default prefill group of 4 chunks, which changes the schedule but not the chunk bits), including when grouping is
+disabled. Only completed prefill rows are reusable; generated rows never extend the record.
 The KV rows are the slot's own cache, so the reuse lasts until
 another request takes the slot. Reused tokens are reported as `cached_tokens`, in `strix_prompt_tokens_cached_total`
 and as `capabilities.prefix_cache` in `/api/status`.
@@ -3334,6 +3335,19 @@ Use the host-path decode exchange module, load the prefill exchange module, and 
 - **Off switch:** STRIX_MM_XFER=off; STRIX_MM_PFX=off; STRIX_MM_PF_INTERLEAVE=off (one at a time)
 - **Measured gain:** Interleaving: 8K TTFT 40.0 -> 35.4 s; 1K inert
 
+### Prefill group width
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_GROUP` (2..8), `STRIX_MM_PFX_DEPTH`. **Default:** group 4, exchange depth 4 (shared policy `include/strix/pair/prefill_group.hpp`).
+
+Interleave up to 8 forward chunks (`--max-rows` 4096 each) of one prompt as one layer-major group, so per-layer work that does not depend on the rows (the FAST_I4 layer-slot conversion) runs once per group: at the default a 32K prompt converts each MoE layer twice instead of four times; `STRIX_MM_PF_GROUP=8 STRIX_MM_PFX_DEPTH=8` makes it once.
+
+- **Preconditions:** The width is clamped to the prompt's chunk count (an 8K prompt is a group of 2 as before) and to the prefill exchange depth; each extra chunk of width costs four `--max-rows` x hidden FP32 row buffers per rank (0.8 GiB at width 4, 2.4 GiB at width 8) and one TX / RX exchange slot.
+- **Automatic selection:** Unset = 4. An explicit narrower `STRIX_MM_PFX_DEPTH` lowers the default width with a notice; an explicit `STRIX_MM_PF_GROUP` above the depth is an error.
+- **Fallback notice:** `mm rank N: prefill group width W (STRIX_MM_PFX_DEPTH)` when the depth narrows the default.
+- **Exactness evidence:** 32K FAST_I4 chain, group 4 vs 2: identical state / final-rows / result hashes, ranks agree, same tokens; prefix-cache reuse alignment stays 2 chunks.
+- **Off switch:** STRIX_MM_PF_GROUP=2 (previous default)
+- **Measured gain:** MiniMax M3.1 FAST_I4 32K TTFT, TP2 USB4, ABAB both orders: group 4 vs 2: 55.0 / 54.5 s -> 52.2 / 51.7 s (-5.1 %); group 8 vs 2: 55.5 / 55.2 s -> 52.5 / 51.4 s (-6.1 %, not distinguishable from 4, hence the default 4); 8K unchanged by construction; decode unchanged (46.1-46.5 ms/token at 32K ctx in all arms).
+
 <a id="mm-gu4"></a>
 
 ### Scalar gu4 expert addressing
@@ -3368,7 +3382,7 @@ producer overwrites it, so the copies overlap compute. Compute and scratch stay 
 
 ### FAST_I4 INT4 MoE chain per chunk
 
-**Engine:** `minimax`. **Control:** `STRIX_MOE_I4_CHAIN`. **Default:** ON with draft FAST_I4 (`STRIX_MMX_MODEL_FORMAT=fast_i4`) scope `all`, for prompts of at most 8192 rows.
+**Engine:** `minimax`. **Control:** `STRIX_MOE_I4_CHAIN`, `STRIX_MOE_I4_CHAIN_GSAVE`. **Default:** ON with draft FAST_I4 (`STRIX_MMX_MODEL_FORMAT=fast_i4`) scope `all`.
 
 The INT4 MoE prefill quantises the gate/up input once, runs gate/up as one paired grouped GEMM whose epilogue applies
 SwiGLU and the down input transform, then the down GEMM and the ordered combine. It runs once per 4096-row pipeline
@@ -3377,7 +3391,7 @@ chunk, so chunk c's MoE overlaps the TP2 exchange of chunk c-1.
 - **Preconditions:** Draft FAST_I4 (`STRIX_MMX_MODEL_FORMAT=fast_i4`) with `STRIX_MMX_FAST_I4_SCOPE=all`; FAST_I4 itself is a lossy opt-in identity whose quality gates are pending.
 - **Exactness evidence:** Same bits as the unfused INT4 calls. 8K and 32K state, final-row and token anchors equal; ranks agree in every run.
 - **Off switch:** `STRIX_MOE_I4_CHAIN=0` (unfused calls, same bits)
-- **Measured gain:** 8K prefill 12.31 s vs 12.65 s unfused (-2.7 %), 12.53 s vs 13.12 s on the reference binary (-4.5 %). 32K 56.47 s vs 55.79 s unfused (+1.2 %, two pairs in both orders, +1.35 / +1.08 %). Regime gate: the chain is default only for prompts of at most 8192 rows; longer prompts take the unfused calls. `STRIX_MOE_I4_CHAIN=0/1` forces either way.
+- **Measured gain:** 8K prefill 12.12 s vs 12.34 s unfused and 12.76 s vs 12.98 s (-1.7 %, both orders). 32K 55.23 s vs 55.74 s unfused (-0.9 %, mean of six n9 pairs, three in each order: -0.6 % S-first, -1.2 % X-first; single runs vary ±3 %). Gate/up keeps the free plan choice via FP32 gate save to global scratch (`STRIX_MOE_I4_CHAIN_GSAVE`, default on); the register save forced plan 1 (BM64) and cost +1.2 % at 32K. Chain GEMMs reach 31 % (8K) / 32 % (32K) of the iu4 WMMA peak.
 - **Implementation / evidence:** [draft FAST_I4](minimax-grouped-prefill.md#draft-fast_i4)
 
 ## GLM

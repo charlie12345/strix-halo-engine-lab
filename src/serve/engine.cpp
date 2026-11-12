@@ -257,6 +257,34 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
     }
 }
 
+std::optional<TakenJob> GenerationQueue::take_serial(bool wait) {
+    Entry entry;
+    {
+        std::unique_lock lock(mutex_);
+        if (wait) ready_.wait(lock, [&] { return stopping_ || !entries_.empty() || control_pending_; });
+        if (entries_.empty() && control_pending_ && !stopping_) {
+            control_pending_ = false;
+            lock.unlock();
+            if (idle_control_) idle_control_();
+            return std::nullopt;
+        }
+        if (entries_.empty()) return std::nullopt;
+        entry = std::move(entries_.front());
+        entries_.pop_front();
+        entry.ticket->queue_position_.store(0);
+        --totals_.queued;
+        ++totals_.running;
+        std::uint64_t position = 0;
+        for (auto& waiting : entries_) waiting.ticket->queue_position_.store(position++);
+    }
+    TakenJob taken{std::move(entry.job), entry.ticket, entry.submitted, std::chrono::steady_clock::now()};
+    auto ticket = taken.ticket;
+    taken.job.on_tokens = [ticket, output = taken.job.output](std::span<const std::uint32_t> tokens) {
+        return publish_tokens(ticket, output, tokens);
+    };
+    return taken;
+}
+
 std::optional<TakenJob> GenerationQueue::take(bool wait, bool short_first) {
     return take_selected(wait, short_first, false, false);
 }
@@ -359,7 +387,7 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
 }
 
 void GenerationQueue::finish(TakenJob& job, GenerationStats stats, std::string error,
-    const std::function<void(const GenerationStats&)>& observe) {
+    const std::function<void(const GenerationStats&)>& observe, QueueCompletion protocol) {
     if (job.ticket->cancelled() && error.empty()) stats.finish = "cancelled";
     if (stats.finish == "cancelled" && stats.constraint) {
         stats.constraint->status = "incomplete";
@@ -370,7 +398,10 @@ void GenerationQueue::finish(TakenJob& job, GenerationStats stats, std::string e
     const auto busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.started).count();
     const bool observed = still_observed(*job.ticket);
     ObserveDelta delta;
-    if (observed) delta = observe_delta(stats, error);  // before the lock, which only adds it
+    if (observed) {
+        if (protocol == QueueCompletion::serial && stats.first_token_ms) *stats.first_token_ms += stats.queue_ms;
+        delta = observe_delta(stats, error); // before the lock, which only adds it
+    }
     {
         const std::lock_guard lock(mutex_);
         --totals_.running;

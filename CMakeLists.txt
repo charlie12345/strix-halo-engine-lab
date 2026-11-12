@@ -2593,7 +2593,7 @@ int main() { return 0; }"
     target_link_libraries(strix-hip-decode-token PRIVATE strix_serve_json)
     target_link_libraries(
         strix-hip-decode-token
-        PRIVATE strix_hip_runtime strix_serve strix_assets strix_qwen_model_description strix_device_profile
+        PRIVATE strix_hip_runtime strix_serve strix_assets strix_qwen_model_description strix_device_profile strix_qwen_http_session_owner
     )
     strix_target_warnings(
         strix-hip-decode-token

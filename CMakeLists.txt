@@ -15,6 +15,8 @@ endif()
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 
+option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
+
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
 option(STRIX_CUDA_QWEN_ONLY "Build only the CUDA Qwen prefill service and gates" OFF)
 if(STRIX_CUDA_QWEN_ONLY)

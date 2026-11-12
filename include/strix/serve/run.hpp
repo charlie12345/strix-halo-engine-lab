@@ -15,7 +15,7 @@ struct ServiceSelection {
     std::string root;
     // Family arguments only, in original order, with empty arguments intact.
     std::vector<std::string> arguments;
-    mutable std::shared_ptr<const ServicePreparation> preparation;
+    mutable std::shared_ptr<const ServicePreparation> preparation = {};
 };
 // An adapter owns its assets, engine, store, queue, runtime and production
 // handler. Members must be ordered so assets outlive their users. No main()
@@ -49,7 +49,7 @@ struct ServiceFactory {
     std::function<std::unique_ptr<SessionService>(const ServiceSelection&)> create;
     // Optional family help/config/deployment inspection exit. Runs after
     // validation and before service construction, with no owner thread.
-    std::function<std::optional<int>(const ServiceSelection&, std::ostream&)> early_exit;
+    std::function<std::optional<int>(const ServiceSelection&, std::ostream&)> early_exit = {};
 };
 class ServiceFactories {
 public:

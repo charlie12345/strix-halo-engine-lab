@@ -108,6 +108,7 @@ public:
             throw std::invalid_argument("context limit");
         const auto saved = state;
         std::vector<std::uint32_t> input;
+        input.reserve(tokens.size() + 1);
         if (state.pending) input.push_back(*state.pending);
         input.insert(input.end(), tokens.begin(), eager_ ? tokens.end() : tokens.end() - 1);
         ForwardPlan plan(backend_, state, std::move(input));

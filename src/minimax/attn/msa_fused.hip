@@ -2571,11 +2571,11 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
             aidx::launch<IdxWmmaPolicyT<true>>(p, aidx::wmma_split(v.max_blocks), (sparse + 1U) / 2U, stream);
         else
             aidx::launch<IdxWmmaPolicyT<false>>(p, aidx::wmma_split(v.max_blocks), (sparse + 3U) / 4U, stream);
-        check(hipGetLastError(), "minimax prefill index wmma");
+        hip_check(hipGetLastError(), "minimax prefill index wmma");
         if (mode == aidx::kModeExact) {  // rescore the cut-off band: the selection is the exact one
             hipLaunchKernelGGL(prefill_index_refine_kernel, dim3(kMaxRows * v.idx_heads, 1, sparse), dim3(256),
                                kRefineExtra * sizeof(uint4) + sel_bytes(v.max_blocks, 256), stream, p);
-            check(hipGetLastError(), "minimax prefill index refine");
+            hip_check(hipGetLastError(), "minimax prefill index refine");
         }
         if (aidx::audit_enabled()) audit_prefill_index(p, stream);
         return;
@@ -2617,17 +2617,17 @@ void audit_prefill_index(const PrefillView& p, hipStream_t stream) {
     const std::size_t r0 = std::size_t{p.first_window} * kMaxRows, rows = p.rows - r0;
     const std::size_t n = rows * v.idx_heads * v.max_blocks, off = r0 * v.idx_heads * v.max_blocks;
     float* exact = nullptr;
-    check(hipMalloc(&exact, (off + n) * sizeof(float)), "minimax idx audit alloc");
+    hip_check(hipMalloc(&exact, (off + n) * sizeof(float)), "minimax idx audit alloc");
     PrefillView q = p;
     q.window.scores = exact;
     launch_prefill_index_exact(q, stream);
     std::vector<float> a(n), b(n);
     std::vector<std::uint64_t> pos(rows);
-    check(hipStreamSynchronize(stream), "minimax idx audit sync");
-    check(hipMemcpy(a.data(), exact + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit exact");
-    check(hipMemcpy(b.data(), v.scores + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit fast");
-    check(hipMemcpy(pos.data(), v.pos + r0, rows * sizeof(std::uint64_t), hipMemcpyDeviceToHost), "minimax idx audit pos");
-    check(hipFree(exact), "minimax idx audit free");
+    hip_check(hipStreamSynchronize(stream), "minimax idx audit sync");
+    hip_check(hipMemcpy(a.data(), exact + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit exact");
+    hip_check(hipMemcpy(b.data(), v.scores + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit fast");
+    hip_check(hipMemcpy(pos.data(), v.pos + r0, rows * sizeof(std::uint64_t), hipMemcpyDeviceToHost), "minimax idx audit pos");
+    hip_check(hipFree(exact), "minimax idx audit free");
     for (std::size_t r = 0; r < rows; ++r)
         for (unsigned h = 0; h < v.idx_heads; ++h) {
             const std::size_t o = (r * v.idx_heads + h) * v.max_blocks;

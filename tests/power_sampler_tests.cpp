@@ -76,7 +76,7 @@ struct Tree {
     [[nodiscard]] std::string path() const { return root.string(); }
 };
 
-const SourceStatus& status_of(const Sampler& sampler, const std::string& name) {
+SourceStatus status_of(const Sampler& sampler, const std::string& name) {
     for (const auto& s : sampler.sources()) if (s.name == name) return s;
     throw std::runtime_error("source not listed: " + name);
 }
@@ -202,7 +202,7 @@ void permission_denied_and_partial() {
 #endif
     Sampler sampler(make_sources(tree.path()));
     if (!root) {
-        const auto& rapl = status_of(sampler, "rapl");
+        const auto rapl = status_of(sampler, "rapl");
         require(!rapl.available && rapl.detail.find("permission denied") != std::string::npos, "rapl permission reason: " + rapl.detail);
     }
     require(status_of(sampler, "amdgpu-hwmon").available, "partial amdgpu still available");

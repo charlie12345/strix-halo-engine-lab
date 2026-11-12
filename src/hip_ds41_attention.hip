@@ -5,6 +5,7 @@
 // src/ds41_attention.cpp (same chains, same xor butterflies, same scalar helpers), so results match bit for bit.
 #include "strix/hip_ds41_attention.hpp"
 #include "hip_ds41_attention_qk.inc"
+#include "attn_core/banded_flash_prefill.hpp"
 
 #include <cstdlib>
 #include <stdexcept>

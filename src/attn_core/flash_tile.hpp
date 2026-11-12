@@ -6,8 +6,8 @@
 //   online_softmax.hpp SoftmaxState, online_step<O, K, Lanes, SumOf> (empty-block guard), finalize_scale
 //   masks.hpp          mask::window_lo/causal_ok/tile_range/list_ok/list_clamp
 //   tile_stage.hpp     pick, store_vt4x8 (V^T staging), sum_partials (fixed order)
-// Users: sparse_flash_wmma.hpp (GLM MLA/DSA, MSA shape); dense_flash_prefill.hpp (attn-flash) and
-// index_score_wmma.hpp (idx-wmma) rebase onto these. API stable: extend, do not change signatures.
+// Users: sparse_flash_wmma.hpp (GLM MLA/DSA, MSA shape); flash_core.hpp policies -> dense_flash_prefill.hpp (G4),
+// banded_flash_prefill.hpp (DS41 f16wmma), selected_flash_prefill.hpp (QSA); index_score_wmma.hpp (idx-wmma) rebases onto these. API stable: extend, do not change signatures.
 #include "attn_core/masks.hpp"
 #include "attn_core/online_softmax.hpp"
 #include "attn_core/tile_stage.hpp"

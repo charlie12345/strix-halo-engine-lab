@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm_deploy_owners.hpp"
 #include "glm/load/glm_rank_plan.hpp"
@@ -121,6 +122,10 @@ std::vector<std::uint32_t> read_u32(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed run still leaves every printed line in its log
     std::setvbuf(stderr, nullptr, _IONBF, 0);  // unbuffered (the C default, made explicit): progress and errors land at once
     try {

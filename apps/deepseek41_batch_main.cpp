@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/deepseek41_batch_dspark.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
@@ -1125,6 +1126,10 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::batch, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     Args a;
     for (int i = 1; i < argc; ++i) {

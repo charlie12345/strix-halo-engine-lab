@@ -361,6 +361,7 @@ strix_target_warnings(strix_core)
 
 include(CTest)
 include(cmake/StrixSession.cmake)
+include(cmake/StrixVisionPreprocess.cmake)
 add_library(strix_ds41_http_session_owner STATIC src/deepseek41/http_session_owner.cpp)
 target_include_directories(strix_ds41_http_session_owner PUBLIC src)
 target_link_libraries(strix_ds41_http_session_owner PUBLIC strix_session_owner)

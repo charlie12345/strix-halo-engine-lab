@@ -821,6 +821,7 @@ struct HipKnownPrefixWindow::Impl {
     std::uint64_t pp_seam_position = 0;
     bool pp_seam_valid = false;
     std::optional<std::uint32_t> pp_seam_layer;
+    bool pp_seam_half = false;
     void pp_seam(bool save, std::uint32_t seam_rows,
         const std::function<ExecutionDispatchContext(std::uint32_t)>& hc_context,
         const std::function<ExecutionDispatchContext(std::uint32_t)>& inject_context,
@@ -828,17 +829,36 @@ struct HipKnownPrefixWindow::Impl {
         if (model.hidden_size != 2560U || model.hc_count != 4U || elementwise_config.activation != HipActivationStorage::bf16)
             throw std::invalid_argument("layer-split seam requires Qwen 2560 x 4 BF16 geometry");
         const auto seam_position = hc_context(0).position;
+        // Whole-layer cut: the attention mix that opens the layer. Half-layer cut: the feed-forward mix after
+        // the attention sub-block. Both carry the same row: four streams, the mix output, four coefficients.
+        const auto seam_op = hc_context(0).op;
+        if (seam_op != SerialOp::attn_hyper_mix && seam_op != SerialOp::mlp_hyper_mix)
+            throw std::invalid_argument("PP seam requires a hyperconnection mix boundary");
+        const bool seam_half = seam_op == SerialOp::mlp_hyper_mix;
+        if (qwen_pp::pipe_context.pipe && seam_half != qwen_pp::pipe_context.half)
+            throw std::logic_error("pair prefill seam is not at the negotiated cut");
         const auto seam_size = static_cast<std::size_t>(seam_rows) * qwen_pp::Seam::row_bytes;
         auto& pair_context = qwen_pp::pipe_context;
         qwen_pp::PipeFrame* pair_frame = nullptr;
         if (pair_context.pipe) {
             if (save != (pair_context.rank == 0U)) throw std::logic_error("pair prefill seam direction mismatch");
+            // Stage B: the host returns from a chunk ahead of the device. Drain the previous chunk before waiting
+            // for the next frame, so the wait is true idle time and the drain is charged to this stage's work
+            // (same total: both must finish before the rows are scattered). Otherwise the device tail of every
+            // chunk hides inside the frame wait and stage B looks cheaper than it is.
+            const auto pair_drain_start = std::chrono::steady_clock::now();
+            if (!save) {
+                hip_check(hipDeviceSynchronize(), "pair prefill stage drain before the frame wait");
+                if (pair_context.timeline)
+                    pair_context.timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_fence, pair_drain_start);
+            }
             const auto pair_wait_start = std::chrono::steady_clock::now();
             pair_frame = &pair_context.pipe->acquire(pair_context.sequence);
             if (pair_context.timeline) pair_context.timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_wait, pair_wait_start);
-            std::fprintf(stderr, "qwen-pair rank=%u chunk=%llu exposed-seam-wait-ms=%.3f\n", pair_context.rank,
+            std::fprintf(stderr, "qwen-pair rank=%u chunk=%llu exposed-seam-wait-ms=%.3f gpu-drain-ms=%.3f\n", pair_context.rank,
                 static_cast<unsigned long long>(pair_context.sequence),
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_wait_start).count());
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_wait_start).count(),
+                std::chrono::duration<double, std::milli>(pair_wait_start - pair_drain_start).count());
             if (save) pair_frame->resize(seam_size);
             if (!save) {
                 const auto& header = pair_frame->header;
@@ -854,6 +874,7 @@ struct HipKnownPrefixWindow::Impl {
                 pp_seam_valid = true;
                 pp_seam_position = seam_position;
                 pp_seam_layer = hc_context(0).layer;
+                pp_seam_half = seam_half;
                 pp_seam_tokens.assign(seam_tokens.begin(), seam_tokens.end());
             }
         }
@@ -863,7 +884,8 @@ struct HipKnownPrefixWindow::Impl {
             pp_seam_tokens.assign(seam_tokens.begin(), seam_tokens.end());
             pp_seam_position = seam_position;
             pp_seam_layer = hc_context(0).layer;
-        } else if (!pp_seam_valid || pp_seam_layer != hc_context(0).layer || (pair_frame ? pair_frame->payload.size() : pp_seam_bytes.size()) != seam_size || pp_seam_position != seam_position ||
+            pp_seam_half = seam_half;
+        } else if (!pp_seam_valid || pp_seam_layer != hc_context(0).layer || pp_seam_half != seam_half || (pair_frame ? pair_frame->payload.size() : pp_seam_bytes.size()) != seam_size || pp_seam_position != seam_position ||
             pp_seam_tokens.size() != seam_tokens.size() || !std::equal(pp_seam_tokens.begin(), pp_seam_tokens.end(), seam_tokens.begin())) {
             throw std::invalid_argument("layer-split resume requires the same owner's saved tile, tokens and position");
         }
@@ -883,8 +905,8 @@ struct HipKnownPrefixWindow::Impl {
         for (std::uint32_t seam_row = 0; seam_row < seam_rows; ++seam_row) {
             const auto hc_dispatch = hc_context(seam_row);
             const auto inject_dispatch = inject_context(seam_row);
-            if (hc_dispatch.op != SerialOp::attn_hyper_mix)
-                throw std::invalid_argument("PP seam requires an attention HC boundary");
+            if (hc_dispatch.op != seam_op)
+                throw std::invalid_argument("PP seam requires one hyperconnection mix boundary for every row");
             const std::array<ExecutionBufferAddress, 3> seam_sources{
                 resolve_dispatch_read(hc_dispatch, 0), resolve_dispatch_write(hc_dispatch, 0),
                 resolve_dispatch_read(inject_dispatch, 2)};
@@ -946,7 +968,8 @@ struct HipKnownPrefixWindow::Impl {
                 auto& header = pair_frame->header;
                 header.fill(0);
                 header[0] = qwen_pp::Seam::magic; header[1] = pair_context.sequence;
-                header[2] = seam_position; header[3] = seam_rows; header[4] = pair_context.cut;
+                header[2] = seam_position; header[3] = seam_rows;
+                header[4] = pair::StageCut(pair_context.cut, pair_context.half).wire();
                 header[5] = pair_context.identity; header[6] = qwen_pp::token_hash(seam_tokens);
                 header[7] = prefill_folded.size();
                 for (std::size_t marker = 0; marker < prefill_folded.size(); ++marker)

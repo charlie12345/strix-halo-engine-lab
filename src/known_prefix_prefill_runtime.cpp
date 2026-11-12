@@ -354,21 +354,36 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         hooks.after_step(step,[&](std::uint32_t row) {
             require(row<rows,"known prefill observer row is outside the block");return context(step,row);});
     };
-    const auto pp_boundary = [&](std::uint32_t layer, bool save) {
-        std::size_t first_step = steps, inject_step = steps;
+    // A cut sits at a hyperconnection mix: the attention mix that opens `layer`, or (half-layer cut) the
+    // feed-forward mix after its attention sub-block. The seam carries that mix's streams and output plus the
+    // coefficients of the inject that closes the same sub-block.
+    struct PpCut { std::size_t mix, inject; };
+    const auto pp_cut = [&](std::uint32_t layer, bool half) {
+        const auto mix_op = half ? SerialOp::mlp_hyper_mix : SerialOp::attn_hyper_mix;
+        const auto inject_op = half ? SerialOp::mlp_inject : SerialOp::attn_inject;
+        std::size_t first_step = steps, mix_step = steps, inject_step = steps;
         for (std::size_t candidate = 0; candidate < steps; ++candidate) {
             const auto& candidate_source = serial.execution.steps[candidate];
             if (candidate_source.layer != layer) continue;
             if (first_step == steps) first_step = candidate;
-            if (candidate_source.op == SerialOp::attn_inject) inject_step = candidate;
+            if (candidate_source.op == mix_op && mix_step == steps) mix_step = candidate;
+            if (candidate_source.op == inject_op) inject_step = candidate;
         }
-        require(first_step != steps && inject_step != steps, "PP seam topology is missing");
-        require(serial.execution.steps[first_step].op == SerialOp::attn_hyper_mix,
+        require(first_step != steps && mix_step != steps && inject_step != steps && mix_step < inject_step,
+            "PP seam topology is missing");
+        require(half || mix_step == first_step,
             "PP cut requires a folded attention-HC boundary of the reference kind");
-        hooks.prefill_seam(save, rows,
-            [&](std::uint32_t row) { return context(first_step, row); },
-            [&](std::uint32_t row) { return context(inject_step, row); });
+        return PpCut{mix_step, inject_step};
     };
+    const auto pp_boundary = [&](const PpCut& cut, bool save) {
+        hooks.prefill_seam(save, rows,
+            [&](std::uint32_t row) { return context(cut.mix, row); },
+            [&](std::uint32_t row) { return context(cut.inject, row); });
+    };
+    const bool pp_begin_bounded = pp_range.enabled && pp_range.begin != 0U;
+    const bool pp_end_bounded = pp_range.enabled && pp_range.end < pp_layers;
+    const PpCut pp_begin = pp_begin_bounded ? pp_cut(pp_range.begin, pp_range.begin_half) : PpCut{0U, 0U};
+    const PpCut pp_end = pp_end_bounded ? pp_cut(pp_range.end, pp_range.end_half) : PpCut{steps, steps};
     std::optional<std::uint32_t> profile_layer;
     bool profile_active = false;
     const auto profile_end = [&] {
@@ -376,7 +391,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         profile_active = false;
     };
     try {
-        if (pp_range.enabled && pp_range.begin) pp_boundary(pp_range.begin, false);
+        if (pp_begin_bounded) pp_boundary(pp_begin, false);
         bool completed_layer=false;
         bool pp_saved = false;
         for(std::size_t step=0;step<steps;++step) {
@@ -384,14 +399,14 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             if(completed_layer && hooks.yield_point && hooks.bundle_closed()) {hooks.yield_point(step);completed_layer=false;}
             const auto& source=serial.execution.steps[step];
             if (pp_range.enabled) {
-                if (source.layer && *source.layer < pp_range.begin) continue;
-                const bool after_range = source.layer ? *source.layer >= pp_range.end :
-                    pp_range.end < pp_layers && (source.op == SerialOp::final_hyper_mix || source.op == SerialOp::lm_head);
+                if (source.layer && step < pp_begin.mix) continue;
+                const bool after_range = source.layer ? step >= pp_end.mix :
+                    pp_end_bounded && (source.op == SerialOp::final_hyper_mix || source.op == SerialOp::lm_head);
                 if (after_range && !pp_saved) {
                     profile_end();
-                    pp_boundary(pp_range.end, true);
+                    pp_boundary(pp_end, true);
                     pp_saved = true;
-                    if (pp_test) pp_boundary(pp_range.end, false);
+                    if (pp_test) pp_boundary(pp_end, false);
                 }
                 if (after_range && !pp_test) break;
                 if (!source.layer && pp_range.begin &&

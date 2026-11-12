@@ -85,15 +85,28 @@ A replacement target is protected during quota selection. If preserving the
 last good generation plus the new payload cannot fit, publication refuses within
 the existing quota. It does not delete that target to finance replacement. No
 new durable victim index, cache or eviction policy is introduced.
+Admission charges every retained or orphan payload generation, including the
+target's old payload, throughout the replacement peak. A successful replacement
+requires an explicitly sufficient budget; the new manifest then selects the new
+generation. Ordinary LRU eviction of other IDs is unchanged. A peer with less
+headroom causes both ranks to refuse before payload publication. Payload or
+manifest failures likewise refuse collectively and preserve the last good group
+when rollback IO succeeds.
 
 ## Qualification and migration
 
 The [independent host project](../../tests/session_checkpoint_io/README.md)
 exercises the real adopters, fixed entry-codec hashes, optional private exact-byte
 fixtures, injected failures, lock contention and platform replacement. Its
-Debug/Release checks stay active. The original Windows unbuffered fixture and
-the historical destructive tight-quota replacement assertion remain unresolved;
-their assertions are retained. Host results do not qualify native restore,
+Debug/Release checks stay active. Publication fault checks select the buffered
+shared writer on every platform and verify the named write, sync and replacement
+failures, old bytes and temporary cleanup. Linux additionally exercises its real
+direct/fallback syscall seam and page residency; those cases are unavailable on
+other platforms, and filesystem direct-IO availability is reported separately.
+The tight-quota replacement test requires safe refusal and old-generation resume;
+separate sufficient-peak tests resume the new generation. This durable-admission
+contract is a deliberate change from destructive replacement, not numerical or
+output equivalence evidence. Host results do not qualify native restore,
 complete model state, capacity or performance.
 
 The full migration remains Gemma4 -> MiniMax -> Qwen -> DS41 -> GLM. This slice

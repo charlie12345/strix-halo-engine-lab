@@ -87,6 +87,9 @@ function(strix_session_add_runtime)
             set_tests_properties(session_${test} PROPERTIES LABELS "cpu;session" TIMEOUT 30)
         endforeach()
     endif()
+    if(BUILD_TESTING AND NOT TARGET http_shutdown_tests)
+        add_subdirectory("${_strix_session_root}/tests/http_shutdown" "${CMAKE_BINARY_DIR}/http-shutdown")
+    endif()
 endfunction()
 
 

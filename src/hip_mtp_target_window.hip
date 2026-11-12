@@ -56,7 +56,7 @@ struct HipMtpTargetWindowCapture::Impl {
     std::shared_ptr<HipMtpTargetWindowBatch::Lease> active;
     std::weak_ptr<const HipMtpTargetWindowBatch::Lease> previous;
     std::uintptr_t pool=0;
-    std::uint64_t pool_bytes=0,pool_lease=0,payload=0,window_id=0,kernel_id=0,serial_id=0,next_epoch=0,row_bytes=0,capacity=0;
+    std::uint64_t pool_bytes=0,pool_lease=0,payload=0,window_id=0,kernel_id=0,serial_id=0,next_epoch=0,row_bytes=0,capacity=0;bool sources_contiguous=false;
     std::uint32_t rows=0,step=0,layer=0,vocab=0;
     ExecutionBufferUse use;
     bool failed=false;
@@ -117,6 +117,8 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipMtpTargetWindowCapture::create(con
         const auto& io=window.row_plan[row].io.steps.back();require(io.op==SerialOp::lm_head && io.writes.size()==1U,"MTP window capture requires every full target head");
         auto logits=resolve_execution_buffer(i.window_id,window.arena.row_view[row],scratch,io.writes[0]);require(logits.bytes==mul(model.vocab_size,4U),"MTP captured head is not full FP32 vocabulary");i.logit_views.push_back(logits);
     }
+    // R2-11: rows that are adjacent in the arena are captured with one copy after the last row.
+    i.sources_contiguous=rows>1U;for(std::uint32_t row=0;row<rows;++row)i.sources_contiguous=i.sources_contiguous&&i.source_views[row].address==i.source_views[0].address+row*bytes;
     i.pool=i.allocator->allocate_device(pool,256U);i.pool_lease=i.allocator->allocation_lease_identity(i.pool,pool,false);
     require(i.pool_lease,"MTP snapshot allocation lacks actual lease");
     require(i.pool_bytes<=std::numeric_limits<std::uintptr_t>::max()-i.pool,"MTP capture allocation range overflows");
@@ -159,8 +161,15 @@ void HipMtpTargetWindowCapture::preflight_row(const ExecutionDispatchContext& c)
 void HipMtpTargetWindowCapture::record_row(const ExecutionDispatchContext& c){
     preflight_row(c);auto& i=*impl_;const auto row=static_cast<std::size_t>(c.position-i.active->base.next_position);
     require(!i.active->recorded[row],"MTP wide row was captured twice");i.require_pool();
+    i.active->recorded[row]=1U;
+    if(i.sources_contiguous){
+        if(std::all_of(i.active->recorded.begin(),i.active->recorded.end(),[](auto x){return x==1U;}))
+            check(hipMemcpyAsync(reinterpret_cast<void*>(i.snapshots[0].address),reinterpret_cast<const void*>(i.source_views[0].address),
+                static_cast<std::size_t>(i.row_bytes)*i.rows,hipMemcpyDeviceToDevice,i.scope.stream));
+        return;
+    }
     check(hipMemcpyAsync(reinterpret_cast<void*>(i.snapshots[row].address),reinterpret_cast<const void*>(i.source_views[row].address),
-        static_cast<std::size_t>(i.row_bytes),hipMemcpyDeviceToDevice,i.scope.stream));i.active->recorded[row]=1U;
+        static_cast<std::size_t>(i.row_bytes),hipMemcpyDeviceToDevice,i.scope.stream));
 }
 void HipMtpTargetWindowCapture::use_device_greedy(const HipGreedyRowsReply* replies) noexcept {impl_->device_greedy=replies;}
 void HipMtpTargetWindowCapture::completed_before_publish(){

@@ -133,11 +133,16 @@ inline MtpDecodeBatchServe make_cohort_tiled_run(const Options& options, const M
             output << "},\"start_ms\":" << r.start_ms << ",\"finish_ms\":" << r.finish_ms << ",\"cycle_tokens\":" << tokens
                 << ",\"tokens_per_second\":" << (elapsed > 0.0 ? 1000.0 * static_cast<double>(tokens) / elapsed : 0.0)
                 << ",\"final_position\":" << r.final_position << ",\"stop_reason\":\"" << stop_name(r.result.finish) << "\"";
-            // Diagnostic only (STRIX_FINAL_STATE_DIGEST=1 or STRIX_PREFIX_CACHE_DIGEST=1): the committed target state
-            // digest at the request's end, for comparisons against a reference; absent otherwise.
+            // Diagnostic only (STRIX_FINAL_STATE_DIGEST=1 or STRIX_PREFIX_CACHE_DIGEST=1), absent otherwise.
+            // final_target_state_digest: the committed target state alone; it depends on the request's tokens only,
+            // so it is the one to compare across runs, cohort sizes and against a solo request.
+            // final_state_digest: target state plus the MTP proposer cache; with the default mixed proposer cache
+            // profile that part also depends on where the cycles started, which follows wall-clock admission.
             if (!r.result.final_state_digest.empty())
                 output << ",\"final_state_position\":" << r.result.final_state_position << ",\"final_state_digest\":\""
                        << r.result.final_state_digest << "\"";
+            if (!r.result.final_target_state_digest.empty())
+                output << ",\"final_target_state_digest\":\"" << r.result.final_target_state_digest << "\"";
             // With STRIX_PREFIX_CACHE_DIGEST_COMPONENTS=1: one digest per registered component (target components and
             // the MTP predictor's mtp.kv, mtp.index and mtp.held), so the target state can be compared on its own.
             if (!r.result.final_state_components.empty())

@@ -94,7 +94,7 @@ struct MtpServeResult {
     std::optional<serve::ConstraintVerdict> constraint;
     std::string error;
     BatchServiceStats service;
-    std::string prompt_state_digest,final_state_digest,final_state_components;
+    std::string prompt_state_digest,final_state_digest,final_target_state_digest,final_state_components;
     std::uint64_t final_state_position=0;
     std::uint64_t restored_tokens = 0, generated_tokens = 0, cycles = 0, proposed = 0, accepted = 0;
     std::uint64_t paid_drafts = 0;
@@ -2047,6 +2047,7 @@ private:
             s.result.final_state_position=s.session->next_position;
             s.result.final_state_digest=model_content_identity_hex((prefix_batch_cert_execution_mode(options_)?s.parents->tiled.cache->state_digest(s.session->next_position,s.runtime->next_source_position()):
                 s.parents->tiled.cache->state_digest(s.session->next_position)));
+            s.result.final_target_state_digest=model_content_identity_hex(s.parents->tiled.cache->state_digest(s.session->next_position,{},true));
             static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
             if(components) s.result.final_state_components=s.parents->tiled.cache->component_digests(s.session->next_position);
         }
@@ -2670,6 +2671,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                             if(hipDeviceSynchronize()!=hipSuccess) throw std::runtime_error("complete final committed state digest");
                             out.final_state_position=session.next_position;
                             out.final_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
+                            out.final_target_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position,{},true));
                             static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
                             if(components) out.final_state_components=parents->tiled.cache->component_digests(session.next_position);
                         }

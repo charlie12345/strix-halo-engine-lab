@@ -2551,6 +2551,31 @@ static int run_decode_entry(
         else if (hipMemset(load_balloon, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) (void)hipGetLastError();
         std::cerr << "load balloon: " << (load_balloon ? "reserved " : "could not reserve ") << bytes << " bytes before registration\n";
     }
+    // STRIX_SERVE_CENSUS=1: host and device-visible memory at three points of one load (before load, after load,
+    // at the slot probe), so the bytes that leave MemAvailable between preflight and the probe can be attributed.
+    const bool serve_census_on = options.http_serve && strix::serve::census_enabled();
+    const auto serve_census = [&](const char* point,
+            std::initializer_list<std::pair<const char*, std::uint64_t>> charged) {
+        strix::serve::MemoryCensus census;
+        census.point = point;
+        strix::decode_cli::PrefillCapabilities census_caps;
+        const auto seen = strix::decode_cli::observe_prefill_memory(census_caps);
+        census.host_total = seen.total; census.host_available = seen.available;
+        census.device_limit = seen.gtt_limit; census.device_used = seen.gtt_used;
+        const auto [meminfo, meminfo_status] = strix::read_linux_uma_text("/proc/meminfo");
+        if (meminfo_status == strix::LinuxUmaReadStatus::read)
+            strix::serve::append_kb_fields(census, meminfo, {"MemFree", "Cached", "Buffers", "Shmem", "AnonPages",
+                "Mapped", "Unevictable", "Mlocked", "SReclaimable", "SUnreclaim"});
+        const auto [status, status_state] = strix::read_linux_uma_text("/proc/self/status");
+        if (status_state == strix::LinuxUmaReadStatus::read)
+            strix::serve::append_kb_fields(census, status, {"VmRSS", "RssAnon", "RssFile", "RssShmem", "VmLck", "VmPin"},
+                "self_");
+        for (const auto& [name, bytes] : charged) census.fields.emplace_back(name, bytes);
+        std::cerr << strix::serve::format_memory_census(census) << '\n';
+        return census;
+    };
+    std::optional<strix::serve::MemoryCensus> census_before_load;
+    if (serve_census_on) census_before_load = serve_census("before_load", {});
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
@@ -4420,6 +4445,15 @@ static int run_decode_entry(
             const auto staging_reserve=qwen_http_batch_staging_reserve(options,model,state_layout);
             headroom=add(headroom,staging_reserve);
             const auto before = observe();
+            std::optional<strix::serve::MemoryCensus> census_after_load;
+            if (serve_census_on) {
+                census_after_load = serve_census("after_load", {{"registered", model_residency.registered_bytes()},
+                    {"registered_locked", model_residency.registered_locked_bytes()},
+                    {"charged_unlocked_registered", unlocked_registered}, {"charged_reserved_table", reserved_table_bytes},
+                    {"charged_headroom", headroom}, {"slot_estimate", estimate}});
+                if (census_before_load)
+                    std::cerr << strix::serve::format_census_delta(*census_before_load, *census_after_load) << '\n';
+            }
             auto retained = estimate;
             // Observations of the last fit, reused if the route falls back to the single runner.
             auto fit_host = before.available;
@@ -4479,6 +4513,19 @@ static int run_decode_entry(
                 cache_prompt_transient=add(cache_prompt_transient,4U*(11U*640U+1U)+2U*4U*10240U*4U);
             }
             options.http_slot_reason = "limited by " + capacity.limiting;
+            if (serve_census_on) {
+                const auto census_probe = serve_census("probe", {{"registered", model_residency.registered_bytes()},
+                    {"registered_locked", model_residency.registered_locked_bytes()},
+                    {"charged_unlocked_registered", unlocked_registered}, {"charged_reserved_table", reserved_table_bytes},
+                    {"charged_headroom", headroom}, {"slot_estimate", estimate}, {"slot_retained", retained}});
+                if (census_after_load)
+                    std::cerr << strix::serve::format_census_delta(*census_after_load, census_probe) << '\n';
+                if (census_before_load)
+                    std::cerr << strix::serve::format_census_delta(*census_before_load, census_probe) << '\n';
+                // Same inputs as the last fit; `slots` is the memory answer before the single-route override.
+                std::cerr << strix::serve::format_capacity_report(strix::serve::report_bridge_capacity(retained, serving,
+                    fit_host, fit_device, headroom, headroom, options.http_batch_cap)) << '\n';
+            }
             batch_slots = !single_route && (capacity.slots > 1U ||
                 ((options.http_batch_explicit || deployment.plan) && options.http_batch_cap == 1U))
                 ? capacity.slots : 0U;

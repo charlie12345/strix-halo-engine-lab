@@ -200,6 +200,34 @@ int main() {
         std::cout << (ok ? "PASS " : "FAIL ") << name << '\n'; failures += ok ? 0U : 1U;
     };
     {
+        ms::Control c;
+        c.command=3;c.task_id=0x0102030405060708ULL;c.parent_task_id=9;c.slot_generation=11;
+        c.active={12,13,14,15,16,17,18,19,20,21,true};
+        c.parked={22,23,24,25,26,27,28,29,30,31,true};
+        c.rows=8;c.pslot=3;c.plen=2000;c.pflags=7;c.bank=1;c.round=37;c.ack_round=36;
+        c.layers=4;c.append=255;c.dslots=8;
+        for(unsigned i=0;i<8;++i){c.row[i]={i,100+i,0x0102030405060708ULL+i};c.dslot[i]=i;c.danchor[i]=200+i;c.dpos[i]=900+i;}
+        const auto canonical=ms::control_wire(c);
+        const auto poison = [&](std::size_t first,std::size_t last) {
+            auto* raw=reinterpret_cast<unsigned char*>(&c);
+            for(auto i=first;i<last;++i)raw[i]=0xa5;
+        };
+        poison(12,16);poison(105,112);poison(177,184);poison(204,208);poison(428,432);
+        const auto wire=ms::control_wire(c);
+        check(std::memcmp(wire.data(),canonical.data(),512)==0,"poisoned padding cannot affect populated wire fields");
+        ms::Control decoded;std::memcpy(&decoded,wire.data(),sizeof decoded);
+        check(decoded.active==c.active && decoded.parked==c.parked && decoded.task_id==c.task_id &&
+              decoded.parent_task_id==c.parent_task_id && decoded.slot_generation==c.slot_generation &&
+              decoded.rows==8 && decoded.pslot==3 && decoded.plen==2000 && decoded.pflags==7 && decoded.bank==1 &&
+              decoded.round==37 && decoded.ack_round==36 && decoded.layers==4 && decoded.append==255 && decoded.dslots==8,
+              "populated task/checkpoint/control fields retain version-3 layout");
+        bool fields=true;
+        for(unsigned i=0;i<8;++i)fields &= decoded.row[i].slot==c.row[i].slot && decoded.row[i].token==c.row[i].token &&
+            decoded.row[i].pos==c.row[i].pos && decoded.dslot[i]==c.dslot[i] && decoded.danchor[i]==c.danchor[i] && decoded.dpos[i]==c.dpos[i];
+        for(std::size_t i=496;i<512;++i)fields &= wire[i]==std::byte{0};
+        check(fields && wire[16]==std::byte{8} && wire[23]==std::byte{1},"ordered rows/drafts and little-endian values preserved; reserved tail zero");
+    }
+    {
         Scenario idle(ms::Sched::interleave);
         const auto r = idle.run(2500);
         check(idle.engine.quiesces == count(r, ms::Command::heartbeat) && idle.engine.quiesces >= 2,
@@ -511,6 +539,7 @@ int main() {
         // rest. The cold request reuses nothing; the warm prefill carries pstart = reuse and plen = the rest.
         Scenario s(ms::Sched::off);
         s.shared.prefix_reuse = true;
+        s.shared.prefix_identity = {"loaded-weights", "profile-tp2", "prefill-v1", 2};
         std::vector<std::uint32_t> base(9000, 7U);
         std::vector<std::uint32_t> warm = base;
         warm.insert(warm.end(), {8U, 9U, 10U});              // prompt.size() = 9003
@@ -533,6 +562,7 @@ int main() {
         // A shared prefix shorter than one prefill chunk is not reused: its suffix could not open on a chunk boundary.
         Scenario s(ms::Sched::off);
         s.shared.prefix_reuse = true;
+        s.shared.prefix_identity = {"loaded-weights", "profile-tp2", "prefill-v1", 2};
         std::vector<std::uint32_t> base(4000, 7U), warm = base;
         warm.insert(warm.end(), {8U, 9U, 10U});
         s.submit_prompt(0, 1, base, 2);
@@ -563,6 +593,7 @@ int main() {
         // the request that follows a named one prefills in full even though its prefix matched before.
         Scenario s(ms::Sched::off);
         s.shared.prefix_reuse = true;
+        s.shared.prefix_identity = {"loaded-weights", "profile-tp2", "prefill-v1", 2};
         std::vector<std::uint32_t> base(9000, 7U), warm = base;
         warm.insert(warm.end(), {8U, 9U, 10U});
         s.submit_prompt(0, 1, base, 2);
@@ -585,6 +616,7 @@ int main() {
     {
         Scenario s(ms::Sched::off);
         s.shared.prefix_reuse = true;
+        s.shared.prefix_identity = {"loaded-weights", "profile-tp2", "prefill-v1", 2};
         s.engine.reuse_alignment = 8192;  // the production engine can group two chunks
         std::vector<std::uint32_t> base(7000, 7U), warm = base;
         warm.push_back(8U);
@@ -596,6 +628,7 @@ int main() {
     {
         Scenario s(ms::Sched::off);
         s.shared.prefix_reuse = true;
+        s.shared.prefix_identity = {"loaded-weights", "profile-tp2", "prefill-v1", 2};
         std::vector<std::uint32_t> base(4095, 7U), warm = base;
         // FakeEngine emits 100 for slot 0. The first is then fed by decode, beyond the partial prompt chunk.
         warm.insert(warm.end(), {100U, 100U, 9U});
@@ -607,6 +640,7 @@ int main() {
     {
         Scenario s(ms::Sched::interleave);
         s.shared.prefix_reuse = true;
+        s.shared.prefix_identity = {"loaded-weights", "profile-tp2", "prefill-v1", 2};
         std::vector<std::uint32_t> prompt(9000, 7U);
         s.submit(0, 99, 10, 100);  // a protected decoder forces the long prefill to yield
         s.submit_prompt(800, 1, prompt, 2);

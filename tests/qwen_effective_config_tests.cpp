@@ -3600,12 +3600,81 @@ int main(int argc, char** arguments) {
         http.options.context_tokens=32768; http.options.context_explicit=true; http.options.unqualified_context=true;
         http.options.tokens.clear();
         const auto fast=resolve(http,memory);
-        expect(fast.options.known_prefix_prefill_rows==8192 && fast.options.automatic_prefill,
-            "HTTP allocates automatic T8192 before prompts arrive");
-        expect(fast.options.context_tokens==32768 && !fast.options.prefill_numerical_profile &&
-            fast.options.numerical_profile==resolve_prefill_effective_config(http,model,info,manifest,
-                validated_model_content_identity,capabilities,memory).options.numerical_profile,
-            "HTTP preserves context and numerical identity");
+        // This fixture's resolver pins STRIX_QPF2K_T16K=0 (the historical ladder), so the owner stays T8192.
+        expect(fast.options.known_prefix_prefill_rows==8192 && fast.options.automatic_prefill && !fast.t16k_policy_source &&
+            fast.serve_prefill_notice.find("T16384:STRIX_QPF2K_T16K-disabled")!=std::string::npos,
+            "HTTP allocates automatic T8192 before prompts arrive and prints why T16384 is declined");
+        expect(fast.options.context_tokens==32768 && fast.options.numerical_profile==dense_a8_profile &&
+            fast.options.prefill_profile_automatic,
+            "HTTP preserves context and resolves the single-request arithmetic");
+        {
+            // One route rule: for the same request shape the server resolves the single-request route.
+            const auto same_identity=[](const Options& a,const Options& b) {
+                return a.prefill_numerical_profile==b.prefill_numerical_profile &&
+                    a.prefill_profile_automatic==b.prefill_profile_automatic &&
+                    a.known_prefix_window==b.known_prefix_window && a.known_prefix_full_rows==b.known_prefix_full_rows &&
+                    a.known_prefix_expert_union==b.known_prefix_expert_union &&
+                    a.known_window_router_rows==b.known_window_router_rows &&
+                    a.known_prefix_output_policy==b.known_prefix_output_policy &&
+                    a.q51_slot_parallel_down==b.q51_slot_parallel_down && a.batched_moe_activation==b.batched_moe_activation &&
+                    a.wave8_q8_gdn_input==b.wave8_q8_gdn_input && a.wave8_q8_gdn_output==b.wave8_q8_gdn_output &&
+                    a.prefetch_q8_lm_head==b.prefetch_q8_lm_head && a.wave8_q8_lm_head==b.wave8_q8_lm_head &&
+                    a.wave8_q8_qsa_output==b.wave8_q8_qsa_output;
+            };
+            for (const std::size_t rows : {std::size_t{8192},std::size_t{32768}}) {
+                auto cli=request; cli.options.tokens.assign(rows,request.options.tokens.front());
+                if (rows==32768) cli.environment["STRIX_QPF2K_T16K"]="1";
+                const auto single=resolve(cli,memory);
+                auto shaped=http; shaped.options.context_tokens=single.options.context_tokens;
+                shaped.environment=cli.environment;
+                const auto server=resolve(shaped,memory);
+                expect(single.admitted && single.options.known_prefix_prefill_rows==(rows==8192?8192U:16384U),
+                    "single-request route admits the pinned request shape");
+                expect(server.options.known_prefix_prefill_rows==single.options.known_prefix_prefill_rows,
+                    "server primary tile equals the single-request tile for the same request shape");
+                expect(same_identity(server.options,single.options) && server.options.prefill_profile_automatic &&
+                    server.options.prefill_numerical_profile==DecodeNumericalProfile::fast_prefill_f16wmma_v1,
+                    "server prefill arithmetic and organization equal the single-request route");
+                expect(server.t16k_policy_source==single.t16k_policy_source,"server T16384 policy equals the single-request policy");
+                expect(server.serve_prefill_notice.find("arithmetic fp16")!=std::string::npos,"server route line names the arithmetic");
+                Options a=http.options;
+                const PromptRouteShape shape{rows};
+                const auto ra=resolve_prompt_route(a,cli.environment,capabilities,shape);
+                expect(ra.primary_rows==single.options.known_prefix_prefill_rows,"shared rule yields the admitted single-request tile");
+                // The automatic threshold is the same pure rule for a prompt and for a server's largest request.
+                Options prompt=http.options,owner=http.options;
+                PromptRouteShape serving{rows,true};
+                const auto automatic_prompt=resolve_prompt_route(prompt,Environment{},capabilities,shape);
+                const auto automatic_owner=resolve_prompt_route(owner,Environment{},capabilities,serving);
+                expect(automatic_prompt.primary_rows==(rows>=t16k_prompt_threshold?16384U:8192U) &&
+                    automatic_owner.primary_rows==automatic_prompt.primary_rows &&
+                    automatic_owner.t16k_policy_source==automatic_prompt.t16k_policy_source,
+                    "automatic T16384 threshold is one rule for both callers");
+            }
+            auto wide=http; wide.options.context_tokens=40960; wide.environment["STRIX_QPF2K_T16K"]="1";
+            auto pinned=wide; pinned.environment["STRIX_SERVE_T16K"]="0";
+            const auto t8=resolve(pinned,memory);
+            expect(t8.options.known_prefix_prefill_rows==8192 && t8.serve_prefill_notice.find("T16384:STRIX_SERVE_T16K=0")!=std::string::npos,
+                "server T16384 off switch keeps T8192 and prints the reason");
+            pinned=wide; pinned.environment["STRIX_SERVE_ROUTE"]="0";
+            const auto legacy=resolve(pinned,memory);
+            expect(legacy.options.known_prefix_prefill_rows==8192 && !legacy.options.prefill_profile_automatic &&
+                legacy.serve_prefill_notice.find("arithmetic preserved")!=std::string::npos,
+                "server route off switch keeps the earlier owner and arithmetic");
+            pinned=http; pinned.environment["STRIX_PREFILL_F16"]="0";
+            const auto no_f16=resolve(pinned,memory);
+            expect(!no_f16.options.prefill_numerical_profile &&
+                no_f16.serve_prefill_notice.find("automatic fp16 declined: STRIX_PREFILL_F16=0")!=std::string::npos,
+                "server prints why the automatic arithmetic is declined");
+            auto slots=memory;
+            slots.estimate=[&](const Options& o) {
+                auto r=memory.estimate(o); if(o.known_prefix_prefill_rows==16384) r.workspace=128*gib_bytes; return r;
+            };
+            const auto fallback=resolve(wide,slots);
+            expect(fallback.options.known_prefix_prefill_rows==8192 && fallback.options.prefill_profile_automatic &&
+                fallback.serve_prefill_notice.find("T16384:memory")!=std::string::npos,
+                "server falls back to T8192 with the shared arithmetic when T16384 does not fit, and says why");
+        }
         expect(fast.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}),
             "HTTP keeps all tail owners for future requests");
         auto context=http; context.options.context_tokens=4096;

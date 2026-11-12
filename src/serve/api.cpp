@@ -1008,9 +1008,15 @@ struct ApiService::Impl {
         out.constraint = spec;
         out.family = ticket->output();
         bool reasoning = spec && spec->starts_in_reasoning;
+        // One named vector per delta: no temporary list outlives its use.
+        const auto emit_delta = [&](ChatSplitter::Delta delta) {
+            std::vector<ChatSplitter::Delta> one;
+            one.push_back(std::move(delta));
+            return on_delta(one);
+        };
         const auto emit = [&](const std::string& text) {
             if (reasoning) out.reasoning += text; else out.text += text;
-            return !on_delta || text.empty() || on_delta({{reasoning, text}});
+            return !on_delta || text.empty() || emit_delta({reasoning, text});
         };
         StopFilter filter(stops);
         std::optional<StopFilter> reasoning_filter;
@@ -1020,7 +1026,7 @@ struct ApiService::Impl {
         const auto family_reasoning = [&](const std::string& text) {
             if (text.empty()) return;
             out.reasoning += text;
-            if (on_delta && !on_delta({{true, text}})) { ticket->cancel(); stopped = true; }
+            if (on_delta && !emit_delta({true, text})) { ticket->cancel(); stopped = true; }
         };
         const auto family_deltas = [&] {
             if (!out.family) return;
@@ -1034,7 +1040,7 @@ struct ApiService::Impl {
                 const auto text = filter.push(delta.content);
                 if (!text.empty()) {
                     out.text += text;
-                    const bool ok = on_delta ? on_delta({{false, text}}) : !on_text || on_text(text);
+                    const bool ok = on_delta ? emit_delta({false, text}) : !on_text || on_text(text);
                     if (!ok) { ticket->cancel(); stopped = true; }
                 }
                 if (filter.matched()) { out.matched = filter.match(); ticket->cancel(); stopped = true; }
@@ -1043,8 +1049,8 @@ struct ApiService::Impl {
                     // supplies parsed calls, while this drain owns delivery.
                     family_reasoning(reasoning_filter->finish());
                     const auto tail=filter.finish();
-                    if (!tail.empty()) { out.text+=tail; if (!on_delta({{false,tail}})) {ticket->cancel();stopped=true;} }
-                    if (!stopped && !on_delta({{false,"",delta.tool_calls}})) {ticket->cancel();stopped=true;}
+                    if (!tail.empty()) { out.text+=tail; if (!emit_delta({false,tail})) {ticket->cancel();stopped=true;} }
+                    if (!stopped && !emit_delta({false,"",delta.tool_calls})) {ticket->cancel();stopped=true;}
                     if (!stopped) out.streamed_tools=true;
                 }
             }
@@ -1495,8 +1501,11 @@ struct ApiService::Impl {
             }
             return true;
         };
-        auto outcome = drive(ticket, stops, [&](const std::string& text) { return send_deltas(config.timed_completion_envelope ?
-                std::vector<ChatSplitter::Delta>{{false,text}} : splitter.push(text)); },
+        auto outcome = drive(ticket, stops, [&](const std::string& text) {
+                if (!config.timed_completion_envelope) return send_deltas(splitter.push(text));
+                std::vector<ChatSplitter::Delta> one;
+                one.push_back(ChatSplitter::Delta{false,text});
+                return send_deltas(one); },
             [&] { return !response.client_gone(); }, [&] { return writer.idle(*ticket); }, spec, send_deltas, [&](const Json& score, bool) { pending_scores.push(score); });
         if (!config.timed_completion_envelope && named_session(body) && !outcome.error.empty()) {
             auto error = stream_error(outcome);
@@ -1922,7 +1931,8 @@ struct ApiService::Impl {
         const auto chunk = [&](const std::string& text, const Json& finish, bool final_usage, const Outcome* outcome) {
             Json choice = Json::object();
             choice.set("index", Json(0)); choice.set("text", Json(sanitize_utf8(text)));
-            if (!config.timed_completion_envelope) choice.set("logprobs", spec && spec->logprobs ? completion_scores(outcome && !stream ? outcome->scores : pending_scores, text_offset) : Json()); pending_scores = Json::array(); choice.set("finish_reason", finish);
+            if (!config.timed_completion_envelope) choice.set("logprobs", spec && spec->logprobs ? completion_scores(outcome && !stream ? outcome->scores : pending_scores, text_offset) : Json());
+            pending_scores = Json::array(); choice.set("finish_reason", finish);
             Json out = Json::object();
             out.set("id", Json(id)); out.set("object", Json("text_completion")); out.set("created", Json(created));
             out.set("model", Json(config.model_id));
@@ -2450,7 +2460,8 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             Json model = Json::object();
             model.set("id", Json(impl.config.model_id)); model.set("object", Json("model")); if (!impl.config.minimal_metadata) model.set("created", Json(unix_now()));
             if (impl.config.capabilities && !impl.config.minimal_metadata) model.set("capabilities_id", Json(impl.capabilities_id));
-            if (!impl.config.minimal_metadata) model.set("owned_by", Json("strix")); model.set("context_length", Json(impl.context_tokens));
+            if (!impl.config.minimal_metadata) model.set("owned_by", Json("strix"));
+            model.set("context_length", Json(impl.context_tokens));
             Json data = Json::array(); data.push(std::move(model));
             Json out = Json::object(); out.set("object", Json("list")); out.set("data", std::move(data));
             response.send(200, "application/json", out.dump());

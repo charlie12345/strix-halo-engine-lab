@@ -2360,6 +2360,17 @@
   },
   {
     "engine": "glm",
+    "name": "Producer exchange publish (GLM decode)",
+    "flag_or_env": "STRIX_GLM_XB_PUBLISH",
+    "default": "1",
+    "exact": "In-process A B A at 1K: identical tokens, last logits and state digests; fresh-process arms at 8K, plain and speculative: identical token digests.",
+    "gain": "plain decode 1K 39.05 -> 38.42 ms/token (-1.6 %); 8K plain 39.88 -> 39.33 (-1.4 %), speculative 23.28 -> 22.84 (-1.9 %)",
+    "preconditions": "Pair decode on the Xfer exchange with the fused boundary, fast attention and fast MoE seams.",
+    "off_switch": "STRIX_GLM_XB_PUBLISH=0",
+    "doc_anchor": "docs/optimizations.md#glm-xfer-producer-publish"
+  },
+  {
+    "engine": "glm",
     "name": "Fast raw-expert MoE",
     "flag_or_env": "STRIX_GLM_MOE",
     "default": "fast",

@@ -1207,11 +1207,19 @@ int main(int argc, char** argv) {
             namespace FA = strix::glm::fast;
             const std::size_t pe = std::min(prompt.find(','), prompt.size());
             const auto toks = read_u32(prompt.substr(0, pe));
-            for (int k = 0; k < 7; ++k) {
+            // STRIX_GLM_ABA_RUNS=n (odd, 3..7; default 7): shorter series for long prompts (each run prefills again).
+            const int aba_runs = std::getenv("STRIX_GLM_ABA_RUNS") != nullptr ? std::clamp(std::atoi(std::getenv("STRIX_GLM_ABA_RUNS")) | 1, 3, 7) : 7;
+            for (int k = 0; k < aba_runs; ++k) {
                 const bool b = k % 2 == 1;
-                TB::set_table_enabled(b);
-                if (b) FA::set_scores_auto();
-                else FA::set_scores_schedule(FA::DenseSchedule::kLane);
+                // STRIX_GLM_ABA_XBPUB=1: the same series over the decode producer publication instead (A off, B on).
+                static const bool xbpub = std::getenv("STRIX_GLM_ABA_XBPUB") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_XBPUB")) == "1";
+                if (xbpub) {
+                    ge::set_decode_producer_publish(b ? 1 : 0);
+                } else {
+                    TB::set_table_enabled(b);
+                    if (b) FA::set_scores_auto();
+                    else FA::set_scores_schedule(FA::DenseSchedule::kLane);
+                }
                 eng.reset(0);
                 std::uint32_t nx = eng.prefill(0, toks, 0);
                 std::vector<std::uint32_t> out{nx};
@@ -1235,6 +1243,7 @@ int main(int argc, char** argv) {
             }
             TB::set_table_enabled(true);
             FA::set_scores_auto();
+            ge::set_decode_producer_publish(-1);
         }
         // --aba-xch N: in-process A B A B A B A of the decode exchange, A = CommExchange (the Communicator), B =
         // XferExchange borrowing the communicator's transport (one load, same session). Per run: reset slots 0..R-1 and

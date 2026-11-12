@@ -437,7 +437,7 @@ void HipMtpDraftHead::wait_step(std::uint32_t step,void* raw_stream) const {
     // The stream that carries the step: the head's own, or the multi-session draft batch stream.
     const auto stream=static_cast<hipStream_t>(raw_stream);
     // STRIX_MTP_DRAFT_POLL=0 synchronises the stream as before.
-    static const bool poll=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_POLL");return !v || v[0]!='0';}();
+    static const bool poll=strix::envcfg::flag("STRIX_MTP_DRAFT_POLL", true);
     if(poll) {
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(50);
         for(unsigned spin=0;;++spin) {

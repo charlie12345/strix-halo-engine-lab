@@ -411,10 +411,9 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
                     std::chrono::duration<double>(std::chrono::steady_clock::now()-t1).count(),1U);
             }
             // STRIX_SERIAL_LOGITS_DIGEST=1 (diagnostic, gates): the row's FP32 logits digest (prompt receipts report the terminal one).
-            static const bool logits_digest=[]{const char* v=std::getenv("STRIX_SERIAL_LOGITS_DIGEST");return v && v[0]=='1';}();
-            const char* mtp_digest=std::getenv("STRIX_MTP_LOGITS_DIGEST");
+            static const bool logits_digest=strix::envcfg::flag("STRIX_SERIAL_LOGITS_DIGEST", false);
             const MtpSerialLogitsDigestPolicy digest_policy{
-                logits_digest,mtp_digest && mtp_digest[0]=='1',mtp_step_logits_digest_enabled()};
+                logits_digest,mtp_logits_digest_enabled(),mtp_step_logits_digest_enabled()};
             // One read of the logits row serves the digests and the session callback (R2-18).
             const bool digest=digest_policy.enabled() || prompt_terminal_digest_enabled();
             if(digest || i.session_logits) {
@@ -431,7 +430,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
         if(resources.qsa_committed_pool) resources.qsa_committed_pool->commit(false,session.next_position);
         lease->committed=session;
         i.record_step(lease->position,lease->logits_digest);
-        if(const char* d=std::getenv("STRIX_MTP_LOGITS_DIGEST");d && d[0]=='1' && lease->logits_digest)
+        if(mtp_logits_digest_enabled() && lease->logits_digest)
             std::fprintf(stderr,"mtp-logits committed position=%llu sha256=%s\n",static_cast<unsigned long long>(lease->position),
                 model_content_identity_hex(*lease->logits_digest).c_str());
         if(session.next_position!=lease->position+1 || session.health!=SerialSessionHealth::ready)

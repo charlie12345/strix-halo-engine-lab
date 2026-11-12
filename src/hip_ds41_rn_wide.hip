@@ -626,7 +626,7 @@ bool parse_shape(const char* e, RnWideShape& s) {
 } // namespace
 
 bool rn_wide_enabled() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_DS41_RN_WIDE"); return e && e[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DS41_RN_WIDE", false);
     return on;
 }
 

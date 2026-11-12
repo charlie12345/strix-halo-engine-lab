@@ -1747,10 +1747,7 @@ __global__ __launch_bounds__(wave * f16_waves) void f16_rows_wide_kernel(F16Rows
         }
 }
 
-bool f16_rows_wide_enabled = [] {
-    const char* e = std::getenv("STRIX_DS41_F16_WIDE");
-    return !(e && e[0] == '0');
-}();
+bool f16_rows_wide_enabled = strix::envcfg::flag("STRIX_DS41_F16_WIDE", true);
 // Many rows: lanes stay the lane classes of the declared lane dot (lane l: elements l, l + 32, ... in
 // ascending order, then the butterfly), and each wave keeps the class sums of 16 rows x 6 outputs, so a
 // weight value is used by 16 rows and an activation value by 6 outputs; a block's 8 waves take 48
@@ -2224,7 +2221,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
                                      !overlap(v.sub, stream_bytes / hc_copies, v.collapse_out, stream_bytes / hc_copies))),
             "hc site view");
     // STRIX_DS41_HC_SITE_FAST=0: the previous site kernel (and its one-launch row limit); same bits either way.
-    static const bool fast_env = [] { const char* e = std::getenv("STRIX_DS41_HC_SITE_FAST"); return !(e && e[0] == '0'); }();
+    static const bool fast_env = strix::envcfg::flag("STRIX_DS41_HC_SITE_FAST", true);
     const bool fast = v.form == 2 || (v.form == 0 && fast_env);
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
@@ -2572,7 +2569,7 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
     }
     if (v.rows <= max_rows) {  // decode rows: lanes kernel, else the wide or the plain site kernel (same bits)
         // Same bits, 16-byte loads (hip_ds41_f16_rows.hip); STRIX_DS41_F16_LANES=0 keeps this kernel.
-        static const bool lanes = [] { const char* e = std::getenv("STRIX_DS41_F16_LANES"); return !(e && e[0] == '0'); }();
+        static const bool lanes = strix::envcfg::flag("STRIX_DS41_F16_LANES", true);
         if (lanes && f16_rows_lanes_supported(v)) { enqueue_f16_rows_lanes(v, stream); return; }
         // DSpark's wide-load kernel (same bits; superseded by the lanes kernel) when the lanes are switched off
         if (f16_rows_wide_enabled && v.width % f16_chunk == 0U && v.x_stride % 4U == 0U) {  // same bits, more bandwidth
@@ -2759,8 +2756,8 @@ void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
 
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream) {
     // STRIX_DS41_F16_PAIR (on by default since P16, =0 off): one launch when both views take the lanes kernels (hip_ds41_f16_rows.hip)
-    static const bool pair = [] { const char* e = std::getenv("STRIX_DS41_F16_PAIR"); return !(e && e[0] == '0'); }();
-    static const bool lanes = [] { const char* e = std::getenv("STRIX_DS41_F16_LANES"); return !(e && e[0] == '0'); }();
+    static const bool pair = strix::envcfg::flag("STRIX_DS41_F16_PAIR", true);
+    static const bool lanes = strix::envcfg::flag("STRIX_DS41_F16_LANES", true);
     if (pair && lanes && a.rows <= max_rows && f16_rows_pair_supported(a, b)) {
         enqueue_f16_rows_lanes_pair(a, b, stream);
         return;
@@ -2860,7 +2857,7 @@ static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, vo
     unsigned tall = v.tall ? v.tall : tall_env;
     if (tall == 1U) {
         tall = strix::core::integer_dense_form(v.rows, v.width, v.count, v.row_width, lean_ok);
-        if (env_on("STRIX_DS41_DENSE_TALL_ROTATE")) {
+        if (tall_rotate) {
             static std::atomic<unsigned> turn{0};
             tall = std::array<unsigned, 3>{814, 914, 822}[turn.fetch_add(1, std::memory_order_relaxed) % 3];
             if (!lean_ok) tall = tall == 914 ? 114 : tall == 822 ? 22 : 14;
@@ -3267,10 +3264,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
     }
     unsigned outputs = 32U;
     const dim3 grid((v.rows + 15U) / 16U, (v.count + outputs - 1U) / outputs);
-    static const bool staged = [] {
-        const char* e = std::getenv("STRIX_DS41_DENSE_FORM");
-        return !(e && e[0] == '0');
-    }();
+    static const bool staged = strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
     // STRIX_DS41_DENSE_TALL=22 / 41 / 14 / 21 / 12: RT OT of the tall form for every call (staged only); auto: by shape,
     // from the gfx1151 smoke (prefill measurements): >= 3072 rows, or 2048 rows and >= 1024 outputs: 1 x 4 (q_a / kv);
     // >= 256 rows with >= 4096 outputs and width >= 4096: 1 x 2 (wo_b halves); else the wide form. Every form: the same bits.

@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/mtp_cohort_partition.hpp"
 #include "strix/cohort_small_plan.hpp"
@@ -25,7 +26,7 @@ void require(bool ok,const char* msg){if(!ok)throw std::invalid_argument(msg);}
 // checks their status, so the host's next-cycle setup overlaps their GPU time instead of a fence. Same
 // launches in the same stream order: tokens, drafts and caches are unchanged.
 bool mtp_device_handoff() {
-    static const bool on=[]{const char* v=std::getenv("STRIX_MTP_DEVICE_HANDOFF");return v && v[0]=='1';}();
+    static const bool on=strix::envcfg::flag("STRIX_MTP_DEVICE_HANDOFF", false);
     return on;
 }
 bool session_matches(const SerialSessionContext& a,const SerialSessionContext& b) {
@@ -246,7 +247,7 @@ std::uint32_t HipMtpGreedyRuntime::draft_begin(const HipMtpTargetHiddenTicket& i
         // Persisted window costs: resolved before the first draft decision of the cycle (sampled sessions stay cold).
         if(i.window) i.window->prepare_cycle(*i.session);
         // STRIX_MTP_DRAFT_WORTH=0: draft until min_probability only, without asking the window cost model.
-        static const bool worth=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_WORTH");return !v || v[0]!='0';}();
+        static const bool worth=strix::envcfg::flag("STRIX_MTP_DRAFT_WORTH", true);
         // The survival controller owns the chain cut (no min-p stop) and sees runner-up probabilities.
         // STRIX_MTP_DIAG_FULL_CHAIN=1 drafts the full depth without any cut.
         const bool full_chain=hip_mtp_full_chain_diagnostic();
@@ -317,7 +318,7 @@ void HipMtpGreedyRuntime::draft_end() {
         }
         // Chain copy-first cycles keep the observing shadow (t36: without it the wide cells learn less, wide cycles
         // 18 -> 9 on rewrite-py-es); STRIX_MTP_CHAIN_SHADOW=0 drops it (diagnostic).
-        static const bool chain_shadow=[]{const char* v=std::getenv("STRIX_MTP_CHAIN_SHADOW");return !v || v[0]!='0';}();
+        static const bool chain_shadow=strix::envcfg::flag("STRIX_MTP_CHAIN_SHADOW", true);
         if(i.context && i.context_observe && (!i.ds.copy_first || chain_shadow) && cost_model && !survival && !full_chain && i.window &&
            i.probabilities.size()==i.candidates.size()) {
             // Observe only: the context drafter builds its shadows over the MTP drafts (learning at finish_cycle);
@@ -901,7 +902,7 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
 // its own chain's. Sessions that cannot join (sampled, exact draft, other kernel branches, copy-first, depth 0)
 // keep their own interleaved chains. STRIX_MTP_DRAFT_BATCH_LOG=1 prints the batch counters at exit.
 bool draft_batch_enabled() {
-    static const bool on=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH");return v && v[0]=='1';}();
+    static const bool on=strix::envcfg::flag("STRIX_MTP_DRAFT_BATCH", false);
     return on;
 }
 bool draft_batch_verify() {
@@ -926,7 +927,7 @@ struct DraftBatchCounters {
     std::uint64_t cycles=0,batched_cycles=0,declined=0,steps=0,rows=0,solo_rows=0,verified=0,mismatched=0;
     std::uint64_t live[hip_mtp_draft_batch_rows+1U]{};
     static bool log() {
-        static const bool on=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_LOG");return v && v[0]=='1';}();
+        static const bool on=strix::envcfg::flag("STRIX_MTP_DRAFT_BATCH_LOG", false);
         return on;
     }
     ~DraftBatchCounters() {print();}
@@ -943,7 +944,7 @@ struct DraftBatchCounters {
 // cycles add their draft/target wall time and emitted tokens to the parity's totals per live-session count, printed every
 // 64 cycles ("draft batch ab N=<sessions> on/off: cycles, draft ms, cycle ms, tokens per cycle").
 bool draft_batch_ab() {
-    static const bool on=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_AB");return v && v[0]=='1';}();
+    static const bool on=strix::envcfg::flag("STRIX_MTP_DRAFT_BATCH_AB", false);
     return on;
 }
 struct DraftBatchAb {
@@ -1008,7 +1009,7 @@ std::vector<MtpSharedExecutionCycle> cohort_drafts(std::span<const HipMtpGreedyC
             if(draft_batch_verify()) {
                 // STRIX_MTP_DRAFT_BATCH_VERIFY_STAGGER=1: member i requests at most 1 + i % 8 drafts (divergent requested
                 // depths and every live count as members stop), diagnostic only.
-                static const bool stagger=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_VERIFY_STAGGER");return v && v[0]=='1';}();
+                static const bool stagger=strix::envcfg::flag("STRIX_MTP_DRAFT_BATCH_VERIFY_STAGGER", false);
                 if(stagger) for(std::size_t i=0;i<runtimes.size();++i) runtimes[i]->draft_batch_verify_cap(1U+static_cast<std::uint32_t>(i%8U));
                 HipMtpRuntime::draft_batch_verify_reference(runtimes);
             }
@@ -1275,7 +1276,7 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
         // Drafts: every session's chain in phases, step k of all sessions (each on its own stream) enqueued
         // before any wait (STRIX_COHORT_DRAFT_INTERLEAVE=0: one session's chain after another). Each session's
         // launches and waits are those of its own chain.
-        static const bool interleave=[]{const char* v=std::getenv("STRIX_COHORT_DRAFT_INTERLEAVE");return !v || v[0]!='0';}();
+        static const bool interleave=strix::envcfg::flag("STRIX_COHORT_DRAFT_INTERLEAVE", true);
         const bool interleaved=interleave && !known_window_cohort_feature_off("draft");
         for(std::size_t m=0;m<members.size();++m) {
             const auto& c=members[m];

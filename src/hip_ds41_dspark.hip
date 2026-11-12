@@ -563,7 +563,7 @@ struct DeviceStage {
 // STRIX_DS41_DSPARK_MEMLOG=1: the amdgpu GTT in use (sysfs mem_info_gtt_used of the first GPU) at each stage of the
 // drafter's setup, against the bytes it allocates there (DeviceDrafter::footprint's parts). Diagnostics only.
 bool memlog_on() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DS41_DSPARK_MEMLOG"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DS41_DSPARK_MEMLOG", false);
     return on;
 }
 std::uint64_t gtt_used() {

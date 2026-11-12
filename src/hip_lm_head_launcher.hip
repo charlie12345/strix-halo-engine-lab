@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
@@ -872,7 +873,7 @@ void lean_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights, std
 template <unsigned Rows, unsigned Cols>
 void launch_lean_lm_head_rows(const LmHeadRowsViews& views, const void* weights, std::uint32_t hidden,
     std::uint32_t vocab, LeanGreedy* partials, hipStream_t stream) {
-    static const bool direct = [] { const char* v = std::getenv("STRIX_QKERN_HEAD_DIRECT"); return v && v[0] == '1'; }();
+    static const bool direct = strix::envcfg::flag("STRIX_QKERN_HEAD_DIRECT", false);
     const auto lds = static_cast<std::uint32_t>(Rows * hidden * 2U);
     const auto blocks = (vocab + hip_greedy_rows_partial_logits - 1U) / hip_greedy_rows_partial_logits;
     if (direct) {
@@ -1449,7 +1450,7 @@ struct PreparedLmHeadRows { LmHeadRowsViews views{}; const void* weights = nullp
 // Lean rows (config.rows_lean 1 or 2) stage every row's input in LDS next to its greedy slots.
 // Windows of up to four rows keep the unstaged rows kernel, which is faster there.
 bool lean_rows_admitted(const HipLmHeadLauncherConfig& config, std::size_t rows) {
-    static const bool direct = [] { const char* v = std::getenv("STRIX_QKERN_HEAD_DIRECT"); return v && v[0] == '1'; }();
+    static const bool direct = strix::envcfg::flag("STRIX_QKERN_HEAD_DIRECT", false);
     return (direct || config.rows_lean == 1U || config.rows_lean == 2U) && rows > 4U && rows <= 8U && config.hidden_size % 256U == 0U &&
         rows * config.hidden_size * 2U <= lm_head_rows_lds_limit;
 }
@@ -1516,7 +1517,7 @@ void lm_head_known_window_rows_preflight(std::span<const ExecutionDispatchContex
 }
 
 bool lm_head_cohort_lean_enabled() {
-    static const bool cohort_lean = [] { const char* v = std::getenv("STRIX_LM_HEAD_COHORT_LEAN"); return v && v[0] == '1'; }();
+    static const bool cohort_lean = strix::envcfg::flag("STRIX_LM_HEAD_COHORT_LEAN", false);
     return !qpf2k::suppressed(qpf2k::Item::cohort_lean) && cohort_lean;
 }
 

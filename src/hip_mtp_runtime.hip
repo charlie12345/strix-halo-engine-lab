@@ -1368,7 +1368,7 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
         p.cycle=false;p.cycle_base.reset();p.base_previous_target.reset();p.base_previous_input.reset();
         p.replay.clear();p.reconcile_final.reset();p.have_replay=false;p.candidates.clear();p.first_cache_reusable=false;
         // Diagnostic only: compare the occupied proposer prefix across schedules.
-        static const bool audit=[] {const char* v=std::getenv("STRIX_MTP_CACHE_AUDIT");return v && v[0]=='1';}();
+        static const bool audit=strix::envcfg::flag("STRIX_MTP_CACHE_AUDIT", false);
         if(audit) {
             const auto cache=cache_state();
             const auto kv_bytes=cache.logical_rows*cache.kv_row_bytes;

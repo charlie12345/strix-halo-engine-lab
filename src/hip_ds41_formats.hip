@@ -2201,7 +2201,7 @@ static void enqueue_router_impl(const RouterView& view, void* stream, const Buil
     const auto queue = static_cast<hipStream_t>(stream);
     const dim3 grid((view.experts + router_waves - 1U) / router_waves), block(32U * router_waves);
     // router row waves by default (P11: -1.7 ms at R1, -7.6 ms per R6 window, same bits); STRIX_DS41_ROUTER_ROWS=0 off
-    static const bool rows_env = [] { const char* e = std::getenv("STRIX_DS41_ROUTER_ROWS"); return !(e && *e == '0'); }();
+    static const bool rows_env = strix::envcfg::flag("STRIX_DS41_ROUTER_ROWS", true);
     // STRIX_DS41_ROUTER_FAST=1 (default off; RouterView::fast for tests): the one-wave selection, fused in the scores
     // kernel's last block when RouterView::tickets is set, after the row-wave scores (1) or the wide ones (4 / 8 / 16).
     // Same bits.

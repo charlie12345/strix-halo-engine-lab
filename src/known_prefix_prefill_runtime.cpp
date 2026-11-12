@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qwen_prefill_pipeline.hpp"
 #include "strix/startup_markers.hpp"
@@ -57,7 +58,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     const qpf2k::ModelScope defaults_scope(serial_resources.model_manifest ? qpf2k::has_gsq_gate(*serial_resources.model_manifest) : qpf2k::gsq_model);
     // STRIX_PREFILL_TIMING=1: host milliseconds of each phase of every block on stderr.
     std::uint32_t pp_layers = 0;
-    const char* pp_env = std::getenv("STRIX_QWEN_PF_LAYER_RANGE");
+    static const char* const pp_env = std::getenv("STRIX_QWEN_PF_LAYER_RANGE"); // R2-13: read once
     if (pp_env) for (const auto& pp_source : serial.execution.steps)
         if (pp_source.layer) pp_layers = std::max(pp_layers, *pp_source.layer + 1U);
     const auto pp_range = qwen_pp::parse_range(pp_env, pp_layers);
@@ -67,7 +68,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         throw std::invalid_argument("layer-split split test requires layer range 0:24 on the 48-layer model");
     if (pp_range.enabled && !hooks.prefill_seam)
         throw std::invalid_argument("layer range requires a native layer-split seam owner");
-    static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
+    static const bool timing=strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
     auto mark=std::chrono::steady_clock::now();
     const auto lap=[&](const char* name) {
         if(!timing) return;

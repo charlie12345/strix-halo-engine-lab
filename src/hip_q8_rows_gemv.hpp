@@ -59,7 +59,7 @@ namespace strix {
 // Launches that drop the AQL barrier bit for kernels proven independent of the one queued
 // just before them (default on; STRIX_ANYORDER=0 keeps every launch barrier-ordered).
 inline bool strix_any_order_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_ANYORDER"); return !v || v[0] != '0'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_ANYORDER", true);
     return enabled;
 }
 }  // namespace strix

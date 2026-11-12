@@ -184,8 +184,7 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
             i.active->row_digests.push_back(raw_fp32_logits_digest(row));
         }
     }
-    const char* digest=std::getenv("STRIX_MTP_LOGITS_DIGEST");
-    if((digest && digest[0]=='1') || mtp_step_logits_digest_enabled()) {
+    if(mtp_logits_digest_enabled() || mtp_step_logits_digest_enabled()) {
         i.active->logit_digests.reserve(i.rows);
         for(std::uint32_t row=0;row<i.rows;++row) {
             std::vector<float> logits;
@@ -196,7 +195,7 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
                 std::fprintf(stderr,"mtp-step-logits physical capture=%p position=%llu epoch=%llu row=%u rows=%u vocab=%u sha256=%s\n",
                     static_cast<void*>(this),static_cast<unsigned long long>(i.active->base.next_position+row),
                     static_cast<unsigned long long>(i.active->epoch),row,i.rows,i.vocab,model_content_identity_hex(sha).c_str());
-            if(digest && digest[0]=='1') std::fprintf(stderr,"mtp-logits physical position=%llu epoch=%llu row=%u sha256=%s\n",
+            if(mtp_logits_digest_enabled()) std::fprintf(stderr,"mtp-logits physical position=%llu epoch=%llu row=%u sha256=%s\n",
                 static_cast<unsigned long long>(i.active->base.next_position+row),
                 static_cast<unsigned long long>(i.active->epoch),row,model_content_identity_hex(sha).c_str());
         }

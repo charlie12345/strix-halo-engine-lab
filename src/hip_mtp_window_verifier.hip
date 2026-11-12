@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include "strix/mtp_payload_geometry.hpp"
@@ -54,7 +55,7 @@ bool session_equal(const SerialSessionContext& a,const SerialSessionContext& b) 
 }
 // STRIX_MTP_REQUEST_RESET=0 keeps the controllers' estimates across requests.
 bool mtp_request_reset() noexcept {
-    static const bool reset=[]{const char* v=std::getenv("STRIX_MTP_REQUEST_RESET");return !v || v[0]!='0';}();
+    static const bool reset=strix::envcfg::flag("STRIX_MTP_REQUEST_RESET", true);
     return reset;
 }
 // Cost-table device key: architecture, marketing name, compute units, memory size, clock, HIP runtime and driver.
@@ -105,7 +106,7 @@ struct SurvivalCalibrator {
 };
 }
 bool hip_mtp_full_chain_diagnostic() noexcept {
-    static const bool enabled=[]{const char* v=std::getenv("STRIX_MTP_DIAG_FULL_CHAIN");return v && v[0]=='1';}();
+    static const bool enabled=strix::envcfg::flag("STRIX_MTP_DIAG_FULL_CHAIN", false);
     return enabled;
 }
 struct HipMtpWindowVerifier::Impl {
@@ -573,7 +574,7 @@ bool HipMtpWindowVerifier::robust_cost_model() const noexcept {return impl_->dep
 std::uint32_t HipMtpWindowVerifier::logical_rows() const noexcept {return impl_->window->logical_rows();}
 void HipMtpWindowVerifier::prepare_admission(const SerialSessionContext& session) {
     // STRIX_WINDOW_SETUP_PREFLIGHT=0 leaves each owner's admission to its first window.
-    static const bool enabled=[]{const char* v=std::getenv("STRIX_WINDOW_SETUP_PREFLIGHT");return !v || v[0]!='0';}();
+    static const bool enabled=strix::envcfg::flag("STRIX_WINDOW_SETUP_PREFLIGHT", true);
     auto& i=*impl_;
     if(!enabled || i.busy || failed()) return;
     const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.target->model().effective_max_positions());

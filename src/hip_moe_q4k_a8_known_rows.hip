@@ -1709,7 +1709,7 @@ __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_wa
 }
 inline int& direct_b_override(){static int v=-1;return v;}
 inline bool direct_b_requested(){
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DIRECT_B");return v&&v[0]=='1'&&v[1]=='\0';}();
+    static const bool env=strix::envcfg::flag("STRIX_QPF2K_MOE_DIRECT_B", false, strix::EnvFlagMatch::exact);
     return direct_b_override()<0?env:direct_b_override()==1;
 }
 inline bool& direct_b_ran(){static thread_local bool v=false;return v;}

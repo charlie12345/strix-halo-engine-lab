@@ -89,13 +89,22 @@ namespace {
 // index, u32 rows, u32 kernel id length,
 // u64 position, u64 bytes, the kernel id, then the bytes. Runs on the execution stream, so the copies follow the step's
 // kernels; the host waits for each step's copies before writing. The values themselves are unchanged.
+// R2-13: startup constants read once (were scanned per prefill block / window).
+const char* qrtx_step_dump_path() {
+    static const char* const path=std::getenv("STRIX_QRTX_STEP_DUMP");
+    return path && *path ? path : nullptr;
+}
+const char* qwen_pf_layer_range_text() {
+    static const char* const text=std::getenv("STRIX_QWEN_PF_LAYER_RANGE");
+    return text;
+}
 strix::HipKnownPrefixWindow::PrefillStepObserver qrtx_step_dump_observer(strix::HipKnownPrefixWindow::PrefillStepObserver inner,
                                                                          std::uint32_t rows) {
-    static const char* path=std::getenv("STRIX_QRTX_STEP_DUMP");
-    if(!path || !*path) return inner;
-    return [inner=std::move(inner),rows](std::size_t step,const std::function<strix::ExecutionDispatchContext(std::uint32_t)>& row) {
+    const char* path=qrtx_step_dump_path();
+    if(!path) return inner;
+    return [inner=std::move(inner),rows,path](std::size_t step,const std::function<strix::ExecutionDispatchContext(std::uint32_t)>& row) {
         if(inner) inner(step,row);
-        static std::FILE* file=[]{std::FILE* f=std::fopen(path,"ab");if(!f)throw std::runtime_error("STRIX_QRTX_STEP_DUMP cannot open");return f;}();
+        static std::FILE* file=[path]{std::FILE* f=std::fopen(path,"ab");if(!f)throw std::runtime_error("STRIX_QRTX_STEP_DUMP cannot open");return f;}();
         static std::vector<std::uint8_t> host;
         const auto stream=strix::hip_execution_stream();
         for(std::uint32_t r=0;r<rows;++r) {
@@ -505,7 +514,7 @@ struct HipKnownPrefixWindow::Impl {
     }
     // STRIX_SHARED_DETACH=0: the shared expert stays on the owner's stream between router and routed experts.
     static bool shared_detach_enabled() {
-        static const bool on = [] { const char* v = std::getenv("STRIX_SHARED_DETACH"); return !v || v[0] != '0'; }();
+        static const bool on = strix::envcfg::flag("STRIX_SHARED_DETACH", true);
         return on;
     }
     SharedDetach& detach_state() {
@@ -1097,7 +1106,7 @@ struct HipKnownPrefixWindow::Impl {
     }
     void setup_prefill_entries() {
         // STRIX_PREFILL_FULL_HC=0: keep HC rows in separate 8-row launches.
-        static const bool hc=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_HC");return !v||v[0]!='0';}();
+        static const bool hc=strix::envcfg::flag("STRIX_PREFILL_FULL_HC", true);
         if(hc&&window.hyper_mix_rows_steps)
             prefill_entries.push_back({KnownWindowR2Variant::hyper_mix_rows8_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1109,7 +1118,7 @@ struct HipKnownPrefixWindow::Impl {
                     hyper_mix_known_prefill_rows_launch(rows,self.hyper_for(rows));
                 }});
         // STRIX_PREFILL_FULL_PLE=0: PLE lookups and projections per 8-row tile (each tile still chains the history).
-        static const bool ple=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_PLE");return !v||v[0]!='0';}();
+        static const bool ple=strix::envcfg::flag("STRIX_PREFILL_FULL_PLE", true);
         if(ple&&window.ple_rows_steps)
             prefill_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1121,7 +1130,7 @@ struct HipKnownPrefixWindow::Impl {
                     static_cast<Impl*>(object)->ple_window->stage_serve(rows);
                 }});
         // STRIX_PREFILL_FULL_QSA=0: keep QSA rows in 8-row tiles.
-        static const bool qsa=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_QSA");return !v||v[0]!='0';}();
+        static const bool qsa=strix::envcfg::flag("STRIX_PREFILL_FULL_QSA", true);
         if(prefill->external_qsa_score_bytes && !qsa)
             throw std::invalid_argument("compact QSA owner requires the full-prefill ring entry");
         if(qsa&&window.qsa_rows_steps)
@@ -1140,7 +1149,7 @@ struct HipKnownPrefixWindow::Impl {
                     },0,true});
             }
         // STRIX_PREFILL_FULL_SHARED=0: keep the shared expert in 8-row tiles.
-        static const bool shared=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_SHARED");return !v||v[0]!='0';}();
+        static const bool shared=strix::envcfg::flag("STRIX_PREFILL_FULL_SHARED", true);
         if(shared)
             prefill_entries.push_back({KnownWindowR2Variant::shared_q8_virtual256_r8_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1152,7 +1161,7 @@ struct HipKnownPrefixWindow::Impl {
                     shared_expert_known_prefill_rows_launch(rows,self.shared_for(rows.first(8U)));
                 }});
         // STRIX_PREFILL_FULL_ELEMENTWISE=0: keep inject / MoE-combine rows in 8-row launches.
-        static const bool elementwise=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ELEMENTWISE");return !v||v[0]!='0';}();
+        static const bool elementwise=strix::envcfg::flag("STRIX_PREFILL_FULL_ELEMENTWISE", true);
         if(elementwise) {
             prefill_entries.push_back({KnownWindowR2Variant::inject_rows_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1170,7 +1179,7 @@ struct HipKnownPrefixWindow::Impl {
                 }});
         }
         // STRIX_PREFILL_FULL_ROUTER=0: keep router rows in separate 8-row launches.
-        static const bool router=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ROUTER");return !v||v[0]!='0';}();
+        static const bool router=strix::envcfg::flag("STRIX_PREFILL_FULL_ROUTER", true);
         if(router)
             prefill_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1469,7 +1478,7 @@ struct HipKnownPrefixWindow::Impl {
             },
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
                 const auto& self=*static_cast<Impl*>(object);
-                static const bool fused=[]{const char* v=std::getenv("STRIX_LM_HEAD_ROWS_GREEDY");return !v||v[0]!='0';}();
+                static const bool fused=strix::envcfg::flag("STRIX_LM_HEAD_ROWS_GREEDY", true);
                 if(self.greedy_replies && self.head_config.rows_lean && fused) {
                     lm_head_known_window_rows_launch_greedy(rows,self.head_config,self.greedy_partials,self.greedy_replies);
                     return;
@@ -1803,7 +1812,7 @@ struct HipKnownPrefixWindow::Impl {
     // on one stream); only the scheduling differs. STRIX_COHORT_SHARED_EXPERT=0 keeps only the
     // shared expert per session.
     static bool cohort_shared_enabled() {
-        static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }();
+        static const bool on = strix::envcfg::flag("STRIX_COHORT_SHARED", true);
         return on;
     }
     // STRIX_COHORT_SHARED_ELEMENTWISE=0: the inject and MoE-combine rows of a chunk run per session again.
@@ -1812,7 +1821,7 @@ struct HipKnownPrefixWindow::Impl {
         return on;
     }
     static bool cohort_shared_expert_enabled() {
-        static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED_EXPERT"); return !v || v[0] != '0'; }();
+        static const bool on = strix::envcfg::flag("STRIX_COHORT_SHARED_EXPERT", true);
         return on;
     }
     // Step i of a cohort runs once for every member's rows on the primary.
@@ -1874,7 +1883,7 @@ struct HipKnownPrefixWindow::Impl {
             total += m.run->rows();
         }
         if (total < 9U || total > 32U) return false;
-        static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
+        static const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
         switch (mode) {
         case KnownWindowStepMode::moe_route_rows:
             if(!joint && cohort_step_rows()!=16U) return false;
@@ -2382,7 +2391,7 @@ struct HipKnownPrefixWindow::Impl {
         bool owned_eager_scope_admitted=false,actual_window_committed=false;
         const PreparedCapture* observed=nullptr;
         // STRIX_PREFILL_TIMING=1: host milliseconds of the owner's own phases around a tiled block (stderr).
-        static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
+        static const bool timing=strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
         auto mark=std::chrono::steady_clock::now();
         const auto lap=[&](const char* name) {
             if(!timing || !prefill) return;
@@ -2439,7 +2448,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.static_preflight_memo=&static_preflight_memo;
             hooks.skip_head=skip_head;
             hooks.partial_rows=partial;
-            const auto pp_native_range = qwen_pp::parse_range(std::getenv("STRIX_QWEN_PF_LAYER_RANGE"),
+            const auto pp_native_range = qwen_pp::parse_range(qwen_pf_layer_range_text(),
                 static_cast<std::uint32_t>(model.hidden_layers));
             if (!pp_native_range.enabled || pp_native_range.begin == 0) {
                 prefill_folded.clear();
@@ -2482,8 +2491,7 @@ struct HipKnownPrefixWindow::Impl {
             if(prefill) {
                 hooks.after_step=qrtx_step_dump_observer(prefill_observer,block_rows);
                 // The step dump (STRIX_QRTX_STEP_DUMP) reads every step: no step predicate then.
-                const char* dump=std::getenv("STRIX_QRTX_STEP_DUMP");
-                if(hooks.after_step&&!(dump&&*dump)) hooks.after_step_observes=prefill_observes;
+                if(hooks.after_step&&!qrtx_step_dump_path()) hooks.after_step_observes=prefill_observes;
                 // STRIX_QPF2K_SCHED: prefill schedule hook. A step observer (MTP tap copies, step dumps) of a detached step
                 // runs on the side stream before that step's join is recorded (prefill_observe).
                 if(prefill_schedule()) {

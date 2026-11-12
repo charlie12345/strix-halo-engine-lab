@@ -1233,7 +1233,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
         return !((v && *v == '0') || (b && *b == '0'));
     }();
     // P13 defaults (after P12): HC_SITE, QA_KV, ENGRAM_ASYNC and COMPRESS_RING on, =0 turns each off.
-    m.compress_ring = [] { const char* v = std::getenv("STRIX_DS41_COMPRESS_RING"); return !(v && *v == '0'); }();
+    m.compress_ring = strix::envcfg::flag("STRIX_DS41_COMPRESS_RING", true);
     m.never = Dev<std::uint32_t>(1);
     {
         const std::size_t n = W * K + 1U;
@@ -1935,15 +1935,15 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     const Step* deferred_shared = nullptr;
     // STRIX_DS41_HC_SITE=1 / STRIX_DS41_QA_KV=1: as DeviceForward (one enqueue_hc_site per hyper-connection boundary,
     // q_a and kv in one launch over one A8 of the attention input), same bits. HC_SITE is off with layer timing.
-    static const bool hc_site_flag = [] { const char* v = std::getenv("STRIX_DS41_HC_SITE"); return !(v && v[0] == '0'); }();
+    static const bool hc_site_flag = strix::envcfg::flag("STRIX_DS41_HC_SITE", true);
     // QA_KV is OFF in BatchForward: with it every request generated one repeated token in P12 (57328), while the
     // in-batch gate compared two wrong runs. Only STRIX_DS41_BATCH_QA_KV=1 enables it,
     // for investigating the fix; DeviceForward keeps QA_KV on (gated against the CPU host forward).
-    static const bool qa_kv_flag = [] { const char* v = std::getenv("STRIX_DS41_BATCH_QA_KV"); return v && v[0] == '1'; }();
+    static const bool qa_kv_flag = strix::envcfg::flag("STRIX_DS41_BATCH_QA_KV", false);
     const bool fuse_hc = hc_site_flag && !m.options.layer_timing;
     const bool fuse_qa_kv = qa_kv_flag;
     // STRIX_DS41_ATTN_A8=1: the attention combine writes o_a's input A8 and o_a's product kernel o_b's, same bits.
-    static const bool attn_a8 = [] { const char* v = std::getenv("STRIX_DS41_ATTN_A8"); return v && v[0] == '1'; }();
+    static const bool attn_a8 = strix::envcfg::flag("STRIX_DS41_ATTN_A8", false);
     // STRIX_DS41_BATCH_SEGMENTS (default on since P17.2, =0 off): the stateful attention kernels of every request segment
     // in one launch per kernel (enqueue_*_segments), each segment's blocks unchanged, same bits. The segment views below
     // are sized for max_rows requests: unset, it is off with STRIX_DS41_BATCH_ROWS16=1 (16 rows); =1 with ROWS16 is refused.
@@ -1992,7 +1992,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         late_mix = nullptr;
     };
     // Residual boundary fusions; each flag is independent (QNORM_A8 off by default, ROUTES on by default).
-    static const bool qnorm_a8 = [] { const char* v = std::getenv("STRIX_DS41_R1FUSE_QNORM_A8"); return v && v[0] == '1'; }();
+    static const bool qnorm_a8 = strix::envcfg::flag("STRIX_DS41_R1FUSE_QNORM_A8", false);
     const bool router_routes = ds41::r1fuse_routes();  // STRIX_DS41_R1FUSE_ROUTES: default on, =0 off
     bool q_a8 = false, routes_ready = false;
     const auto route_view = [&] {
@@ -2057,7 +2057,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     };
     // the weights of the steps after `from` (whole tensors in step order, the last one cut), up to prefetch_bytes;
     // the routed experts (which rows are unknown) and the embedding tables are skipped
-    static const bool past_experts = [] { const char* v = std::getenv("STRIX_DS41_PREFETCH_PAST_EXPERTS"); return v && v[0] == '1'; }();
+    static const bool past_experts = strix::envcfg::flag("STRIX_DS41_PREFETCH_PAST_EXPERTS", false);
     const auto prefetch_after = [&](const Step& from) {
         if (m.prefetch_bytes == 0U) return;
         std::uint64_t left = m.prefetch_bytes;

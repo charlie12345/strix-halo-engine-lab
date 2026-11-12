@@ -3,6 +3,7 @@
 // batched runner with one slot per request. lockstep admits every request (prompts one after another), then
 // decodes them together until all end; sequential admits each request after the previous one ended, each
 // exactly as alone (the in-process reference). The receipt keeps the cohort receipt's fields.
+#include "strix/env_flags.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_decode_receipt_json.hpp"
 #include "hip_mtp_decode_bridge.hpp"
@@ -103,7 +104,7 @@ inline MtpDecodeBatchServe make_cohort_tiled_run(const Options& options, const M
         output << "{\n" << prefill_identity_fields(prefill_options_active()) << ",\n  \"mode\":\"native-mtp-cohort-tiled-prompt-target-verified-" << (mtp_sampling(m) ? "sampled" : "greedy") << "\",\n"
             << "  \"mtp_native_hardware_qualified\":false,\n  \"mtp_performance_qualified\":false,\n"
             << "  \"mtp_cohort_mode\":\"" << (lockstep ? "lockstep" : "sequential") << "\",\n"
-            << "  \"mtp_cohort_shared_steps\":" << ([] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }() ? "true" : "false") << ",\n"
+            << "  \"mtp_cohort_shared_steps\":" << (strix::envcfg::flag("STRIX_COHORT_SHARED", true) ? "true" : "false") << ",\n"
             << "  \"mtp_cohort_requests\":" << records.size() << ",\n"
             << "  \"mtp_calibration_rows\":" << runner.calibration.rows << ",\n  \"mtp_calibration_ms\":" << runner.calibration.ms << ",\n"
             << "  \"mtp_cohort_windows\":" << stats.cohort.cohort_windows << ",\n  \"mtp_cohort_window_sessions\":" << stats.cohort.cohort_sessions

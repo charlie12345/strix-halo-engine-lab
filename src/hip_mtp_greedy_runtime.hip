@@ -10,6 +10,7 @@
 #include "strix/hip_mtp_window_verifier.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
+#include "strix/serve/cycle_receipt.hpp"
 #include <hip/hip_runtime.h>
 #include <optional>
 #include <algorithm>
@@ -21,6 +22,32 @@
 namespace strix {
 namespace {
 void require(bool ok,const char* msg){if(!ok)throw std::invalid_argument(msg);}
+// STRIX_SERVE_RECEIPT=1: wall time this thread spent proposing drafts since the last hip_mtp_take_serve_draft_ms().
+// The outermost scope counts; with the switch unset no clock is read.
+double& serve_draft_ms(){thread_local double ms=0.0;return ms;}
+struct ServeDraftScope {
+    static unsigned& depth(){thread_local unsigned d=0;return d;}
+    bool on=strix::serve::cycle_receipt_enabled() && depth()++==0U;
+    std::chrono::steady_clock::time_point t0=on?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    bool counted=strix::serve::cycle_receipt_enabled();
+    void close() {
+        if(!counted) return;
+        counted=false;--depth();
+        if(on) serve_draft_ms()+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+    }
+    ~ServeDraftScope(){close();}
+};
+// STRIX_COHORT_MAX_ROWS=2|4|8 and STRIX_COHORT_ROWS=16|32 (cohort_cycle below documents both).
+std::uint32_t cohort_max_rows_override() {
+    static const std::uint32_t rows=[]{const char* v=std::getenv("STRIX_COHORT_MAX_ROWS");
+        const auto n=v?std::atoi(v):0;return n==2||n==4||n==8?static_cast<std::uint32_t>(n):0U;}();
+    return rows;
+}
+std::uint32_t cohort_budget_rows() {
+    static const std::uint32_t rows=[]{const char* v=std::getenv("STRIX_COHORT_ROWS");
+        const auto n=v?std::atoi(v):(strix::cohort_auto()?16:0);return n==16||n==32?static_cast<std::uint32_t>(n):0U;}();
+    return rows;
+}
 // STRIX_MTP_DEVICE_HANDOFF=1: a cycle that continues (no EOS, budget left) leaves its reconciliation's teacher
 // cache rows queued on the predictor stream; the next draft chain enqueues behind them and its completion
 // checks their status, so the host's next-cycle setup overlaps their GPU time instead of a fence. Same
@@ -200,6 +227,7 @@ HipMtpTargetHiddenTicket HipMtpGreedyRuntime::prefill_prompt(std::span<const std
 }
 std::uint32_t HipMtpGreedyRuntime::begin_cycle_draft(const HipMtpTargetHiddenTicket& initial,
     std::uint32_t max_candidates,std::uint32_t budget,std::span<const std::uint32_t> eos,bool cost_model) {
+    ServeDraftScope serve_draft;
     const auto depth=draft_begin(initial,max_candidates,budget,eos,cost_model);
     if(!drafting()) return depth;
     while(draft_launch_step() && draft_after_step()) {}
@@ -1130,6 +1158,7 @@ std::vector<HipMtpGreedyCycleResult> joint_cycle(std::span<const HipMtpGreedyCoh
         stamp_drafts(out,drafts);
         const auto end=clock::now();
         const auto draft_ms=std::chrono::duration<double,std::milli>(drafted-start).count();
+        if(strix::serve::cycle_receipt_enabled()) serve_draft_ms()+=draft_ms;
         const auto target_ms=std::chrono::duration<double,std::milli>(end-drafted).count();
         std::vector<std::uint32_t> accepted;
         std::uint32_t emitted=0;
@@ -1262,15 +1291,13 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
     // Rows per session: at most 8 / sessions (4 for two, 2 for three or four), so that the sessions of a
     // cycle fill one 8-row cohort; drafts beyond that window are not drafted.
     // STRIX_COHORT_MAX_ROWS=2|4|8 overrides it.
-    static const std::uint32_t max_rows_override=[]{const char* v=std::getenv("STRIX_COHORT_MAX_ROWS");
-        const auto n=v?std::atoi(v):0;return n==2||n==4||n==8?static_cast<std::uint32_t>(n):0U;}();
+    const std::uint32_t max_rows_override=cohort_max_rows_override();
     // STRIX_COHORT_ROWS=16|32: a global row budget per cycle instead of one 8-row cohort. Each session keeps
     // the rows it gets in an 8-row cohort (8 / sessions, at least 2), so up to four sessions run as before and
     // more fill one group of up to the budget instead of several cohorts; the sessions of a group run in one
     // stream of steps as chunks of at most eight rows (16 with STRIX_COHORT_STEP_ROWS=16). Measured: more rows per
     // session (4 at four sessions, 8 at two) cost more than the drafts they accept.
-    static const std::uint32_t budget_rows=[]{const char* v=std::getenv("STRIX_COHORT_ROWS");
-        const auto n=v?std::atoi(v):(strix::cohort_auto()?16:0);return n==16||n==32?static_cast<std::uint32_t>(n):0U;}();
+    const std::uint32_t budget_rows=cohort_budget_rows();
     const std::uint32_t cap=max_rows_override?max_rows_override:members.size()>=3U?2U:members.size()==2U?4U:8U;
     try {
         // Drafts: every session's chain in phases, step k of all sessions (each on its own stream) enqueued
@@ -1278,6 +1305,7 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
         // launches and waits are those of its own chain.
         static const bool interleave=strix::envcfg::flag("STRIX_COHORT_DRAFT_INTERLEAVE", true);
         const bool interleaved=interleave && !known_window_cohort_feature_off("draft");
+        ServeDraftScope serve_draft;
         for(std::size_t m=0;m<members.size();++m) {
             const auto& c=members[m];
             require(c.runtime && c.initial && c.runtime->window_verifier(),"MTP cohort cycle requires window-verified greedy runtimes");
@@ -1297,6 +1325,7 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
         }
         for(std::size_t m=0;m<members.size();++m) if(open[m])
             static_cast<void>(members[m].runtime->extend_cohort_drafts(cap,cohort_context_gate()));
+        serve_draft.close();
         for(std::size_t m=0;m<members.size();++m) {
             const auto& c=members[m];
             if(!open[m]){out[m].final_target=*c.initial;out[m].eos=true;continue;}
@@ -1319,5 +1348,23 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
         throw;
     }
 }
+}
+double hip_mtp_take_serve_draft_ms() noexcept {
+    const auto ms=serve_draft_ms();
+    serve_draft_ms()=0.0;
+    return ms;
+}
+std::vector<HipMtpServeLever> hip_mtp_serve_levers() {
+    const auto raw=[](const char* name){const char* v=std::getenv(name);return std::string(v&&*v?v:"unset");};
+    const bool interleave=strix::envcfg::flag("STRIX_COHORT_DRAFT_INTERLEAVE", true);
+    const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
+    return {
+        {"cohort_rows","STRIX_COHORT_ROWS",cohort_budget_rows()!=0U,std::to_string(cohort_budget_rows())},
+        {"cohort_max_rows","STRIX_COHORT_MAX_ROWS",cohort_max_rows_override()!=0U,std::to_string(cohort_max_rows_override())},
+        {"cohort_step_rows","STRIX_COHORT_STEP_ROWS",std::getenv("STRIX_COHORT_STEP_ROWS")!=nullptr,raw("STRIX_COHORT_STEP_ROWS")},
+        {"draft_interleave","STRIX_COHORT_DRAFT_INTERLEAVE",interleave,interleave?"1":"0"},
+        {"draft_batch","STRIX_MTP_DRAFT_BATCH",draft_batch_enabled(),draft_batch_enabled()?"1":"0"},
+        {"joint_window","STRIX_MTP_BATCH_JOINT",joint,joint?"1":"0"},
+    };
 }
 } // namespace strix

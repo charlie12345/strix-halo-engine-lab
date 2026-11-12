@@ -84,9 +84,11 @@ struct I4ReferenceSchedule {
 void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     const strix::core::IU4Group* groups,unsigned char* ws,std::size_t bytes,hipStream_t stream,bool dense_groups=true) {
     namespace st=strix::core;
-    // Plan 2 (BM128) paired gate/up spills the saved gate registers on gfx1151; the paired call
-    // runs at most plan 1 on its own tile list, the down call keeps the selected plan.
-    const int plan=iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows), pplan=plan<1 ? plan : 1;
+    // With the gate kept in registers, plan 2 (BM128) paired gate/up spills on gfx1151 and the paired
+    // call runs at most plan 1 on its own tile list. GSave keeps the pass-0 gate in a global FP32
+    // scratch (exact, L2-resident, same thread reads it back) so both calls share the selected plan.
+    const bool gsv=st::moe_i4::gsave_enabled();
+    const int plan=iu4_plan(t.pairs,strix::core::moe_i4::kPlan2Rows), pplan=gsv||plan<1 ? plan : 1;
     const auto ptiles=static_cast<unsigned>(st::iu4_grouped_max_tiles(t.pairs,kI4Experts,pplan));
     const auto dtiles=static_cast<unsigned>(st::iu4_grouped_max_tiles(t.pairs,kI4Experts,plan));
     const unsigned max_tiles=ptiles>dtiles ? ptiles : dtiles;
@@ -97,7 +99,8 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     // Gate/up A4 image of the control (row 2*pair+m): quantised once, not once per N tile.
     const std::size_t gqbytes=align256(2*std::size_t(t.pairs)*(kHidden/2));
     const std::size_t gsbytes=align256(2*std::size_t(t.pairs)*(kHidden/64)*4);
-    if(bytes<tile_bytes+256+qbytes+sbytes+dbytes+gqbytes+gsbytes) throw std::logic_error("minimax fused i4 scratch too small");
+    const std::size_t gvbytes=gsv ? align256(std::size_t(t.pairs)*kInter*4) : 0;
+    if(bytes<tile_bytes+256+qbytes+sbytes+dbytes+gqbytes+gsbytes+gvbytes) throw std::logic_error("minimax fused i4 scratch too small");
     auto* tiles=reinterpret_cast<st::IU4GroupTile*>(ws);
     auto* ntiles=reinterpret_cast<unsigned*>(ws+tile_bytes);
     auto* aq=ws+tile_bytes+256;
@@ -105,6 +108,7 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     auto* dn=reinterpret_cast<float*>(aq+qbytes+sbytes);
     auto* gq=aq+qbytes+sbytes+dbytes;
     auto* gs=reinterpret_cast<float*>(gq+gqbytes);
+    auto* gv=gsv ? reinterpret_cast<float*>(gq+gqbytes+gsbytes) : nullptr;
     st::moe_i4::Weights w{};
     for(unsigned m=0;m<3;++m) {
         w.q[m]=q.wq[m]; w.s[m]=q.ws[m]; w.svh[m]=q.svh[m];
@@ -117,7 +121,7 @@ void launch_i4_chain(const Tables& t,const I4Layer& q,const float* x,float* out,
     iu4_ok(hipGetLastError(),"chain gather + quantiser");
     mark("gather",stream);
     iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,pplan,tiles,ntiles,ptiles,stream),"chain tiles");
-    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,ntiles,ptiles,gq,gs,aq,as,stream),"chain paired gate/up");
+    iu4_ok(st::moe_i4::launch<true>(pplan,b,w,tiles,ntiles,ptiles,gq,gs,aq,as,stream,gv),"chain paired gate/up");
     mark("gate_up",stream);
     if(pplan!=plan) iu4_ok(st::build_iu4_grouped_tiles(groups,kI4Experts,plan,tiles,ntiles,dtiles,stream),"chain down tiles");
     iu4_ok(st::moe_i4::launch<false>(plan,b,w,tiles,ntiles,dtiles,nullptr,nullptr,aq,as,stream),"chain down");

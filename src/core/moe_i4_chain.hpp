@@ -13,7 +13,8 @@ namespace strix::core::moe_i4 {
 // Chain plan policy: auto-select BM128 (plan 2) when the call averages >= kPlan2Rows rows per group.
 // Waves past a ragged tile's rows skip their WMMA (tiled_core), so BM128's padding no longer costs its
 // compute: grouped down on MiniMax-like routing (gfx1151) BM128 vs BM64 -4 % at ~159 rows per group and
-// equal at 64. The paired GEMM is BM64 always (BM128 paired spills).
+// equal at 64. The paired GEMM keeps its pass-0 gate in a global FP32 scratch (GSave, default on) so
+// it runs the same plan as down; STRIX_MOE_I4_CHAIN_GSAVE=0 restores the register save (BM64 max).
 inline constexpr unsigned kPlan2Rows = 64;
 // STRIX_MOE_I4_CHAIN=0|1 overrides the engine's default (def).
 inline bool enabled(bool def = false) {
@@ -22,6 +23,14 @@ inline bool enabled(bool def = false) {
     if (std::strcmp(p, "0") == 0) return false;
     if (std::strcmp(p, "1") == 0) return true;
     throw std::invalid_argument("STRIX_MOE_I4_CHAIN must be 0 or 1");
+}
+// STRIX_MOE_I4_CHAIN_GSAVE=0|1: paired gate kept in global FP32 scratch (1) or registers (0).
+inline bool gsave_enabled(bool def = true) {
+    const char* p = std::getenv("STRIX_MOE_I4_CHAIN_GSAVE");
+    if (!p || !*p) return def;
+    if (std::strcmp(p, "0") == 0) return false;
+    if (std::strcmp(p, "1") == 0) return true;
+    throw std::invalid_argument("STRIX_MOE_I4_CHAIN_GSAVE must be 0 or 1");
 }
 struct Weights {
     const uint8_t* q[3];
@@ -136,12 +145,17 @@ template<class Binding> __global__ void fp16_activation_rows(Binding b,const flo
 // Paired gate/up reads the interleaved pre-quantised A4 image written once by the shared input
 // pre-pass (row 2*pair+m, m=0 gate, m=1 up): the pass selects the row, so the K loop never
 // re-gathers, re-transforms or re-quantises the input. Bytes equal the LDS-staged ones.
-template<class Binding,bool Pair> struct Chain {
+// GSave: the paired pass-0 gate values (FP32, exact) go to a per-pair global scratch row
+// (gsave[pair*I + col]) instead of registers, so BM128 paired does not spill; the same thread
+// reads its own stores back in pass 1 (program order, L2-resident), no barrier needed.
+template<class Binding,bool Pair,bool GSave=false> struct Chain {
     static constexpr bool kActive = true;
     static constexpr int kPasses = Pair ? 2 : 1;
     static constexpr uint32_t kPassRow = Pair ? 1 : 0;
+    static constexpr bool kSaveRegs = Pair && !GSave;
     Binding b; Weights w;
     uint8_t* aq; float* as;
+    float* gsave = nullptr;
     unsigned expert = 0;
     __device__ __forceinline__ void bind(unsigned e, int pass, const uint32_t* __restrict__& q, const _Float16*& s, const uint16_t* __restrict__& svh) {
         expert=e;
@@ -154,25 +168,27 @@ template<class Binding,bool Pair> struct Chain {
     __device__ __forceinline__ void store(unsigned pos,unsigned col,int pass,int slot,float (&v)[4],float* saved) const {
         const unsigned pair=b.pair(pos);
         if constexpr (Pair) {
+            float* gp=nullptr;
+            if constexpr (GSave) gp=gsave+size_t(pair)*Binding::I+col+(threadIdx.x&31U);
             if (!pass) {
                 #pragma unroll
-                for (unsigned j=0;j<4;++j) saved[unsigned(slot)*4+j]=v[j];
+                for (unsigned j=0;j<4;++j) { if constexpr (GSave) gp[32*j]=v[j]; else saved[unsigned(slot)*4+j]=v[j]; }
             } else {
                 float g[4],a[4];
                 #pragma unroll
-                for (unsigned j=0;j<4;++j) g[j]=saved[unsigned(slot)*4+j];
+                for (unsigned j=0;j<4;++j) { if constexpr (GSave) g[j]=gp[32*j]; else g[j]=saved[unsigned(slot)*4+j]; }
                 EpiloguePolicy<Binding>{b}.activation(expert,col,g,v,a);
                 iu4_quant128(a,aq+size_t(pair)*(Binding::I/2),as+size_t(pair)*(Binding::I/64),col,threadIdx.x&31U);
             }
         } else EpiloguePolicy<Binding>{b}.contribution(pair,col,v);
     }
 };
-template<int Plan,bool Pair,class Binding> hipError_t launch(const Binding& b,const Weights& w,
+template<int Plan,bool Pair,bool GSave,class Binding> hipError_t launch(const Binding& b,const Weights& w,
     const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,const uint8_t* gq,const float* gs,
-    uint8_t* aq,float* as,hipStream_t stream) {
+    uint8_t* aq,float* as,float* gsave,hipStream_t stream) {
     constexpr auto c=iu4_tiles[Plan];
     using G=wmma_tiled::Geometry<c.bm,c.bn,c.wm,c.wn,PackedIU4>;
-    using C=Chain<Binding,Pair>;
+    using C=Chain<Binding,Pair,GSave>;
     wmma_tiled::GroupedArgs gp; gp.tiles=tiles; gp.ntiles=ntiles; gp.col_scale=w.svh[0]; gp.map=b.map();
     // Paired: A is the pre-quantised gate/up image gq/gs, row 2*pair+pass (pass offset via kPassRow).
     // Down: A is the down image aq/as written by the paired epilogue, row = pair.
@@ -186,16 +202,24 @@ template<int Plan,bool Pair,class Binding> hipError_t launch(const Binding& b,co
     if (status!=hipSuccess) return status;
     if (attr.localSizeBytes || blocks*G::waves<4) return hipErrorNotSupported;
     kernel<<<dim3(max_tiles*(N/c.bn)),G::threads,0,stream>>>(reinterpret_cast<const uint32_t*>(w.q[0]),nullptr,nullptr,
-        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? gq : aq,Pair ? gs : as,w.s[0],nullptr,gp,{},C{b,w,aq,as});
+        K,N,0,1,nullptr,nullptr,nullptr,1.f,0.f,1,Pair ? gq : aq,Pair ? gs : as,w.s[0],nullptr,gp,{},C{b,w,aq,as,gsave});
     return hipGetLastError();
 }
+// gsave != nullptr (paired only): pass-0 gate values go to global scratch (pairs*I floats),
+// which removes the register save and lets the paired GEMM run plan 2 (BM128) without spilling.
 template<bool Pair,class Binding> hipError_t launch(int plan,const Binding& b,const Weights& w,
     const IU4GroupTile* tiles,const uint32_t* ntiles,unsigned max_tiles,const uint8_t* gq,const float* gs,
-    uint8_t* aq,float* as,hipStream_t stream) {
+    uint8_t* aq,float* as,hipStream_t stream,float* gsave=nullptr) {
+    if constexpr (Pair) if (gsave) switch(plan) {
+        case 0:return launch<0,Pair,true>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,gsave,stream);
+        case 1:return launch<1,Pair,true>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,gsave,stream);
+        case 2:return launch<2,Pair,true>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,gsave,stream);
+        default:return hipErrorInvalidValue;
+    }
     switch(plan) {
-        case 0:return launch<0,Pair>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,stream);
-        case 1:return launch<1,Pair>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,stream);
-        case 2:return launch<2,Pair>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,stream);
+        case 0:return launch<0,Pair,false>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,nullptr,stream);
+        case 1:return launch<1,Pair,false>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,nullptr,stream);
+        case 2:return launch<2,Pair,false>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,nullptr,stream);
         default:return hipErrorInvalidValue;
     }
 }

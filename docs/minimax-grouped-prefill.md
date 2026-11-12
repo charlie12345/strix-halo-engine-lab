@@ -121,10 +121,15 @@ With scope `all`, the INT4 chain is the default (`STRIX_MOE_I4_CHAIN=0` selects 
 same bits). It quantises the gate/up input once, runs gate/up as one paired grouped GEMM whose
 epilogue applies SwiGLU and the down input transform, then the down GEMM and the ordered combine.
 It runs once per chunk, so chunk c's MoE overlaps the exchange of chunk c-1.
-Measured on the TP2 pair: 8K 12.31 s versus 12.65 s unfused (-2.7 %) and 12.53 s versus 13.12 s on the
-reference binary (-4.5 %); 32K 56.47 s versus 55.79 s unfused (+1.2 %, two pairs in both orders,
-+1.35 / +1.08 %). State, final-row and token anchors are equal and the ranks agree in every run. A regime
-gate (chain only for groups of at most two chunks) is open.
+The paired gate/up keeps pass-0 FP32 gate values in global scratch (same thread reads them back in
+pass 1, no barrier; `STRIX_MOE_I4_CHAIN_GSAVE=0` selects the register save). The register save needed
+so many VGPRs that the pair was forced to plan 1 (BM64) while the unfused call ran plan 2 (BM128): at
+32K that cost MoE GEMM time and slowed the overlapping attention kernels (+1.2 % TTFT). With the global
+save the plan is chosen freely (VGPR 183-239, no spills; scratch 5·T·inter·4 bytes, ~126 MB at T=4096).
+Measured on the TP2 pair: 8K 12.12 s versus 12.34 s unfused and 12.76 s versus 12.98 s (-1.7 %, both
+orders); 32K 55.23 s versus 55.74 s (-0.9 %, mean of six pairs, three per order; single runs vary ±3 %).
+Chain GEMMs run at 31 % (8K) and 32 % (32K) of the iu4 WMMA peak. State, final-row and token anchors are
+equal and the ranks agree in every run; no regime gate is needed.
 
 `STRIX_MMX_PF_IU4=0` and `--ab pfi4:PROMPT.u32:128` retain the same model load and buffers while
 selecting the original EXL3 prefill arm; `STRIX_MMX_FAKEQ_A4` remains available for quality study.

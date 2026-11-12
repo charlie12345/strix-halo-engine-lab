@@ -98,6 +98,9 @@ function(strix_session_add_runtime)
     if(BUILD_TESTING AND NOT TARGET serial_session_owner_tests)
         add_subdirectory("${_strix_session_root}/tests/serial_session_owner" "${CMAKE_BINARY_DIR}/serial-session-owner")
     endif()
+    if(BUILD_TESTING AND NOT TARGET http_shutdown_tests)
+        add_subdirectory("${_strix_session_root}/tests/http_shutdown" "${CMAKE_BINARY_DIR}/http-shutdown")
+    endif()
 endfunction()
 
 

@@ -1,0 +1,30 @@
+# Device declaration (strix-devices-v1) and the start gate every GPU binary calls before its first allocation.
+# Host-only; usable from the full build and from the standalone CUDA configurations.
+if(TARGET strix_device)
+    return()
+endif()
+if(NOT TARGET strix_model_description)
+    add_library(strix_model_description STATIC ${CMAKE_CURRENT_LIST_DIR}/../src/model_description.cpp)
+    target_include_directories(strix_model_description PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../include)
+    target_compile_features(strix_model_description PUBLIC cxx_std_20)
+endif()
+add_library(strix_device STATIC
+    ${CMAKE_CURRENT_LIST_DIR}/../src/device/declaration.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../src/device/gate.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../src/device/nvidia_smi.cpp)
+target_link_libraries(strix_device PUBLIC strix_model_description)
+target_compile_features(strix_device PUBLIC cxx_std_20)
+if(MSVC)
+    target_compile_definitions(strix_device PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+if(COMMAND strix_target_warnings)
+    strix_target_warnings(strix_device)
+endif()
+if(BUILD_TESTING)
+    add_executable(strix-device-gate-tests ${CMAKE_CURRENT_LIST_DIR}/../tests/device_gate_tests.cpp)
+    target_link_libraries(strix-device-gate-tests PRIVATE strix_device)
+    if(COMMAND strix_target_warnings)
+        strix_target_warnings(strix-device-gate-tests)
+    endif()
+    add_test(NAME strix-device-gate-tests COMMAND strix-device-gate-tests)
+endif()

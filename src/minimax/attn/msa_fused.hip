@@ -5,9 +5,11 @@
 // it (fewer launches, N sequences per launch) and how the caches are read (coalesced tiles through LDS).
 #include "msa_fused.hpp"
 #include "msa_inblock_layout.hpp"
+#include "msa_select_dump.hpp"
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -2571,11 +2573,11 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
             aidx::launch<IdxWmmaPolicyT<true>>(p, aidx::wmma_split(v.max_blocks), (sparse + 1U) / 2U, stream);
         else
             aidx::launch<IdxWmmaPolicyT<false>>(p, aidx::wmma_split(v.max_blocks), (sparse + 3U) / 4U, stream);
-        check(hipGetLastError(), "minimax prefill index wmma");
+        hip_check(hipGetLastError(), "minimax prefill index wmma");
         if (mode == aidx::kModeExact) {  // rescore the cut-off band: the selection is the exact one
             hipLaunchKernelGGL(prefill_index_refine_kernel, dim3(kMaxRows * v.idx_heads, 1, sparse), dim3(256),
                                kRefineExtra * sizeof(uint4) + sel_bytes(v.max_blocks, 256), stream, p);
-            check(hipGetLastError(), "minimax prefill index refine");
+            hip_check(hipGetLastError(), "minimax prefill index refine");
         }
         if (aidx::audit_enabled()) audit_prefill_index(p, stream);
         return;
@@ -2617,17 +2619,17 @@ void audit_prefill_index(const PrefillView& p, hipStream_t stream) {
     const std::size_t r0 = std::size_t{p.first_window} * kMaxRows, rows = p.rows - r0;
     const std::size_t n = rows * v.idx_heads * v.max_blocks, off = r0 * v.idx_heads * v.max_blocks;
     float* exact = nullptr;
-    check(hipMalloc(&exact, (off + n) * sizeof(float)), "minimax idx audit alloc");
+    hip_check(hipMalloc(&exact, (off + n) * sizeof(float)), "minimax idx audit alloc");
     PrefillView q = p;
     q.window.scores = exact;
     launch_prefill_index_exact(q, stream);
     std::vector<float> a(n), b(n);
     std::vector<std::uint64_t> pos(rows);
-    check(hipStreamSynchronize(stream), "minimax idx audit sync");
-    check(hipMemcpy(a.data(), exact + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit exact");
-    check(hipMemcpy(b.data(), v.scores + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit fast");
-    check(hipMemcpy(pos.data(), v.pos + r0, rows * sizeof(std::uint64_t), hipMemcpyDeviceToHost), "minimax idx audit pos");
-    check(hipFree(exact), "minimax idx audit free");
+    hip_check(hipStreamSynchronize(stream), "minimax idx audit sync");
+    hip_check(hipMemcpy(a.data(), exact + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit exact");
+    hip_check(hipMemcpy(b.data(), v.scores + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit fast");
+    hip_check(hipMemcpy(pos.data(), v.pos + r0, rows * sizeof(std::uint64_t), hipMemcpyDeviceToHost), "minimax idx audit pos");
+    hip_check(hipFree(exact), "minimax idx audit free");
     for (std::size_t r = 0; r < rows; ++r)
         for (unsigned h = 0; h < v.idx_heads; ++h) {
             const std::size_t o = (r * v.idx_heads + h) * v.max_blocks;
@@ -2637,6 +2639,40 @@ void audit_prefill_index(const PrefillView& p, hipStream_t stream) {
     std::fprintf(stderr, "%s (call %u)\n", audit.line("minimax").c_str(), ++calls);
 }
 }  // namespace
+
+namespace {
+std::FILE* g_select_dump = nullptr;
+
+// One record per sparse batch (msa_select_dump.hpp): the ids the attend launch selected for [first_window * 16, rows).
+void dump_prefill_select(const PrefillView& p, hipStream_t stream) {
+    const DecodeView& v = p.window;
+    const std::size_t r0 = std::size_t{p.first_window} * kMaxRows, rows = p.rows - r0, rg = rows * v.kv_heads;
+    std::vector<std::uint32_t> cnt(rg), ids(rg * kTopK);
+    hip_check(hipStreamSynchronize(stream), "minimax select dump sync");
+    hip_check(hipMemcpy(cnt.data(), v.idx_count + r0 * v.kv_heads, rg * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+          "minimax select dump counts");
+    hip_check(hipMemcpy(ids.data(), v.idx + r0 * v.kv_heads * kTopK, rg * kTopK * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+          "minimax select dump ids");
+    const std::uint64_t pos = p.pos0 + r0;
+    const std::uint32_t head[8] = {0x444C4553U, 1U, aidx::wmma_mode(aidx::kModeExact), static_cast<std::uint32_t>(pos),
+                                   static_cast<std::uint32_t>(pos >> 32), static_cast<std::uint32_t>(rows), v.kv_heads, kTopK};
+    if (std::fwrite(head, sizeof(head), 1, g_select_dump) != 1 ||
+        std::fwrite(cnt.data(), sizeof(std::uint32_t), cnt.size(), g_select_dump) != cnt.size() ||
+        std::fwrite(ids.data(), sizeof(std::uint32_t), ids.size(), g_select_dump) != ids.size())
+        throw std::runtime_error("minimax select dump: short write");
+}
+}  // namespace
+
+void set_select_dump(const char* path) {
+    if (g_select_dump != nullptr) {
+        std::FILE* const f = g_select_dump;
+        g_select_dump = nullptr;
+        if (std::fclose(f) != 0) throw std::runtime_error("minimax select dump: close failed");
+    }
+    if (path == nullptr) return;
+    g_select_dump = std::fopen(path, "wb");
+    if (g_select_dump == nullptr) throw std::runtime_error(std::string("minimax select dump: cannot write ") + path);
+}
 
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
     const DecodeView& v = p.window;
@@ -2677,6 +2713,7 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
             if (marker != nullptr) marker(user, "attend", true);
             launch_prefill_attend<false>(batch, sparse, stream);
             if (marker != nullptr) marker(user, "attend", false);
+            if (g_select_dump != nullptr) dump_prefill_select(batch, stream);
         }
         batch.first_window = 0;
         if (dense != 0 && marker != nullptr) marker(user, "attend", true);

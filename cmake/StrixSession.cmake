@@ -68,6 +68,30 @@ function(strix_session_add_contract_tests)
     endforeach()
 endfunction()
 strix_session_add_contract_tests()
+
+# Actual MiniMax continuation target; also used by the standalone host project.
+function(strix_session_add_minimax_continuation)
+    add_executable(minimax_continuation_tests
+        "${_strix_session_root}/tests/minimax_session_shared/continuation_tests.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/capture_noop.cpp")
+    target_link_libraries(minimax_continuation_tests PRIVATE minimax_replay_family minimax_owner_cache)
+    add_test(NAME minimax-continuation COMMAND minimax_continuation_tests)
+    set_tests_properties(minimax-continuation PROPERTIES TIMEOUT 90 LABELS "cpu;session;minimax")
+endfunction()
+
+# Resident prefix target uses the production owner/control/adapter seams.
+function(strix_session_add_minimax_prefix_reuse)
+    add_executable(minimax_prefix_reuse_tests
+        "${_strix_session_root}/tests/minimax_session_shared/prefix_reuse_tests.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/capture_noop.cpp")
+    target_link_libraries(minimax_prefix_reuse_tests PRIVATE minimax_replay_family minimax_owner_cache)
+    add_test(NAME minimax-prefix-reuse COMMAND minimax_prefix_reuse_tests)
+    set_tests_properties(minimax-prefix-reuse PROPERTIES TIMEOUT 90 LABELS "cpu;session;minimax")
+endfunction()
+
+# Called once the existing production HTTP and registry targets exist. Keeping
+# this separate leaves the session resources independent of serving/core and
+# keeps the earlier minimal accelerator configure independent of the shell.
 function(strix_session_add_runtime)
     add_library(strix_session_runtime INTERFACE)
     target_link_libraries(strix_session_runtime INTERFACE strix_session_owner strix_serve strix_model_registry)
@@ -87,27 +111,82 @@ function(strix_session_add_runtime)
             set_tests_properties(session_${test} PROPERTIES LABELS "cpu;session" TIMEOUT 30)
         endforeach()
     endif()
+    if(BUILD_TESTING AND STRIX_FAMILY_MINIMAX)
+        add_subdirectory("${_strix_session_root}/tests/minimax_session_shared"
+            "${CMAKE_BINARY_DIR}/minimax-session-shared")
+    endif()
 endfunction()
-
 
 # Explicit optional archive reference without a runtime/family dependency cycle.
 function(strix_session_link_services)
+    if(TARGET strix_minimax_session)
+        set(checkpoint_minimax strix_minimax_session)
+    elseif(TARGET minimax_owner_cache)
+        set(checkpoint_minimax minimax_owner_cache)
+    endif()
+    if(BUILD_TESTING AND checkpoint_minimax
+       AND EXISTS "${_strix_session_root}/tests/session_checkpoint_io_tests.cpp"
+       AND EXISTS "${_strix_session_root}/src/session/checkpoint_io.cpp"
+       AND NOT TARGET session_checkpoint_io_tests)
+        add_executable(session_checkpoint_io_tests "${_strix_session_root}/tests/session_checkpoint_io_tests.cpp")
+        target_link_libraries(session_checkpoint_io_tests PRIVATE strix_state_cache ${checkpoint_minimax})
+        strix_session_warnings(session_checkpoint_io_tests)
+        if(MSVC)
+            target_compile_options(session_checkpoint_io_tests PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(session_checkpoint_io_tests PRIVATE -UNDEBUG -Wno-missing-field-initializers)
+        endif()
+        set(STRIX_CHECKPOINT_REFERENCE_DIR "" CACHE PATH "Optional independently archived host checkpoint reference files")
+        add_test(NAME session_checkpoint_io COMMAND session_checkpoint_io_tests "${STRIX_CHECKPOINT_REFERENCE_DIR}")
+        set_tests_properties(session_checkpoint_io PROPERTIES TIMEOUT 120 LABELS "cpu;session;checkpoint")
+    elseif(BUILD_TESTING AND checkpoint_minimax AND NOT TARGET session_checkpoint_io_tests)
+        message(STATUS "Checkpoint adapter test source pending; no placeholder test registered")
+    endif()
+    if(BUILD_TESTING AND TARGET minimax_replay_family AND NOT MINIMAX_SESSION_BASELINE
+       AND EXISTS "${_strix_session_root}/tests/minimax_session_shared/shared_api_tests.cpp"
+       AND NOT TARGET minimax_shared_api_tests)
+        add_executable(minimax_shared_api_tests
+            "${_strix_session_root}/tests/minimax_session_shared/shared_api_tests.cpp"
+            "${CMAKE_BINARY_DIR}/minimax-session-shared/capture_noop.cpp")
+        target_link_libraries(minimax_shared_api_tests PRIVATE minimax_replay_family minimax_owner_cache)
+        add_test(NAME minimax-shared-api COMMAND minimax_shared_api_tests)
+        set_tests_properties(minimax-shared-api PROPERTIES TIMEOUT 120 LABELS "cpu;session;minimax;api")
+    endif()
+    if(TARGET strix_minimax_session_service AND TARGET strix_session_shell)
+        target_compile_definitions(strix_session_shell PRIVATE STRIX_SERVE_MINIMAX=1)
+        target_link_libraries(strix_session_shell PRIVATE strix_minimax_session_service)
+        if(TARGET session_registry_tests)
+            target_compile_definitions(session_registry_tests PRIVATE STRIX_EXPECT_MINIMAX_SERVICE=1)
+        endif()
+    endif()
     if(TARGET strix_gemma4_session_service AND TARGET strix_session_shell)
         target_compile_definitions(strix_session_shell PRIVATE STRIX_SERVE_GEMMA4=1)
         target_link_libraries(strix_session_shell PRIVATE strix_gemma4_session_service)
         if(TARGET session_registry_tests)
             target_compile_definitions(session_registry_tests PRIVATE STRIX_EXPECT_GEMMA4_SERVICE=1)
         endif()
-        # A device-backed service makes HIP the link language of every shell
-        # consumer; these targets were declared before the HIP target list.
-        if(STRIX_ENABLE_HIP_RUNTIME AND DEFINED STRIX_HIP_ARCHS)
-            foreach(_t strix_session_shell strix-serve session_runtime_tests session_http_replay_tests
-                    session_registry_tests session_turn_cache_tests)
-                if(TARGET ${_t})
-                    set_target_properties(${_t} PROPERTIES HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-                endif()
-            endforeach()
-        endif()
+    endif()
+    # Explicit native operator target only: no accelerator language is enabled
+    # here, no GPU test enters CTest, and ordinary/legacy construction stays OFF.
+    if(BUILD_TESTING AND TARGET strix_minimax_engine AND TARGET strix_minimax_session_service)
+        add_executable(minimax-native-paired-state EXCLUDE_FROM_ALL
+            "${_strix_session_root}/tests/minimax_session_shared/native_paired_state_tests.cpp")
+        target_link_libraries(minimax-native-paired-state PRIVATE strix_minimax_session_service
+            strix_minimax_engine strix_minimax_dspark strix_dist)
+        target_compile_features(minimax-native-paired-state PRIVATE cxx_std_20)
+        strix_session_warnings(minimax-native-paired-state)
+    endif()
+    # A device-backed service makes HIP the link language of every shell
+    # consumer; these targets were declared before the HIP target list.
+    if(STRIX_ENABLE_HIP_RUNTIME AND DEFINED STRIX_HIP_ARCHS
+       AND (TARGET strix_gemma4_session_service OR TARGET strix_minimax_session_service))
+        foreach(_t strix_session_shell strix-serve strix-skeleton-serve skeleton_engine_tests
+                session_runtime_tests session_http_replay_tests session_registry_tests session_turn_cache_tests
+                minimax_service_tests minimax_service_compat minimax-native-paired-state)
+            if(TARGET ${_t})
+                set_target_properties(${_t} PROPERTIES HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            endif()
+        endforeach()
     endif()
 endfunction()
 cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL strix_session_link_services)

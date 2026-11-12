@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
 #include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
@@ -1196,6 +1197,10 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
 static int run_decode_entry(
     int argc,
     char** argv, strix::decode_cli::MtpBundleSetupRetry bundle_retry = {}) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
+    strix::device::bind_hip_main(argc, argv);
     if (strix::print_device_profile_if_requested(argc, argv)) return 0;
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"

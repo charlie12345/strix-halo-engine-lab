@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 // strix-minimax-rank: one rank of the MiniMax M3.1 Flash TP2 engine (both ranks run the same command line).
 // The DS bench roles in one binary: teacher-forced gates, single-user sessions (TTFT, prefill tok/s, decode tok/s) and
@@ -1654,6 +1655,10 @@ void sel_check(mm::Engine& eng, const std::string& name, const std::vector<std::
 }
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     // Defaults-on resolver before anything reads a switch; --print-effective-config prints the resolved configuration.
     if (strix::minimax::defaults::print_or_apply("rank", argc, argv)) return 0;
     if (argc < 5) {

@@ -4,12 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
-#include <cstdio>
-#include <stdexcept>
 #include <string>
 
-// HIP side of the start gate. Enumeration reads device properties only. bind_hip() is the one call a HIP binary makes
-// before its first allocation. Without a declaration, a lone integrated device keeps working (receipt: declared=implicit).
+// What the HIP runtime exposes to this process. Properties only: no allocation is made on any device.
+// AMD devices are identified by PCI address. The binding itself is in strix/device/hip_gate.hpp.
 namespace strix::device {
 
 class HipEnumerator final : public Enumerator {
@@ -38,18 +36,5 @@ public:
         return out;
     }
 };
-
-// Resolves the device (throws Refusal), makes it current and prints the receipt line on `receipt` (null = silent).
-inline Bound bind_hip(Request request = {}, const std::string& devices_path = {}, std::FILE* receipt = stderr) {
-    HipEnumerator enumerator;
-    auto bound = start_gate(enumerator, std::move(request), devices_path);
-    if (const auto status = hipSetDevice(bound.visible.ordinal); status != hipSuccess)
-        throw Refusal(std::string("device gate: refusing to start: hipSetDevice failed: ") + hipGetErrorString(status));
-    if (receipt) {
-        std::fprintf(receipt, "%s\n", receipt_line(bound).c_str());
-        std::fflush(receipt);
-    }
-    return bound;
-}
 
 } // namespace strix::device

@@ -7,6 +7,7 @@
 // stream devices of every live cable, in the paired order of the detected topology, never fixed
 // numbers) or TCP (debug).
 
+#include "strix/device/hip_gate.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/ds41_dspark_files.hpp"
@@ -61,6 +62,10 @@ Run run(DeviceDrafter& d, std::uint32_t steps) {
 } // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     std::string target, draft_file, listen, connect, usb4, spec, vocab_spec = "full";
     std::uint32_t rank = 0, steps = 8;
     for (int i = 1; i < argc; ++i) {

@@ -59,14 +59,16 @@ Three small GGUF files, all F32, in the format published with the Apache-2.0 luc
 
 The loaders fail closed. A file is rejected when a key or tensor is missing or has another type or shape,
 when the schema, base model or feature tap is not the expected one, or when the drafter hash stored in the
-file (`<prefix>.runtime_gguf_sha256`) differs from the hash of the drafter that was loaded. The scoring head
-is optional by design: without it the scorer uses the drafter's own block-15 projections.
+file (`<prefix>.runtime_gguf_sha256`) differs from the hash of the drafter that was loaded. That applies to a
+file that is given; none of the three has to be.
 
 **Licence of the weights.** This repository ships no weights, and its tests use synthetic weights only. The
 drafter base model (Qwen3.5-0.8B) is published under Apache-2.0. The three trained files above are published
 with the licence field `other` and no licence text, so their terms of use are not stated; whoever downloads
-them is responsible for clearing that. The scorer works without them only for the QK mass (drafter's own
-projections); unit boundaries and request detection then need another source.
+them is responsible for clearing that. The default path uses none of them: all three are optional inputs,
+absent by default. The QK mass then comes from the drafter's own block-15 projections, the request rows from
+the request window the caller passes, and unit boundaries from length and line starts
+(see [pflash-drafter.md](pflash-drafter.md)).
 
 ## Limits
 

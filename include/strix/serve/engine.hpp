@@ -77,6 +77,12 @@ struct ConstraintVerdict {
     // (transforms, argmax, scores) and, on MTP windows, the whole row (readback + mask + select).
     std::uint64_t profile_rows = 0, profile_window_rows = 0, profile_known_rows = 0;
     double profile_mask_ms = 0, profile_select_ms = 0, profile_window_row_ms = 0;
+    // Mask-ahead: rows whose mask came from the host worker (mask_ms then holds only the wait), and every
+    // mask the worker walked with its own time (off the selection thread; includes masks no row needed).
+    std::uint64_t profile_ahead_rows = 0, profile_ahead_masks = 0;
+    // Rows decided by ranked membership (maximum refused, a next-best logit admitted): no mask walk.
+    std::uint64_t profile_ranked_rows = 0;
+    double profile_ahead_ms = 0;
 };
 
 // Armed instrumentation: one process-wide word, unarmed until a GET /metrics or GET /api/status?detail=1 arms it

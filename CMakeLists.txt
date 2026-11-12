@@ -18,6 +18,8 @@ project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
 option(STRIX_CUDA_QWEN_ONLY "Build only the CUDA Qwen prefill service and gates" OFF)
 if(STRIX_CUDA_QWEN_ONLY)
+    include(CTest)
+    include(cmake/StrixSession.cmake)
     include(cmake/QwenCuda.cmake)
     return()
 endif()
@@ -139,6 +141,7 @@ else()
 endif()
 
 find_package(Threads REQUIRED)
+include(cmake/StrixStateCache.cmake)
 
 # Prompt-lookup (n-gram) index shared by the engines' drafting (it only proposes draft tokens: verification decides).
 add_library(strix_lookup STATIC src/lookup/index.cpp)
@@ -156,15 +159,11 @@ if(STRIX_CUDA_DS41_ONLY)
 add_library(strix_core STATIC
     src/gguf_reader.cpp
     src/model_manifest.cpp
-    src/model_runtime_binding.cpp
-    src/model_content_hash.cpp
-    src/prompt_terminal_diagnostics.cpp
     src/model_family_registry.cpp
     src/cost_table_cache.cpp
 )
 else()
 add_library(strix_core STATIC
-    src/rotary_descriptor.cpp
     src/qwen_yarn_table.cpp
     src/final_generation_state_export.cpp
     src/greedy_serving_scheduler.cpp
@@ -265,8 +264,6 @@ add_library(strix_core STATIC
     src/low_precision.cpp
     src/memory_plan.cpp
     src/model_contract.cpp
-    src/model_content_hash.cpp
-    src/prompt_terminal_diagnostics.cpp
     src/mtp_draft_binding.cpp
     src/mtp_draft_contract.cpp
     src/mtp_draft_qualification.cpp
@@ -298,7 +295,6 @@ add_library(strix_core STATIC
     src/qualified_mtp_draft_backend.cpp
     src/qualified_mtp_forward_runtime.cpp
     src/model_manifest.cpp
-    src/model_runtime_binding.cpp
     src/model_tensor_index.cpp
     src/moe_plan.cpp
     src/moe_layer_schedule.cpp
@@ -346,8 +342,6 @@ add_library(strix_core STATIC
     src/ple_direct.cpp
     src/ple_rolling.cpp
     src/ple_workspace.cpp
-    src/session_state_cache.cpp
-    src/prefix_state_cache.cpp
     src/rtx_state_import.cpp
     src/bp_codec.cpp
     src/transport.cpp
@@ -355,15 +349,16 @@ add_library(strix_core STATIC
 endif()
 target_include_directories(strix_core PUBLIC include)
 target_compile_features(strix_core PUBLIC cxx_std_20)
-target_link_libraries(strix_core PUBLIC Threads::Threads)
+target_link_libraries(strix_core PUBLIC Threads::Threads strix_state_cache)
 if(STRIX_USE_OPENSSL_SHA256)
     find_package(OpenSSL REQUIRED COMPONENTS Crypto)
-    target_link_libraries(strix_core PRIVATE OpenSSL::Crypto)
-    target_compile_definitions(strix_core PRIVATE STRIX_USE_OPENSSL_SHA256=1)
+    target_link_libraries(strix_state_cache PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(strix_state_cache PRIVATE STRIX_USE_OPENSSL_SHA256=1)
 endif()
 strix_target_warnings(strix_core)
 
 include(CTest)
+include(cmake/StrixSession.cmake)
 if(BUILD_TESTING)
     add_executable(strix-dist-transport-spec-tests tests/dist_transport_spec_tests.cpp)
     target_include_directories(strix-dist-transport-spec-tests PRIVATE include)
@@ -5324,5 +5319,16 @@ if(BUILD_TESTING)
         ENVIRONMENT "STRIX_QWEN_PF_PIPE_DUMP=${CMAKE_CURRENT_BINARY_DIR}/qwen-prefill-pipe-dump")
 endif()
 
+# Reuse the extracted host identity/cache provider in the existing Gemma model
+# archive. Keep one owner of these production translation units per link graph.
+function(strix_link_host_cache_adopters)
+    if(TARGET strix_gemma4_model)
+        get_target_property(cache_adopter_sources strix_gemma4_model SOURCES)
+        list(FILTER cache_adopter_sources EXCLUDE REGEX "(^|/)(model_content_hash|model_runtime_binding)\\.cpp$")
+        set_property(TARGET strix_gemma4_model PROPERTY SOURCES "${cache_adopter_sources}")
+        target_link_libraries(strix_gemma4_model PUBLIC strix_state_cache)
+    endif()
+endfunction()
+cmake_language(DEFER CALL strix_link_host_cache_adopters)
 # Serving-spec fragments (cmake/servespec/*.cmake): shared serving sources and their host tests.
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")

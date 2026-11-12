@@ -27,6 +27,15 @@
 
 namespace strix {
 
+namespace session { struct PrefixSnapshot; struct ResidentPrefix; }
+
+// A quota is part of this store's one service budget, never another allocator.
+// The sole-oversize exception is for legacy prompt snapshots only.
+struct PrefixEntryPolicy {
+    std::uint64_t scope = 0, max_bytes = 0, max_entries = 0;
+    bool fifo = false, sole_oversize = false;
+};
+
 // Block-boundary prefix state cache (see docs/engine/serving/prefix-state-cache.md).
 //
 // A checkpoint is the complete session state after the first P = k*T prompt tokens of a tiled
@@ -70,6 +79,14 @@ struct PrefixCacheCheckpoint {
     std::vector<std::shared_ptr<const PrefixCacheSegment>> segments;
     PrefixCacheBuffer fixed;
     std::vector<std::byte> metadata;
+    // RAM-only extensions. The legacy disk codec never writes these fields.
+    PrefixEntryPolicy retention;
+    std::uint64_t charge = 0, declared_metadata = 0;
+    bool legacy_index_exemption = false;
+    std::string name, replacement, keep;
+    std::shared_ptr<const session::PrefixSnapshot> snapshot;
+    std::shared_ptr<const session::ResidentPrefix> resident;
+    std::shared_ptr<const std::vector<std::uint8_t>> encoded;
     // Copy of every token of the prefix, checked on lookup.
     [[nodiscard]] std::vector<std::uint32_t> tokens() const;
 };
@@ -109,6 +126,7 @@ public:
 // One attach-time backing allocation. Leases return aligned ranges, never pinned pages.
 class PrefixPayloadPool : public std::enable_shared_from_this<PrefixPayloadPool> {
     PrefixCacheBuffer backing_;
+    std::uint64_t alignment_ = 256;
     std::mutex mutex_;
     using FreeRanges = std::map<std::uint64_t,std::uint64_t>;
     FreeRanges free_;
@@ -124,7 +142,9 @@ class PrefixPayloadPool : public std::enable_shared_from_this<PrefixPayloadPool>
         free_.insert(std::move(node)); // granted leases already own this node; no allocation
     }
 public:
-    explicit PrefixPayloadPool(PrefixCacheBuffer backing) : backing_(std::move(backing)) {
+    explicit PrefixPayloadPool(PrefixCacheBuffer backing, std::uint64_t alignment = 256)
+        : backing_(std::move(backing)), alignment_(alignment) {
+        if (!alignment || (alignment & (alignment - 1))) throw std::invalid_argument("prefix pool alignment");
         free_.emplace(0,backing_.bytes);
     }
     std::uint64_t bytes() const {return backing_.bytes;}
@@ -142,8 +162,8 @@ public:
         std::vector<std::pair<std::uint64_t,std::uint64_t>> ranges(free_.begin(),free_.end());
         for(const auto bytes:requests) {
             if(!bytes) continue;
-            if(bytes>UINT64_MAX-255U) return false;
-            const auto aligned=(bytes+255U)&~UINT64_C(255);
+            if(bytes>UINT64_MAX-(alignment_-1)) return false;
+            const auto aligned=(bytes+alignment_-1)&~(alignment_-1);
             bool found=false;
             for(auto& range:ranges) if(range.second>=aligned) {
                 range.first+=aligned; range.second-=aligned; found=true; break;
@@ -154,8 +174,8 @@ public:
     }
     PrefixCacheBuffer allocate(std::uint64_t bytes) {
         if(!bytes) return {};
-        if(bytes>UINT64_MAX-255U) throw PrefixCacheAllocationFailure();
-        const auto aligned=(bytes+255U)&~UINT64_C(255);
+        if(bytes>UINT64_MAX-(alignment_-1)) throw PrefixCacheAllocationFailure();
+        const auto aligned=(bytes+alignment_-1)&~(alignment_-1);
         struct Lease {
             std::shared_ptr<PrefixPayloadPool> pool;
             std::uint64_t at=0, bytes=0;
@@ -226,6 +246,11 @@ inline constexpr std::array<std::string_view,20> prefix_certificate_decline_name
     "prefix-no-compatible-checkpoint",
 };
 struct PrefixStateCacheStats {
+    // Generic RAM gauges are distinct from the historical pinned-host gauges.
+    std::uint64_t immutable_bytes = 0, retention_metadata_bytes = 0, reserved_bytes = 0;
+    std::uint64_t encoded_host_bytes = 0, service_bytes = 0, session_entries = 0;
+    std::uint64_t policy_exempt_bytes = 0;
+    std::uint64_t legacy_live_over_budget_bytes = 0;
     std::uint64_t lookups = 0, plan_misses = 0, host_hits = 0, disk_hits = 0, misses = 0;
     std::uint64_t inserted = 0, evicted = 0, rejected_over_budget = 0;
     std::uint64_t host_bytes = 0, host_checkpoints = 0, host_segments = 0;
@@ -266,8 +291,34 @@ public:
     };
     // Credits include outstanding reservations and live payload leases. An incoming
     // capture preserves fair directory admission; disk reads need no directory slot.
-    [[nodiscard]] Reservation reserve(std::uint64_t bytes, const PrefixCacheCheckpoint* incoming = nullptr);
+    [[nodiscard]] Reservation reserve(std::uint64_t bytes, const PrefixCacheCheckpoint* incoming = nullptr,
+        std::string_view protected_name = {}, bool session_retention = false);
     [[nodiscard]] PrefixCacheBuffer allocate(std::uint64_t bytes, Reservation&, bool segment = false);
+
+    // Session facades carry query/compatibility policy only. All retained values,
+    // replacement, protection, victim ordering and physical credits live here.
+    std::uint64_t new_scope();
+    struct NamedView { const std::vector<std::uint8_t>& bytes; std::uint64_t touched = 0; };
+    // Borrowed compatibility directory. Every core erase removes its descriptor
+    // BEFORE releasing backing. Concurrent readers use query() ownership leases.
+    [[nodiscard]] const std::map<std::string, NamedView>& named_view(std::uint64_t scope) const;
+    using EntryPredicate = std::function<bool(const PrefixCacheCheckpoint&)>;
+    using EntryRank = std::function<std::uint64_t(const PrefixCacheCheckpoint&)>;
+    [[nodiscard]] std::shared_ptr<const PrefixCacheCheckpoint> query(std::uint64_t scope,
+        const EntryRank&, bool touch = true);
+    [[nodiscard]] std::vector<std::shared_ptr<const PrefixCacheCheckpoint>> inspect(std::uint64_t scope) const;
+    bool retain(std::shared_ptr<PrefixCacheCheckpoint>, bool replace, Reservation* = nullptr);
+    bool retention_room(const PrefixEntryPolicy&, std::uint64_t, std::string_view replacement = {}, std::string_view keep = {}) const;
+    void remove(std::uint64_t scope, const EntryPredicate&) noexcept;
+    bool unpin(std::uint64_t scope, const std::string&);
+    bool reclaim(std::uint64_t scope, const std::function<bool(std::uint64_t)>&,
+        const std::optional<std::string>& protected_name = {});
+    [[nodiscard]] std::uint64_t retained_charge(std::uint64_t scope) const noexcept;
+    [[nodiscard]] std::size_t entry_count(std::uint64_t scope) const noexcept;
+    [[nodiscard]] std::uint64_t scope_evictions(std::uint64_t scope) const noexcept;
+    // Adopt a codec's existing host allocation as pool backing, without copying
+    // or serializing a device owner. Capacity, including codec slack, is charged.
+    bool retain_encoded(std::shared_ptr<PrefixCacheCheckpoint>, std::vector<std::uint8_t>, Reservation* = nullptr);
 
     PrefixStateCache(PrefixStateCachePolicy, PrefixCacheAllocator);
     ~PrefixStateCache();
@@ -336,29 +387,51 @@ private:
         std::list<ModelContentIdentity>::iterator lru;
         std::uint64_t epoch = 0, reuse = 0;
         std::set<std::string> conversations;
+        bool protected_entry = false;
     };
     struct DigestLess {
         bool operator()(const ModelContentIdentity& a, const ModelContentIdentity& b) const noexcept {
             return a.bytes < b.bytes;
         }
     };
-    struct Ledger { std::mutex mutex; std::uint64_t bytes = 0, segments = 0, reserved = 0; };
+    struct Ledger {
+        std::mutex mutex;
+        std::uint64_t bytes = 0, segments = 0, reserved = 0, immutable = 0, retention_metadata = 0, encoded = 0, certificates = 0, exempt = 0;
+        std::map<std::weak_ptr<const void>, std::uint64_t, std::owner_less<std::weak_ptr<const void>>> immutable_owners;
+        std::map<std::weak_ptr<const void>, std::uint64_t, std::owner_less<std::weak_ptr<const void>>> certificate_owners;
+    };
+    struct RetentionLease {
+        std::shared_ptr<Ledger> ledger;
+        std::shared_ptr<const PrefixCacheCheckpoint> value;
+        std::uint64_t metadata = 0, exempt = 0;
+        ~RetentionLease();
+    };
     struct Receipt {
         std::shared_ptr<Ledger> ledger;
         std::shared_ptr<std::byte> payload;
+        std::shared_ptr<const std::vector<std::uint8_t>> encoded_owner;
         std::uint64_t bytes = 0;
-        bool registered = false, segment = false;
+        bool registered = false, segment = false, encoded = false;
         ~Receipt() {
             if (registered) {
                 std::lock_guard lock(ledger->mutex);
                 payload.reset();
+                encoded_owner.reset();
                 ledger->bytes -= bytes;
+                if (encoded) ledger->encoded -= bytes;
                 if (segment) --ledger->segments;
             }
         }
     };
     std::shared_ptr<Ledger> ledger_ = std::make_shared<Ledger>();
+    static void reap_immutable_locked(Ledger&);
+    std::uint64_t next_scope_ = 0;
+    std::map<std::uint64_t, std::uint64_t> scope_evictions_;
+    std::map<std::uint64_t, std::map<std::string, NamedView>> named_views_;
+    bool retention_room_locked(const PrefixEntryPolicy&, std::uint64_t, std::string_view, std::string_view) const;
+    bool reclaim_one_locked(std::optional<std::uint64_t> scope = {}, std::string_view protected_name = {});
     mutable std::map<const std::byte*, std::weak_ptr<Receipt>> receipts_;
+    void prune_receipts_locked() const noexcept;
     void register_buffer_locked(const PrefixCacheBuffer&, bool segment);
     // Bounded by retained associations; forget reuse when the last member leaves.
     struct GroupActivity {
@@ -389,7 +462,8 @@ private:
     std::uint64_t retained_bytes_locked();
     void touch_locked(Entry&, bool reused = false);
     void evict_to_budget_locked(std::uint64_t reserve, const PrefixCacheCheckpoint* incoming = nullptr,
-        std::span<const std::uint64_t> payloads = {}, std::uint64_t metadata = 0);
+        std::span<const std::uint64_t> payloads = {}, std::uint64_t metadata = 0,
+        std::string_view protected_name = {});
     std::shared_ptr<const PrefixCacheCheckpoint> load_from_disk(const ModelContentIdentity& identity,
         const ModelContentIdentity& digest, std::span<const std::uint32_t> tokens, std::uint32_t block_rows);
     std::shared_ptr<const PrefixCacheSegment> load_segment(const ModelContentIdentity& identity,

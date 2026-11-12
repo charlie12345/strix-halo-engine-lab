@@ -2,6 +2,7 @@
 #include "state_cache_stats.hpp"
 // Serialized by the bridge request mutex. Uses the existing prefix-cache allocator/LRU.
 #include "strix/session_state_cache.hpp"
+#include "strix/session/checkpoint_io.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/serve/session_api.hpp"
 #include <algorithm>
@@ -9,17 +10,6 @@
 #include <array>
 #include <cstring>
 #include <cerrno>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
-#endif
-
 namespace strix::decode_cli {
 inline void validate_http_session_id(const std::string& id) {
     if (id.empty() || id.size() > 128 || !std::all_of(id.begin(), id.end(), [](unsigned char c) {
@@ -44,39 +34,13 @@ inline std::uint64_t session_capture_peak_bound(std::uint64_t fixed, std::uint64
 }
 // One persistent lock inode per shared directory. Never unlink it after unlocking.
 class SessionDirectoryLock {
+    session::checkpoint_io::DirectoryLock lock_;
 public:
-    explicit SessionDirectoryLock(const std::filesystem::path& dir) {
-        std::filesystem::create_directories(dir);
-#ifdef _WIN32
-        handle_ = CreateFileW((dir / ".session.lock").c_str(), GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        OVERLAPPED overlap{};
-        if (handle_ == INVALID_HANDLE_VALUE || !LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlap)) {
-            if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
-            throw SessionApiError(507, "session_budget", "session directory lock failed");
-        }
-#else
-        fd_ = ::open((dir / ".session.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-        int result;
-        do { result = fd_ < 0 ? -1 : ::flock(fd_, LOCK_EX); } while (result < 0 && errno == EINTR);
-        if (result < 0) { if (fd_ >= 0) ::close(fd_); throw SessionApiError(507, "session_budget", "session directory lock failed"); }
-#endif
+    explicit SessionDirectoryLock(const std::filesystem::path& dir) try
+        : lock_(dir, session::checkpoint_io::LockMode::blocking) {}
+    catch (const std::exception&) {
+        throw SessionApiError(507, "session_budget", "session directory lock failed");
     }
-    ~SessionDirectoryLock() {
-#ifdef _WIN32
-        OVERLAPPED overlap{}; UnlockFileEx(handle_, 0, MAXDWORD, MAXDWORD, &overlap); CloseHandle(handle_);
-#else
-        (void)::flock(fd_, LOCK_UN); ::close(fd_);
-#endif
-    }
-    SessionDirectoryLock(const SessionDirectoryLock&) = delete;
-    SessionDirectoryLock& operator=(const SessionDirectoryLock&) = delete;
-private:
-#ifdef _WIN32
-    HANDLE handle_ = INVALID_HANDLE_VALUE;
-#else
-    int fd_ = -1;
-#endif
 };
 class HttpSessionStore final {
 public:

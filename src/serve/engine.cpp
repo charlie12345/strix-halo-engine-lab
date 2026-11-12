@@ -11,6 +11,13 @@ namespace {
 using SteadyClock = std::chrono::steady_clock;
 constexpr auto kNever = SteadyClock::time_point::max();
 
+bool publish_tokens(const std::shared_ptr<GenerationTicket>& ticket,
+    const std::shared_ptr<GenerationOutput>& output, std::span<const std::uint32_t> tokens) {
+    const bool keep = !output || !output->consume_tokens || output->consume_tokens(tokens);
+    // Published IDs remain accounted even when the presentation requests stop.
+    return ticket->publish(tokens) && keep;
+}
+
 // The process-wide arming state (HTTP side and the expiry thread only), on its own cache line (written on every arming
 // request, unlike the period word the engine threads read). One lock orders the arming requests and the expiry, so an
 // arming request never loses its period to an expiry decided before it. The expiry thread is started by the first
@@ -159,6 +166,7 @@ std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     auto ticket = std::make_shared<GenerationTicket>();
     const std::lock_guard lock(mutex_);
     if (stopping_ || draining_ || entries_.size() >= max_queued_) return nullptr;
+    ticket->output_ = job.output;
     ticket->submitted_queue_position_ = entries_.size();
     ticket->queue_position_.store(entries_.size());
     ticket->progress_.total_tokens = job.prompt.size();
@@ -211,7 +219,9 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
         const auto started = std::chrono::steady_clock::now();
         if (ticket->cancelled()) stats.finish = "cancelled";
         else {
-            entry.job.on_tokens = [ticket](std::span<const std::uint32_t> tokens) { return ticket->publish(tokens); };
+            entry.job.on_tokens = [ticket, output = entry.job.output](std::span<const std::uint32_t> tokens) {
+                return publish_tokens(ticket, output, tokens);
+            };
             try { stats = engine.generate(entry.job); }
             catch (const GenerationRequestError& e) { stats = e.stats; error = e.what(); }
             catch (const std::exception& e) { error = e.what(); }
@@ -259,11 +269,19 @@ std::optional<TakenJob> GenerationQueue::take(bool wait, QueueSelection selectio
     return take_selected(wait, selection == QueueSelection::short_first, selection == QueueSelection::short_first, true, eligible, reorder, timed_eligible, overtake_blocked);
 }
 
+std::optional<TakenJob> GenerationQueue::take(bool wait, QueueSelection selection,
+    const std::function<bool(const GenerationJob&)>& eligible,
+    const std::function<bool(std::chrono::steady_clock::time_point)>& reorder,
+    const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible,
+    const std::function<void()>& overtake_blocked, bool* blocked) {
+    return take_selected(wait, selection == QueueSelection::short_first, selection == QueueSelection::short_first, true, eligible, reorder, timed_eligible, overtake_blocked, blocked);
+}
+
 std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_first, bool cancel_first, bool finite,
     const std::function<bool(const GenerationJob&)>& eligible,
     const std::function<bool(std::chrono::steady_clock::time_point)>& reorder,
     const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible,
-    const std::function<void()>& overtake_blocked) {
+    const std::function<void()>& overtake_blocked, bool* blocked) {
     std::size_t remaining = 0;
     bool first = true;
     for (;;) {
@@ -271,6 +289,7 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
         bool reordered = false;
         {
             std::unique_lock lock(mutex_);
+            if (blocked) *blocked = false;
 #ifdef STRIX_SERVE_QUEUE_TEST
             ++work.take_locks;
 #endif
@@ -308,7 +327,10 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
                         if (!admitted && ordered && e.overtakes >= kMaxQueueOvertakes && overtake_blocked) overtake_blocked();
                         return admitted;
                     });
-                if (pick == remaining) return std::nullopt;
+                if (pick == remaining) {
+                    if (blocked) *blocked = true;
+                    return std::nullopt;
+                }
                 it = entries_.begin() + static_cast<std::ptrdiff_t>(pick);
             }
             reordered = it != entries_.begin();
@@ -329,7 +351,9 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
             continue;
         }
         auto ticket = taken.ticket;
-        taken.job.on_tokens = [ticket](std::span<const std::uint32_t> tokens) { return ticket->publish(tokens); };
+        taken.job.on_tokens = [ticket, output = taken.job.output](std::span<const std::uint32_t> tokens) {
+            return publish_tokens(ticket, output, tokens);
+        };
         return taken;
     }
 }

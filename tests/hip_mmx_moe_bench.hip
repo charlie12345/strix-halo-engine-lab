@@ -1659,8 +1659,7 @@ struct Bench {
         std::vector<float> out;
         std::vector<std::uint8_t> xt, at, part;
     };
-    PfDump run_dump(Prefill& q, int core, int mtfit = -1, bool raw_tiled = false, int core8 = 0, int gufuse = 0, bool debug_partials = false, float* intermediates = nullptr, bool producer_only = false, int pipe = 0) {
-        (void)core;  // all dumps execute the sole v4 core path
+    PfDump run_dump(Prefill& q, int mtfit = -1, bool raw_tiled = false, int core8 = 0, int gufuse = 0, bool debug_partials = false, float* intermediates = nullptr, bool producer_only = false, int pipe = 0) {
         const int saved_pipe = opt::prefill_pipe_override();
         struct RestorePipe { int value; ~RestorePipe() { opt::set_prefill_pipe(value); } } restore_pipe{saved_pipe};
         opt::set_prefill_pipe(pipe);
@@ -2066,8 +2065,8 @@ struct Bench {
             check_prefill_gufuse(q, "loaded shared rows " + std::to_string(rows));
             if (rows == 97)
                 for (int core : {0, 1, 2}) {
-                    const PfDump a = run_dump(q, core, 0, false, 0, 0);
-                    const PfDump b = run_dump(q, core, 0, false, 0, 1);
+                    const PfDump a = run_dump(q, 0, false, 0, 0);
+                    const PfDump b = run_dump(q, 0, false, 0, 1);
                     check(a.part == b.part && a.xt == b.xt && a.at == b.at && same_bits(a.out, b.out),
                           "gufuse older core fallback " + std::to_string(core));
                 }
@@ -2462,7 +2461,12 @@ struct Bench {
             check(refused && !opt::prefill_dense_supported(w), "dense_v4 refuses 7-bit weights");
             std::printf("dense_v4 7-bit descriptor: %s\n", refused ? "refused" : "ACCEPTED");
         }
-        for (unsigned T : {9U, 17U, 100U, 129U, 1024U, 4096U}) {
+        // band 0 = MT8 PIPE CTAs; 4 / 8 = tall bands (full bands + PIPE tiles + tail at 1700 rows).
+        struct RestoreBand { ~RestoreBand() { opt::set_prefill_dense_band(-1); } } restore_band;
+        for (int band : {0, 4, 8})
+        for (unsigned T : {9U, 17U, 100U, 129U, 1024U, 1700U, 4096U}) {
+            if (band != 0 && T < 1024U) continue;
+            opt::set_prefill_dense_band(band);
             for (const auto& g : dense_v4_groups()) {
                 const unsigned K = g[0]->input;
                 std::vector<float> hin(std::size_t{T} * K);
@@ -2494,7 +2498,8 @@ struct Bench {
                     all = all && same;
                     detail += " " + g[i]->name + (same ? " bitwise" : " DIFF " + std::to_string(diff) + "/" + std::to_string(a.size()));
                 }
-                const std::string cell = "dense_v4 " + group_name(g) + " T" + std::to_string(T);
+                const std::string cell = "dense_v4 " + group_name(g) + " T" + std::to_string(T) +
+                                         (band != 0 ? " band" + std::to_string(band) : std::string());
                 check(all, cell + " differs:" + detail);
                 std::printf("%s:%s (splits", cell.c_str(), detail.c_str());
                 for (auto* ds : g) std::printf(" %u", opt::gemm_splits(ds->input, ds->output, ds->copies[0].dev.bits, T));
@@ -2508,10 +2513,12 @@ struct Bench {
         }
     }
     void bench_prefill_dense() {
+        struct RestoreBand { ~RestoreBand() { opt::set_prefill_dense_band(-1); } } restore_band;
         for (unsigned T : {1024U, 4096U}) {
             for (const auto& g : dense_v4_groups()) {
                 const std::string cell = "pfdv4 " + group_name(g) + " T" + std::to_string(T);
                 if (!wanted(cell)) continue;
+                opt::set_prefill_dense_band(0);
                 const unsigned K = g[0]->input;
                 float* in = dalloc<float>(std::size_t{T} * K);
                 hip_ok(hipMemset(in, 0, std::size_t{T} * K * 4), "zero");
@@ -2535,6 +2542,19 @@ struct Bench {
                     }, [&](int i) { run_dense_v4(g, in, outs, T, ws, bytes, static_cast<std::size_t>(i < 0 ? 0 : i)); });
                 const double us = time_us([&](int i) { run_dense_v4(g, in, outs, T, ws, bytes, static_cast<std::size_t>(i < 0 ? 0 : i)); }, o.iters);
                 std::printf("cell %-26s v4 %9.1f us  %.2f TFLOPS\n", cell.c_str(), us, fl / us / 1e6);
+                // Tall bands against the MT8 PIPE CTAs, interleaved (STRIX_MMX_PREFILL_DENSE_BAND).
+                for (int band : {4, 8}) {
+                    double t[2] = {1e30, 1e30};
+                    for (int rep = 0; rep < 4; ++rep) {
+                        const int arm = rep & 1;
+                        opt::set_prefill_dense_band(arm != 0 ? band : 0);
+                        t[arm] = std::min(t[arm], time_us([&](int i) {
+                            run_dense_v4(g, in, outs, T, ws, bytes, static_cast<std::size_t>(i < 0 ? 0 : i)); }, o.iters));
+                    }
+                    std::printf("cell %-26s band%d %9.1f us  %.2f TFLOPS  (pipe %9.1f us, %+.1f %%)\n", cell.c_str(), band, t[1],
+                                fl / t[1] / 1e6, t[0], 100.0 * (t[1] / t[0] - 1.0));
+                }
+                opt::set_prefill_dense_band(0);
                 std::fflush(stdout);
                 hip_ok(hipFree(ws), "free");
                 hip_ok(hipFree(in), "free");

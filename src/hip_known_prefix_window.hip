@@ -1840,20 +1840,28 @@ struct HipKnownPrefixWindow::Impl {
         }
         return true;
     }
-    // STRIX_COHORT_WIDE=gdn,qsa,head,moe,combine,inject (comma list, or "all"): with two or more chunks, the
-    // listed steps run once for the rows of every chunk (9..32 rows) instead of once per chunk. Per-row
-    // arithmetic as in the chunk.
-    static bool cohort_wide_enabled(const char* family) {
-        static const std::string list = [] { const char* v = std::getenv("STRIX_COHORT_WIDE"); return std::string(v ? v : ""); }();
+    // Wide cohort steps (one launch for the rows of every chunk, 9..32 rows, per-row arithmetic as in the chunk)
+    // are the default: cohort_step_rows() is 16 unless STRIX_COHORT_AUTO=0 or STRIX_COHORT_STEP_ROWS says otherwise.
+    // With 8-row steps, STRIX_COHORT_WIDE=gdn,qsa,head,moe,combine,inject,router,hyper,shared (comma list, or
+    // "all") still selects families; the list is resolved once.
+    static bool cohort_wide_enabled(std::string_view family) {
+        static constexpr std::array<std::string_view, 9> families{"gdn", "qsa", "head", "moe", "combine", "inject", "router", "hyper",
+            "shared"};
+        static const std::uint32_t listed = [] {
+            if (cohort_step_rows() == 16U) return ~0U;
+            const char* v = std::getenv("STRIX_COHORT_WIDE");
+            const std::string_view list(v ? v : "");
+            if (list == "all") return ~0U;
+            std::uint32_t mask = 0;
+            for (std::size_t at = 0; at <= list.size();) {
+                const auto end = std::min(list.find(',', at), list.size());
+                for (std::size_t f = 0; f < families.size(); ++f) if (list.substr(at, end - at) == families[f]) mask |= 1U << f;
+                at = end + 1U;
+            }
+            return mask;
+        }();
         if (known_window_cohort_feature_off(family)) return false;
-        if (cohort_step_rows()==16U) return true;
-        if (list == "all") return true;
-        std::size_t at = 0;
-        while (at <= list.size()) {
-            const auto end = std::min(list.find(',', at), list.size());
-            if (list.compare(at, end - at, family) == 0) return true;
-            at = end + 1U;
-        }
+        for (std::size_t f = 0; f < families.size(); ++f) if (family == families[f]) return (listed >> f & 1U) != 0U;
         return false;
     }
     static bool cohort_wide_step(std::size_t i, std::span<CohortMember> members, bool all_chunked) {

@@ -65,6 +65,7 @@
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
+#include "minimax/attn/msa_select_dump.hpp"
 #include "hip_minimax_dspark.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
@@ -196,7 +197,16 @@ std::vector<std::uint32_t> session(mm::Engine& eng, const std::string& name, con
     const auto st0 = eng.comm_stats();
     const mm::Profile pf0 = eng.profile();
     const auto t0 = Clock::now();
+    // STRIX_MM_QUALITY_SELECT=1 with STRIX_MM_QUALITY_OUT=PREFIX: the block ids every sparse prefill batch selected,
+    // as PREFIX-<name>-sel-r<rank>.u32 (msa_select_dump.hpp; synchronizes each batch: quality runs only).
+    const char* const qsel = std::getenv("STRIX_MM_QUALITY_SELECT");
+    const char* const qsel_out = std::getenv("STRIX_MM_QUALITY_OUT");
+    const bool sel_dump = qsel != nullptr && std::strcmp(qsel, "1") == 0 && qsel_out != nullptr && *qsel_out != '\0';
+    if (sel_dump)
+        strix::minimax::msa::fused::set_select_dump(
+            (std::string(qsel_out) + "-" + name + "-sel-r" + std::to_string(eng.rank()) + ".u32").c_str());
     std::vector<std::uint32_t> gen{eng.prefill(0, prompt, 0)};
+    if (sel_dump) strix::minimax::msa::fused::set_select_dump(nullptr);
     const double ttft = secs(t0, Clock::now());
     const mm::Profile pf1 = eng.profile();
     const auto st1 = eng.comm_stats();

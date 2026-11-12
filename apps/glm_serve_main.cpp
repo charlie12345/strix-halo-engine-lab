@@ -625,6 +625,14 @@ struct EngineOps {
             eng.flush(slot);
         }
     }
+    // Fatal owner cleanup only: no new collective against an unknown peer.
+    // ImportStager cancels and joins its receivers before physical engine teardown.
+    // Tentative device state is abandoned with the failing engine, never reused.
+    void owner_abandon() {
+        dec.reset();
+        seed.reset();
+        stager.reset();
+    }
 };
 
 // Metadata only (no tensor payload): config.json bytes, then every *.json / *.safetensors name and size, sorted.

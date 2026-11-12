@@ -67,6 +67,8 @@ bool prefill_iu4();
 // STRIX_MMX_FAKEQ_A4=1 (quality study only, default off): the exact v4 path with the gate/up and down inputs
 // fake-quantised to A4 g64 after their input transforms (iu4_fake128); EXL3 weights unchanged.
 bool prefill_fakeq_a4();
+// Per-call shadow controls; environment preserves each planner's existing behavior.
+enum class PrefillFakeq { environment, off, on };
 
 struct PrefillMoeView {
     std::uint32_t rows = 0;                     // T
@@ -78,7 +80,9 @@ struct PrefillMoeView {
     float* out = nullptr;                       // T x 6144 (device)
     const I4Layer* i4 = nullptr;                // FAST_I4 layer pack (null: EXL3 path)
     bool i4_all = true;                         // false: IU4 gate/up, original EXL3 down
+    unsigned i4_a8 = 0;                         // W4A8 planes: bit 0 gate/up input, bit 1 down input (unfused path only)
     bool i4_chain = false;                      // fused candidate chain (prefill_i4_chain of the prompt)
+    PrefillFakeq fakeq_a4 = PrefillFakeq::environment;
 };
 
 // Dense prefill linears on the v4 core: jobs share one input x [rows][input] (input % 128 == 0, output % 128 == 0)
@@ -116,6 +120,7 @@ struct PrefillMoeDeviceView {
     const I4Layer* i4 = nullptr;
     bool i4_all = true;
     bool i4_chain = false;
+    PrefillFakeq fakeq_a4 = PrefillFakeq::environment;
 };
 bool prefill_moe_device_plan(std::uint32_t rows);
 // The fused FAST_I4 candidate chain for a prompt of total_rows rows (0: capability/opt-in checks). Default on at

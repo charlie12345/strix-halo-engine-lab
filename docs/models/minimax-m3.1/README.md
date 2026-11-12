@@ -12,7 +12,10 @@ instructions (trellis library included): [getting started](../../getting-started
 Draft opt-in FAST_I4 (`STRIX_MMX_MODEL_FORMAT=fast_i4`): INT4 is produced per layer during prefill
 in two reusable buffers; memory +3.6 GiB; context never shrinks; decode unchanged. EXL3 weights stay
 resident for every decode layer and MTP row. `STRIX_MMX_FAST_I4_SCOPE=all|gate_up` selects INT4 for
-all expert projections (default) or gate/up only. Serial conversion is the default;
+all expert projections (default) or gate/up only. By default INT4 runs in MoE layers 38-59 and layers 3-37 stay on
+EXL3 (`STRIX_MMX_FAST_I4_EXL3_LAYERS`, `none` = every layer), and prompts under 4096 rows prefill on EXL3
+(`STRIX_MMX_FAST_I4_MIN_ROWS`): 2K KL 0.0139, top-1 agreement 96.5 %, dNLL +0.006 against the exact format on four
+chat prompts. Serial conversion is the default;
 `STRIX_MMX_FAST_I4_PREFETCH=1` enables event-ordered prefetch pending timing qualification.
 This is a lossy numerical identity awaiting native timing and model quality gates; it does not
 inherit the exact production path's qualification. With scope `all` the fused INT4 MoE chain runs once

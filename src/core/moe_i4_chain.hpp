@@ -70,13 +70,21 @@ struct ReferenceRow {
     unsigned expert,pair,m,col,width;
     const float* gu=nullptr;
     uint8_t* aq=nullptr; float* as=nullptr; _Float16* fp16=nullptr;
+    uint8_t* aq2=nullptr; float* as2=nullptr;   // optional remainder plane (iu4_quant128_planes, W4A8 as two IU4 GEMMs)
 };
 __device__ __forceinline__ void reference_store(const ReferenceRow& r,const float (&v)[4]) {
-    if(r.aq) iu4_quant128(v,r.aq+size_t(r.pair)*(r.width/2),r.as+size_t(r.pair)*(r.width/64),r.col,threadIdx.x&31U);
+    if(r.aq && r.aq2) iu4_quant128_planes(v,r.aq+size_t(r.pair)*(r.width/2),r.as+size_t(r.pair)*(r.width/64),
+        r.aq2+size_t(r.pair)*(r.width/2),r.as2+size_t(r.pair)*(r.width/64),r.col,threadIdx.x&31U);
+    else if(r.aq) iu4_quant128(v,r.aq+size_t(r.pair)*(r.width/2),r.as+size_t(r.pair)*(r.width/64),r.col,threadIdx.x&31U);
     else {
         #pragma unroll
         for(unsigned j=0;j<4;++j) r.fp16[size_t(r.pair)*r.width+r.col+(threadIdx.x&31U)+32*j]=_Float16(v[j]);
     }
+}
+// dst += src over n floats (unfused W4A8 control: the remainder-plane GEMM output joins the first plane's).
+template<class T> __global__ __launch_bounds__(256) void reference_add_kernel(T* dst,const T* src,size_t n) {
+    const size_t i=size_t(blockIdx.x)*256U+threadIdx.x;
+    if(i<n) dst[i]+=src[i];
 }
 template<class Schedule> __global__ __launch_bounds__(256) void reference_input_kernel(Schedule s) {
     ReferenceRow r{};

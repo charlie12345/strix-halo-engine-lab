@@ -9,6 +9,8 @@
 #include "strix/execution_arena.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/runtime_launchers.hpp"
+#include "strix/rows_launch_registry.hpp"
+#include "strix/known_window_cohort.hpp"
 
 #include <algorithm>
 #include <array>
@@ -775,6 +777,32 @@ void KnownWindowRun::launch_step(std::size_t i) {
         }
         observe();
         return;
+    }
+    // A row-loop step with a registered rows form (token embedding, hyper expand, inject: the same per-element
+    // arithmetic, every row admitted as its one-row launch admits it) runs all rows in one launch when the form
+    // takes them (buffers at one pitch); otherwise row by row below. Position readers, PLE, runtime steps, the
+    // terminal head and a wrapped launcher (the MTP capture tap) stay per row. STRIX_WINDOW_ROW_LOOP_ROWS=0: per row.
+    static const bool rows_loops = [] { const char* v = std::getenv("STRIX_WINDOW_ROW_LOOP_ROWS"); return !v || v[0] != '0'; }();
+    if (rows_loops && !known_window_cohort_feature_off("rowloop") && rows > 1U && i + 1U != steps && !window_reads_position(step.reads_state) && step.op != SerialOp::ple &&
+        !current_execution_telemetry()) {
+        const CompiledStepLauncher* first = nullptr;
+        bool same = true;
+        for (std::size_t r = 0; r < rows && same; ++r) {
+            const auto* launcher = window.row_plan[r].bindings.bindings[i].host_or_runtime_step ? nullptr :
+                st.dispatchers[r].kernel_launcher(contexts[i][r]);
+            if (r == 0) first = launcher;
+            same = launcher && launcher->function == first->function && launcher->user_data == first->user_data;
+        }
+        if (const auto batched = same ? rows_launch_for(first->function) : nullptr;
+            batched && batched(std::span<const ExecutionDispatchContext>(contexts[i].data(), rows), first->user_data)) {
+            for (std::size_t r = 0; r < rows; ++r) {
+                ++result.execution.kernel_steps; ++result.row_loop_dispatches; ++result.execution.completed_steps;
+                result.execution.completion_order.push_back(step.id);
+                result.execution.state.publish_write(step.writes_state);
+            }
+            observe();
+            return;
+        }
     }
     for (std::size_t r = 0; r < rows; ++r) {
         const auto& context = contexts[i][r];

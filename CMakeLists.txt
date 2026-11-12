@@ -5315,3 +5315,5 @@ function(strix_link_host_cache_adopters)
     endif()
 endfunction()
 cmake_language(DEFER CALL strix_link_host_cache_adopters)
+# Serving-spec fragments (cmake/servespec/*.cmake): shared serving sources and their host tests.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")

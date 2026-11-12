@@ -1,5 +1,6 @@
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/cohort_step_plan.hpp"
 #include "strix/hip_gdn_decode_fuse.hpp"
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
@@ -6455,12 +6456,19 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
         for (const auto& row : segment.rows) rows[count++] = row;
     }
     // More than 8 rows: dense A8 projections only (the 16-row-tile WMMA forms; the FP32 Q8 wide forms do not
-    // keep the per-row arithmetic of the 1..8-row forms). Totals other than 16 / 32 are padded for the
-    // projections with rows that read row 0's input and write only a sink no row reads.
+    // keep the per-row arithmetic of the 1..8-row forms). Split projections into existing row forms;
+    // only 15 / 31 retain a sink row reading row 0, since splitting would save just one row.
     if (count > gdn_window_max_rows && !config.dense_a8_projections)
         throw std::invalid_argument("GDN cohort window of more than 8 rows requires dense A8 projections");
     const auto native = static_cast<hipStream_t>(stream);
-    const auto padded = count <= gdn_window_max_rows || count == 16U || count == 32U ? count : count < 16U ? 16U : 32U;
+    auto plan = cohort_row_split(count);
+    // STRIX_COHORT_GDN_SPLIT=1 selects the split; the default stays the padded 16 / 32-row launch until a served
+    // cohort of 9..15 / 17..31 rows has passed the bitwise gate (the lockstep CLI cohorts never exceed 8 rows per
+    // call). In-process A/B: STRIX_COHORT_AB_OFF=gdnsplit.
+    static const bool split = [] { const char* v = std::getenv("STRIX_COHORT_GDN_SPLIT"); return v && v[0] == '1'; }();
+    if (count > gdn_window_max_rows && (!split || known_window_cohort_feature_off("gdnsplit")))
+        plan = {{{0U, count <= 16U ? 16U : 32U}}};
+    const auto padded = plan[0].rows > count ? plan[0].rows : count;
     if (padded > count) {
         const auto shape = gdn_window_shape(config.model);
         const auto workspace_bytes = ((static_cast<std::uint64_t>(shape.conv_width) + 2U * shape.value_width + 2U * shape.value_heads) *
@@ -6470,9 +6478,13 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
             rows[r] = {rows[0].input, reinterpret_cast<std::uint16_t*>(sink + workspace_bytes), reinterpret_cast<float*>(sink)};
     }
     const std::span<const GdnWindowRow> all(rows.data(), padded);
-    gdn_cohort_rows_dispatch(padded, [&](auto width) {
-        enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 1U);
-    });
+    for (const auto& launch : plan) {
+        if (launch.rows == 0U) break;
+        gdn_cohort_rows_dispatch(launch.rows, [&](auto width) {
+            enqueue_gdn_window<decltype(width)::value>(a, all.subspan(launch.offset, launch.rows),
+                segments[0].control, config, native, 1U);
+        });
+    }
     // Part 2 of every segment in one prepare and one recurrence launch (STRIX_COHORT_GDN_SEGMENTS=0: one pair per
     // segment). The tiled recurrence (STRIX_GDN_WINDOW_TILED=1) keeps one pair per segment.
     static const bool segmented = [] { const char* v = std::getenv("STRIX_COHORT_GDN_SEGMENTS"); return !v || v[0] != '0'; }();
@@ -6485,9 +6497,13 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
         gdn_window_rows_dispatch(segment.rows.size(), [&](auto width) {
             enqueue_gdn_window<decltype(width)::value>(segment.layer, segment.rows, segment.control, config, native, 2U);
         });
-    gdn_cohort_rows_dispatch(padded, [&](auto width) {
-        enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 4U);
-    });
+    for (const auto& launch : plan) {
+        if (launch.rows == 0U) break;
+        gdn_cohort_rows_dispatch(launch.rows, [&](auto width) {
+            enqueue_gdn_window<decltype(width)::value>(a, all.subspan(launch.offset, launch.rows),
+                segments[0].control, config, native, 4U);
+        });
+    }
 }
 
 void gdn_window_cohort_rows_preflight(std::span<const HipGdnWindowCohortSegment> segments) {

@@ -948,7 +948,7 @@ template<class T> T* device_alloc(std::size_t count, std::size_t& total) {
     return static_cast<T*>(p);
 }
 }  // namespace
-double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream) {
+double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream, int scale_rule) {
 #if STRIX_GLM_PF_IU4_LIB
     const auto t0 = std::chrono::steady_clock::now();
     for (unsigned e = 0; e < E; ++e) {
@@ -976,7 +976,7 @@ double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t s
         for (unsigned e = 0; e < E; ++e) tr[e] = (&host_table[e].gate)[m].trellis;
         ok(hipMemcpyAsync(trellis_tab, tr.data(), E * sizeof(void*), hipMemcpyHostToDevice, stream), "iu4 trellis table");
         iu4_ok(strix::core::convert_exl3_iu4(trellis_tab, 4, static_cast<int>(E), static_cast<int>(K), static_cast<int>(N), q.wq[m],
-                                               reinterpret_cast<_Float16*>(q.ws[m]), std::size_t{K} * N / 2U, std::size_t{N} * (K / 64U), stream),
+                                               reinterpret_cast<_Float16*>(q.ws[m]), std::size_t{K} * N / 2U, std::size_t{N} * (K / 64U), stream, scale_rule),
                "iu4 convert (strix-trellis convert_exl3_iu4)");
         ok(hipStreamSynchronize(stream), "iu4 trellis table");  // tr is reused for the next matrix
     }

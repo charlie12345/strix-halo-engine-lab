@@ -18,6 +18,8 @@
 #include "glm/engine/glm_fast_attn.hpp"
 #include "glm/engine/glm_fast_moe.hpp"
 #include "glm/engine/glm_fast_i4_pack.hpp"
+#include "core/iu4.hpp"
+#include "moe_core/int4_layer_policy.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/engine/glm_lib.hpp"
@@ -640,17 +642,44 @@ struct Engine::Impl {
     const bool boundary_fused = !(std::getenv("STRIX_GLM_BOUNDARY") != nullptr && std::string(std::getenv("STRIX_GLM_BOUNDARY")) == "0");
     // MoE kernels (TP2 rank slices, I = 1024): default for world 2; STRIX_GLM_MOE=ref = DefaultMoe.
     const bool moe_fast = opt.world == 2 && !(std::getenv("STRIX_GLM_MOE") != nullptr && std::string(std::getenv("STRIX_GLM_MOE")) == "ref");
-    // STRIX_GLM_MODEL_FORMAT=exl3 (default) | fast_i4. fast_i4 (lossy FAST identity glm-fast-i4): at load every MoE
-    // layer's routed experts are decoded from EXL3 and converted on the GPU to the IU4 g64 pack (or read from a matching
-    // STRIX_GLM_FAST_I4_PACK), and their EXL3 trellis is freed; prefill runs them W4A4 on the grouped IU4 core, decode /
-    // MTP verify W4A16. Shared experts, attention, dense layers and the head stay EXL3. Exact identities are refused.
+    // STRIX_GLM_MODEL_FORMAT=exl3 (default) | fast_i4. fast_i4 (lossy FAST identity glm-fast-i4): at load the routed
+    // experts of the INT4 layers are decoded from EXL3 and converted on the GPU to the IU4 g64 pack (or read from a
+    // matching STRIX_GLM_FAST_I4_PACK), and their EXL3 trellis is freed; prefill runs them W4A4 on the grouped IU4 core,
+    // decode / MTP verify W4A16. Shared experts, attention, dense layers and the head stay EXL3. Exact identities are refused.
     const bool model_fast_i4 = [] {
         const char* v = std::getenv("STRIX_GLM_MODEL_FORMAT");
         if (v == nullptr || *v == '\0' || std::string(v) == "exl3") return false;
         if (std::string(v) == "fast_i4") return true;
         throw std::invalid_argument("STRIX_GLM_MODEL_FORMAT must be exl3 or fast_i4");
     }();
-    static constexpr unsigned i4_matrices = 3;
+    // Layer / scope policy (src/moe_core/int4_layer_policy.hpp; the engine only names the options and the defaults).
+    // STRIX_GLM_FAST_I4_EXL3_LAYERS = none | comma list of trunk MoE ordinals / ranges a-b (0 = the first MoE layer) that
+    // keep the EXL3 routed experts in prefill and decode. Default 0-14: an early INT4 layer costs a saturating KL step
+    // (about 0.007 alone), late layers about 0.0003 each; INT4 on ordinals >= 15 passes the quality gate, all layers do not.
+    // STRIX_GLM_FAST_I4_SCOPE = gate_up (default: the routed down stays EXL3, the largest error source) | all.
+    // STRIX_GLM_FAST_I4_SCALE = fast_full (default: core/iu4.hpp fast full-range rule) | legacy (max|w| / 7).
+    const strix::moe_core::Int4LayerPolicy i4_policy = [] {
+        strix::moe_core::Int4LayerPolicy policy;
+        const char* layers_env = std::getenv("STRIX_GLM_FAST_I4_EXL3_LAYERS");
+        policy.source_mask = strix::moe_core::parse_int4_source_layers(layers_env == nullptr || *layers_env == '\0' ? "0-14" : layers_env, "STRIX_GLM_FAST_I4_EXL3_LAYERS");
+        const char* scope_env = std::getenv("STRIX_GLM_FAST_I4_SCOPE");
+        policy.matrices = strix::moe_core::parse_int4_scope(scope_env == nullptr || *scope_env == '\0' ? "gate_up" : scope_env, "STRIX_GLM_FAST_I4_SCOPE");
+        return policy;
+    }();
+    const unsigned i4_matrices = i4_policy.matrices;
+    const int i4_scale_rule = [] {
+        const char* v = std::getenv("STRIX_GLM_FAST_I4_SCALE");
+        if (v == nullptr || *v == '\0' || std::string(v) == "fast_full") return strix::core::iu4_scale_rule_fast_full;
+        if (std::string(v) == "legacy") return strix::core::iu4_scale_rule_legacy;
+        throw std::invalid_argument("STRIX_GLM_FAST_I4_SCALE must be fast_full or legacy");
+    }();
+    // INT4 layer: a trunk MoE layer whose ordinal the policy does not keep in EXL3 (the MTP layer stays EXL3).
+    bool i4_layer_at(unsigned layer) const {
+        if (!model_fast_i4 || layer == kMtpLayer || !is_moe_layer(layer)) return false;
+        unsigned ordinal = 0;
+        for (unsigned l = 0; l < layer; ++l) ordinal += l != kMtpLayer && is_moe_layer(l) ? 1U : 0U;
+        return i4_policy.int4(ordinal);
+    }
     fast_i4::Pack i4pack;
     double i4_convert_s = 0;
     std::uint64_t i4_bytes = 0;
@@ -763,7 +792,10 @@ struct Engine::Impl {
                 why = "replaces STRIX_GLM_PF_IU4=1 (the duplicate-copy opt-in): unset it";
             else if (kv_shard || kv_shard_auto) why = "is not qualified with STRIX_GLM_KV_SHARD";
             if (why) throw std::invalid_argument(std::string("STRIX_GLM_MODEL_FORMAT=fast_i4 ") + why);
-            std::printf("glm model format: fast_i4 (routed INT4 g64 stored; W4A4 prefill / W4A16 decode; lossy)\n");
+            std::printf("glm model format: fast_i4 (routed INT4 g64 stored, scope %s, EXL3 MoE ordinals mask 0x%llx, scale %s; "
+                        "W4A4 prefill / W4A16 decode; lossy)\n", i4_matrices == 3U ? "all" : "gate_up",
+                        static_cast<unsigned long long>(i4_policy.source_mask),
+                        i4_scale_rule == strix::core::iu4_scale_rule_legacy ? "legacy" : "fast_full");
         }
         xch = opt.world == 1 || load_test ? local_exchange()
               : opt.external_exchange   ? std::shared_ptr<Exchange>(std::make_shared<MissingExchange>())
@@ -875,11 +907,21 @@ struct Engine::Impl {
             return Mlp{lib.out_slice(p + "gate_proj", r * I, I), lib.out_slice(p + "up_proj", r * I, I), lib.in_slice(p + "down_proj", r * I, I)};
         };
         w.moew.experts.reserve(kExperts);
-        const bool i4_layer = model_fast_i4;
+        const bool i4_layer = i4_layer_at(w.index);
         const bool i4_hit = i4_layer && !lib.planning() && i4pack.has(w.index);
         if (i4_layer)
-            lib.i4_routed_begin(std::uint64_t{kExperts} * 3U * (kHidden / 16U) * (I / 16U) * 4U * 32U, i4_hit);
-        for (unsigned e = 0; e < kExperts; ++e) w.moew.experts.push_back(mlp(m + "experts." + std::to_string(e) + "."));
+            lib.i4_routed_begin(std::uint64_t{kExperts} * i4_matrices * (kHidden / 16U) * (I / 16U) * 4U * 32U, i4_hit);
+        auto routed = [&](const std::string& p) {  // scope gate_up: the routed down stays a resident EXL3 raw slice
+            if (!i4_layer || i4_matrices == 3U) return mlp(p);
+            Mlp x;
+            x.gate = lib.out_slice_raw(p + "gate_proj", r * I, I);
+            x.up = lib.out_slice_raw(p + "up_proj", r * I, I);
+            lib.i4_suspend(true);
+            x.down = lib.in_slice_raw(p + "down_proj", r * I, I);
+            lib.i4_suspend(false);
+            return x;
+        };
+        for (unsigned e = 0; e < kExperts; ++e) w.moew.experts.push_back(routed(m + "experts." + std::to_string(e) + "."));
         if (i4_layer) lib.i4_routed_end();
         w.moew.shared = mlp(m + "shared_experts.");
         if (i4_layer) install_i4(w, i4_hit);
@@ -924,15 +966,17 @@ struct Engine::Impl {
             }
         } else {
             double s = 0;
-            auto conv = [&] { s = X::convert_into(host.data(), v, stream); };
+            auto conv = [&] { s = X::convert_into(host.data(), v, stream, i4_scale_rule); };
             if (i4_converted == 0) i4_receipt(w, host, conv);  // first converted layer: the MoE block, EXL3 vs fast_i4
             else conv();
             i4_convert_s += s;
             ++i4_converted;
             if (!i4pack.dir.empty()) i4_pack_write(q, w.index, w.moew.experts);
         }
-        for (Mlp& x : w.moew.experts)
-            x.gate.raw.trellis = x.up.raw.trellis = x.down.raw.trellis = nullptr;
+        for (Mlp& x : w.moew.experts) {
+            x.gate.raw.trellis = x.up.raw.trellis = nullptr;
+            if (nm == 3U) x.down.raw.trellis = nullptr;
+        }
         ++i4_layers;
         i4_bytes += q.bytes;
         if (i4_layers % 8 == 1)
@@ -1264,8 +1308,8 @@ struct Engine::Impl {
             const std::array<std::uint32_t, 5> policy{kv_shard_auto ? 2U : kv_shard ? 1U : 0U,
                 static_cast<std::uint32_t>(pf_policy.scratch), static_cast<std::uint32_t>(pf_policy.query_window + 1),
                 pf_seqpar ? 4U | (opt.pf_pipeline << 3U) | (pf_streams == 1 ? 1U << 5U : 0U) : 0U,
-                model_fast_i4 ? 0x46493400U + 3U + 0x10U + (1U << 8U) + 0x40U
-                              : 0x45584c33U /* model format + scope + down + decode */};
+                model_fast_i4 ? 0x46493400U ^ i4_policy.tag(static_cast<unsigned>(i4_scale_rule))
+                              : 0x45584c33U /* model format + layer mask + scope + scale rule */};
             std::array<std::uint32_t, 5> peer_policy{};
             comm->exchange_host({reinterpret_cast<const std::byte*>(policy.data()), sizeof(policy)},
                                 {reinterpret_cast<std::byte*>(peer_policy.data()), sizeof(peer_policy)},
@@ -1342,15 +1386,19 @@ struct Engine::Impl {
             // Context, slots, KV, state and prefill workspace keep their planned sizes.
             std::size_t dev_free = 0, dev_total = 0;
             hip_ok(hipMemGetInfo(&dev_free, &dev_total), "fast_i4 budget");
-            unsigned n = 0;
-            for (unsigned l = 0; l < opt.layers; ++l) n += is_moe_layer(l) ? 1U : 0U;
+            unsigned n = 0, total = 0;
+            for (unsigned l = 0; l < opt.layers; ++l) {
+                n += i4_layer_at(l) ? 1U : 0U;
+                total += l != kMtpLayer && is_moe_layer(l) ? 1U : 0U;
+            }
             auto a = prefill_admission(false);
             std::printf("glm fast_i4 budget: rank %u context %llu x %u slots, max_rows %u (KV/state/workspace planned first); "
-                        "all %u routed layers INT4, routed EXL3 released; device plan %.2f GiB of %.2f GiB free; decode W4A16\n",
-                        opt.rank, static_cast<unsigned long long>(opt.capacity), opt.slots, opt.max_rows, n,
+                        "%u of %u routed layers INT4 (%s), their routed EXL3 released; device plan %.2f GiB of %.2f GiB free; decode W4A16\n",
+                        opt.rank, static_cast<unsigned long long>(opt.capacity), opt.slots, opt.max_rows, n, total,
+                        i4_matrices == 3U ? "gate, up, down" : "gate, up",
                         static_cast<double>(plan.physical(amodel)) / double(1ULL << 30), static_cast<double>(dev_free) / double(1ULL << 30));
             if (!mem::fits(a.terms, a.snapshot, a.margins, a.device_free))
-                throw std::runtime_error("fast_i4: all routed INT4 layers do not fit after configured KV/state/workspace");
+                throw std::runtime_error("fast_i4: the routed INT4 layers do not fit after configured KV/state/workspace");
             if (admit_prefill) admit_prefill(a);
         }
         if (admit_prefill || kv_shard_auto) {
@@ -1445,14 +1493,15 @@ struct Engine::Impl {
         // 4. The load, checked after every step against the plan (measured gtt_used growth) and the node's headroom.
         monitor->phase("load");
         if (model_fast_i4) {
-            i4pack = fast_i4::Pack::open(opt.model_dir, opt.rank, opt.world, expert_i, 3U, "none");
+            i4pack = fast_i4::Pack::open(opt.model_dir, opt.rank, opt.world, expert_i, i4_matrices, "none",
+                                         i4_scale_rule == strix::core::iu4_scale_rule_legacy ? "" : "fast_full");
         }
         const auto t_i4 = Clock::now();
         std::size_t idx = 0;
         load_steps(want_head, [&](const std::string& n) { check_step(n, idx++, t0); });
         if (model_fast_i4) {
             const auto freed = lib.i4_temp_release();
-            std::printf("glm fast_i4 startup: rank %u all %u routed layers stored INT4, %.3f GiB; "
+            std::printf("glm fast_i4 startup: rank %u %u routed layers stored INT4, %.3f GiB; "
                         "routed EXL3 released (scratch %.3f GiB); load+pack %.2f s; decode W4A16\n",
                         opt.rank, i4_layers, static_cast<double>(i4_bytes) / double(1ULL << 30),
                         static_cast<double>(freed) / double(1ULL << 30), std::chrono::duration<double>(Clock::now() - t_i4).count());
@@ -2319,8 +2368,10 @@ struct Engine::Impl {
 
     bool reference_prefill_installed() const { return dynamic_cast<const ReferencePrefill*>(pf.get()) != nullptr; }
     // Chunked prefill through the PrefillPath (prefill): chunks of max_rows rows; head on the last row only.
+    unsigned score_calls_ = 0;  // prefill calls of this process (score dump file index)
     std::uint32_t prefill_chunked(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
         if (tokens.empty()) throw std::invalid_argument("prefill: no tokens");
+        ++score_calls_;
         if (opt.layers != kLayers && !smoke_head) throw std::logic_error("prefill needs all 45 layers (G3 uses gate_residual)");
         if (slot >= opt.slots) throw std::out_of_range("prefill slot");
         if (opt.spec && pending.at(slot) > 0) flush(slot);
@@ -2345,24 +2396,62 @@ struct Engine::Impl {
         hip_ok(hipStreamSynchronize(stream), "prefill sync");
         // Quality harness (any identity): STRIX_GLM_PF_SCORE_LAST=N STRIX_GLM_PF_SCORE_OUT=PREFIX writes the head logits of the
         // last N rows of the final chunk (real-text teacher forcing through the prefill path) to PREFIX-r<rank>.f32 [N][slice].
+        // Row i is prompt position T-N+i (T = prompt length): it predicts token T-N+i+1 (the last row: the first new token).
+        // Sequence-parallel prefill leaves each rank only its own rows of X (plus the materialized last row), so the final
+        // hidden rows are normalized by their owner and all-gathered first (as prefill_mtp does); else every rank's vocab
+        // slice would score the peer's rows from stale residuals.
         if (const char* sn = std::getenv("STRIX_GLM_PF_SCORE_LAST"); sn != nullptr && *sn != '\0') {
             const char* so = std::getenv("STRIX_GLM_PF_SCORE_OUT");
             if (so == nullptr || *so == '\0') throw std::invalid_argument("STRIX_GLM_PF_SCORE_LAST needs STRIX_GLM_PF_SCORE_OUT");
             const std::size_t n = std::min<std::size_t>(std::stoul(sn), rows.size());
+            const auto R = static_cast<unsigned>(rows.size());
+            const float* gathered = nullptr;
+            if (pf_seqpar && xfer::seqpar_admits(R)) {
+                if (!seqpar_xch) throw std::logic_error("glm seqpar: score dump needs the seqpar channel");
+                float* const g = seqpar_xch->normalized();
+                const unsigned tiles = xfer::seqpar_tiles(R, opt.pf_pipeline);
+                for (unsigned i = 0; i < tiles; ++i) {
+                    const auto tile = xfer::seqpar_tile(R, opt.pf_pipeline, i);
+                    const auto own = xfer::seqpar_owner(tile, opt.rank);
+                    D::hc_final(X + own.elements(kHc * kHidden), hfin + own.elements(), own.count, stream);
+                    D::GlmNorm::run(hfin + own.elements(), final_norm, D::WType::BF16, kHidden, kEps, g + own.elements(), own.count, stream);
+                    seqpar_xch->start_gather(g, tile, i, stream);
+                }
+                for (unsigned i = 0; i < tiles; ++i) seqpar_xch->finish(i, stream);
+                seqpar_xch->complete();
+                gathered = g;
+            }
             std::vector<float> all(n * vocab_n);
-            for (std::size_t i = 0; i < n; ++i) {
-                const std::size_t row = rows.size() - n + i;
-                D::hc_final(X + row * kHc * kHidden, hfin, 1, stream);
-                D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, 1, stream);
-                lib.run(head, hidden, logits, 1, stream);
-                hip_ok(hipMemcpyAsync(all.data() + i * vocab_n, logits, vocab_n * sizeof(float), hipMemcpyDeviceToHost, stream), "score logits");
+            // STRIX_GLM_PF_SCORE_BLOCK=1..8 rows per head call (default 1; the head GEMV reads the whole head per call).
+            const char* sbv = std::getenv("STRIX_GLM_PF_SCORE_BLOCK");
+            const std::size_t sb = sbv != nullptr && *sbv != '\0' ? std::stoul(sbv) : 1U;
+            if (sb < 1U || sb > 8U) throw std::invalid_argument("STRIX_GLM_PF_SCORE_BLOCK must be 1..8");
+            for (std::size_t i = 0; i < n; i += sb) {
+                const std::size_t row = rows.size() - n + i, b = std::min(sb, n - i);
+                const auto bu = static_cast<unsigned>(b);
+                if (gathered != nullptr) {  // the head reads the engine's hidden buffer (as prefill_mtp hands the rows over)
+                    hip_ok(hipMemcpyAsync(hidden, gathered + row * kHidden, b * kHidden * sizeof(float), hipMemcpyDeviceToDevice, stream),
+                           "score hidden row");
+                    lib.run(head, hidden, logits, bu, stream);
+                } else {
+                    D::hc_final(X + row * kHc * kHidden, hfin, bu, stream);
+                    D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, bu, stream);
+                    lib.run(head, hidden, logits, bu, stream);
+                }
+                hip_ok(hipMemcpyAsync(all.data() + i * vocab_n, logits, b * vocab_n * sizeof(float), hipMemcpyDeviceToHost, stream),
+                       "score logits");
             }
             hip_ok(hipStreamSynchronize(stream), "score sync");
-            const std::string f = std::string(so) + "-r" + std::to_string(opt.rank) + ".f32";
-            std::ofstream sf(f, std::ios::binary | std::ios::trunc);
-            sf.write(reinterpret_cast<const char*>(all.data()), static_cast<std::streamsize>(all.size() * sizeof(float)));
-            std::printf("rank %u prefill score: last %zu rows of %zu, vocab slice %zu -> %s\n", opt.rank, n, rows.size(),
-                        static_cast<std::size_t>(vocab_n), f.c_str());
+            // STRIX_GLM_PF_SCORE_SEQ=1: each prefill call keeps its own file, PREFIX-c<call>-r<rank>.f32 (call = prefill
+            // calls of this process, 0-based), so one process scores a list of prompts.
+            const char* sq = std::getenv("STRIX_GLM_PF_SCORE_SEQ");
+            const bool seq = sq != nullptr && std::string(sq) == "1";
+            const std::string f = std::string(so) + (seq ? "-c" + std::to_string(score_calls_ - 1U) : std::string()) + "-r" +
+                                  std::to_string(opt.rank) + ".f32";
+            std::ofstream score_file(f, std::ios::binary | std::ios::trunc);
+            score_file.write(reinterpret_cast<const char*>(all.data()), static_cast<std::streamsize>(all.size() * sizeof(float)));
+            std::printf("rank %u prefill score: last %zu rows of %zu (%s), vocab slice %zu -> %s\n", opt.rank, n, rows.size(),
+                        gathered != nullptr ? "seqpar rows gathered" : "local rows", static_cast<std::size_t>(vocab_n), f.c_str());
         }
         ++prof.calls;
         return out;

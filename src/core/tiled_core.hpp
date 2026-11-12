@@ -273,7 +273,10 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     static_assert(!IU4 || (IU4Group == 64 || IU4Group == 128 || IU4Group == 256));
     constexpr int sa_per_thread = IU4 ? (SLOTS * BM + G::threads - 1) / G::threads : 1;
     constexpr int sw_per_thread = IU4 ? (SLOTS * BN + G::threads - 1) / G::threads : 1;
-    float sa_reg[sa_per_thread] = {}, sw_reg[sw_per_thread] = {};
+    // sw_reg keeps the F16 weight scale as loaded: converting in fetch() would consume the load before the
+    // stage's WMMA and stall every wave on memory once per stage; store() converts (same FP32 value).
+    float sa_reg[sa_per_thread] = {};
+    _Float16 sw_reg[sw_per_thread] = {};
     // Grouped: gathered A rows, resolved once (clamped to the tile's last row).
     [[maybe_unused]] uint32_t a_src[IU4Grouped ? G::a_per_thread : 1], sa_src[IU4Grouped ? sa_per_thread : 1];
     if constexpr (IU4Grouped) {
@@ -352,7 +355,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                 if ((SLOTS * BN) % G::threads == 0 || e < SLOTS * BN) {
                     int g = (k0 + (e % SLOTS) * SEG) / GK;
                     g = g < groups ? g : groups - 1;
-                    sw_reg[i] = float(w_scale[uint32_t(first_col + e / SLOTS) * uint32_t(groups) + uint32_t(g)]);
+                    sw_reg[i] = w_scale[uint32_t(first_col + e / SLOTS) * uint32_t(groups) + uint32_t(g)];
                 }
             }
         } else {
@@ -441,7 +444,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
                 #pragma unroll
                 for (int i = 0; i < sw_per_thread; ++i) {
                     const int e = thread + i * G::threads;
-                    if ((SLOTS * BN) % G::threads == 0 || e < SLOTS * BN) sl[SLOTS * BM + (e % SLOTS) * BN + e / SLOTS] = sw_reg[i];
+                    if ((SLOTS * BN) % G::threads == 0 || e < SLOTS * BN) sl[SLOTS * BM + (e % SLOTS) * BN + e / SLOTS] = float(sw_reg[i]);
                 }
             }
         } else {

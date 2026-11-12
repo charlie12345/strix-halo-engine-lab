@@ -2867,6 +2867,39 @@ Two neighbouring CTAs of the 128-row MT8 PIPE launch split the 128 output column
 - **Measured gain:** MoE call, real weights and routes of one layer, 10 A B B A blocks, five runs: 4096 rows -0.9 to -1.5 % (e.g. 50.19 -> 49.43 ms; one noisy run -0.1 %), 2048 rows -0.6 to -1.0 %; 1024 rows mixed (-1.1 to +0.7 %), so it stays unpaired. Two Strix Halo nodes over 2x USB4, in-process A B A B A B A: 8K TTFT mean 14.14 -> 14.04 s (-0.7 %); 32K fresh process per arm (A B A, B A B): TTFT 63.70 -> 63.48 s (-0.3 %, within noise), MoE GPU time 22.86 -> 22.90 s (neutral).
 - **Implementation / evidence:** [kernel](../src/minimax/moe/mmx_prefill_core.hpp), [dispatch](../src/minimax/moe/mmx_prefill.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
 
+<a id="mm-pf-dense-band"></a>
+
+### Prefill dense tall PIPE bands (opt-in)
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_DENSE_BAND`. **Default:** 0 (off).
+
+Dense prefill linears (attention q/k/v and o_proj) under PIPE can run tall bands instead of MT8 PIPE CTAs: one CTA
+of 4 or 8 waves owns 32 output columns over 4 or 8 full 128-row tiles, decodes each weight tile once per band
+(each wave decodes 16 / W states of the two tiles) and shares the decoded B fragments through a double-buffered
+LDS stage, one barrier per k tile. Rows beyond the last full band keep the PIPE tiles and the tail.
+
+- **Preconditions:** v4 prefill core with PIPE (the default); dense calls only. Values 0, 4 or 8.
+- **Exactness evidence:** Same operands, WMMA chain and split partials per output as the PIPE kernel. Bench `test_prefill_dense`: band 0 / 4 / 8 byte-identical, T 1024, 1700 and 4096. TP2 8K and 32K state, token and result anchors equal, ranks agree.
+- **Off switch:** `STRIX_MMX_PREFILL_DENSE_BAND=0` (default)
+- **Measured gain:** None that clears noise, so it stays opt-in. Kernel bench at T4096 (band vs PIPE, interleaved): band 4 q -0.9 %, o -3.9 %, q+k+v -1.3 %, k+v +5.7 %; band 8 is slower (+2.3 to +13.6 %). TP2 32K TTFT, band 4 vs PIPE: -1.05 % (band first) and -0.57 % (PIPE first), mean -0.8 %, below the ±3 % single-run spread; band 8 +0.6 % (one pair). Default flip needs more pairs.
+- **Implementation / evidence:** [kernel](../src/moe_core/grouped_core.hpp), [dispatch](../src/minimax/moe/mmx_prefill.hip), [bench tests](../tests/hip_mmx_moe_bench.hip)
+
+<a id="core-iu4-wscale-defer"></a>
+
+### IU4 tiled core: weight scale converted at the LDS store
+
+**Engine:** `minimax` (shared `src/core/tiled_core.hpp`; GLM INT4 uses the same core). **Control:** none. **Default:** on.
+
+The grouped and dense IU4 tiled core converted the F16 weight scale to FP32 inside `fetch()`, right after it issued
+the next stage's loads, so every wave waited for those loads (`s_waitcnt vmcnt`) before the stage's WMMA. The
+scale now stays F16 in registers until `store()` writes it to LDS after the WMMA.
+
+- **Preconditions:** IU4 tiled core plans (FAST_I4 MoE, the INT4 chain, GLM INT4).
+- **Exactness evidence:** F16 to FP32 conversion is exact; same FP32 value at the same LDS slot. gfx1151 ISA: the wait is gone, VGPR -1, no spills, occupancy unchanged. Grouped microbench output bitwise across plans.
+- **Off switch:** None (code motion only).
+- **Measured gain:** Grouped IU4 microbench (MiniMax shapes, A B B A): plan 2 gate K6144 N1536 -6.8 % (T4096) / -5.9 % (T8192), down K1536 N6144 -4.9 % / -4.2 %; dense plan 2 -2 to -5 %. TP2 32K TTFT (unfused MoE path, both orders) -0.8 % and -1.5 % against an older binary without the change (that binary also lacks other later commits, so this is an upper bound).
+- **Implementation / evidence:** [core](../src/core/tiled_core.hpp)
+
 <a id="mm-pf-gather-tok"></a>
 
 ### Prefill MoE token-major gather

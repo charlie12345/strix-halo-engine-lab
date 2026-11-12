@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/tokenizer.hpp"
 #include "strix/serve/chat_template.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
@@ -15,6 +15,36 @@
 #include <vector>
 
 namespace strix::serve {
+
+// Extension routes use the shared error schema and HTTP status handling.
+struct ApiRouteError : std::runtime_error {
+    ApiRouteError(int status_value, const std::string& message) : std::runtime_error(message), status(status_value) {}
+    int status;
+};
+
+struct ApiChatPrompt {
+    std::vector<std::uint32_t> tokens;
+    bool thinking = false;
+    Json tools;
+    std::uint32_t stable_prefix = 0;
+    std::shared_ptr<GenerationContext> context = {};
+};
+
+// Terminal domain data is frozen after the accepted ticket finishes. Hooks never
+// receive a response writer and cannot own protocol delivery or queue work.
+struct ApiTerminalData {
+    Json timings;
+    std::optional<double> max_gap_ms;
+};
+struct ApiRequestObservation {
+    std::string request_id, completion_id, route;
+    std::int64_t time = 0;
+    bool stream = false, delivered = true, observed = false, refused = false;
+    std::uint64_t prompt_tokens = 0;
+    GenerationStats stats;
+    std::string error;
+    ApiTerminalData terminal;
+};
 
 struct ApiConfig {
     DeploymentCallbacks deployment;
@@ -67,6 +97,38 @@ struct ApiConfig {
     bool sessions_enabled = false;
     std::function<std::string()> state_cache_stats;
     std::function<bool(const HttpRequest&, HttpResponseWriter&)> engine_routes;
+    // Hooks are host-only, before queue admission. prepare_chat renders once and
+    // returns owning typed context; prepare_job retains it across continuation.
+    std::function<ApiChatPrompt(const Json&)> prepare_chat = {};
+    std::vector<std::string> chat_extension_fields = {}; // copied through shared protocol normalization
+    std::function<void(const HttpRequest&, const Json&)> validate_request = {};
+    std::function<void(const HttpRequest&, const Json&, GenerationJob&)> prepare_job = {};
+    std::optional<std::uint64_t> default_seed = {};
+    double maximum_temperature = 2.0;
+    bool float_sampling_parameters = false;
+    bool strict_context_limit = false;
+    bool strict_request_json = false;
+    // Existing compact chat envelope conventions, selected only by an adopter.
+    bool compact_chat_envelope = false;
+    std::string chat_id_prefix = "chatcmpl-";
+    // Historical OpenAI convention: timings after usage, optional IDs only,
+    // no role-only SSE event, content-only live chat, cancelled => stop.
+    bool timed_completion_envelope = false;
+    bool exact_max_tokens = false; // exact integer spelling; clamp to full context
+    bool minimal_metadata = false;
+    std::optional<std::uint64_t> status_slots = {}; // capacity metadata without queue response headers
+    bool explicit_thinking_only = false; // normalization preserves an absent family control
+    bool tokenize_text_field = false; // text alias, token array without count
+    bool session_error_envelope = false;
+    std::function<ApiTerminalData(const GenerationTicket&)> terminal_data = {};
+    // Replaces the built-in recent-request owner; called once after delivery and
+    // terminal cleanup, or on queue refusal. Validation creates no observation.
+    std::function<void(const ApiRequestObservation&)> request_finished = {};
+    std::function<Json(const QueueSnapshot&, bool stopping, bool detail)> status_data = {};
+    std::function<std::string(const QueueSnapshot&)> metrics_data = {};
+    // Authenticated extension returning domain JSON through shared framing.
+    std::function<std::optional<Json>(const HttpRequest&)> route_data = {};
+
 };
 
 // OpenAI-compatible (/v1/chat/completions, /v1/completions, /v1/responses, /v1/models) and Anthropic-compatible
@@ -75,6 +137,8 @@ struct ApiConfig {
 class ApiService {
 public:
     ApiService(ApiConfig config, std::shared_ptr<const BpeTokenizer> tokenizer, GenerationQueue& queue,
+        std::uint64_t context_tokens, bool engine_samples);
+    ApiService(ApiConfig config, ApiTokenizerBinding tokenizer, GenerationQueue& queue,
         std::uint64_t context_tokens, bool engine_samples);
     ~ApiService();
     void handle(const HttpRequest& request, HttpResponseWriter& response);

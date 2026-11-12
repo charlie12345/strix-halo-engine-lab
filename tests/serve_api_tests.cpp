@@ -14,17 +14,51 @@
 #include "../apps/qwen_effective_config.hpp"
 #include "strix/serve/http_server.hpp"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define MSG_NOSIGNAL 0
+#else
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <atomic>
 #include <iostream>
-#include <netinet/in.h>
 #include <mutex>
 #include <set>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
 
 namespace {
+#ifdef _WIN32
+using TestSocket = SOCKET;
+constexpr TestSocket invalid_socket = INVALID_SOCKET;
+void close_socket(TestSocket fd) { (void)::closesocket(fd); }
+int socket_option(TestSocket fd,int level,int option,const void* value,int size) {
+    return ::setsockopt(fd,level,option,static_cast<const char*>(value),size);
+}
+struct SocketRuntime {
+    SocketRuntime() { WSADATA data{}; if (WSAStartup(MAKEWORD(2,2),&data)) throw std::runtime_error("Winsock initialization failed"); }
+    ~SocketRuntime() { WSACleanup(); }
+};
+#else
+using TestSocket = int;
+constexpr TestSocket invalid_socket = -1;
+void close_socket(TestSocket fd) { (void)::close(fd); }
+int socket_option(TestSocket fd,int level,int option,const void* value,socklen_t size) {
+    return ::setsockopt(fd,level,option,value,size);
+}
+struct SocketRuntime {};
+#endif
+void set_receive_timeout(TestSocket fd,unsigned seconds) {
+#ifdef _WIN32
+    const DWORD timeout=seconds*1000;
+#else
+    timeval timeout{};timeout.tv_sec=seconds;
+#endif
+    (void)socket_option(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+}
 using namespace strix::serve;
 int failures = 0;
 void check(bool ok, const std::string& what) {
@@ -230,12 +264,12 @@ struct Reply { int status = 0; std::string headers, body; };
 // Plain HTTP/1.1 client; decodes chunked bodies. `abort_after` closes the socket after that many body bytes.
 Reply http(std::uint16_t port, const std::string& method, const std::string& path, const std::string& body,
     const std::string& extra = {}, std::size_t abort_after = 0, std::atomic<bool>* headers_seen = nullptr) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
     ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) { ::close(fd); return {}; }
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) { close_socket(fd); return {}; }
     const auto request = method + " " + path + " HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\n" + extra +
         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
     (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
@@ -248,7 +282,7 @@ Reply http(std::uint16_t port, const std::string& method, const std::string& pat
         if (headers_seen && raw.find("\r\n\r\n") != std::string::npos) headers_seen->store(true);
         if (abort_after && raw.size() > abort_after) break;
     }
-    ::close(fd);
+    close_socket(fd);
     Reply out;
     const auto end = raw.find("\r\n\r\n");
     if (end == std::string::npos) return out;
@@ -823,6 +857,7 @@ void test_scoring_transforms(const std::shared_ptr<const BpeTokenizer>& tokenize
 }
 
 int main() try {
+    [[maybe_unused]] SocketRuntime sockets;
     {
         // Large objects: repeated keys keep their first position and the last value (serving parser) or fail (unique
         // parser), with or without the key index; a large object parses in linear time.
@@ -895,15 +930,13 @@ int main() try {
         {
             // Pipelined keep-alive requests: a stream interrupted by an exception must end the connection, so the
             // second response can never appear inside the unfinished chunked body.
-            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in address{};
             address.sin_family = AF_INET;
             address.sin_port = htons(boom.port());
             ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
             check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "pipelined client connects");
-            timeval receive_limit{};
-            receive_limit.tv_sec = 20;  // a regression keeps the connection open: fail fast instead of the 300 s idle wait
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            set_receive_timeout(fd,20);  // preserve the bounded receive deadline
             const std::string requests = "GET /stream-boom HTTP/1.1\r\nHost: x\r\n\r\nGET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
             (void)::send(fd, requests.data(), requests.size(), MSG_NOSIGNAL);
             std::string raw;
@@ -913,7 +946,7 @@ int main() try {
                 if (n <= 0) break;
                 raw.append(buffer, static_cast<std::size_t>(n));
             }
-            ::close(fd);
+            close_socket(fd);
             std::size_t responses = 0;
             for (auto at = raw.find("HTTP/1.1 "); at != std::string::npos; at = raw.find("HTTP/1.1 ", at + 1U)) ++responses;
             check(responses == 1 && raw.find("data: x") != std::string::npos, "interrupted stream closes the connection");
@@ -944,18 +977,16 @@ int main() try {
         timed.listen();
         std::thread timed_thread([&] { timed.serve(); });
         const auto connect_local = [&] {
-            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in address{};
             address.sin_family = AF_INET;
             address.sin_port = htons(timed.port());
             ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
-            timeval receive_limit{};
-            receive_limit.tv_sec = 20;
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            set_receive_timeout(fd,20);  // preserve the bounded receive deadline
             check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "deadline client connects");
             return fd;
         };
-        const auto read_all = [](int fd) {
+        const auto read_all = [](TestSocket fd) {
             std::string raw;
             char buffer[4096];
             for (;;) {
@@ -966,17 +997,17 @@ int main() try {
             return raw;
         };
         {
-            const int fd = connect_local();
+            const TestSocket fd = connect_local();
             const std::string partial = "GET /ok HTTP/1.1\r\nHo";
             (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
-            ::close(fd);
+            close_socket(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "stalled request header answers 408");
         }
         {
             // A kept-alive connection: a first request, idle longer than the request deadline, then a second request
             // that is answered; a third that stalls is refused with 408 even though the connection already responded.
-            const int fd = connect_local();
+            const TestSocket fd = connect_local();
             const auto read_response = [&] {
                 std::string raw;
                 char buffer[4096];
@@ -997,24 +1028,24 @@ int main() try {
             (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "a stalled request on a kept-alive connection answers 408");
-            ::close(fd);
+            close_socket(fd);
         }
         {
             // A body that stops arriving is refused once the request deadline passes.
-            const int fd = connect_local();
+            const TestSocket fd = connect_local();
             const std::string partial = "POST /ok HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
             (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
-            ::close(fd);
+            close_socket(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "stalled request body answers 408");
         }
         {
             // Framing that cannot be read unambiguously is refused and the connection closed (one response only).
             const auto answer = [&](const std::string& raw_request) {
-                const int fd = connect_local();
+                const TestSocket fd = connect_local();
                 (void)::send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
                 const auto raw = read_all(fd);
-                ::close(fd);
+                close_socket(fd);
                 std::size_t responses = 0;
                 for (auto at = raw.find("HTTP/1.1 "); at != std::string::npos; at = raw.find("HTTP/1.1 ", at + 1U)) ++responses;
                 return responses == 1U ? raw.substr(9, 3) : "x" + std::to_string(responses);
@@ -1034,11 +1065,11 @@ int main() try {
             check(answer("G(T /ok HTTP/1.1\r\n\r\n") == "400", "non-token method answers 400");
             {
                 // The refusal survives unread request bytes (no reset before the client reads it) and is complete JSON.
-                const int fd = connect_local();
+                const TestSocket fd = connect_local();
                 const std::string raw_request = "POST /ok HTTP/1.1\r\nContent-Length: x\r\n\r\n" + std::string(200000, 'z');
                 (void)::send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
                 const auto raw = read_all(fd);
-                ::close(fd);
+                close_socket(fd);
                 const auto body_at = raw.find("\r\n\r\n");
                 bool json = false;
                 try { json = body_at != std::string::npos && parse_json(raw.substr(body_at + 4U)).find("error") != nullptr; } catch (...) {}
@@ -1052,27 +1083,25 @@ int main() try {
             HttpServer small(small_config, [](const HttpRequest&, HttpResponseWriter& w) { w.send(200, "text/plain", "ok"); });
             small.listen();
             std::thread small_thread([&] { small.serve(); });
-            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in address{};
             address.sin_family = AF_INET;
             address.sin_port = htons(small.port());
             ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
-            timeval receive_limit{};
-            receive_limit.tv_sec = 20;
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            set_receive_timeout(fd,20);  // preserve the bounded receive deadline
             check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "header-limit client connects");
             const std::string big = "GET /ok HTTP/1.1\r\nX-Pad: " + std::string(4000, 'a') + "\r\n\r\n";
             (void)::send(fd, big.data(), big.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
-            ::close(fd);
+            close_socket(fd);
             check(raw.rfind("HTTP/1.1 431", 0) == 0, "header over the limit answers 431 whatever the read sizes");
             // A header of exactly the limit gets the same answer whole and split inside its terminator.
             const auto at_limit = [&](std::size_t extra, bool split) {
                 const std::string prefix = "GET /ok HTTP/1.1\r\nConnection: close\r\nX-Pad: ";
                 const std::string head = prefix + std::string(1024U + extra - prefix.size(), 'a');
                 const std::string request = head + "\r\n\r\n";
-                const int c = ::socket(AF_INET, SOCK_STREAM, 0);
-                ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+                const TestSocket c = ::socket(AF_INET, SOCK_STREAM, 0);
+                set_receive_timeout(c,20);
                 (void)::connect(c, reinterpret_cast<sockaddr*>(&address), sizeof(address));
                 const auto cut = split ? request.size() - 2U : request.size();
                 (void)::send(c, request.data(), cut, MSG_NOSIGNAL);
@@ -1081,7 +1110,7 @@ int main() try {
                     (void)::send(c, request.data() + cut, request.size() - cut, MSG_NOSIGNAL);
                 }
                 const auto reply = read_all(c);
-                ::close(c);
+                close_socket(c);
                 return reply.substr(0, 12);
             };
             check(at_limit(0, false) == "HTTP/1.1 200" && at_limit(0, true) == "HTTP/1.1 200", "a header at the limit is accepted whole or split");
@@ -1090,16 +1119,16 @@ int main() try {
             small_thread.join();
         }
         {
-            const int fd = connect_local();
+            const TestSocket fd = connect_local();
             const int small = 4096;
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+            socket_option(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
             const std::string request = "GET /flood HTTP/1.1\r\nHost: x\r\n\r\n";
             (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
             const auto begin = std::chrono::steady_clock::now();
             while (flood_result.load() == 0 && std::chrono::steady_clock::now() - begin < std::chrono::seconds(30))
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));  // never read: the server's send stalls
             check(flood_result.load() == 1, "a client that stops reading is marked gone within the write timeout");
-            ::close(fd);
+            close_socket(fd);
         }
         timed.stop();
         timed_thread.join();

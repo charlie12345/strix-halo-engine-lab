@@ -23,6 +23,7 @@ if(STRIX_CUDA_QWEN_ONLY)
     include(CTest)
     include(cmake/StrixSession.cmake)
     include(cmake/QwenCuda.cmake)
+    include(cmake/StrixLevers.cmake)
     return()
 endif()
 

@@ -13,8 +13,11 @@ Every switch read from the environment is one of:
   * one boolean switch is read through the governed helpers with two different defaults.
 Baseline names that are no longer read raw are reported and removed with --update (never added by hand).
 
+--self-test runs the scanner on its fixtures (positive and negative).
 --report prints the counts; --tsv FILE writes one row per switch (name, class, read sites, documented).
-The scan is textual: a switch whose name is built at run time or passed through a wrapper is not seen.
+The scan is lexical: comments are removed, white space and new lines between the tokens of a call are allowed.
+A switch whose name is built at run time or passed through a wrapper is not seen. The baseline governs names,
+not read sites: a baselined switch may gain another raw read.
 """
 from __future__ import annotations
 
@@ -30,11 +33,16 @@ DOC_PATHS = ("docs", "README.md", "AGENTS.md", "models", "recipes")
 DOC_EXT = {".md", ".toml", ".txt", ".json", ".sh"}
 HELPER_FILE = "include/strix/env_flags.hpp"
 
-RAW = re.compile(r'\bgetenv\(\s*"(STRIX_[A-Z0-9_]+)"')
-GOVERNED = re.compile(r'\b(envcfg::[a-z_]+|env_[a-z_0-9]+)\(\s*"(STRIX_[A-Z0-9_]+)"')
+# Lexical pass: comments become one space, string and character literals are kept. The patterns below then run on
+# code only, and allow any white space (including new lines) between the tokens of a call.
+LEXEME = re.compile(
+    r"""//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|'(?:\\[^\n]{1,8}?|[^'\\\n])'""", re.S)
+RAW = re.compile(r'\bgetenv\s*\(\s*"(STRIX_[A-Z0-9_]+)"')
+GOVERNED = re.compile(r'\b(envcfg\s*::\s*[a-z_]+|env_[a-z_0-9]+)\s*\(\s*"(STRIX_[A-Z0-9_]+)"')
 TABLE = re.compile(r'\.env\s*=\s*"(STRIX_[A-Z0-9_]+)"')
 FLAG_DEFAULT = re.compile(
-    r'\benvcfg::flag\(\s*"(STRIX_[A-Z0-9_]+)"\s*,\s*(true|false)\b|\benv_flag_default_(on|off)\(\s*"(STRIX_[A-Z0-9_]+)"')
+    r'\benvcfg\s*::\s*flag\s*\(\s*"(STRIX_[A-Z0-9_]+)"\s*,\s*(true|false)\b'
+    r'|\benv_flag_default_(on|off)\s*\(\s*"(STRIX_[A-Z0-9_]+)"')
 NAME = re.compile(r'STRIX_[A-Z0-9_]+')
 
 
@@ -61,29 +69,82 @@ def documented_names(root: Path) -> set[str]:
     return names
 
 
+def strip_comments(text: str) -> str:
+    return LEXEME.sub(lambda m: " " if m.group(0).startswith(("//", "/*")) else m.group(0), text)
+
+
+def scan_text(text: str):
+    """Switches of one source text: (raw names, governed names, [(name, 'on'|'off')] of governed flag reads)."""
+    code = strip_comments(text)
+    raw = set(RAW.findall(code))
+    governed = {name for helper, name in GOVERNED.findall(code) if helper != "env_reject"}
+    governed.update(TABLE.findall(code))
+    defaults = []
+    for a_name, a_default, b_default, b_name in FLAG_DEFAULT.findall(code):
+        defaults.append((a_name or b_name, "on" if (a_default == "true" or b_default == "on") else "off"))
+    return raw, governed, defaults
+
+
 def scan(root: Path):
     raw: dict[str, set[str]] = defaultdict(set)
     governed: dict[str, set[str]] = defaultdict(set)
     defaults: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    inspected = 0
     for path in source_files(root):
         rel = path.relative_to(root).as_posix()
+        inspected += 1
         if rel == HELPER_FILE:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "STRIX_" not in text:
             continue
-        for name in RAW.findall(text):
+        file_raw, file_governed, file_defaults = scan_text(text)
+        for name in file_raw:
             raw[name].add(rel)
-        for helper, name in GOVERNED.findall(text):
-            if helper not in ("env_reject",):
-                governed[name].add(rel)
-        for name in TABLE.findall(text):
+        for name in file_governed:
             governed[name].add(rel)
-        for a_name, a_default, b_default, b_name in FLAG_DEFAULT.findall(text):
-            name = a_name or b_name
-            default = "on" if (a_default == "true" or b_default == "on") else "off"
+        for name, default in file_defaults:
             defaults[name][default].add(rel)
-    return raw, governed, defaults
+    return raw, governed, defaults, inspected
+
+
+# Fixtures for --self-test: (source text, raw names, governed names, flag defaults).
+FIXTURES = [
+    ('const char* v = std::getenv("STRIX_A");', {"STRIX_A"}, set(), []),
+    ('auto v = std::getenv ("STRIX_A");', {"STRIX_A"}, set(), []),
+    ('auto v = getenv\n    (\n  "STRIX_A"\n);', {"STRIX_A"}, set(), []),
+    ('auto v = std::getenv /* why */ ( /* name */ "STRIX_A");', {"STRIX_A"}, set(), []),
+    ('auto v = ::getenv(// name\n "STRIX_A");', {"STRIX_A"}, set(), []),
+    ('// old: getenv("STRIX_A")\nint x = 0;', set(), set(), []),
+    ('/* getenv("STRIX_A")\n   getenv("STRIX_B") */ int x = 0;', set(), set(), []),
+    ('const char* doc = "see // getenv"; auto v = getenv("STRIX_A");', {"STRIX_A"}, set(), []),
+    ('const char* doc = "/* open"; auto v = getenv("STRIX_A"); /* getenv("STRIX_B") */', {"STRIX_A"}, set(), []),
+    ('char q = \'"\'; auto v = getenv("STRIX_A"); // getenv("STRIX_B")', {"STRIX_A"}, set(), []),
+    ('auto v = my_getenv("STRIX_A"); auto w = getenv_or("STRIX_B");', set(), set(), []),
+    ('auto v = getenv(name); auto w = getenv("OTHER_A"); auto x = getenv("strix_a");', set(), set(), []),
+    ('const char* s = "getenv(\\"STRIX_A\\")";', set(), set(), []),
+    ('bool on = envcfg::flag("STRIX_A", true);', set(), {"STRIX_A"}, [("STRIX_A", "on")]),
+    ('bool on = strix::envcfg :: flag (\n "STRIX_A" ,\n false );', set(), {"STRIX_A"}, [("STRIX_A", "off")]),
+    ('bool on = envcfg::flag /* x */ ("STRIX_A", /* y */ true);', set(), {"STRIX_A"}, [("STRIX_A", "on")]),
+    ('bool on = env_flag_default_off ("STRIX_A");', set(), {"STRIX_A"}, [("STRIX_A", "off")]),
+    ('// envcfg::flag("STRIX_A", true)\nint n = envcfg::integer("STRIX_B", 4);', set(), {"STRIX_B"}, []),
+    ('{.name = "x", .env\n = "STRIX_A", .default_on = true}', set(), {"STRIX_A"}, []),
+    ('detail::env_reject("STRIX_A", value, "why");', set(), set(), []),
+    ('auto a = getenv("STRIX_A"); bool b = envcfg::flag("STRIX_A", true);', {"STRIX_A"}, {"STRIX_A"},
+     [("STRIX_A", "on")]),
+]
+
+
+def self_test() -> int:
+    failed = 0
+    for index, (text, raw, governed, defaults) in enumerate(FIXTURES):
+        got = scan_text(text)
+        if got != (raw, governed, defaults):
+            failed += 1
+            print(f"env switch census self-test: fixture {index} {text!r}: got {got}, "
+                  f"expected {(raw, governed, defaults)}", file=sys.stderr)
+    print(f"env switch census self-test: {len(FIXTURES) - failed}/{len(FIXTURES)} fixtures ok")
+    return 1 if failed else 0
 
 
 def read_baseline(path: Path) -> set[str]:
@@ -108,13 +169,23 @@ def main() -> int:
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--update", action="store_true", help="drop baseline names that are no longer read raw")
     mode.add_argument("--seed", action="store_true", help="write the baseline from the current tree (first use only)")
+    mode.add_argument("--self-test", action="store_true", help="run the scanner on its fixtures")
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--tsv", type=Path)
     args = parser.parse_args()
     root = args.root.resolve()
     baseline_path = args.baseline or root / "tools" / "env_switch_baseline.txt"
 
-    raw, governed, defaults = scan(root)
+    if args.self_test:
+        return self_test()
+    raw, governed, defaults, inspected = scan(root)
+    # A scan that saw nothing proves nothing: a wrong --root or a missing baseline is an error, not a pass.
+    if inspected == 0:
+        print(f"env switch census: no source files under {root} ({', '.join(SOURCE_DIRS)})", file=sys.stderr)
+        return 2
+    if not args.seed and not baseline_path.is_file():
+        print(f"env switch census: baseline {baseline_path} not found", file=sys.stderr)
+        return 2
     baseline = read_baseline(baseline_path)
     conflicts = {name: sides for name, sides in defaults.items() if len(sides) > 1}
     new_raw = sorted(set(raw) - baseline)

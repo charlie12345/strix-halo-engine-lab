@@ -38,19 +38,54 @@ son iguales a los de la ejecución de referencia. Detalles y condiciones:
 [Qwen servido desde una RTX](models/qwen3.8/rtx-serve.md),
 [GLM en una RTX](models/glm-5.3/README.es.md#glm-rtx-results).
 
-## Fije la GPU correcta
+## Declare la GPU que se usa
 
-Si el equipo tiene más de una GPU NVIDIA, seleccione la tarjeta por UUID, nunca por índice (los índices pueden diferir
-entre `nvidia-smi` y CUDA):
+Los binarios CUDA de DeepSeek y Qwen solo arrancan en una tarjeta que usted haya declarado. Cada uno lee un archivo
+`strix-devices-v1` antes de su primera reserva de memoria, identifica las tarjetas por UUID (nunca por índice) y se
+niega a arrancar, con una línea que enumera cada tarjeta y el motivo, cuando la tarjeta no está declarada, está marcada
+como `excluded`, coincide con una política de denegación, o cuando hay más de una tarjeta declarada utilizable y no se
+ha elegido ninguna. Una tarjeta no declarada es una tarjeta excluida.
+
+```toml
+schema = "strix-devices-v1"
+
+[devices.main]                       # the table name is the device id
+vendor = "nvidia"
+uuid = "GPU-<uuid from nvidia-smi -L>"
+roles = ["replica", "prefill"]       # no roles = no work
+attach = { kind = "pcie", pcie_gen = 4, pcie_width = 16 }
+
+[devices.other]                      # a card these binaries must never use
+vendor = "nvidia"
+uuid = "GPU-<uuid>"
+excluded = true
+reason = "kept for the desktop"
+
+[device_policies.never-other]        # deny by name: still holds if the UUID changes
+name_contains = "<part of the card name>"
+excluded = true
+```
+
+Indique el archivo con `--devices FILE`, con `STRIX_DEVICES`, o guárdelo como `%APPDATA%\strix\devices.toml`
+(`~/.config/strix/devices.toml` en Linux). Si hay varias tarjetas utilizables, elija una con `--device-id ID` o
+`STRIX_DEVICE`. El binario restringe entonces su propio proceso a esa tarjeta (fija `CUDA_VISIBLE_DEVICES` al UUID
+antes de iniciar CUDA y comprueba el resultado), de modo que ningún hilo puede alcanzar otra tarjeta, e imprime la
+tarjeta que ha tomado:
+
+```
+device: id=main vendor=nvidia uuid=GPU-... pci=0000:01:00.0 name="..." arch=sm_120 ordinal=0 attach=pcie gen4 x16 roles=replica,prefill declared=devices.toml
+```
+
+`strix-cuda-qwen-serve` también la muestra en `device` dentro de `/api/status`.
+
+Las herramientas de GLM de esta página aún no leen la declaración. Para ellas, y para cualquier otro programa CUDA,
+seleccione la tarjeta por UUID en la consola:
 
 ```powershell
 nvidia-smi -L                      # lists each GPU with its UUID
 $env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"
 $env:CUDA_VISIBLE_DEVICES = "GPU-<uuid of the card to use>"
 ```
-
-Establézcalo en la misma consola antes de cada comando de esta página, incluidas las impresiones de configuración y
-las ejecuciones en seco.
 
 ## DeepSeek V4.1 Flash, RTX independiente
 
@@ -111,7 +146,7 @@ El archivo de unidades, todas las opciones y las filas medidas: [guía de GLM RT
 El servicio de GLM (`glm_native_service`) acepta además `--dgpu auto|<uuid>`: comprueba mediante NVML, antes de
 cualquier llamada CUDA, que la tarjeta es una RTX PRO `sm_120` (`auto` elige la tarjeta válida con más memoria) y la
 fija; `--dgpu off` se rechaza (esta ruta no tiene camino por CPU). El arnés de la ejecución medida de arriba selecciona
-la tarjeta con `CUDA_VISIBLE_DEVICES`, como se describe en [Fije la GPU correcta](#fije-la-gpu-correcta).
+la tarjeta con `CUDA_VISIBLE_DEVICES`, como se describe en [Declare la GPU que se usa](#declare-la-gpu-que-se-usa).
 
 ## Solución de problemas
 

@@ -1,9 +1,11 @@
 #include "strix/serve/session_runtime.hpp"
+#include "../core/byte_budget.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <set>
 #include <stop_token>
 
@@ -642,6 +644,9 @@ struct SessionRuntime::Impl {
                 }
             }
             for (const auto& w : work) {
+                // Decode marks the byte budget: background host work is capped while sessions decode.
+                std::optional<::strix::core::ByteBudget::DecodeScope> decoding;
+                if (w.phase != SessionPhase::prefill) decoding.emplace(::strix::core::shared_byte_budget());
                 try { execute(w); }
                 catch (const std::exception& e) { for (auto i : w.lanes) if (!lanes[i]->done) fail(*lanes[i], e.what()); }
                 catch (...) { for (auto i : w.lanes) if (!lanes[i]->done) fail(*lanes[i], "session phase failed"); }

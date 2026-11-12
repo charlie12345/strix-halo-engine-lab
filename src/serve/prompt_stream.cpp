@@ -1,6 +1,6 @@
 #include "strix/serve/prompt_stream.hpp"
 
-#include "core/host_lane.hpp"
+#include "../core/host_lane.hpp"
 
 #include <stdexcept>
 #include <utility>

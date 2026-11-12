@@ -1,12 +1,12 @@
 # Row budget for the batched MTP decode
 
-`STRIX_SERVE_ROW_BUDGET=1` makes the batched Qwen MTP server choose how many verify rows each decoding request
-gets in a cycle from a cost model, instead of the fixed table of 8, 4 or 2 rows by number of requests. The
-switch is off by default.
+The batched Qwen MTP server chooses how many verify rows each decoding request gets in a cycle from a cost
+model. `STRIX_SERVE_ROW_BUDGET=0` (or the baseline mode) restores the fixed table of 8, 4 or 2 rows by number
+of requests.
 
 ## What it does
 
-With the switch on the cohort cycle runs through the joint window controller with the rule `budget`
+The cohort cycle runs through the joint window controller with the rule `budget`
 (`STRIX_MTP_JOINT_PLAN=budget` selects the same rule by name). The rule hands the shared planner
 `strix::serve::plan_rows` (`include/strix/serve/row_budget.hpp`) one demand per request:
 
@@ -29,7 +29,7 @@ priors. `STRIX_SERVE_ROW_COST=fixed,row[,lane]` pins the model.
 ## Exactness
 
 Scheduling only. Every emitted token comes from the request's own target rows, so token ids equal those of a
-run without the switch.
+run with `STRIX_SERVE_ROW_BUDGET=0`.
 
 ## Observing it
 

@@ -184,11 +184,11 @@ std::array<std::uint32_t,3> batch_key(std::span<const std::uint32_t> rows) {
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::rule_from_env(bool baseline) {
     const char* v=std::getenv("STRIX_MTP_JOINT_PLAN");
-    if(!v && mtp_serve_row_budget_enabled()) return parse_rule("budget");
+    if(!v && !baseline && mtp_serve_row_budget_enabled()) return parse_rule("budget");
     return v?parse_rule(v):parse_rule(baseline?"production":"calibrated-c3");
 }
 bool mtp_serve_row_budget_enabled() noexcept {
-    static const bool on=[]{const char* v=std::getenv("STRIX_SERVE_ROW_BUDGET");return v && v[0]=='1' && v[1]==0;}();
+    static const bool on=[]{const char* v=std::getenv("STRIX_SERVE_ROW_BUDGET");return !v || !(v[0]=='0' && v[1]==0);}();
     return on;
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_view text) {

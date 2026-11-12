@@ -16,11 +16,13 @@ namespace strix {
 // with the slot's per-depth history (which, once seen, barely depends on the draft's own confidence).
 // calibrated_min_members gates calibration by the joint group's member count at plan time.
 // budget: plan() and choose() take each request's rows from the shared row budget (strix/serve/row_budget.hpp):
-// a cycle costs fixed + per-row milliseconds, so draft rows shrink as the lanes of a cycle grow. Selected by
-// STRIX_SERVE_ROW_BUDGET=1 or the rule name "budget". Scheduling only, as every other rule.
+// a cycle costs fixed + per-row + per-request milliseconds, so draft rows follow acceptance and shrink as the lanes
+// of a cycle grow. The serving default (STRIX_SERVE_ROW_BUDGET=0 turns it off); also the rule name "budget".
+// Scheduling only, as every other rule.
 struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t cap=8; std::size_t calibrated_min_members=0;
     bool budget=false;};
-// STRIX_SERVE_ROW_BUDGET=1 (default off): the batched decode runs its joint cycle with the budget rule.
+// The batched decode runs its joint cycle with the budget rule. On by default; STRIX_SERVE_ROW_BUDGET=0 (or the
+// baseline mode) restores the fixed rows-per-request table.
 [[nodiscard]] bool mtp_serve_row_budget_enabled() noexcept;
 // Joint scheduling only: all selections still come from each request's target.
 // A non-drafting request normally uses R2, commits one row and discards padding.

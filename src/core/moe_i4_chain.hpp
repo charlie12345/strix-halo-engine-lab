@@ -86,7 +86,29 @@ template<class T> __global__ __launch_bounds__(256) void reference_add_kernel(T*
     const size_t i=size_t(blockIdx.x)*256U+threadIdx.x;
     if(i<n) dst[i]+=src[i];
 }
+template<class Schedule,class=void> struct ReferenceInputMatrices : std::integral_constant<unsigned,1> {};
+template<class Schedule> struct ReferenceInputMatrices<Schedule,std::void_t<decltype(Schedule::kInputMatrices)>>
+    : std::integral_constant<unsigned,Schedule::kInputMatrices> {};
+// Multiple matrices preserve a cached row's outer slot loop and unrolled matrix loop.
+// The default keeps the existing reference schedule traversal unchanged.
 template<class Schedule> __global__ __launch_bounds__(256) void reference_input_kernel(Schedule s) {
+    if constexpr (ReferenceInputMatrices<Schedule>::value>1) {
+        const unsigned token=s.token(),col=s.col();
+        float cached[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) cached[j]=s.b.x[size_t(token)*Schedule::Binding::H+col+(threadIdx.x&31U)+32U*static_cast<unsigned>(j)];
+        const auto rows=s.prepare();
+        for(unsigned i=0;i<Schedule::kInputRows;++i) {
+            if(!s.admit(rows,i)) continue;
+            #pragma unroll
+            for(unsigned m=0;m<ReferenceInputMatrices<Schedule>::value;++m) {
+                ReferenceRow r{};
+                s.input(rows,i,m,r);
+                float v[4]; InputPolicy<typename Schedule::Binding>{s.b}.load(r.expert,s.source_pair(r.pair),r.m,r.col,v,cached);
+                reference_store(r,v);
+            }
+        }
+    } else {
     ReferenceRow r{};
     float cached[4];
     if constexpr (Schedule::kCachedInput) {
@@ -98,6 +120,7 @@ template<class Schedule> __global__ __launch_bounds__(256) void reference_input_
     for(unsigned i=0;s.input(i,r);++i) {
         float v[4]; InputPolicy<typename Schedule::Binding>{s.b}.load(r.expert,s.source_pair(r.pair),r.m,r.col,v,Schedule::kCachedInput ? cached : nullptr);
         reference_store(r,v);
+    }
     }
 }
 template<class Schedule> __global__ __launch_bounds__(256) void reference_activation_kernel(Schedule s) {

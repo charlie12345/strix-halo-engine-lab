@@ -1832,6 +1832,28 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill dense tall PIPE bands",
+    "flag_or_env": "STRIX_MMX_PREFILL_DENSE_BAND",
+    "default": "0",
+    "exact": "Same operands, WMMA chain and split partials per output as the PIPE kernel; bench test_prefill_dense band 0/4/8 byte-identical (T 1024, 1700, 4096); TP2 8K and 32K anchors equal.",
+    "gain": "None beyond noise (opt-in). Kernel bench T4096: band 4 q -0.9 %, o -3.9 %, q+k+v -1.3 %, k+v +5.7 %; band 8 slower.",
+    "preconditions": "v4 prefill core with PIPE; dense prefill linears; values 0, 4 or 8.",
+    "off_switch": "STRIX_MMX_PREFILL_DENSE_BAND=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-dense-band"
+  },
+  {
+    "engine": "minimax",
+    "name": "IU4 tiled core: weight scale converted at the LDS store",
+    "flag_or_env": "none",
+    "default": "on",
+    "exact": "F16 to FP32 conversion is exact; same FP32 value at the same LDS slot; gfx1151 ISA wait removed, no spills, occupancy unchanged.",
+    "gain": "Grouped IU4 microbench plan 2: gate -6.8 % (T4096) / -5.9 % (T8192), down -4.9 % / -4.2 %.",
+    "preconditions": "IU4 tiled core plans (FAST_I4 MoE, INT4 chain, GLM INT4).",
+    "off_switch": "none",
+    "doc_anchor": "docs/optimizations.md#core-iu4-wscale-defer"
+  },
+  {
+    "engine": "minimax",
     "name": "Prefill MoE token-major gather",
     "flag_or_env": "STRIX_MMX_PREFILL_GATHER_TOK",
     "default": "1",

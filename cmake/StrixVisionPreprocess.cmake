@@ -17,6 +17,10 @@ if(COMMAND strix_target_warnings)
 endif()
 if(MSVC)
     target_compile_options(strix_vision_preprocess PRIVATE /EHsc /utf-8)
+else()
+    # The fp32 resampler and normalization are a bit-exact contract (fixtures, cache digests): never fuse a
+    # multiply and an add, whatever the target instruction set.
+    target_compile_options(strix_vision_preprocess PRIVATE -ffp-contract=off -fno-fast-math)
 endif()
 
 if(BUILD_TESTING)

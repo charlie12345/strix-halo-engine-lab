@@ -1,5 +1,5 @@
 #pragma once
-#include "core/byte_budget.hpp"
+#include "byte_budget.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -96,8 +96,11 @@ inline bool pin_current_thread(const std::vector<int>& cores) {
 
 class HostLane {
 public:
-    explicit HostLane(HostLaneConfig config = {})
-        : config_(std::move(config)), budget_(config_.byte_cap_gbytes_ps * 1e9) {
+    // budget: null gives the lane its own budget from config.byte_cap_gbytes_ps; the process-wide lane shares
+    // the process-wide budget.
+    explicit HostLane(HostLaneConfig config = {}, ByteBudget* budget = nullptr)
+        : config_(std::move(config)), own_budget_(budget ? 0.0 : config_.byte_cap_gbytes_ps * 1e9),
+          budget_(budget ? budget : &own_budget_) {
         if (config_.critical_threads > 2) config_.critical_threads = 2;
         if (!config_.enabled) config_.critical_threads = config_.background_threads = 0;
         const std::size_t reserved = std::min<std::size_t>(config_.critical_threads, config_.cores.size());
@@ -144,7 +147,7 @@ public:
         return result;
     }
 
-    ByteBudget& budget() { return budget_; }
+    ByteBudget& budget() { return *budget_; }
     const HostLaneConfig& config() const { return config_; }
     HostLaneStats stats() const {
         HostLaneStats out;
@@ -153,7 +156,7 @@ public:
         out.inline_jobs = inline_jobs_.load(std::memory_order_relaxed);
         out.critical_busy_ns = critical_busy_ns_.load(std::memory_order_relaxed);
         out.background_busy_ns = background_busy_ns_.load(std::memory_order_relaxed);
-        out.budget = budget_.stats();
+        out.budget = budget_->stats();
         return out;
     }
     // Receipt fields: busy time, bytes granted to background work, and how often the cap made a job wait.
@@ -219,7 +222,8 @@ private:
     }
 
     HostLaneConfig config_;
-    ByteBudget budget_;
+    ByteBudget own_budget_;
+    ByteBudget* budget_;
     std::mutex mutex_;
     std::condition_variable critical_wake_, background_wake_;
     std::deque<Job> critical_, background_;
@@ -235,37 +239,22 @@ private:
 //   STRIX_HOST_LANE_CORES=2-15         cores the lane may pin
 //   STRIX_HOST_LANE_BACKGROUND=N       background threads (default 2)
 //   STRIX_HOST_BYTE_CAP_GBPS=10        background ceiling during decode; 0 = never capped
-inline const char* host_lane_environment(const char* name) {
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4996) // read-only lookup
-#endif
-    return std::getenv(name);
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-}
 inline HostLaneConfig host_lane_config_from_environment() {
     HostLaneConfig config;
-    if (const char* value = host_lane_environment("STRIX_HOST_LANE")) config.enabled = std::string(value) != "0";
-    if (const char* value = host_lane_environment("STRIX_HOST_LANE_CORES")) config.cores = parse_core_list(value);
-    if (const char* value = host_lane_environment("STRIX_HOST_LANE_BACKGROUND")) {
+    if (const char* value = host_environment("STRIX_HOST_LANE")) config.enabled = std::string(value) != "0";
+    if (const char* value = host_environment("STRIX_HOST_LANE_CORES")) config.cores = parse_core_list(value);
+    if (const char* value = host_environment("STRIX_HOST_LANE_BACKGROUND")) {
         const long threads = std::strtol(value, nullptr, 10);
         if (threads < 0 || threads > 64) throw std::invalid_argument("STRIX_HOST_LANE_BACKGROUND out of range");
         config.background_threads = static_cast<unsigned>(threads);
     }
-    if (const char* value = host_lane_environment("STRIX_HOST_BYTE_CAP_GBPS")) {
-        char* end = nullptr;
-        config.byte_cap_gbytes_ps = std::strtod(value, &end);
-        if (end == value || *end != '\0' || config.byte_cap_gbytes_ps < 0.0)
-            throw std::invalid_argument("STRIX_HOST_BYTE_CAP_GBPS is not a non-negative number");
-    }
+    config.byte_cap_gbytes_ps = byte_cap_gbytes_ps_from_environment(config.byte_cap_gbytes_ps);
     return config;
 }
 
 // The process-wide lane. Created on first use; every engine and the serving layer share it.
 inline HostLane& shared_host_lane() {
-    static HostLane lane(host_lane_config_from_environment());
+    static HostLane lane(host_lane_config_from_environment(), &shared_byte_budget());
     return lane;
 }
 } // namespace strix::core

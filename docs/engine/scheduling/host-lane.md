@@ -27,6 +27,12 @@ takes. `ByteBudget` is a token bucket in bytes per second:
 - no session decoding: unlimited;
 - at least one session decoding (`ByteBudget::DecodeScope`): `byte_cap_gbytes_ps` (10 GB/s by default).
 
+Decode is marked per call, so the cap stays in force for a short linger (250 ms) after the last decode
+call ends: the gaps between the steps of one generation neither lift the cap nor refill the bucket.
+
+`shared_byte_budget()` is the process-wide budget. Decode loops mark it, shared background paths draw
+from it, and the process-wide lane uses it as its budget.
+
 A reservation is always granted; the returned duration is the wait owed before the bytes are read, so a
 request larger than the burst is legal. `acquire()` is the blocking form and returns early when the last
 decode ends. `governed_slices()` walks a range in slices so a long pass reacts to a decode that starts

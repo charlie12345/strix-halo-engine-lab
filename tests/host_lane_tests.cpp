@@ -42,7 +42,7 @@ void budget_is_unlimited_without_decode() {
 }
 
 void budget_caps_during_decode() {
-    ByteBudget budget(1000.0, 0.1);
+    ByteBudget budget(1000.0, 0.1, std::chrono::seconds(1));
     const auto t0 = Clock::time_point{} + std::chrono::seconds(10);
     budget.decode_begin(t0);
     require(budget.capped(), "decode did not arm the cap");
@@ -59,9 +59,20 @@ void budget_caps_during_decode() {
     const auto stats = budget.stats();
     require(stats.bytes_granted == 952 && stats.bytes_capped == 952 && stats.cap_hits == 4, "capped stats");
     require(stats.throttled_ns >= 1000000000ull, "throttle time not recorded");
-    budget.decode_end();
-    require(!budget.capped(), "cap outlived the decode");
-    require(budget.reserve(1u << 20, t0 + std::chrono::seconds(101)) == Clock::duration::zero(), "idle after decode");
+    // The cap lingers after a decode step, and the next step of the same generation does not refill the bucket.
+    const auto t1 = t0 + std::chrono::seconds(100);
+    (void)budget.reserve(2000, t1); // two seconds of debt
+    budget.decode_end(t1);
+    require(budget.capped(t1 + milliseconds(500)), "cap dropped between two decode steps");
+    budget.decode_begin(t1 + milliseconds(500));
+    require(budget.reserve(1, t1 + milliseconds(500)) > Clock::duration::zero(), "a new step refilled the bucket");
+    budget.decode_end(t1 + milliseconds(600));
+    require(budget.capped(t1 + milliseconds(1500)) && !budget.capped(t1 + milliseconds(1700)), "linger length");
+    require(budget.reserve(1u << 20, t1 + std::chrono::seconds(2)) == Clock::duration::zero(), "idle after decode");
+    // A decode after a real idle gap starts with a full burst again.
+    budget.decode_begin(t1 + std::chrono::seconds(3));
+    require(budget.reserve(100, t1 + std::chrono::seconds(3)) == Clock::duration::zero(), "burst after an idle gap");
+    budget.decode_end(t1 + std::chrono::seconds(3));
 }
 
 void budget_long_run_rate_stays_under_the_cap() {
@@ -82,10 +93,10 @@ void budget_long_run_rate_stays_under_the_cap() {
     require(static_cast<double>(bytes) >= 0.98 * cap * elapsed, "governor wasted more than 2 % of the cap");
     // Nested decodes: the cap holds until the last one ends.
     budget.decode_begin(now);
-    budget.decode_end();
-    require(budget.capped(), "cap dropped while a decode was still active");
-    budget.decode_end();
-    require(!budget.capped(), "cap held after the last decode");
+    budget.decode_end(now);
+    require(budget.capped(now + std::chrono::seconds(60)), "cap dropped while a decode was still active");
+    budget.decode_end(now);
+    require(budget.capped(now + milliseconds(100)) && !budget.capped(now + std::chrono::seconds(1)), "cap after the last decode");
 }
 
 void budget_wait_ends_with_the_decode() {
@@ -103,7 +114,7 @@ void budget_wait_ends_with_the_decode() {
         ByteBudget::DecodeScope decode(budget);
         require(budget.capped(), "scope did not arm the cap");
     }
-    require(!budget.capped(), "scope did not release the cap");
+    require(!budget.capped(Clock::now() + std::chrono::seconds(1)), "scope did not release the cap");
     std::uint64_t seen = 0, calls = 0;
     strix::core::governed_slices(budget, 10, 4, [&](std::uint64_t offset, std::uint64_t length) {
         require(offset == seen, "slices out of order");

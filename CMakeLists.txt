@@ -690,6 +690,8 @@ if(BUILD_TESTING)
 endif()
 # Device declaration (strix-devices-v1) and the start gate every GPU binary calls before its first allocation.
 include(cmake/StrixDevice.cmake)
+# Typed lever declaration and the census of environment switches (host tests).
+include(cmake/StrixLevers.cmake)
 # Every HIP app calls the start gate first; the core library carries it to all of them.
 target_link_libraries(strix_core PUBLIC strix_device_hip)
 # Effective-config headers are consumed by the core CLI and its host tests.

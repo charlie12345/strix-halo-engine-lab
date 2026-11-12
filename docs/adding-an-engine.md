@@ -195,6 +195,25 @@ boundary:
 The CPU backend is a correctness reference for the contracts and for host tests. It
 is not a production inference path.
 
+## Levers and switches
+
+A lever is an implementation choice with an off switch. Declare it as one row of a
+`strix::lever::Decl` table (`include/strix/lever.hpp`): its `STRIX_*` switch, its
+exactness class (`bitwise`: on by default; `bit_changing`: off until the engine's
+gate opens), its default, and, when it wins only in some regimes, the crossover on
+one axis (rows, context tokens or concurrent streams). `lever::select` is the
+decision rule (explicit switch, then gate, then regime, then default) and records
+the result for `--print-effective-config`; `lever::require_consistent` refuses two
+levers that the table declares incompatible. `static_assert(lever::valid(table))`
+checks the table at compile time.
+
+Read any other switch through `include/strix/env_flags.hpp`. The
+`strix-env-switch-census` test (`tools/env_switch_census.py --check`) fails when a
+new switch is read with a raw `getenv`, or when one boolean switch is read with two
+different defaults. `tools/env_switch_baseline.txt` lists the switches that are
+still read raw; it only shrinks (`--update` removes migrated names).
+`tools/env_switch_census.py --report` prints the current counts.
+
 ## Checklist
 
 1. `models/<model>.toml`, registry row, CMake option `STRIX_FAMILY_<NAME>`.

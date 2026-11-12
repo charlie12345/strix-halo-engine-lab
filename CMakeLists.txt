@@ -4937,6 +4937,13 @@ if(STRIX_FAMILY_MINIMAX)
             target_compile_options(strix_minimax_engine PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64 -fno-fast-math
                 -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee>)
             strix_target_warnings(strix_minimax_engine)
+            if(BUILD_TESTING)  # FAST shared WMMA indexer core: gate + timing against the exact Q64 index kernel
+                add_executable(strix-hip-idx-wmma-mm-tests tests/hip_idx_wmma_tests.hip)
+                target_link_libraries(strix-hip-idx-wmma-mm-tests PRIVATE strix_minimax_engine)
+                target_compile_definitions(strix-hip-idx-wmma-mm-tests PRIVATE IDXW_MM)
+                set_target_properties(strix-hip-idx-wmma-mm-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+                target_compile_options(strix-hip-idx-wmma-mm-tests PRIVATE -mno-wavefrontsize64)
+            endif()
             # DSpark speculative draft (src/minimax/dspark): host reference + gfx1151 kernels.
             add_library(strix_minimax_dspark STATIC src/minimax/dspark/hip_minimax_dspark.hip src/minimax/dspark/markov_cand.hip src/minimax/dspark/minimax_dspark_host.cpp
                 src/minimax/dspark/minimax_dspark_files.cpp src/minimax/dspark/minimax_ngram.cpp)
@@ -5184,6 +5191,10 @@ if(STRIX_FAMILY_GLM5)
             target_link_libraries(strix-hip-glm5-pf-moe-tests PRIVATE strix_glm5_engine)
             target_include_directories(strix-hip-glm5-pf-moe-tests PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")
             list(APPEND strix_glm5_hip_targets strix-hip-glm5-prefill-tests strix-hip-glm5-pf-tierb-tests strix-hip-glm5-pf-moe-tests)
+            add_executable(strix-hip-idx-wmma-glm-tests tests/hip_idx_wmma_tests.hip)  # FAST shared WMMA indexer core: gate + timing
+            target_link_libraries(strix-hip-idx-wmma-glm-tests PRIVATE strix_glm5_kernels)
+            target_compile_definitions(strix-hip-idx-wmma-glm-tests PRIVATE IDXW_GLM)
+            list(APPEND strix_glm5_hip_targets strix-hip-idx-wmma-glm-tests)
             add_executable(strix-glm5-rank apps/glm_rank_main.cpp src/glm/spec/glm_spec_run.cpp)
             target_link_libraries(strix-glm5-rank PRIVATE strix_glm5_engine strix_device_profile)
             target_include_directories(strix-glm5-rank PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")

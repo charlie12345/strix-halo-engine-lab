@@ -5308,3 +5308,6 @@ if(BUILD_TESTING)
     set_tests_properties(qwen-prefill-pipe-dump PROPERTIES
         ENVIRONMENT "STRIX_QWEN_PF_PIPE_DUMP=${CMAKE_CURRENT_BINARY_DIR}/qwen-prefill-pipe-dump")
 endif()
+
+# Serving-spec fragments (cmake/servespec/*.cmake): shared serving sources and their host tests.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")

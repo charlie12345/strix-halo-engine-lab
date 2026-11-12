@@ -29,12 +29,34 @@
 //   excluded = true
 //   reason = "never schedule on this card"
 //
-// Unknown keys, a device without an identity, duplicate identities and unknown roles are errors.
+//   [devices.npu]                                # a unit that is not a GPU states its kind
+//   kind = "npu"                                 # gpu (default) | npu | cpu
+//   vendor = "amd"
+//   pci = "0000:c5:00.1"                         # identity as for a GPU
+//   arch = "aie2p"
+//   roles = ["aux"]                              # side models only (score, vision, embed)
+//   driver = "amdxdna"                           # the three keys below are required before `aux` is granted
+//   firmware = "1.1.2.64"
+//   corun_qualification = "E1-2026-11"           # id of the GPU + NPU co-run receipt
+//
+//   [devices.host]
+//   kind = "cpu"                                 # no identity; at most one cpu unit
+//   cores = "2-15"                               # cores the host lane may pin
+//   roles = ["host", "aux"]                      # host: tokenizer, image, sampling, exchange fold, background work
+//   byte_cap_gbytes_ps = 10.0                    # background memory traffic ceiling while any decode is active
+//
+// Unknown keys, a device without an identity, duplicate identities and unknown roles are errors. An NPU or CPU that
+// is not declared gets no work: there is no implicit non-GPU unit. `decode`, `prefill`, `pair`, `draft`, `replica`,
+// `front` and `experts` are GPU roles; an NPU takes only `aux`; a CPU takes only `host` and `aux`.
 namespace strix::device {
 
 enum class Vendor { amd, nvidia, intel };
 [[nodiscard]] std::string_view vendor_name(Vendor vendor) noexcept;
 [[nodiscard]] Vendor parse_vendor(std::string_view text); // throws std::invalid_argument
+
+enum class Kind { gpu, npu, cpu };
+[[nodiscard]] std::string_view kind_name(Kind kind) noexcept;
+[[nodiscard]] Kind parse_kind(std::string_view text); // throws std::invalid_argument
 
 struct Attach {
     std::string kind;            // "" (not stated) | integrated | pcie | oculink | remote
@@ -47,7 +69,8 @@ struct Attach {
 
 struct Descriptor {
     std::string id;
-    Vendor vendor = Vendor::amd;
+    Kind kind = Kind::gpu;
+    Vendor vendor = Vendor::amd; // optional for a cpu unit
     std::string arch;
     std::string uuid; // normalised: lower-case, "gpu-" prefix removed; empty when not declared
     std::string pci;  // normalised: dddd:bb:dd.f lower-case; empty when not declared
@@ -57,6 +80,14 @@ struct Descriptor {
     std::vector<std::string> roles;
     bool excluded = false;
     std::string reason;
+    // kind = cpu only.
+    std::string cores_text;           // as declared ("2-15", "0,4-7"); empty = not declared
+    std::vector<std::uint32_t> cores; // sorted, unique
+    double byte_cap_gbytes_ps = 0.0;  // 0 = not declared
+    // kind = npu only: what was qualified. `aux` is refused while any of the three is missing.
+    std::string driver;
+    std::string firmware;
+    std::string corun_qualification;
 };
 
 struct Policy {
@@ -83,9 +114,20 @@ struct Declaration {
 [[nodiscard]] std::string normalise_uuid(std::string_view text); // 32 hex digits -> 8-4-4-4-12
 [[nodiscard]] std::string normalise_pci(std::string_view text);  // [dddd:]bb:dd.f -> dddd:bb:dd.f
 
+// "2-15", "0,4-7,12" -> sorted unique core indices. Throws std::invalid_argument (empty, reversed range, repeat, > 4095).
+[[nodiscard]] std::vector<std::uint32_t> parse_cores(std::string_view text);
+
 [[nodiscard]] bool known_role(std::string_view role) noexcept;
+// Whether a unit of this kind may declare the role at all (the parser refuses the file otherwise).
+[[nodiscard]] bool role_allowed(Kind kind, std::string_view role) noexcept;
 // Empty when the descriptor may take the role; otherwise the reason it may not (role absent, or a role that needs a
-// measured rate on a link that was never probed).
+// measured rate on a link that was never probed, or `aux` on an NPU without driver, firmware and co-run qualification).
 [[nodiscard]] std::string role_refusal(const Descriptor& device, std::string_view role);
+
+// The declared units that may take `role` now (not excluded, no refusal), in declaration order. GPU entries are
+// included: whether a declared GPU is present is the start gate's question, not this one's.
+[[nodiscard]] std::vector<const Descriptor*> units_for_role(const Declaration& declaration, std::string_view role);
+// The cpu unit when it is declared, not excluded and carries `host`; otherwise null (no host lane work).
+[[nodiscard]] const Descriptor* host_unit(const Declaration& declaration) noexcept;
 
 } // namespace strix::device

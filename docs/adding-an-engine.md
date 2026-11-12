@@ -79,6 +79,39 @@ cycle, with `RowHints`), `fork_lane`, `cancel_lane`, `resume_lane`,
 `RecurrentStateOps` (`include/strix/session/recurrent_state.hpp`) for models whose
 state is not only attention KV.
 
+### Embedding rows (image input)
+
+A prompt stays a sequence of 32-bit ids. A row that is not a vocabulary token, such as
+one output row of a vision encoder, is a *virtual id* (`include/strix/session/embed_rows.hpp`):
+
+```
+bit 31 = 1 | handle (17 bits) | row (14 bits)
+```
+
+- `EmbedInterner` maps a digest (content and producer identity) to a handle, once per
+  process. The same image gives the same ids, so prefix directories, turn caches and
+  family prefix caches compare and hash image runs like text, and a prefix may end
+  inside an image. A handle keeps its payload while a lease exists; afterwards the
+  handle stays reserved for its digest until the handle space wraps (`epoch()`).
+- `EmbedTable` is the immutable handle -> rows view of one request: bf16 rows of the
+  LM width, a role per row, optional positions, the vocabulary token a row stands
+  for, and optional rows added after later layers. It owns leases.
+- `expand_embed_rows` replaces each placeholder token of the rendered prompt by the
+  ids of one span and reports where the runs are.
+- `GenerationJob::embeds` carries the table of the request; it is null for a prompt
+  without virtual ids.
+
+An engine opts in with `Capabilities::embed_rows` and implements
+`bind_embeds(state, table)`. Its embed stage then resolves token rows by lookup as
+before and virtual rows from the bound table, after `EmbedTable::validate` passed for
+the whole input and before any write. An engine without the capability refuses any id
+with bit 31 set in prevalidation (`reject_embed_ids`). Decode never produces a virtual
+id. Handles are local to the process: what leaves it carries `EmbedTable::manifest()`
+and the receiver rewrites the ids with `remap_embed_ids`.
+
+A prompt without virtual ids takes the same path as before, with or without a bound
+table: ids, state and results are unchanged.
+
 ### Backend operations
 
 A family asks a `session::Backend` (`include/strix/session/backend.hpp`) for:
@@ -168,6 +201,8 @@ is not a production inference path.
 2. Model code under `src/<family>/`: tensors, numerics, kernels that are truly
    model-specific. Reuse `src/core`, `src/moe_core`, `src/attn_core`.
 3. `session::Engine` adapter and `KvStore` hooks; report capabilities truthfully.
+   A family with image input sets `embed_rows` and resolves virtual ids in its
+   embed stage; every other family rejects them before a write.
 4. `SessionService` and `install_session_service`; no `main()` and no request loop.
 5. Host test with the CPU backend or a scripted engine, in the style of
    `tests/skeleton_engine_tests.cpp`; device exactness gate for the real kernels.

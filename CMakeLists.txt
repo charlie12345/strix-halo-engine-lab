@@ -361,6 +361,7 @@ strix_target_warnings(strix_core)
 
 include(CTest)
 include(cmake/StrixSession.cmake)
+include(cmake/StrixVisionPreprocess.cmake)
 add_library(strix_ds41_http_session_owner STATIC src/deepseek41/http_session_owner.cpp)
 target_include_directories(strix_ds41_http_session_owner PUBLIC src)
 target_link_libraries(strix_ds41_http_session_owner PUBLIC strix_session_owner)
@@ -736,6 +737,7 @@ add_library(strix_serve STATIC
     src/serve/json_constraint.cpp
     src/serve/constraint_selection.cpp
     src/serve/bpe_tokenizer.cpp
+    src/serve/prompt_stream.cpp
     src/serve/chat_template.cpp
     src/serve/deepseek_chat.cpp
     src/serve/glm_chat.cpp
@@ -745,8 +747,9 @@ add_library(strix_serve STATIC
     src/serve/deployment.cpp
     src/serve/request_fields.cpp
     src/serve/health.cpp
+    src/serve/media.cpp
 )
-target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
+target_include_directories(strix_serve PUBLIC include PRIVATE src/serve src)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
 target_link_libraries(strix_serve PUBLIC Threads::Threads strix_core strix_serve_json)
 if(WIN32)
@@ -865,6 +868,22 @@ if(BUILD_TESTING)
     target_compile_features(strix-batch-service-handoff-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-batch-service-handoff-tests)
     add_test(NAME strix-batch-service-handoff-tests COMMAND strix-batch-service-handoff-tests)
+    # Host lane and byte budget: the one host pool (critical / background) and the background byte governor.
+    add_executable(strix-host-lane-tests tests/host_lane_tests.cpp)
+    target_include_directories(strix-host-lane-tests PRIVATE src)
+    target_link_libraries(strix-host-lane-tests PRIVATE Threads::Threads)
+    target_compile_features(strix-host-lane-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-host-lane-tests)
+    add_test(NAME strix-host-lane-tests COMMAND strix-host-lane-tests)
+    set_tests_properties(strix-host-lane-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Checkpoint publication and reads under the process-wide byte budget (the test sets its own small cap).
+    add_executable(strix-governed-checkpoint-io-tests tests/governed_checkpoint_io_tests.cpp)
+    target_include_directories(strix-governed-checkpoint-io-tests PRIVATE src)
+    target_link_libraries(strix-governed-checkpoint-io-tests PRIVATE strix_state_cache Threads::Threads)
+    target_compile_features(strix-governed-checkpoint-io-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-governed-checkpoint-io-tests)
+    add_test(NAME strix-governed-checkpoint-io-tests COMMAND strix-governed-checkpoint-io-tests)
+    set_tests_properties(strix-governed-checkpoint-io-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_executable(strix-rotary-descriptor-tests tests/rotary_descriptor_tests.cpp)
     target_link_libraries(strix-rotary-descriptor-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-rotary-descriptor-tests)
@@ -898,6 +917,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-frontend-tests)
     add_test(NAME strix-serve-frontend-tests COMMAND strix-serve-frontend-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/chat_template_cases.json)
+    # Incremental encoding: ids equal to the one-shot encoding at every slice end, for every pre-tokenizer, and the
+    # prompt stream that runs it on the host lane.
+    add_executable(strix-incremental-tokenizer-tests tests/incremental_tokenizer_tests.cpp)
+    target_link_libraries(strix-incremental-tokenizer-tests PRIVATE strix_serve)
+    target_include_directories(strix-incremental-tokenizer-tests PRIVATE src)
+    strix_target_warnings(strix-incremental-tokenizer-tests)
+    add_test(NAME strix-incremental-tokenizer-tests COMMAND strix-incremental-tokenizer-tests)
+    set_tests_properties(strix-incremental-tokenizer-tests PROPERTIES LABELS "cpu" TIMEOUT 300)
     add_executable(strix-glm-tokenizer-tests tests/glm_tokenizer_tests.cpp)
     target_link_libraries(strix-glm-tokenizer-tests PRIVATE strix_serve)
     strix_target_warnings(strix-glm-tokenizer-tests)
@@ -932,6 +959,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serve-json-constraint-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-json-constraint-tests)
     add_test(NAME strix-serve-json-constraint-tests COMMAND strix-serve-json-constraint-tests)
+
+    add_executable(strix-serve-media-tests tests/serve_media_tests.cpp)
+    target_link_libraries(strix-serve-media-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-media-tests)
+    add_test(NAME strix-serve-media-tests COMMAND strix-serve-media-tests)
     add_executable(strix-serve-observe-tests tests/serve_observe_tests.cpp)
     target_link_libraries(strix-serve-observe-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-observe-tests)

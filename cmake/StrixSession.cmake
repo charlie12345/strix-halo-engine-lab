@@ -31,6 +31,7 @@ endfunction()
 
 add_library(strix_session STATIC
     "${_strix_session_root}/src/session/backend_cpu.cpp"
+    "${_strix_session_root}/src/session/embed_rows.cpp"
     "${_strix_session_root}/src/session/kv.cpp"
     "${_strix_session_root}/src/session/prefix_cache.cpp"
     "${_strix_session_root}/src/session/parallel_job.cpp")

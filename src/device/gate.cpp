@@ -44,11 +44,26 @@ std::string roles_text(const Descriptor& d) {
     return out.empty() ? "-" : out;
 }
 
+std::string rate_text(double value) {
+    char text[32];
+    std::snprintf(text, sizeof text, "%g", value);
+    return text;
+}
+
+std::vector<Descriptor> other_units(const Declaration& declaration) {
+    std::vector<Descriptor> out;
+    for (const auto& d : declaration.devices)
+        if (d.kind != Kind::gpu && !d.excluded) out.push_back(d);
+    return out;
+}
+
 [[noreturn]] void refuse(const std::string& why) { throw Refusal("device gate: refusing to start: " + why); }
 
 // Identity comparison of one declared entry against one enumerated device.
 enum class Match { none, yes, conflict };
 Match match(const Descriptor& d, const Visible& v) {
+    // The enumerators list GPUs only. An entry of another kind that carries this GPU's address is a wrong file.
+    if (d.kind == Kind::cpu) return Match::none;
     const bool uuid_known = !d.uuid.empty() && !v.uuid.empty();
     const bool pci_known = !d.pci.empty() && !v.pci.empty();
     const bool uuid_hit = uuid_known && d.uuid == v.uuid;
@@ -147,7 +162,8 @@ Verdict classify(const Declaration& declaration, const Visible& visible) {
         return out;
     }
     const auto& d = *out.declared;
-    if (d.excluded) out.reason = "excluded" + (d.reason.empty() ? std::string() : " (" + d.reason + ")");
+    if (d.kind != Kind::gpu) out.reason = "declared as " + d.id + " with kind " + std::string(kind_name(d.kind)) + ", the device is a GPU";
+    else if (d.excluded) out.reason = "excluded" + (d.reason.empty() ? std::string() : " (" + d.reason + ")");
     else if (d.roles.empty()) out.reason = "declared as " + d.id + " without a role";
     else if (!d.arch.empty() && !visible.arch.empty() && d.arch != lower(visible.arch))
         out.reason = "declared as " + d.id + " with arch " + d.arch + ", the device reports " + visible.arch;
@@ -164,7 +180,7 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
 
     if (!declaration) {
         if (request.vendor == Vendor::amd && visible.size() == 1 && visible.front().integrated && request.select.empty())
-            return Bound{implicit_integrated(visible.front()), visible.front(), "implicit"};
+            return Bound{implicit_integrated(visible.front()), visible.front(), "implicit", {}};
         std::string list;
         for (const auto& v : visible) list += (list.empty() ? "" : "; ") + describe(v);
         refuse("no device declaration was found, so every " + vendor +
@@ -192,7 +208,7 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
     };
     const auto bind = [&](std::size_t i) {
         if (!verdicts[i].eligible) refuse("device " + describe(visible[i]) + " is " + verdicts[i].reason + "." + listing());
-        Bound bound{*verdicts[i].declared, visible[i], declaration->source};
+        Bound bound{*verdicts[i].declared, visible[i], declaration->source, other_units(*declaration)};
         if (!request.role.empty())
             if (auto why = role_refusal(bound.device, request.role); !why.empty()) refuse(why + "." + listing());
         return bound;
@@ -203,6 +219,8 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
         for (const auto& d : declaration->devices)
             if (d.id == request.select) wanted = &d;
         if (!wanted) refuse("device id " + request.select + " is not declared." + listing());
+        if (wanted->kind != Kind::gpu)
+            refuse("device id " + request.select + " is a " + std::string(kind_name(wanted->kind)) + " unit, not a GPU." + listing());
         if (wanted->vendor != request.vendor) refuse("device id " + request.select + " is not a " + vendor + " device." + listing());
         for (std::size_t i = 0; i < visible.size(); ++i)
             if (verdicts[i].declared == wanted) return bind(i);
@@ -265,14 +283,54 @@ Bound start_gate(Enumerator& enumerator, Request request, const std::string& dev
     return resolve(path.empty() ? nullptr : &declaration, enumerator.enumerate(), request);
 }
 
+std::string units_text(const std::vector<Descriptor>& units) {
+    std::string out;
+    for (const auto& d : units) {
+        out += (out.empty() ? "" : ",") + std::string(kind_name(d.kind)) + ":" + d.id + "[";
+        std::string roles;
+        for (const auto& role : d.roles) roles += (roles.empty() ? "" : ",") + role + (role_refusal(d, role).empty() ? "" : "(refused)");
+        out += roles.empty() ? "-" : roles;
+        if (!d.cores_text.empty()) out += " cores=" + d.cores_text;
+        if (d.byte_cap_gbytes_ps > 0.0) out += " byte_cap=" + rate_text(d.byte_cap_gbytes_ps) + "GB/s";
+        if (!d.corun_qualification.empty()) out += " qualified=" + d.corun_qualification;
+        out += "]";
+    }
+    return out.empty() ? "-" : out;
+}
+
 std::string receipt_line(const Bound& bound) {
     const auto& d = bound.device;
     const auto& v = bound.visible;
     return "device: id=" + d.id + " vendor=" + std::string(vendor_name(v.vendor)) + " uuid=" + shown_uuid(v.vendor, v.uuid) +
            " pci=" + (v.pci.empty() ? std::string("-") : v.pci) + " name=\"" + v.name + "\" arch=" + (v.arch.empty() ? std::string("-") : v.arch) +
            " ordinal=" + std::to_string(v.ordinal) + " attach=" + attach_text(d.attach) + " roles=" + roles_text(d) +
-           " declared=" + bound.source;
+           " declared=" + bound.source + (bound.units.empty() ? std::string() : " units=" + units_text(bound.units));
 }
+
+namespace {
+// Absent without units, so a receipt from a GPU-only declaration keeps its bytes.
+std::string units_json(const std::vector<Descriptor>& units) {
+    if (units.empty()) return {};
+    std::string out = ",\"units\":[";
+    for (std::size_t i = 0; i < units.size(); ++i) {
+        const auto& d = units[i];
+        std::string granted, refused;
+        for (const auto& role : d.roles) {
+            auto& list = role_refusal(d, role).empty() ? granted : refused;
+            list += (list.empty() ? "" : ",") + role;
+        }
+        out += std::string(i ? "," : "") + "{\"id\":" + json_string(d.id) + ",\"kind\":" + json_string(kind_name(d.kind)) +
+               ",\"roles\":" + json_string(granted) + ",\"roles_refused\":" + json_string(refused);
+        if (d.kind == Kind::cpu)
+            out += ",\"cores\":" + json_string(d.cores_text) + ",\"byte_cap_gbytes_ps\":" + rate_text(d.byte_cap_gbytes_ps);
+        if (d.kind == Kind::npu)
+            out += ",\"pci\":" + json_string(d.pci) + ",\"driver\":" + json_string(d.driver) + ",\"firmware\":" + json_string(d.firmware) +
+                   ",\"corun_qualification\":" + json_string(d.corun_qualification);
+        out += "}";
+    }
+    return out + "]";
+}
+} // namespace
 
 std::string receipt_json(const Bound& bound) {
     const auto& d = bound.device;
@@ -280,7 +338,7 @@ std::string receipt_json(const Bound& bound) {
     return "{\"id\":" + json_string(d.id) + ",\"vendor\":" + json_string(vendor_name(v.vendor)) +
            ",\"uuid\":" + json_string(v.uuid.empty() ? std::string() : shown_uuid(v.vendor, v.uuid)) + ",\"pci\":" + json_string(v.pci) +
            ",\"name\":" + json_string(v.name) + ",\"arch\":" + json_string(v.arch) + ",\"attach\":" + json_string(attach_text(d.attach)) +
-           ",\"roles\":" + json_string(roles_text(d)) + ",\"declared\":" + json_string(bound.source) + "}";
+           ",\"roles\":" + json_string(roles_text(d)) + ",\"declared\":" + json_string(bound.source) + units_json(bound.units) + "}";
 }
 
 CommandLine take_command_line(int& argc, char** argv) {

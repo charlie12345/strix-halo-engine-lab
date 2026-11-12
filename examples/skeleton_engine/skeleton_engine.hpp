@@ -66,6 +66,7 @@ class Engine final : public ss::Engine {
     ss::Backend& backend_;
     ss::Queue queue_;
     std::array<ss::Buffer, kSlots> rows_;
+    std::array<std::shared_ptr<const ss::EmbedTable>, kSlots> embeds_; // per lane, see bind_embeds
     ss::Capabilities limits_;
 
 public:
@@ -78,6 +79,7 @@ public:
         limits_.max_slots = kSlots;
         limits_.max_batch = 1;
         limits_.prefix_cache = true;
+        limits_.embed_rows = true;
     }
 
     ss::Capabilities caps() const override { return limits_; }
@@ -91,6 +93,12 @@ public:
     void prefill(std::span<const std::uint32_t> ids, ss::KvHandle& k) override {
         anchor(k);
         consume(k, ids);
+    }
+
+    // Embedding rows (image input): the table that resolves the virtual ids of
+    // the rows this lane consumes next.
+    void bind_embeds(ss::KvHandle& k, std::shared_ptr<const ss::EmbedTable> table) override {
+        embeds_.at(k.slot) = std::move(table);
     }
 
     ss::StepResult decode(ss::KvHandle& k, const ss::SamplerState& s) override {
@@ -126,6 +134,15 @@ private:
         if (ids.empty()) return;
         const auto at = static_cast<std::size_t>(store.consumed(k));
         if (at + ids.size() > kContext) throw std::length_error("skeleton context exceeded");
+        // Prevalidation of virtual ids, before any write. A real family then
+        // fills its embed stage: token rows by lookup, virtual rows by copying
+        // table->find(embed_handle(id))->row(embed_row(id)), plus its per-row
+        // extras (role, positions, real_token_id). The stand-in keeps the ids.
+        if (ss::has_embed_ids(ids)) {
+            const auto& table = embeds_.at(k.slot);
+            if (!table) throw std::invalid_argument("embedding rows without a bound table");
+            table->validate(ids);
+        }
         backend_.upload(queue_, slice(k, at, ids.size()), std::as_bytes(ids));
         backend_.synchronize(queue_);
         store.append_consumed(k, ids);
@@ -156,8 +173,8 @@ private:
     ss::Hooks hooks() {
         ss::Hooks h;
         h.initialize = [](ss::KvHandle) {};
-        h.reset = [](ss::KvHandle) {};
-        h.release = [](ss::KvHandle) {};
+        h.reset = [this](ss::KvHandle k) { embeds_.at(k.slot).reset(); };
+        h.release = [this](ss::KvHandle k) { embeds_.at(k.slot).reset(); };
         h.capture = [this](ss::KvHandle k, std::uint32_t) { return snapshot(k); };
         h.view = [this](ss::KvHandle k, std::uint32_t) { return snapshot(k); };
         h.restore = [this](ss::KvHandle k, std::uint32_t, const ss::RankState& state) {

@@ -290,13 +290,27 @@ bool XferExchange::fused_boundary_rows(const float* part, const float* X, const 
     return true;
 }
 
+XferExchange::ProducerSlot XferExchange::producer_slot(unsigned rows, hipStream_t s) {
+    if (rows == 0 || rows > max_rows_) return {};
+    Exchanger& x = ensure(s);
+    const auto t = x.producer_target();
+    auto* data = static_cast<float*>(x.tx());
+    produced_ = data;
+    return {data, {t.flag, t.counter, t.sequence}};
+}
+
 void XferExchange::boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flag,
                                   unsigned rows, unsigned flag_stride, hipStream_t s) {
     if (rows == 0 || rows > max_rows_) throw std::invalid_argument("glm xfer exchange: rows");
     Exchanger& x = ensure(s);
     const std::size_t bytes = GlmSchedule::row_bytes(rows);
     strix::xport::TransportBackend<Exchanger> backend(x);
-    const auto ticket = backend.post_copy(Tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_}, part, bytes);
+    const Tag tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_};
+    // A partial produced in the slot of producer_slot() is already written and published by its last kernel.
+    const bool produced = produced_ != nullptr && part == produced_;
+    if (produced_ != nullptr && !produced) throw std::logic_error("glm xfer exchange: producer slot taken but not used by the next boundary");
+    produced_ = nullptr;
+    const auto ticket = produced ? backend.post_publish(tag, bytes, Publish::producer) : backend.post_copy(tag, part, bytes);
     ++layer_;
     if (use_bracket_) {
         if (bracket_ == nullptr) ok(hipMalloc(reinterpret_cast<void**>(&bracket_), GlmSchedule::row_bytes(max_rows_) * kHc), "bracket");

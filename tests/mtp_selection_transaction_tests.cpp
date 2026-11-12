@@ -2,6 +2,11 @@
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/serve/constraint_selection.hpp"
 
+#include <functional>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -698,8 +703,129 @@ void argmax_first() {
     check(known_answer > 100 && known_forced > 10 && known_reasoning > 100 && known_declined > 1000, "argmax-first coverage");
 }
 
+// Mask-ahead: the worker only changes who walks a mask. Three executors cover the three ways a row meets its
+// slot: built before the row (inline executor), never started (dropped job: the row builds it), and a real
+// thread racing the rows.
+void mask_ahead() {
+    const std::vector<std::string> vocab{"{", "}", "\"a\"", ":", "12", ",", "\"", "{\"", "\":", "z", "x", "1}", "a"};
+    const std::uint32_t eos = 9, end_thinking = 10, n = static_cast<std::uint32_t>(vocab.size());
+    Fixture f(vocab);
+    const std::array<std::uint32_t, 1> excluded{eos};
+    f.trie = std::make_shared<TokenByteTrie>(*f.tokenizer, excluded);
+    const std::array<const char*, 3> schemas{"", "{\"const\":{}}", "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}}"};
+    constexpr std::array<float, 7> values{-1, -0.0F, 0.0F, 1, 2, 2, 3};
+    std::uint64_t seed = 777;
+    const auto next = [&] { seed = seed * 6364136223846793005ULL + 1442695040888963407ULL; return static_cast<std::uint32_t>(seed >> 33); };
+    const auto random_row = [&] { std::vector<float> row(n); for (auto& v : row) v = values[next() % values.size()]; return row; };
+    const auto lowest_max = [](const std::vector<float>& row) {
+        std::uint32_t g = 0;
+        for (std::uint32_t i = 1; i < row.size(); ++i) if (row[i] > row[g]) g = i;
+        return g;
+    };
+    struct Worker {
+        std::mutex m; std::condition_variable cv; std::deque<std::function<void()>> q; bool stop = false; std::thread t;
+        Worker() : t([this] {
+            for (;;) {
+                std::function<void()> job;
+                { std::unique_lock lock(m); cv.wait(lock, [this] { return stop || !q.empty(); }); if (q.empty()) return; job = std::move(q.front()); q.pop_front(); }
+                job();
+            }
+        }) {}
+        ~Worker() { { std::lock_guard lock(m); stop = true; } cv.notify_all(); t.join(); }
+        void submit(std::function<void()> job) { { std::lock_guard lock(m); q.push_back(std::move(job)); } cv.notify_one(); }
+    } worker;
+    std::uint64_t jobs = 0, windows = 0, rows_checked = 0, serial_rows = 0, ranked_rows = 0;
+    std::array<std::uint64_t, 3> ahead_rows{}, ahead_masks{};
+    for (unsigned executor = 0; executor < 3; ++executor) for (unsigned program = 0; program < 3; ++program)
+    for (unsigned policy = 0; policy < 3; ++policy) for (unsigned thinking = 0; thinking < 2; ++thinking) for (unsigned argmax = 0; argmax < 3; ++argmax) {
+        // argmax 0: every answer row walks a mask; 1: argmax-first with two ranked candidates (the rest falls to
+        // the mask); 2: argmax-first, ranked membership off.
+        const unsigned ranked = argmax == 1 ? 2U : 0U;
+        ConstraintSpec spec; spec.eos_ids = {eos}; spec.end_thinking_id = end_thinking;
+        spec.program = std::make_shared<ConstraintProgram>(program ? compile_json_schema(parse_json(schemas[program])) : compile_json_object());
+        spec.logprobs = policy == 1; spec.top_logprobs = 3;
+        if (policy == 2) spec.transform.bias = {{1, 0.5}};
+        if (thinking) { spec.starts_in_reasoning = true; spec.thinking = ThinkingPolicy{0, 0, 3, {end_thinking, 5}}; }
+        const ConstraintAheadSubmit submit = [&, executor](std::function<void()> job) {
+            ++jobs;
+            if (executor == 0) job(); else if (executor == 2) worker.submit(std::move(job));
+        };
+        for (unsigned walk = 0; walk < 24; ++walk) {
+            // Windows: plain serial selection against a window whose drafts are sometimes wrong.
+            const auto serial_spec = copy_spec(spec), window_spec = copy_spec(spec);
+            auto serial = f.selection(serial_spec), windowed = f.selection(window_spec);
+            serial->set_argmax_first(false); windowed->set_argmax_first(argmax != 0); windowed->set_ranked(ranked);
+            windowed->set_mask_ahead(submit);
+            auto t = windowed->window_transaction();
+            for (unsigned window = 0; window < 6 && !serial->state().terminal; ++window) {
+                std::vector<std::vector<float>> rows; std::vector<ConstraintSelection::Staged> want; std::vector<std::uint32_t> drafts;
+                auto state = serial->state();
+                bool refused = false;
+                for (unsigned r = 0; r < 5 && !state.terminal; ++r) {
+                    rows.push_back(random_row());
+                    try { want.push_back(serial->select_row(rows.back(), state)); } catch (const ConstraintError&) { rows.pop_back(); refused = true; break; }
+                    state = want.back().state;
+                    drafts.push_back(next() % 4 ? want.back().token : next() % n);
+                }
+                if (want.empty()) { check(refused, "an empty window is a refusal"); break; }
+                if (next() % 3 == 0 && drafts.size() > 1) drafts.pop_back();   // the last row may have no draft
+                t->reset(); t->expect(drafts); ++windows;
+                std::size_t taken = 0;
+                for (std::size_t r = 0; r < want.size(); ++r) {
+                    std::uint32_t id = 0;
+                    if (next() % 2) { auto k = t->select_known(lowest_max(rows[r]), 0); id = k ? *k : t->select(rows[r]); }
+                    else id = t->select(rows[r]);
+                    check(id == want[r].token, "mask-ahead window row equals serial row");
+                    ++taken; ++rows_checked;
+                    if (r >= drafts.size() || drafts[r] != id) break;
+                }
+                auto receipt = t->seal();
+                check(receipt->size() == taken, "mask-ahead window receipt size");
+                receipt->publish();
+                for (std::size_t r = 0; r < taken; ++r) serial->commit(want[r]);
+                check(same_state(windowed->state(), serial->state(), spec, *f.trie), "mask-ahead window equals serial frontier");
+            }
+            scores_equal(window_spec->scores->tokens, serial_spec->scores->tokens);
+            const auto v = windowed->verdict("stop", "test");
+            ahead_rows[executor] += v.profile_ahead_rows;
+            // Serial rows: the committed state is planned at prepare(), taken at select().
+            const auto plain_spec = copy_spec(spec), row_spec = copy_spec(spec);
+            auto plain = f.selection(plain_spec), ahead = f.selection(row_spec);
+            plain->set_argmax_first(false); ahead->set_argmax_first(argmax != 0); ahead->set_ranked(ranked); ahead->set_mask_ahead(submit);
+            ranked_rows += v.profile_ranked_rows;
+            ConstraintRowSelection route(ahead);
+            for (unsigned r = 0; r < 12 && !plain->state().terminal; ++r) {
+                const auto row = random_row();
+                std::optional<ConstraintSelection::Staged> want;
+                try { want = plain->select_row(row, plain->state()); } catch (const ConstraintError&) {}
+                route.prepare();
+                if (next() % 5 == 0) route.prepare();   // a replanned row drops its first plan
+                std::optional<std::uint32_t> got;
+                try { got = route.select(row); } catch (const ConstraintError&) {}
+                check(want.has_value() == got.has_value(), "mask-ahead serial row refuses exactly when the plain row does");
+                if (!want) break;
+                check(*got == want->token, "mask-ahead serial row equals the plain row");
+                plain->commit(*want); route.commit(); ++serial_rows;
+                check(same_state(ahead->state(), plain->state(), spec, *f.trie), "mask-ahead serial frontier");
+            }
+            scores_equal(row_spec->scores->tokens, plain_spec->scores->tokens);
+            const auto rv = ahead->verdict("stop", "test");
+            ahead_rows[executor] += rv.profile_ahead_rows;
+            if (executor != 2) ahead_masks[executor] += v.profile_ahead_masks + rv.profile_ahead_masks;
+        }
+    }
+    check(jobs > 1000 && windows > 1000 && rows_checked > 3000 && serial_rows > 1000 && ranked_rows > 200, "mask-ahead and ranked coverage");
+    check(ahead_rows[0] > 500 && ahead_masks[0] >= ahead_rows[0], "inline executor: rows take worker-built masks");
+    check(ahead_rows[1] == 0 && ahead_masks[1] == 0, "dropped jobs: every row builds its own mask");
+    // No submit callback: no plan.
+    ConstraintSpec spec; spec.eos_ids = {eos}; spec.program = std::make_shared<ConstraintProgram>(compile_json_object());
+    auto off = f.selection(copy_spec(spec));
+    check(!off->plan_ahead(off->state(), {}), "mask-ahead is off without a submit callback");
+}
+
 int main() try {
     argmax_first();
+    mask_ahead();
     selection_failures(); routes_and_reuse(); boundaries(); allocation_failures(); masks_and_cohorts(); enumeration(); masked_enumeration(); grammar_and_thinking();
     // A four-row window can reject comparisons at rows 0..2; row 3 is bonus.
     check(rejection_rows[0] && rejection_rows[1] && rejection_rows[2], "rejection coverage");

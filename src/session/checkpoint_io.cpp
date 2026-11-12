@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <vector>
 #include <fstream>
@@ -17,11 +18,16 @@
 #else
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace strix::session::checkpoint_io {
 namespace {
+thread_local std::uint64_t observed_activity = 0;
 void inject(Operation op) {
     if (faults().fail == op) {
         if (faults().skip) --faults().skip;
@@ -35,6 +41,7 @@ std::filesystem::path parent(const std::filesystem::path& p) {
     return p.parent_path().empty() ? std::filesystem::path(".") : p.parent_path();
 }
 }
+std::uint64_t activity() noexcept { return observed_activity; }
 Faults& faults() noexcept { static thread_local Faults value; return value; }
 std::span<const std::byte> take(std::span<const std::byte> bytes, std::size_t& at, std::uint64_t n) {
     check(at <= bytes.size() && n <= bytes.size() - at, Operation::read, "checkpoint frame bounds");
@@ -42,6 +49,7 @@ std::span<const std::byte> take(std::span<const std::byte> bytes, std::size_t& a
     at += static_cast<std::size_t>(n); return out;
 }
 void sync_directory(const std::filesystem::path& dir, bool durable) {
+    ++observed_activity;
     if (!durable) return;
     inject(Operation::directory_sync);
 #ifndef _WIN32
@@ -57,6 +65,7 @@ void sync_directory(const std::filesystem::path& dir, bool durable) {
 #endif
 }
 void create_directories(const std::filesystem::path& dir, bool durable) {
+    ++observed_activity;
     std::vector<std::filesystem::path> missing;
     for (auto p = std::filesystem::absolute(dir); !std::filesystem::exists(p); p = p.parent_path())
         missing.push_back(p);
@@ -64,6 +73,7 @@ void create_directories(const std::filesystem::path& dir, bool durable) {
     for (auto it = missing.rbegin(); it != missing.rend(); ++it) sync_directory(it->parent_path(), durable);
 }
 void sync_existing(const std::filesystem::path& p) {
+    ++observed_activity;
     inject(Operation::sync);
 #ifdef _WIN32
     const auto h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -79,32 +89,74 @@ void sync_existing(const std::filesystem::path& p) {
     check(ok == 0 && closed == 0, Operation::sync, "checkpoint retained file fsync failed");
 #endif
 }
+void publish_directory(const std::filesystem::path& temporary, const std::filesystem::path& target, bool durable) {
+    ++observed_activity;
+    check(std::filesystem::equivalent(parent(temporary), parent(target)), Operation::replace,
+        "checkpoint directory publication requires the same parent");
+    check(!std::filesystem::is_symlink(temporary) && std::filesystem::is_directory(temporary),
+        Operation::replace, "checkpoint publication source is not a directory");
+    check(!std::filesystem::exists(target) && !std::filesystem::is_symlink(target),
+        Operation::replace, "checkpoint immutable directory target exists");
+    inject(Operation::replace);
+#ifdef _WIN32
+    check(MoveFileExW(temporary.c_str(), target.c_str(), durable ? MOVEFILE_WRITE_THROUGH : 0) != 0,
+        Operation::replace, "checkpoint immutable directory rename failed");
+#elif defined(__linux__) && defined(SYS_renameat2)
+    // rename() alone can overwrite an empty directory; RENAME_NOREPLACE cannot.
+    check(::syscall(SYS_renameat2, AT_FDCWD, temporary.c_str(), AT_FDCWD, target.c_str(), 1U) == 0,
+        Operation::replace, "checkpoint immutable directory rename failed");
+#elif defined(__APPLE__)
+    check(::renamex_np(temporary.c_str(), target.c_str(), RENAME_EXCL) == 0,
+        Operation::replace, "checkpoint immutable directory rename failed");
+#else
+    throw Error(Operation::replace, "checkpoint no-replace directory publication unsupported");
+#endif
+    sync_directory(parent(target), durable); // A failure here cannot undo visibility.
+}
 struct DirectoryLock::Impl {
 #ifdef _WIN32
     HANDLE handle = INVALID_HANDLE_VALUE;
-    ~Impl() { if (handle != INVALID_HANDLE_VALUE) { OVERLAPPED o{}; UnlockFileEx(handle,0,MAXDWORD,MAXDWORD,&o); CloseHandle(handle); } }
+    DWORD low = MAXDWORD, high = MAXDWORD;
+    ~Impl() { if (handle != INVALID_HANDLE_VALUE) { OVERLAPPED o{}; UnlockFileEx(handle,0,low,high,&o); CloseHandle(handle); } }
 #else
     int fd = -1;
     ~Impl() { if (fd >= 0) { (void)::flock(fd, LOCK_UN); ::close(fd); } }
 #endif
 };
-DirectoryLock::DirectoryLock(const std::filesystem::path& dir, LockMode mode) : impl_(std::make_unique<Impl>()) {
+DirectoryLock::DirectoryLock(const std::filesystem::path& dir, LockMode mode, const std::string& basename, LockRange range) : impl_(std::make_unique<Impl>()) {
+    ++observed_activity;
+#ifndef _WIN32
+    (void)range; // flock always locks the inode, including legacy first-byte callers.
+#endif
     check(!dir.empty(), Operation::create, "checkpoint empty lock directory");
+    // A leading dot also excludes Windows device names (CON, NUL, COM1, ...).
+    // Validate before directory creation or opening any host path.
+    check(basename.size() > 1 && basename.size() <= 255 && basename.front() == '.' && basename.back() != '.' &&
+        basename.find("..") == std::string::npos && std::all_of(basename.begin(), basename.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == '.' || c == '-' || c == '_';
+        }), Operation::create, "checkpoint lock basename must be a private filename");
     checkpoint_io::create_directories(dir, true);
-    const auto path = dir / ".session.lock"; // Persistent inode: never remove or replace.
+    const auto path = dir / basename; // Persistent inode: never remove or replace.
 #ifdef _WIN32
+    if (range == LockRange::first_byte || basename != ".session.lock") { impl_->low = 1; impl_->high = 0; }
     impl_->handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     check(impl_->handle != INVALID_HANDLE_VALUE, Operation::create, "checkpoint directory lock open failed");
     OVERLAPPED o{};
-    check(LockFileEx(impl_->handle, LOCKFILE_EXCLUSIVE_LOCK | (mode == LockMode::nonblocking ? LOCKFILE_FAIL_IMMEDIATELY : 0),
-        0, MAXDWORD, MAXDWORD, &o) != 0, Operation::create, "checkpoint directory locked/unavailable");
+    if (!LockFileEx(impl_->handle, LOCKFILE_EXCLUSIVE_LOCK | (mode == LockMode::nonblocking ? LOCKFILE_FAIL_IMMEDIATELY : 0),
+        0, impl_->low, impl_->high, &o)) {
+        const auto error = GetLastError();
+        throw Error(Operation::create, "checkpoint directory locked/unavailable",
+            mode == LockMode::nonblocking && error == ERROR_LOCK_VIOLATION);
+    }
 #else
     impl_->fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     check(impl_->fd >= 0, Operation::create, "checkpoint directory lock open failed");
     int result; do { result = ::flock(impl_->fd, LOCK_EX | (mode == LockMode::nonblocking ? LOCK_NB : 0)); }
         while (result < 0 && errno == EINTR);
-    check(result == 0, Operation::create, "checkpoint directory locked/unavailable");
+    if (result != 0) throw Error(Operation::create, "checkpoint directory locked/unavailable",
+        mode == LockMode::nonblocking && (errno == EWOULDBLOCK || errno == EAGAIN));
 #endif
 }
 DirectoryLock::~DirectoryLock() = default;
@@ -132,7 +184,10 @@ struct Publication::Impl {
         if (created && !committed && !temporary.empty()) { std::error_code ec; std::filesystem::remove(temporary, ec); }
     }
 };
-Publication::Publication(const std::filesystem::path& target, Options options) : impl_(std::make_unique<Impl>()) {
+Publication::Publication(const std::filesystem::path& target, Options options) {
+    ++observed_activity;
+    inject(Operation::allocation);
+    impl_ = std::make_unique<Impl>();
     auto& p = *impl_; p.target = target; p.options = options;
     checkpoint_io::create_directories(parent(target), options.durable);
     static std::atomic<std::uint64_t> sequence{0};
@@ -140,8 +195,14 @@ Publication::Publication(const std::filesystem::path& target, Options options) :
     const std::filesystem::path prefix(options.temporary_prefix);
     check(options.temporary_prefix.find_first_of("/\\") == std::string::npos && !prefix.has_root_path() &&
         options.temporary_prefix!="." && options.temporary_prefix!="..", Operation::create, "checkpoint temporary prefix is not a filename");
+    check(options.temporary_suffix.empty() || (options.temporary_suffix.front() == '.' &&
+        options.temporary_suffix.size() > 1 && std::all_of(options.temporary_suffix.begin()+1,
+        options.temporary_suffix.end(), [](unsigned char c) { return (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); })),
+        Operation::create, "checkpoint temporary suffix is not an extension");
     p.temporary = options.temporary_prefix.empty() ? target : parent(target)/options.temporary_prefix;
     p.temporary += ".tmp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(++sequence);
+    p.temporary += options.temporary_suffix;
     inject(Operation::create);
     if (options.direct == DirectIo::automatic && state_file_io::unbuffered_io_enabled()) {
         p.direct = std::make_unique<state_file_io::SequentialWriter>(p.temporary, true, options.permissions);
@@ -184,7 +245,7 @@ void Publication::write(std::span<const std::byte> bytes) {
         p.offset += done; bytes = bytes.subspan(static_cast<std::size_t>(done));
     }
 }
-void Publication::commit() {
+void Publication::commit(const std::function<void()>& flushed) {
     auto& p = *impl_; check(!p.committed, Operation::replace, "checkpoint already published");
     if (p.options.durable) inject(Operation::sync);
     if (p.direct) { p.direct->finish(p.options.durable); p.direct.reset(); }
@@ -198,10 +259,14 @@ void Publication::commit() {
             int result; do { result = ::fsync(p.fd); } while (result < 0 && errno == EINTR);
             check(result == 0, Operation::sync, "checkpoint fsync failed");
         }
+#if defined(POSIX_FADV_DONTNEED)
+        if (p.options.drop_page_cache) (void)::posix_fadvise(p.fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
         const auto fd = p.fd; p.fd = -1;
         check(::close(fd) == 0, Operation::sync, "checkpoint close failed");
 #endif
     }
+    if (flushed) flushed();
     inject(Operation::replace);
 #ifdef _WIN32
     check(MoveFileExW(p.temporary.c_str(), p.target.c_str(), MOVEFILE_REPLACE_EXISTING |
@@ -217,7 +282,9 @@ void atomic_write(const std::filesystem::path& p, std::span<const std::byte> byt
 }
 void read(const std::filesystem::path& p, std::uint64_t minimum, std::uint64_t maximum,
     const std::function<std::span<std::byte>(std::uint64_t)>& allocate, DirectIo direct,
-    const std::function<void(std::span<const std::byte>, std::uint64_t)>& observe) {
+    const std::function<void(std::span<const std::byte>, std::uint64_t)>& observe, std::size_t chunk_bytes) {
+    ++observed_activity;
+    check(chunk_bytes > 0, Operation::read, "checkpoint zero read chunk");
     auto admitted = [&](std::uint64_t n) {
         check(n >= minimum && n <= maximum && n <= std::numeric_limits<std::size_t>::max(), Operation::read, "checkpoint size outside admission budget");
         inject(Operation::allocation); auto bytes = allocate(n);
@@ -227,7 +294,7 @@ void read(const std::filesystem::path& p, std::uint64_t minimum, std::uint64_t m
         state_file_io::SequentialReader in(p); check(in.open(), Operation::read, "checkpoint open failed");
         auto bytes = admitted(in.size());
         for (std::size_t at = 0; at < bytes.size();) {
-            inject(Operation::read); const auto n = std::min(bytes.size() - at, state_file_io::chunk_bytes);
+            inject(Operation::read); const auto n = std::min({bytes.size() - at, state_file_io::chunk_bytes, chunk_bytes});
             in.read(bytes.data() + at, n);
             if (observe) observe(bytes.subspan(at,n),at);
             at += n;
@@ -239,12 +306,82 @@ void read(const std::filesystem::path& p, std::uint64_t minimum, std::uint64_t m
     const auto end = in.tellg(); check(end >= 0, Operation::read, "checkpoint size failed");
     auto bytes = admitted(static_cast<std::uint64_t>(end)); in.seekg(0);
     for (std::size_t at = 0; at < bytes.size();) {
-        inject(Operation::read); const auto n = std::min<std::size_t>(bytes.size() - at, 1U << 26);
+        inject(Operation::read); const auto n = std::min({bytes.size() - at, chunk_bytes, std::size_t{1} << 26});
         in.read(reinterpret_cast<char*>(bytes.data() + at), static_cast<std::streamsize>(n));
         check(bool(in), Operation::read, "checkpoint truncated during read");
         if (observe) observe(bytes.subspan(at,n),at);
         at += n;
     }
     check(in.peek() == std::ifstream::traits_type::eof(), Operation::read, "checkpoint grew during read");
+    // Small observer chunks may leave prefetched bytes in the stream buffer.
+    // Recheck the opened file itself so truncation cannot hide behind that buffer.
+    in.clear(); in.seekg(0, std::ios::end);
+    check(in.tellg() == end, Operation::read, "checkpoint length changed during read");
+}
+void read(const std::filesystem::path& path, std::vector<std::uint8_t>& out,
+          DirectIo direct, bool drop_page_cache) {
+#ifdef _WIN32
+    (void)direct; (void)drop_page_cache;
+    checkpoint_io::read(path, 0, std::numeric_limits<std::size_t>::max(), [&](std::uint64_t n) {
+        out.resize(static_cast<std::size_t>(n)); return std::as_writable_bytes(std::span(out));
+    });
+#else
+    ++observed_activity;
+    struct File {
+        int fd = -1;
+        ~File() { if (fd >= 0) ::close(fd); }
+    } file;
+    bool is_direct = false;
+#if defined(__linux__)
+    if (direct == DirectIo::automatic && !state_file_io::fault_injection().refuse_direct.load()) {
+        file.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+        is_direct = file.fd >= 0;
+    }
+#else
+    (void)direct;
+#endif
+    if (file.fd < 0) file.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    check(file.fd >= 0, Operation::read, "checkpoint open failed");
+    struct stat st{};
+    check(::fstat(file.fd, &st) == 0 && st.st_size >= 0, Operation::read, "checkpoint size failed");
+    constexpr std::size_t alignment = 4096, chunk = 16U << 20;
+    const auto n = static_cast<std::uint64_t>(st.st_size);
+    check(n <= std::numeric_limits<std::size_t>::max() - 3 * alignment,
+        Operation::allocation, "checkpoint aligned allocation overflow");
+    const auto size = static_cast<std::size_t>(n);
+    inject(Operation::allocation);
+    out.resize(((size + alignment-1) / alignment + 2) * alignment);
+    auto* base = out.data();
+    const auto offset = (alignment - reinterpret_cast<std::uintptr_t>(base) % alignment) % alignment;
+    auto* dst = base + offset;
+    std::size_t at = 0;
+    while (at < size) {
+        inject(Operation::read);
+        const auto want = std::min(chunk, (size-at+alignment-1)/alignment*alignment);
+        ssize_t got;
+        do { got = ::pread(file.fd, dst+at, want, static_cast<off_t>(at)); } while (got < 0 && errno == EINTR);
+        if (got < 0 && is_direct && at == 0) {
+            ::close(file.fd);
+            file.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            check(file.fd >= 0, Operation::read, "checkpoint buffered fallback open failed");
+            is_direct = false; continue;
+        }
+        check(got > 0 && static_cast<std::size_t>(got) <= size-at,
+            Operation::read, "checkpoint truncated or grew during read");
+        at += static_cast<std::size_t>(got);
+    }
+    struct stat end{};
+    check(::fstat(file.fd, &end) == 0 && end.st_size == st.st_size,
+        Operation::read, "checkpoint length changed during read");
+#if defined(POSIX_FADV_DONTNEED)
+    if (!is_direct && drop_page_cache) (void)::posix_fadvise(file.fd, 0, 0, POSIX_FADV_DONTNEED);
+#else
+    (void)drop_page_cache;
+#endif
+    const auto fd = file.fd; file.fd = -1;
+    check(::close(fd) == 0, Operation::read, "checkpoint read close failed");
+    if (offset) std::memmove(base, dst, size);
+    out.resize(size);
+#endif
 }
 } // namespace strix::session::checkpoint_io

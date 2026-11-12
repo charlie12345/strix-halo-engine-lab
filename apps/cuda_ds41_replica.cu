@@ -78,6 +78,7 @@
 //                               schats0b0 for the record), the other phases as --window says
 // The trace covers probe, fixed-window and compared (spec) phases only, never a timed controller arm; the survival table
 // is saved after the phase's last window is credited (outside every timed cycle).
+#include "strix/device/cuda_enumerator.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/ds41_replica_census.hpp"
 #include "strix/model_content_hash.hpp"
@@ -353,6 +354,9 @@ static std::optional<strix::ds41::dspark::WindowController::Table> resolve_prior
 }
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel
 #ifdef _WIN32
     _putenv_s("CUDA_MODULE_LOADING", "EAGER");

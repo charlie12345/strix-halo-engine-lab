@@ -31,7 +31,8 @@ struct MixedFixture final : ss::Engine {
 };
 sv::SessionHooks mixed_hooks() {
     sv::SessionHooks h;h.schedule=[](std::span<const sv::SessionView> views){sv::SessionWork w{sv::SessionPhase::mixed,{},{}};
-        for(std::size_t i=0;i<views.size();++i)w.lanes.push_back(i);return std::vector<sv::SessionWork>{w};};return h;
+        for(std::size_t i=0;i<views.size();++i) { w.lanes.push_back(i); }
+        return std::vector<sv::SessionWork>{w};};return h;
 }
 }
 int main() {
@@ -457,6 +458,209 @@ int main() {
             try{runtime.run();}catch(const std::runtime_error&){failed=true;}
             CHECK(failed && q.stopping() && stops==1);
             runtime.run();CHECK(stops==1);
+        }
+        {
+            // Opt-in native ticket protocol: authoritative receipt replacement,
+            // deferred FIFO ownership, generation checks and final drain turn.
+            FakeEngine e;e.limits.owner_control=true;sv::GenerationQueue q;
+            ss::Policy p;p.enabled=false;p.store=false;
+            sv::SessionHooks h;unsigned turns=0;bool drained=false;
+            h.native_validate=[](const auto&){};h.disable_native_cache=true;
+            h.drain_native_on_shutdown=true;h.native_drained=[&]{return drained;};
+            h.control_turn=[&](sv::SessionRuntime&){++turns;drained=true;};
+            sv::SessionRuntime r(q,e,e.store,p,h);
+            CHECK(!r.cache_owner() && r.cache_entries()==0 && !r.unpin_turn_cache("none"));
+            auto j=job();j.ngram_draft=true; // belongs to native ABI, not scalar SamplerState
+            auto cancelled=q.submit(j);cancelled->cancel();
+            auto ticket=q.submit(j);CHECK(r.reserve_fifo());
+            CHECK(drain(cancelled).stats.finish=="cancelled");
+            const auto head=r.reservation();CHECK(head && r.reserve(sv::QueueSelection::fifo) && r.reservation()==head);
+            const auto taken_time=head->started;
+            auto lease=r.activate(0,true);CHECK(lease.taken.started==taken_time);
+            r.notify_admitted(lease.state);
+            const sv::GenerationProgress progress{sv::GenerationPhase::prefill,1,0,3};
+            r.publish_progress(lease.state,progress);CHECK(ticket->progress()==progress);
+            const std::uint32_t id=65;CHECK(r.publish(lease.state,std::span(&id,1)));
+            sv::GenerationStats stats;stats.generated_tokens=1;stats.engine_extra={{"native","{\"preserved\":true}"}};
+            r.complete_native(lease.state,stats);
+            CHECK(r.ticket_cancelled(lease.state));
+            CHECK(ticket->stats().generated_tokens==1 && ticket->stats().engine_extra==stats.engine_extra);
+            bool stale=false;try{r.complete_native(lease.state,{});}catch(const std::invalid_argument&){stale=true;}CHECK(stale);
+            q.shutdown();r.run();CHECK(turns==1 && drained);
+        }
+        {
+            FakeEngine e;sv::GenerationQueue q;auto h=runtime_hooks(e);h.disable_native_cache=true;
+            bool refused=false;try{sv::SessionRuntime r(q,e,e.store,{},h);}catch(const std::invalid_argument&){refused=true;}
+            CHECK(refused); // no generic route may opt out of its ownership contract
+        }
+        {
+            FakeEngine e;sv::GenerationQueue q;auto h=runtime_hooks(e);
+            h.serial_queue_protocol=true;
+            bool refused=false;
+            try{sv::SessionRuntime r(q,e,e.store,{},h);}catch(const std::invalid_argument&){refused=true;}
+            CHECK(refused); // serial accounting cannot opt a scalar engine into native ownership
+        }
+        {
+            // A nonblocking reservation cannot implement CUDA's original idle
+            // take(true): the owner would spin. The opt-in wait must use that
+            // SAME take and dispatch control callbacks outside the queue lock.
+            FakeEngine e; e.limits.owner_control = true; sv::GenerationQueue q;
+            ss::Policy p; p.enabled = false; p.store = false;
+            sv::SessionHooks h; h.native_validate = [](const auto&) {};
+            h.disable_native_cache = true;
+            std::atomic<unsigned> turns{0};
+            h.control_turn = [&](sv::SessionRuntime& r) {
+                ++turns;
+                if (!r.reserve_fifo(true)) return;
+                const auto lease = r.activate(0, true);
+                r.complete_native(lease.state, {});
+                q.shutdown();
+            };
+            sv::SessionRuntime r(q, e, e.store, p, h);
+            // Deterministic stepping may never block, even if a native planner
+            // asks for the run() idle contract.
+            CHECK(r.step(false) && turns == 1 && !r.reservation());
+            std::exception_ptr failure;
+            // A control wake is the only
+            // queued work. Its callback submits while outside the queue lock.
+            unsigned controls = 0;
+            q.set_idle_control([&] { ++controls; CHECK(q.submit(job())); });
+            std::thread owner([&] { try { r.run(); } catch (...) { failure = std::current_exception(); } });
+            q.wake_control();
+            owner.join(); if (failure) std::rethrow_exception(failure);
+            CHECK(controls == 1 && turns == 3 && q.snapshot().completed == 1);
+        }
+        {
+            // Taken deferred work is independent of logical/native capacity.
+            // Checks stay active under NDEBUG via the fixture's CHECK macro.
+            FakeEngine e; e.limits.owner_control = true; e.limits.max_slots = 1;
+            sv::GenerationQueue q;
+            ss::Policy p; p.enabled = false; p.store = false;
+            sv::SessionHooks h; h.disable_native_cache = true;
+            h.control_turn = [](sv::SessionRuntime&) {};
+            unsigned validated = 0;
+            bool reject = false;
+            h.native_validate = [&](const auto&) { ++validated; if (reject) throw std::runtime_error("native admission refusal"); };
+            sv::SessionRuntime r(q, e, e.store, p, h);
+            std::vector<std::shared_ptr<sv::GenerationTicket>> tickets;
+            std::vector<sv::PendingSession> pending;
+            for (unsigned i = 0; i < 7; ++i) {
+                tickets.push_back(q.submit(job({10, 11, i + 12})));
+                CHECK(r.reserve_fifo());
+                const auto submitted = r.reservation()->submitted, started = r.reservation()->started;
+                const auto id = r.hold_reservation(); pending.push_back(id);
+                CHECK(r.inspect(id).submitted == submitted && r.inspect(id).started == started);
+                CHECK(!r.reservation() && r.live() == 0 && r.pending_count() == i + 1);
+            }
+            CHECK(e.initializes == 0 && e.releases == 0 && !r.cache_owner());
+            const auto* borrowed = &r.inspect(pending[1]);
+            const auto started = borrowed->started, submitted = borrowed->submitted;
+            reject = true;
+            bool refused = false;
+            try { (void)r.promote(pending[1]); } catch (const std::runtime_error&) { refused = true; }
+            CHECK(refused && r.pending_count() == 7 && e.initializes == 0 && &r.inspect(pending[1]) == borrowed);
+            reject = false;
+            const auto lane = r.promote(pending[1]);
+            CHECK(&lane.taken == borrowed && lane.taken.started == started && lane.taken.submitted == submitted);
+            CHECK(r.live() == 1 && r.pending_count() == 6 && r.pending_cancelled(pending[1]));
+            refused = false;
+            try { (void)r.promote(pending[2]); } catch (const std::runtime_error&) { refused = true; }
+            CHECK(refused && r.pending_count() == 6 && validated == 2);
+            // Foreign pending handles are refused before validation/accounting.
+            FakeEngine peer; peer.limits.owner_control = true;
+            sv::GenerationQueue pq;
+            sv::SessionHooks ph; ph.disable_native_cache = true; ph.control_turn = [](sv::SessionRuntime&) {};
+            sv::SessionRuntime pr(pq, peer, peer.store, p, ph);
+            for (auto operation : {0, 1, 2}) {
+                refused = false;
+                try {
+                    if (operation == 0) (void)pr.inspect(pending[2]);
+                    else if (operation == 1) (void)pr.promote(pending[2]);
+                    else pr.refuse_pending(pending[2]);
+                } catch (const std::invalid_argument&) { refused = true; }
+                CHECK(refused && peer.initializes == 0 && pq.snapshot().completed == 0);
+            }
+            CHECK(pr.pending_cancelled(pending[2]));
+            r.notify_admitted(lane.state);
+            CHECK(tickets[1]->wait_admission(std::chrono::milliseconds(0)));
+            sv::GenerationProgress progress; progress.prefilled_tokens = 2;
+            r.publish_progress(lane.state, progress);
+            CHECK(tickets[1]->progress().prefilled_tokens == 2);
+            const std::array<std::uint32_t, 2> ids{31, 32};
+            CHECK(r.publish(lane.state, ids));
+            sv::GenerationStats stats; stats.prompt_tokens = 3; stats.generated_tokens = 2; stats.cycles = 8;
+            r.complete_native(lane.state, stats);
+            CHECK(q.snapshot().generated_tokens == 2 && q.snapshot().completed == 1 && r.live() == 0);
+            const auto reused = r.promote(pending[2]);
+            CHECK(reused.state.slot == lane.state.slot && reused.state != lane.state);
+            for (auto operation : {0, 1, 2, 3, 4}) {
+                refused = false;
+                try {
+                    if (operation == 0) (void)r.inspect(lane.state);
+                    else if (operation == 1) (void)r.publish(lane.state, ids);
+                    else if (operation == 2) r.notify_admitted(lane.state);
+                    else if (operation == 3) r.publish_progress(lane.state, progress);
+                    else r.complete_native(lane.state, stats);
+                } catch (const std::invalid_argument&) { refused = true; }
+                CHECK(refused && q.snapshot().completed == 1);
+            }
+            CHECK(r.ticket_cancelled(lane.state));
+            r.complete_native(reused.state, {});
+            tickets[0]->cancel(); CHECK(r.pending_cancelled(pending[0]));
+            stats = {}; stats.prompt_tokens = 3; stats.finish = "cancelled";
+            r.refuse_pending(pending[0], stats);
+            refused = false;
+            try { r.refuse_pending(pending[0], stats); } catch (const std::invalid_argument&) { refused = true; }
+            CHECK(refused && r.pending_count() == 4 && q.snapshot().cancelled == 1);
+            r.shutdown(); CHECK(!r.step());
+            CHECK(r.pending_count() == 0 && r.live() == 0 && q.snapshot().running == 0);
+            CHECK(q.snapshot().completed + q.snapshot().cancelled + q.snapshot().failed == 7);
+        }
+        {
+            // Destruction settles active, pending and the single reservation.
+            FakeEngine e; e.limits.owner_control = true; sv::GenerationQueue q;
+            ss::Policy p; p.enabled = false; p.store = false;
+            sv::SessionHooks h; h.disable_native_cache = true; h.native_validate = [](const auto&) {};
+            h.control_turn = [](sv::SessionRuntime&) {};
+            {
+                sv::SessionRuntime r(q, e, e.store, p, h);
+                for (unsigned i = 0; i < 4; ++i) CHECK(q.submit(job()));
+                CHECK(r.reserve_fifo()); const auto a = r.hold_reservation(); (void)r.promote(a);
+                CHECK(r.reserve_fifo()); (void)r.hold_reservation();
+                CHECK(r.reserve_fifo()); (void)r.hold_reservation();
+                CHECK(r.reserve_fifo());
+            }
+            CHECK(q.snapshot().running == 0 && q.snapshot().cancelled == 4 && e.releases == 1);
+        }
+        {
+            // An escaping native turn may have several unactivated candidates
+            // and a live peer. Cleanup must finish each original ticket once.
+            FakeEngine e; e.limits.owner_control = true; sv::GenerationQueue q;
+            ss::Policy p; p.enabled = false; p.store = false;
+            sv::SessionHooks h; h.disable_native_cache = true; h.native_validate = [](const auto&) {};
+            h.drain_native_on_shutdown = true; h.native_drained = [] { return false; };
+            ss::KvHandle active;
+            sv::SessionRuntime* owner = nullptr;
+            unsigned failures = 0;
+            h.failed = [&] {
+                ++failures;
+                sv::GenerationStats stats; stats.prompt_tokens = 3; stats.generated_tokens = 2; stats.cycles = 17;
+                owner->complete_native(active, stats, "native primary failure");
+            };
+            h.control_turn = [&](sv::SessionRuntime& r) {
+                for (unsigned i = 0; i < 5; ++i) {
+                    CHECK(r.reserve_fifo()); const auto id = r.hold_reservation();
+                    if (i == 0) active = r.promote(id).state;
+                }
+                CHECK(r.publish(active, std::array<std::uint32_t, 2>{71, 72}));
+                throw std::runtime_error("native primary failure");
+            };
+            sv::SessionRuntime r(q, e, e.store, p, h); owner = &r;
+            for (unsigned i = 0; i < 5; ++i) CHECK(q.submit(job()));
+            bool failed = false;
+            try { r.run(); } catch (const std::runtime_error& error) { failed = std::string(error.what()) == "native primary failure"; }
+            CHECK(failed && failures == 1 && r.pending_count() == 0 && r.live() == 0 && e.releases == 1);
+            CHECK(q.snapshot().running == 0 && q.snapshot().failed == 5 && q.snapshot().generated_tokens == 2);
         }
         std::cout << "session runtime checks passed\n";
         return 0;

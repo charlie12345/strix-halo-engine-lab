@@ -119,6 +119,12 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
 std::vector<std::uint32_t> PrefixCacheCheckpoint::tokens() const {
     std::vector<std::uint32_t> out;
     out.reserve(static_cast<std::size_t>(position));
+    if(chain_retention && segments.size()==1) {
+        std::vector<const PrefixCacheSegment*> path;
+        for(auto p=segments.front().get();p;p=p->ancestor.get()) path.push_back(p);
+        for(auto i=path.rbegin();i!=path.rend();++i) out.insert(out.end(),(*i)->tokens.begin(),(*i)->tokens.end());
+        return out;
+    }
     for (const auto& segment : segments) out.insert(out.end(), segment->tokens.begin(), segment->tokens.end());
     return out;
 }
@@ -240,6 +246,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::query(std::uint64
 }
 std::uint64_t PrefixStateCache::retained_charge(std::uint64_t scope) const noexcept {
     std::lock_guard lock(mutex_);
+    if(const auto i=chain_stats_.find(scope);i!=chain_stats_.end()) return i->second.bytes;
     std::uint64_t total = 0;
     for (const auto& [d,e] : entries_) if (e.checkpoint->retention.scope == scope) {
         (void)d;
@@ -282,13 +289,14 @@ bool PrefixStateCache::reclaim_one_locked(std::optional<std::uint64_t> scope, st
     for (const auto& d : lru_) {
         auto i = entries_.find(d);
         const auto& c = *i->second.checkpoint;
+        if (c.chain_retention && !scope) continue; // this adopter has scoped victim authority
         if ((scope && c.retention.scope != *scope) || i->second.protected_entry ||
             (!protected_name.empty() && c.name == protected_name)) continue;
         // Physical slab owners cannot be reclaimed while their backing is leased.
         // Generic lookups may be evicted: their lease stays charged in the ledger.
         if (!c.retention.scope && payload_pool_ && i->second.checkpoint.use_count() != 1) continue;
         const auto owner = c.retention.scope;
-        erase_locked(d);
+        erase_locked(d, true);
         ++stats_.evicted; ++stats_.evictions_space;
         if (owner) ++scope_evictions_.at(owner);
         return true;
@@ -329,7 +337,7 @@ bool PrefixStateCache::reclaim(std::uint64_t scope, const std::function<bool(std
     }
 }
 bool PrefixStateCache::retain(std::shared_ptr<PrefixCacheCheckpoint> value, bool replace, Reservation* credit) {
-    if (!value) return false;
+    if (!value || value->chain_retention) return false;
     value = std::make_shared<PrefixCacheCheckpoint>(*value);
     std::lock_guard lock(mutex_);
     const auto& p = value->retention;
@@ -480,6 +488,143 @@ bool PrefixStateCache::retain(std::shared_ptr<PrefixCacheCheckpoint> value, bool
     prune_receipts_locked();
     ++stats_.inserted;
     return true;
+}
+PrefixStateCache::ChainStats PrefixStateCache::chain_stats(std::uint64_t scope) const {
+    std::lock_guard lock(mutex_);
+    auto i=chain_stats_.find(scope);
+    return i==chain_stats_.end() ? ChainStats{} : i->second;
+}
+std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::chain_segment(std::uint64_t scope, const ModelContentIdentity& d) const {
+    std::lock_guard lock(mutex_);
+    const auto i=chain_refs_.find(d);
+    if(i==chain_refs_.end() || i->second.scope!=scope) return {};
+    const auto s=segments_.find(d);
+    return s==segments_.end() ? nullptr : s->second.lock();
+}
+std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::chain_checkpoint(std::uint64_t scope, const ModelContentIdentity& d, bool touch) {
+    std::lock_guard lock(mutex_);
+    const auto i=entries_.find(d);
+    if(i==entries_.end() || !i->second.checkpoint->chain_retention || i->second.checkpoint->retention.scope!=scope) return {};
+    if(touch) touch_locked(i->second);
+    return i->second.checkpoint;
+}
+void PrefixStateCache::prune_chain_locked(const ModelContentIdentity& d, bool eviction) {
+    const auto i=chain_refs_.find(d);
+    if(i==chain_refs_.end() || i->second.refs || i->second.pins) return;
+    auto& s=chain_stats_.at(i->second.scope);
+    s.bytes-=i->second.charge; --s.blocks;
+    if(eviction) ++s.evicted_blocks;
+    // Remove the query index before releasing any payload owner.
+    segments_.erase(d); chain_refs_.erase(i);
+}
+void PrefixStateCache::release_chain_locked(const PrefixCacheCheckpoint& c, bool eviction) {
+    auto& s=chain_stats_.at(c.retention.scope);
+    s.bytes-=c.charge; --s.snapshots;
+    if(eviction) ++s.evicted_snapshots;
+    for(auto p=c.segments.front();p;p=p->ancestor) {
+        --chain_refs_.at(p->digest).refs;
+        prune_chain_locked(p->digest,eviction);
+    }
+}
+bool PrefixStateCache::retain_chain(std::shared_ptr<PrefixCacheCheckpoint> c,
+    const std::function<void(PrefixCacheCheckpoint&, const PrefixCacheAllocator&)>& fill) {
+    if(!c || c->segments.size()!=1 || !c->retention.scope || !c->charge ||
+       c->snapshot || c->resident || c->encoded || !c->metadata.empty() || !c->producer_certificate.empty()) return false;
+    c=std::make_shared<PrefixCacheCheckpoint>(*c);
+    std::lock_guard lock(mutex_);
+    const auto scope=c->retention.scope;
+    if(policy_.legacy || payload_pool_ || !scope_evictions_.contains(scope)) return false;
+    if(auto i=entries_.find(c->digest);i!=entries_.end()) {
+        if(i->second.checkpoint->retention.scope!=scope || !i->second.checkpoint->chain_retention) return false;
+        auto a=c->segments.front(), b=i->second.checkpoint->segments.front();
+        while(a && b) {
+            if(a->digest!=b->digest || a->parent!=b->parent || a->block_rows!=b->block_rows ||
+               a->block_index!=b->block_index || a->tokens!=b->tokens) return false;
+            a=a->ancestor; b=b->ancestor;
+        }
+        if(a || b || c->position!=i->second.checkpoint->position) return false;
+        touch_locked(i->second); return true;
+    }
+    std::vector<std::shared_ptr<const PrefixCacheSegment>> path, fresh;
+    std::set<ModelContentIdentity,DigestLess> visited;
+    auto need=c->charge;
+    for(auto p=c->segments.front();p;p=p->ancestor) {
+        if(!visited.insert(p->digest).second || !p->charge || p->payload.bytes>p->charge) return false;
+        if(p->ancestor && (p->block_index!=p->ancestor->block_index+1 || p->parent!=p->ancestor->digest)) return false;
+        if(!p->ancestor && p->block_index!=0) return false;
+        path.push_back(p);
+        const auto i=chain_refs_.find(p->digest);
+        if(i==chain_refs_.end()) {
+            // A leased, erased block cannot be republished as a new allocation.
+            if(p->payload.data || p->charge>UINT64_MAX-need) return false;
+            need+=p->charge; fresh.push_back(p);
+        } else if(i->second.scope!=scope || segments_.at(p->digest).lock()!=p) return false;
+    }
+    const auto limit=c->retention.max_bytes;
+    if(c->fixed.bytes>c->charge || need>limit || need>policy_.host_byte_budget) return false;
+    auto& gauges=chain_stats_[scope];
+    // All control nodes are prepared before selecting a victim.
+    decltype(chain_refs_) pending_refs;
+    decltype(segments_) pending_segments;
+    decltype(entries_) pending_entry;
+    std::list<ModelContentIdentity> pending_lru{c->digest};
+    c->chain_retention=true;
+    pending_entry.emplace(c->digest,Entry{c,pending_lru.begin(),0,0,{}});
+    for(const auto& p:fresh) {
+        pending_refs.emplace(p->digest,ChainRef{scope,0,0,p->charge});
+        pending_segments.emplace(p->digest,p);
+    }
+    for(const auto& p:path) if(auto i=chain_refs_.find(p->digest);i!=chain_refs_.end()) ++i->second.pins;
+    const auto unpin=[&] {
+        for(const auto& p:path) if(auto i=chain_refs_.find(p->digest);i!=chain_refs_.end() && i->second.pins) {
+            --i->second.pins; prune_chain_locked(p->digest,true);
+        }
+    };
+    try {
+        while(gauges.bytes>limit-need || retained_bytes_locked()>policy_.host_byte_budget-need)
+            if(!reclaim_one_locked(scope)) { unpin(); return false; }
+        Reservation credit(ledger_,need);
+        { std::lock_guard credits(ledger_->mutex); ledger_->reserved+=need; }
+        std::reverse(fresh.begin(),fresh.end());
+        std::size_t at=0;
+        // Reserve the complete legacy charge, including control storage. Payload
+        // receipts own that charge until the last immutable lease is released.
+        const PrefixCacheAllocator allocator=[&](std::uint64_t bytes) {
+            if(at>fresh.size()) throw std::invalid_argument("chain allocation count");
+            const auto expected=at<fresh.size()?fresh[at]->payload.bytes:c->fixed.bytes;
+            const auto charge=at<fresh.size()?fresh[at]->charge:c->charge;
+            if(bytes!=expected) throw std::invalid_argument("chain allocation size");
+            auto raw=bytes ? allocate_(bytes) : PrefixCacheBuffer{};
+            if(bytes && (!raw.data || raw.bytes<bytes)) throw PrefixCacheAllocationFailure();
+            auto receipt=std::make_shared<Receipt>();
+            receipt->ledger=ledger_; receipt->payload=std::move(raw.data); receipt->bytes=charge;
+            receipt->segment=at<fresh.size();
+            // Metadata-only segments still need a lifetime/credit owner; no
+            // zero-byte allocation is required of the service allocator.
+            auto* address=bytes ? receipt->payload.get() : reinterpret_cast<std::byte*>(receipt.get());
+            PrefixCacheBuffer result{std::shared_ptr<std::byte>(receipt,address),bytes};
+            {
+                std::lock_guard credits(ledger_->mutex);
+                ledger_->reserved-=charge; credit.bytes_-=charge; ledger_->bytes+=charge;
+                if(receipt->segment) ++ledger_->segments;
+                receipt->registered=true;
+            }
+            ++at; return result;
+        };
+        fill(*c,allocator);
+        if(at!=fresh.size()+1 || !c->fixed.data) throw std::invalid_argument("chain incomplete capture");
+        for(const auto& p:fresh) if(!p->payload.data) throw std::invalid_argument("chain missing block capture");
+        // Publication is a nonallocating node transfer. The pending entry owns
+        // the same checkpoint filled by the codec through its captured handle.
+        chain_refs_.merge(pending_refs); segments_.merge(pending_segments);
+        for(const auto& p:fresh) { gauges.bytes+=p->charge; ++gauges.blocks; }
+        for(const auto& p:path) ++chain_refs_.at(p->digest).refs;
+        gauges.bytes+=c->charge; ++gauges.snapshots;
+        pending_entry.begin()->second.epoch=++epoch_;
+        entries_.merge(pending_entry); lru_.splice(lru_.end(),pending_lru);
+        unpin(); ++stats_.inserted;
+        return true;
+    } catch(...) { unpin(); throw; }
 }
 bool PrefixStateCache::retain_encoded(std::shared_ptr<PrefixCacheCheckpoint> c, std::vector<std::uint8_t> bytes, Reservation* staging) {
     if (!c || bytes.size() > c->retention.max_bytes || !c->retention.max_entries) return false;
@@ -820,9 +965,10 @@ void PrefixStateCache::add_locked(std::shared_ptr<const PrefixCacheCheckpoint> c
         register_buffer_locked(segment->payload, true);
     }
 }
-void PrefixStateCache::erase_locked(const ModelContentIdentity& digest) {
+void PrefixStateCache::erase_locked(const ModelContentIdentity& digest, bool eviction) {
     const auto it = entries_.find(digest);
     if (it == entries_.end()) return;
+    if (it->second.checkpoint->chain_retention) release_chain_locked(*it->second.checkpoint, eviction);
     if (it->second.checkpoint->retention.scope && it->second.checkpoint->encoded)
         named_views_.at(it->second.checkpoint->retention.scope).erase(it->second.checkpoint->name);
     metadata_bytes_ -= it->second.checkpoint->metadata.size() + it->second.checkpoint->producer_certificate.size()*sizeof(std::uint64_t);
@@ -881,7 +1027,10 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             if (!reclaim_one_locked({}, protected_name)) break;
             continue;
         }
-        auto victim = entries_.find(lru_.front());
+        auto first=lru_.begin();
+        while(first!=lru_.end() && entries_.at(*first).checkpoint->chain_retention) ++first;
+        if(first==lru_.end()) break;
+        auto victim = entries_.find(*first);
         if(payload_pool_ && policy_.retention==PrefixCacheRetention::lru) {
             auto oldest=lru_.begin();
             while(oldest!=lru_.end() && entries_.at(*oldest).checkpoint.use_count()!=1) ++oldest;
@@ -998,7 +1147,7 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             for (const auto& d : lru_) {
                 auto i = entries_.find(d);
                 const auto& c = *i->second.checkpoint;
-                if (c.retention.scope && !i->second.protected_entry && (protected_name.empty() || c.name != protected_name)) {
+                if (c.retention.scope && !c.chain_retention && !i->second.protected_entry && (protected_name.empty() || c.name != protected_name)) {
                     generic = i; break;
                 }
             }

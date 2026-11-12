@@ -4,8 +4,12 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <memory>
+#include <span>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace {
 namespace sv = strix::serve;
@@ -41,8 +45,49 @@ Writer post(const sv::HttpHandler& handler, const std::string& path, const std::
 }
 } // namespace
 
+// Embedding rows through the engine contract: a bound table resolves virtual
+// ids, everything else is refused before a write.
+void embed_rows() {
+    namespace ss = strix::session;
+    ss::CpuBackend backend;
+    skeleton::Engine engine(backend);
+    CHECK(engine.caps().embed_rows);
+    ss::EmbedInterner interner;
+    ss::EmbedRows rows;
+    rows.digest[0] = 7;
+    rows.rows = 3;
+    rows.width = 2;
+    rows.data.assign(6, 0x3f80);
+    const auto lease = interner.intern(std::move(rows));
+    auto table = std::make_shared<const ss::EmbedTable>(std::vector<ss::EmbedLease>{lease});
+    std::vector<std::uint32_t> prompt{'a', 'b'};
+    for (const auto id : lease.ids()) prompt.push_back(id);
+    prompt.push_back('c');
+
+    auto lane = engine.store.acquire();
+    const auto refused = [&](std::span<const std::uint32_t> ids) {
+        try {
+            engine.prefill(ids, lane);
+        } catch (const std::invalid_argument&) {
+            return engine.store.consumed(lane) == 0;
+        }
+        return false;
+    };
+    CHECK(refused(prompt)); // no table bound
+    engine.bind_embeds(lane, table);
+    const std::vector<std::uint32_t> outside{'a', ss::embed_id(lease.handle(), 3)};
+    CHECK(refused(outside)); // row outside the span
+    const std::vector<std::uint32_t> unknown{'a', ss::embed_id(lease.handle() + 1, 0)};
+    CHECK(refused(unknown)); // handle outside the request
+    engine.prefill(prompt, lane);
+    CHECK(engine.store.consumed(lane) == prompt.size());
+    engine.store.release(lane);
+    CHECK(interner.status().live == 1); // lease + table still hold it
+}
+
 int main(int argc, char** argv) {
     CHECK(argc == 2);
+    embed_rows();
     sv::ServiceFactories factories;
     skeleton::install_session_service(factories);
 

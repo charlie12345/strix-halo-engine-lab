@@ -2,6 +2,7 @@
 
 #include "strix/engine_profile.hpp"
 #include "strix/serve/engine.hpp"
+#include "strix/session/embed_rows.hpp"
 #include "strix/session/kv.hpp"
 
 #include <cstdint>
@@ -166,6 +167,9 @@ struct Capabilities {
     bool owner_control = false;
     bool row_hints = false; // only qualified native adapters may opt in
     bool turn_commit = false;
+    // The engine resolves virtual ids (session/embed_rows.hpp) in its embed stage.
+    // Without it any id >= 2^31 is a prevalidation error (reject_embed_ids).
+    bool embed_rows = false;
 };
 
 struct PrefillItem {
@@ -318,6 +322,18 @@ public:
     // or poisons only affected lanes. Empty suffix follows prefill's no-op rule.
     virtual void append_external(std::span<const std::uint32_t>, KvHandle&) {
         throw std::invalid_argument("engine does not support external append");
+    }
+
+    // Capabilities::embed_rows only. Names the table that resolves the virtual ids of
+    // the rows this lane consumes next (prefill, append_external, advance suffixes);
+    // it replaces the lane's earlier table, and the engine keeps it until the lane is
+    // released or bound again. Rows already consumed need no table. Null unbinds.
+    // Token rows are resolved as before; prompts without a virtual id are unaffected
+    // whether or not a table is bound. Before any write the engine validates every
+    // virtual id against the bound table (EmbedTable::validate); an id with no table
+    // bound is a prevalidation error.
+    virtual void bind_embeds(KvHandle&, std::shared_ptr<const EmbedTable> table) {
+        if (table) throw std::invalid_argument("engine does not support embedding rows");
     }
 
     // Optional hooks for existing multi-stream coordinators and grouped row

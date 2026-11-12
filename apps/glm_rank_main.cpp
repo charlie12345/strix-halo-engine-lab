@@ -369,6 +369,10 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("the FAST attention core (STRIX_GLM_PF_ATTN_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
                                         "needs the startup agreement (--decode N or --tf, comm exchange) so both ranks "
                                         "are checked to run the same prefill identity");
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::kda_wmma::enabled())
+            throw std::invalid_argument("the FAST KDA projections (STRIX_GLM_PF_KDA_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
+                                        "need the startup agreement (--decode N or --tf, comm exchange) so both ranks "
+                                        "are checked to run the same prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
             throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N or --tf, "
                                         "comm exchange) so both ranks are checked to run the same prefill identity");
@@ -407,6 +411,7 @@ int main(int argc, char** argv) {
                 (strix::glm::pf::wmma_x::enabled() ? rd::kPfWmmaConfig : 0U) |  // FAST prefill identity must match on both ranks
                 (eng.model_fast_i4() ? rd::kFastI4Config : 0U) |                 // and the model format (also in the load vote)
                 (strix::glm::pf::attn_wmma::enabled() ? rd::kPfAttnWmmaConfig : 0U) |
+                (strix::glm::pf::kda_wmma::enabled() ? rd::kPfKdaWmmaConfig : 0U) |
                 (idx_wmma << rd::kIdxWmmaShift);                                   // FAST indexer identity, ditto
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
@@ -1099,6 +1104,9 @@ int main(int argc, char** argv) {
                 if (const auto ac = strix::glm::pf::attn_wmma::calls.exchange(0); ac != 0)
                     std::printf("rank %u prefill identity glm-pf-attn-wmma FAST (fused bf16 WMMA MLA/DSA core, "
                                 "T %u, calls %llu)\n", opt.rank, strix::glm::pf::attn_wmma::block_keys(), static_cast<unsigned long long>(ac));
+                if (const auto kc = strix::glm::pf::kda_wmma::calls.exchange(0); kc != 0)
+                    std::printf("rank %u prefill identity glm-pf-kda-wmma-v1 FAST (KDA plain-weight projections on the dense "
+                                "FP16 WMMA core, calls %llu)\n", opt.rank, static_cast<unsigned long long>(kc));
             }
             if (!logits_out.empty()) {
                 std::vector<float> lg(eng.vocab_slice());

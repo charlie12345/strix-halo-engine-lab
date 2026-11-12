@@ -5,9 +5,11 @@
 // it (fewer launches, N sequences per launch) and how the caches are read (coalesced tiles through LDS).
 #include "msa_fused.hpp"
 #include "msa_inblock_layout.hpp"
+#include "msa_select_dump.hpp"
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -2638,6 +2640,40 @@ void audit_prefill_index(const PrefillView& p, hipStream_t stream) {
 }
 }  // namespace
 
+namespace {
+std::FILE* g_select_dump = nullptr;
+
+// One record per sparse batch (msa_select_dump.hpp): the ids the attend launch selected for [first_window * 16, rows).
+void dump_prefill_select(const PrefillView& p, hipStream_t stream) {
+    const DecodeView& v = p.window;
+    const std::size_t r0 = std::size_t{p.first_window} * kMaxRows, rows = p.rows - r0, rg = rows * v.kv_heads;
+    std::vector<std::uint32_t> cnt(rg), ids(rg * kTopK);
+    hip_check(hipStreamSynchronize(stream), "minimax select dump sync");
+    hip_check(hipMemcpy(cnt.data(), v.idx_count + r0 * v.kv_heads, rg * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+          "minimax select dump counts");
+    hip_check(hipMemcpy(ids.data(), v.idx + r0 * v.kv_heads * kTopK, rg * kTopK * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+          "minimax select dump ids");
+    const std::uint64_t pos = p.pos0 + r0;
+    const std::uint32_t head[8] = {0x444C4553U, 1U, aidx::wmma_mode(aidx::kModeExact), static_cast<std::uint32_t>(pos),
+                                   static_cast<std::uint32_t>(pos >> 32), static_cast<std::uint32_t>(rows), v.kv_heads, kTopK};
+    if (std::fwrite(head, sizeof(head), 1, g_select_dump) != 1 ||
+        std::fwrite(cnt.data(), sizeof(std::uint32_t), cnt.size(), g_select_dump) != cnt.size() ||
+        std::fwrite(ids.data(), sizeof(std::uint32_t), ids.size(), g_select_dump) != ids.size())
+        throw std::runtime_error("minimax select dump: short write");
+}
+}  // namespace
+
+void set_select_dump(const char* path) {
+    if (g_select_dump != nullptr) {
+        std::FILE* const f = g_select_dump;
+        g_select_dump = nullptr;
+        if (std::fclose(f) != 0) throw std::runtime_error("minimax select dump: close failed");
+    }
+    if (path == nullptr) return;
+    g_select_dump = std::fopen(path, "wb");
+    if (g_select_dump == nullptr) throw std::runtime_error(std::string("minimax select dump: cannot write ") + path);
+}
+
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
     const DecodeView& v = p.window;
     if (p.msa_rework > 10 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
@@ -2677,6 +2713,7 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
             if (marker != nullptr) marker(user, "attend", true);
             launch_prefill_attend<false>(batch, sparse, stream);
             if (marker != nullptr) marker(user, "attend", false);
+            if (g_select_dump != nullptr) dump_prefill_select(batch, stream);
         }
         batch.first_window = 0;
         if (dense != 0 && marker != nullptr) marker(user, "attend", true);

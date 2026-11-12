@@ -2804,10 +2804,10 @@ struct Engine::Impl {
 
     // One sized buffer, copies queued on the engine stream (ordered after its pending work), one sync.
     std::vector<std::uint8_t> state_bytes(std::uint32_t slot, std::uint64_t frontier = ~std::uint64_t{0}) {
-        const std::size_t head = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
+        const std::size_t key_bytes = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
         const std::size_t payload = state_payload_bytes(slot, frontier);
-        std::vector<std::uint8_t> out(head + payload);
-        std::size_t o = head;
+        std::vector<std::uint8_t> out(key_bytes + payload);
+        std::size_t o = key_bytes;
         for_each_state_region(slot, frontier, [&](const void* p, std::size_t bytes) {
             if (bytes) hip_ok(hipMemcpyAsync(out.data() + o, p, bytes, hipMemcpyDeviceToHost, stream), "state");
             o += bytes;
@@ -2822,16 +2822,16 @@ struct Engine::Impl {
 
     void restore_state(std::uint32_t slot, std::span<const std::uint8_t> in, std::uint64_t frontier) {
         if (slot >= opt.slots) throw std::out_of_range("restore_state: slot");
-        const std::size_t head = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
+        const std::size_t key_bytes = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
         const std::size_t payload = state_payload_bytes(slot, frontier);
         if (kv_shard)
             kvshard::validate_snapshot(in.data(), in.size(), true,
                                        kvshard::snapshot_key(opt.capacity, opt.rank, std::min(opt.capacity, frontier), payload));
         else kvshard::validate_snapshot(in.data(), in.size(), false);
-        if (in.size() < head + payload) throw std::invalid_argument("restore_state: state shorter than this engine's layout");
-        if (in.size() > head + payload) throw std::invalid_argument("restore_state: state longer than this engine's layout");
+        if (in.size() < key_bytes + payload) throw std::invalid_argument("restore_state: state shorter than this engine's layout");
+        if (in.size() > key_bytes + payload) throw std::invalid_argument("restore_state: state longer than this engine's layout");
         reset(slot);  // memsets on the stream; the copies below are queued after them
-        std::size_t o = head;
+        std::size_t o = key_bytes;
         for_each_state_region(slot, frontier, [&](const void* p, std::size_t bytes) {
             if (bytes) hip_ok(hipMemcpyAsync(const_cast<void*>(p), in.data() + o, bytes, hipMemcpyHostToDevice, stream), "restore");
             o += bytes;

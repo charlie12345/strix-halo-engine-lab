@@ -9,7 +9,7 @@ inline bool has_startup_handshake(unsigned world, const std::string& xch, bool d
     return world == 2 && xch == "comm" && decode && !reference_gate;
 }
 // Teacher-forced scoring (--tf) on two comm ranks also runs the agreement so the per-rank FAST prefill switches
-// (kPfWmmaConfig/kPfAttnWmmaConfig) are verified. Rows stay on the no-handshake fallback (fixed, never promoted),
+// (kPfWmmaConfig/kPfAttnWmmaConfig/kPfKdaWmmaConfig) are verified. Rows stay on the no-handshake fallback (fixed, never promoted),
 // so the agreement only checks config bits there; both ranks run the same --tf command and reach the same merges.
 inline bool has_config_agreement(unsigned world, const std::string& xch, bool decode, bool reference_gate, bool tf) {
     return has_startup_handshake(world, xch, decode, reference_gate) || (world == 2 && xch == "comm" && tf);
@@ -29,6 +29,7 @@ inline constexpr std::uint32_t kAutoRowsConfig = 1U << 11;
 inline constexpr std::uint32_t kPfWmmaConfig = 1U << 12;  // STRIX_GLM_PF_WMMA=1 (FAST prefill identity) on this rank
 inline constexpr std::uint32_t kFastI4Config = 1U << 13;  // STRIX_GLM_MODEL_FORMAT=fast_i4 on this rank
 inline constexpr std::uint32_t kPfAttnWmmaConfig = 1U << 14;  // FAST attention core (glm-pf-attn-wmma) on this rank
+inline constexpr std::uint32_t kPfKdaWmmaConfig = 1U << 17;  // FAST KDA projections (glm-pf-kda-wmma-v1) on this rank
 inline constexpr unsigned kIdxWmmaShift = 15;  // 2 bits: STRIX_IDX_WMMA mode (0 off, 1 bf16, 2 f16) on this rank
 
 struct StartupResult { unsigned rows; bool eligible; };

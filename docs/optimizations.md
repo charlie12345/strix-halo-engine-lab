@@ -4268,7 +4268,7 @@ exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select ot
 
 ### FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_KDA_WMMA`. **Default:** off (opt-in FAST identity).
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_KDA_WMMA`. **Default:** on in FAST prefill (`STRIX_GLM_PF_WMMA=1`); off in exact mode.
 
 The five plain FP16 projections of a KDA layer in the chunked prefill (f_a, g_a and b of the layer input in one
 grouped call, then f_b and g_b) run on the shared dense FP16 WMMA core (`src/core/f16_dense_tall.hpp`, GLM adapter
@@ -4279,9 +4279,9 @@ once. Kernels: 194 / 224 VGPRs, no spills, 36,864 bytes of LDS, occupancy 6. The
 stay on the exact kernels: they select experts and tokens, where a flip is not a rounding error.
 
 - **Preconditions:** FP16 weights, every width a multiple of 16, input width a multiple of 128; other shapes keep the exact kernels.
-- **Exactness:** FAST identity (FP16-rounded activations, WMMA FP32 accumulation); kernel gate: against the FP64 value of the contract rel-L2 <= 8.0e-7, against the exact chains rel-L2 <= 2.3e-4 (297 checks); teacher-forced 3 x 256 positions at 8K against FAST without it: KL 0.0038 / 0.0004 / 0.0004 nats, top-1 98.0 / 100 / 100 %, NLL change -0.006 / +0.001 / +0.002 (chat / code / json); unset or 0 keeps the previous bytes.
+- **Exactness:** FAST identity (FP16-rounded activations, WMMA FP32 accumulation); kernel gate: against the FP64 value of the contract rel-L2 <= 8.0e-7, against the exact chains rel-L2 <= 2.3e-4 (297 checks); teacher-forced 3 x 256 positions at 8K against FAST without it: KL 0.0038 / 0.0004 / 0.0004 nats, top-1 98.0 / 100 / 100 %, NLL change -0.006 / +0.001 / +0.002 (chat / code / json); the exact route, or 0 with FAST, keeps the previous bytes.
 - **Measured:** Pair FAST prefill 8K 9.25 -> 9.05 s (-2.1 %, 2 ABAB pairs: 9.258 / 9.245 vs 9.034 / 9.073); 32K 37.74 -> 37.13 s (-1.6 %; off 37.705 / 37.771, on 36.990 / 37.280 / 37.105; one run of each arm at 41-43 s discarded as a disturbed run); kernels at 4096 rows: f_a + g_a + b 3.06 -> 1.71 ms, f_b / g_b (8192 outputs) 4.06 -> 2.03 ms.
-- **Off switch:** `STRIX_GLM_PF_KDA_WMMA=0` or unset.
+- **Off switch:** `STRIX_GLM_PF_KDA_WMMA=0` (or exact mode). `=1` forces it; both ranks of a pair must resolve the same value (checked by the startup agreement).
 
 <a id="glm-pf-attn-wmma"></a>
 

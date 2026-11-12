@@ -87,6 +87,42 @@ $env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"
 $env:CUDA_VISIBLE_DEVICES = "GPU-<uuid of the card to use>"
 ```
 
+### Other units: the NPU and the CPU
+
+The same file can declare the two units that are not GPUs. Nothing uses them unless they are declared: there is no
+implicit NPU or CPU unit, and an old file without these entries behaves exactly as before.
+
+```toml
+[devices.npu]
+kind = "npu"                         # gpu (default) | npu | cpu
+vendor = "amd"
+pci = "0000:c5:00.1"                 # identity, as for a GPU
+arch = "aie2p"
+roles = ["aux"]                      # side models only (scoring, vision, embeddings)
+driver = "amdxdna"                   # the next three keys are required before aux is granted
+firmware = "<firmware version>"
+corun_qualification = "<id of the GPU + NPU co-run receipt>"
+
+[devices.host]
+kind = "cpu"                         # no identity; at most one cpu unit
+cores = "2-15"                       # cores the host lane may pin
+roles = ["host", "aux"]              # host: tokenizer, image decode, sampling, background work
+byte_cap_gbytes_ps = 10.0            # ceiling for background memory traffic while a session is decoding
+```
+
+Rules the parser and the start gate enforce:
+
+- `decode`, `prefill`, `pair`, `draft`, `replica`, `front` and `experts` are GPU roles. An NPU takes only `aux`; a CPU
+  takes only `host` and `aux`; a GPU may also carry `aux`.
+- An NPU keeps its `aux` role refused until `driver`, `firmware` and `corun_qualification` are all present. The file
+  still loads; the unit simply gets no work.
+- `cores` and `byte_cap_gbytes_ps` belong to the cpu unit, the three qualification keys to an NPU; anywhere else they
+  are errors.
+- The start line and the receipt list the declared units after the GPU, for example
+  `units=cpu:host[host,aux cores=2-15 byte_cap=10GB/s],npu:npu[aux(refused)]`.
+
+Declaring a unit only records what the machine has and what it may do. No engine sends work to an NPU today.
+
 ## DeepSeek V4.1 Flash, standalone RTX
 
 Build tierstream's CUDA library first, then, from the repository root with a tierstream checkout at `TIERSTREAM`:

@@ -15,7 +15,7 @@ namespace {
 using Value = model_description::Value;
 using Table = Value::Table;
 
-constexpr std::array<std::string_view, 7> roles_known{"pair", "decode", "prefill", "draft", "replica", "front", "experts"};
+constexpr std::array<std::string_view, 9> roles_known{"pair", "decode", "prefill", "draft", "replica", "front", "experts", "aux", "host"};
 constexpr std::array<std::string_view, 3> roles_rated{"prefill", "front", "experts"};
 
 [[noreturn]] void bad(const std::string& key, const std::string& what) { throw std::invalid_argument(key + ": " + what); }
@@ -81,12 +81,27 @@ Attach parse_attach(const Value& v, const std::string& key) {
 Descriptor parse_device(const std::string& id, const Value& v) {
     const std::string key = "devices." + id;
     const auto& t = table(v, key);
-    only(t, {"vendor", "arch", "uuid", "pci", "name", "memory_bytes", "attach", "roles", "excluded", "reason"}, key + ".");
+    only(t, {"kind", "vendor", "arch", "uuid", "pci", "name", "memory_bytes", "attach", "roles", "excluded", "reason", "cores",
+             "byte_cap_gbytes_ps", "driver", "firmware", "corun_qualification"}, key + ".");
     Descriptor d;
     d.id = id;
+    try {
+        if (const auto* x = find(t, "kind")) d.kind = parse_kind(string(*x, key + ".kind"));
+    } catch (const std::invalid_argument& e) {
+        bad(key, e.what());
+    }
+    const bool cpu = d.kind == Kind::cpu;
+    const std::string kind(kind_name(d.kind));
+    // Keys that describe one kind of unit are refused on the others: a typo must not silently drop a limit.
+    for (const std::string_view name : {"cores", "byte_cap_gbytes_ps"})
+        if (!cpu && find(t, name)) bad(key + "." + std::string(name), "only a kind = \"cpu\" unit takes this key");
+    for (const std::string_view name : {"driver", "firmware", "corun_qualification"})
+        if (d.kind != Kind::npu && find(t, name)) bad(key + "." + std::string(name), "only a kind = \"npu\" unit takes this key");
+    for (const std::string_view name : {"uuid", "pci", "attach", "memory_bytes"})
+        if (cpu && find(t, name)) bad(key + "." + std::string(name), "a cpu unit takes no " + std::string(name));
     const auto* vendor = find(t, "vendor");
-    if (!vendor) bad(key + ".vendor", "required");
-    d.vendor = parse_vendor(string(*vendor, key + ".vendor"));
+    if (!vendor && !cpu) bad(key + ".vendor", "required");
+    if (vendor) d.vendor = parse_vendor(string(*vendor, key + ".vendor"));
     if (const auto* x = find(t, "arch")) d.arch = lower(string(*x, key + ".arch"));
     try {
         if (const auto* x = find(t, "uuid")) d.uuid = normalise_uuid(string(*x, key + ".uuid"));
@@ -94,7 +109,7 @@ Descriptor parse_device(const std::string& id, const Value& v) {
     } catch (const std::invalid_argument& e) {
         bad(key, e.what());
     }
-    if (d.uuid.empty() && d.pci.empty()) bad(key, "needs an identity: uuid or pci (an index is not an identity)");
+    if (!cpu && d.uuid.empty() && d.pci.empty()) bad(key, "needs an identity: uuid or pci (an index is not an identity)");
     if (const auto* x = find(t, "name")) d.name = string(*x, key + ".name");
     if (const auto* x = find(t, "memory_bytes")) d.memory_bytes = integer(*x, key + ".memory_bytes");
     if (const auto* x = find(t, "attach")) d.attach = parse_attach(*x, key + ".attach");
@@ -104,6 +119,7 @@ Descriptor parse_device(const std::string& id, const Value& v) {
         for (const auto& item : *list) {
             auto role = string(item, key + ".roles");
             if (!known_role(role)) bad(key + ".roles", "unknown role " + role);
+            if (!role_allowed(d.kind, role)) bad(key + ".roles", "role " + role + " is not available to a " + kind + " unit");
             for (const auto& seen : d.roles)
                 if (seen == role) bad(key + ".roles", "duplicate role " + role);
             d.roles.push_back(std::move(role));
@@ -111,6 +127,21 @@ Descriptor parse_device(const std::string& id, const Value& v) {
     }
     if (const auto* x = find(t, "excluded")) d.excluded = boolean(*x, key + ".excluded");
     if (const auto* x = find(t, "reason")) d.reason = string(*x, key + ".reason");
+    if (const auto* x = find(t, "cores")) {
+        d.cores_text = string(*x, key + ".cores");
+        try {
+            d.cores = parse_cores(d.cores_text);
+        } catch (const std::invalid_argument& e) {
+            bad(key, e.what());
+        }
+    }
+    if (const auto* x = find(t, "byte_cap_gbytes_ps")) {
+        d.byte_cap_gbytes_ps = rate(*x, key + ".byte_cap_gbytes_ps");
+        if (d.byte_cap_gbytes_ps <= 0.0) bad(key + ".byte_cap_gbytes_ps", "must be positive (omit the key for no declared cap)");
+    }
+    if (const auto* x = find(t, "driver")) d.driver = string(*x, key + ".driver");
+    if (const auto* x = find(t, "firmware")) d.firmware = string(*x, key + ".firmware");
+    if (const auto* x = find(t, "corun_qualification")) d.corun_qualification = string(*x, key + ".corun_qualification");
     return d;
 }
 
@@ -140,6 +171,55 @@ std::string_view vendor_name(Vendor vendor) noexcept {
     case Vendor::intel: return "intel";
     }
     return "unknown";
+}
+
+std::string_view kind_name(Kind kind) noexcept {
+    switch (kind) {
+    case Kind::gpu: return "gpu";
+    case Kind::npu: return "npu";
+    case Kind::cpu: return "cpu";
+    }
+    return "unknown";
+}
+
+Kind parse_kind(std::string_view text) {
+    const auto v = lower(text);
+    if (v == "gpu") return Kind::gpu;
+    if (v == "npu") return Kind::npu;
+    if (v == "cpu") return Kind::cpu;
+    throw std::invalid_argument("kind: expected gpu, npu or cpu, got " + std::string(text));
+}
+
+std::vector<std::uint32_t> parse_cores(std::string_view text) {
+    const auto fail = [&](const char* why) {
+        throw std::invalid_argument("cores: " + std::string(why) + " in \"" + std::string(text) + "\"");
+    };
+    std::set<std::uint32_t> seen;
+    std::size_t at = 0;
+    const auto number = [&] {
+        std::uint32_t value = 0;
+        const auto start = at;
+        while (at < text.size() && text[at] >= '0' && text[at] <= '9') {
+            value = value * 10 + static_cast<std::uint32_t>(text[at++] - '0');
+            if (value > 4095) fail("core index above 4095");
+        }
+        if (at == start) fail("expected a core index");
+        return value;
+    };
+    while (true) {
+        const auto first = number();
+        auto last = first;
+        if (at < text.size() && text[at] == '-') {
+            ++at;
+            last = number();
+            if (last < first) fail("reversed range");
+        }
+        for (auto core = first; core <= last; ++core)
+            if (!seen.insert(core).second) fail("core listed twice");
+        if (at == text.size()) break;
+        if (text[at++] != ',') fail("expected , or -");
+    }
+    return {seen.begin(), seen.end()};
 }
 
 Vendor parse_vendor(std::string_view text) {
@@ -184,10 +264,39 @@ bool known_role(std::string_view role) noexcept {
     return false;
 }
 
+bool role_allowed(Kind kind, std::string_view role) noexcept {
+    if (role == "aux") return true;
+    if (role == "host") return kind == Kind::cpu;
+    return kind == Kind::gpu && known_role(role);
+}
+
+std::vector<const Descriptor*> units_for_role(const Declaration& declaration, std::string_view role) {
+    std::vector<const Descriptor*> out;
+    for (const auto& d : declaration.devices)
+        if (!d.excluded && role_refusal(d, role).empty()) out.push_back(&d);
+    return out;
+}
+
+const Descriptor* host_unit(const Declaration& declaration) noexcept {
+    for (const auto& d : declaration.devices) {
+        if (d.kind != Kind::cpu || d.excluded) continue;
+        for (const auto& role : d.roles)
+            if (role == "host") return &d;
+    }
+    return nullptr;
+}
+
 std::string role_refusal(const Descriptor& device, std::string_view role) {
     bool has = false;
     for (const auto& r : device.roles) has = has || r == role;
     if (!has) return "role " + std::string(role) + " is not declared for device " + device.id;
+    if (device.kind == Kind::npu) {
+        // An NPU shares DRAM and clocks with the GPU: it works only in a configuration someone measured next to it.
+        const char* missing = device.driver.empty() ? "driver"
+                              : device.firmware.empty() ? "firmware"
+                              : device.corun_qualification.empty() ? "corun_qualification" : nullptr;
+        return missing ? "role " + std::string(role) + " on npu " + device.id + " needs " + missing + " to be declared" : std::string{};
+    }
     bool rated = false;
     for (const auto r : roles_rated) rated = rated || r == role;
     if (!rated || device.attach.kind == "integrated") return {};
@@ -220,6 +329,7 @@ Declaration parse_declaration(std::string_view toml, std::string source) {
             const auto& b = out.devices[j];
             if (!a.uuid.empty() && a.uuid == b.uuid) bad("devices." + b.id + ".uuid", "same identity as device " + a.id);
             if (!a.pci.empty() && a.pci == b.pci) bad("devices." + b.id + ".pci", "same identity as device " + a.id);
+            if (a.kind == Kind::cpu && b.kind == Kind::cpu) bad("devices." + b.id + ".kind", "second cpu unit (the first is " + a.id + ")");
         }
     return out;
 }

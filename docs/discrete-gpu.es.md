@@ -92,6 +92,42 @@ $env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"
 $env:CUDA_VISIBLE_DEVICES = "GPU-<uuid of the card to use>"
 ```
 
+### Otras unidades: la NPU y la CPU
+
+El mismo archivo puede declarar las dos unidades que no son GPU. Nada las usa si no se declaran: no hay NPU ni CPU
+implícita, y un archivo antiguo sin estas entradas se comporta exactamente igual que antes.
+
+```toml
+[devices.npu]
+kind = "npu"                         # gpu (por defecto) | npu | cpu
+vendor = "amd"
+pci = "0000:c5:00.1"                 # identidad, como en una GPU
+arch = "aie2p"
+roles = ["aux"]                      # solo modelos auxiliares (puntuación, visión, embeddings)
+driver = "amdxdna"                   # las tres claves siguientes son obligatorias para conceder aux
+firmware = "<versión del firmware>"
+corun_qualification = "<id del recibo de ejecución conjunta GPU + NPU>"
+
+[devices.host]
+kind = "cpu"                         # sin identidad; como máximo una unidad cpu
+cores = "2-15"                       # núcleos que puede fijar el carril del host
+roles = ["host", "aux"]              # host: tokenizador, decodificación de imagen, muestreo, trabajo de fondo
+byte_cap_gbytes_ps = 10.0            # techo del tráfico de memoria de fondo mientras una sesión decodifica
+```
+
+Reglas que aplican el analizador y la puerta de arranque:
+
+- `decode`, `prefill`, `pair`, `draft`, `replica`, `front` y `experts` son roles de GPU. Una NPU solo admite `aux`; una
+  CPU solo admite `host` y `aux`; una GPU también puede llevar `aux`.
+- El rol `aux` de una NPU queda rechazado hasta que estén presentes `driver`, `firmware` y `corun_qualification`. El
+  archivo se carga igualmente; la unidad simplemente no recibe trabajo.
+- `cores` y `byte_cap_gbytes_ps` pertenecen a la unidad cpu, y las tres claves de cualificación a una NPU; en cualquier
+  otro sitio son errores.
+- La línea de arranque y el recibo listan las unidades declaradas después de la GPU, por ejemplo
+  `units=cpu:host[host,aux cores=2-15 byte_cap=10GB/s],npu:npu[aux(refused)]`.
+
+Declarar una unidad solo registra lo que tiene la máquina y lo que puede hacer. Hoy ningún motor envía trabajo a una NPU.
+
 ## DeepSeek V4.1 Flash, RTX independiente
 
 Compile primero la biblioteca CUDA de tierstream y después, desde la raíz del repositorio con una copia de tierstream

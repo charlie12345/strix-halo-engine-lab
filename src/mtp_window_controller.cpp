@@ -283,22 +283,35 @@ MtpBatchWindowController::BudgetCost MtpBatchWindowController::budget_cost() con
     static const BudgetCost pinned=[]{
         BudgetCost c;const char* v=std::getenv("STRIX_SERVE_ROW_COST");
         if(v) {char* end=nullptr;const double f=std::strtod(v,&end);
-            if(end && *end==',') {const double r=std::strtod(end+1,nullptr);
-                if(f>0.0 && r>0.0 && std::isfinite(f) && std::isfinite(r)) {c.fixed_ms=f;c.row_ms=r;c.fitted=true;}}}
+            if(end && *end==',') {char* next=nullptr;const double r=std::strtod(end+1,&next);
+                const double l=next && *next==','?std::strtod(next+1,nullptr):0.0;
+                if(f>0.0 && r>0.0 && l>=0.0 && std::isfinite(f) && std::isfinite(r) && std::isfinite(l)) {
+                    c.fixed_ms=f;c.row_ms=r;c.lane_ms=l;c.fitted=true;}}}
         return c;}();
-    if(pinned.fitted) return {pinned.fixed_ms,pinned.row_ms,false};
-    // Least squares of the measured topologies' cycle ms on their physical rows.
-    double n=0.0,sx=0.0,sy=0.0,sxx=0.0,sxy=0.0;
+    if(pinned.fitted) return {pinned.fixed_ms,pinned.row_ms,pinned.lane_ms,false};
+    // Least squares of the measured topologies' cycle ms on (1, physical rows, lanes).
+    double a[3][4]{};
     for(const auto& [k,v]:costs_) {
         if(!v.samples()) continue;
-        const double x=2.0*k[0]+4.0*k[1]+8.0*k[2],y=v.value();
-        n+=1.0;sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;
+        const double x[3]{1.0,2.0*k[0]+4.0*k[1]+8.0*k[2],static_cast<double>(k[0]+k[1]+k[2])},y=v.value();
+        for(int i=0;i<3;++i) {for(int j=0;j<3;++j) a[i][j]+=x[i]*x[j];a[i][3]+=x[i]*y;}
     }
-    const double det=n*sxx-sx*sx;
-    if(n<2.0 || !(det>0.0)) return {};
-    const double row=(n*sxy-sx*sy)/det,fixed=(sy-row*sx)/n;
-    if(!(row>0.0) || !(fixed>0.0) || !std::isfinite(row) || !std::isfinite(fixed)) return {};
-    return {fixed,row,true};
+    // Gaussian elimination with partial pivoting; a pivot that vanishes relative to its column's scale
+    // means rows and lanes did not move independently, and the priors stay.
+    for(int i=0;i<3;++i) {
+        int pivot=i;
+        for(int r=i+1;r<3;++r) if(std::abs(a[r][i])>std::abs(a[pivot][i])) pivot=r;
+        const double scale=std::max({std::abs(a[0][i]),std::abs(a[1][i]),std::abs(a[2][i]),1.0});
+        if(!(std::abs(a[pivot][i])>1e-9*scale)) return {};
+        for(int j=0;j<4;++j) std::swap(a[i][j],a[pivot][j]);
+        for(int r=0;r<3;++r) if(r!=i) {
+            const double f=a[r][i]/a[i][i];
+            for(int j=i;j<4;++j) a[r][j]-=f*a[i][j];
+        }
+    }
+    const double fixed=a[0][3]/a[0][0],row=a[1][3]/a[1][1],lane=a[2][3]/a[2][2];
+    if(!(row>0.0) || !(fixed>0.0) || !(lane>=0.0) || !std::isfinite(row) || !std::isfinite(fixed) || !std::isfinite(lane)) return {};
+    return {fixed,row,lane,true};
 }
 std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const Request> q,std::uint32_t budget,bool prior,
     PlanInfo* info) const {
@@ -323,7 +336,7 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
     }
     const auto model=budget_cost();
     const double draft_ms=prior?(draft_.samples()?draft_.value():1.2):0.0;
-    const serve::CycleCost cost{model.fixed_ms,model.row_ms,0.0,draft_ms};
+    const serve::CycleCost cost{model.fixed_ms,model.row_ms,model.lane_ms,draft_ms};
     const serve::RowLimits limits{budget,{},static_cast<std::uint32_t>(q.size()),0.0};
     const auto plan=serve::plan_rows(lanes,cost,limits);
     // Owners hold 2, 4 or 8 rows: each lane keeps the largest owner inside its planned rows.
@@ -341,7 +354,28 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
         for(std::size_t k=0;k<q.size();++k) if(out[k]==2U && q[k].limit>=4U && (!prior || rule_.cap>=4U) && used+2U<=budget &&
             (best==q.size() || accept[k][1]>accept[best][1])) best=k;
         if(best!=q.size() && (used+2U==4U || used+2U==8U)) {out[best]=4U;used+=2U;}
-        else std::fill(out.begin(),out.end(),2U);
+        else {std::fill(out.begin(),out.end(),2U);used=2U*static_cast<std::uint32_t>(q.size());}
+    }
+    // Rows the owner sizes left unused: a lane moves to its next owner (2 -> 4 -> 8) while the budget holds it
+    // and the added rows yield more tokens per millisecond than the cycle does; most promising lane first.
+    const auto value=[&](std::size_t k,std::uint32_t from,std::uint32_t to) {
+        double chance=1.0,tokens=0.0;
+        for(std::uint32_t r=0;r<to;++r) {chance*=static_cast<double>(accept[k][r]);if(r>=from) tokens+=chance;}
+        return tokens;
+    };
+    double tokens=0.0;
+    for(std::size_t k=0;k<q.size();++k) tokens+=value(k,0U,out[k]);
+    while(used>=8U) {
+        const double ms=model.fixed_ms+model.row_ms*used+model.lane_ms*static_cast<double>(q.size())+draft_ms*(used-static_cast<double>(q.size()));
+        std::size_t best=q.size();double best_gain=0.0;
+        for(std::size_t k=0;k<q.size();++k) {
+            const auto next=out[k]*2U;
+            if(next>lanes[k].max_rows || used+out[k]>budget) continue;
+            const double gain=value(k,out[k],next)/((model.row_ms+draft_ms)*out[k]);
+            if(gain>tokens/ms && gain>best_gain) {best=k;best_gain=gain;}
+        }
+        if(best==q.size()) break;
+        tokens+=value(best,out[best],out[best]*2U);used+=out[best];out[best]*=2U;
     }
     if(prior) {
         // Two physical rows are the minimum either way; the one draft that fills the second row is bought only

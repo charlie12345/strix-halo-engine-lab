@@ -347,7 +347,7 @@ int main() {
         expect(rule.budget && !Controller::parse_rule("calibrated-c3").budget,"budget rule name parses");
         Controller c(8,rule);
         const auto model=c.budget_cost();
-        expect(!model.fitted && model.fixed_ms==34.0 && model.row_ms==6.0,"budget cost starts from the 34 + 6 x rows prior");
+        expect(!model.fitted && model.fixed_ms+model.lane_ms==34.0 && model.row_ms==6.0,"budget cost starts from the 34 + 6 x rows prior of one lane");
         const std::vector<float> sure(7,0.95F),poor(7,0.05F);
         std::uint32_t previous=UINT32_MAX;
         for(std::uint32_t lanes=1;lanes<=8U;++lanes) {
@@ -360,6 +360,7 @@ int main() {
             expect(total>8U || total==4U || total==8U,"small budget totals are four or eight rows");
             expect(widest<=previous,"rows per lane do not grow with the lanes of a cycle");
             previous=widest;
+            if(lanes==8U) expect(total==32U && widest==4U,"eight confident lanes share the 32-row budget");
         }
         const std::vector<Controller::Request> one{{0,8,sure}},eight{{0,8,sure},{1,8,sure},{2,8,sure},{3,8,sure},{4,8,sure},
             {5,8,sure},{6,8,sure},{7,8,sure}};
@@ -372,17 +373,24 @@ int main() {
         expect(bounded[0]==2U && bounded[1]<=4U,"budget rows respect each request's owner limit");
         const std::vector<Controller::Request> tails{{0,2,{}},{1,2,{}},{2,2,{}}};
         expect(c.choose(tails,32)==std::vector<std::uint32_t>({2,2,2}),"three two-row tails keep their small chunks");
-        // Measured topologies replace the prior: 20 + 10 x rows makes rows dearer, so the plan narrows.
+        // Measured topologies replace the prior once rows and lanes moved apart: 20 + 10 x rows + 3 x lanes.
         Controller measured(8,rule);
-        std::vector<Controller::Request> four;
+        std::vector<Controller::Request> four,two;
         for(std::uint32_t k=0;k<4U;++k) four.push_back({k,8,sure});
+        for(std::uint32_t k=0;k<2U;++k) two.push_back({k,8,sure});
         const auto before=measured.choose(four,32);
         const std::array<std::uint32_t,4> r2{2,2,2,2},r4{4,4,4,4},none{0,0,0,0};
-        for(int k=0;k<8;++k) {measured.observe(four,r2,none,0.0,20.0+10.0*8.0,0);measured.observe(four,r4,none,0.0,20.0+10.0*16.0,0);}
+        const std::array<std::uint32_t,2> p4{4,4},p8{8,8},none2{0,0};
+        const auto ms=[](double base,double per_row,double per_lane,double row_count,double lane_count){return base+per_row*row_count+per_lane*lane_count;};
+        for(int k=0;k<8;++k) {measured.observe(four,r2,none,0.0,ms(20,10,3,8,4),0);measured.observe(four,r4,none,0.0,ms(20,10,3,16,4),0);}
+        expect(!measured.budget_cost().fitted,"one lane count does not identify the lane term: the prior stays");
+        for(int k=0;k<8;++k) {measured.observe(two,p4,none2,0.0,ms(20,10,3,8,2),0);measured.observe(two,p8,none2,0.0,ms(20,10,3,16,2),0);}
         const auto fit=measured.budget_cost();
-        expect(fit.fitted && std::abs(fit.fixed_ms-20.0)<1.0 && std::abs(fit.row_ms-10.0)<0.5,"budget cost follows the measured topologies");
+        expect(fit.fitted && std::abs(fit.fixed_ms-20.0)<1.0 && std::abs(fit.row_ms-10.0)<0.5 && std::abs(fit.lane_ms-3.0)<0.5,
+            "budget cost follows the measured topologies");
         Controller dear(8,rule);
-        for(int k=0;k<8;++k) {dear.observe(four,r2,none,0.0,2.0+40.0*8.0,0);dear.observe(four,r4,none,0.0,2.0+40.0*16.0,0);}
+        for(int k=0;k<8;++k) {dear.observe(four,r2,none,0.0,ms(2,40,1,8,4),0);dear.observe(four,r4,none,0.0,ms(2,40,1,16,4),0);
+            dear.observe(two,p4,none2,0.0,ms(2,40,1,8,2),0);dear.observe(two,p8,none2,0.0,ms(2,40,1,16,2),0);}
         const std::vector<float> half(7,0.5F);
         std::vector<Controller::Request> unsure;
         for(std::uint32_t k=0;k<4U;++k) unsure.push_back({k,8,half});

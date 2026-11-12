@@ -53,9 +53,10 @@ public:
     // The last plan(): its expected tokens and ms (target estimate + draft estimate), and whether it was a probe.
     struct PlanInfo {double expected=0.0, ms=0.0; bool probe=false;};
     [[nodiscard]] const PlanInfo& last_plan() const noexcept {return last_;}
-    // Budget rule cost model: fixed + per-row ms of a cycle. Priors 34 + 6 x rows (STRIX_SERVE_ROW_COST=fixed,row
-    // pins them); once two or more topologies with different row totals are measured, their least-squares line.
-    struct BudgetCost {double fixed_ms=34.0,row_ms=6.0; bool fitted=false;};
+    // Budget rule cost model: a cycle costs fixed + row x physical rows + lane x lanes ms. Priors 28 + 6 x rows
+    // + 6 x lanes (one lane: 34 + 6 x rows; STRIX_SERVE_ROW_COST=fixed,row,lane pins them); once the measured
+    // topologies identify the three terms, their least-squares fit.
+    struct BudgetCost {double fixed_ms=28.0,row_ms=6.0,lane_ms=6.0; bool fitted=false;};
     [[nodiscard]] BudgetCost budget_cost() const;
     void resize_slots(std::size_t slots) {history_.resize(slots);}
     void reset(std::uint32_t slot) {history_.at(slot)={};}

@@ -888,11 +888,12 @@ int main(int argc, char** argv) {
             if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
             (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
-            std::string receipt;
-            auto transport = strix::glm::rank_transport::open_transport(transport_spec, opt.rank, receipt);
+            auto opened = strix::dist::open_pair(transport_spec, opt.rank);
+            auto transport = std::move(opened.host);
+            const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
-            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), opt.exchange_rows);
+            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), std::move(opened.direct), opt.exchange_rows);
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(),
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
         }

@@ -211,6 +211,9 @@ public:
     // wake_on_cancel false: a cancellation does not end the wait (a caller that cancelled waits for the finish)
     std::vector<std::uint32_t> wait(std::chrono::milliseconds timeout, bool& done, bool wake_on_cancel = true);
     // Wait without consuming tokens until session admission or completion.
+    // Ends the current (or next) wait() without tokens: an engine that hands output to the HTTP thread by another
+    // path (Gemma4's batched deltas) wakes it instead of the HTTP thread polling.
+    void wake();
     bool wait_admission(std::chrono::milliseconds timeout);
     void admit();
     [[nodiscard]] GenerationProgress progress() const;
@@ -238,6 +241,7 @@ private:
     std::string error_;
     bool admitted_ = false;
     bool done_ = false;
+    bool woken_ = false;
     std::atomic<bool> cancelled_{false};
     bool observed_ = false;
     std::uint64_t submitted_queue_position_ = 0;
@@ -335,6 +339,10 @@ public:
     // Explicit QueueSelection calls process only the initial batch; retry nullopt until stopping.
     // The bool/default API retains upstream FIFO/DeepSeek cancellation and wait semantics.
     [[nodiscard]] bool has_queued_work() const;
+    // Idle owner loops: block until work is queued, the queue stops, or the deadline passes, instead of polling with
+    // a short sleep. A control wake (wake_control) does not end the wait: take(false) never clears it, so waking on it
+    // would spin. Returns has_queued_work() at return.
+    bool wait_work_until(std::chrono::steady_clock::time_point deadline) const;
     [[nodiscard]] bool has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& eligible) const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
@@ -367,7 +375,7 @@ private:
     void observe_locked(const ObserveDelta& d) noexcept;
     struct Entry { GenerationJob job; std::shared_ptr<GenerationTicket> ticket; std::chrono::steady_clock::time_point submitted; std::uint32_t overtakes = 0; };
     mutable std::mutex mutex_;
-    std::condition_variable ready_;
+    mutable std::condition_variable ready_;  // mutable: wait_work_until is const
     std::deque<Entry> entries_;
     std::size_t max_queued_;
     bool stopping_ = false;

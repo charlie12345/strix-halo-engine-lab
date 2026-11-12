@@ -1,4 +1,5 @@
 #include "strix/dist/open_transport.hpp"
+#include "strix/env_flags.hpp"
 // strix-minimax-serve: the MiniMax M3.1 Flash TP2 engine behind an OpenAI-compatible HTTP API (both ranks run it;
 // rank 0 serves HTTP). The DS serve recipe: rank 0 owns the queue and a continuous-batching scheduler over the
 // engine's sequence slots and sends one fixed-size control block per round (prefill / unit / step / draft / heartbeat /
@@ -103,27 +104,9 @@ std::string hex(std::uint64_t v) {
     std::snprintf(b, sizeof b, "%016llx", static_cast<unsigned long long>(v));
     return b;
 }
-double env_num(const char* name, double def) {
-    const char* v = std::getenv(name);
-    return v == nullptr || *v == 0 ? def : std::atof(v);
-}
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
-
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::hyphen_transport;
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(300);
-    options.usb.transport_capabilities = 0; // preserve the serving capability contract
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    receipt = std::move(opened.receipt);
-    return std::move(opened.host);
-}
 
 // The transport shared in turn by the communicator and the exchange module (as strix-minimax-rank).
 using Borrowed = strix::xport::BorrowedTransport<
@@ -172,8 +155,8 @@ struct Runner {
     std::uint64_t local_id = 0, control_round = 0;
     std::uint32_t last_next = 0, contexts = 0;
     // STRIX_MM_SERVE_DSPARK_STAGE=0 (or STRIX_MM_BASELINE=1 when unset) appends every cycle's rows at once (previous form).
-    const bool stage = std::getenv("STRIX_MM_SERVE_DSPARK_STAGE") != nullptr ? env_num("STRIX_MM_SERVE_DSPARK_STAGE", 1) != 0
-                                                                     : env_num("STRIX_MM_BASELINE", 0) != 1;
+    const bool stage = std::getenv("STRIX_MM_SERVE_DSPARK_STAGE") != nullptr ? strix::env_number<double>("STRIX_MM_SERVE_DSPARK_STAGE", 1) != 0
+                                                                     : strix::env_number<double>("STRIX_MM_BASELINE", 0) != 1;
     void retire_contexts(std::uint32_t mask) {
         contexts &= ~mask;
         if (dd != nullptr) for (std::uint32_t s = 0; s < eng.slots(); ++s)
@@ -270,17 +253,13 @@ using ms::lead::Lead;
 
 void follow(mm::Engine& eng, Runner& run, strix::minimax::session::Runtime* session = nullptr) try {
     ms::SessionCounts counts;
-    bool taps = run.dd != nullptr && env_num("STRIX_MM_SERVE_DSPARK", 0) != 0;
-    std::uint64_t round = run.control_round;
+    // STRIX_MM_SERVE_DSPARK is off|auto|on|0|1 (ds::parse_mode); the follower starts taps only for an exact "1".
+    bool taps = run.dd != nullptr && strix::env_flag_default_off("STRIX_MM_SERVE_DSPARK");
+    strix::pair::Lockstep lock(static_cast<std::uint32_t>(eng.rank()), run.control_round);
     for (;;) {
         Control mine;
-        mine.ack_round = round == 0 ? ~std::uint64_t{0} : round - 1;
         mine.plen = eng.prefill_progress().open ? 0 : run.last_next;
-        const Control c = exchange(eng, mine);
-        if (c.round != round++) {
-            eng.abort("control channel: duplicate / stale round");
-            throw std::runtime_error("control channel: duplicate / stale round");
-        }
+        const Control c = exchange(eng, mine, lock);
         if (static_cast<Command>(c.command) == Command::heartbeat) run.quiesce();
         if (static_cast<Command>(c.command) == Command::session) {
             const auto body = ms::session_wire(eng, {}, c.plen);
@@ -478,26 +457,21 @@ int resume_check(mm::Engine& eng, Runner& run, const std::string& files, unsigne
         const auto nested_arm = [&](unsigned checkpoint, bool background_step) {
             Result r;
             std::array<std::uint64_t, 3> pos{p.size(), short_prompt.size(), q.size()};
-            auto& check_round = run.control_round;
+            strix::pair::Lockstep lock(static_cast<std::uint32_t>(eng.rank()), run.control_round);
             const auto command = [&](Command op, std::uint64_t id, std::uint64_t parent = 0,
                                      unsigned slot = 0, unsigned layers = 0) {
                 Control out;
-                out.ack_round = check_round == 0 ? ~std::uint64_t{0} : check_round - 1;
                 if (eng.rank() == 0) {
                     out.command = static_cast<std::uint32_t>(op);
-                    out.round = check_round;
                     out.task_id = id; out.parent_task_id = parent; out.slot_generation = 1;
                     out.pslot = slot; out.layers = layers;
                     out.bank = op == Command::nest ? 1U : eng.prefill_progress().bank;
                     if (op == Command::check) out.plen = run.last_next;
                     if (op == Command::prefill || op == Command::nest) out.plen = static_cast<std::uint32_t>(prompts[slot].size());
                 }
-                const auto peer = exchange(eng, out);
+                const auto peer = exchange(eng, out, lock);
+                run.control_round = lock.round();
                 const auto& c = eng.rank() == 0 ? out : peer;
-                if (c.round != check_round++) {
-                    eng.abort("nested check replay round");
-                    throw std::runtime_error("nested check replay round");
-                }
                 (void)ms::replay_command(c, eng, run, [&](std::size_t n) {
                     auto prompt = eng.rank() == 0 ? prompts[slot] : std::vector<std::uint32_t>{};
                     exchange_tokens(eng, prompt, n, eng.rank() == 0);
@@ -868,8 +842,10 @@ int main(int argc, char** argv) {
             }
             deploy_spec = std::move(spec);
         }
-        std::string receipt;
-        auto transport = open_transport(transport_spec, opt.rank, receipt);
+        // transport_capabilities 0 preserves the serving capability contract.
+        auto opened = strix::dist::open_pair(transport_spec, opt.rank, {std::chrono::seconds(300), 0});
+        auto transport = std::move(opened.host);
+        const auto& receipt = opened.receipt;
         if (deploy_spec) {
             auto plan = strix::deploy::resolve_pair(*deploy_spec,*deploy_provider,opt.rank,strix::deploy::probe_device(),
                 [&](auto out, auto in) { transport->exchange(out,in); });
@@ -896,12 +872,11 @@ int main(int argc, char** argv) {
             xo.from_env();
             exchanger = std::make_unique<strix::minimax::xfer::Exchanger>(std::make_unique<Borrowed>(*transport), xo);
         }
-        auto comm_owner = gpu_direct
-            ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), std::move(gpu_direct), max_bytes)
-            : std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), max_bytes);
+        auto comm_owner = std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport),
+                                                                      std::move(opened.direct), max_bytes);
         auto& comm = *comm_owner;
-        cli.transport = strix::dist::negotiated_transport(transport_spec,
-            comm.device_exchange() != nullptr, strix::dist::hyphen_transport);
+        cli.transport = strix::dist::negotiated_transport(transport_spec, comm.device_exchange() != nullptr,
+                                                          strix::minimax::defaults::kRouteHost, strix::minimax::defaults::kRouteGpu);
         if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
         std::printf("connected: rank %u transport %s\n", opt.rank, comm.transport_name().c_str());
         std::fflush(stdout);
@@ -1019,13 +994,13 @@ int main(int argc, char** argv) {
         Shared shared;
         shared.prefix_reuse = prefix_agreed;
         {
-            shared.policy.nest = env_num("STRIX_MM_SERVE_NEST", 1) != 0;
+            shared.policy.nest = strix::env_number<double>("STRIX_MM_SERVE_NEST", 1) != 0;
             shared.nest_rows = eng.nested_rows();
             shared.nest_reason = eng.nested_reason();
             shared.nest_taps = drafter != nullptr;
             shared.policy.sched = ms::sched_mode(std::getenv("STRIX_MM_SERVE_SCHED"));
             shared.policy.service_ms = ms::service_ms(std::getenv("STRIX_MM_SERVE_SERVICE_MS"));
-            shared.policy.short_first = env_num("STRIX_MM_SERVE_SHORT_FIRST", 1) != 0;
+            shared.policy.short_first = strix::env_number<double>("STRIX_MM_SERVE_SHORT_FIRST", 1) != 0;
             shared.unlimited_reason = eng.prefill_unlimited_reason();
             shared.policy.gap_ms = ms::gap_ms(std::getenv("STRIX_MM_SERVE_GAP_MS"));
             shared.policy.dspark_mode = dspark_mode;
@@ -1033,7 +1008,7 @@ int main(int argc, char** argv) {
             shared.policy.lookup = lookup_env == nullptr || std::strcmp(lookup_env, "0") != 0;
             shared.policy.dspark_prior = dspark_prior;
             shared.policy.inflight = dspark_inflight;
-            shared.policy.draft_slots = static_cast<std::uint32_t>(std::clamp(env_num("STRIX_MM_SERVE_DRAFT_SLOTS", 8), 1.0, 8.0));
+            shared.policy.draft_slots = static_cast<std::uint32_t>(std::clamp(strix::env_number<double>("STRIX_MM_SERVE_DRAFT_SLOTS", 8), 1.0, 8.0));
         }
         sv::GenerationQueue queue(64);
         ms::SessionService session_service;

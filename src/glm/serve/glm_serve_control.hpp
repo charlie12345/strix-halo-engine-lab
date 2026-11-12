@@ -21,6 +21,7 @@
 
 #include "glm/serve/glm_serve_import.hpp"
 #include "glm/serve/glm_serve_prefix_cache.hpp"
+#include "strix/pair/lockstep.hpp"
 
 namespace strix::glm::serve {
 
@@ -35,7 +36,7 @@ inline constexpr std::uint32_t kImportDsaOnce = 8U;  // import_state pflags: han
 inline constexpr std::size_t kControlBytes = 512;
 inline constexpr unsigned kMaxRows = 8;                       // Engine::step takes 1..8 rows
 inline constexpr std::size_t kTokensPerMessage = 16384;       // 64 KiB per prompt message
-inline constexpr std::uint64_t kNoRound = ~std::uint64_t{0};
+using strix::pair::kNoRound;
 
 // mtp_enter: seed the slot's drafter from the last step's row pslot (row[0] = {slot, token it produced, its position}).
 // mtp_run: up to `cycles` verify cycles of slot pslot (the first run opens the decoder from the seed with `budget`).
@@ -173,10 +174,7 @@ inline std::uint64_t fnv1a64(const void* p, std::size_t n, std::uint64_t h = 146
 }
 inline std::uint64_t fnv1a64(const std::string& s, std::uint64_t h = 14695981039346656037ULL) { return fnv1a64(s.data(), s.size(), h); }
 
-class ProtocolError : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
+using strix::pair::ProtocolError;
 
 using Block = std::array<std::byte, kControlBytes>;
 
@@ -280,15 +278,16 @@ inline bool consecutive_slots(std::span<const WireRow> rows) {
 class Channel {
 public:
     using Wire = std::function<void(std::span<const std::byte>, std::span<std::byte>, std::uint32_t layer, std::uint64_t request)>;
-    Channel(Wire wire, std::uint32_t rank) : wire_(std::move(wire)), rank_(rank) {}
+    Channel(Wire wire, std::uint32_t rank) : wire_(std::move(wire)), lock_(rank) {}
 
     // One round: fills the bookkeeping fields of `mine` and returns the peer's block after every check.
     Control exchange(Control mine) {
         mine.magic = kControlMagic;
         mine.version = kControlVersion;
-        mine.round = round_;
-        mine.ack_round = round_ == 0 ? kNoRound : round_ - 1;
-        mine.rank = rank_;
+        const strix::pair::LockstepHeader head = lock_.header();
+        mine.round = head.round;
+        mine.ack_round = head.ack_round;
+        mine.rank = head.rank;
         mine.echo_round = echo_round_;
         mine.echo_count = echo_count_;
         mine.echo_token = echo_token_;
@@ -296,17 +295,14 @@ public:
         Control peer;
         if (!wire_) {
             peer = mine;
-            peer.rank = rank_ ^ 1U;
+            peer.rank = head.rank ^ 1U;
         } else {
             const Block out = encode(mine);
             Block in{};
-            wire_(out, in, 0, round_);
+            wire_(out, in, 0, head.round);
             peer = decode(in);
         }
-        if (peer.round != round_) throw ProtocolError("control channel: duplicate / stale round " + std::to_string(peer.round) +
-                                                      ", expected " + std::to_string(round_));
-        if (peer.ack_round != mine.ack_round) throw ProtocolError("control channel: preceding round not acknowledged");
-        if (peer.rank == rank_) throw ProtocolError("control channel: peer reports the same rank");
+        lock_.check({peer.round, peer.ack_round, peer.rank});
         if (peer.echo_round != echo_round_ || peer.echo_count != echo_count_ || peer.echo_token != echo_token_ ||
             peer.echo_hash != echo_hash_)
             throw ProtocolError("cross-rank token mismatch: round " + std::to_string(echo_round_) + " local count " +
@@ -314,7 +310,7 @@ public:
                                 std::to_string(echo_hash_) + ", peer round " + std::to_string(peer.echo_round) + " count " +
                                 std::to_string(peer.echo_count) + " last " + std::to_string(peer.echo_token) + " hash " +
                                 std::to_string(peer.echo_hash));
-        ++round_;
+        lock_.accept({peer.round, peer.ack_round, peer.rank});
         return peer;
     }
 
@@ -330,7 +326,7 @@ public:
             in.assign(m, 0);
             if (sender) std::memcpy(out.data(), tokens.data() + c0, m * 4);
             wire_(std::as_bytes(std::span<const std::uint32_t>(out)), std::as_writable_bytes(std::span<std::uint32_t>(in)),
-                  1, (round_ << 20) | k);
+                  1, (lock_.round() << 20) | k);
             if (!sender) std::memcpy(tokens.data() + c0, in.data(), m * 4);
         }
     }
@@ -354,13 +350,12 @@ public:
         if (!m.empty()) throw ProtocolError("hello mismatch between the ranks: " + m);
     }
 
-    [[nodiscard]] std::uint64_t round() const noexcept { return round_; }
-    [[nodiscard]] std::uint32_t rank() const noexcept { return rank_; }
+    [[nodiscard]] std::uint64_t round() const noexcept { return lock_.round(); }
+    [[nodiscard]] std::uint32_t rank() const noexcept { return lock_.rank(); }
 
 private:
     Wire wire_;
-    std::uint32_t rank_ = 0;
-    std::uint64_t round_ = 0;
+    strix::pair::Lockstep lock_;
     std::uint64_t echo_round_ = kNoRound;
     std::uint32_t echo_count_ = 0, echo_token_ = 0, echo_hash_ = 2166136261U;
 };

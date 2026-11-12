@@ -32,6 +32,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -5002,11 +5003,6 @@ void enqueue_gdn_prefill_core_tiles(const std::vector<std::array<GdnKnownWindowR
 }
 // Shapes: STRIX_GDN_LANES (keys of a column split over 2|4|8 lanes, default 4), STRIX_GDN_LANE_WAVES
 // (2|4|8 waves per recurrence block, default 8), STRIX_GDN_CHUNK (8|16 staged rows, default 8).
-std::uint32_t gdn_prefill_env(const char* name, std::uint32_t fallback, std::initializer_list<std::uint32_t> allowed) {
-    const char* v = std::getenv(name);
-    const auto n = v ? static_cast<std::uint32_t>(std::atoi(v)) : fallback;
-    return std::find(allowed.begin(), allowed.end(), n) != allowed.end() ? n : fallback;
-}
 // STRIX_QPF2K_GDN=1 (default OFF): the qpf2k core kernels (gdn_qpf2k_prefill.inc) replace the production gates and lane
 // recurrence where their shape conditions hold; STRIX_QPF2K_GDN_PARTS (bit 1 recurrence, bit 2 gates, bit 4 fused core =
 // q/k conv per row segment + recurrence with v conv and gated norm, bit 8 = that core with the norm exchange pipelined one
@@ -5231,7 +5227,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     const bool fp16_chunk = gdn_fp16_chunk_enabled(first, strided);
     if (fp16_chunk) qpf2k &= ~4U;
     // STRIX_GDN_GATE_HEADS: beta/alpha outputs per gates block (1|2|4, default 2; must divide the head count).
-    static const auto gate_heads_env = gdn_prefill_env("STRIX_GDN_GATE_HEADS", 2U, {1U, 2U, 4U});
+    static const auto gate_heads_env = 1U << strix::env_choice("STRIX_GDN_GATE_HEADS", 1, {"1", "2", "4"});
     const auto gate_heads = first.value_heads % gate_heads_env ? 1U : gate_heads_env;
     const auto gates = [&]<unsigned H>() {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_gates_kernel<8U, H>), dim3(first.value_heads * 2U / H, count / 8U),
@@ -5552,9 +5548,9 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
         reinterpret_cast<const void*>(first.tensors.conv.runtime->address), small_weight_kind(first.tensors.conv.manifest->ggml_type),
         first.key_heads, first.head_dim, config.model.gdn_qk_l2_epsilon);
     check_hip(hipGetLastError(), "GDN prefill conv rows launch");
-    static const auto lanes = gdn_prefill_env("STRIX_GDN_LANES", 4U, {2U, 4U, 8U});
-    static const auto waves = gdn_prefill_env("STRIX_GDN_LANE_WAVES", 8U, {2U, 4U, 8U});
-    static const auto chunk_env = gdn_prefill_env("STRIX_GDN_CHUNK", 8U, {8U, 16U});
+    static const auto lanes = 2U << strix::env_choice("STRIX_GDN_LANES", 1, {"2", "4", "8"});
+    static const auto waves = 2U << strix::env_choice("STRIX_GDN_LANE_WAVES", 2, {"2", "4", "8"});
+    static const auto chunk_env = 8U << strix::env_choice("STRIX_GDN_CHUNK", 0, {"8", "16"});
     const auto chunk = count % chunk_env ? 8U : chunk_env;
     auto* matrix = reinterpret_cast<float*>(first.matrix_state.address);
     const auto launch = [&]<GdnRecurrentStorage S, unsigned G, unsigned W, unsigned C>() {
@@ -5841,7 +5837,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         out.input0 = reinterpret_cast<const unsigned char*>(first.workspace.core); out.input_stride = si;
         out.output0 = reinterpret_cast<unsigned char*>(first.output.address); out.output_stride = so;
         if (!q8_rows::tiled::supported(out, count, q8_rows::tiled::kPre)) return false;
-        core16.form = gdn_prefill_env("STRIX_QPF2K_GDN_CORE16_FORM", 4U, {0U, 1U, 2U, 3U, 4U});
+        core16.form = static_cast<decltype(core16.form)>(strix::env_choice("STRIX_QPF2K_GDN_CORE16_FORM", 4, {"0", "1", "2", "3", "4"}));
         static const auto raster = [] {
             const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16_RASTER");
             const int n = v ? std::atoi(v) : 2;
@@ -6724,7 +6720,7 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
     const auto rows = static_cast<std::uint32_t>(input.size());
     // The fixture rewrites weights in place between calls (STRIX_Q8_ROWS_LANE_PROBE_CACHE=1 keeps the
     // lane kernel's repacked weights, for timing one unchanged matrix).
-    if (!q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
+    if (!strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
     if (rows < 1U || (rows > 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows ||
         (direction != GdnKnownWindowProjectionDirection::bf16_to_fp32 &&
          direction != GdnKnownWindowProjectionDirection::fp32_to_bf16) ||

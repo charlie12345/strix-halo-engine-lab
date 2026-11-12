@@ -3,6 +3,7 @@
 // Serialized by the bridge request mutex. Uses the existing prefix-cache allocator/LRU.
 #include "strix/session_state_cache.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/serve/session_api.hpp"
 #include <algorithm>
 #include <set>
 #include <array>
@@ -31,12 +32,7 @@ inline bool session_prompt_extends(const SessionFrontier& f, std::span<const std
         !std::equal(f.tokens.begin(), f.tokens.end(), prompt.begin())) return false;
     return !f.pending || prompt[f.tokens.size()] == *f.pending;
 }
-struct SessionApiError : std::runtime_error {
-    int status;
-    std::string code;
-    SessionApiError(int s, std::string c, const std::string& message)
-        : std::runtime_error(message), status(s), code(std::move(c)) {}
-};
+using serve::SessionApiError;
 // Fresh observation is supplied by the caller after resident and retained owners exist.
 // This pure admission seam refuses before any checkpoint allocation or device work.
 inline std::uint64_t session_capture_peak_bound(std::uint64_t fixed, std::uint64_t unit,
@@ -45,11 +41,6 @@ inline std::uint64_t session_capture_peak_bound(std::uint64_t fixed, std::uint64
     if (!unit || fixed>limit || rows>(limit-fixed)/unit)
         throw SessionApiError(507,"session_budget","session capture exceeds fresh UMA/host peak budget");
     return 4U*(fixed+rows*unit);
-}
-inline serve::Json session_error_json(const SessionApiError& e) {
-    auto body = serve::Json::object(), error = serve::Json::object();
-    error.set("code", serve::Json(e.code)); error.set("message", serve::Json(e.what()));
-    body.set("error", std::move(error)); return body;
 }
 // One persistent lock inode per shared directory. Never unlink it after unlocking.
 class SessionDirectoryLock {

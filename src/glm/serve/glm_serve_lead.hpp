@@ -323,7 +323,11 @@ private:
                     count_round();
                     last_round = Clock::now();
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                // Idle: wake on a submit at once (was a 2 ms poll). The 20 ms cap bounds how late stop_ and the
+                // prefix-clear flag (plain atomics, no queue wake) are seen; the heartbeat deadline keeps its cadence.
+                const auto hb_due = last_round + std::chrono::duration_cast<Clock::duration>(
+                                                     std::chrono::duration<double>(cfg_.heartbeat_seconds));
+                (void)queue_.wait_work_until(std::min(hb_due, Clock::now() + std::chrono::milliseconds(20)));
                 continue;
             }
             // decode first: the running requests' round, then the import poll of a prompt waiting for its RTX state

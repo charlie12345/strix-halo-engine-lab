@@ -116,7 +116,6 @@ std::vector<std::uint32_t> read_u32(const std::string& path) {
     return v;
 }
 
-using strix::glm::rank_transport::open_transport;
 
 }  // namespace
 
@@ -343,8 +342,9 @@ int main(int argc, char** argv) {
             (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
             // the DS/MiniMax 'hp' host path (STRIX_DIST_CRC_PARALLEL / HOST_CRC_OVERLAP / HOST_CHUNK_BYTES) is set by rank_defaults
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
-            std::string receipt;
-            auto transport = open_transport(transport_spec, opt.rank, receipt);
+            auto opened = strix::dist::open_pair(transport_spec, opt.rank);
+            auto transport = std::move(opened.host);
+            const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
             if (xch_kind == "xfer") {  // the module owns the transport; no Communicator (Options::external_exchange)
@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
             } else {
             // one exchange carries up to max(8, max_rows) rows of 4096 floats (a chunked prefill exchanges whole chunks)
             opt.exchange_rows = rd::max_rows_auto(eff) ? rd::kFallbackMaxRows : opt.max_rows;
-            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), opt.exchange_rows);
+            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), std::move(opened.direct), opt.exchange_rows);
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(), secs(t_start, Clock::now()));
             }
         }

@@ -68,21 +68,6 @@ std::vector<std::uint32_t> parse_list(const std::string& s) {
     return out;
 }
 
-// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (null: host path).
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::compact_transport;
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(timeout);
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    if (!opened.receipt.empty()) std::fprintf(stderr, "usb4 topology: %s\n", opened.receipt.c_str());
-    return std::move(opened.host);
-}
-
-// Device scratch for the drafter's input rows and the window packet.
 struct Scratch {
     float* main_hidden = nullptr;  // [128][15360]
     std::uint32_t* packet = nullptr;  // [2][16]: own, peer
@@ -229,9 +214,10 @@ void run_dump(const Args& a, strix::deepseek41::DeviceForward& fwd, bool write) 
     (void)hipFree(rows_dev);
 }
 
-void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print) {
+void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print,
+              std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
     const auto t_start = clock_type::now();
-    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733432ULL}, std::move(transport), std::move(gpu_direct), 512U << 10U);
+    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733432ULL}, std::move(transport), std::move(direct), 512U << 10U);
     const bool spec = a.mode == "spec", oracle = a.mode == "oracle";
     const auto reference = a.reference.empty() ? std::vector<std::uint32_t>{} : parse_list(a.reference);
     const auto oracle_rows = parse_list(a.oracle_rows);
@@ -820,11 +806,12 @@ int main(int argc, char** argv) try {
     }
     // A blocked open() of a stream on a dead link would hold this node (and the peer) indefinitely.
     ::alarm(a.connect_timeout);
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout), strix::dist::all_transport_capabilities, true});
+    auto transport = std::move(opened.host);
     ::alarm(0);
     std::printf("connected (%s)\n", transport->name().c_str());
     std::fflush(stdout);
-    run_rank(a, a.rank, std::move(transport), true);
+    run_rank(a, a.rank, std::move(transport), true, std::move(opened.direct));
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << '\n';

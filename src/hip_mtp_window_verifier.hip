@@ -15,6 +15,7 @@
 #include <vector>
 #include "strix/hip_token_sampling_device.hpp"
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -70,7 +71,6 @@ bool hip_mtp_survival_controller() noexcept {
     return enabled;
 }
 namespace {
-double env_number(const char* name,double fallback) {const char* v=std::getenv(name);return v && *v?std::atof(v):fallback;}
 double clamped_logit(double p) {p=std::clamp(p,1e-6,1.0-1e-6);return std::log(p/(1.0-p));}
 double sigmoid(double z) {return 1.0/(1.0+std::exp(-std::clamp(z,-30.0,30.0)));}
 // P(draft k equals the target's greedy token | drafts 0..k-1 did): a logistic over the draft's own
@@ -291,14 +291,14 @@ struct HipMtpWindowVerifier::Impl {
         // The survival controller prices options by measured time: never with a timing-independent schedule.
         survival=prefix && hip_mtp_survival_controller() && !timing_independent;
         if(survival) {
-            const bool active_rows=env_number("STRIX_MTP_ACTIVE_ROWS",0.0)!=0.0;
+            const bool active_rows=strix::env_number<double>("STRIX_MTP_ACTIVE_ROWS",0.0)!=0.0;
             for(auto& o:owners) {
                 if(active_rows && (o.rows==4U || o.rows==8U)) options.push_back({&o,o.rows==4U?3U:6U});
                 options.push_back({&o,o.rows});
             }
-            explore=env_number("STRIX_MTP_EXPLORE",0.0);
-            reprobe_cycles=static_cast<std::uint64_t>(std::max(0.0,env_number("STRIX_MTP_REPROBE",64.0)));
-            if(env_number("STRIX_MTP_SURVIVAL_ADAPT",1.0)!=0.0) {calibrator.rate=0.01;calibrator.pull=0.01;}
+            explore=strix::env_number<double>("STRIX_MTP_EXPLORE",0.0);
+            reprobe_cycles=static_cast<std::uint64_t>(std::max(0.0,strix::env_number<double>("STRIX_MTP_REPROBE",64.0)));
+            if(strix::env_number<double>("STRIX_MTP_SURVIVAL_ADAPT",1.0)!=0.0) {calibrator.rate=0.01;calibrator.pull=0.01;}
         }
         // Persisted costs: the default min-p controller with measured costs only (no depth/survival controller,
         // no timing-independent schedule, no diagnostics), per-request resets (the default), and every owner admitted
@@ -325,7 +325,7 @@ struct HipMtpWindowVerifier::Impl {
         for(std::size_t o=1;o<owners.size();++o) owners[o].window->share_deferred(*owners.front().window);
         // STRIX_WINDOW_ROUTE_LOG=1 (diagnostics, never timed): after each router step of a verify window, the
         // routed expert ids of every row ("route pos=P rows=R row=r layer=L ids=..." on stderr). Synchronizes.
-        if(env_number("STRIX_WINDOW_ROUTE_LOG",0.0)!=0.0) for(auto& o:owners) {
+        if(strix::env_number<double>("STRIX_WINDOW_ROUTE_LOG",0.0)!=0.0) for(auto& o:owners) {
             const auto top_k=static_cast<std::size_t>(target->model().num_experts_per_token);
             o.window->set_window_step_observer([rows=o.rows,top_k](std::size_t,const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
                 const auto first=row(0);
@@ -964,7 +964,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     // Matched-position diagnostics: execute a physical owner, but commit only one
     // exact target row. Every arm therefore visits the same target frontiers.
     const bool diagnostic=hip_mtp_full_chain_diagnostic();
-    const auto diagnostic_rows=diagnostic?static_cast<std::uint32_t>(env_number("STRIX_MTP_DIAG_ROWS",1.0)):0U;
+    const auto diagnostic_rows=diagnostic?static_cast<std::uint32_t>(strix::env_number<double>("STRIX_MTP_DIAG_ROWS",1.0)):0U;
     require(!diagnostic || diagnostic_rows==1U || diagnostic_rows==2U || diagnostic_rows==4U || diagnostic_rows==8U,
         "MTP diagnostic rows must be 1, 2, 4 or 8");
     if(diagnostic && diagnostic_rows==1U) budget=std::min(budget,1U);

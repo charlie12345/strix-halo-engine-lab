@@ -295,7 +295,7 @@ SessionConfig session_policy(const Cli& cli, const Lookup& env, bool explicit_cl
     else if (c.max_parked == 0) c.reason = "max parked is zero";
     // Live direct serving is unqualified even with an explicit cache opt-in.
     // Runtime callers supply the negotiated transport, not the request spelling.
-    else if (cli.app == "serve" && cli.transport == "usb4gpu")
+    else if (cli.app == "serve" && cli.transport == kRouteGpu)
         c.reason = "route not yet GPU-qualified: " + c.route;
     else if (!explicit_cli && !qualified && mode != "1" && mode != "on")
         c.reason = "route not yet GPU-qualified: " + c.route;

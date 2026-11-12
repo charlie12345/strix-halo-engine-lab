@@ -1,5 +1,6 @@
 #include "api.hpp"
 #include "gemma4/features/features.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -43,15 +44,16 @@ Json output_message(const gemma4::serve::Output& output) {
     if (output.tool_calls.size()) message.set("tool_calls",wire_calls(output.tool_calls,false));
     return message;
 }
+// A count from the environment, clamped to `maximum` (larger values have always meant "the most").
 std::size_t env_count(const char* name, std::size_t fallback, std::size_t maximum) {
-    const auto* p = std::getenv(name);
-    if (!p) return fallback;
-    const auto n = std::strtoull(p,nullptr,10);
-    return n > maximum ? maximum : std::size_t(n);
+    return std::min(strix::env_number<std::size_t>(name, fallback), maximum);
 }
-bool serve_batched() { const auto* p = std::getenv("STRIX_G4_SERVE_BATCH"); return !p || std::string(p) != "0"; }
+bool serve_batched() { return strix::env_flag_default_on("STRIX_G4_SERVE_BATCH"); }
 }
-std::size_t serve_slots() { return serve_batched() ? std::max<std::size_t>(1,env_count("STRIX_G4_SERVE_SLOTS",8,8)) : 1; }
+std::size_t serve_slots(std::size_t requested) {
+    if (!serve_batched()) return 1;
+    return std::clamp<std::size_t>(requested != 0 ? requested : env_count("STRIX_G4_SERVE_SLOTS",8,8),1,8);
+}
 ChatRequest parse_chat_request(const Json& j, DraftMode default_mode, const Request& defaults) {
     if (!j.is_object()) throw std::invalid_argument("chat request must be an object");
     for (const auto& [key,value] : j.as_object()) {
@@ -123,9 +125,12 @@ struct Api::Impl final : strix::serve::GenerationEngine {
         ChatResult result;
         ChatSink sink;
         std::atomic<bool> cancelled{false};
-        // Continuous batching: deltas the batcher produced, written to the client by the handler thread.
+        // Continuous batching: deltas the batcher produced, written to the client by the handler thread, which the
+        // batcher wakes through the ticket (set under deltas_mutex once submitted; deltas buffered before are drained
+        // ahead of the first wait).
         std::mutex deltas_mutex;
         std::vector<gemma4::serve::OutputDelta> deltas;
+        std::shared_ptr<strix::serve::GenerationTicket> ticket;
     };
     Backend& backend;
     gemma4::serve::Adapter adapter;
@@ -145,20 +150,20 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     // (default 8) jobs share one Coordinator and decode together; STRIX_G4_SERVE_PREFILL_PER_STEP (default 1, 0 = all)
     // bounds the prompt chunks one step may prefill. Each job's ids equal the job run alone.
     const bool batched = serve_batched();
-    const std::size_t slots = serve_slots();
+    const std::size_t slots;
     const std::size_t prefill_per_step = env_count("STRIX_G4_SERVE_PREFILL_PER_STEP",1,8);
     // Prompt rows per prefill chunk while other requests decode (0 = whole 512-row chunks).
     const std::size_t prefill_rows = env_count("STRIX_G4_SERVE_PREFILL_ROWS",64,512);
     // Prompt prefix cache (STRIX_G4_SERVE_PREFIX=0 off): committed states at the end of each prompt and of each
     // finished request, reused by a later prompt that starts with exactly those tokens (a conversation's next turn).
     // LRU within STRIX_G4_SERVE_PREFIX_MB (default 4096) of KV and 16 entries.
-    const bool prefix_cache = batched && [] { const auto* p = std::getenv("STRIX_G4_SERVE_PREFIX"); return !p || std::string(p) != "0"; }();
+    const bool prefix_cache = batched && strix::env_flag_default_on("STRIX_G4_SERVE_PREFIX");
     const std::size_t prefix_bytes = env_count("STRIX_G4_SERVE_PREFIX_MB",4096,1U << 20U) << 20U;
     std::thread worker;
     Impl(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request settings,
-        strix::serve::DeploymentCallbacks callbacks)
+        strix::serve::DeploymentCallbacks callbacks, std::size_t requested_slots)
         : backend(b), adapter(std::move(t)), drafts(std::move(d)), mode(m), defaults(std::move(settings)), model(std::move(name)),
-          deployment(std::move(callbacks)), worker([this] { if (batched) batch_loop(); else queue.run(*this); }) {
+          deployment(std::move(callbacks)), slots(serve_slots(requested_slots)), worker([this] { if (batched) batch_loop(); else queue.run(*this); }) {
         if (!deployment.capacity_provider) deployment.capacity_provider = [this] {
             const auto q = queue.snapshot();
             return strix::serve::ServeCapacity{batched ? slots : 1, q.running, std::nullopt, q.queued};
@@ -440,8 +445,13 @@ struct Api::Impl final : strix::serve::GenerationEngine {
                 };
                 // Batched: the batcher only buffers; this thread writes, so a slow client never stalls other jobs.
                 task->sink = batched ? ChatSink([task = task.get()](const gemma4::serve::OutputDelta& delta) {
-                    std::lock_guard lock(task->deltas_mutex);
-                    task->deltas.push_back(delta);
+                    std::shared_ptr<strix::serve::GenerationTicket> ticket;
+                    {
+                        std::lock_guard lock(task->deltas_mutex);
+                        task->deltas.push_back(delta);
+                        ticket = task->ticket;
+                    }
+                    if (ticket) ticket->wake();
                     return !task->cancelled.load();
                 }) : emit;
             }
@@ -456,14 +466,17 @@ struct Api::Impl final : strix::serve::GenerationEngine {
             const auto ticket = queue.submit(std::move(job));
             if (!ticket) { failure_status = 503; throw std::runtime_error("generation queue is full or shutting down"); }
             failure_status = 500;
+            { std::lock_guard lock(task->deltas_mutex); task->ticket = ticket; }
+            // Woken by each batched delta and by the finish; the 50 ms bound only paces the client-gone check.
             bool done = false;
             for (;;) {
-                (void)ticket->wait(std::chrono::milliseconds(batched && streaming ? 5 : 50),done,false);
                 drain();
                 if (writer.client_gone() || task->cancelled) { task->cancelled = true; ticket->cancel(); }
                 if (done) break;
+                (void)ticket->wait(std::chrono::milliseconds(50),done,false);
             }
             drain();
+            { std::lock_guard lock(task->deltas_mutex); task->ticket.reset(); }
             { std::lock_guard lock(mutex); tasks.erase(task_id); }
             if (!ticket->error().empty()) throw std::runtime_error(ticket->error());
             if (writer.client_gone()) return;
@@ -499,8 +512,8 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     }
 };
 Api::Api(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request defaults,
-    strix::serve::DeploymentCallbacks deployment)
-    : impl_(std::make_unique<Impl>(b,std::move(t),std::move(d),m,std::move(name),std::move(defaults),std::move(deployment))) {}
+    strix::serve::DeploymentCallbacks deployment, std::size_t slots)
+    : impl_(std::make_unique<Impl>(b,std::move(t),std::move(d),m,std::move(name),std::move(defaults),std::move(deployment),slots)) {}
 Api::~Api() = default;
 void Api::handle(const HttpRequest& r, HttpResponseWriter& w) { impl_->handle(r,w); }
 } // namespace strix::gemma4::engine

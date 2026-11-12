@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 // gfx1151 kernels of the deepseek41 decode attention. The arithmetic of each kernel is its host reference in
 // src/ds41_attention.cpp (same chains, same xor butterflies, same scalar helpers), so results match bit for bit.
@@ -1867,17 +1868,15 @@ void enqueue_select(const SelectView& v, hipStream_t stream) {
 namespace {
 int index_candidate_filter_mode = -1, index_direct_mode = -1, attention_segment_hpw_mode = -1;
 unsigned attention_min_blocks_value = 0;
-// on unless the variable is "0" (exact and never slower in interleaved ABA measurements: default on, =0 turns it off)
-bool env_on_unless_zero(const char* name) { const char* e = std::getenv(name); return e == nullptr || !(e[0] == '0' && e[1] == 0); }
 }  // namespace
 void set_index_candidate_filter(int mode) { index_candidate_filter_mode = mode; }
 bool index_candidate_filter() {
-    static const bool env = env_on_unless_zero("STRIX_DS41_IDX_CAND_FILTER");
+    static const bool env = strix::env_flag_default_on("STRIX_DS41_IDX_CAND_FILTER");
     return index_candidate_filter_mode < 0 ? env : index_candidate_filter_mode != 0;
 }
 void set_index_direct(int mode) { index_direct_mode = mode; }
 bool index_direct() {
-    static const bool env = env_on_unless_zero("STRIX_DS41_IDX_DIRECT");
+    static const bool env = strix::env_flag_default_on("STRIX_DS41_IDX_DIRECT");
     return index_direct_mode < 0 ? env : index_direct_mode != 0;
 }
 void set_attention_segment_hpw(int mode) { attention_segment_hpw_mode = mode; }
@@ -1888,7 +1887,7 @@ static unsigned attention_min_blocks() {
     return attention_min_blocks_value != 0U ? attention_min_blocks_value : env;
 }
 static bool attention_segment_hpw() {
-    static const bool env = env_on_unless_zero("STRIX_DS41_ATTN_SEG_HPW");
+    static const bool env = strix::env_flag_default_on("STRIX_DS41_ATTN_SEG_HPW");
     return attention_segment_hpw_mode < 0 ? env : attention_segment_hpw_mode != 0;
 }
 static void check_select_direct(const SelectView& v) {

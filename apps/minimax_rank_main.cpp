@@ -114,22 +114,6 @@ std::uint64_t fnv(const void* p, std::size_t bytes, std::uint64_t h = 1469598103
 using Borrowed = strix::xport::BorrowedTransport<
     strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;
 
-// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (as the DS apps).
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt,
-                                                     std::uint16_t capabilities) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::hyphen_transport;
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(180);
-    options.usb.transport_capabilities = capabilities;
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    receipt = std::move(opened.receipt);
-    return std::move(opened.host);
-}
-
 std::vector<std::uint32_t> read_u32(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("read " + path);
@@ -1739,7 +1723,6 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(warm.hits));
             return 0;
         }
-        std::string receipt;
         // The ranks load at different speeds (measurement: 44 s vs 166 s under page-cache pressure): the first collective after
         // the load must not hit the dist layer's 120 s default. An explicit value wins.
         (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
@@ -1760,8 +1743,9 @@ int main(int argc, char** argv) {
         const auto capabilities = strix::dist::parse_transport_capabilities(strix::xport::staging_env("STRIX_MM_USB4_CAPS"));
         if (capabilities && std::string(argv[3]).rfind("usb4", 0) != 0)
             throw std::invalid_argument("STRIX_MM_USB4_CAPS requires USB4 startup capability agreement");
-        auto transport = open_transport(argv[3], opt.rank, receipt, capabilities);
-        if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
+        auto opened = strix::dist::open_pair(argv[3], opt.rank, {std::chrono::seconds(180), capabilities});
+        auto transport = std::move(opened.host);
+        if (!opened.receipt.empty()) std::printf("transport: %s\n", opened.receipt.c_str());
         strix::dist::Group group;
         group.transport_capabilities = capabilities;
         group.rank = opt.rank;
@@ -1806,9 +1790,10 @@ int main(int argc, char** argv) {
         const bool borrow = xfer_load || pfx_load;
         // Keep the host owner alive for both modules even when direct is present.
         // Engine module entry retires communicator work before handing it over.
-        auto comm_owner = gpu_direct ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), std::move(gpu_direct), max_bytes)
-                        : borrow ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), max_bytes)
-                                 : std::make_unique<strix::dist::Communicator>(group, std::move(transport), max_bytes);
+        const bool lend = opened.direct != nullptr || borrow;
+        auto comm_owner = std::make_unique<strix::dist::Communicator>(
+            group, lend ? std::unique_ptr<strix::dist::Transport>(std::make_unique<Borrowed>(*transport)) : std::move(transport),
+            std::move(opened.direct), max_bytes);
         strix::dist::Communicator& comm = *comm_owner;
         std::printf("connected: rank %u transport %s routes %s %.1f s\n", opt.rank, comm.transport_name().c_str(),
                     comm.route_text().c_str(), secs(t_start, Clock::now()));

@@ -65,7 +65,11 @@ BORROWED
 struct Echo final : strix::dist::Transport {
     void send(std::span<const std::byte>) override {}
     void receive(std::span<std::byte> m) override { std::fill(m.begin(), m.end(), std::byte{}); }
-    void exchange(std::span<const std::byte> o, std::span<std::byte> i) override { std::copy(o.begin(), o.end(), i.begin()); }
+    void exchange(std::span<const std::byte> o, std::span<std::byte> i) override {
+        std::copy(o.begin(), o.end(), i.begin());
+        // The echoed peer is the other rank of the pair: the lockstep header check rejects a same-rank Control.
+        if (i.size() == 512) i[offsetof(strix::minimax::serve::Control, rank)] ^= std::byte{1};
+    }
     std::string name() const override { return "echo"; }
     void abort(const std::string&) override {}
 };
@@ -92,19 +96,24 @@ int main(int argc, char**) {
     command.command = 1;
     (void)strix::minimax::serve::exchange(engine, command);
 }
-'''.replace('BORROWED', borrowed).replace('#include <algorithm>', '#include <algorithm>\n#include <array>')
+'''.replace('BORROWED', borrowed).replace('#include <algorithm>', '#include <algorithm>\n#include <array>\n#include <cstddef>')
     (tree/'startup.cpp').write_text(harness)
     executable = tree/'startup-check'
     subprocess.run([compiler, '-std=c++20', '-I' + str(root/'include'), '-I' + str(tree),
                     str(tree/'startup.cpp'), '-o', str(executable)], check=True)
+    def echoed(sent, received, controls):
+        # The echo returns every byte except the rank of each 512-byte Control, which it flips 0 -> 1.
+        assert len(sent) == len(received)
+        diff = [k for k in range(len(sent)) if sent[k] != received[k]]
+        assert len(diff) == controls and all(sent[k] == 0 and received[k] == 1 for k in diff), diff
     def witness(tag, extra):
         prefix = tree/tag
         subprocess.run([str(executable)] + extra, env=dict(os.environ, MM_DEFAULT_PROBE=str(prefix)), check=True)
         sent = pathlib.Path(str(prefix) + '.r0.startup-send').read_bytes()
-        assert sent == pathlib.Path(str(prefix) + '.r0.startup-receive').read_bytes()
+        echoed(sent, pathlib.Path(str(prefix) + '.r0.startup-receive').read_bytes(), 1)
         ordinary = pathlib.Path(str(prefix) + '.r0.send').read_bytes()
         assert len(ordinary) == 512
-        assert ordinary == pathlib.Path(str(prefix) + '.r0.receive').read_bytes()
+        echoed(ordinary, pathlib.Path(str(prefix) + '.r0.receive').read_bytes(), 1)
         sizes, at = [], 0
         while at < len(sent):
             size, = struct.unpack_from('=Q', sent, at)

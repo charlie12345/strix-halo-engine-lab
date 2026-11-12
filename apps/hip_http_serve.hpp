@@ -8,6 +8,7 @@
 #include "hip_mtp_decode_bridge.hpp"
 #include "rtx_state_import_routes.hpp"
 #include "strix/serve/api.hpp"
+#include "strix/serve/session_api.hpp"
 #include "qwen_service_health.hpp"
 #include "qwen_rotary_capabilities.hpp"
 #include "qwen_moe_route_bf16.hpp"
@@ -187,38 +188,23 @@ inline bool handle_session_route(bool enabled, const MtpServeRunner& run,
     const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
     if (enabled && (request.path == "/v1/sessions" || request.path == "/v1/cache/stats" || request.path.starts_with("/v1/sessions/"))) {
         try {
+            // Route grammar, id rule and durability parsing are the shared strix::serve ones (404 on an unknown route).
+            const auto parsed = serve::session_command(request.method, request.path, request.body);
             MtpServeRequest command;
-            if (request.method == "GET" && request.path == "/v1/sessions") command.session_operation = "list";
-            else if (request.method == "GET" && request.path == "/v1/cache/stats") command.session_operation = "stats";
-            else if (request.path.starts_with("/v1/sessions/")) {
-                const auto rest = request.path.substr(13);
-                const auto slash = rest.find('/');
-                command.session_id = rest.substr(0, slash);
-                validate_http_session_id(command.session_id);
-                if (request.method == "DELETE" && slash == std::string::npos) command.session_operation = "delete";
-                else if (request.method == "POST" && slash != std::string::npos) {
-                    command.session_operation = rest.substr(slash + 1U);
-                    if (command.session_operation != "checkpoint" && command.session_operation != "park" && command.session_operation != "resume")
-                        throw std::invalid_argument("unknown session operation");
-                    if (command.session_operation == "checkpoint") {
-                        const auto body = serve::parse_request_json(request.body);
-                        const auto* durability = body.find("durability");
-                        if (!durability || !durability->is_string()) throw std::invalid_argument("durability must be ram|disk");
-                        command.session_durability = durability->as_string();
-                    }
-                }
-            }
-            if (command.session_operation.empty()) { response.send(405, "application/json", "{}"); return true; }
+            const auto& op = parsed.find("op")->as_string();
+            command.session_operation = op == "ram_checkpoint" ? std::string("checkpoint") : op;
+            if (const auto* id = parsed.find("id")) command.session_id = id->as_string();
+            if (const auto* durability = parsed.find("durability")) command.session_durability = durability->as_string();
             response.send(200, "application/json", run(command).session_json);
         } catch (const SessionApiError& error) {
-            response.send(error.status, "application/json", session_error_json(error).dump());
+            response.send(error.status, "application/json", serve::session_error(error.code, error.what()).dump());
         } catch (const std::invalid_argument& error) {
-            response.send(400, "application/json", session_error_json(SessionApiError(400, "invalid_request", error.what())).dump());
+            response.send(400, "application/json", serve::session_error("invalid_request", error.what()).dump());
         } catch (const std::exception& error) {
             const bool incompatible = std::string_view(error.what()).find("compatibility mismatch") != std::string_view::npos;
-            SessionApiError classified(incompatible ? 409 : 422,
-                incompatible ? "session_incompatible" : "session_corrupt", error.what());
-            response.send(classified.status, "application/json", session_error_json(classified).dump());
+            const int status = incompatible ? 409 : 422;
+            response.send(status, "application/json",
+                serve::session_error(incompatible ? "session_incompatible" : "session_corrupt", error.what()).dump());
         }
         return true;
     }

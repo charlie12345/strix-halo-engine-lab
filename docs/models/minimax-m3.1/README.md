@@ -53,7 +53,9 @@ Index projection weights are loaded by route. The load keeps only the layouts th
 `STRIX_MM_INDEX_PROJ` (`attn` default, `tiled`, `off`) and `STRIX_MM_INDEX_DECODE` (default 1) route uses for
 decode/verify (1–8 rows) and prompt (more than 8 rows): the default `attn` route loads the packed layout only;
 `tiled` loads the FP16 block (decode, with `STRIX_MM_INDEX_DECODE=1`) and FP16 transposed layouts; `off` loads the
-FP32 transposed layout. Prefill and decode outputs are bitwise identical to loading every layout. The other
+FP32 transposed layout. Prefill and decode outputs are bitwise identical to loading every layout. On the packed
+layout, prompt rows run the slab kernel (scalar activation operands, the FP16 weight stage widened once in LDS):
+the same bits as the previous tiled kernel in 0.67-0.70x its time per call (unit bench, 1024-8192 rows). The other
 routes still work: set both variables before the engine loads. Selecting a route whose layout was not loaded is
 refused with an error that asks for a reload; a layout set that does not fit in device memory fails the load.
 

@@ -2613,6 +2613,17 @@
   },
   {
     "engine": "glm",
+    "name": "FAST fused MLA/DSA attention core (glm-pf-attn-wmma)",
+    "flag_or_env": "STRIX_GLM_PF_ATTN_WMMA",
+    "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",
+    "exact": "FAST identity (bf16 operands, online softmax); fused vs FP64 rel-L2 mean 1.8e-3 worst 2.7e-3; layer-bench output vs exact rel-L2 1.9e-3; pair 8K exact logits equal the anchors; vs FAST without the core prefill-logits KL 7.8e-4 (8K), 8 decode steps mean KL 1.3e-3, top-1 8/8, greedy equal; teacher-forced 3 x 256 pending.",
+    "gain": "Layer bench C 2048: scores+softmax+o-bar 17.3 -> 6.7 us/row (8K position), 22.9 -> 7.2 (32K), MLA total 21.3 -> 11.2 / 27.3 -> 11.4 us/row; pair FAST prefill 8K 10.600 -> 9.695 s (-8.5 %, 2 ABAB pairs), 32K 44.30 -> 40.26 s (-9.1 %, one F / core / F set); FAST_I4 not measured",
+    "preconditions": "32 MLA heads per rank (TP2).",
+    "off_switch": "STRIX_GLM_PF_ATTN_WMMA=0 (or exact mode)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-attn-wmma"
+  },
+  {
+    "engine": "glm",
     "name": "Server batched MTP verify",
     "flag_or_env": "STRIX_GLM_SERVE_G2",
     "default": "on (with MTP)",

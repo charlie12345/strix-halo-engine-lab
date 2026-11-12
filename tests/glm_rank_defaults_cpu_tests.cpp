@@ -528,6 +528,21 @@ void test_startup_agreement() {
     auto ineligible = common;
     ineligible[0] = 0;
     pair(common, ineligible, false, false, false);
+    // --tf on two comm ranks: config-only agreement on the fixed no-handshake rows (2 frames, rows unchanged),
+    // and a FAST attention switch set on one rank only is refused on both ranks.
+    {
+        const auto request = rd::scan({"--world", "2", "--tf", "prompt.u32"});
+        auto tf = rd::resolve(request, getter({}));
+        rd::fallback_without_handshake(tf, request, getter({}));
+        CHECK(!rd::max_rows_auto(tf) && tf.max_rows.value == "4096");
+        auto fast = common;
+        fast[1] = rd::kPfWmmaConfig | rd::kPfAttnWmmaConfig;
+        fast[2] = 4096;
+        pair(fast, fast, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        auto opt_out = fast;
+        opt_out[1] = rd::kPfWmmaConfig;
+        pair(fast, opt_out, false, false, true);
+    }
     // External Xfer, including fixed and baseline modes, never enters this host handshake.
     for (const auto& extra : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {
         auto e = resolve(cat({"--xch", "xfer"}, extra), {});
@@ -554,6 +569,13 @@ void test_startup_agreement() {
     CHECK(exchanges == 0);
     CHECK(!rd::has_startup_handshake(2, "comm", false, false));
     CHECK(!rd::has_startup_handshake(2, "comm", true, true));
+    // --tf adds a config-only agreement on two comm ranks; other reference gates and xfer/world 1 stay exchange-free.
+    CHECK(rd::has_config_agreement(2, "comm", false, true, true));
+    CHECK(rd::has_config_agreement(2, "comm", true, true, true));
+    CHECK(rd::has_config_agreement(2, "comm", true, false, false));
+    CHECK(!rd::has_config_agreement(2, "comm", true, true, false));
+    CHECK(!rd::has_config_agreement(2, "xfer", false, true, true));
+    CHECK(!rd::has_config_agreement(1, "comm", false, true, true));
 }
 
 void test_no_handshake_fallback() {

@@ -60,7 +60,8 @@ for x in a['added_tokens']:
 )";
     f<<"pathlib.Path(sys.argv[1]).write_text(json.dumps(a,ensure_ascii=False,separators=(',',':')),encoding='utf-8')\n";
     f.close();CHECK(f.good());
-    CHECK(std::system(("python \""+script.string()+"\"").c_str())==0);
+    // The interpreter is named python or python3 depending on the platform.
+    CHECK(std::system(("python \""+script.string()+"\"").c_str())==0 || std::system(("python3 \""+script.string()+"\"").c_str())==0);
     return g::serve::Tokenizer::load(asset);
 }
 g::ModelManifest http_model() {

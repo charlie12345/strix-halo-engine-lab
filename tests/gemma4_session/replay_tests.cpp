@@ -133,7 +133,9 @@ Json normalize(const Json& j, const std::string& key={}) {
     // measured durations are masked, including timing arrays in cost receipts.
     if(key=="created" || key.ends_with("_ms") || key.find("_ms_")!=std::string::npos) return Json(0);
     if(key=="id" && j.is_string() && j.as_string().starts_with("chatcmpl-g4-")) return Json("chatcmpl-g4-ID");
-    if(j.is_object()) { auto out=Json::object(); for(const auto& [k,v]:j.as_object()) out.set(k,normalize(v,k)); return out; }
+    // Host facts (kernel release, driver parameter) exist only on some platforms.
+    const auto host_fact=[](const std::string& k){ return k=="kernel" || k=="amdgpu.iommu_perfopt"; };
+    if(j.is_object()) { auto out=Json::object(); for(const auto& [k,v]:j.as_object()) { if(!host_fact(k)) out.set(k,normalize(v,k)); } return out; }
     if(j.is_array()) { auto out=Json::array(); for(const auto& v:j.as_array()) out.push(normalize(v)); return out; }
     return j;
 }

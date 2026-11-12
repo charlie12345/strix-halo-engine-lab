@@ -3381,6 +3381,20 @@ Interleave up to 8 forward chunks (`--max-rows` 4096 each) of one prompt as one 
 - **Off switch:** STRIX_MM_PF_GROUP=2 (previous default)
 - **Measured gain:** MiniMax M3.1 FAST_I4 32K TTFT, TP2 USB4, ABAB both orders: group 4 vs 2: 55.0 / 54.5 s -> 52.2 / 51.7 s (-5.1 %); group 8 vs 2: 55.5 / 55.2 s -> 52.5 / 51.4 s (-6.1 %, not distinguishable from 4, hence the default 4); 8K unchanged by construction; decode unchanged (46.1-46.5 ms/token at 32K ctx in all arms).
 
+<a id="mm-pf-moe-group"></a>
+### Prefill group-wide EXL3 MoE call
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MOE_GROUP` (0 = automatic, 1 = one call per chunk, 2..8 chunks per call). **Default:** automatic (shared policy `include/strix/pair/prefill_group.hpp`): calls of half the group for a prefill group of 8 chunks, one call per chunk otherwise.
+
+Run the EXL3 MoE of a layer once for several chunks of the prefill group, so an expert's weights are decoded once for those chunks' rows. The plan merges an expert's rows per K-split class of their own chunk (the split count follows the rows an expert holds in a chunk), so every row keeps its per-chunk arithmetic.
+
+- **Preconditions:** Device-planned EXL3 MoE layers (not the FAST_I4 chain layers); every chunk of a call at least 97 rows; outputs written in place into the exchange TX slots or per-member partials. A call of W chunks needs its own workspace (3.94 GiB at 2 x 4096 rows, 6.40 GiB at 4 x 4096 rows per rank), allocated at start-up only when the width can exceed 1.
+- **Automatic selection:** A call sends all its chunks' partials at once; another sub-group's compute must cover those transfers. Unset: width 4 for `STRIX_MM_PF_GROUP=8` on prompts of 8 chunks, 1 at the default group 4 and for shorter prompts.
+- **Fallback notice:** `mm rank N: prefill MoE sub-group width up to W (workspace X GiB)` when enabled; spans that do not qualify run one call per chunk silently (same bits).
+- **Exactness evidence:** Device test `test_prefill_group` (group call vs one call per chunk, 7 chunk layouts, bitwise); 8K and 32K pair runs: identical state / final-rows / result hashes in every arm, ranks agree.
+- **Off switch:** STRIX_MM_PF_MOE_GROUP=1
+- **Measured gain:** Kernel (whole MoE call, real weights and routes repeated per chunk): 2 chunks -4..-9 %, 4 chunks -13 %. MiniMax M3.1 FAST_I4 TTFT, TP2 USB4: 32K group 8 with calls of 4 chunks vs the default group 4, both orders: 49.20 -> 48.99 s, 49.25 -> 48.75 s (-0.4 %, -1.0 %); 32K group 4 with calls of 2 chunks: neutral (49.35 / 49.28 -> 49.36 / 49.15 s); 8K with one call for both chunks: +13..23 % (12.28 / 12.96 -> 15.14 / 14.60 s), which is why the automatic width keeps one call per chunk there.
+
 <a id="mm-gu4"></a>
 
 ### Scalar gu4 expert addressing

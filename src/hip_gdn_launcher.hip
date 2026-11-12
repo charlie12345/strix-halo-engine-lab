@@ -2627,6 +2627,37 @@ void gdn_window_recurrent_segments_kernel(GdnSegments segments, std::uint32_t ke
     default: gdn_window_recurrence<8, Storage, Columns>(gdn_rows_prefix<8>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
     }
 }
+// Separate opt-in entry points: adding cases must not change the register allocation
+// of the established 2/4/8 segmented kernels above. Each case uses the exact
+// single-session Rows specialization, including pending commits and saved slots.
+template <bool ParallelGates>
+__global__ __launch_bounds__(kRecurrentThreads)
+void gdn_window_prepare_anyseg_kernel(GdnSegments segments, const void* conv_weights, SmallWeightKind conv_kind,
+    const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind, std::uint32_t key_heads,
+    std::uint32_t value_heads, std::uint32_t head_dim, float epsilon) {
+    __shared__ float scratch[kRecurrentThreads];
+    const auto& s = segments.segment[blockIdx.y];
+#define STRIX_GDN_PREPARE_CASE(N) case N: \
+    gdn_window_prepare_rows<N, ParallelGates>(gdn_rows_prefix<N>(s.rows), s.conv_state, conv_weights, conv_kind, \
+        dt, dt_kind, a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break
+    switch (s.count) {
+    STRIX_GDN_PREPARE_CASE(1); STRIX_GDN_PREPARE_CASE(2); STRIX_GDN_PREPARE_CASE(3); STRIX_GDN_PREPARE_CASE(4);
+    STRIX_GDN_PREPARE_CASE(5); STRIX_GDN_PREPARE_CASE(6); STRIX_GDN_PREPARE_CASE(7); STRIX_GDN_PREPARE_CASE(8);
+    }
+#undef STRIX_GDN_PREPARE_CASE
+}
+template <GdnRecurrentStorage Storage, std::uint32_t Columns>
+__global__ __launch_bounds__(32)
+void gdn_window_recurrent_anyseg_kernel(GdnSegments segments, std::uint32_t key_heads, std::uint32_t head_dim) {
+    const auto& s = segments.segment[blockIdx.y];
+#define STRIX_GDN_RECURRENT_CASE(N) case N: \
+    gdn_window_recurrence<N, Storage, Columns>(gdn_rows_prefix<N>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break
+    switch (s.count) {
+    STRIX_GDN_RECURRENT_CASE(1); STRIX_GDN_RECURRENT_CASE(2); STRIX_GDN_RECURRENT_CASE(3); STRIX_GDN_RECURRENT_CASE(4);
+    STRIX_GDN_RECURRENT_CASE(5); STRIX_GDN_RECURRENT_CASE(6); STRIX_GDN_RECURRENT_CASE(7); STRIX_GDN_RECURRENT_CASE(8);
+    }
+#undef STRIX_GDN_RECURRENT_CASE
+}
 // Standalone commit of the pending rows: recurrence tiles, then 32-channel conv groups.
 template <GdnRecurrentStorage Storage>
 __global__ __launch_bounds__(32)
@@ -6388,9 +6419,10 @@ template <class Body> void gdn_cohort_rows_dispatch(std::size_t rows, Body&& bod
         gdn_window_rows_dispatch(rows, std::forward<Body>(body));
     }
 }
-// Part 2 (prepare and recurrence) of every cohort segment in one launch each (segments of 2, 4 or 8 rows).
+// Part 2 (prepare and recurrence) of every cohort segment in one launch each:
+// legacy 2/4/8 rows, or 1..8 through the separate ANYSEG entry points.
 static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config,
-    hipStream_t stream) {
+    hipStream_t stream, bool anyseg = false) {
     if (segments.size() > gdn_window_max_rows) throw std::invalid_argument("GDN cohort segments exceed eight sessions");
     const auto shape = gdn_window_shape(config.model);
     GdnSegments all{};
@@ -6409,7 +6441,9 @@ static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> 
     const auto& layer = segments[0].layer;
     const auto count = static_cast<std::uint32_t>(segments.size());
     static const bool parallel_gates = strix::envcfg::flag("STRIX_GDN_WINDOW_PREPARE_GATES", false);
-    const auto prepare = parallel_gates ? gdn_window_prepare_segments_kernel<true> : gdn_window_prepare_segments_kernel<false>;
+    const auto prepare = anyseg
+        ? (parallel_gates ? gdn_window_prepare_anyseg_kernel<true> : gdn_window_prepare_anyseg_kernel<false>)
+        : (parallel_gates ? gdn_window_prepare_segments_kernel<true> : gdn_window_prepare_segments_kernel<false>);
     hipLaunchKernelGGL(prepare, dim3(shape.key_heads * 2U + shape.value_heads + 1U, count), dim3(kRecurrentThreads), 0, stream, all,
         layer.conv, small_weight_kind(layer.conv_type), layer.dt, small_weight_kind(layer.dt_type), layer.a,
         small_weight_kind(layer.a_type), shape.key_heads, shape.value_heads, shape.head_dim, config.model.gdn_qk_l2_epsilon);
@@ -6421,12 +6455,13 @@ static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> 
     }();
     const auto recurrence = [&]<std::uint32_t Columns>() {
         const auto tiles = dim3(shape.value_heads * (shape.head_dim / Columns), count);
-        if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_segments_kernel<GdnRecurrentStorage::value_key, Columns>), tiles,
-                dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
-        else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_segments_kernel<GdnRecurrentStorage::key_value, Columns>), tiles,
-                dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
+        const auto launch = [&]<GdnRecurrentStorage Storage>() {
+            const auto kernel = anyseg ? gdn_window_recurrent_anyseg_kernel<Storage, Columns>
+                : gdn_window_recurrent_segments_kernel<Storage, Columns>;
+            hipLaunchKernelGGL(kernel, tiles, dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
+        };
+        if (config.recurrent_storage == GdnRecurrentStorage::value_key) launch.template operator()<GdnRecurrentStorage::value_key>();
+        else launch.template operator()<GdnRecurrentStorage::key_value>();
     };
     if (window_columns == 4U) recurrence.template operator()<4U>();
     else if (window_columns == 2U) recurrence.template operator()<2U>();
@@ -6492,10 +6527,19 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
     // segment). The tiled recurrence (STRIX_GDN_WINDOW_TILED=1) keeps one pair per segment.
     static const bool segmented = strix::envcfg::flag("STRIX_COHORT_GDN_SEGMENTS", true);
     const bool tiled = gdn_window_tiled_enabled();
+    static const bool anyseg_set = strix::envcfg::flag("STRIX_COHORT_GDN_ANYSEG", false);
+    const bool anyseg = anyseg_set && !known_window_cohort_feature_off("anyseg"); // in-process A/B: STRIX_COHORT_AB_OFF=anyseg
     bool fused = segmented && !tiled && segments.size() >= 2U && !known_window_cohort_feature_off("gdnseg");
     for (const auto& segment : segments)
-        fused = fused && (segment.rows.size() == 2U || segment.rows.size() == 4U || segment.rows.size() == 8U);
-    if (fused) enqueue_gdn_window_segments(segments, config, native);
+        fused = fused && (anyseg || segment.rows.size() == 2U || segment.rows.size() == 4U || segment.rows.size() == 8U);
+    if (fused && anyseg) {
+        static const bool noted = [&] {
+            std::fprintf(stderr, "lever active: STRIX_COHORT_GDN_ANYSEG (first launch: %zu segments)\n", segments.size());
+            return true;
+        }();
+        static_cast<void>(noted);
+    }
+    if (fused) enqueue_gdn_window_segments(segments, config, native, anyseg);
     else for (const auto& segment : segments)
         gdn_window_rows_dispatch(segment.rows.size(), [&](auto width) {
             enqueue_gdn_window<decltype(width)::value>(segment.layer, segment.rows, segment.control, config, native, 2U);

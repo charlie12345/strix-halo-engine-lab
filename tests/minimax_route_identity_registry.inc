@@ -4,6 +4,8 @@
 {"msa-dense", 'a', "model+position+prefix; 128-key blocks", "msa_fused_tests.hip:run_case dense v3/v4 and n4-mixed/n8-mixed; prefill_batch_cases", ""},
 // src/minimax/attn/index_proj.hip:399
 {"index-proj", 'a', "index projection FP32 chain", "index_proj_tests.hip; split/ring/LDS bitwise gates", ""},
+// Former opt-in was removed with its split launcher; retain the mismatch until the native split-vs-unsplit cache gate is restored.
+{"index-split-retirement", 'c', "former STRIX_MMATTN_INDEX_SPLIT=1 / mf::set_index_split(true); default was OFF; index-score and cache-store order", "UNCOVERED: current msa_fused_tests.hip exercises only the unsplit launcher; restore native split-vs-unsplit full score/cache bytes and graph-replay gate before treating explicit-on behavior as equivalent", "first changed decode index score/cache byte at index_kernel"},
 // src/minimax/engine/engine.hip:1372
 {"index-fallback", 'a', "index projection FP32 chain", "mm_kernels.hpp dense_t16 contract; engine index fallback contract; index_proj_tests.hip; minimax_index_layout_tests.cpp ownership/admission/refusal (native load-change equality pending)", ""},
 // src/minimax/moe/mmx_moe.hip:1128
@@ -130,6 +132,8 @@
 {"draft-auto", 'a', "target identity+unchanged OFF prefill plan+greedy verify; frozen structural-v1 or unqualified-v1", "CPU features/admission and Lead traces: prose == OFF, structural C1 uses legacy controller, C2 retires; GPU tokens/logits/committed-state and paired json/code/long/story/prose-es receipts pending", ""},
 // src/minimax/session/runtime.cpp; src/minimax/serve/minimax_lead.hpp
 {"session-producer", 'b', "model+numerical environment+geometry+single-row suffix+fixed-width-one verification", "session_cache_gate.sh A/L/B IDs, every FP32 row and complete-state digest on both ranks; UNCOVERED native and complete-workload qualification", ""},
+// serve defaults to direct transport, which the session resolver refuses pending its own route qualification.
+{"session-direct-transport", 'b', "Cli{app=serve,transport=usb4gpu}; negotiated transport is the construction input", "route_identity_tests.cpp session_direct_transport_boundary; session_cache_gate.sh A/L/B currently covers usb4-auto only; UNCOVERED direct-route native state and complete-workload gate", ""},
 // src/minimax/session/session_cache.cpp; include/strix/file_snapshot.hpp
 {"session-restore", 'b', "loader-fd asset identities+executable+runtime+schema+frontier+rank-group digest", "minimax_session_cache_tests.cpp envelope/transaction/retarget negatives; session_cache_gate.sh fresh restore and never-saved control; UNCOVERED GPU state equality", ""},
 // src/minimax/moe/mmx_moe.hip: moe_grid_slots / launch_experts4_grid

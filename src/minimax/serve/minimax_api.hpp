@@ -18,7 +18,7 @@
 // accepted inbound id).
 
 #include "minimax/serve/minimax_observe.hpp"
-#include "strix/serve/engine.hpp"
+#include "strix/serve/api.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/serve/deployment.hpp"
@@ -43,6 +43,9 @@ struct ApiTokenizer {
     std::function<std::vector<std::uint32_t>(std::string_view)> encode;  // special tokens parsed
     std::function<std::string(std::span<const std::uint32_t>)> decode;   // special tokens skipped
     std::function<std::string(std::uint32_t)> stream_bytes;              // the bytes a stream writes for one id (none for specials)
+    // Optional exact metadata/decode delegation for shared token operations.
+    // Callback-only test callers retain their original construction and behavior.
+    std::shared_ptr<const strix::serve::ApiTokenizer> delegated = {};
 };
 [[nodiscard]] ApiTokenizer api_tokenizer(std::shared_ptr<const MinimaxTokenizer> tokenizer);
 
@@ -95,14 +98,7 @@ public:
     void handle(const strix::serve::HttpRequest& request, strix::serve::HttpResponseWriter& response);
 
 private:
-    void generate(const strix::serve::HttpRequest& request, strix::serve::HttpResponseWriter& response,
-                  std::vector<std::uint32_t> prompt, const strix::serve::Json& body, bool chat, const std::string& inbound_id);
-
-    ApiTokenizer tok_;
-    strix::serve::GenerationQueue& queue_;
-    MinimaxApiOptions options_;
-    Observer& observer_;
-    std::atomic<std::uint64_t> next_id_{1};
+    std::unique_ptr<strix::serve::ApiService> service_;
 };
 
 }  // namespace strix::minimax::serve

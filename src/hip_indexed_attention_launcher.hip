@@ -7042,7 +7042,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         // session's part 2 (softmax and value/gate in the same call) takes the tail too; its dense A8 codes go
         // to the session's rows of the cohort slot (output_slot below), as the value/gate kernel writes them.
         // STRIX_QSA_TAIL_INT8=1 (opt-in): the fused tail for kv-int8 windows too (the same softmax and value bodies).
-        const bool fused_tail = Rows <= 8U && qpersist_qsa_tail_enabled() && (!Int8 || qsa_tail_int8_enabled()) && !fast && !grouped &&
+        const bool fused_tail = Rows <= 8U && qpersist_qsa_window_tail_admitted(Rows) && (!Int8 || qsa_tail_int8_enabled()) && !fast && !grouped &&
             (!cohort_slot || qsa_cohort_tail_enabled()) && a.head_dim <= kThreads && (subparts & 96U) == 96U;
         if (fused_tail) count_qsa_launch(Int8 ? &QsaLaunchStats::tail_int8 : &QsaLaunchStats::tail_bf16);
         if (!fused_tail && !fast && (subparts & 32U))

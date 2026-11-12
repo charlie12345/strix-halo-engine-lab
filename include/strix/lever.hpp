@@ -43,13 +43,13 @@ struct Regime {
 };
 
 struct Decl {
-    std::string_view name;                       // receipt key, unique in the table
-    std::string_view env;                        // STRIX_* switch: "0" off, "1" on, unset/empty = automatic
+    std::string_view name{};                     // receipt key, unique in the table
+    std::string_view env{};                      // STRIX_* switch: "0" off, "1" on, unset/empty = automatic
     Exactness exactness = Exactness::bitwise;
     bool default_on = false;                     // used when `regime.axis == Axis::none`
     Regime regime{};
     std::span<const std::string_view> conflicts{};  // names of levers that must not be ON together with this one
-    std::string_view source;                     // measurement receipt or qualification plan the row rests on
+    std::string_view source{};                   // measurement receipt or qualification plan the row rests on
 };
 
 // What the request looks like when the decision is taken. Zero means "not known": a regime rule on an unknown

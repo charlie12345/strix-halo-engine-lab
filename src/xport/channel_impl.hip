@@ -3,6 +3,7 @@
 #include "channel_device.hpp"
 #include "wire.hpp"
 #include "small_progress.hpp"
+#include "strix/hip_argmax_core.hpp"
 
 #include <immintrin.h>
 #include <pthread.h>
@@ -50,8 +51,11 @@ __device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::
 
 [[maybe_unused]] __global__ __launch_bounds__(kArgThreads) void argmax_candidate_kernel(const float* logits, unsigned vn, unsigned ld, std::uint32_t id0,
                                                                        std::uint32_t* tx, ProducerTarget target) {
-    __shared__ float sv[kArgThreads];
-    __shared__ std::uint32_t si[kArgThreads];
+    struct Best {
+        float value;
+        std::uint32_t id;
+    };
+    __shared__ Best sb[kArgThreads];
     __shared__ unsigned bad;
     const unsigned t = threadIdx.x;
     if (t == 0) bad = 0;
@@ -69,19 +73,13 @@ __device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::
         }
     }
     if (!finite) atomicOr(&bad, 1U);
-    sv[t] = bv;
-    si[t] = bi;
-    __syncthreads();
-    for (unsigned s = kArgThreads / 2; s >= 1; s >>= 1U) {
-        if (t < s && better(sv[t + s], si[t + s], sv[t], si[t])) {
-            sv[t] = sv[t + s];
-            si[t] = si[t + s];
-        }
-        __syncthreads();
-    }
+    // Shared tree (R2-07); ordering stays float-compare so the transmitted
+    // value bits are unchanged for non-finite rows.
+    const Best best = strix::argmax::block_reduce<kArgThreads>(
+        sb, t, Best{bv, bi}, [](const Best& a, const Best& b) { return better(b.value, b.id, a.value, a.id) ? b : a; });
     if (t == 0) {
-        tx[2 * blockIdx.x] = __float_as_uint(sv[0]);
-        tx[2 * blockIdx.x + 1] = bad != 0 || si[0] == 0xFFFFFFFFU ? 0xFFFFFFFFU : id0 + si[0];
+        tx[2 * blockIdx.x] = __float_as_uint(best.value);
+        tx[2 * blockIdx.x + 1] = bad != 0 || best.id == 0xFFFFFFFFU ? 0xFFFFFFFFU : id0 + best.id;
     }
     publish(target, gridDim.x);
 }

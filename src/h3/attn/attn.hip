@@ -10,6 +10,7 @@
 // consecutive keys (dims) of one query. P^T (B: lane = query, 16 keys) is assembled from the packed bf16 P of the
 // two half-waves with ds_swizzle broadcasts.
 #include "h3/attn/attn.hpp"
+#include "strix/hip_check.hpp"
 
 #include <hip/hip_runtime.h>
 #include "strix/env_flags.hpp"
@@ -519,7 +520,7 @@ template <unsigned D, bool Fused> void launch_flash(const Args& a, unsigned nblo
 }
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("h3 attn ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("h3 attn ", e, what);
 }
 bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U; }
 // Head dims qualified against a host reference: 128 only (the D64 kernels are built but rejected until a

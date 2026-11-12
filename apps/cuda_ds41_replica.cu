@@ -78,6 +78,7 @@
 //                               schats0b0 for the record), the other phases as --window says
 // The trace covers probe, fixed-window and compared (spec) phases only, never a timed controller arm; the survival table
 // is saved after the phase's last window is credited (outside every timed cycle).
+#include "strix/env_flags.hpp"
 #include "strix/ds41_replica_census.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/cuda_ds41_dspark.hpp"
@@ -1373,10 +1374,7 @@ int main(int argc, char** argv) {
             ~HostRows() { if (p) cudaFreeHost(p); }
         } hidden_map;
         // STRIX_DS41_REPLICA_MAPPED_HIDDEN=1: the mapped capture also on one GPU (qualifies it in csmoke on a single GPU)
-        const bool force_mapped = [] {
-            const char* v = std::getenv("STRIX_DS41_REPLICA_MAPPED_HIDDEN");
-            return v && v[0] == '1';
-        }();
+        const bool force_mapped = strix::envcfg::flag("STRIX_DS41_REPLICA_MAPPED_HIDDEN", false);
         if ((load_drafter && ddev != target_device) || (force_mapped && (load_drafter || o.stream_hashes)))
             STRIX_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&hidden_map.p), std::size_t{8} * 3U * shape.hidden * sizeof(float),
                                            cudaHostAllocPortable | cudaHostAllocMapped));

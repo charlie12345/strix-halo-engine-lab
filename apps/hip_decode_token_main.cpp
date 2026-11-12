@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qwen_prefill_handoff.hpp"
@@ -966,7 +967,7 @@ public:
             rows_.push_back({tokens[r], first_position + r, {values[r].begin(), values[r].end()}});
         tiled_rows_ += count;
         // STRIX_PREFILL_TIMING=1: host milliseconds of scoring and spooling each block on stderr.
-        static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+        static const bool timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
         if (timing)
             std::fprintf(stderr, "teacher block %llu rows: score %.1f ms\n", static_cast<unsigned long long>(count),
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_at).count());
@@ -3394,13 +3395,20 @@ static int run_decode_entry(
             pair_legal[pair_layer] = pair_first != compiled.execution.steps.end() &&
                 pair_first->op == strix::SerialOp::attn_hyper_mix && pair_inject;
         }
+        const auto pair_legal_half = strix::qwen_pp::legal_cuts(compiled.execution.steps,
+            strix::SerialOp::mlp_hyper_mix, strix::SerialOp::mlp_inject, false);
         if (pair_cost_env) {
             const auto pair_costs = strix::qwen_pp::load_costs(pair_cost_env, options.tokens.size());
             pair_bucket = pair_costs.context;
             pair_cost_bucket = pair_costs;
             pair_prediction = pair_cut_env ? strix::qwen_pp::predict_cut(pair_costs,
-                strix::qwen_pp::parse_cut(pair_cut_env, pair_legal)) : strix::qwen_pp::choose_cut(pair_costs, pair_legal);
-        } else pair_prediction.cut = strix::qwen_pp::parse_cut(pair_cut_env, pair_legal);
+                strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half)) :
+                strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half);
+        } else {
+            const auto pair_cut = strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half);
+            pair_prediction.cut = pair_cut.layer;
+            pair_prediction.half = pair_cut.half;
+        }
         const auto pair_legacy_rows = options.known_prefix_prefill_rows;
         const auto choice = strix::qwen_pp::choose_chunk(std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"),
             pair_legacy_rows, options.tokens.size(), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
@@ -4682,7 +4690,7 @@ static int run_decode_entry(
                 add_tiled(*stack);
                 batch_stacks.push_back(std::move(stack));
                 // STRIX_HTTP_SLOT_TIMING=1: setup time of every extra slot (stack, tiled owners).
-                static const bool timing = [] { const char* v = std::getenv("STRIX_HTTP_SLOT_TIMING"); return v && v[0] == '1'; }();
+                static const bool timing = strix::envcfg::flag("STRIX_HTTP_SLOT_TIMING", false);
                 if (timing) std::fprintf(stderr, "http slot %zu built: stack %.0f ms tiled %.0f ms\n", slot,
                     std::chrono::duration<double, std::milli>(stacked - built).count(),
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stacked).count());
@@ -5663,16 +5671,16 @@ static int run_decode_entry(
             const unsigned pair_rank = std::getenv("STRIX_QWEN_PF_PIPE_RANK")[0] == '0' ? 0U : 1U;
             if (pair_cost_bucket && session.next_position != 0U)
                 throw std::invalid_argument("pair prefill cost-driven chunk selection requires a fresh prompt");
-            const auto pair_range = pair_rank == 0U ? "0:" + std::to_string(pair_prediction.cut) :
-                std::to_string(pair_prediction.cut) + ":48";
+            const auto pair_cut_text = pair_prediction.stage().text();
+            const auto pair_range = pair_rank == 0U ? "0:" + pair_cut_text : pair_cut_text + ":48";
 #if defined(_WIN32)
             if (_putenv_s("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str()) != 0)
 #else
             if (::setenv("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str(), 1) != 0)
 #endif
                 throw std::runtime_error("pair prefill layer range update failed");
-            std::fprintf(stderr, "qwen-pair rank=%u cut=%u cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
-                pair_rank, pair_prediction.cut, pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "measured-default"),
+            std::fprintf(stderr, "qwen-pair rank=%u cut=%s cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
+                pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "measured-default"),
                 static_cast<unsigned long long>(pair_bucket), pair_prediction.a * static_cast<double>(options.tokens.size()),
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
             // Deployment may already have exchanged measured facts and plan IDs on its own link.
@@ -5684,7 +5692,7 @@ static int run_decode_entry(
                 (pair_prompt_size + known_prefill_plan->logical_rows - 1U) / known_prefill_plan->logical_rows,
                 [&](std::span<const std::byte> data) { pair_link->send(data); },
                 [&](std::span<std::byte> data) { pair_link->receive(data); },
-                [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.cut,
+                [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.stage(),
                 [&] { return strix::qwen_pp::make_hip_pipe_staging(
                     static_cast<std::size_t>(known_prefill_plan->logical_rows) * strix::qwen_pp::Seam::row_bytes); },
                 [](std::span<const std::byte> data) { return strix::dist::crc32c(data); },
@@ -5693,7 +5701,7 @@ static int run_decode_entry(
                 }, &pair_timeline);
             auto& pair_context = strix::qwen_pp::pipe_context;
             pair_context = {&pair_pipe, pair_rank, 0U, known_prefill_plan->prefill_execution_identity, pair_prediction.cut,
-                pair_timeline.enabled() ? &pair_timeline : nullptr};
+                pair_timeline.enabled() ? &pair_timeline : nullptr, pair_prediction.half};
             pair_context.identity ^= compiled.execution_identity ^ known_prefill_plan->prefill_kernel_plan_identity;
             for (const char pair_byte : strix::model_content_identity_hex(mapped.file_sha256()))
                 pair_context.identity = (pair_context.identity ^ static_cast<unsigned char>(pair_byte)) * 1099511628211ULL;
@@ -5747,14 +5755,16 @@ static int run_decode_entry(
             if (strix::qwen_pp::decode_enabled()) {
                 const auto handoff_start = std::chrono::steady_clock::now();
                 check_hip(hipDeviceSynchronize(), "pair handoff state producer fence");
-                const auto views = pair_state_views(pair_prediction.cut, 48U);
+                // A half-layer cut leaves the attention state of the cut layer with stage A.
+                const auto pair_state_begin = pair_prediction.stage().state_begin();
+                const auto views = pair_state_views(pair_state_begin, 48U);
                 std::vector<strix::qwen_pp::StatePart> parts;
                 for (const auto& view : views) parts.push_back(view.first);
                 parts.push_back({48U, 0xffffffffU, model.vocab_size * sizeof(float)});
                 if (pair_rank == 0U) pair_final_logits.resize(static_cast<std::size_t>(model.vocab_size));
                 auto pair_staging = strix::qwen_pp::make_hip_state_staging();
                 const auto handoff_bytes = strix::qwen_pp::handoff_overlap(pair_rank == 1U, parts,
-                    pair_context.identity ^ session.state_layout_identity, session.next_position, pair_prediction.cut, *pair_staging,
+                    pair_context.identity ^ session.state_layout_identity, session.next_position, pair_state_begin, *pair_staging,
                     [&](std::span<const std::byte> data) { pair_link->send(data); },
                     [&](std::span<std::byte> data) { pair_link->receive(data); },
                     [&](bool save, std::size_t index, std::uint64_t offset, std::span<std::byte> data) {
@@ -5770,7 +5780,7 @@ static int run_decode_entry(
                     }, [](std::span<const std::byte> data) { return strix::dist::crc32c(data); },
                     [&] { pair_link->abort("pair handoff state transfer failed"); });
                 check_hip(hipDeviceSynchronize(), "pair handoff installed state fence");
-                pair_dump_state(pair_rank == 0U ? 0U : pair_prediction.cut, 48U, pair_rank == 0U ? "handoff-r0" : "handoff-r1");
+                pair_dump_state(pair_rank == 0U ? 0U : pair_state_begin, 48U, pair_rank == 0U ? "handoff-r0" : "handoff-r1");
                 std::fprintf(stderr, "qwen-handoff rank=%u handoff-bytes=%llu handoff-seconds=%.6f prefill-handoff-seconds=%.6f\n",
                     pair_rank, static_cast<unsigned long long>(handoff_bytes),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - handoff_start).count(),

@@ -53,6 +53,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/glm_chat.hpp"
+#include "strix/session/speculation_default.hpp"
 #include "strix/serve/http_server.hpp"
 
 #include "glm/engine/glm_mem.hpp"
@@ -807,10 +808,12 @@ int main(int argc, char** argv) {
             }
             else if (a == "--import-gate-tokens") import_gate_tokens = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--import-dsa-once") import_dsa_once = true;
+            else if (strix::session::speculation_opt_out_argument(a)) serve_mtp = false;
             else throw std::invalid_argument("unknown option " + a);
         }
         if (const char* b = std::getenv("STRIX_GLM_SERVE_BATCH"); b != nullptr && std::string(b) == "0") serial = true;
         if (const char* m = std::getenv("STRIX_GLM_SERVE_MTP"); m != nullptr && std::string(m) == "0") serve_mtp = false;
+        if (strix::session::speculation_environment_off(std::getenv(strix::session::speculation_environment))) serve_mtp = false;
         bool serve_g2 = true;
         if (const char* g = std::getenv("STRIX_GLM_SERVE_G2"); g != nullptr && std::string(g) == "0") serve_g2 = false;
         if (mtp_cycles == 0 || mtp_cycles > gs::kMaxMtpCycles) throw std::invalid_argument("--mtp-cycles 1..64");

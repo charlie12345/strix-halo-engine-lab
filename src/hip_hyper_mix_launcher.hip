@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/prefill_identity.hpp"
@@ -4592,7 +4593,7 @@ PersistentHyperBarrier& persistent_hyper_barrier(hipStream_t stream) {
 // STRIX_HC_PERSISTENT=1: window rows 2/4/8 of the split-K + rank-320 lane-chain form run as one persistent
 // launch when all kPersistBlocks blocks fit on the device at once; otherwise the three-kernel form runs.
 bool persistent_up_late() {
-    static const bool late = [] { const char* v = std::getenv("STRIX_HC_PERSISTENT_UP_LATE"); return v && v[0] == '1'; }();
+    static const bool late = strix::envcfg::flag("STRIX_HC_PERSISTENT_UP_LATE", false);
     return late;
 }
 // All kPersistBlocks blocks of one instantiation fit on the device at once (checked once per instantiation).
@@ -4727,7 +4728,7 @@ bool persistent_hyper_rows_enabled() {
 // their expressions and order (the HC rows fixtures check it against the serial R1 launches bit for bit).
 bool launch_persistent_hyper_draft(const std::uint16_t* input, const float* norm, const void* down, const float* inject,
     const void* up, float* normalized, float* low, float* injection, std::uint16_t* output, float epsilon, hipStream_t stream) {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_MTP_HC_PERSISTENT"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_MTP_HC_PERSISTENT", false);
     if (!enabled || !persistent_hyper_resident<std::uint16_t, 1U, false>()) return false;
     HyperRows rows{};
     rows.input[0] = input; rows.output[0] = output; rows.normalized[0] = normalized; rows.low[0] = low; rows.injection[0] = injection;
@@ -4886,7 +4887,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
             const auto lds = lane_chain_hyper_output_lds(config.hc_count, config.lowrank) +
                 static_cast<std::uint64_t>(count - 1U) * config.hc_count * 32U * sizeof(float);
             // STRIX_HC_LANE_CHAIN_REGS=0: keep the LDS-staged form for rank 320 as well.
-            static const bool regs = [] { const char* v = std::getenv("STRIX_HC_LANE_CHAIN_REGS"); return !v || v[0] != '0'; }();
+            static const bool regs = strix::envcfg::flag("STRIX_HC_LANE_CHAIN_REGS", true);
             // The registered Q6P32 copy of the up tensor replaces it (same bits).
             const auto* q6_up = q6p::find(reinterpret_cast<const void*>(p.up_runtime->address));
             const bool q6 = q6_up && q6_up->kind == q6p::Kind::q6p32 && q6_up->cols == config.lowrank &&
@@ -4895,7 +4896,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
             // Q8_0 windows of 8 rows run the row-split output form with 2 row groups per block (in-run R8 window
             // 3.22 -> 2.98 ms per window; 4 and 8 groups were not faster, and at 4 rows the register form wins).
             // STRIX_HC_LANE_SPLIT=0 keeps the LDS form; =2|4|8 forces that many groups (also for 4-row windows).
-            static const int split_env = [] { const char* v = std::getenv("STRIX_HC_LANE_SPLIT"); return v ? std::atoi(v) : -1; }();
+            static const int split_env = strix::envcfg::integer("STRIX_HC_LANE_SPLIT", -1);
             const auto output = [&]<std::uint32_t Count, bool Q6>() {
                 const unsigned split = split_env >= 0 ? static_cast<unsigned>(split_env) : (Count == 8U ? 2U : 0U);
                 if constexpr (!Q6 && (Count == 4U || Count == 8U)) if (split >= 2U && split <= Count && config.hc_count * 32U * split <= 1024U) {
@@ -5233,7 +5234,7 @@ PreparedHyperRows prepare_hyper_prefill_rows(std::span<const ExecutionDispatchCo
 // STRIX_HC_WIDE=0 keeps the 8-row tile kernels.
 bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLauncherConfig& config, std::uint32_t tiles,
     HyperWideRows& wide) {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_HC_WIDE"); return !v || v[0] != '0'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_HC_WIDE", true);
     static const bool fused_norm = std::getenv("STRIX_HC_ROWS_FUSED_NORM") != nullptr;
     if (!enabled || fused_norm || !config.splitk_projection || !config.lane_chain_output ||
         config.hidden_size * config.hc_count != 10240U || config.lowrank != 320U ||
@@ -5486,7 +5487,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
         // STRIX_HC_WIDE2_WAVES (8 default, 4): waves per block. STRIX_HC_WIDE2_VOPD=0: the C++ FMA loop
         // instead of the hand-paired VOPD chunk.
         static const unsigned waves = [] { const char* v = std::getenv("STRIX_HC_WIDE2_WAVES"); return v && std::atoi(v) == 4 ? 4U : 8U; }();
-        static const bool vopd = [] { const char* v = std::getenv("STRIX_HC_WIDE2_VOPD"); return !v || v[0] != '0'; }();
+        static const bool vopd = strix::envcfg::flag("STRIX_HC_WIDE2_VOPD", true);
         auto* scratch = wide2_pack_scratch();
         const auto* pack_codes = reinterpret_cast<const uint4*>(scratch);
         const auto* pack_scales = reinterpret_cast<const float*>(scratch + kWide2PackCodeBytes);
@@ -5754,7 +5755,7 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
     const bool norm16 = norm && config.fast_prefill_wmma && (norm16_env == 1U || norm16_env == 2U) && wide.count <= kHcwLowRows;
     const bool only16 = norm16 && norm16_env == 2U && fast_output_kernel() == 1U;
     if (norm16) { rows.normalized16 = hcw_normalized16_scratch(wide.count); rows.normalized16_pitch = kHcwNorm16Pitch; rows.normalized16_only = only16; }
-    static const bool normfree_env = [] { const char* v = std::getenv("STRIX_HCW_NORMFREE"); return v && v[0] == '1'; }();
+    static const bool normfree_env = strix::envcfg::flag("STRIX_HCW_NORMFREE", false);
     const bool normfree = norm && !norm_launched && !norm16 && normfree_env && allow_normfree && hcw_normfree_rows(prepared, tile_rows, wide, config, rows);
     if (norm_launched && norm16) throw std::logic_error("qpf2k HC fold with STRIX_HCW_NORM16");
     const auto invoke = [&]<typename Storage>() {
@@ -5848,9 +5849,9 @@ void hyper_mix_known_prefill_rows_launch(std::span<const ExecutionDispatchContex
         return;
     }
     // STRIX_HC_WIDE_CHECK=1: also run the 8-row tile kernels and compare every written value bitwise.
-    static const bool check = [] { const char* v = std::getenv("STRIX_HC_WIDE_CHECK"); return v && v[0] == '1'; }();
+    static const bool check = strix::envcfg::flag("STRIX_HC_WIDE_CHECK", false);
     // STRIX_HCW_NORMFREE_CHECK=1: run the step with and without STRIX_HCW_NORMFREE and compare every written value bitwise.
-    static const bool normfree_check = [] { const char* v = std::getenv("STRIX_HCW_NORMFREE_CHECK"); return v && v[0] == '1'; }();
+    static const bool normfree_check = strix::envcfg::flag("STRIX_HCW_NORMFREE_CHECK", false);
     if (normfree_check && config.fast_prefill_wmma) {
         launch_wide_hyper_rows(prepared, tile_rows, wide, config, tiles, true, false);
         const auto reference = snapshot_wide_hyper_rows(wide, config);
@@ -6900,8 +6901,8 @@ void launch_hip_mtp_hyper_mix_draft(const MtpNativeContext& c,MtpHyperRole role,
 // lane-chain coefficients, gate expression, stream mix and BF16 store (rows_lane_chain_hyper_output_kernel,
 // Count 0). Only the production branch is batched (rows kernels on, persistent HC off, 16-aligned workspaces).
 bool hip_mtp_hyper_mix_draft_rows_supported() {
-    static const bool rows_kernels=[]{const char* v=std::getenv("STRIX_MTP_HC_ROWS");return !v || v[0]!='0';}();
-    static const bool persistent=[]{const char* v=std::getenv("STRIX_MTP_HC_PERSISTENT");return v && v[0]=='1';}();
+    static const bool rows_kernels=strix::envcfg::flag("STRIX_MTP_HC_ROWS", true);
+    static const bool persistent=strix::envcfg::flag("STRIX_MTP_HC_PERSISTENT", false);
     return rows_kernels && !persistent;
 }
 void enqueue_hip_mtp_hyper_mix_q8_rows(const HipMtpHyperDraftRows& views,std::uint32_t count,const float* norm,const void* down,
@@ -6967,7 +6968,7 @@ void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,c
     // outputs per block, twice the blocks). The window kernel reproduces the serial kernel per
     // row bit for bit (the known-window fixtures check this); outputs per block only regroup
     // independent chains. The serial lane-chain output stays: its one-row register form is slower.
-    static const bool rows_kernels=[]{const char* v=std::getenv("STRIX_MTP_HC_ROWS");return !v || v[0]!='0';}();
+    static const bool rows_kernels=strix::envcfg::flag("STRIX_MTP_HC_ROWS", true);
     if(draft && rows_kernels && reinterpret_cast<std::uintptr_t>(normalized)%16U==0U) {
         if(launch_persistent_hyper_draft(input,norm,down,static_cast<const float*>(inject),up,normalized,low,injection,output,epsilon,stream))
             return;

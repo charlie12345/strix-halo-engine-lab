@@ -7,6 +7,7 @@
 // [42] wire version 3. All other words belong to the engine's validator.
 #include <array>
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -25,6 +27,36 @@
 
 namespace strix::pair {
 inline constexpr std::size_t seam_piece_bytes = 16U * 1024U * 1024U;
+// Where a two-stage layer pipeline is cut. Stage A runs layers [0, layer) and, for a half-layer cut, the first
+// sub-block of `layer` (attention before its feed-forward half); stage B runs the rest. A half-layer cut lets an
+// engine whose layers have two residual sub-blocks balance the stages to half a layer. Text form: "23", "22.5".
+struct StageCut {
+    std::uint32_t layer = 0;
+    bool half = false;
+    constexpr StageCut() = default;
+    constexpr StageCut(std::uint32_t whole, bool with_half = false) : layer(whole), half(with_half) {}
+    // First layer whose first sub-block (and so its sequence state) belongs to stage B.
+    constexpr std::uint32_t state_begin() const noexcept { return layer + (half ? 1U : 0U); }
+    // Position in half-layer units; orders cuts and range ends.
+    constexpr std::uint64_t units() const noexcept { return 2ULL * layer + (half ? 1U : 0U); }
+    // Seam header word: a whole-layer cut keeps the plain layer number.
+    constexpr std::uint64_t wire() const noexcept { return layer | (half ? 1ULL << 32U : 0ULL); }
+    friend constexpr bool operator==(const StageCut&, const StageCut&) = default;
+    std::string text() const { return std::to_string(layer) + (half ? ".5" : ""); }
+    // "N" or "N.5"; anything else is rejected.
+    static StageCut parse(std::string_view text) {
+        StageCut cut;
+        const auto* const end = text.data() + text.size();
+        const auto parsed = std::from_chars(text.data(), end, cut.layer);
+        if (parsed.ec != std::errc{}) throw std::invalid_argument("stage cut requires a layer number");
+        if (parsed.ptr != end) {
+            if (std::string_view(parsed.ptr, static_cast<std::size_t>(end - parsed.ptr)) != ".5")
+                throw std::invalid_argument("stage cut requires a layer number or a half layer (N.5)");
+            cut.half = true;
+        }
+        return cut;
+    }
+};
 class SeamCrc {
 public:
     void update(std::span<const std::byte> bytes) noexcept {

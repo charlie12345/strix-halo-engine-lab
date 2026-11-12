@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/host_copy.hpp"
 #include "dist_crc32c_parallel.hpp"
@@ -45,7 +47,7 @@ namespace strix::dist {
 namespace {
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("dist communicator: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("dist communicator: ", status, what);
 }
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("dist transport: " + what); }
 
@@ -727,7 +729,7 @@ private:
     std::array<std::pair<std::size_t, std::size_t>, 4> table_{}; // (message bytes up to, streams), STRIX_DIST_USB4_STREAMS
     std::chrono::milliseconds timeout_;
     bool small_spin_ = false;
-    const bool spin_ = [] { const char* v = std::getenv("STRIX_DIST_USB4_SPIN"); return v && v[0] == '1'; }();
+    const bool spin_ = strix::envcfg::flag("STRIX_DIST_USB4_SPIN", false);
     std::atomic<bool> aborted_{false};
     std::atomic<bool> poisoned_{false};
     // Per stream, for failure reports: bytes done / expected of the part in flight, last successful read and write
@@ -740,7 +742,7 @@ private:
         std::uint64_t last_w_count = 0, last_r_count = 0;  // calling thread only
     };
     // STRIX_DIST_USB4_TRAFFIC=1: per-stream bytes, busy time and completion skew, printed when the transport closes
-    const bool traffic_ = [] { const char* v = std::getenv("STRIX_DIST_USB4_TRAFFIC"); return v && v[0] == '1'; }();
+    const bool traffic_ = strix::envcfg::flag("STRIX_DIST_USB4_TRAFFIC", false);
     std::uint64_t eager_messages_ = 0, eager_bytes_ = 0, striped_messages_ = 0, striped_bytes_ = 0, skew_w_ns_ = 0, skew_r_ns_ = 0;
     [[nodiscard]] std::string traffic() const {
         std::ostringstream out;
@@ -971,7 +973,7 @@ std::vector<Candidate> layout_candidates(const Usb4AutoOptions& options, std::ve
 }
 
 bool pairing_debug() {
-    static const bool debug = [] { const char* v = std::getenv("STRIX_DIST_USB4_DEBUG"); return v && v[0] == '1'; }();
+    static const bool debug = strix::envcfg::flag("STRIX_DIST_USB4_DEBUG", false);
     return debug;
 }
 void note(Candidate& c, const std::string& what) {
@@ -2900,7 +2902,7 @@ void Communicator::stop(const std::string& why) {
 }
 
 bool Communicator::check_on_caller() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_CHECK_ON_CALLER"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DIST_CHECK_ON_CALLER", false);
     return on;
 }
 

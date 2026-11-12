@@ -110,6 +110,7 @@
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_batch_schedule.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/session/speculation_default.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/deepseek41_prefill.hpp"
@@ -3500,7 +3501,7 @@ int main(int argc, char** argv) try {
         else if (s == "--pool-positions") a.pool = u32();
         else if (s == "--prompt-rows") a.prompt_rows = u32();
         else if (s == "--dspark") a.dspark = next();
-        else if (s == "--no-dspark") a.dspark.clear();
+        else if (s == "--no-dspark" || strix::session::speculation_opt_out_argument(s)) a.dspark.clear();
         else if (s == "--dspark-window") a.dspark_window = next();
         else if (s == "--dspark-vocab") a.dspark_vocab = next();
         else if (s == "--dspark-ranks") a.dspark_ranks = u32();

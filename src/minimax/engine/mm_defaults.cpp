@@ -7,6 +7,7 @@
 #include "minimax/engine/route_identity.hpp"
 #include "minimax/serve/minimax_sched.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
+#include "strix/session/speculation_default.hpp"
 
 #include <array>
 #include <cstdio>
@@ -237,6 +238,8 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
         if (a == "--dspark-prior") {
             if (!has) throw std::invalid_argument("--dspark-prior requires a version");
             c.dspark_prior = dspark::prior_name(dspark::parse_prior(args[++i].c_str()));
+        } else if (strix::session::speculation_opt_out_argument(a) && app == "serve") {
+            if (c.dspark_mode.empty()) c.dspark_mode = "off";  // an explicit --dspark-mode wins
         } else if (a == "--dspark-mode" && app == "serve") {
             if (!has) throw std::invalid_argument("--dspark-mode requires off | auto | on");
             c.dspark_mode = dspark::mode_name(dspark::parse_mode(args[++i]));
@@ -423,6 +426,9 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
             (void)export_env(flag.second, argv[++i], 1); break;
         }
     }
+    // shared opt-out: DSpark off unless STRIX_MM_SERVE_DSPARK is set (must precede apply(), which exports the default)
+    if (app == "serve" && strix::session::speculation_environment_off(process_env(strix::session::speculation_environment)))
+        (void)export_env("STRIX_MM_SERVE_DSPARK", "0", 0);
     apply();
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
     (void)effective_config(parse_cli(app, args), process_env);

@@ -14,7 +14,7 @@
 // MoE header reuse: STRIX_QPF2K_MOE_HDR=1 launches project_prefill_f16x_da16_mg (same bits; unset 0, decoder injects 1).
 inline int& prefill_hdr_override(){static int v=-1;return v;}
 inline bool prefill_hdr_reuse(bool gsq) {
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_HDR");return v&&v[0]=='1'&&v[1]=='\0';}();
+    static const bool env=strix::envcfg::flag("STRIX_QPF2K_MOE_HDR", false, strix::EnvFlagMatch::exact);
     const int o=prefill_hdr_override();
     return !qpf2k::suppressed(qpf2k::Item::moe_hdr,gsq)&&(o<0?env:o!=0);
 }
@@ -25,14 +25,14 @@ inline bool prefill_hdr_reuse(bool gsq) {
 inline int& prefill_xor64_override(){static int v=-1;return v;}
 inline constexpr unsigned prefill_xor64_min_rows=3072U;
 inline bool prefill_xor64(bool gsq) {
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_XOR64");return v&&v[0]=='1'&&v[1]=='\0';}();
+    static const bool env=strix::envcfg::flag("STRIX_QPF2K_MOE_XOR64", false, strix::EnvFlagMatch::exact);
     const int o=prefill_xor64_override();
     return !qpf2k::suppressed(qpf2k::Item::moe_xor64,gsq)&&(o<0?env:o!=0);
 }
 inline int& prefill_da16_override(){static int v=-1;return v;}
 inline bool prefill_da16() {
     if(prefill_moe_gsq_off()&1U)return false;
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DA16");return v&&v[0]=='1'&&v[1]=='\0';}();
+    static const bool env=strix::envcfg::flag("STRIX_QPF2K_MOE_DA16", false, strix::EnvFlagMatch::exact);
     const int o=prefill_da16_override();
     return o<0?env:o==1;
 }
@@ -112,6 +112,7 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16
 #define STRIX_DA16_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
+#include "strix/env_flags.hpp"
 #include "hip_moe_da16_down_body.inc"
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD

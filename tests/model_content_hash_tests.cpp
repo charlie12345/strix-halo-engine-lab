@@ -1,4 +1,6 @@
 #include "strix/model_content_hash.hpp"
+#include "strix/file_snapshot.hpp"
+#include <fcntl.h>
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +71,50 @@ void windows_cache_tests(const std::filesystem::path& root) {
     expect(std::distance(std::filesystem::directory_iterator(cache), std::filesystem::directory_iterator{}) == 1,
            "Windows cache publishes one record and leaves no temporary files");
 
+    // The loader-bound overload must ignore even a syntactically valid unrelated
+    // ordinary v3 cache digest. Its metadata stamp intentionally differs.
+    const auto loader_identity = [&] {
+        const int fd = _wopen(file.c_str(), _O_RDONLY | _O_BINARY);
+        if (fd < 0) throw std::runtime_error("loader fixture open");
+        try { auto id = strix::fd_identity(fd); _close(fd); return id; }
+        catch (...) { _close(fd); throw; }
+    }();
+    const auto record = std::filesystem::directory_iterator(cache)->path();
+    std::ifstream saved(record, std::ios::binary);
+    const std::string original{std::istreambuf_iterator<char>(saved), {}};
+    saved.close();
+    const auto end_stamp = original.find('\n');
+    write_file(record, original.substr(0, end_stamp + 1) + std::string(64, '1') + "\n");
+    expect(strix::sha256_file_content(file, loader_identity) == digest,
+           "loader-bound hash cannot return unrelated ordinary cached digest");
+    write_file(record, original);
+    for (const auto& setting_value : {cache.wstring(), std::wstring(L"0")}) {
+        ScopedEnvironment arm(L"STRIX_HASH_CACHE", setting_value);
+        auto bad = loader_identity; ++bad.ino;
+        bool refused = false;
+        try { (void)strix::sha256_file_content(file, bad); }
+        catch (const std::exception&) { refused = true; }
+        expect(refused, "loader expected identity refused with cache enabled and disabled");
+        expect(strix::sha256_file_content(file, loader_identity) == digest,
+               "loader unchanged success with cache enabled and disabled");
+        const auto tamper = root / (setting_value == L"0" ? "tamper-off.bin" : "tamper-on.bin");
+        write_file(tamper, "abc");
+        const auto original_time = std::filesystem::last_write_time(tamper);
+        const int fd = _wopen(tamper.c_str(), _O_RDONLY | _O_BINARY);
+        if (fd < 0) throw std::runtime_error("tamper fixture open");
+        strix::FileIdentity before;
+        try { before = strix::fd_identity(fd); _close(fd); }
+        catch (...) { _close(fd); throw; }
+        (void)strix::sha256_file_content(tamper); // Seed ordinary v3 when enabled.
+        write_file(tamper, "xyz");
+        std::filesystem::last_write_time(tamper, original_time);
+        refused = false;
+        try { (void)strix::sha256_file_content(tamper, before); }
+        catch (const std::exception&) { refused = true; }
+        expect(refused, "completed same-length tamper refused with ordinary cache enabled/disabled");
+
+    }
+
     const auto before_stats = strix::file_hash_cache_stats();
     std::vector<std::uint64_t> progress;
     expect(strix::sha256_file_content(file, &stats, [&](auto done, auto total) {
@@ -93,6 +139,8 @@ void windows_cache_tests(const std::filesystem::path& root) {
     // A metadata-only NTFS event (adding/removing another hard link moves ChangeTime) keeps the record.
     const auto link = root / "windows-cache-link.bin";
     std::filesystem::create_hard_link(file, link);
+    expect(strix::sha256_file_content(link, &stats) == digest && stats.cache_hit,
+           "Windows hard-link alias shares ordinary v3 cache record");
     std::filesystem::remove(link);
     expect(strix::sha256_file_content(file, &stats) == digest && stats.cache_hit,
            "Windows hard-link removal (ChangeTime only) keeps the cached digest");
@@ -179,15 +227,17 @@ int main() {
                "fast SHA-256 matches the known vector");
         std::cout << "sha256 fast provider: " << strix::sha256_fast_provider() << '\n';
     }
-    const auto root =
-        std::filesystem::temp_directory_path() /
-        "strix-model-content-hash-test";
+    const auto root = [] {
+        for (unsigned attempt = 0; attempt < 100; ++attempt) {
+            auto candidate = std::filesystem::temp_directory_path() /
+                ("strix-model-content-hash-" + std::to_string(
+                    std::chrono::steady_clock::now().time_since_epoch().count()) +
+                    "-" + std::to_string(attempt));
+            if (std::filesystem::create_directory(candidate)) return candidate;
+        }
+        throw std::runtime_error("cannot create unique hash fixture root");
+    }();
     std::error_code error;
-    std::filesystem::remove_all(
-        root,
-        error);
-    std::filesystem::create_directories(
-        root);
 
 #ifdef _WIN32
     windows_cache_tests(root);

@@ -648,9 +648,30 @@ ModelContentIdentity sha256_file_content(const std::filesystem::path& path, cons
     const FileDigest digest{hash.finalize(), bytes};
     if (key) hash_cache_write(*key, digest);
     return digest.digest;
+#elif defined(_WIN32)
+    // Loader-bound hashing never consults the ordinary Windows v3 cache: that
+    // cache intentionally has different metadata/hard-link semantics.
+    ++cache_misses;
+    const auto changed = [] { throw std::runtime_error("model files changed during startup"); };
+    file_snapshot_detail::Handle input(path);
+    if (file_snapshot_detail::identity(input.value) != expected) changed();
+    FileSha256 hash;
+    std::vector<std::uint8_t> buffer(1024U * 1024U);
+    std::uint64_t bytes = 0;
+    for (;;) {
+        DWORD count = 0;
+        if (!ReadFile(input.value, buffer.data(), static_cast<DWORD>(buffer.size()), &count, nullptr)) changed();
+        if (count > expected.size - bytes) changed();
+        hash.update(buffer.data(), count);
+        bytes += count;
+        if (!count) break;
+    }
+    if (bytes != expected.size || file_snapshot_detail::identity(input.value) != expected ||
+        file_snapshot_detail::path_identity(path) != expected) changed();
+    return hash.finalize();
 #else
     (void)path; (void)expected;
-    throw std::runtime_error("loader-bound hashing requires Linux");
+    throw std::runtime_error("loader-bound hashing requires Linux or Windows");
 #endif
 }
 

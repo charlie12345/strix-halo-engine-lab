@@ -143,7 +143,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
         }
         if (selected.empty()) throw std::invalid_argument("unknown model family or description: " + model);
         if (selected.size() != 1) throw std::invalid_argument("ambiguous model family; choose --description or a registry ID");
-        ServiceSelection selection{*selected[0], load(*selected[0]), root, std::move(family_args)};
+        ServiceSelection selection{*selected[0], load(*selected[0]), root, std::move(family_args), {}};
         const auto* factory = factories.find(selection.model.family);
         if (inspect) {
             out << selection.model.id << '\t' << selection.model.name << '\t' << selection.model.family

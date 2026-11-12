@@ -1,13 +1,16 @@
 #include "strix/serve/session_runtime.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <map>
 #include <set>
 #include <stop_token>
 
 namespace strix::serve {
 namespace {
 using session::FinishReason;
+std::atomic<std::uint64_t> pending_owner_sequence{1};
 std::uint64_t logical(const session::Frontier& f) {
     if (f.pending && f.consumed_tokens == UINT64_MAX) throw std::runtime_error("session frontier overflow");
     return f.consumed_tokens + f.pending.has_value();
@@ -92,12 +95,18 @@ struct SessionRuntime::Impl {
     session::KvStore& store;
     session::Policy policy;
     SessionHooks hooks;
-    session::PrefixCache cache;
+    std::optional<session::PrefixCache> cache;
     session::Capabilities caps;
     std::vector<std::unique_ptr<Lane>> lanes;
     std::optional<TakenJob> reserved;
+    // Heap Lane storage keeps borrowed request metadata stable on promotion.
+    // Pending lanes have no KvHandle and consume no logical/native capacity.
+    std::map<std::uint64_t, std::unique_ptr<Lane>> pending;
+    const std::uint64_t pending_owner = pending_owner_sequence.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t pending_generation = 0;
     std::string owner_error;
     bool closed = false;
+    bool control_wait = false;
     SessionRuntime* owner = nullptr;
     std::uint64_t hits = 0, misses = 0;
     bool stop_notified = false;
@@ -111,10 +120,19 @@ struct SessionRuntime::Impl {
             if (!hooks.control_turn && caps.mixed_advance && caps.lane_cancellation) {
                 try { engine.cancel_lane(l->handle); } catch (...) { store.invalidate(l->handle); }
             }
-            l->stats.finish = "cancelled";
-            finish(*l, failure ? "session owner failed" : "");
+            if (hooks.drain_native_on_shutdown && !owner_error.empty()) l->stats = {};
+            else l->stats.finish = "cancelled";
+            finish(*l, failure ? "session owner failed" : owner_error);
         }
-        if (reserved) { GenerationStats stats; stats.finish = "cancelled"; queue.finish(*reserved, stats, owner_error); reserved.reset(); }
+        if (reserved) { GenerationStats stats; if (!hooks.drain_native_on_shutdown || owner_error.empty()) stats.finish = "cancelled"; queue.finish(*reserved, stats, owner_error); reserved.reset(); }
+        while (!pending.empty()) {
+            auto l = std::move(pending.begin()->second);
+            pending.erase(pending.begin()); // retire before terminal callbacks
+            GenerationStats stats;
+            stats.prompt_tokens = l->taken.job.prompt.size();
+            if (owner_error.empty()) stats.finish = "cancelled";
+            queue.finish(l->taken, std::move(stats), owner_error);
+        }
         if (failure) std::rethrow_exception(failure);
     }
     void notify_stopped() {
@@ -124,7 +142,18 @@ struct SessionRuntime::Impl {
     }
 
     Impl(GenerationQueue& q, session::Engine& e, session::KvStore& s, session::Policy p, SessionHooks h, std::shared_ptr<PrefixStateCache> pooled)
-        : queue(q), engine(e), store(s), policy(p), hooks(std::move(h)), cache(p, std::move(pooled)), caps(e.caps()) {
+        : queue(q), engine(e), store(s), policy(p), hooks(std::move(h)), caps(e.caps()) {
+        if ((hooks.native_validate || hooks.drain_native_on_shutdown || hooks.native_drained || hooks.disable_native_cache || hooks.serial_queue_protocol || hooks.serial_observe) && !caps.owner_control)
+            throw std::invalid_argument("native protocol requires owner_control");
+        if (hooks.drain_native_on_shutdown && !hooks.native_drained)
+            throw std::invalid_argument("native draining requires an explicit terminal boundary");
+        if (hooks.disable_native_cache && (policy.enabled || policy.store))
+            throw std::invalid_argument("request-only native owner requires retention disabled");
+        if (hooks.serial_queue_protocol && (!hooks.disable_native_cache || hooks.drain_native_on_shutdown))
+            throw std::invalid_argument("serial queue protocol requires request-only ownership");
+        if (hooks.serial_observe && !hooks.serial_queue_protocol)
+            throw std::invalid_argument("serial observer requires serial queue protocol");
+        if (!hooks.disable_native_cache) cache.emplace(p, std::move(pooled));
         if ((hooks.idle || hooks.can_admit) && hooks.idle_interval <= std::chrono::milliseconds::zero())
             throw std::invalid_argument("session idle interval must be positive");
         if (!caps.max_slots || !caps.max_batch || !caps.max_context)
@@ -139,10 +168,10 @@ struct SessionRuntime::Impl {
     bool caching() const {
         // A completed-turn miss must never fall back to a resume checkpoint's
         // old request RNG/policy. Ordinary prompt-cache defaults stay separate.
-        return policy.enabled && !policy.completed_turns && caps.prefix_cache &&
+        return cache && policy.enabled && !policy.completed_turns && caps.prefix_cache &&
             hooks.identity.known() && hooks.identity.ranks == store.ranks();
     }
-    bool turn_caching() const { return cache.turns_enabled() && caps.turn_commit && !caps.owner_control; }
+    bool turn_caching() const { return cache && cache->turns_enabled() && caps.turn_commit && !caps.owner_control; }
     // This operation is called ONLY after successful final-phase completion.
     // Every cache failure stays outside reply error/finish/receipt accounting.
     void completed_turn(Lane& l, FinishReason reason) noexcept {
@@ -153,12 +182,12 @@ struct SessionRuntime::Impl {
                 l.taken.job.cache_retention == CacheRetention::no_store || !hooks.identity.known() ||
                 hooks.identity.ranks != store.ranks() || !l.turn->metadata.known() ||
                 !l.turn->max_state_bytes ||
-                !cache.can_admit_turn(hooks.identity, l.turn->metadata, logical(frontier(l)), l.turn->max_state_bytes) ||
+                !cache->can_admit_turn(hooks.identity, l.turn->metadata, logical(frontier(l)), l.turn->max_state_bytes) ||
                 !hooks.turn_checkpoint || !hooks.turn_checkpoint(l.view(), reason)) {
                 ++turn_refused; return;
             }
             if (cancelled(l)) { ++turn_refused; return; }
-            auto credit = cache.reserve_turn(hooks.identity, l.turn->metadata, logical(frontier(l)), l.turn->max_state_bytes);
+            auto credit = cache->reserve_turn(hooks.identity, l.turn->metadata, logical(frontier(l)), l.turn->max_state_bytes);
             if (!credit) { ++turn_refused; return; }
             const auto before = frontier(l);
             l.cache_cleanup = true;
@@ -173,7 +202,7 @@ struct SessionRuntime::Impl {
             require(snap->state.bytes <= l.turn->max_state_bytes, "turn payload exceeds declared bound");
             snap->attention_frontier = snap->recurrent_frontier = snap->state.consumed;
             if (cancelled(l)) { ++turn_refused; return; }
-            if (cache.admit(std::move(snap), &credit)) ++turn_admitted; else ++turn_refused;
+            if (cache->admit(std::move(snap), &credit)) ++turn_admitted; else ++turn_refused;
         } catch (...) { ++turn_failed; }
     }
     void receipt(Lane& l, std::string& error) {
@@ -192,13 +221,13 @@ struct SessionRuntime::Impl {
             try {
                 const bool retain = resident_rows && error.empty() && policy.store && hooks.identity.known() &&
                     l.taken.job.cache_retention != CacheRetention::no_store;
-                cache.invalidate_resident(l.handle);
+                if (cache) cache->invalidate_resident(l.handle);
                 if (!retain) store.release(l.handle);
                 else {
                     if (resident_rows > l.taken.job.prompt.size())
                         throw std::logic_error("decode rows cannot certify a resident prefill prefix");
                     const auto certificate = store.release_resident(l.handle, resident_rows);
-                    try { (void)cache.admit_resident(store, l.handle, certificate->tokens(), hooks.identity); }
+                    try { (void)cache->admit_resident(store, l.handle, certificate->tokens(), hooks.identity); }
                     catch (...) { /* Optional index allocation cannot fail a delivered reply. */ }
                 }
             }
@@ -211,7 +240,8 @@ struct SessionRuntime::Impl {
             }
         }
         l.done = true;
-        queue.finish(l.taken, std::move(l.stats), std::move(error));
+        queue.finish(l.taken, std::move(l.stats), std::move(error), hooks.serial_observe,
+            hooks.serial_queue_protocol ? QueueCompletion::serial : QueueCompletion::taken);
     }
     void fail(Lane& l, const std::string& error) {
         // Exceptions from adapters may leave invalid physical state. Release is
@@ -260,7 +290,7 @@ struct SessionRuntime::Impl {
             try { l.turn = hooks.turn_cache(l.view()); } catch (...) { ++turn_failed; }
         }
         if (l.turn && hooks.identity.ranks == store.ranks()) {
-            auto hit = cache.lookup_turn(l.taken.job.prompt, hooks.identity, l.turn->metadata);
+            auto hit = cache->lookup_turn(l.taken.job.prompt, hooks.identity, l.turn->metadata);
             if (!hit) ++misses;
             else {
                 bool restored = false;
@@ -273,7 +303,7 @@ struct SessionRuntime::Impl {
             }
         }
         if (caching() && !l.offset) {
-            auto hit = cache.lookup(l.taken.job.prompt, hooks.identity);
+            auto hit = cache->lookup(l.taken.job.prompt, hooks.identity);
             if (!hit) ++misses;
             else {
                 ++hits;
@@ -297,7 +327,7 @@ struct SessionRuntime::Impl {
         snap->identity = hooks.identity;
         snap->state = store.capture_prompt(l.handle);
         snap->attention_frontier = snap->recurrent_frontier = snap->state.consumed;
-        (void)cache.admit(snap);
+        (void)cache->admit(snap);
     }
     void progress(Lane& l) {
         if (l.taken.job.on_progress) l.taken.job.on_progress({
@@ -313,7 +343,7 @@ struct SessionRuntime::Impl {
         snap->identity = hooks.identity;
         snap->state = store.capture(l.handle);
         snap->attention_frontier = snap->recurrent_frontier = snap->state.consumed;
-        (void)cache.admit(snap); // policy may decline size/duplicates without failing generation
+        (void)cache->admit(snap); // policy may decline size/duplicates without failing generation
     }
     void terminal(Lane& l, FinishReason reason) {
         if(caps.mixed_advance && caps.lane_cancellation && reason==FinishReason::cancelled) engine.cancel_lane(l.handle);
@@ -505,7 +535,9 @@ struct SessionRuntime::Impl {
             // An external owner stop closes native work/protocol first. The
             // shell retains responsibility for shutting down unreserved HTTP
             // work, preserving the queue's existing shutdown ordering.
-            if (queue.stopping() || (hooks.stop_requested && hooks.stop_requested())) { close(); return false; }
+            if ((queue.stopping() || (hooks.stop_requested && hooks.stop_requested())) &&
+                (!hooks.drain_native_on_shutdown || hooks.native_drained())) { close(); return false; }
+            control_wait = wait;
             hooks.control_turn(*owner);
             return true;
         }
@@ -582,15 +614,25 @@ SessionRuntime::~SessionRuntime() {
 void SessionRuntime::run() {
     try { while (step(true)) {} impl_->close(); }
     catch (...) {
+        if (impl_->hooks.serial_queue_protocol) {
+            // generate() failures are request-local. Only idle/observer or owner
+            // failures escape; preserve run()'s caller-owned queue lifetime.
+            impl_->close();
+            throw;
+        }
         try { throw; }
-        catch (const std::exception& e) { impl_->owner_error = e.what(); }
-        catch (...) { impl_->owner_error = "session owner failed"; }
+        catch (const std::exception& e) {
+            impl_->owner_error = e.what();
+            if (impl_->hooks.drain_native_on_shutdown && impl_->owner_error.empty()) impl_->owner_error = "engine failure";
+        }
+        catch (...) { impl_->owner_error = impl_->hooks.drain_native_on_shutdown ? "engine failure" : "session owner failed"; }
         for (auto& l : impl_->lanes) if (!l->done && l->publication_error.empty()) l->publication_error = impl_->owner_error;
-        shutdown();
+        if (!impl_->hooks.drain_native_on_shutdown) shutdown();
         try { if (impl_->hooks.failed) impl_->hooks.failed(); } catch (...) {}
         try { impl_->close(); } catch (...) {}
         for (auto& l : impl_->lanes) if (!l->done) impl_->fail(*l, "session owner failed");
         try { impl_->notify_stopped(); } catch (...) {}
+        if (impl_->hooks.drain_native_on_shutdown) shutdown();
         throw;
     }
     impl_->notify_stopped();
@@ -611,49 +653,118 @@ bool SessionRuntime::reserve(QueueSelection selection,
         impl_->reserved = impl_->queue.take(false, selection, {}, reorder, eligible, blocked);
     return impl_->reserved.has_value();
 }
+bool SessionRuntime::reserve_fifo(bool wait, bool short_first) {
+    if (!impl_->hooks.control_turn) throw std::logic_error("native reservation requires a control planner");
+    if (!impl_->reserved && !stopping()) impl_->reserved = impl_->queue.take(wait && impl_->control_wait, short_first);
+    return impl_->reserved.has_value();
+}
+bool SessionRuntime::reserve_serial(bool wait) {
+    if (!impl_->hooks.control_turn || !impl_->hooks.serial_queue_protocol)
+        throw std::logic_error("serial reservation requires the serial queue protocol");
+    if (!impl_->reserved) impl_->reserved = impl_->queue.take_serial(wait && impl_->control_wait);
+    return impl_->reserved.has_value();
+}
 void SessionRuntime::refuse(GenerationStats stats, std::string error) {
     if (!impl_->reserved) throw std::logic_error("no reserved session");
     impl_->queue.finish(*impl_->reserved, std::move(stats), std::move(error));
     impl_->reserved.reset();
 }
-SessionLease SessionRuntime::activate(std::uint64_t resident_alignment) {
+SessionLease SessionRuntime::activate(std::uint64_t resident_alignment, bool preserve_take_time) {
     if (!impl_->reserved) throw std::logic_error("no reserved session");
     if (live() >= impl_->caps.max_slots) throw std::runtime_error("session slots exhausted");
     auto l = std::make_unique<Impl::Lane>();
     // Allocate owner metadata before acquiring a physical lease or moving work.
     impl_->lanes.reserve(impl_->lanes.size() + 1);
-    admission(impl_->reserved->job, impl_->caps, impl_->hooks);
+    if (impl_->hooks.native_validate) impl_->hooks.native_validate(impl_->reserved->job);
+    else admission(impl_->reserved->job, impl_->caps, impl_->hooks);
     if (impl_->reserved->job.family_context && !impl_->hooks.validate)
         throw std::invalid_argument("unvalidated family context");
     if (impl_->hooks.validate) impl_->hooks.validate(impl_->reserved->job);
     const auto started = impl_->hooks.now ? impl_->hooks.now() : std::chrono::steady_clock::now();
-    const auto hit = resident_alignment ? impl_->cache.lookup_resident(impl_->store,
+    if (resident_alignment && !impl_->cache) throw std::invalid_argument("native retention disabled");
+    const auto hit = resident_alignment ? impl_->cache->lookup_resident(impl_->store,
         impl_->reserved->job.prompt, impl_->hooks.identity, resident_alignment) : session::ResidentHit{};
     if (hit.entry) {
         // Remove the descriptor BEFORE a new lease or native mutation exists.
-        impl_->cache.invalidate_resident(hit.entry->source);
+        impl_->cache->invalidate_resident(hit.entry->source);
         l->handle = impl_->store.acquire_resident(hit.entry->source, hit.entry->tokens().first(static_cast<std::size_t>(hit.rows)));
         l->stats.cached_tokens = hit.rows; ++impl_->hits;
     } else {
         l->handle = impl_->store.acquire();
-        impl_->cache.invalidate_resident(l->handle);
+        if (impl_->cache) impl_->cache->invalidate_resident(l->handle);
         if (resident_alignment) ++impl_->misses;
     }
     l->taken = std::move(*impl_->reserved); impl_->reserved.reset();
-    l->taken.started = started;
+    if (!preserve_take_time) l->taken.started = started;
     l->stats.prompt_tokens = l->taken.job.prompt.size();
     SessionLease result{l->taken, l->stats, l->handle};
     impl_->lanes.push_back(std::move(l));
     return result;
 }
+PendingSession SessionRuntime::hold_reservation() {
+    if (!impl_->hooks.control_turn || !impl_->hooks.disable_native_cache || impl_->hooks.serial_queue_protocol)
+        throw std::logic_error("pending requests require request-only native ownership");
+    if (!impl_->reserved) throw std::logic_error("no reserved session");
+    if (!impl_->pending_owner || impl_->pending_generation == UINT64_MAX)
+        throw std::overflow_error("pending session generation exhausted");
+    auto l = std::make_unique<Impl::Lane>();
+    const auto generation = impl_->pending_generation + 1;
+    auto [it, inserted] = impl_->pending.emplace(generation, std::move(l));
+    if (!inserted) throw std::logic_error("pending session generation collision");
+    it->second->taken = std::move(*impl_->reserved);
+    impl_->reserved.reset();
+    impl_->pending_generation = generation;
+    return {generation, impl_->pending_owner};
+}
+const TakenJob& SessionRuntime::inspect(PendingSession h) const {
+    if (h.owner != impl_->pending_owner || !h.valid()) throw std::invalid_argument("foreign pending session");
+    const auto it = impl_->pending.find(h.generation);
+    if (it == impl_->pending.end()) throw std::invalid_argument("stale pending session");
+    return it->second->taken;
+}
+const TakenJob& SessionRuntime::inspect(session::KvHandle h) const {
+    for (const auto& l : impl_->lanes) if (!l->done && l->handle == h) {
+        (void)impl_->store.consumed(h);
+        return l->taken;
+    }
+    throw std::invalid_argument("stale native request inspection");
+}
+bool SessionRuntime::pending_cancelled(PendingSession h) const noexcept {
+    try { return inspect(h).ticket->cancelled(); } catch (...) { return true; }
+}
+std::size_t SessionRuntime::pending_count() const noexcept { return impl_->pending.size(); }
+SessionLease SessionRuntime::promote(PendingSession h) {
+    const auto& taken = inspect(h); // validate provenance before any hooks
+    if (live() >= impl_->caps.max_slots) throw std::runtime_error("session slots exhausted");
+    impl_->lanes.reserve(impl_->lanes.size() + 1);
+    if (impl_->hooks.native_validate) impl_->hooks.native_validate(taken.job);
+    else admission(taken.job, impl_->caps, impl_->hooks);
+    if (taken.job.family_context && !impl_->hooks.validate) throw std::invalid_argument("unvalidated family context");
+    if (impl_->hooks.validate) impl_->hooks.validate(taken.job);
+    auto& l = *impl_->pending.at(h.generation);
+    l.handle = impl_->store.acquire();
+    l.stats.prompt_tokens = taken.job.prompt.size();
+    // Preserve original queue submission/take clocks, reorder and observation.
+    SessionLease result{l.taken, l.stats, l.handle};
+    impl_->lanes.push_back(std::move(impl_->pending.at(h.generation)));
+    impl_->pending.erase(h.generation);
+    return result;
+}
+void SessionRuntime::refuse_pending(PendingSession h, GenerationStats stats, std::string error) {
+    (void)inspect(h); // reject stale/foreign before accounting or callbacks
+    auto l = std::move(impl_->pending.at(h.generation));
+    impl_->pending.erase(h.generation);
+    impl_->queue.finish(l->taken, std::move(stats), std::move(error));
+}
 bool SessionRuntime::has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& f) const {
     return impl_->queue.has_waiting(f);
 }
-bool SessionRuntime::publish(session::KvHandle h, std::span<const std::uint32_t> ids, bool deliver) {
+bool SessionRuntime::publish(session::KvHandle h, std::span<const std::uint32_t> ids, bool deliver, bool propagate_callback_error) {
     for (auto& l : impl_->lanes) if (!l->done && l->handle == h) {
         (void)impl_->store.consumed(h); // validate generation even at publication
         l->stats.generated_tokens += ids.size();
         if (!deliver) return false;
+        if (propagate_callback_error) return !l->taken.job.on_tokens || l->taken.job.on_tokens(ids);
         try { return !l->taken.job.on_tokens || l->taken.job.on_tokens(ids); }
         catch (const std::exception& e) { l->publication_error = e.what(); }
         catch (...) { l->publication_error = "session output callback failed"; }
@@ -662,7 +773,34 @@ bool SessionRuntime::publish(session::KvHandle h, std::span<const std::uint32_t>
     throw std::invalid_argument("stale session publication");
 }
 void SessionRuntime::invalidate_residents() noexcept {
-    impl_->cache.invalidate_residents(); impl_->store.invalidate_residents();
+    if (impl_->cache) impl_->cache->invalidate_residents();
+    impl_->store.invalidate_residents();
+}
+bool SessionRuntime::ticket_cancelled(session::KvHandle h) const noexcept {
+    for (const auto& l : impl_->lanes) if (!l->done && l->handle == h) {
+        try { (void)impl_->store.consumed(h); }
+        catch (...) { return true; }
+        return l->taken.ticket->cancelled();
+    }
+    return true;
+}
+void SessionRuntime::notify_admitted(session::KvHandle h) {
+    if (!impl_->hooks.control_turn) throw std::logic_error("native admission event requires a control planner");
+    for (const auto& l : impl_->lanes) if (!l->done && l->handle == h) {
+        (void)impl_->store.consumed(h);
+        if (l->taken.job.on_admitted) l->taken.job.on_admitted();
+        return;
+    }
+    throw std::invalid_argument("stale native admission event");
+}
+void SessionRuntime::publish_progress(session::KvHandle h, GenerationProgress progress) {
+    if (!impl_->hooks.control_turn) throw std::logic_error("native progress requires a control planner");
+    for (const auto& l : impl_->lanes) if (!l->done && l->handle == h) {
+        (void)impl_->store.consumed(h);
+        if (l->taken.job.on_progress) l->taken.job.on_progress(progress);
+        return;
+    }
+    throw std::invalid_argument("stale native progress");
 }
 void SessionRuntime::abandon_resident(session::KvHandle h) {
     for (auto& l : impl_->lanes) if (!l->done && l->handle == h) {
@@ -677,15 +815,25 @@ void SessionRuntime::complete(session::KvHandle h, std::string error, std::uint6
     throw std::invalid_argument("stale session completion");
 }
 bool SessionRuntime::stopping() const { return impl_->queue.stopping() || (impl_->hooks.stop_requested && impl_->hooks.stop_requested()); }
-void SessionRuntime::wait_for(std::chrono::milliseconds duration) {
-    if (impl_->hooks.wait) impl_->hooks.wait(duration);
-    else impl_->queue.wait_for_work_until(std::chrono::steady_clock::now() + duration, false);
+void SessionRuntime::complete_native(session::KvHandle h, GenerationStats stats, std::string error) {
+    if (!impl_->hooks.control_turn) throw std::logic_error("native completion requires a control planner");
+    for (auto& l : impl_->lanes) if (!l->done && l->handle == h) {
+        (void)impl_->store.consumed(h);
+        l->stats = std::move(stats);
+        impl_->finish(*l, std::move(error));
+        return;
+    }
+    throw std::invalid_argument("stale native completion");
 }
-const std::shared_ptr<PrefixStateCache>& SessionRuntime::cache_owner() const noexcept { return impl_->cache.owner(); }
-std::size_t SessionRuntime::cache_entries() const noexcept { return impl_->cache.size(); }
-SessionCacheStats SessionRuntime::cache_stats() const noexcept { return {impl_->cache.size(),impl_->cache.bytes(),impl_->hits,impl_->misses,
+void SessionRuntime::wait_for(std::chrono::milliseconds duration, bool generation_ready) {
+    if (impl_->hooks.wait) impl_->hooks.wait(duration);
+    else impl_->queue.wait_for_work_until(std::chrono::steady_clock::now() + duration, generation_ready);
+}
+const std::shared_ptr<PrefixStateCache>& SessionRuntime::cache_owner() const noexcept { static const std::shared_ptr<PrefixStateCache> none; return impl_->cache ? impl_->cache->owner() : none; }
+std::size_t SessionRuntime::cache_entries() const noexcept { return impl_->cache ? impl_->cache->size() : 0; }
+SessionCacheStats SessionRuntime::cache_stats() const noexcept { return {impl_->cache ? impl_->cache->size() : 0,impl_->cache ? impl_->cache->bytes() : 0,impl_->hits,impl_->misses,
     impl_->turn_admitted,impl_->turn_refused,impl_->turn_failed,impl_->restore_failed}; }
-bool SessionRuntime::unpin_turn_cache(const std::string& keep) { return impl_->cache.unpin(keep); }
+bool SessionRuntime::unpin_turn_cache(const std::string& keep) { return impl_->cache && impl_->cache->unpin(keep); }
 session::Capabilities SessionRuntime::capabilities() const { return impl_->caps; }
 void SessionRuntime::configure_api(ApiConfig& c) const {
     const auto caps = capabilities();

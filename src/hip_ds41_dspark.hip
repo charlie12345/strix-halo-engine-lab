@@ -1,4 +1,7 @@
 #pragma clang fp contract(off)
+#include "strix/env_flags.hpp"
+#include "strix/hip_argmax_core.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 
 #include <hip/hip_fp16.h>
@@ -210,27 +213,18 @@ __global__ __launch_bounds__(256) void markov_bias_kernel(const std::uint16_t* e
     }
 }
 __global__ __launch_bounds__(1024) void argmax_kernel(const float* logits, unsigned step, std::uint32_t* tokens) {
-    __shared__ float values[1024];
-    __shared__ unsigned indices[1024];
+    // Ordering stays the host/device better() shared with the CPU reference (float compare: NaN never
+    // wins); the block tree is the shared argmax core (R2-07).
+    struct Best { float value; unsigned index; };
+    __shared__ Best values[1024];
     const float* l = logits + static_cast<std::size_t>(step) * vocab;
-    float best = -__builtin_huge_valf();
-    unsigned best_index = vocab;
+    Best best{-__builtin_huge_valf(), vocab};
     for (unsigned v = threadIdx.x; v < vocab; v += 1024U)
-        if (better(l[v], v, best, best_index)) { best = l[v]; best_index = v; }
-    values[threadIdx.x] = best;
-    indices[threadIdx.x] = best_index;
-    __syncthreads();
-    for (unsigned half = 512; half != 0U; half /= 2U) {
-        if (threadIdx.x < half) {
-            const unsigned o = threadIdx.x + half;
-            if (better(values[o], indices[o], values[threadIdx.x], indices[threadIdx.x])) {
-                values[threadIdx.x] = values[o];
-                indices[threadIdx.x] = indices[o];
-            }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0U) tokens[step + 1U] = indices[0];
+        if (better(l[v], v, best.value, best.index)) best = Best{l[v], v};
+    best = strix::argmax::block_reduce<1024>(values, threadIdx.x, best, [](const Best& a, const Best& b) {
+        return better(b.value, b.index, a.value, a.index) ? b : a;
+    });
+    if (threadIdx.x == 0U) tokens[step + 1U] = best.index;
 }
 __global__ __launch_bounds__(32) void confidence_kernel(const float* weight, const float* x, const float* markov, float* out) {
     const unsigned lane = threadIdx.x, r = blockIdx.x;

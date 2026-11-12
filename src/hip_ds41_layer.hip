@@ -1,5 +1,7 @@
+#include "strix/hip_check.hpp"
 #include "ds41_dense_adapter.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1)
 #include "strix/env_flags.hpp"
+#include "strix/hip_argmax_core.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/hip_ds41_prefill.hpp"
@@ -2060,7 +2062,8 @@ constexpr unsigned argmax_threads = 256, argmax_span = 4096;
 
 __device__ inline ArgmaxCandidate better(const ArgmaxCandidate& a, const ArgmaxCandidate& b) {
     // Both usable: larger value, then lower index. Unusable entries (index ~0U, value -inf) never win.
-    ArgmaxCandidate o = (b.value > a.value || (b.value == a.value && b.index < a.index)) ? b : a;
+    // Shared first-max order (R2-07); identical to the float compare for finite/-inf values.
+    ArgmaxCandidate o = strix::argmax::better(b.value, b.index, a.value, a.index) ? b : a;
     o.finite = a.finite & b.finite;
     return o;
 }
@@ -2079,12 +2082,8 @@ __global__ __launch_bounds__(argmax_threads) void argmax_partial_kernel(const fl
         if (!__builtin_isfinite(v)) { best.finite = 0; continue; }
         best = better(best, ArgmaxCandidate{v, first_index + i, 1});
     }
-    s[threadIdx.x] = best;
-    __syncthreads();
-    for (unsigned d = argmax_threads / 2; d; d >>= 1) {
-        if (threadIdx.x < d) s[threadIdx.x] = better(s[threadIdx.x], s[threadIdx.x + d]);
-        __syncthreads();
-    }
+    strix::argmax::block_reduce<argmax_threads>(
+        s, threadIdx.x, best, [](const ArgmaxCandidate& a, const ArgmaxCandidate& b) { return better(a, b); });
     if (threadIdx.x == 0) partial[static_cast<std::size_t>(r) * blocks + b] = s[0];
 }
 
@@ -2098,12 +2097,8 @@ __global__ __launch_bounds__(argmax_threads) void argmax_final_kernel(const Argm
         const ArgmaxCandidate* q = partial + static_cast<std::size_t>(r) * blocks + i;
         best = better(best, ArgmaxCandidate{q->value, q->index, q->finite});  // field loads: no private copy
     }
-    s[threadIdx.x] = best;
-    __syncthreads();
-    for (unsigned d = argmax_threads / 2; d; d >>= 1) {
-        if (threadIdx.x < d) s[threadIdx.x] = better(s[threadIdx.x], s[threadIdx.x + d]);
-        __syncthreads();
-    }
+    strix::argmax::block_reduce<argmax_threads>(
+        s, threadIdx.x, best, [](const ArgmaxCandidate& a, const ArgmaxCandidate& b) { return better(a, b); });
     if (threadIdx.x == 0) out[r] = s[0];
 }
 

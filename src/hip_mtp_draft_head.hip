@@ -1,3 +1,6 @@
+#include "strix/env_flags.hpp"
+#include "strix/hip_argmax_core.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
@@ -35,12 +38,8 @@ __device__ float block_sum(float* values,float value) {
     }
     return values[0];
 }
-__device__ Partial choose(Partial a,const Partial b) {
-    const auto bad=a.bad|b.bad;
-    if(b.valid && (!a.valid || numeric_key(b.value)>numeric_key(a.value) ||
-        (numeric_key(b.value)==numeric_key(a.value) && b.token<a.token))) a=b;
-    a.bad=bad;return a;
-}
+// Shared first-max rule (strix::argmax, R2-07); sum/second ride along with the winner.
+__device__ Partial choose(Partial a,const Partial b) {return strix::argmax::choose(a,b);}
 // choose() that also keeps the runner-up value: the other partial's best and both seconds compete.
 // Partials cover disjoint rows, so a valid winner's token tells which side it came from.
 __device__ Partial choose_second(Partial a,const Partial b) {
@@ -48,6 +47,9 @@ __device__ Partial choose_second(Partial a,const Partial b) {
     const float loser=a.valid && b.valid?(best.token==a.token?b.value:a.value):-INFINITY;
     const float second=fmaxf(fmaxf(a.second,b.second),loser);
     a=best;a.second=second;return a;
+}
+template<bool Second> __device__ __forceinline__ Partial combine(Partial a,const Partial b) {
+    if constexpr(Second) return choose_second(a,b); else return choose(a,b);
 }
 __global__ __launch_bounds__(threads) void draft_gather_rows(const std::uint8_t* head,const std::uint32_t* ids,
     std::uint32_t first,std::uint32_t count,std::uint32_t row_bytes,std::uint8_t* compact) {
@@ -173,55 +175,21 @@ __global__ __launch_bounds__(256) void draft_q4_head_tails(DraftHeadRows h,std::
     const auto t=blockIdx.y;
     draft_q4_head_body(h.hidden[t],h.compact[t],blocks,h.rows[t],h.logits[t],shared+blockIdx.x*8U+threadIdx.x/32U);
 }
-template<bool Second> __device__ __forceinline__ void draft_argmax_partials_body(const float* logits,const std::uint32_t* ids,
-    std::uint32_t rows,Partial* partials) {
-    __shared__ Partial values[threads];
-    const auto lane=static_cast<unsigned>(threadIdx.x);
-    const auto index=static_cast<std::uint64_t>(blockIdx.x)*threads+lane;
-    __shared__ float sums[threads];
-    Partial value{0.0F,0,0,0,0.0F,-INFINITY};
-    if(index<rows) {
-        value.value=logits[index];value.token=ids?ids[index]:static_cast<std::uint32_t>(index);
-        value.bad=(__float_as_uint(value.value)&0x7f800000U)==0x7f800000U?1U:0U;value.valid=value.bad==0?1U:0U;
-    }
-    values[lane]=value;__syncthreads();
-    for(unsigned stride=threads/2;stride;stride>>=1U) {
-        if(lane<stride) values[lane]=Second?choose_second(values[lane],values[lane+stride]):choose(values[lane],values[lane+stride]);
-        __syncthreads();
-    }
-    auto best=values[0];
-    best.sum=block_sum(sums,value.valid && best.valid?expf(value.value-best.value):0.0F);
-    if(!lane) partials[blockIdx.x]=best;
-}
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_partials(const float* logits,const std::uint32_t* ids,
-    std::uint32_t rows,Partial* partials) {
-    draft_argmax_partials_body<Second>(logits,ids,rows,partials);
-}
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_partials_rows(DraftHeadRows h) {
-    const auto t=blockIdx.y;
-    if(blockIdx.x>=(h.rows[t]-1U)/threads+1U) return;
-    draft_argmax_partials_body<Second>(h.logits[t],h.ids[t],h.rows[t],h.partials[t]);
-}
 template<bool Second> __device__ __forceinline__ void draft_argmax_finish_body(const Partial* partials,std::uint32_t count,
     std::uint32_t step,std::uint32_t* slots,Reply* reply) {
     __shared__ Partial values[threads];
     const auto lane=static_cast<unsigned>(threadIdx.x);
     __shared__ float sums[threads];
     Partial value{0.0F,0,0,0,0.0F,-INFINITY};
-    for(std::uint32_t i=lane;i<count;i+=threads) value=Second?choose_second(value,partials[i]):choose(value,partials[i]);
-    values[lane]=value;__syncthreads();
-    for(unsigned stride=threads/2;stride;stride>>=1U) {
-        if(lane<stride) values[lane]=Second?choose_second(values[lane],values[lane+stride]):choose(values[lane],values[lane+stride]);
-        __syncthreads();
-    }
-    const auto best=values[0];
+    for(std::uint32_t i=lane;i<count;i+=threads) value=combine<Second>(value,partials[i]);
+    const auto best=strix::argmax::block_reduce<threads>(values,lane,value,[](const Partial& a,const Partial& b){return combine<Second>(a,b);});
     float sum=0.0F;
     for(std::uint32_t i=lane;i<count;i+=threads) {
         const auto& p=partials[i];if(p.valid && best.valid) sum+=p.sum*expf(p.value-best.value);
     }
     sum=block_sum(sums,sum);
     if(!lane) {
-        const auto failed=best.bad|(best.valid?0U:2U);
+        const auto failed=strix::argmax::status(best);
         // A failed row still feeds a valid id forward; the chain reader rejects it.
         const auto token=failed?0U:best.token;
         slots[step]=token;reply->tokens[step]=token;reply->probabilities[step]=failed?0.0F:1.0F/sum;
@@ -232,13 +200,44 @@ template<bool Second> __device__ __forceinline__ void draft_argmax_finish_body(c
         __hip_atomic_store(&reply->completed,step+1U,__ATOMIC_RELEASE,__HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* partials,std::uint32_t count,
-    std::uint32_t step,std::uint32_t* slots,Reply* reply) {
+// One launch per depth for the argmax (R2-10): every block writes its partial and takes a ticket on `done`;
+// the block holding the last ticket folds the partials exactly as the former separate finish kernel did
+// (same array, same lane/stride order, same tree), so ids and probabilities are unchanged. It then rearms
+// `done` for the next depth (stream order separates launches).
+template<bool Second> __device__ __forceinline__ void draft_argmax_body(const float* logits,const std::uint32_t* ids,
+    std::uint32_t rows,Partial* partials,std::uint32_t* done,std::uint32_t step,std::uint32_t* slots,Reply* reply) {
+    __shared__ Partial values[threads];
+    __shared__ float sums[threads];
+    __shared__ bool last;
+    const auto lane=static_cast<unsigned>(threadIdx.x);
+    const auto index=static_cast<std::uint64_t>(blockIdx.x)*threads+lane;
+    const std::uint32_t count=(rows-1U)/threads+1U;
+    Partial value{0.0F,0,0,0,0.0F,-INFINITY};
+    if(index<rows) {
+        const auto loaded=strix::argmax::load(logits[index],ids?ids[index]:static_cast<std::uint32_t>(index));
+        value.value=loaded.value;value.token=loaded.token;value.bad=loaded.bad;value.valid=loaded.valid;
+    }
+    auto best=strix::argmax::block_reduce<threads>(values,lane,value,[](const Partial& a,const Partial& b){return combine<Second>(a,b);});
+    best.sum=block_sum(sums,value.valid && best.valid?expf(value.value-best.value):0.0F);
+    if(!lane) {
+        partials[blockIdx.x]=best;
+        last=__hip_atomic_fetch_add(done,1U,__ATOMIC_ACQ_REL,__HIP_MEMORY_SCOPE_AGENT)==count-1U;
+    }
+    __syncthreads();
+    if(!last) return;
+    // Acquire for every lane: the other blocks' partials are visible past this CU's caches.
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"agent");
     draft_argmax_finish_body<Second>(partials,count,step,slots,reply);
+    if(!lane) __hip_atomic_store(done,0U,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT);
 }
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_finish_rows(DraftHeadRows h,std::uint32_t step) {
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax(const float* logits,const std::uint32_t* ids,
+    std::uint32_t rows,Partial* partials,std::uint32_t* done,std::uint32_t step,std::uint32_t* slots,Reply* reply) {
+    draft_argmax_body<Second>(logits,ids,rows,partials,done,step,slots,reply);
+}
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_rows(DraftHeadRows h,std::uint32_t step) {
     const auto t=blockIdx.y;
-    draft_argmax_finish_body<Second>(h.partials[t],(h.rows[t]-1U)/threads+1U,step,h.slots[t],h.reply[t]);
+    if(blockIdx.x>=(h.rows[t]-1U)/threads+1U) return;
+    draft_argmax_body<Second>(h.logits[t],h.ids[t],h.rows[t],h.partials[t],h.done[t],step,h.slots[t],h.reply[t]);
 }
 } // namespace
 

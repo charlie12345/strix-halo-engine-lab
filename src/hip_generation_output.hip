@@ -1,4 +1,6 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_generation_output.hpp"
+#include "strix/hip_argmax_core.hpp"
 #include "strix/mtp_payload_geometry.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
@@ -39,8 +41,7 @@ void clear_hip_greedy_output_diagnostic_fault() noexcept {
 namespace {
 constexpr unsigned threads = 256;
 static_assert(sizeof(float) == 4);
-struct Partial { float value; std::uint32_t token, bad, valid; };
-static_assert(sizeof(Partial) == 16);
+using argmax::Partial;
 struct alignas(8) Reply {
     std::uint64_t epoch, position;
     std::uint32_t token, status;
@@ -49,38 +50,14 @@ struct alignas(8) Reply {
 static_assert(sizeof(Reply) == 32);
 static_assert(offsetof(Reply, execution_identity) == 24);
 
-// Integer monotone keys implement the CPU finite numeric comparison exactly,
-// including subnormals independently of device FP denormal mode. Both zeros
-// normalize to the same key, retaining lowest-token tie semantics.
-__device__ std::uint32_t numeric_key(float value) {
-    auto bits = __float_as_uint(value);
-    if ((bits & 0x7fffffffU) == 0) bits = 0;
-    return (bits & 0x80000000U) ? ~bits : (bits ^ 0x80000000U);
-}
-__device__ Partial choose(Partial a, const Partial b) {
-    const auto bad = a.bad | b.bad;
-    if (b.valid && (!a.valid || numeric_key(b.value) > numeric_key(a.value) ||
-                     (numeric_key(b.value) == numeric_key(a.value) && b.token < a.token))) a = b;
-    a.bad = bad;
-    return a;
-}
 __global__ __launch_bounds__(threads) void greedy_output_partials(
     const float* logits, std::uint32_t vocabulary, Partial* partials) {
     __shared__ Partial values[threads];
     const auto lane = static_cast<unsigned>(threadIdx.x);
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * threads + lane;
-    Partial value{0.0F, 0, 0, 0};
-    if (index < vocabulary) {
-        value.value = logits[index]; value.token = static_cast<std::uint32_t>(index);
-        value.bad = (__float_as_uint(value.value) & 0x7f800000U) == 0x7f800000U ? 1U : 0U;
-        value.valid = value.bad == 0 ? 1U : 0U;
-    }
-    values[lane] = value;
-    __syncthreads();
-    for (unsigned stride = threads / 2; stride; stride >>= 1U) {
-        if (lane < stride) values[lane] = choose(values[lane], values[lane + stride]);
-        __syncthreads();
-    }
+    const Partial value = index < vocabulary
+        ? argmax::load(logits[index], static_cast<std::uint32_t>(index)) : argmax::empty();
+    argmax::block_argmax<threads>(values, lane, value);
     if (!lane) partials[blockIdx.x] = values[0];
 }
 __global__ __launch_bounds__(threads) void greedy_output_finish(
@@ -88,18 +65,10 @@ __global__ __launch_bounds__(threads) void greedy_output_finish(
     std::uint64_t epoch, std::uint64_t position, std::uint64_t execution_identity) {
     __shared__ Partial values[threads];
     const auto lane = static_cast<unsigned>(threadIdx.x);
-    Partial value{0.0F, 0, 0, 0};
-    for (std::uint64_t i = lane; i < count; i += threads) value = choose(value, partials[i]);
-    values[lane] = value;
-    __syncthreads();
-    for (unsigned stride = threads / 2; stride; stride >>= 1U) {
-        if (lane < stride) values[lane] = choose(values[lane], values[lane + stride]);
-        __syncthreads();
-    }
+    const auto best = argmax::block_argmax_partials<threads>(values, lane, partials, count, argmax::empty());
     if (!lane) {
-        const auto best = values[0];
         *reply = Reply{epoch, position, best.token,
-                       best.bad | (best.valid ? 0U : 2U), execution_identity};
+                       argmax::status(best), execution_identity};
     }
 }
 struct GreedyRowsViews { const float* logits[hip_greedy_rows_max]; };
@@ -109,18 +78,9 @@ __global__ __launch_bounds__(threads) void greedy_rows_partials(
     const auto lane = static_cast<unsigned>(threadIdx.x);
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * threads + lane;
     const auto* logits = views.logits[blockIdx.y];
-    Partial value{0.0F, 0, 0, 0};
-    if (index < vocabulary) {
-        value.value = logits[index]; value.token = static_cast<std::uint32_t>(index);
-        value.bad = (__float_as_uint(value.value) & 0x7f800000U) == 0x7f800000U ? 1U : 0U;
-        value.valid = value.bad == 0 ? 1U : 0U;
-    }
-    values[lane] = value;
-    __syncthreads();
-    for (unsigned stride = threads / 2; stride; stride >>= 1U) {
-        if (lane < stride) values[lane] = choose(values[lane], values[lane + stride]);
-        __syncthreads();
-    }
+    const Partial value = index < vocabulary
+        ? argmax::load(logits[index], static_cast<std::uint32_t>(index)) : argmax::empty();
+    argmax::block_argmax<threads>(values, lane, value);
     if (!lane) partials[static_cast<std::uint64_t>(blockIdx.y) * count + blockIdx.x] = values[0];
 }
 __global__ __launch_bounds__(threads) void greedy_rows_finish(
@@ -128,22 +88,12 @@ __global__ __launch_bounds__(threads) void greedy_rows_finish(
     __shared__ Partial values[threads];
     const auto lane = static_cast<unsigned>(threadIdx.x);
     const auto* row = partials + static_cast<std::uint64_t>(blockIdx.x) * count;
-    Partial value{0.0F, 0, 0, 0};
-    for (std::uint64_t i = lane; i < count; i += threads) value = choose(value, row[i]);
-    values[lane] = value;
-    __syncthreads();
-    for (unsigned stride = threads / 2; stride; stride >>= 1U) {
-        if (lane < stride) values[lane] = choose(values[lane], values[lane + stride]);
-        __syncthreads();
-    }
+    const auto best = argmax::block_argmax_partials<threads>(values, lane, row, count, argmax::empty());
     if (!lane) {
-        const auto best = values[0];
-        replies[blockIdx.x] = HipGreedyRowsReply{best.token, best.bad | (best.valid ? 0U : 2U)};
+        replies[blockIdx.x] = HipGreedyRowsReply{best.token, argmax::status(best)};
     }
 }
-void check(hipError_t result, const char* operation) {
-    if (result != hipSuccess) throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(result));
-}
+using strix::hip_check;
 void require(bool value, const char* message) {
     if (!value) throw std::invalid_argument(message);
 }

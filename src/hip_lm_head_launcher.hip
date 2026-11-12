@@ -11,6 +11,7 @@
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/known_window_rows_binding.hpp"
 #include "strix/hip_generation_output.hpp"
+#include "strix/hip_argmax_core.hpp"
 #include "strix/q8_projection_organization.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -581,19 +582,7 @@ __device__ float lane_down(float value) {
 // covers Groups consecutive Waves-row tiles; it changes no arithmetic.
 // Q6: weights is the Q6P32 copy of the Q8_0 head; it yields the same codes and
 // scales (decoded where the Q8_0 path unpacks its prefetched codes).
-struct LeanGreedy { float value; std::uint32_t token, bad, valid; };
-__device__ __forceinline__ std::uint32_t lean_key(float value) {
-    auto bits = __float_as_uint(value);
-    if ((bits & 0x7fffffffU) == 0) bits = 0;
-    return (bits & 0x80000000U) ? ~bits : (bits ^ 0x80000000U);
-}
-__device__ __forceinline__ LeanGreedy lean_choose(LeanGreedy a, const LeanGreedy& b) {
-    const auto bad = a.bad | b.bad;
-    if (b.valid && (!a.valid || lean_key(b.value) > lean_key(a.value) ||
-                    (lean_key(b.value) == lean_key(a.value) && b.token < a.token))) a = b;
-    a.bad = bad;
-    return a;
-}
+using LeanGreedy = strix::argmax::Partial;
 // Greedy (staged form, one block per hip_greedy_rows_partial_logits vocabulary rows): lane 0 of
 // each wave also folds its logits into one greedy-rows partial record per window row, so the
 // separate partials launch (a second read of every logit) is not needed. The records hold the
@@ -683,11 +672,8 @@ __device__ __forceinline__ void lm_head_rows_body(uint4* staged, const LmHeadRow
             p[0] += p[1];
             views.output[r][row] = p[0];
             if constexpr (Greedy) {
-                LeanGreedy here{p[0], row, 0U, 0U};
-                here.bad = (__float_as_uint(p[0]) & 0x7f800000U) == 0x7f800000U ? 1U : 0U;
-                here.valid = here.bad ^ 1U;
                 auto& slot = best[(static_cast<std::uint32_t>(threadIdx.x) / 32U) * Rows + r];
-                slot = lean_choose(slot, here);
+                slot = strix::argmax::choose(slot, strix::argmax::load(p[0], row));
             }
         }
     }
@@ -696,7 +682,7 @@ __device__ __forceinline__ void lm_head_rows_body(uint4* staged, const LmHeadRow
         __syncthreads();
         if (threadIdx.x < Rows) {
             LeanGreedy total{0.0F, 0U, 0U, 0U};
-            for (unsigned w = 0; w < Waves; ++w) total = lean_choose(total, best[w * Rows + threadIdx.x]);
+            for (unsigned w = 0; w < Waves; ++w) total = strix::argmax::choose(total, best[w * Rows + threadIdx.x]);
             records->row[threadIdx.x][blockIdx.x] = total;
         }
     }
@@ -848,10 +834,7 @@ void lean_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights, std
                 if (row >= output_width) continue;
                 views.output[slot % Rows][row] = v[j];
                 if constexpr (Greedy) {
-                    LeanGreedy here{v[j], row, 0U, 0U};
-                    here.bad = (__float_as_uint(v[j]) & 0x7f800000U) == 0x7f800000U ? 1U : 0U;
-                    here.valid = here.bad ^ 1U;
-                    best[j] = lean_choose(best[j], here);
+                    best[j] = strix::argmax::choose(best[j], strix::argmax::load(v[j], row));
                 }
             }
         }
@@ -864,7 +847,7 @@ void lean_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights, std
         if (threadIdx.x < Rows) {
             LeanGreedy total{0.0F, 0U, 0U, 0U};
             for (unsigned w = 0; w < lm_head_lean_waves; ++w)
-                for (unsigned c = 0; c < Cols; ++c) total = lean_choose(total, best_lds[w * slots + c * Rows + threadIdx.x]);
+                for (unsigned c = 0; c < Cols; ++c) total = strix::argmax::choose(total, best_lds[w * slots + c * Rows + threadIdx.x]);
             partials[static_cast<std::uint64_t>(threadIdx.x) * partial_count + blockIdx.x] = total;
         }
     }

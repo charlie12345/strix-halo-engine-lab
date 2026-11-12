@@ -17,7 +17,7 @@ all expert projections (default) or gate/up only. Serial conversion is the defau
 This is a lossy numerical identity awaiting native timing and model quality gates; it does not
 inherit the exact production path's qualification. With scope `all` the fused INT4 MoE chain runs once
 per 4096-row chunk by default (`STRIX_MOE_I4_CHAIN=0` selects the unfused calls, same bits): 8K prefill
-12.31 s versus 12.65 s unfused (-2.7 %); 32K 56.47 s versus 55.79 s (+1.2 %, both orders); anchors equal,
+12.12 s versus 12.34 s unfused (-1.7 %, both orders); 32K 55.23 s versus 55.74 s (-0.9 %, six pairs, both orders); anchors equal,
 ranks agree. [Implementation contract](../../minimax-grouped-prefill.md#draft-fast_i4).
 
 <a id="minimax-pair"></a>

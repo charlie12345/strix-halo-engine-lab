@@ -138,6 +138,7 @@ struct NoChain {
     static constexpr bool kActive = false;
     static constexpr int kPasses = 1;
     static constexpr uint32_t kPassRow = 0;
+    static constexpr bool kSaveRegs = false;
 };
 struct NoAdapter {
     static constexpr bool kActive = false, kTiles = false;
@@ -194,7 +195,7 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     static_assert(!Chain::kActive || (IU4Grouped && Fused && IU4Group == 64 && !AD));
     // Gate values stay in each lane's registers across the paired gate/up mainloops.
     constexpr int chain_groups = (G::waves_m * 16 * (BN / 128) + G::waves - 1) / G::waves;
-    float chain_saved[Chain::kPasses == 2 ? MT * chain_groups * 4 : 1];
+    float chain_saved[Chain::kSaveRegs ? MT * chain_groups * 4 : 1];
     const auto* chain_packed = packed;
     const auto* chain_wscale = w_scale;
     for (int chain_pass = 0; chain_pass < Chain::kPasses; ++chain_pass) {

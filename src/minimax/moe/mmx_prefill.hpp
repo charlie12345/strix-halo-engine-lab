@@ -118,9 +118,8 @@ struct PrefillMoeDeviceView {
     bool i4_chain = false;
 };
 bool prefill_moe_device_plan(std::uint32_t rows);
-// The fused FAST_I4 candidate chain for a prompt of total_rows rows (0: capability/opt-in checks). Default on up to
-// kI4ChainRows rows: it measured -2.7 % at 8K but +1.2 % at 32K. STRIX_MOE_I4_CHAIN=0/1 overrides. Same bits.
-inline constexpr std::size_t kI4ChainRows = 8192;
+// The fused FAST_I4 candidate chain for a prompt of total_rows rows (0: capability/opt-in checks). Default on at
+// every length (8K -1.7 %, 32K -0.9 % with the global gate save). STRIX_MOE_I4_CHAIN=0/1 overrides. Same bits.
 bool prefill_i4_chain(std::size_t total_rows = 0);
 std::size_t prefill_i4_workspace_bound(std::uint32_t rows);
 void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes,

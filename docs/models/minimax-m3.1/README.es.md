@@ -16,8 +16,8 @@ todas las proyecciones de expertos (predeterminado) o solo gate/up. La conversi�
 `STRIX_MMX_FAST_I4_PREFETCH=1` activa la precarga ordenada por eventos, pendiente de cualificación de tiempos. Es una
 identidad numérica con pérdida pendiente de las puertas nativas de tiempo y calidad; no hereda la cualificación de la
 ruta exacta de producción. Con el alcance `all`, la cadena MoE INT4 fusionada se ejecuta una vez por chunk de 4096
-filas por defecto (`STRIX_MOE_I4_CHAIN=0` selecciona las llamadas sin fusionar, mismos bits): prefill 8K 12.31 s
-frente a 12.65 s sin fusionar (−2.7 %); 32K 56.47 s frente a 55.79 s (+1.2 %, en ambos órdenes); anclas iguales,
+filas por defecto (`STRIX_MOE_I4_CHAIN=0` selecciona las llamadas sin fusionar, mismos bits): prefill 8K 12.12 s
+frente a 12.34 s sin fusionar (−1.7 %, ambos órdenes); 32K 55.23 s frente a 55.74 s (−0.9 %, seis pares, ambos órdenes); anclas iguales,
 los ranks coinciden. [Contrato de implementación](../../minimax-grouped-prefill.md#draft-fast_i4).
 
 <a id="minimax-pair"></a>

@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
             Counts follower_counts;bool fail=false;
             sv::ServiceFactories peers;
             peers.install("minimax",{[](const sv::ServiceSelection&){},[](const sv::ServiceSelection&,std::ostream&){},
-                [&](const sv::ServiceSelection&){return std::make_unique<Follower>(follower_counts,fail);}});
+                [&](const sv::ServiceSelection&){return std::make_unique<Follower>(follower_counts,fail);}, {}});
             sv::ServeShell forbidden;
             forbidden.serve=[](const sv::HttpServerConfig&,sv::HttpHandler,sv::SessionRuntime&){throw std::runtime_error("follower entered HTTP shell");};
             const std::vector<std::string> args{"serve","--registry-root",root,"--model","minimax"};
@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
         factories.install("gemma4", {
             [&](const sv::ServiceSelection& s) { ++c.validated; CHECK(s.description.find("dims.hidden")); forwarded = s.arguments; },
             [&](const sv::ServiceSelection&, std::ostream& out) { ++c.inspected; out << "family read-only\n"; },
-            [&](const sv::ServiceSelection&) { return std::make_unique<Service>(c); }});
+            [&](const sv::ServiceSelection&) { return std::make_unique<Service>(c); }, {}});
         CHECK(invoke({"serve", "--help", "--registry", "absent"}, factories).code == 0);
         CHECK(c.created == 0 && c.validated == 0);
         auto listing = invoke({"serve", "--registry-root", root, "--list-models"}, factories);
@@ -134,17 +134,17 @@ int main(int argc, char** argv) {
         CHECK(c.created == 2);
         bool duplicate = false;
         try { factories.install("gemma4", {[](const sv::ServiceSelection&) {}, [](const sv::ServiceSelection&, std::ostream&) {},
-            [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> { return {}; }}); }
+            [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> { return {}; }, {}}); }
         catch (const std::invalid_argument&) { duplicate = true; }
         CHECK(duplicate);
         sv::ServiceFactories empty_service;
         empty_service.install("gemma4", {[](const sv::ServiceSelection&) {}, [](const sv::ServiceSelection&, std::ostream&) {},
-            [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> { return {}; }});
+            [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> { return {}; }, {}});
         CHECK(invoke({"serve", "--registry-root", root, "--model", "gemma4"}, empty_service).error.find("no service") != std::string::npos);
         sv::ServiceFactories invalid_deployment;
         invalid_deployment.install("gemma4", {[](const sv::ServiceSelection&) { throw std::invalid_argument("deployment refused"); },
             [](const sv::ServiceSelection&, std::ostream&) {},
-            [&](const sv::ServiceSelection&) { return std::make_unique<Service>(c); }});
+            [&](const sv::ServiceSelection&) { return std::make_unique<Service>(c); }, {}});
         CHECK(invoke({"serve", "--registry-root", root, "--model", "gemma4"}, invalid_deployment).code == 2);
         CHECK(c.created == 2);
         std::cout << "session registry checks passed\n"; return 0;

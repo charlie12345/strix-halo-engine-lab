@@ -115,6 +115,9 @@ function(strix_session_add_runtime)
         add_subdirectory("${_strix_session_root}/tests/minimax_session_shared"
             "${CMAKE_BINARY_DIR}/minimax-session-shared")
     endif()
+    if(BUILD_TESTING AND NOT TARGET http_shutdown_tests)
+        add_subdirectory("${_strix_session_root}/tests/http_shutdown" "${CMAKE_BINARY_DIR}/http-shutdown")
+    endif()
 endfunction()
 
 # Explicit optional archive reference without a runtime/family dependency cycle.

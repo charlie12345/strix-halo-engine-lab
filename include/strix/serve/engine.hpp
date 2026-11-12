@@ -341,6 +341,8 @@ struct QueueSnapshot {
 
 // FIFO is the default; MiniMax short-first also gives cancellation precedence.
 enum class QueueSelection { fifo, short_first };
+// Serial generate() measures TTFT from entry, unlike native batched producers.
+enum class QueueCompletion { taken, serial };
 
 // Generation jobs executed on the thread that calls run() or take().
 class GenerationQueue {
@@ -380,6 +382,9 @@ public:
     std::shared_ptr<GenerationTicket> submit(GenerationJob job);
     // Runs jobs until shutdown(); `observe` (optional) sees every finished job's stats.
     void run(GenerationEngine& engine, const std::function<void(const GenerationStats&)>& observe = {});
+    // One FIFO entry, including cancelled work, with run()'s idle-control wake
+    // boundary. No cancellation sweep or completion occurs during reservation.
+    std::optional<TakenJob> take_serial(bool wait);
     // Batching engines, which decode several jobs at once and take new ones between steps instead of
     // run(): chooses a job with the requested policy (FIFO by default), waiting when `wait`.
     // nullopt when none is queued; cancelled entries are finished here. Selection preserves
@@ -416,7 +421,8 @@ public:
     // before the lock plus a few additions under it (no allocation, no syscall). A runner's timed region that encloses
     // the call therefore sees at most that constant, on top of the totals update it already contained.
     void finish(TakenJob& job, GenerationStats stats, std::string error = {},
-        const std::function<void(const GenerationStats&)>& observe = {});
+        const std::function<void(const GenerationStats&)>& observe = {},
+        QueueCompletion protocol = QueueCompletion::taken);
     [[nodiscard]] bool stopping() const;
     // Close admission atomically with submit, preserving all accepted work and the owner loop.
     // Returns true only on the first call.

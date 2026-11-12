@@ -3,6 +3,7 @@
 #include "strix/device/declaration.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -38,6 +39,15 @@ public:
     [[nodiscard]] virtual Vendor vendor() const noexcept = 0;
     [[nodiscard]] virtual std::vector<Visible> enumerate() = 0;
 };
+
+// NVIDIA cards as `nvidia-smi --query-gpu=index,uuid,pci.bus_id,memory.total,name --format=csv,noheader,nounits`
+// prints them. This listing does not start the CUDA runtime, so the process can still be restricted to one card
+// afterwards. `ordinal` is the nvidia-smi index. parse throws std::invalid_argument; query returns nullopt when the
+// tool is missing, fails or prints something unexpected.
+[[nodiscard]] std::vector<Visible> parse_nvidia_smi(std::string_view csv);
+[[nodiscard]] std::optional<std::vector<Visible>> query_nvidia_smi();
+// Sets a variable in this process's environment (used to restrict the vendor runtime before it starts). Throws Refusal.
+void set_process_environment(const char* name, const std::string& value);
 
 class FakeEnumerator final : public Enumerator {
 public:

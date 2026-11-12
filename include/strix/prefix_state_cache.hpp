@@ -68,6 +68,13 @@ struct PrefixCacheSegment {
     std::uint32_t block_rows = 0;
     std::vector<std::uint32_t> tokens;  // the T tokens of this block
     PrefixCacheBuffer payload;
+    // Scoped chain adopters retain ancestry once, rather than a full prefix
+    // vector per snapshot. Zero charge/ancestor preserve the tiled producer.
+    std::shared_ptr<const PrefixCacheSegment> ancestor;
+    std::uint64_t charge = 0;
+    // The original segment released payload first. Keep that order with chain
+    // ancestry too: snapshot, leaf payload, then unneeded ancestor payloads.
+    ~PrefixCacheSegment() { payload = {}; }
 };
 
 struct PrefixCacheCheckpoint {
@@ -83,6 +90,7 @@ struct PrefixCacheCheckpoint {
     PrefixEntryPolicy retention;
     std::uint64_t charge = 0, declared_metadata = 0;
     bool legacy_index_exemption = false;
+    bool chain_retention = false;
     std::string name, replacement, keep;
     std::shared_ptr<const session::PrefixSnapshot> snapshot;
     std::shared_ptr<const session::ResidentPrefix> resident;
@@ -320,6 +328,20 @@ public:
     // or serializing a device owner. Capacity, including codec slack, is charged.
     bool retain_encoded(std::shared_ptr<PrefixCacheCheckpoint>, std::vector<std::uint8_t>, Reservation* = nullptr);
 
+    // Legacy block-sharing policy: one leaf segment per checkpoint, snapshot LRU
+    // first, then unneeded ancestors. The codec fills new blocks root-to-leaf,
+    // then fixed, using ONLY the supplied allocator (no store reentry). Each
+    // request must match its declared payload bytes. Credits include metadata,
+    // staging and outstanding read leases. No durable writer is used here.
+    struct ChainStats {
+        std::uint64_t bytes=0, blocks=0, snapshots=0, evicted_blocks=0, evicted_snapshots=0;
+    };
+    bool retain_chain(std::shared_ptr<PrefixCacheCheckpoint>,
+        const std::function<void(PrefixCacheCheckpoint&, const PrefixCacheAllocator&)>& fill);
+    [[nodiscard]] std::shared_ptr<const PrefixCacheSegment> chain_segment(std::uint64_t scope, const ModelContentIdentity&) const;
+    [[nodiscard]] std::shared_ptr<const PrefixCacheCheckpoint> chain_checkpoint(std::uint64_t scope, const ModelContentIdentity&, bool touch=false);
+    [[nodiscard]] ChainStats chain_stats(std::uint64_t scope) const;
+
     PrefixStateCache(PrefixStateCachePolicy, PrefixCacheAllocator);
     ~PrefixStateCache();
     PrefixStateCache(const PrefixStateCache&) = delete;
@@ -427,6 +449,11 @@ private:
     static void reap_immutable_locked(Ledger&);
     std::uint64_t next_scope_ = 0;
     std::map<std::uint64_t, std::uint64_t> scope_evictions_;
+    struct ChainRef { std::uint64_t scope=0, refs=0, pins=0, charge=0; };
+    std::map<ModelContentIdentity, ChainRef, DigestLess> chain_refs_;
+    std::map<std::uint64_t, ChainStats> chain_stats_;
+    void release_chain_locked(const PrefixCacheCheckpoint&, bool eviction);
+    void prune_chain_locked(const ModelContentIdentity&, bool eviction);
     std::map<std::uint64_t, std::map<std::string, NamedView>> named_views_;
     bool retention_room_locked(const PrefixEntryPolicy&, std::uint64_t, std::string_view, std::string_view) const;
     bool reclaim_one_locked(std::optional<std::uint64_t> scope = {}, std::string_view protected_name = {});
@@ -453,7 +480,7 @@ private:
     void mark_private_prefix_successors_locked(const PrefixCacheCheckpoint*, std::uint64_t);
     void associate_locked(Entry&, const std::string&, bool reused = false);
     void add_locked(std::shared_ptr<const PrefixCacheCheckpoint>);
-    void erase_locked(const ModelContentIdentity&);
+    void erase_locked(const ModelContentIdentity&, bool eviction = false);
     friend struct PrefixStateCacheTestAccess;
     // Global store activity: one insertion/duplicate capture or validated touch
     // across ALL conversations, not wall time or per-conversation turns.

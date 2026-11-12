@@ -55,7 +55,10 @@ la ruta resuelta por `STRIX_MM_INDEX_PROJ` (`attn` predeterminada, `tiled`, `off
 (predeterminado 1) para decode/verificación (1–8 filas) y prompt (más de 8 filas): la ruta predeterminada `attn`
 carga solo la disposición empaquetada; `tiled` carga la disposición FP16 por bloques (decode, con
 `STRIX_MM_INDEX_DECODE=1`) y la FP16 traspuesta; `off` carga la FP32 traspuesta. Las salidas de prefill y decode
-son idénticas bit a bit a las obtenidas cargando todas las disposiciones. Las demás rutas siguen funcionando:
+son idénticas bit a bit a las obtenidas cargando todas las disposiciones. Con la disposición empaquetada, las filas
+del prompt usan el kernel slab (activaciones como operandos escalares, la etapa de pesos FP16 ampliada una vez en
+LDS): los mismos bits que el kernel tiled anterior en 0,67-0,70x de su tiempo por llamada (banco unitario, 1024-8192
+filas). Las demás rutas siguen funcionando:
 defina ambas variables antes de que el motor cargue. Seleccionar una ruta cuya disposición no se cargó se rechaza
 con un error que pide recargar; un conjunto de disposiciones que no cabe en la memoria del dispositivo hace fallar la carga.
 

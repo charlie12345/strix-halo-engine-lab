@@ -5,6 +5,8 @@
 // FP16 rounding points follow the reference module (see vae_ref.hpp): one FP32 computation and one FP16
 // rounding per tensor op; linears accumulate K16 tiles in ascending order into one FP32 accumulator.
 
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "h3/vae/vae_kernels.hpp"
 
 #include <hip/hip_runtime.h>
@@ -23,7 +25,7 @@ typedef float f8 __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("h3 vae hip: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("h3 vae hip: ", e, what);
 }
 void launched(const char* what) { check(hipGetLastError(), what); }
 

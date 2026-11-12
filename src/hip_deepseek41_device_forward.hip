@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/file_snapshot.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
@@ -54,7 +56,7 @@ namespace strix::deepseek41 {
 namespace {
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("deepseek41 device forward: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("deepseek41 device forward: ", e, what);
 }
 
 std::uint64_t fnv(const std::vector<float>& v) {

@@ -185,21 +185,21 @@ struct HipGreedyOutput::Impl {
         require(partial_bytes <= std::numeric_limits<std::size_t>::max(), "GPU greedy scratch exceeds host size");
         guard->require_original();
         try {
-            check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create greedy output stream");
+            hip_check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create greedy output stream");
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::partial_allocation);
 #endif
-            check(hipMalloc(reinterpret_cast<void**>(&partials), static_cast<std::size_t>(partial_bytes)), "allocate greedy partials");
+            hip_check(hipMalloc(reinterpret_cast<void**>(&partials), static_cast<std::size_t>(partial_bytes)), "allocate greedy partials");
             ++counters.pool_allocations;
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::reply_allocation);
 #endif
-            check(hipMalloc(reinterpret_cast<void**>(&device_reply), sizeof(Reply)), "allocate greedy result");
+            hip_check(hipMalloc(reinterpret_cast<void**>(&device_reply), sizeof(Reply)), "allocate greedy result");
             ++counters.pool_allocations;
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::pinned_allocation);
 #endif
-            check(hipHostMalloc(reinterpret_cast<void**>(&host_reply), sizeof(Reply)), "allocate greedy pinned result");
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&host_reply), sizeof(Reply)), "allocate greedy pinned result");
             ++counters.pool_allocations;
         } catch (...) { cleanup(); throw; }
     }
@@ -243,28 +243,28 @@ struct HipGreedyOutput::Impl {
         pending_position = position;
         pending = true;
         try {
-            check(hipPeekAtLastError(), "GPU greedy preexisting HIP error");
+            hip_check(hipPeekAtLastError(), "GPU greedy preexisting HIP error");
             // Poison the complete device reply before EACH launch. If a stage is
             // accidentally omitted, stale metadata cannot pass current-call checks.
             *host_reply = Reply{~epoch, ~position, 0xffffffffU, 0xffffffffU, ~execution_identity};
-            check(hipMemcpyAsync(device_reply, host_reply, sizeof(Reply), hipMemcpyHostToDevice, stream), "poison greedy result");
+            hip_check(hipMemcpyAsync(device_reply, host_reply, sizeof(Reply), hipMemcpyHostToDevice, stream), "poison greedy result");
             counters.poison_h2d_bytes += sizeof(Reply);
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_poison);
 #endif
             hipLaunchKernelGGL(greedy_output_partials, dim3(partial_count), dim3(threads), 0, stream,
                                reinterpret_cast<const float*>(input.address), vocabulary, partials);
-            check(hipGetLastError(), "submit greedy partials"); ++counters.reduction_kernel_submissions;
+            hip_check(hipGetLastError(), "submit greedy partials"); ++counters.reduction_kernel_submissions;
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_partials);
 #endif
             hipLaunchKernelGGL(greedy_output_finish, dim3(1), dim3(threads), 0, stream,
                                partials, partial_count, device_reply, epoch, position, execution_identity);
-            check(hipGetLastError(), "submit greedy finish"); ++counters.reduction_kernel_submissions;
+            hip_check(hipGetLastError(), "submit greedy finish"); ++counters.reduction_kernel_submissions;
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_finish);
 #endif
-            check(hipMemcpyAsync(host_reply, device_reply, sizeof(Reply), hipMemcpyDeviceToHost, stream), "read greedy result");
+            hip_check(hipMemcpyAsync(host_reply, device_reply, sizeof(Reply), hipMemcpyDeviceToHost, stream), "read greedy result");
             counters.result_d2h_bytes += sizeof(Reply);
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_readback);
@@ -281,7 +281,7 @@ struct HipGreedyOutput::Impl {
         const auto position = pending_position;
         try {
             guard->require_original();
-            check(hipStreamSynchronize(stream), "complete greedy result");
+            hip_check(hipStreamSynchronize(stream), "complete greedy result");
             ++counters.stream_completions;
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
             diagnostic_boundary(HipGreedyOutputDiagnosticFault::after_completion);
@@ -339,11 +339,11 @@ void enqueue_hip_greedy_rows_finish(ExecutionBufferAddress partials, std::uint32
     require(replies && partials.address && partials.address % alignof(Partial) == 0 && partials.bytes >= bytes,
         "GPU greedy rows scratch/reply views are invalid");
     void* device_replies = nullptr;
-    check(hipHostGetDevicePointer(&device_replies, replies, 0), "GPU greedy rows replies must be host-mapped");
+    hip_check(hipHostGetDevicePointer(&device_replies, replies, 0), "GPU greedy rows replies must be host-mapped");
     const auto count = static_cast<std::uint32_t>((static_cast<std::uint64_t>(vocabulary) - 1U) / threads + 1U);
     hipLaunchKernelGGL(greedy_rows_finish, dim3(rows), dim3(threads), 0, reinterpret_cast<hipStream_t>(stream),
         reinterpret_cast<const Partial*>(partials.address), count, static_cast<HipGreedyRowsReply*>(device_replies));
-    check(hipGetLastError(), "submit greedy rows finish");
+    hip_check(hipGetLastError(), "submit greedy rows finish");
 }
 void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std::uint32_t vocabulary,
     ExecutionBufferAddress partials, HipGreedyRowsReply* replies, void* stream) {
@@ -361,15 +361,15 @@ void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std
         views.logits[r] = reinterpret_cast<const float*>(view.address);
     }
     void* device_replies = nullptr;
-    check(hipHostGetDevicePointer(&device_replies, replies, 0), "GPU greedy rows replies must be host-mapped");
+    hip_check(hipHostGetDevicePointer(&device_replies, replies, 0), "GPU greedy rows replies must be host-mapped");
     const auto count = static_cast<std::uint32_t>((static_cast<std::uint64_t>(vocabulary) - 1U) / threads + 1U);
     const auto queue = reinterpret_cast<hipStream_t>(stream);
     auto* scratch = reinterpret_cast<Partial*>(partials.address);
-    check(hipPeekAtLastError(), "GPU greedy rows preexisting HIP error");
+    hip_check(hipPeekAtLastError(), "GPU greedy rows preexisting HIP error");
     hipLaunchKernelGGL(greedy_rows_partials, dim3(count, rows), dim3(threads), 0, queue, views, vocabulary, count, scratch);
-    check(hipGetLastError(), "submit greedy rows partials");
+    hip_check(hipGetLastError(), "submit greedy rows partials");
     hipLaunchKernelGGL(greedy_rows_finish, dim3(rows), dim3(threads), 0, queue, scratch, count,
         static_cast<HipGreedyRowsReply*>(device_replies));
-    check(hipGetLastError(), "submit greedy rows finish");
+    hip_check(hipGetLastError(), "submit greedy rows finish");
 }
 } // namespace strix

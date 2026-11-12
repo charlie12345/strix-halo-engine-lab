@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/dist/open_transport.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include <cstdlib>
 
@@ -83,7 +84,7 @@ private:
     std::uint64_t sequence_ = 0;
     dist::Transport& transport() { return comm_ ? comm_->transport() : *host_; }
     static void check(hipError_t status) {
-        if (status != hipSuccess) throw std::runtime_error(std::string("pair transport: ") + hipGetErrorString(status));
+        ::strix::hip_check(status, "pair transport");
     }
 };
 } // namespace strix::qwen_pp

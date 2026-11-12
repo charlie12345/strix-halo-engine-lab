@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/dist/gpu_direct.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/gpu_direct_copy.hpp"
 
 #include <algorithm>
@@ -30,7 +32,7 @@ using transport::GpuQueueOperation;
 using transport::LinuxGpuQueue;
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("gpu-direct: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("gpu-direct: ", status, what);
 }
 inline void relax() noexcept {
 #if defined(__x86_64__)

@@ -1,3 +1,5 @@
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/startup_markers.hpp"
 #pragma once
 #include "qwen_pair_transport.hpp"
@@ -353,7 +355,7 @@ public:
         if(tap_==SIZE_MAX)throw std::logic_error("tiled MTP prompt has no wide hidden tap step");
         // STRIX_PREFILL_PIPE=1: two tap buffers, so block k's predictor rows build on the MTP stream while block k+1 runs.
         const auto buffer=static_cast<std::size_t>(mtp_cli_mul(tiled_.rows,width_));
-        check(hipMalloc(reinterpret_cast<void**>(&block_hidden_),pipe_mtp()?2U*buffer:buffer),"tiled MTP hidden rows");
+        strix::hip_check(hipMalloc(reinterpret_cast<void**>(&block_hidden_),pipe_mtp()?2U*buffer:buffer),"tiled MTP hidden rows");
         hidden_allocation_=block_hidden_;
         if(pipe_mtp()) spare_hidden_=block_hidden_+buffer;
         plan_config_=tiled_.numerical_plan;
@@ -421,7 +423,7 @@ public:
             try {
                 if(submitter_.valid()) (void)submitter_.get();
                 if(runtime_.prime_hidden_rows_pending())
-                    check(hipStreamSynchronize(static_cast<hipStream_t>(runtime_.resources().stream())),"cancelled prefix producer drain");
+                    strix::hip_check(hipStreamSynchronize(static_cast<hipStream_t>(runtime_.resources().stream())),"cancelled prefix producer drain");
             } catch(...) {capture_->fatal();std::terminate();}
         } else {
             if(submitter_.valid()) submitter_.wait();
@@ -586,7 +588,7 @@ public:
                 bool even=address[1]>address[0] && pitch>=width_ && bytes>=width_;
                 for(std::uint32_t r=2;even && r<rows;++r) even=address[r]-address[r-1U]==pitch;
                 if(even) {
-                    check(hipMemcpy2DAsync(block_hidden_,static_cast<std::size_t>(width_),reinterpret_cast<const void*>(address[0]),
+                    strix::hip_check(hipMemcpy2DAsync(block_hidden_,static_cast<std::size_t>(width_),reinterpret_cast<const void*>(address[0]),
                         static_cast<std::size_t>(pitch),static_cast<std::size_t>(width_),rows,hipMemcpyDeviceToDevice,stream),"tiled MTP tap rows copy");
                     return;
                 }
@@ -595,7 +597,7 @@ public:
                 const auto c=row(r);
                 const auto source=resolve_dispatch_write(c,0);
                 if(source.bytes<width_)throw std::logic_error("tiled MTP tap row is undersized");
-                check(hipMemcpyAsync(block_hidden_+static_cast<std::size_t>(r)*width_,reinterpret_cast<const void*>(source.address),
+                strix::hip_check(hipMemcpyAsync(block_hidden_+static_cast<std::size_t>(r)*width_,reinterpret_cast<const void*>(source.address),
                     static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP tap copy");
             }
         };
@@ -634,14 +636,14 @@ public:
             if((block.capture || tiled_.cache_tails) && tiled_.cache && !legacy_cache())
                 capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),
                     !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
-            int device=0;check(hipGetDevice(&device),"get priming device");
+            int device=0;strix::hip_check(hipGetDevice(&device),"get priming device");
             const auto submit=[this,device,stream,last,capture=capture_,views=std::move(views),next=std::move(next)] {
                 try {
-                    check(hipSetDevice(device),"bind priming device");
+                    strix::hip_check(hipSetDevice(device),"bind priming device");
                     const bool pending=runtime_.prime_hidden_rows_submit(qualified_,activated_,views,next,producer_rotary_);
-                    check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
+                    strix::hip_check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
                     if(capture) capture->submit_predictor(stream);
-                    if(!pending) check(hipStreamSynchronize(stream),"tiled MTP held copy");
+                    if(!pending) strix::hip_check(hipStreamSynchronize(stream),"tiled MTP held copy");
                     return pending;
                 } catch(...) {if(capture && capture->quarantine) capture->fatal();throw;}
             };
@@ -669,7 +671,7 @@ public:
                 block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
         }
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
-        check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
+        strix::hip_check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held copy");
         pos_+=rows;
         const bool complete=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
@@ -858,7 +860,6 @@ private:
     std::vector<QwenUnitExec> trace_;
     std::uint64_t request_order_=0;
     bool legacy_cache() const {return tiled_.cache && tiled_.cache->has_store() && tiled_.cache->store().policy().legacy;}
-    static void check(hipError_t e,const char* what){if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));}
     [[nodiscard]] MtpDeviceView view(const std::byte* p) const {return MtpDeviceView{reinterpret_cast<std::uintptr_t>(p),width_,1U};}
     // STRIX_PREFILL_PIPE (bit mask, default 0): 1 = a T block's predictor rows build on the MTP stream while the next
     // block runs (completed before any other use of the predictor, the held row or the prefix cache);
@@ -975,7 +976,7 @@ public:
         if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
         for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(tickets[r].view());next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
-        check(hipMemcpy(held_,reinterpret_cast<const void*>(tickets.back().view().address),static_cast<std::size_t>(width_),
+        strix::hip_check(hipMemcpy(held_,reinterpret_cast<const void*>(tickets.back().view().address),static_cast<std::size_t>(width_),
             hipMemcpyDeviceToDevice),"tiled MTP held window copy");
         pending_=std::move(tickets.back());pos_+=rows;window_rows_+=rows;
         window_pending_=true;
@@ -1017,7 +1018,7 @@ private:
             const std::array<MtpDeviceView,1> one{view(held_)};const std::array<std::uint32_t,1> token{tokens_[static_cast<std::size_t>(pos_)]};
             runtime_.prime_hidden_rows(qualified_,activated_,one,token,producer_rotary_);
         }
-        check(hipMemcpy(held_,reinterpret_cast<const void*>(ticket.view().address),static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
+        strix::hip_check(hipMemcpy(held_,reinterpret_cast<const void*>(ticket.view().address),static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held ticket copy");
         check_yarn_memory();
         pending_=std::move(ticket);++pos_;++serial_rows_;

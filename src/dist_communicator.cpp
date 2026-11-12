@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/host_copy.hpp"
 #include "dist_crc32c_parallel.hpp"
@@ -45,7 +47,7 @@ namespace strix::dist {
 namespace {
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("dist communicator: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("dist communicator: ", status, what);
 }
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("dist transport: " + what); }
 

@@ -23,7 +23,7 @@ namespace strix::ds41::dspark {
 namespace {
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("ds41 dspark: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("ds41 dspark: ", status, what);
 }
 namespace mc = ::strix::dspark::markov_cand;
 static_assert(block_size <= mc::kMaxRows && markov_rank == mc::kRank);

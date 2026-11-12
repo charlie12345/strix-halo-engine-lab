@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 MSA decode, fused and batched (src/minimax/attn/msa_fused.hpp). Every arithmetic step is the one of
 // src/hip_minimax_msa.hip (K1-K4) in the same order, so the outputs are bit-identical; what changes is who computes
@@ -2073,9 +2074,7 @@ template <unsigned NT> __global__ __launch_bounds__(NT) void select_kernel(Decod
     }
 }
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 
 }  // namespace
 
@@ -2098,7 +2097,7 @@ void enqueue_index(const DecodeView& v, hipStream_t stream) {
     const unsigned cap = index_grid_cap(), grid = items == 0 ? 1U : items < cap ? items : cap;  // >= 1: K/V rows
     const std::size_t lds = kChunks16 * sizeof(uint4) + static_cast<std::size_t>(rows) * v.idx_heads * kIdxDim * sizeof(float);
     hipLaunchKernelGGL((index_kernel<DecodeView>), dim3(grid), dim3(kIdxThreads), lds, stream, v);
-    check(hipGetLastError(), "minimax fused index");
+    hip_check(hipGetLastError(), "minimax fused index");
 }
 
 unsigned attend_heads(const DecodeView& v) {
@@ -2125,7 +2124,7 @@ template <bool DENSE> void launch_attend(const DecodeView& v, bool select, hipSt
         case 4: hipLaunchKernelGGL((attend4_kernel<4, DENSE>), grid4, dim3(4 * 32), lds4, stream, v, sel4); break;
         default: throw std::invalid_argument("minimax fused attend: heads_per_wave must be 1, 2 or 4");
         }
-        check(hipGetLastError(), "minimax fused attend v4");
+        hip_check(hipGetLastError(), "minimax fused attend v4");
         return;
     }
     const dim3 grid(rows * v.kv_heads * (kGroup / hw), kMaxChunks);
@@ -2150,7 +2149,7 @@ template <bool DENSE> void launch_attend(const DecodeView& v, bool select, hipSt
     case 43: hipLaunchKernelGGL((attend2_kernel<4, DENSE, true>), grid, dim3(4 * 32), lds, stream, v, sel); break;
     default: throw std::invalid_argument("minimax fused attend: heads_per_block must be 4, 8 or 16");
     }
-    check(hipGetLastError(), "minimax fused attend");
+    hip_check(hipGetLastError(), "minimax fused attend");
 }
 
 void enqueue_attend(const DecodeView& v, bool select, hipStream_t stream) {
@@ -2176,7 +2175,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         if constexpr (!DENSE) {
             hipLaunchKernelGGL(prefill_select_kernel, dim3(kMaxRows * v.kv_heads, 1, windows), dim3(256),
                                sel_bytes(v.max_blocks, 256), stream, scheduled);
-            check(hipGetLastError(), "minimax prefill shared selection");
+            hip_check(hipGetLastError(), "minimax prefill shared selection");
         }
         const auto chunks = prefill_chunk_prefix(p.pos0 + scheduled.rows) -
                             prefill_chunk_prefix(p.pos0 + p.first_window * kMaxRows);
@@ -2187,7 +2186,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, false, 1, true>),
                                dim3((scheduled.rows - p.first_window * kMaxRows) * v.kv_heads), dim3(256),
                                InblockLayout::kSharedBytes, stream, repaired, 0);
-            check(hipGetLastError(), "minimax prefill in-block attend");
+            hip_check(hipGetLastError(), "minimax prefill in-block attend");
             return;
         }
         if (p.msa_rework == 8 || p.msa_rework == 9) {
@@ -2201,7 +2200,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
                 hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, true, 2>),
                                    dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                                    4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, repaired, 0);
-            check(hipGetLastError(), "minimax prefill fused tree partial producers");
+            hip_check(hipGetLastError(), "minimax prefill fused tree partial producers");
             return;
         }
         if (p.msa_rework == 7) {
@@ -2211,7 +2210,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, true>),
                                dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                                4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, repaired, 0);
-            check(hipGetLastError(), "minimax prefill fused partial producers");
+            hip_check(hipGetLastError(), "minimax prefill fused partial producers");
             return;
         }
         if (p.msa_rework == 4) {
@@ -2242,10 +2241,10 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
                                dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                                kChunks16 * sizeof(uint4), stream, scheduled, 0);
         }
-        check(hipGetLastError(), "minimax prefill partial producers");
+        hip_check(hipGetLastError(), "minimax prefill partial producers");
         hipLaunchKernelGGL((prefill_combine_kernel<DENSE>), dim3(kMaxRows, v.q_heads / 8, windows),
                            dim3(256), 0, stream, scheduled);
-        check(hipGetLastError(), "minimax prefill separate combine");
+        hip_check(hipGetLastError(), "minimax prefill separate combine");
         return;
     }
     const dim3 grid(kMaxRows * v.kv_heads, kMaxChunks, windows);
@@ -2260,7 +2259,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         if (g_attend_lds_min > lds) lds = g_attend_lds_min;
         hipLaunchKernelGGL((attend2_kernel<16, DENSE, true, PrefillView>), grid, dim3(16 * 32), lds, stream, p, select);
     }
-    check(hipGetLastError(), "minimax batched prefill attend");
+    hip_check(hipGetLastError(), "minimax batched prefill attend");
 }
 }  // namespace
 
@@ -2312,7 +2311,7 @@ template <bool DENSE> void launch_prefill_partials(const PrefillView& p, unsigne
                            dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                            4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, p, 0);
     }
-    check(hipGetLastError(), "minimax prefill diagnostic partial producers");
+    hip_check(hipGetLastError(), "minimax prefill diagnostic partial producers");
 }
 }  // namespace
 
@@ -2367,7 +2366,7 @@ void enqueue_prefill_selection(const PrefillView& p, hipStream_t stream) {
     scheduled.first_window = dense;
     hipLaunchKernelGGL(prefill_select_kernel, dim3(kMaxRows * p.window.kv_heads, 1, windows - dense),
                        dim3(256), sel_bytes(p.window.max_blocks, 256), stream, scheduled);
-    check(hipGetLastError(), "minimax prefill diagnostic selection");
+    hip_check(hipGetLastError(), "minimax prefill diagnostic selection");
 }
 
 void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
@@ -2399,7 +2398,7 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
     } else {
         hipLaunchKernelGGL((index_kernel<PrefillView>), dim3(grid, sparse), dim3(kIdxThreads), lds, stream, p);
     }
-    check(hipGetLastError(), "minimax batched prefill index");
+    hip_check(hipGetLastError(), "minimax batched prefill index");
 }
 
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
@@ -2422,7 +2421,7 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
     const unsigned prep_grid = index_grid_cap();
     if (marker != nullptr) marker(user, "msa-prep", true);
     hipLaunchKernelGGL(prefill_prep_kernel, dim3(prep_grid), dim3(kIdxThreads), 0, stream, p);
-    check(hipGetLastError(), "minimax batched prefill prep");
+    hip_check(hipGetLastError(), "minimax batched prefill prep");
     if (marker != nullptr) marker(user, "msa-prep", false);
     const unsigned windows = (p.rows - 1) / kMaxRows + 1;
     const unsigned batch_cap = p.scratch_windows < 65535U ? p.scratch_windows : 65535U;
@@ -2463,7 +2462,7 @@ void enqueue_decode(const DecodeView& v, hipStream_t stream) {
         if (rows == 0 || rows > kMaxRows || v.max_blocks > kMaxBlocks || v.idx_heads != v.kv_heads || v.shard_count != 1)
             throw std::invalid_argument("minimax fused select: bad view (context-parallel views select by candidates/merge)");
         hipLaunchKernelGGL((select_kernel<256>), dim3(rows * v.kv_heads), dim3(256), sel_bytes(v.max_blocks, 256), stream, v);
-        check(hipGetLastError(), "minimax fused select");
+        hip_check(hipGetLastError(), "minimax fused select");
         enqueue_attend(v, false, stream);
         return;
     }

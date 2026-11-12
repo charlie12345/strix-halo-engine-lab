@@ -1,6 +1,7 @@
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/open_transport.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/ds41_layer.hpp"
 
 #include <hip/hip_runtime.h>
@@ -57,7 +58,7 @@ struct RowStats {
 static_assert(sizeof(RowStats) == 48);
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("hip: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("hip: ", e, what);
 }
 
 std::vector<std::uint32_t> read_u32(const std::string& path) {

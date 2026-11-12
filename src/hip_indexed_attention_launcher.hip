@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/qsa_prefill_stage_plan.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/known_prefill_limits.hpp"
@@ -75,10 +77,15 @@
 
 namespace strix {
 namespace {
+// R2-13: diagnostic switch read once (was up to 4 getenv scans per QSA layer per window).
+bool qsa_mtp_pool_check() {
+    static const bool on = envcfg::flag("STRIX_QSA_MTP_POOL_CHECK", false);
+    return on;
+}
 struct HipQsaScratchBackend {
     using Event=hipEvent_t;
     static void check(hipError_t e) {
-        if(e!=hipSuccess) throw std::runtime_error(std::string("QSA scratch: ")+hipGetErrorString(e));
+        ::strix::hip_check(e, "QSA scratch");
     }
     int device() const { int d=-1;check(hipGetDevice(&d));return d; }
     void activate(int d) { check(hipSetDevice(d)); }

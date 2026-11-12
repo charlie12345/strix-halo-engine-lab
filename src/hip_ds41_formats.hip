@@ -1,4 +1,6 @@
 #pragma clang fp contract(off)
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/hip_ds41_routes_fast.hpp"
 #include "hip_ds41_routes_fast_body.hpp"
@@ -25,7 +27,7 @@ __device__ const unsigned long long iq2_grid_device[256] = {
 };
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("ds41 formats: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("ds41 formats: ", status, what);
 }
 
 __device__ __forceinline__ float half_bits_to_float(unsigned short bits) {

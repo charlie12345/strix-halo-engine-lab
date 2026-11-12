@@ -1,3 +1,5 @@
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/hip_mtp_target_hidden.hpp"
 #include "strix/mtp_payload_geometry.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
@@ -26,9 +28,7 @@
 #include <vector>
 namespace strix {
 namespace {
-void check(hipError_t e,const char* op) {
-    if(e!=hipSuccess) throw std::runtime_error(std::string(op)+": "+hipGetErrorString(e));
-}
+using strix::hip_check;
 }
 namespace {
 bool same_target_state(const SessionStateMemoryBinding& a,const SessionStateMemoryBinding& b) {
@@ -275,14 +275,14 @@ std::shared_ptr<HipMtpTargetHidden> HipMtpTargetHidden::create(
         throw std::invalid_argument("MTP target producer requires full FP32 target vocabulary");
     i.selector=std::make_unique<HipGreedyOutput>(static_cast<std::uint32_t>(m.vocab_size),
         i.memory->scratch(),i.memory,i.guard);
-    check(hipStreamCreateWithFlags(&i.stream,hipStreamNonBlocking),"MTP target capture stream");
+    hip_check(hipStreamCreateWithFlags(&i.stream,hipStreamNonBlocking),"MTP target capture stream");
     if(deferred.state_layout) {
         i.shadow=std::make_unique<SerialHostStateShadow>(*deferred.state_layout,i.memory->state(),deferred.generations->next());
         i.deferred_status={c.execution_identity,i.allocator->allocate_device(8,256),8,deferred.generations->next()};
         i.status_lease=i.allocator->allocation_lease_identity(i.deferred_status.arena_base,8,false);
         if(!i.status_lease)throw std::runtime_error("MTP target D1 lacks actual allocator lease");
-        check(hipMemsetAsync(reinterpret_cast<void*>(i.deferred_status.arena_base),0,8,i.stream),"MTP target D1 initialization");
-        check(hipStreamSynchronize(i.stream),"MTP target D1 setup completion");
+        hip_check(hipMemsetAsync(reinterpret_cast<void*>(i.deferred_status.arena_base),0,8,i.stream),"MTP target D1 initialization");
+        hip_check(hipStreamSynchronize(i.stream),"MTP target D1 setup completion");
         i.guard->require_original();
     }
     i.slots.resize(rows);
@@ -362,7 +362,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
             auto source=resolve_dispatch_write(c,0);
             if(source.bytes!=destination.bytes || !source.allocation_generation)
                 throw std::invalid_argument("MTP target capture source is undersized");
-            check(hipMemcpyAsync(reinterpret_cast<void*>(destination.address),
+            hip_check(hipMemcpyAsync(reinterpret_cast<void*>(destination.address),
                 reinterpret_cast<const void*>(source.address),destination.bytes,hipMemcpyDeviceToDevice,owner.stream),"MTP target wide capture");
             captured=true;
         }
@@ -382,10 +382,10 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
             if(!tap.captured) throw std::runtime_error("MTP target hidden producer was not executed");
             DeferredMoeFirstError status{};
             if(i.deferred_status.arena_base)
-                check(hipMemcpyAsync(&status,reinterpret_cast<const void*>(i.deferred_status.arena_base),sizeof(status),
+                hip_check(hipMemcpyAsync(&status,reinterpret_cast<const void*>(i.deferred_status.arena_base),sizeof(status),
                     hipMemcpyDeviceToHost,i.stream),"MTP target D1 readback");
             // The copy and D1 readback precede this completion on the same stream.
-            check(hipStreamSynchronize(i.stream),"MTP target execution completion");
+            hip_check(hipStreamSynchronize(i.stream),"MTP target execution completion");
             i.guard->require_original();
             if(i.deferred_status.arena_base)check_deferred_moe_status(status);
             // Host policy validation belongs after the model execution commits.
@@ -497,9 +497,9 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessi
     }
     i.busy=true;
     try {
-        check(hipMemcpyAsync(reinterpret_cast<void*>(slot->view.address),reinterpret_cast<const void*>(hidden.address),
+        hip_check(hipMemcpyAsync(reinterpret_cast<void*>(slot->view.address),reinterpret_cast<const void*>(hidden.address),
             static_cast<std::size_t>(hidden.bytes),hipMemcpyDeviceToDevice,i.stream),"MTP prefill row capture");
-        check(hipStreamSynchronize(i.stream),"MTP prefill row capture completion");
+        hip_check(hipStreamSynchronize(i.stream),"MTP prefill row capture completion");
         i.guard->require_original();
     } catch(...) {i.failed=true;i.busy=false;i.guard->recover_or_fail_stop();throw;}
     if(i.session_logits) i.session_logits(lease->position,logits);

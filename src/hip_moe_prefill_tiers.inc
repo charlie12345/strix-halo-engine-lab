@@ -30,8 +30,8 @@ inline const std::array<hipEvent_t,3>*& prefill_da16_events() {
     static thread_local const std::array<hipEvent_t,3>* events=nullptr;return events;
 }
 inline void prefill_da16_mark(unsigned index,hipStream_t stream) {
-    if(const auto* events=prefill_da16_events())check(hipEventRecord((*events)[index],stream),"DA16 timing event");
-    if(const auto* events=prefill_test_events())check(hipEventRecord(events[index],stream),"DA16 tile64 timing event");
+    if(const auto* events=prefill_da16_events())hip_check(hipEventRecord((*events)[index],stream),"DA16 timing event");
+    if(const auto* events=prefill_test_events())hip_check(hipEventRecord(events[index],stream),"DA16 tile64 timing event");
 }
 inline bool prefill_down_lds() {
     static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DOWN_LDS_EPI");return v&&v[0]=='1'&&v[1]=='\0';}();
@@ -48,7 +48,7 @@ template<auto Kernel> void prefill_tier_resources() {
         const char* v=std::getenv("STRIX_INTPREFILL_RESOURCES");
         if(v&&v[0]=='1') {
             hipFuncAttributes a{};
-            check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(Kernel)),"DA16 tier resources");
+            hip_check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(Kernel)),"DA16 tier resources");
             std::fprintf(stderr,"DA16 tier resource %s: vgpr=%d lds=%zu scratch=%zu\n",__PRETTY_FUNCTION__,a.numRegs,a.sharedSizeBytes,a.localSizeBytes);
         }
         return true;
@@ -121,7 +121,7 @@ void launch_prefill_tier(const unsigned char* gate,const unsigned char* up,Prefi
     };
     if(q5k){if(reuse)project.template operator()<true,true>();else project.template operator()<true,false>();}
     else {if(reuse)project.template operator()<false,true>();else project.template operator()<false,false>();}
-    check(hipGetLastError(),"DA16 tier gate/up");
+    hip_check(hipGetLastError(),"DA16 tier gate/up");
     // Down is deliberately launched later, after BOTH gate/up tiers. A global
     // projection failure must suppress every down batch, including the first tier.
 }
@@ -144,6 +144,6 @@ void launch_prefill_down_tier(const unsigned char* down,PrefillRows rows,unsigne
     } else {
         if(q51)kind.template operator()<true,false>();else kind.template operator()<false,false>();
     }
-    check(hipGetLastError(),"DA16 tier down");
+    hip_check(hipGetLastError(),"DA16 tier down");
     if(lds)prefill_down_lds_flag()=true;
 }

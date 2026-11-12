@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 index projections in one launch, exact dense_t order (src/minimax/attn/index_proj.hpp).
 #include "index_proj.hpp"
@@ -275,9 +276,7 @@ template <unsigned R, unsigned XW> __global__ __launch_bounds__(kWaves * 32) voi
         if (tb == t0 || tb + t >= t0) store_out(v, tb + t, o, acc[t]);  // a shifted wave stores only rows >= t0
 }
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 
 template <unsigned D> void launch_decode(const IndexProjView& v, unsigned rpw, hipStream_t stream) {
     if (rpw == 2 && v.rows > 2) {  // row split: pairs of rows per wave
@@ -353,7 +352,7 @@ void enqueue_index_proj_decode(const IndexProjView& v, unsigned ring, hipStream_
     case 48: launch_decode<48>(v, rows_per_wave, stream); break;
     default: throw std::invalid_argument("index_proj decode: ring must be 8, 16, 32 or 48");
     }
-    check(hipGetLastError(), "index_proj decode");
+    hip_check(hipGetLastError(), "index_proj decode");
 }
 
 void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t stream) {
@@ -373,27 +372,27 @@ void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t strea
         default: hipLaunchKernelGGL((proj_decode_kernel<2, 16, 0>), g2, dim3(32), 0, stream, v); break;
         }
     }
-    check(hipGetLastError(), "index_proj diag");
+    hip_check(hipGetLastError(), "index_proj diag");
 }
 
 void enqueue_index_proj_decode_lds(const IndexProjView& v, hipStream_t stream) {
     if (v.rows < 2 || v.rows > 8) throw std::invalid_argument("index_proj decode lds: rows must be 2..8");
     hipLaunchKernelGGL(proj_decode_lds_kernel, dim3(kProjOut / 32), dim3(kLdsWaves * 32), 0, stream, v);
-    check(hipGetLastError(), "index_proj decode lds");
+    hip_check(hipGetLastError(), "index_proj decode lds");
 }
 
 void enqueue_index_proj_tiled(const IndexProjView& v, hipStream_t stream) {
     if (v.rows < kTokPerWave) throw std::invalid_argument("index_proj tiled: rows must be >= 8 (use the decode kernel)");
     const dim3 grid(kProjOut / 32, (v.rows + kWaves * kTokPerWave - 1) / (kWaves * kTokPerWave));
     hipLaunchKernelGGL(proj_tiled_kernel, grid, dim3(kWaves * 32), 0, stream, v);
-    check(hipGetLastError(), "index_proj tiled");
+    hip_check(hipGetLastError(), "index_proj tiled");
 }
 
 void enqueue_index_proj_slab(const IndexProjView& v, hipStream_t stream) {
     if (v.rows < kTokPerWave) throw std::invalid_argument("index_proj slab: rows must be >= 8 (use the decode kernel)");
     const dim3 grid(kProjOut / 32, (v.rows + kWaves * kTokPerWave - 1) / (kWaves * kTokPerWave));
     hipLaunchKernelGGL((proj_slab_kernel<kTokPerWave, 8>), grid, dim3(kWaves * 32), 0, stream, v);
-    check(hipGetLastError(), "index_proj slab");
+    hip_check(hipGetLastError(), "index_proj slab");
 }
 
 void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {
@@ -410,14 +409,14 @@ void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {
 }
 
 void index_proj_fork(const IndexProjView& v, hipStream_t main, hipStream_t side, hipEvent_t forked) {
-    check(hipEventRecord(forked, main), "index_proj fork record");
-    check(hipStreamWaitEvent(side, forked, 0), "index_proj fork wait");
+    hip_check(hipEventRecord(forked, main), "index_proj fork record");
+    hip_check(hipStreamWaitEvent(side, forked, 0), "index_proj fork wait");
     enqueue_index_proj(v, side);
 }
 
 void index_proj_join(hipStream_t main, hipStream_t side, hipEvent_t joined) {
-    check(hipEventRecord(joined, side), "index_proj join record");
-    check(hipStreamWaitEvent(main, joined, 0), "index_proj join wait");
+    hip_check(hipEventRecord(joined, side), "index_proj join record");
+    hip_check(hipStreamWaitEvent(main, joined, 0), "index_proj join wait");
 }
 
 }  // namespace strix::minimax::attn

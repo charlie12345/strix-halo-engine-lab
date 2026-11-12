@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
+#include "strix/hip_check.hpp"
 #pragma clang fp contract(off)
 #include "strix/hip_ds41_prefill.hpp"
 
@@ -22,7 +24,7 @@ namespace strix::ds41 {
 namespace {
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("ds41 prefill: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("ds41 prefill: ", status, what);
 }
 
 // ---- Format helpers (the decode kernels' integer forms, hip_ds41_formats.hip) ----

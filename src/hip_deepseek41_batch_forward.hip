@@ -1,5 +1,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/file_snapshot.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
@@ -57,7 +58,7 @@ namespace {
 constexpr std::size_t control_bytes = 64U << 10U;
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("deepseek41 batch forward: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("deepseek41 batch forward: ", e, what);
 }
 
 template <typename T>

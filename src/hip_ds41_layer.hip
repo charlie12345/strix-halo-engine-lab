@@ -36,9 +36,7 @@
 namespace strix::ds41 {
 namespace {
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 void require(bool ok, const char* message) {
     if (!ok) throw std::invalid_argument(message);
 }
@@ -2186,7 +2184,7 @@ void enqueue_hc_mixes(const HcMixView& v, void* stream) {
                        as_stream(stream), v.stream, v.fn, v.hidden, v.rows, chunks, v.partial);
     hipLaunchKernelGGL(hc_mix_final_kernel, dim3(v.rows), dim3(wave), 0, as_stream(stream), v.partial, v.base, v.scale, n, chunks,
                        v.iters, v.hc_eps, v.norm_eps, v.out);
-    check(hipGetLastError(), "hc mixes launch");
+    hip_check(hipGetLastError(), "hc mixes launch");
 }
 
 void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden, float* out,
@@ -2194,7 +2192,7 @@ void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32
     const auto total = static_cast<unsigned long long>(rows) * hidden;
     hipLaunchKernelGGL(hc_collapse_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), hc_stream, mixes,
                        hidden, total, out);
-    check(hipGetLastError(), "hc collapse launch");
+    hip_check(hipGetLastError(), "hc collapse launch");
 }
 
 void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden,
@@ -2204,7 +2202,7 @@ void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mix
     const auto total = static_cast<unsigned long long>(rows) * hc_copies * hidden;
     hipLaunchKernelGGL(hc_expand_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), sub, residual, mixes,
                        hidden, total, out);
-    check(hipGetLastError(), "hc expand launch");
+    hip_check(hipGetLastError(), "hc expand launch");
 }
 
 std::size_t hc_site_counter_count(std::uint32_t rows) { return rows; }
@@ -2263,7 +2261,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
             const unsigned gc = g < 4U ? g : 4U, ctiles = (v.rows + gc - 1U) / gc;
             const auto kernel = gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>;
             hipLaunchKernelGGL(kernel, dim3(mix_chunks / hc_copies * ctiles), dim3(site_threads), 0, as_stream(stream), v, mix_chunks);
-            check(hipGetLastError(), "hc site collapse launch");
+            hip_check(hipGetLastError(), "hc site collapse launch");
             return;
         }
         const unsigned partial_blocks = v.fn || v.sub ? mix_chunks * tiles : 0U;
@@ -2276,7 +2274,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
         hipLaunchKernelGGL(kernel, dim3(partial_blocks + norm_blocks), dim3(site_threads), 0, as_stream(stream), v, mix_chunks,
                            partial_blocks, norm_chunks, part);
     }
-    check(hipGetLastError(), "hc site launch");
+    hip_check(hipGetLastError(), "hc site launch");
 }
 
 void enqueue_norm(const NormView& v, void* stream) {
@@ -2299,7 +2297,7 @@ void enqueue_norm(const NormView& v, void* stream) {
         hipLaunchKernelGGL(norm_ilp_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
     else
         hipLaunchKernelGGL(norm_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
-    check(hipGetLastError(), "norm launch");
+    hip_check(hipGetLastError(), "norm launch");
 }
 
 void enqueue_rms_norm(const float* x, const float* weight, std::uint32_t rows, std::uint32_t n, std::uint32_t stride, float eps,
@@ -2314,14 +2312,14 @@ void enqueue_inverse_rope_a8(const InverseRopeA8View& v, void* stream) {
     require(v.o && v.rows && n % 32U == 0 && v.head_dim >= 2U * v.pairs && v.rope_cos && v.rope_sin && v.positions && v.codes &&
                 v.deltas && v.sums, "inverse RoPE + A8 view");
     hipLaunchKernelGGL(inverse_rope_a8_kernel, dim3((n / 32U + 7U) / 8U, v.rows), dim3(256), 0, as_stream(stream), v);
-    check(hipGetLastError(), "inverse RoPE + A8 launch");
+    hip_check(hipGetLastError(), "inverse RoPE + A8 launch");
 }
 
 void enqueue_rope(const RopeView& v, void* stream) {
     require(v.x && v.cos && v.sin && v.positions && v.rows && v.vectors && v.pairs, "RoPE view");
     require(v.offset % 2U == 0 && v.row_stride % 2U == 0 && v.vector_stride % 2U == 0, "RoPE view alignment");
     hipLaunchKernelGGL(rope_kernel, dim3((v.vectors * v.pairs + 255U) / 256U, v.rows), dim3(256), 0, as_stream(stream), v);
-    check(hipGetLastError(), "RoPE launch");
+    hip_check(hipGetLastError(), "RoPE launch");
 }
 
 template <unsigned MaxRows, unsigned W>
@@ -2356,7 +2354,7 @@ void enqueue_fp8_a8(const Q8A8View& view, hipStream_t q) {
     require(view.scales && !view.planar && view.rows <= 16U, "native FP8 x A8 site: scales, interleaved rows, 1..16 rows");
     if (view.rows > max_rows) {
         launch_fp8_a8<16, 1>(view, q);
-        check(hipGetLastError(), "native FP8 x A8 sixteen-row launch");
+        hip_check(hipGetLastError(), "native FP8 x A8 sixteen-row launch");
         return;
     }
     // Outputs per wave (1, 2 or 4; same bits): STRIX_DS41_FP8_W, default 1 at 1-2 rows (one contiguous row stream per
@@ -2369,7 +2367,7 @@ void enqueue_fp8_a8(const Q8A8View& view, hipStream_t q) {
     else if (view.rows == 2) { if (w4) launch_fp8_a8<2, 4>(view, q); else if (w2) launch_fp8_a8<2, 2>(view, q); else launch_fp8_a8<2, 1>(view, q); }
     else if (view.rows <= 4) { if (w4) launch_fp8_a8<4, 4>(view, q); else if (w2) launch_fp8_a8<4, 2>(view, q); else launch_fp8_a8<4, 1>(view, q); }
     else { if (w2) launch_fp8_a8<8, 2>(view, q); else launch_fp8_a8<8, 1>(view, q); }
-    check(hipGetLastError(), "native FP8 x A8 launch");
+    hip_check(hipGetLastError(), "native FP8 x A8 launch");
 }
 }  // namespace
 
@@ -2380,7 +2378,7 @@ void enqueue_swiglu_a8(const float* gate, const float* up, std::uint32_t rows, s
     require(gate && up && codes && deltas && sums && rows && width && width % 32U == 0, "SwiGLU + A8 view");
     const unsigned groups = rows * (width / 32U);
     hipLaunchKernelGGL(swiglu_a8_kernel, dim3((groups + 7U) / 8U), dim3(256), 0, as_stream(stream), gate, up, groups, limit, codes, deltas, sums);
-    check(hipGetLastError(), "SwiGLU + A8 launch");
+    hip_check(hipGetLastError(), "SwiGLU + A8 launch");
 }
 
 static Q8A8View checked_q8_0_a8(const Q8A8View& v) {
@@ -2425,7 +2423,7 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
         Q8A8View plain = view;
         plain.a8_codes = nullptr;
         launch_q8_0_a8<16, 1>(plain, as_stream(stream));
-        check(hipGetLastError(), "Q8_0 x A8 sixteen-row launch");
+        hip_check(hipGetLastError(), "Q8_0 x A8 sixteen-row launch");
         if (v.a8_codes) enqueue_quantize_a8(v.out, v.count, v.rows, v.a8_codes, v.a8_deltas, v.a8_sums, stream);
         return;
     }
@@ -2475,7 +2473,7 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_staged_kernel<0>), grid, block, 0, q, view);
     }
     else launch_q8_0_a8<8, 1>(view, q);
-    check(hipGetLastError(), "Q8_0 x A8 launch");
+    hip_check(hipGetLastError(), "Q8_0 x A8 launch");
 }
 
 namespace {
@@ -2530,7 +2528,7 @@ bool enqueue_q8_0_a8_ready(const Q8A8View& v, dist::ProducerStage stage, void* s
     else if (view.packed == 4U) launch_q8_ready_rows<4>(view, stage, q);
     else if (view.packed == 5U) launch_q8_ready_rows<5>(view, stage, q);
     else launch_q8_ready_rows<6>(view, stage, q);
-    check(hipGetLastError(), "Q8 x A8 ready epilogue launch");
+    hip_check(hipGetLastError(), "Q8 x A8 ready epilogue launch");
     return true;
 }
 
@@ -2556,7 +2554,7 @@ void enqueue_q8_0_a8_pair(const Q8A8View& a, const Q8A8View& b, void* stream) {
     if (x.rows == 1) { if (w4) launch_q8_0_a8_pair<1, 4>(x, y, q); else if (w2) launch_q8_0_a8_pair<1, 2>(x, y, q); else launch_q8_0_a8_pair<1, 1>(x, y, q); }
     else if (x.rows == 2) { if (w4) launch_q8_0_a8_pair<2, 4>(x, y, q); else if (w2) launch_q8_0_a8_pair<2, 2>(x, y, q); else launch_q8_0_a8_pair<2, 1>(x, y, q); }
     else { if (w2) launch_q8_0_a8_pair<4, 2>(x, y, q); else launch_q8_0_a8_pair<4, 1>(x, y, q); }
-    check(hipGetLastError(), "Q8_0 x A8 pair launch");
+    hip_check(hipGetLastError(), "Q8_0 x A8 pair launch");
 }
 
 void enqueue_f16_rows(const F16RowsView& v, void* stream) {
@@ -2584,11 +2582,11 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
             else
                 hipLaunchKernelGGL(f16_rows_wide_kernel<1>, dim3((v.count + f16_waves - 1U) / f16_waves), dim3(wave * f16_waves), 0,
                                    as_stream(stream), v);
-            check(hipGetLastError(), "F16 rows launch");
+            hip_check(hipGetLastError(), "F16 rows launch");
             return;
         }
         hipLaunchKernelGGL(f16_rows_kernel, dim3((v.count + 7U) / 8U), dim3(256), 0, as_stream(stream), v);
-        check(hipGetLastError(), "F16 rows launch");
+        hip_check(hipGetLastError(), "F16 rows launch");
         return;
     }
     // prefill rows: the LDS-tiled kernel, else the many-rows kernel (same lane classes, same bits)
@@ -2611,7 +2609,7 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
     } else
         hipLaunchKernelGGL(f16_many_kernel, dim3((v.count + f16_block_outputs - 1U) / f16_block_outputs, (v.rows + f16_tile_rows - 1U) / f16_tile_rows),
                            dim3(256), 0, as_stream(stream), v);
-    check(hipGetLastError(), "F16 rows launch");
+    hip_check(hipGetLastError(), "F16 rows launch");
 }
 
 // One flag word per (device, stream), allocated on first use and kept. The caller holds the entry's mutex from the reset
@@ -2632,10 +2630,10 @@ static EngramWideFlags& engram_wide_flags() {
 static EngramWideFlag& engram_wide_flag(void* stream) {
     EngramWideFlags& all = engram_wide_flags();
     int device = 0;
-    check(hipGetDevice(&device), "Engram flag device");
+    hip_check(hipGetDevice(&device), "Engram flag device");
     const std::lock_guard<std::mutex> lock(all.mu);
     EngramWideFlag& f = all.flags[{device, stream}];
-    if (!f.p) check(hipMalloc(reinterpret_cast<void**>(&f.p), sizeof(unsigned)), "Engram flag alloc");
+    if (!f.p) hip_check(hipMalloc(reinterpret_cast<void**>(&f.p), sizeof(unsigned)), "Engram flag alloc");
     return f;
 }
 
@@ -2660,7 +2658,7 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
     bool fma = !(f && f[0] == '0') && as_stream(stream) != hipStreamPerThread;
     if (fma) {
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-        check(hipStreamIsCapturing(as_stream(stream), &capture), "Engram capture status");
+        hip_check(hipStreamIsCapturing(as_stream(stream), &capture), "Engram capture status");
         fma = capture == hipStreamCaptureStatusNone;
     }
     // Tile unset = auto: 48 x 64 whenever the fused form can run (measured up to 3.8 % faster than 48 x 32 at 1056 and 2048
@@ -2674,7 +2672,7 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
         EngramWideFlag& w = engram_wide_flag(stream);
         submit = std::unique_lock<std::mutex>(w.submit);
         flag = w.p;
-        check(hipMemsetAsync(flag, 0, sizeof(unsigned), as_stream(stream)), "Engram x scan reset");
+        hip_check(hipMemsetAsync(flag, 0, sizeof(unsigned), as_stream(stream)), "Engram x scan reset");
         hipLaunchKernelGGL(engram_x_exact_scan, dim3(256), dim3(256), 0, as_stream(stream), v, flag);
     }
     const auto launch = [&](auto fused) {
@@ -2699,7 +2697,7 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
     };
     if (fma) launch(std::true_type{});
     launch(std::false_type{});
-    check(hipGetLastError(), "Engram F16 prefetch tile launch");
+    hip_check(hipGetLastError(), "Engram F16 prefetch tile launch");
 }
 
 #if STRIX_DS41_ENGRAM_DIAG
@@ -2707,7 +2705,7 @@ void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
 bool engram_f16_pf_x_exact(const F16RowsView& v) {
     require(engram_f16_pf_supported(v), "Engram F16 prefetch tile view");
     unsigned* flag = nullptr;
-    check(hipMalloc(reinterpret_cast<void**>(&flag), sizeof(unsigned)), "Engram scan flag");
+    hip_check(hipMalloc(reinterpret_cast<void**>(&flag), sizeof(unsigned)), "Engram scan flag");
     unsigned h = 1U;
     hipError_t e = hipMemset(flag, 0, sizeof(unsigned));
     if (e == hipSuccess) {
@@ -2716,7 +2714,7 @@ bool engram_f16_pf_x_exact(const F16RowsView& v) {
     }
     if (e == hipSuccess) e = hipMemcpy(&h, flag, sizeof(unsigned), hipMemcpyDeviceToHost);
     (void)hipFree(flag);
-    check(e, "Engram scan");
+    hip_check(e, "Engram scan");
     return h == 0U;
 }
 
@@ -2725,13 +2723,13 @@ void enqueue_engram_f16_pf_fused_unchecked(const F16RowsView& v, void* stream) {
     const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
     hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, true>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
                        0, as_stream(stream), v, row_tiles, output_tiles, static_cast<const unsigned*>(nullptr));
-    check(hipGetLastError(), "Engram F16 fused launch");
+    hip_check(hipGetLastError(), "Engram F16 fused launch");
 }
 
 int engram_f16_pf_stream_flag(void* stream) {
     EngramWideFlags& all = engram_wide_flags();
     int device = 0;
-    check(hipGetDevice(&device), "Engram flag device");
+    hip_check(hipGetDevice(&device), "Engram flag device");
     unsigned* p = nullptr;
     {
         const std::lock_guard<std::mutex> lock(all.mu);
@@ -2739,9 +2737,9 @@ int engram_f16_pf_stream_flag(void* stream) {
         if (it == all.flags.end()) return -1;
         p = it->second.p;
     }
-    check(hipStreamSynchronize(as_stream(stream)), "Engram flag sync");
+    hip_check(hipStreamSynchronize(as_stream(stream)), "Engram flag sync");
     unsigned h = 0U;
-    check(hipMemcpy(&h, p, sizeof(unsigned), hipMemcpyDeviceToHost), "Engram flag read");
+    hip_check(hipMemcpy(&h, p, sizeof(unsigned), hipMemcpyDeviceToHost), "Engram flag read");
     return static_cast<int>(h);
 }
 #endif
@@ -2778,7 +2776,7 @@ void enqueue_embedding(const std::uint16_t* table, const std::uint32_t* tokens, 
     const auto total = static_cast<unsigned long long>(rows) * hc_copies * hidden;
     hipLaunchKernelGGL(embedding_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), table, tokens, hidden,
                        total, stream_out);
-    check(hipGetLastError(), "embedding launch");
+    hip_check(hipGetLastError(), "embedding launch");
 }
 
 std::uint32_t argmax_partial_blocks(std::uint32_t count) { return (count + argmax_span - 1U) / argmax_span; }
@@ -2790,20 +2788,20 @@ void enqueue_argmax(const float* logits, std::uint32_t rows, std::uint32_t count
     hipLaunchKernelGGL(argmax_partial_kernel, dim3(blocks, rows), dim3(argmax_threads), 0, as_stream(stream), logits, count,
                        stride, first_index, blocks, partial);
     hipLaunchKernelGGL(argmax_final_kernel, dim3(rows), dim3(argmax_threads), 0, as_stream(stream), partial, blocks, out);
-    check(hipGetLastError(), "argmax launch");
+    hip_check(hipGetLastError(), "argmax launch");
 }
 
 void enqueue_combine_argmax(const ArgmaxCandidate* a, const ArgmaxCandidate* b, std::uint32_t rows, ArgmaxCandidate* out,
                             void* stream) {
     hipLaunchKernelGGL(combine_argmax_kernel, dim3((rows + 63U) / 64U), dim3(64), 0, as_stream(stream), a, b, rows, out);
-    check(hipGetLastError(), "argmax combine launch");
+    hip_check(hipGetLastError(), "argmax combine launch");
 }
 
 void enqueue_engram_rows_bf16(const std::uint8_t* rows, std::uint32_t row_count, float* out, void* stream) {
     enqueue_decode_engram_rows(rows, row_count, out, stream);
     const auto total = static_cast<unsigned long long>(row_count) * engram_row_elements;
     hipLaunchKernelGGL(round_bf16_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), out, total);
-    check(hipGetLastError(), "Engram bf16 launch");
+    hip_check(hipGetLastError(), "Engram bf16 launch");
 }
 
 PrefillRoutes prefill_site_routes(std::uint32_t rows, std::uint32_t groups, std::uint32_t batch_rows) {
@@ -2833,15 +2831,16 @@ void enqueue_q8_0_a8_prefill(const Q8A8PrefillView& v, void* stream) {
 // STRIX_DS41_PF_CORE=1 (opt-in, see hip_ds41_prefill.hpp): the dense Q8_0 x A8 prefill on the shared tiled core. The
 // same forms (tall selector, two-part fusion, fused A8) as policy values; the same bits as the kernels below.
 static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, void* stream) {
-    const auto env_on = [](const char* name) { const char* e = std::getenv(name); return e && e[0] == '1'; };
-    static const bool staged = [] { const char* e = std::getenv("STRIX_DS41_DENSE_FORM"); return !(e && e[0] == '0'); }();
+    static const bool tall_rotate = strix::envcfg::flag("STRIX_DS41_DENSE_TALL_ROTATE", false);
+    static const bool dense_stats = strix::envcfg::flag("STRIX_DS41_DENSE_STATS", false);
+    static const bool staged = strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
     const bool lean_ok = std::uint64_t(v.rows) * v.x_stride < 0x7fffffffULL &&
         std::uint64_t(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) < 0x7fffffffULL;
     if (v.k_parts == 2U) {
         if (strix::core::integer_dense_fuse_parts(v.tall, v.rows, v.row_width, v.width, v.count, lean_ok,
-            env_on("STRIX_DS41_DENSE_TALL_ROTATE") || env_on("STRIX_DS41_DENSE_STATS"), staged)) {
+            tall_rotate || dense_stats, staged)) {
             integer_core::launch_dense<2, 2, 4, false, 2>(v, as_stream(stream));
-            check(hipGetLastError(), "Q8_0 x A8 two-part shared core");
+            hip_check(hipGetLastError(), "Q8_0 x A8 two-part shared core");
             return false;
         }
         auto part = v;
@@ -3026,7 +3025,7 @@ static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, vo
         if (v.count <= 16U) integer_core::launch_dense<1, 1, 0, false, 1, true, false>(v, as_stream(stream));
         else integer_core::launch_dense<1, 2, 0, false, 1, true, false>(v, as_stream(stream));
     }
-    check(hipGetLastError(), "Q8_0 x A8 dense shared core");
+    hip_check(hipGetLastError(), "Q8_0 x A8 dense shared core");
     return v.a8_codes != nullptr && staged && a8;
 }
 
@@ -3248,11 +3247,11 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                          !strix::env_flag_default_off("STRIX_DS41_DENSE_STATS", strix::EnvFlagMatch::first_character) &&
                          static_cast<std::size_t>(v.rows) * v.x_stride < 0x7fffffffULL &&
                          static_cast<std::size_t>(v.count) * (v.row_width / 32U * 34U) < 0x7fffffffULL &&
-                         [] { const char* e = std::getenv("STRIX_DS41_DENSE_FORM"); return !(e && e[0] == '0'); }();
+                         strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
         if (one) {
             const dim3 g((v.rows + 31U) / 32U, (v.count + 31U) / 32U);
             hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 4U, 2U>), g, dim3(32 * tall_waves), 0, as_stream(stream), v);
-            check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
+            hip_check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
             return false;
         }
         auto p0 = v;
@@ -3399,7 +3398,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         if (staged) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<true, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
     }
-    check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
+    hip_check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
     // the tall forms with an even OT wrote the outputs' A8 (the others ignore a8_codes)
     static constexpr unsigned a8_forms[] = {22U,  14U,   114U,  112U,  214U,  212U,  314U,  312U,  414U,  412U,  514U,  614U,
                                             612U, 714U,  814U,  812U,  914U,  422U,  822U,  1514U, 1522U, 1614U, 1714U, 1722U,
@@ -3417,7 +3416,7 @@ void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_nor
     require(chunks * hc_copies <= 32U, "Engram injection hidden size");
     hipLaunchKernelGGL(engram_inject_kernel, dim3(rows), dim3(wave * hc_copies * chunks), 0, as_stream(stream), hc_stream, kv, q_norm,
                        k_norm, hidden, eps, inv);
-    check(hipGetLastError(), "Engram injection launch");
+    hip_check(hipGetLastError(), "Engram injection launch");
 }
 
 // ---- launch accesses ---------------------------------------------------------------------------

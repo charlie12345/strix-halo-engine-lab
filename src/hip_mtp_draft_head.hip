@@ -25,13 +25,7 @@ struct Partial {float value;std::uint32_t token,bad,valid;float sum,second;};
 struct Reply {std::uint32_t tokens[max_slots];std::uint32_t status;float probabilities[max_slots];std::uint32_t completed;
     float runner_up[max_slots];};
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
-void check(hipError_t e,const char* message) {if(e!=hipSuccess) throw std::runtime_error(std::string(message)+": "+hipGetErrorString(e));}
-// Same monotone key and lowest-token tie rule as the full greedy selector.
-__device__ std::uint32_t numeric_key(float value) {
-    auto bits=__float_as_uint(value);
-    if((bits&0x7fffffffU)==0) bits=0;
-    return (bits&0x80000000U)?~bits:(bits^0x80000000U);
-}
+using strix::hip_check;
 __device__ float block_sum(float* values,float value) {
     const auto lane=static_cast<unsigned>(threadIdx.x);
     values[lane]=value;__syncthreads();
@@ -267,13 +261,13 @@ struct HipMtpDraftHead::Impl {
     ~Impl() {
         if(stream) (void)hipStreamSynchronize(stream);
         for(void* p:{static_cast<void*>(compact),static_cast<void*>(ids),static_cast<void*>(logits),
-                     static_cast<void*>(partials),static_cast<void*>(slots)}) if(p) (void)hipFree(p);
+                     static_cast<void*>(partials),static_cast<void*>(done),static_cast<void*>(slots)}) if(p) (void)hipFree(p);
         if(host_ids) (void)hipHostFree(host_ids);
         if(reply) (void)hipHostFree(reply);
         if(runner_logits) (void)hipHostFree(runner_logits);
     }
     template<class T> T* device(std::uint64_t count) {
-        void* p=nullptr;check(hipMalloc(&p,static_cast<std::size_t>(count*sizeof(T))),"MTP draft head allocation");return static_cast<T*>(p);
+        void* p=nullptr;hip_check(hipMalloc(&p,static_cast<std::size_t>(count*sizeof(T))),"MTP draft head allocation");return static_cast<T*>(p);
     }
     // Appends unseen ids to the append-only pinned list, then gathers the new rows.
     std::uint32_t admit(std::span<const std::uint32_t> tokens,std::uint32_t limit) {
@@ -284,11 +278,11 @@ struct HipMtpDraftHead::Impl {
             seen[token]=1U;host_ids[rows++]=token;++added;
         }
         if(rows==first) return 0;
-        check(hipMemcpyAsync(ids+first,host_ids+first,(rows-first)*sizeof(std::uint32_t),hipMemcpyHostToDevice,stream),"MTP draft ids upload");
+        hip_check(hipMemcpyAsync(ids+first,host_ids+first,(rows-first)*sizeof(std::uint32_t),hipMemcpyHostToDevice,stream),"MTP draft ids upload");
         if(config.q4) hipLaunchKernelGGL(draft_gather_rows_q4,dim3(rows-first),dim3(threads),0,stream,head,ids,first,rows-first,
             config.hidden_size/32U,compact);
         else hipLaunchKernelGGL(draft_gather_rows,dim3(rows-first),dim3(threads),0,stream,head,ids,first,rows-first,row_bytes,compact);
-        check(hipGetLastError(),"MTP draft row gather");
+        hip_check(hipGetLastError(),"MTP draft row gather");
         return added;
     }
 };
@@ -455,19 +449,19 @@ void HipMtpDraftHead::wait_step(std::uint32_t step,void* raw_stream) const {
             }
         }
     }
-    check(hipStreamSynchronize(stream),"MTP draft early-stop step");
+    hip_check(hipStreamSynchronize(stream),"MTP draft early-stop step");
 }
 void HipMtpDraftHead::read_logits(std::vector<float>& out) const {
     const auto& p=*impl_;out.resize(p.rows);
-    check(hipMemcpyAsync(out.data(),p.logits,p.rows*sizeof(float),hipMemcpyDeviceToHost,p.stream),"MTP draft logits readback");
-    check(hipStreamSynchronize(p.stream),"MTP draft logits readback completion");
+    hip_check(hipMemcpyAsync(out.data(),p.logits,p.rows*sizeof(float),hipMemcpyDeviceToHost,p.stream),"MTP draft logits readback");
+    hip_check(hipStreamSynchronize(p.stream),"MTP draft logits readback completion");
 }
 std::span<const std::uint32_t> HipMtpDraftHead::host_ids() const noexcept {
     const auto& p=*impl_;return p.config.full?std::span<const std::uint32_t>{}:std::span<const std::uint32_t>(p.host_ids,p.rows);
 }
 void HipMtpDraftHead::set_token(std::uint32_t step,std::uint32_t token,void* stream) {
     auto& p=*impl_;require(step<p.config.max_depth && stream==p.stream && token<p.config.vocab_size,"MTP draft token override is invalid");
-    check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(p.slots+step),static_cast<int>(token),1,p.stream),"MTP draft token override");
+    hip_check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(p.slots+step),static_cast<int>(token),1,p.stream),"MTP draft token override");
     p.reply->tokens[step]=token;
 }
 std::uint32_t* HipMtpDraftHead::device_token_slot(std::uint32_t step) {

@@ -169,7 +169,7 @@ void equivalence() {
             }
         }
         // Texts with no slice end at all still encode, in one final step.
-        for (const std::string text : {std::string(), std::string(300, 'a'), std::string(300, ' '), std::string(300, '\n'),
+        for (const std::string& text : {std::string(), std::string(300, 'a'), std::string(300, ' '), std::string(300, '\n'),
                                        std::string("a"), std::string(" "), std::string("a "), std::string(" a")})
             check_text(*tokenizer, text, true, std::string(pre) + " edge");
         require(slices > 2000 && specials > 100, std::string(pre) + ": the corpus did not exercise slices and specials");

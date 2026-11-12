@@ -237,6 +237,7 @@ int main(int argc, char** argv) {
             else if (a == "--tf-stop") tf_stop = std::stoull(next());
             else if (a == "--state-out") state_out = next();
             else if (a == "--state-in") state_in = next();
+            else if (strix::session::speculation_opt_out_argument(a)) {}  // resolved by rank_defaults
             else if (a == "--baseline") {}  // resolved by rank_defaults (old path of every default-on item)
             else if (a == "--print-effective-config") print_config = true;
             else if (a == "--print-model-graph") print_graph = true;

@@ -1,6 +1,7 @@
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
+#include "strix/session/speculation_default.hpp"
 
 #include <algorithm>
 #include <array>
@@ -105,7 +106,7 @@ void resolve_sessions(App app, Resolved& r, const Getenv& env, const Probe& prob
     c.disk_bytes = disk_budget.empty() ? 0 : number(disk_budget);
     std::string effective_draft;
     for (std::size_t i = 0; i < r.args.size(); ++i) {
-        if (r.args[i] == "--no-dspark") effective_draft.clear();
+        if (r.args[i] == "--no-dspark" || strix::session::speculation_opt_out_argument(r.args[i])) effective_draft.clear();
         else if (r.args[i] == "--dspark" && i + 1 < r.args.size()) effective_draft = r.args[++i];
     }
     const std::string route = !effective_draft.empty() ? "tp2-http-batch-dspark" : "tp2-http-target";
@@ -340,7 +341,10 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     if (app == App::serve) {
         def.insert(def.end(), {"--peer-timeout", "120", "--prefill-path", "device", "--slots", "8", "--prefill-rows", "auto"});
         const char* rows16 = env("STRIX_DS41_BATCH_ROWS16");
-        if (has(user, "--no-dspark") || has(user, "--dspark") || model.empty()) {
+        if (has(user, "--no-dspark") || has(user, strix::session::speculation_opt_out_flag.data()) || has(user, "--dspark") ||
+            model.empty()) {
+        } else if (strix::session::speculation_environment_off(env(strix::session::speculation_environment))) {
+            notice("serve DSpark off (STRIX_MTP=0)");
         } else if (rows16 != nullptr && rows16[0] == '1') {
             notice("serve DSpark off (not qualified with STRIX_DS41_BATCH_ROWS16=1)");
         } else if ([&] {

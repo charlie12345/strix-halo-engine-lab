@@ -15,6 +15,7 @@
 #include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/glm_pair_profile_table.hpp"
+#include "strix/session/speculation_default.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -131,7 +132,8 @@ inline const std::vector<EnvItem>& env_items() {
 // Options with no value (everything else the rank app accepts takes exactly one value).
 inline bool is_value_free(const std::string& a) {
     return a == "--g3-sweep" || a == "--pf-install-before-load" || a == "--pf-swap-moe" || a == "--mem-plan" ||
-           a == "--profile" || a == "--tf-check" || a == "--baseline" || a == "--print-effective-config";
+           a == "--profile" || a == "--tf-check" || a == "--baseline" || a == "--print-effective-config" ||
+           strix::session::speculation_opt_out_argument(a);
 }
 
 // Gate / measurement modes that install their own prefill path (prefill auto -> ref under them).
@@ -154,7 +156,7 @@ struct Request {
     bool spec = false, g3 = false, decode_or_batch = false, mem_plan = false, reference_gate = false;
     unsigned idcheck = 0;
     std::string xch = "comm";
-    bool baseline_flag = false, print = false;
+    bool baseline_flag = false, print = false, no_mtp = false;  // no_mtp: shared speculation opt-out
 };
 
 inline Request scan(std::vector<std::string> args) {
@@ -168,6 +170,7 @@ inline Request scan(std::vector<std::string> args) {
             if (a == "--mem-plan") r.mem_plan = true;
             else if (a == "--baseline") r.baseline_flag = true;
             else if (a == "--print-effective-config") r.print = true;
+            else if (strix::session::speculation_opt_out_argument(a)) r.no_mtp = true;
             continue;
         }
         if (i + 1 >= args.size()) break;  // the app's own parser reports the missing value
@@ -269,6 +272,9 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         if (std::string(v) != "0" && std::string(v) != "1") throw std::invalid_argument("STRIX_GLM_MTP_SPEC=0|1");
         requested = std::string(v) == "1";
     }
+    // shared opt-out: plain decode unless an engine switch was given
+    if (!requested && (r.no_mtp || strix::session::speculation_environment_off(env(strix::session::speculation_environment))))
+        requested = false;
     const bool normal_decode = r.decode && !r.reference_gate && !r.mem_plan && r.idcheck == 0;
     const std::string requested_prefill = r.prefill.value_or(env("STRIX_GLM_PREFILL") ? env("STRIX_GLM_PREFILL") : "auto");
     const bool eligible = !env_is(env, "STRIX_GLM_SMOKE_HEAD", "1") && e.identity.value != "r1b-all" &&

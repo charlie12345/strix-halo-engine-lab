@@ -10,6 +10,7 @@
 // Linears: strix_gemm for prefill / gate calls, strix_gemv for decode steps (<= 8 rows).
 #include "strix/minimax/engine.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/pair/prefill_group.hpp"
 
 #include "mm_kernels.hpp"
 #include "strix/hip_minimax_moe.hpp"
@@ -554,14 +555,17 @@ struct Engine::Impl {
     std::size_t pf_async_min_rows = 2048;
     // Persistent per-member/per-activation-bank fences. Children currently fit
     // one chunk, but must never alias the parked parent's event generations.
+    static constexpr unsigned kPfGroupMax = strix::pair::prefill_group::kMax;  // one 32K prompt (8 x 4096 rows) as one group
     struct PfFences {
-        std::array<hipEvent_t, 4> last_r_use{}, p_free{};
-        std::array<bool, 4> destination_untracked{};
-        std::array<bool, 4> source_pending{};
+        std::array<hipEvent_t, kPfGroupMax> last_r_use{}, p_free{};
+        std::array<bool, kPfGroupMax> destination_untracked{};
+        std::array<bool, kPfGroupMax> source_pending{};
     };
     std::array<PfFences, 2> pf_fences{};
     bool pf_comm_inflight = false;
-    unsigned pf_group = 2;                     // STRIX_MM_PF_GROUP: chunks interleaved together (2..4)
+    bool pf_group_explicit = false;            // STRIX_MM_PF_GROUP given (then a narrower exchange depth is an error)
+    unsigned pf_group = strix::pair::prefill_group::kDefault;  // STRIX_MM_PF_GROUP: chunks interleaved together (2..8;
+                                               // clamped to the prompt's chunk count, and to the exchange depth)
     std::vector<float*> grp_h, grp_hn;         // residual / normed rows of group members 1.. (member 0 uses h / hn)
     std::vector<float*> grp_part, grp_remote;  // communicator backend: each member's local / peer partials (member 0: part / remote)
     bool pf_comm_interleave = true;            // the communicator backend is available (start/finish; used when the module is off)
@@ -757,10 +761,11 @@ struct Engine::Impl {
         }
         pf_inplace = env_flag("STRIX_MM_PFX_INPLACE", false);
         pf_tx_uncached = env_flag("STRIX_MM_PF_TX_UNCACHED", true);  // ON (measurement: exact, send 0.23 -> 0.002 s); =0
-        if (const char* g = std::getenv("STRIX_MM_PF_GROUP"); g != nullptr && *g != '\0') {
-            pf_group = static_cast<unsigned>(std::stoul(g));
-            if (pf_group < 2 || pf_group > 4) throw std::invalid_argument("STRIX_MM_PF_GROUP must be 2..4");
-        }
+        // Default 4 (was 2): the FAST_I4 slots convert a layer once per group, so a 32K prompt pays 2 instead of
+        // 4 conversion episodes per layer (group 4 vs 2: 32K TTFT -5.1 %, bitwise; 8 is not better than 4). The
+        // width is clamped to the prompt's chunk count at run time; an explicit value is honoured as given.
+        pf_group_explicit = std::getenv("STRIX_MM_PF_GROUP") != nullptr && *std::getenv("STRIX_MM_PF_GROUP") != '\0';
+        pf_group = strix::pair::prefill_group::width_from_env(std::getenv("STRIX_MM_PF_GROUP"), "STRIX_MM_PF_GROUP");
         const char* pid = std::getenv("STRIX_MM_PREFILL_IDENTITY");
         fp32_prefill = route::fp32_profile(pid);
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
@@ -1130,8 +1135,13 @@ struct Engine::Impl {
         router_scratch = dalloc<float>(moe::hip::router_tiled_scratch_floats(static_cast<std::uint32_t>(T)));  // any router form can be selected later
         part = dalloc<float>(T * kHidden);
         remote = dalloc<float>(T * kHidden);
-        if (pf != nullptr && pf->options().depth < pf_group)
-            throw std::invalid_argument("STRIX_MM_PFX_DEPTH must be >= STRIX_MM_PF_GROUP (slot reuse of the interleaved schedule)");
+        if (pf != nullptr && pf->options().depth < pf_group) {
+            if (pf_group_explicit)
+                throw std::invalid_argument("STRIX_MM_PFX_DEPTH must be >= STRIX_MM_PF_GROUP (slot reuse of the interleaved schedule)");
+            // The default width follows a narrower explicit exchange depth (one TX / RX slot per interleaved chunk).
+            pf_group = strix::pair::prefill_group::width_for_depth(pf_group, pf->options().depth);
+            std::fprintf(stderr, "mm rank %u: prefill group width %u (STRIX_MM_PFX_DEPTH)\n", static_cast<unsigned>(opt.rank), pf_group);
+        }
         if (pf != nullptr || pf_comm_interleave) {  // at start-up: no multi-GB allocation inside a prefill (KFD queue eviction)
             for (unsigned g = 1; g < pf_group; ++g) {
                 grp_h.push_back(dalloc<float>(T * kHidden));
@@ -2330,8 +2340,8 @@ struct Engine::Impl {
         const std::size_t m = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         float* const h0 = h;
         float* const hn0 = hn;
-        std::array<float*, 4> H{}, HN{}, P{}, R{};
-        std::array<std::size_t, 4> N{};
+        std::array<float*, kPfGroupMax> H{}, HN{}, P{}, R{};
+        std::array<std::size_t, kPfGroupMax> N{};
         auto& fences = pf_fences[child_bank ? 1U : 0U];
         const double pipeline_reuse_before = comm.stats().pipeline_reuse_wait;
         const double host_reuse_before = comm.stats().host_reuse_wait;
@@ -3073,8 +3083,10 @@ LoaderSnapshot Engine::draft_loader_snapshot() const {
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
 std::uint64_t Engine::prefill_reuse_rows() const {
-    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping.
-    return std::uint64_t{impl_->opt.max_rows} * impl_->pf_group;
+    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping. The alignment stays at
+    // the width the default used to have (2 chunks): a wider group changes the schedule, not the chunk bits
+    // (group 2 and 4 give identical state hashes), and a resumed prefill's first group is already narrower.
+    return std::uint64_t{impl_->opt.max_rows} * std::min(impl_->pf_group, strix::pair::prefill_group::kReuseChunks);
 }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
 const std::uint16_t* Engine::embed_row(std::uint32_t token) const {

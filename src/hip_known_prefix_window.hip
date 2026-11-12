@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/qwen_prefill_pair.hpp"
@@ -88,13 +89,22 @@ namespace {
 // index, u32 rows, u32 kernel id length,
 // u64 position, u64 bytes, the kernel id, then the bytes. Runs on the execution stream, so the copies follow the step's
 // kernels; the host waits for each step's copies before writing. The values themselves are unchanged.
+// R2-13: startup constants read once (were scanned per prefill block / window).
+const char* qrtx_step_dump_path() {
+    static const char* const path=std::getenv("STRIX_QRTX_STEP_DUMP");
+    return path && *path ? path : nullptr;
+}
+const char* qwen_pf_layer_range_text() {
+    static const char* const text=std::getenv("STRIX_QWEN_PF_LAYER_RANGE");
+    return text;
+}
 strix::HipKnownPrefixWindow::PrefillStepObserver qrtx_step_dump_observer(strix::HipKnownPrefixWindow::PrefillStepObserver inner,
                                                                          std::uint32_t rows) {
-    static const char* path=std::getenv("STRIX_QRTX_STEP_DUMP");
-    if(!path || !*path) return inner;
-    return [inner=std::move(inner),rows](std::size_t step,const std::function<strix::ExecutionDispatchContext(std::uint32_t)>& row) {
+    const char* path=qrtx_step_dump_path();
+    if(!path) return inner;
+    return [inner=std::move(inner),rows,path](std::size_t step,const std::function<strix::ExecutionDispatchContext(std::uint32_t)>& row) {
         if(inner) inner(step,row);
-        static std::FILE* file=[]{std::FILE* f=std::fopen(path,"ab");if(!f)throw std::runtime_error("STRIX_QRTX_STEP_DUMP cannot open");return f;}();
+        static std::FILE* file=[path]{std::FILE* f=std::fopen(path,"ab");if(!f)throw std::runtime_error("STRIX_QRTX_STEP_DUMP cannot open");return f;}();
         static std::vector<std::uint8_t> host;
         const auto stream=strix::hip_execution_stream();
         for(std::uint32_t r=0;r<rows;++r) {
@@ -128,10 +138,7 @@ struct ExecutionLease {
     ~ExecutionLease(){active=false;}
 };
 
-void check(hipError_t error, const char* operation) {
-    if (error != hipSuccess)
-        throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(error));
-}
+using strix::hip_check;
 bool empty(const ExecutionMemoryBinding& binding) {
     return !binding.execution_identity && !binding.arena_base && !binding.arena_bytes &&
         !binding.allocation_generation;
@@ -349,7 +356,7 @@ struct HipKnownPrefixWindow::Impl {
             // The caller constructs the largest compiled T owner before tails. The
             // device arena identifies the owner; never reserve on an unrelated device.
             hipPointerAttribute_t attributes{};
-            check(hipPointerGetAttributes(&attributes, reinterpret_cast<const void*>(scratch.arena_base)),
+            hip_check(hipPointerGetAttributes(&attributes, reinterpret_cast<const void*>(scratch.arena_base)),
                 "query prefill arena device");
             if (attributes.device != hip_prefill_device())
                 throw std::invalid_argument("prefill setup requires the window's owning device");
@@ -406,7 +413,7 @@ struct HipKnownPrefixWindow::Impl {
         // all deep admission. Exclusive status ownership preserves zero across
         // successful calls; any exception disables the owner permanently.
         if (config.deferred_moe_status) guard.run([&] {
-            check(hipMemcpy(&completion_status, reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base),
+            hip_check(hipMemcpy(&completion_status, reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base),
                 sizeof(completion_status), hipMemcpyDeviceToHost), "read initial known-window deferred status");
             check_deferred_moe_status(completion_status);
         });
@@ -430,7 +437,7 @@ struct HipKnownPrefixWindow::Impl {
         if (slot.owner) return slot;
         const auto bytes = q51_known_rows::required_scratch_bytes(rows, routed_config.expert_count, routed_config.top_k);
         void* memory = nullptr;
-        guard.run([&] { check(hipMalloc(&memory, bytes), "allocate known-window cohort routed CSR"); });
+        guard.run([&] { hip_check(hipMalloc(&memory, bytes), "allocate known-window cohort routed CSR"); });
         std::shared_ptr<void> owner(memory, [](void* p) { if (p) (void)hipFree(p); });
         const auto base = reinterpret_cast<std::uintptr_t>(memory);
         if (base % 256U) throw std::runtime_error("known-window cohort routed CSR allocation is not 256-byte aligned");
@@ -447,7 +454,7 @@ struct HipKnownPrefixWindow::Impl {
         if (slot.owner) return slot;
         const auto bytes = q51_known_rows::prefill_scratch_bytes(rows, u32(model.num_experts), u32(model.num_experts_per_token));
         void* memory = nullptr;
-        guard.run([&] { check(hipMalloc(&memory, bytes), "allocate known prefill segmented routed CSR"); });
+        guard.run([&] { hip_check(hipMalloc(&memory, bytes), "allocate known prefill segmented routed CSR"); });
         std::shared_ptr<void> owner(memory, [](void* p) { if (p) (void)hipFree(p); });
         const auto base = reinterpret_cast<std::uintptr_t>(memory);
         if (base % 256U) throw std::runtime_error("known prefill segmented routed CSR allocation is not 256-byte aligned");
@@ -476,7 +483,7 @@ struct HipKnownPrefixWindow::Impl {
             scope.context_tokens || scope.vocabulary_size)
             throw std::invalid_argument("known-window native owner requires empty graph bindings and one eager owned stream");
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-        check(hipStreamIsCapturing(scope.stream, &capture), "query known-window native capture");
+        hip_check(hipStreamIsCapturing(scope.stream, &capture), "query known-window native capture");
         if (capture != hipStreamCaptureStatusNone)
             throw std::invalid_argument("known-window native stream is being captured");
         const auto& status = scope.deferred_moe_status;
@@ -507,7 +514,7 @@ struct HipKnownPrefixWindow::Impl {
     }
     // STRIX_SHARED_DETACH=0: the shared expert stays on the owner's stream between router and routed experts.
     static bool shared_detach_enabled() {
-        static const bool on = [] { const char* v = std::getenv("STRIX_SHARED_DETACH"); return !v || v[0] != '0'; }();
+        static const bool on = strix::envcfg::flag("STRIX_SHARED_DETACH", true);
         return on;
     }
     SharedDetach& detach_state() {
@@ -523,28 +530,28 @@ struct HipKnownPrefixWindow::Impl {
         const unsigned side_cus = [] { const char* e = std::getenv("STRIX_QPF2K_SIDE_CUS"); return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 0)) : 0U; }();
         int cus = 0, device = 0;
         if (prefill && side_cus) {
-            check(hipGetDevice(&device), "known prefill device");
-            check(hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, device), "known prefill CU count");
+            hip_check(hipGetDevice(&device), "known prefill device");
+            hip_check(hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, device), "known prefill CU count");
         }
         if (prefill && side_cus && side_cus < static_cast<unsigned>(cus)) {
             std::vector<std::uint32_t> mask((static_cast<unsigned>(cus) + 31U) / 32U, 0U);
             for (unsigned cu = static_cast<unsigned>(cus) - side_cus; cu < static_cast<unsigned>(cus); ++cu) mask[cu / 32U] |= 1U << (cu % 32U);
-            check(hipExtStreamCreateWithCUMask(&d->side, static_cast<std::uint32_t>(mask.size()), mask.data()), "create known prefill CU-masked shared stream");
+            hip_check(hipExtStreamCreateWithCUMask(&d->side, static_cast<std::uint32_t>(mask.size()), mask.data()), "create known prefill CU-masked shared stream");
             std::fprintf(stderr, "qpf2k sched side stream CU mask: last %u of %d CUs\n", side_cus, cus);
         } else
         if (prefill && (prefill_schedule() & 32U)) {
             int least = 0, greatest = 0;
-            check(hipDeviceGetStreamPriorityRange(&least, &greatest), "known prefill stream priority range");
-            check(hipStreamCreateWithPriority(&d->side, hipStreamNonBlocking, least), "create known prefill low-priority shared stream");
+            hip_check(hipDeviceGetStreamPriorityRange(&least, &greatest), "known prefill stream priority range");
+            hip_check(hipStreamCreateWithPriority(&d->side, hipStreamNonBlocking, least), "create known prefill low-priority shared stream");
         } else
-        check(hipStreamCreateWithFlags(&d->side, hipStreamNonBlocking), "create known-window shared stream");
+        hip_check(hipStreamCreateWithFlags(&d->side, hipStreamNonBlocking), "create known-window shared stream");
         for (auto* list : {&d->forked, &d->joined})
             // Both streams are on this device: no system-scope fence (an L2 writeback per event otherwise).
-            for (auto& e : *list) check(hipEventCreateWithFlags(&e, hipEventDisableTiming | hipEventDisableSystemFence),
+            for (auto& e : *list) hip_check(hipEventCreateWithFlags(&e, hipEventDisableTiming | hipEventDisableSystemFence),
                 "create known-window shared event");
         // Rows keep the arena's row stride (one row view apart), so this covers eight rows of any window.
         d->workspace_bytes = 8ULL << 20U;
-        check(hipMalloc(&d->workspace, d->workspace_bytes), "allocate known-window shared workspace");
+        hip_check(hipMalloc(&d->workspace, d->workspace_bytes), "allocate known-window shared workspace");
         shared_detach = std::move(d);
         return *shared_detach;
     }
@@ -567,11 +574,11 @@ struct HipKnownPrefixWindow::Impl {
             if (d.pending[layer]) throw std::logic_error("known-window shared expert detached twice before its combine");
             const auto& rows = contexts[i];
             const auto e = layer + d.parity * d.pending.size();
-            check(hipEventRecord(d.forked[e], scope.stream), "record known-window shared fork");
-            check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known-window shared stream");
+            hip_check(hipEventRecord(d.forked[e], scope.stream), "record known-window shared fork");
+            hip_check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known-window shared stream");
             shared_expert_known_window_rows_launch_detached(rows, shared_for(rows), d.side,
                 reinterpret_cast<std::uintptr_t>(d.workspace), d.workspace_bytes);
-            check(hipEventRecord(d.joined[e], d.side), "record known-window shared join");
+            hip_check(hipEventRecord(d.joined[e], d.side), "record known-window shared join");
             d.pending[layer] = 1U;
             return true;
         }
@@ -606,10 +613,10 @@ struct HipKnownPrefixWindow::Impl {
             const auto need = stride * rows.size();
             if (d.prefill_workspace_bytes < need) {
                 // Once per owner (T rows): nothing of this owner is outstanding on the side stream between blocks.
-                check(hipStreamSynchronize(d.side), "drain known prefill shared stream");
-                if (d.prefill_workspace) check(hipFree(d.prefill_workspace), "free known prefill shared workspace");
+                hip_check(hipStreamSynchronize(d.side), "drain known prefill shared stream");
+                if (d.prefill_workspace) hip_check(hipFree(d.prefill_workspace), "free known prefill shared workspace");
                 d.prefill_workspace = nullptr; d.prefill_workspace_bytes = 0;
-                check(hipMalloc(&d.prefill_workspace, need), "allocate known prefill shared workspace");
+                hip_check(hipMalloc(&d.prefill_workspace, need), "allocate known prefill shared workspace");
                 d.prefill_workspace_bytes = need;
             }
             const auto e = layer + d.parity * d.pending.size();
@@ -623,14 +630,14 @@ struct HipKnownPrefixWindow::Impl {
                 ++prefill_detached_shared;
                 return true;
             }
-            check(hipEventRecord(d.forked[e], scope.stream), "record known prefill shared fork");
-            check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known prefill shared stream");
+            hip_check(hipEventRecord(d.forked[e], scope.stream), "record known prefill shared fork");
+            hip_check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known prefill shared stream");
             shared_expert_known_prefill_rows_launch_detached(rows, shared_for(rows.first(8U)), d.side,
                 reinterpret_cast<std::uintptr_t>(d.prefill_workspace), d.prefill_workspace_bytes);
             // With a step observer the join is recorded after the observer's copies of this step (enqueued on the
             // side stream, see the after_step wrapper); without one, here.
             if (prefill_observed) prefill_join_due = e + 1U;
-            else check(hipEventRecord(d.joined[e], d.side), "record known prefill shared join");
+            else hip_check(hipEventRecord(d.joined[e], d.side), "record known prefill shared join");
             d.pending[layer] = 1U;
             ++prefill_detached_shared;
             return true;
@@ -675,11 +682,11 @@ struct HipKnownPrefixWindow::Impl {
         const auto e = late_shared_event;
         const std::span<const ExecutionDispatchContext> rows(late_shared_rows);
         late_shared_due = false;
-        check(hipEventRecord(d.forked[e], stream), "record known prefill late shared fork");
-        check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known prefill late shared stream");
+        hip_check(hipEventRecord(d.forked[e], stream), "record known prefill late shared fork");
+        hip_check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known prefill late shared stream");
         shared_expert_known_prefill_rows_launch_detached(rows, shared_for(rows.first(8U)), d.side,
             reinterpret_cast<std::uintptr_t>(d.prefill_workspace), d.prefill_workspace_bytes);
-        check(hipEventRecord(d.joined[e], d.side), "record known prefill late shared join");
+        hip_check(hipEventRecord(d.joined[e], d.side), "record known prefill late shared join");
         late_shared_rows.clear();
         ++prefill_late_launched;
     }
@@ -721,7 +728,7 @@ struct HipKnownPrefixWindow::Impl {
         active_hip_launch_context = &side;
         try { inner(i, row); } catch (...) { active_hip_launch_context = saved; throw; }
         active_hip_launch_context = saved;
-        check(hipEventRecord(d.joined[e], d.side), "record known prefill shared join");
+        hip_check(hipEventRecord(d.joined[e], d.side), "record known prefill shared join");
     }
     std::uint64_t prefill_detached_shared = 0, prefill_join_due = 0;
     bool partial_current = false;
@@ -732,7 +739,7 @@ struct HipKnownPrefixWindow::Impl {
     void join_shared(std::uint32_t layer) {
         if (!shared_detach || !shared_detach->pending[layer]) return;
         auto& d = *shared_detach;
-        check(hipStreamWaitEvent(scope.stream, d.joined[layer + d.parity * d.pending.size()], 0), "join known-window shared stream");
+        hip_check(hipStreamWaitEvent(scope.stream, d.joined[layer + d.parity * d.pending.size()], 0), "join known-window shared stream");
         d.pending[layer] = 0U;
     }
     // Window HC folds (each opt-in; see hyper_mix_known_window_rows_launch_folded):
@@ -864,7 +871,7 @@ struct HipKnownPrefixWindow::Impl {
         // pair prefill copies its immutable snapshot on the separate per-slot stream.
         auto* const pair_timeline = pair_frame ? pair_context.timeline : nullptr;
         const auto pair_fence_start = pair_timeline ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        check(hipDeviceSynchronize(), "layer-split seam producer fence");
+        hip_check(hipDeviceSynchronize(), "layer-split seam producer fence");
         if (pair_timeline) pair_timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_fence, pair_fence_start);
         const auto pair_pack_start = pair_timeline ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto seam_stream = hip_execution_stream();
@@ -892,8 +899,8 @@ struct HipKnownPrefixWindow::Impl {
                 auto* seam_device = reinterpret_cast<void*>(seam_source.address);
                 if (seam_batched) seam_rows_at[seam_part].push_back(seam_source.address);
                 else if (pair_frame) pair_frame->staging->copy(save, seam_offset, seam_device, seam_lengths[seam_part]);
-                else if (save) check(hipMemcpyAsync(seam_host, seam_device, seam_lengths[seam_part], hipMemcpyDeviceToHost, seam_stream), "layer-split save seam");
-                else check(hipMemcpyAsync(seam_device, seam_host, seam_lengths[seam_part], hipMemcpyHostToDevice, seam_stream), "layer-split load seam");
+                else if (save) hip_check(hipMemcpyAsync(seam_host, seam_device, seam_lengths[seam_part], hipMemcpyDeviceToHost, seam_stream), "layer-split save seam");
+                else hip_check(hipMemcpyAsync(seam_device, seam_host, seam_lengths[seam_part], hipMemcpyHostToDevice, seam_stream), "layer-split load seam");
                 seam_offset += seam_lengths[seam_part];
             }
         }
@@ -917,7 +924,7 @@ struct HipKnownPrefixWindow::Impl {
             }
         }
         if (pair_frame && save) pair_frame->staging->seal(seam_size);
-        else check(hipStreamSynchronize(seam_stream), "layer-split seam transfer fence");
+        else hip_check(hipStreamSynchronize(seam_stream), "layer-split seam transfer fence");
         if (pair_timeline) pair_timeline->add_since(pair_context.sequence, qwen_pp::pt_seam_pack, pair_pack_start);
         const auto seam_payload = pair_frame ? std::span<const std::byte>(pair_frame->payload) : std::span<const std::byte>(pp_seam_bytes);
         if (qwen_pp::dump_enabled()) {
@@ -955,7 +962,7 @@ struct HipKnownPrefixWindow::Impl {
 
     void pp_dump_layer_input(std::size_t pp_step, std::uint32_t pp_rows,
         const std::function<ExecutionDispatchContext(std::uint32_t)>& pp_context) {
-        check(hipDeviceSynchronize(), "PP stage-B input dump fence");
+        hip_check(hipDeviceSynchronize(), "PP stage-B input dump fence");
         const bool pp_folded = std::find(prefill_folded.begin(), prefill_folded.end(), pp_step) != prefill_folded.end();
         std::array<std::uint64_t, 3> pp_hashes{14695981039346656037ULL, 14695981039346656037ULL, 14695981039346656037ULL};
         std::vector<std::byte> pp_scratch(qwen_pp::Seam::hc_bytes);
@@ -968,7 +975,7 @@ struct HipKnownPrefixWindow::Impl {
                     resolve_dispatch_write(pp_dispatch, pp_part - 1U);
                 if (!pp_address.address || pp_address.bytes < pp_lengths[pp_part])
                     throw std::invalid_argument("PP input dump buffer too small");
-                check(hipMemcpy(pp_scratch.data(), reinterpret_cast<const void*>(pp_address.address),
+                hip_check(hipMemcpy(pp_scratch.data(), reinterpret_cast<const void*>(pp_address.address),
                     pp_lengths[pp_part], hipMemcpyDeviceToHost), "PP stage-B input dump");
                 pp_hashes[pp_part] = qwen_pp::dump_hash(
                     std::span<const std::byte>(pp_scratch.data(), pp_lengths[pp_part]), pp_hashes[pp_part]);
@@ -1099,7 +1106,7 @@ struct HipKnownPrefixWindow::Impl {
     }
     void setup_prefill_entries() {
         // STRIX_PREFILL_FULL_HC=0: keep HC rows in separate 8-row launches.
-        static const bool hc=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_HC");return !v||v[0]!='0';}();
+        static const bool hc=strix::envcfg::flag("STRIX_PREFILL_FULL_HC", true);
         if(hc&&window.hyper_mix_rows_steps)
             prefill_entries.push_back({KnownWindowR2Variant::hyper_mix_rows8_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1111,7 +1118,7 @@ struct HipKnownPrefixWindow::Impl {
                     hyper_mix_known_prefill_rows_launch(rows,self.hyper_for(rows));
                 }});
         // STRIX_PREFILL_FULL_PLE=0: PLE lookups and projections per 8-row tile (each tile still chains the history).
-        static const bool ple=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_PLE");return !v||v[0]!='0';}();
+        static const bool ple=strix::envcfg::flag("STRIX_PREFILL_FULL_PLE", true);
         if(ple&&window.ple_rows_steps)
             prefill_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1123,7 +1130,7 @@ struct HipKnownPrefixWindow::Impl {
                     static_cast<Impl*>(object)->ple_window->stage_serve(rows);
                 }});
         // STRIX_PREFILL_FULL_QSA=0: keep QSA rows in 8-row tiles.
-        static const bool qsa=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_QSA");return !v||v[0]!='0';}();
+        static const bool qsa=strix::envcfg::flag("STRIX_PREFILL_FULL_QSA", true);
         if(prefill->external_qsa_score_bytes && !qsa)
             throw std::invalid_argument("compact QSA owner requires the full-prefill ring entry");
         if(qsa&&window.qsa_rows_steps)
@@ -1142,7 +1149,7 @@ struct HipKnownPrefixWindow::Impl {
                     },0,true});
             }
         // STRIX_PREFILL_FULL_SHARED=0: keep the shared expert in 8-row tiles.
-        static const bool shared=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_SHARED");return !v||v[0]!='0';}();
+        static const bool shared=strix::envcfg::flag("STRIX_PREFILL_FULL_SHARED", true);
         if(shared)
             prefill_entries.push_back({KnownWindowR2Variant::shared_q8_virtual256_r8_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1154,7 +1161,7 @@ struct HipKnownPrefixWindow::Impl {
                     shared_expert_known_prefill_rows_launch(rows,self.shared_for(rows.first(8U)));
                 }});
         // STRIX_PREFILL_FULL_ELEMENTWISE=0: keep inject / MoE-combine rows in 8-row launches.
-        static const bool elementwise=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ELEMENTWISE");return !v||v[0]!='0';}();
+        static const bool elementwise=strix::envcfg::flag("STRIX_PREFILL_FULL_ELEMENTWISE", true);
         if(elementwise) {
             prefill_entries.push_back({KnownWindowR2Variant::inject_rows_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1172,7 +1179,7 @@ struct HipKnownPrefixWindow::Impl {
                 }});
         }
         // STRIX_PREFILL_FULL_ROUTER=0: keep router rows in separate 8-row launches.
-        static const bool router=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_ROUTER");return !v||v[0]!='0';}();
+        static const bool router=strix::envcfg::flag("STRIX_PREFILL_FULL_ROUTER", true);
         if(router)
             prefill_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -1182,14 +1189,14 @@ struct HipKnownPrefixWindow::Impl {
                     moe_route_known_prefill_rows_launch(rows,static_cast<Impl*>(object)->route_config);
                 }});
         // STRIX_PREFILL_FULL_GDN=0 / STRIX_PREFILL_FULL_MOE=0: keep that step in 8-row tiles.
-        static const bool gdn=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_GDN");return !v||v[0]!='0';}();
-        static const bool moe=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_MOE");return !v||v[0]!='0';}();
+        static const bool gdn=strix::envcfg::flag("STRIX_PREFILL_FULL_GDN", true);
+        static const bool moe=strix::envcfg::flag("STRIX_PREFILL_FULL_MOE", true);
         if(q51_known_rows::prefill_csr_enabled(moe,window.routed_expert_union_steps,
             config.a8_down_q51,config.a8_down_q80,prefill->logical_rows)) {
             const auto bytes=q51_known_rows::prefill_csr_inventory(prefill->logical_rows,
                 u32(model.num_experts),u32(model.num_experts_per_token)).fixed;
             void* memory=nullptr;
-            guard.run([&] { check(hipMalloc(&memory,bytes),"allocate known prefill routed CSR"); });
+            guard.run([&] { hip_check(hipMalloc(&memory,bytes),"allocate known prefill routed CSR"); });
             std::shared_ptr<void> owner(memory,[](void* p){ if(p) (void)hipFree(p); });
             const auto base=reinterpret_cast<std::uintptr_t>(memory);
             if(base%256U) throw std::runtime_error("known prefill routed CSR allocation is not 256-byte aligned");
@@ -1361,7 +1368,7 @@ struct HipKnownPrefixWindow::Impl {
     GdnWindowControl* gdn_control() const noexcept { return static_cast<GdnWindowControl*>(gdn_deferred->control.get()); }
     void bind_deferred() {
         void* device_control=nullptr;
-        check(hipHostGetDevicePointer(&device_control,gdn_deferred->control.get(),0),"deferred GDN control device view");
+        hip_check(hipHostGetDevicePointer(&device_control,gdn_deferred->control.get(),0),"deferred GDN control device view");
         gdn_window_config.retained=gdn_deferred->retained.get();
         gdn_window_config.control=static_cast<const GdnWindowControl*>(device_control);
     }
@@ -1372,9 +1379,9 @@ struct HipKnownPrefixWindow::Impl {
             gdn_deferred=std::make_shared<DeferredGdn>();
             void* retained=nullptr; void* control=nullptr;
             guard.run([&] {
-                check(hipMalloc(&retained,bytes),"allocate deferred GDN retained rows");
+                hip_check(hipMalloc(&retained,bytes),"allocate deferred GDN retained rows");
                 gdn_deferred->retained.reset(retained);
-                check(hipHostMalloc(&control,sizeof(GdnWindowControl),hipHostMallocMapped|hipHostMallocCoherent),
+                hip_check(hipHostMalloc(&control,sizeof(GdnWindowControl),hipHostMallocMapped|hipHostMallocCoherent),
                     "allocate deferred GDN control");
                 gdn_deferred->control.reset(control);
             });
@@ -1432,13 +1439,13 @@ struct HipKnownPrefixWindow::Impl {
             const HipLaunchScope active(scope);
             for(const auto& row:gdn_commit_rows) gdn_window_commit_launch(row,gdn_window_config);
         }
-        check(hipStreamSynchronize(scope.stream),"complete deferred GDN commit");
+        hip_check(hipStreamSynchronize(scope.stream),"complete deferred GDN commit");
         gdn_control()->pending_rows=0; gdn_deferred->pending=false;
     }
     void discard_deferred() {
         invalidate_hip_qsa_window_pool(qsa_config.window_pool);
         if(!gdn_deferred || !gdn_deferred->pending) return;
-        check(hipStreamSynchronize(scope.stream),"discard deferred GDN rows fence");
+        hip_check(hipStreamSynchronize(scope.stream),"discard deferred GDN rows fence");
         gdn_control()->pending_rows=0; gdn_deferred->pending=false;
     }
     void share_deferred(const Impl& primary) {
@@ -1471,7 +1478,7 @@ struct HipKnownPrefixWindow::Impl {
             },
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
                 const auto& self=*static_cast<Impl*>(object);
-                static const bool fused=[]{const char* v=std::getenv("STRIX_LM_HEAD_ROWS_GREEDY");return !v||v[0]!='0';}();
+                static const bool fused=strix::envcfg::flag("STRIX_LM_HEAD_ROWS_GREEDY", true);
                 if(self.greedy_replies && self.head_config.rows_lean && fused) {
                     lm_head_known_window_rows_launch_greedy(rows,self.head_config,self.greedy_partials,self.greedy_replies);
                     return;
@@ -1539,18 +1546,18 @@ struct HipKnownPrefixWindow::Impl {
     std::uint64_t deferred_blocks = 0, deferred_checked = 0;
     void enqueue_completion_reads(q51_known_rows::Summary* summary, DeferredMoeFirstError* status, std::uint32_t prefill_rows_done) {
         if(window.routed_expert_union_steps && !cohort_member)
-            check(hipMemcpyAsync(summary,
+            hip_check(hipMemcpyAsync(summary,
                 reinterpret_cast<const void*>(full_prefill_union()?prefill_union(prefill_rows_done).memory.arena_base:routed_workspace.memory.arena_base),
                 sizeof(*summary),hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
         if (config.deferred_moe_status)
-            check(hipMemcpyAsync(status,
+            hip_check(hipMemcpyAsync(status,
                 reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base), sizeof(*status),
                 hipMemcpyDeviceToHost, scope.stream), "read completed known-window deferred status");
     }
     void finish_deferred_completion() {
         if (deferred_pending < 0) return;
         const auto slot = static_cast<unsigned>(deferred_pending);
-        check(hipEventSynchronize(deferred_events[slot]), "complete deferred known prefill block");
+        hip_check(hipEventSynchronize(deferred_events[slot]), "complete deferred known prefill block");
         deferred_pending = -1; ++deferred_checked;
         guard.require_original();
         pending_union_summary = deferred_slots[slot].summary; completion_status = deferred_slots[slot].status;
@@ -1567,10 +1574,10 @@ struct HipKnownPrefixWindow::Impl {
     }
     void service_boundary() {
         prefill_service(scope.stream,[&] {
-            check(hipStreamSynchronize(scope.stream),"drain prefill service producer");
+            hip_check(hipStreamSynchronize(scope.stream),"drain prefill service producer");
             finish_deferred_completion();
             if(config.deferred_moe_status) {
-                check(hipMemcpy(&completion_status,reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base),sizeof(completion_status),hipMemcpyDeviceToHost),"read service D1");
+                hip_check(hipMemcpy(&completion_status,reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base),sizeof(completion_status),hipMemcpyDeviceToHost),"read service D1");
                 check_deferred_moe_status(completion_status);
             }
         });
@@ -1583,21 +1590,21 @@ struct HipKnownPrefixWindow::Impl {
         if(defer) {
             if(!deferred_slots) {
                 void* p=nullptr;
-                check(hipHostMalloc(&p,2U*sizeof(DeferredCompletion),hipHostMallocDefault),"allocate deferred known prefill slots");
+                hip_check(hipHostMalloc(&p,2U*sizeof(DeferredCompletion),hipHostMallocDefault),"allocate deferred known prefill slots");
                 deferred_slots=static_cast<DeferredCompletion*>(p);
-                for(auto& e:deferred_events) check(hipEventCreateWithFlags(&e,hipEventDisableTiming),"create deferred known prefill event");
+                for(auto& e:deferred_events) hip_check(hipEventCreateWithFlags(&e,hipEventDisableTiming),"create deferred known prefill event");
             }
             // The previous deferred block's checks first (its event precedes this block on the stream).
             finish_deferred_completion();
             const auto slot=deferred_next;deferred_next^=1U;
             deferred_slots[slot].rows_done=prefill_rows_done;
             enqueue_completion_reads(&deferred_slots[slot].summary,&deferred_slots[slot].status,prefill_rows_done);
-            check(hipEventRecord(deferred_events[slot],scope.stream),"record deferred known prefill completion");
+            hip_check(hipEventRecord(deferred_events[slot],scope.stream),"record deferred known prefill completion");
             deferred_pending=static_cast<int>(slot);++deferred_blocks;
             return;
         }
         enqueue_completion_reads(&pending_union_summary,&completion_status,prefill_rows_done);
-        check(hipStreamSynchronize(scope.stream), "complete known-window native stream");
+        hip_check(hipStreamSynchronize(scope.stream), "complete known-window native stream");
         guard.require_original();
         // A deferred previous block of this owner: its event precedes this block, so it is complete; check it first.
         if (deferred_pending >= 0) {
@@ -1805,7 +1812,7 @@ struct HipKnownPrefixWindow::Impl {
     // on one stream); only the scheduling differs. STRIX_COHORT_SHARED_EXPERT=0 keeps only the
     // shared expert per session.
     static bool cohort_shared_enabled() {
-        static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }();
+        static const bool on = strix::envcfg::flag("STRIX_COHORT_SHARED", true);
         return on;
     }
     // STRIX_COHORT_SHARED_ELEMENTWISE=0: the inject and MoE-combine rows of a chunk run per session again.
@@ -1814,7 +1821,7 @@ struct HipKnownPrefixWindow::Impl {
         return on;
     }
     static bool cohort_shared_expert_enabled() {
-        static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED_EXPERT"); return !v || v[0] != '0'; }();
+        static const bool on = strix::envcfg::flag("STRIX_COHORT_SHARED_EXPERT", true);
         return on;
     }
     // Step i of a cohort runs once for every member's rows on the primary.
@@ -1876,7 +1883,7 @@ struct HipKnownPrefixWindow::Impl {
             total += m.run->rows();
         }
         if (total < 9U || total > 32U) return false;
-        static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
+        static const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
         switch (mode) {
         case KnownWindowStepMode::moe_route_rows:
             if(!joint && cohort_step_rows()!=16U) return false;
@@ -2042,11 +2049,11 @@ struct HipKnownPrefixWindow::Impl {
             auto& d = detach_state();
             if (d.pending[layer]) throw std::logic_error("known-window cohort shared expert detached twice before its combine");
             const auto e = layer + d.parity * d.pending.size();
-            check(hipEventRecord(d.forked[e], scope.stream), "record known-window cohort shared fork");
-            check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known-window cohort shared stream");
+            hip_check(hipEventRecord(d.forked[e], scope.stream), "record known-window cohort shared fork");
+            hip_check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known-window cohort shared stream");
             shared_expert_known_window_cohort_launch(segments, shared, d.side, reinterpret_cast<std::uintptr_t>(d.workspace),
                 d.workspace_bytes);
-            check(hipEventRecord(d.joined[e], d.side), "record known-window cohort shared join");
+            hip_check(hipEventRecord(d.joined[e], d.side), "record known-window cohort shared join");
             d.pending[layer] = 1U;
             break;
         }
@@ -2078,7 +2085,7 @@ struct HipKnownPrefixWindow::Impl {
         const auto& step = serial.execution.steps[i];
         if (step.op != SerialOp::moe_combine || !step.layer || !shared_detach || !shared_detach->pending[*step.layer]) return;
         auto& d = *shared_detach;
-        check(hipStreamWaitEvent(scope.stream, d.joined[*step.layer + d.parity * d.pending.size()], 0), "join known-window cohort shared stream");
+        hip_check(hipStreamWaitEvent(scope.stream, d.joined[*step.layer + d.parity * d.pending.size()], 0), "join known-window cohort shared stream");
         d.pending[*step.layer] = 0U;
     }
     static std::vector<HipMtpTargetWindowExecution> execute_cohort(Impl& primary, std::span<CohortMember> members) {
@@ -2296,10 +2303,10 @@ struct HipKnownPrefixWindow::Impl {
                 // The last wide union's summary, read on the lead stream; the lead's complete() below fences it.
                 if (!lead.wide_union_host) {
                     void* p = nullptr;
-                    check(hipHostMalloc(&p, sizeof(q51_known_rows::Summary), hipHostMallocDefault), "allocate wide cohort union summary");
+                    hip_check(hipHostMalloc(&p, sizeof(q51_known_rows::Summary), hipHostMallocDefault), "allocate wide cohort union summary");
                     lead.wide_union_host = static_cast<q51_known_rows::Summary*>(p);
                 }
-                check(hipMemcpyAsync(lead.wide_union_host, reinterpret_cast<const void*>(lead.cohort_union(wide_union_rows).memory.arena_base),
+                hip_check(hipMemcpyAsync(lead.wide_union_host, reinterpret_cast<const void*>(lead.cohort_union(wide_union_rows).memory.arena_base),
                     sizeof(q51_known_rows::Summary), hipMemcpyDeviceToHost, lead.scope.stream), "read wide cohort routed union metadata");
             }
             const bool lead_defers = lead.defer_current; // complete() clears it; a deferred lead leaves its stream running
@@ -2310,7 +2317,7 @@ struct HipKnownPrefixWindow::Impl {
             }
             if (wide_union_rows) {
                 // The last wide union's summary (the stream is complete): its rows, assignments and status.
-                if (lead_defers) check(hipStreamSynchronize(lead.scope.stream), "complete wide cohort union read");
+                if (lead_defers) hip_check(hipStreamSynchronize(lead.scope.stream), "complete wide cohort union read");
                 const auto s = *lead.wide_union_host;
                 const auto assignments = wide_union_rows * lead.routed_config.top_k;
                 if (s.status || s.version != 1U || s.logical_rows != wide_union_rows || s.assignments != assignments ||
@@ -2384,7 +2391,7 @@ struct HipKnownPrefixWindow::Impl {
         bool owned_eager_scope_admitted=false,actual_window_committed=false;
         const PreparedCapture* observed=nullptr;
         // STRIX_PREFILL_TIMING=1: host milliseconds of the owner's own phases around a tiled block (stderr).
-        static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
+        static const bool timing=strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
         auto mark=std::chrono::steady_clock::now();
         const auto lap=[&](const char* name) {
             if(!timing || !prefill) return;
@@ -2441,7 +2448,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.static_preflight_memo=&static_preflight_memo;
             hooks.skip_head=skip_head;
             hooks.partial_rows=partial;
-            const auto pp_native_range = qwen_pp::parse_range(std::getenv("STRIX_QWEN_PF_LAYER_RANGE"),
+            const auto pp_native_range = qwen_pp::parse_range(qwen_pf_layer_range_text(),
                 static_cast<std::uint32_t>(model.hidden_layers));
             if (!pp_native_range.enabled || pp_native_range.begin == 0) {
                 prefill_folded.clear();
@@ -2451,7 +2458,7 @@ struct HipKnownPrefixWindow::Impl {
             if (prefill && qwen_pp::pipe_context.pipe && qwen_pp::pipe_profile_enabled()) {
                 hooks.prefill_profile_boundary = [&](std::optional<std::uint32_t> layer, bool begin) {
                     // Includes detached streams; do not call complete() or publish state here.
-                    check(hipDeviceSynchronize(), "pair prefill layer profile fence");
+                    hip_check(hipDeviceSynchronize(), "pair prefill layer profile fence");
                     const auto now = std::chrono::steady_clock::now();
                     if (begin) { pp_profile_start = now; return; }
                     const auto& pair = qwen_pp::pipe_context;
@@ -2484,8 +2491,7 @@ struct HipKnownPrefixWindow::Impl {
             if(prefill) {
                 hooks.after_step=qrtx_step_dump_observer(prefill_observer,block_rows);
                 // The step dump (STRIX_QRTX_STEP_DUMP) reads every step: no step predicate then.
-                const char* dump=std::getenv("STRIX_QRTX_STEP_DUMP");
-                if(hooks.after_step&&!(dump&&*dump)) hooks.after_step_observes=prefill_observes;
+                if(hooks.after_step&&!qrtx_step_dump_path()) hooks.after_step_observes=prefill_observes;
                 // STRIX_QPF2K_SCHED: prefill schedule hook. A step observer (MTP tap copies, step dumps) of a detached step
                 // runs on the side stream before that step's join is recorded (prefill_observe).
                 if(prefill_schedule()) {
@@ -2765,10 +2771,10 @@ void HipKnownPrefixWindow::reset_cancelled_prefill() {
     auto& s=*impl_;
     if(s.executing || s.failed || s.deferred_pending>=0) throw std::logic_error("cancelled prefill reset requires a drained healthy owner");
     const auto clear=[&](const q51_known_rows::Workspace& w) {
-        if(w.owner) check(hipMemsetAsync(reinterpret_cast<void*>(w.memory.arena_base),0,static_cast<std::size_t>(w.memory.arena_bytes),s.scope.stream),"reset private prefill union");
+        if(w.owner) hip_check(hipMemsetAsync(reinterpret_cast<void*>(w.memory.arena_base),0,static_cast<std::size_t>(w.memory.arena_bytes),s.scope.stream),"reset private prefill union");
     };
     clear(s.prefill_routed_workspace);for(const auto& entry:s.prefill_union_workspace) clear(entry.second);
-    check(hipStreamSynchronize(s.scope.stream),"complete cancelled prefill reset");
+    hip_check(hipStreamSynchronize(s.scope.stream),"complete cancelled prefill reset");
     s.prefill_union_rows=0;s.last_union_observation.reset();s.pending_union_summary={};s.completion_status={};
 }
 void HipKnownPrefixWindow::set_window_step_observer(PrefillStepObserver observer) {

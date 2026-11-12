@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/dist/gpu_direct.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/gpu_direct_copy.hpp"
 
 #include <algorithm>
@@ -30,7 +32,7 @@ using transport::GpuQueueOperation;
 using transport::LinuxGpuQueue;
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("gpu-direct: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("gpu-direct: ", status, what);
 }
 inline void relax() noexcept {
 #if defined(__x86_64__)
@@ -88,11 +90,11 @@ long long rx_lead_us() {
 // controllers (measured: 9-15 per 3000 back-to-back exchanges without, none with). The next exchange's geometry comes
 // from the communicator's hint (expect_next).
 bool prepost_rx() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_GPU_PREPOST"); return !(v && v[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_DIST_GPU_PREPOST", true);
     return on;
 }
 bool lazy_tx() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_GPU_LAZY_TX"); return !(v && v[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_DIST_GPU_LAZY_TX", true);
     return on;
 }
 
@@ -198,7 +200,7 @@ constexpr std::uint64_t failed_flag = ~std::uint64_t{0};
 
 // STRIX_DIST_GPU_DEBUG=1: one line per step of every exchange on stderr.
 bool debug() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_GPU_DEBUG"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DIST_GPU_DEBUG", false);
     return on;
 }
 void trace(const char* what, std::uint64_t sequence, std::size_t extra = 0) {

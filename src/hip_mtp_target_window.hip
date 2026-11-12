@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/mtp_payload_geometry.hpp"
 #include "strix/hip_generation_output.hpp"
@@ -20,7 +21,7 @@
 namespace strix {
 namespace {
 void require(bool v,const char* m){if(!v)throw std::invalid_argument(m);}
-void check(hipError_t e){if(e!=hipSuccess)throw std::runtime_error(hipGetErrorString(e));}
+using strix::hip_check;
 std::uint64_t mul(std::uint64_t a,std::uint64_t b){if(b && a>UINT64_MAX/b)throw std::overflow_error("MTP target window payload overflow");return a*b;}
 bool same(ExecutionMemoryBinding a,ExecutionMemoryBinding b){return a.execution_identity==b.execution_identity && a.arena_base==b.arena_base && a.arena_bytes==b.arena_bytes && a.allocation_generation==b.allocation_generation;}
 void copy_session(SerialSessionContext& to,const SerialSessionContext& from){
@@ -90,7 +91,7 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipMtpTargetWindowCapture::create(con
         model.vocab_size && model.vocab_size<=UINT32_MAX,"MTP window capture needs bounded actual all-head closed-window resources");
     validate_compiled_known_prefix_window(window,serial);validate_execution_memory_binding(window.window_execution_identity,window.arena.physical,scratch);
     require(scope.stream && !scope.graph_capture,"MTP window capture needs an owned eager stream");
-    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;check(hipStreamIsCapturing(scope.stream,&capture));
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;hip_check(hipStreamIsCapturing(scope.stream,&capture));
     require(capture==hipStreamCaptureStatusNone,"MTP capture preparation cannot enter active capture");
     const auto head=std::find_if(serial.execution.steps.begin(),serial.execution.steps.end(),[](const auto& s){return s.op==SerialOp::final_hyper_mix;});
     require(head!=serial.execution.steps.end() && head!=serial.execution.steps.begin(),"MTP window capture has no final wide producer");
@@ -164,11 +165,11 @@ void HipMtpTargetWindowCapture::record_row(const ExecutionDispatchContext& c){
     i.active->recorded[row]=1U;
     if(i.sources_contiguous){
         if(std::all_of(i.active->recorded.begin(),i.active->recorded.end(),[](auto x){return x==1U;}))
-            check(hipMemcpyAsync(reinterpret_cast<void*>(i.snapshots[0].address),reinterpret_cast<const void*>(i.source_views[0].address),
+            hip_check(hipMemcpyAsync(reinterpret_cast<void*>(i.snapshots[0].address),reinterpret_cast<const void*>(i.source_views[0].address),
                 static_cast<std::size_t>(i.row_bytes)*i.rows,hipMemcpyDeviceToDevice,i.scope.stream));
         return;
     }
-    check(hipMemcpyAsync(reinterpret_cast<void*>(i.snapshots[row].address),reinterpret_cast<const void*>(i.source_views[row].address),
+    hip_check(hipMemcpyAsync(reinterpret_cast<void*>(i.snapshots[row].address),reinterpret_cast<const void*>(i.source_views[row].address),
         static_cast<std::size_t>(i.row_bytes),hipMemcpyDeviceToDevice,i.scope.stream));
 }
 void HipMtpTargetWindowCapture::use_device_greedy(const HipGreedyRowsReply* replies) noexcept {impl_->device_greedy=replies;}
@@ -183,8 +184,7 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
             i.active->row_digests.push_back(raw_fp32_logits_digest(row));
         }
     }
-    const char* digest=std::getenv("STRIX_MTP_LOGITS_DIGEST");
-    if((digest && digest[0]=='1') || mtp_step_logits_digest_enabled()) {
+    if(mtp_logits_digest_enabled() || mtp_step_logits_digest_enabled()) {
         i.active->logit_digests.reserve(i.rows);
         for(std::uint32_t row=0;row<i.rows;++row) {
             std::vector<float> logits;
@@ -195,7 +195,7 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
                 std::fprintf(stderr,"mtp-step-logits physical capture=%p position=%llu epoch=%llu row=%u rows=%u vocab=%u sha256=%s\n",
                     static_cast<void*>(this),static_cast<unsigned long long>(i.active->base.next_position+row),
                     static_cast<unsigned long long>(i.active->epoch),row,i.rows,i.vocab,model_content_identity_hex(sha).c_str());
-            if(digest && digest[0]=='1') std::fprintf(stderr,"mtp-logits physical position=%llu epoch=%llu row=%u sha256=%s\n",
+            if(mtp_logits_digest_enabled()) std::fprintf(stderr,"mtp-logits physical position=%llu epoch=%llu row=%u sha256=%s\n",
                 static_cast<unsigned long long>(i.active->base.next_position+row),
                 static_cast<unsigned long long>(i.active->epoch),row,model_content_identity_hex(sha).c_str());
         }

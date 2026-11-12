@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qwen_prefill_handoff.hpp"
@@ -966,7 +967,7 @@ public:
             rows_.push_back({tokens[r], first_position + r, {values[r].begin(), values[r].end()}});
         tiled_rows_ += count;
         // STRIX_PREFILL_TIMING=1: host milliseconds of scoring and spooling each block on stderr.
-        static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+        static const bool timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
         if (timing)
             std::fprintf(stderr, "teacher block %llu rows: score %.1f ms\n", static_cast<unsigned long long>(count),
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_at).count());
@@ -4682,7 +4683,7 @@ static int run_decode_entry(
                 add_tiled(*stack);
                 batch_stacks.push_back(std::move(stack));
                 // STRIX_HTTP_SLOT_TIMING=1: setup time of every extra slot (stack, tiled owners).
-                static const bool timing = [] { const char* v = std::getenv("STRIX_HTTP_SLOT_TIMING"); return v && v[0] == '1'; }();
+                static const bool timing = strix::envcfg::flag("STRIX_HTTP_SLOT_TIMING", false);
                 if (timing) std::fprintf(stderr, "http slot %zu built: stack %.0f ms tiled %.0f ms\n", slot,
                     std::chrono::duration<double, std::milli>(stacked - built).count(),
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stacked).count());

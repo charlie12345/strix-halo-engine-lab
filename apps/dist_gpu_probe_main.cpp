@@ -16,6 +16,7 @@
 // GPU-direct, the breakdown of the progress thread (witness->submit, submit->RX complete, ->TX complete) and of the
 // stream (scatter, wait, gather).
 
+#include "strix/hip_check.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/env_flags.hpp"
 #include "xport/borrowed_transport.hpp"
@@ -41,9 +42,7 @@
 #include <vector>
 
 namespace {
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 double at(std::vector<double> v, double q) {
     std::sort(v.begin(), v.end());
     return v[std::min(v.size() - 1U, static_cast<std::size_t>(q * static_cast<double>(v.size())))];
@@ -66,7 +65,7 @@ struct Load {
     void* buffer = nullptr;
     explicit Load(bool on) {
         if (!on) return;
-        check(hipMalloc(&buffer, std::size_t{1} << 30U), "load buffer");
+        hip_check(hipMalloc(&buffer, std::size_t{1} << 30U), "load buffer");
         thread = std::thread([this] {
             hipStream_t s{};
             (void)hipStreamCreateWithFlags(&s, hipStreamNonBlocking);
@@ -119,10 +118,10 @@ int main(int argc, char** argv) try {
     if (rank == 0U && direct) std::cout << receipt << '\n';
     const std::size_t largest = *std::max_element(sizes.begin(), sizes.end());
     hipStream_t s{};
-    check(hipStreamCreate(&s), "stream");
+    hip_check(hipStreamCreate(&s), "stream");
     void *local = nullptr, *remote = nullptr;
-    check(hipMalloc(&local, largest), "local");
-    check(hipMalloc(&remote, largest), "remote");
+    hip_check(hipMalloc(&local, largest), "local");
+    hip_check(hipMalloc(&remote, largest), "remote");
     std::vector<std::uint32_t> got(largest / 4U);
     const unsigned pause_us = strix::env_number<unsigned>("STRIX_PROBE_PAUSE_US", 0U);
     const bool hot_gap = strix::env_flag_default_off("STRIX_PROBE_HOT_GAP");
@@ -170,9 +169,9 @@ int main(int argc, char** argv) try {
                 } else {
                     void* producer = staged ? c.send_staging(size) : local;
                     if (!producer) throw std::runtime_error("staged probe requires fused staging and a host route");
-                    check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(producer), static_cast<int>(value_of(i, rank)), size / 4U, s), "producer");
+                    hip_check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(producer), static_cast<int>(value_of(i, rank)), size / 4U, s), "producer");
                 }
-                check(hipStreamSynchronize(s), "producer");
+                hip_check(hipStreamSynchronize(s), "producer");
                 if (pause_us && hot_gap) {
                     const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(pause_us);
                     while (std::chrono::steady_clock::now() < until) {
@@ -208,12 +207,12 @@ int main(int argc, char** argv) try {
                 } else {
                     c.exchange(s, local, remote, size, strix::dist::Tag{1U, i, 0U});
                 }
-                check(hipStreamSynchronize(s), "exchange");
+                hip_check(hipStreamSynchronize(s), "exchange");
                 strix::dist::latency::mark("probe_h2d_sync_done", i);
                 const double t = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 if (!produced.data) available = t;
                 const double c1 = cpu_seconds();
-                check(hipMemcpy(got.data(), received, size, hipMemcpyDefault), "read back");
+                hip_check(hipMemcpy(got.data(), received, size, hipMemcpyDefault), "read back");
                 const auto expect = value_of(i, 1U - rank);
                 bad += std::all_of(got.begin(), got.begin() + static_cast<std::ptrdiff_t>(size / 4U), [&](std::uint32_t w) { return w == expect; }) ? 0U : 1U;
                 if (i >= 10U) {

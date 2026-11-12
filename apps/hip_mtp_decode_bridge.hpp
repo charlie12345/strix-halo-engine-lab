@@ -1,3 +1,5 @@
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/startup_markers.hpp"
 #pragma once
 #include "qwen_pair_transport.hpp"
@@ -353,7 +355,7 @@ public:
         if(tap_==SIZE_MAX)throw std::logic_error("tiled MTP prompt has no wide hidden tap step");
         // STRIX_PREFILL_PIPE=1: two tap buffers, so block k's predictor rows build on the MTP stream while block k+1 runs.
         const auto buffer=static_cast<std::size_t>(mtp_cli_mul(tiled_.rows,width_));
-        check(hipMalloc(reinterpret_cast<void**>(&block_hidden_),pipe_mtp()?2U*buffer:buffer),"tiled MTP hidden rows");
+        strix::hip_check(hipMalloc(reinterpret_cast<void**>(&block_hidden_),pipe_mtp()?2U*buffer:buffer),"tiled MTP hidden rows");
         hidden_allocation_=block_hidden_;
         if(pipe_mtp()) spare_hidden_=block_hidden_+buffer;
         plan_config_=tiled_.numerical_plan;
@@ -421,7 +423,7 @@ public:
             try {
                 if(submitter_.valid()) (void)submitter_.get();
                 if(runtime_.prime_hidden_rows_pending())
-                    check(hipStreamSynchronize(static_cast<hipStream_t>(runtime_.resources().stream())),"cancelled prefix producer drain");
+                    strix::hip_check(hipStreamSynchronize(static_cast<hipStream_t>(runtime_.resources().stream())),"cancelled prefix producer drain");
             } catch(...) {capture_->fatal();std::terminate();}
         } else {
             if(submitter_.valid()) submitter_.wait();
@@ -472,7 +474,7 @@ public:
                tail.backend->output_policy()==KnownWindowOutputPolicy::all_rows) return BatchNestedRecipe{{},0,"row_class"};
             owners.push_back(tail.rows);
         }
-        static const bool start=[]{const char* v=std::getenv("STRIX_MTP_TILED_START");return !v || v[0]!='0';}();
+        static const bool start=strix::envcfg::flag("STRIX_MTP_TILED_START", true);
         const bool heads=start && tiled_.blocks->output_policy()!=KnownWindowOutputPolicy::state_only;
         for(const auto& tail:tiled_.tails) if(tail.backend &&
             (start && tail.backend->output_policy()!=KnownWindowOutputPolicy::state_only)!=heads)
@@ -500,7 +502,7 @@ public:
                 // STRIX_QPF2K_SCHED bit 8 fail-closed: rows the ladder runs in one unit must not fall to a smaller tail
                 // owner or to the serial suffix (row classes sit on a 128-row grid per block; a pruned owner would change
                 // their arithmetic silently). Owners larger than the unit are skipped below and re-checked next pass.
-                static const bool start=[]{const char* v=std::getenv("STRIX_MTP_TILED_START");return !v || v[0]!='0';}();
+                static const bool start=strix::envcfg::flag("STRIX_MTP_TILED_START", true);
                 // rows the current owner may take (the step below: pos + rows <= n - 1, or == n with heads)
                 const bool theads=start && (tail_>=tiled_.tails.size() ||
                     tiled_.tails[tail_].backend->output_policy()!=KnownWindowOutputPolicy::state_only);
@@ -517,7 +519,7 @@ public:
             // STRIX_MTP_TILED_START=0: the last prompt row always runs serially (the previous handoff).
             // Otherwise a block that ends exactly at the last prompt row also computes that row's head, and
             // the first draft cycle starts from the block's last row (its tap and FP32 logits).
-            static const bool tiled_start=[]{const char* v=std::getenv("STRIX_MTP_TILED_START");return !v || v[0]!='0';}();
+            static const bool tiled_start=strix::envcfg::flag("STRIX_MTP_TILED_START", true);
             const bool heads=tiled_start && backend.output_policy()!=KnownWindowOutputPolicy::state_only;
             // STRIX_QPF2K_SCHED bit 16: balanced blocks on the T owner (the prompt's rows down to a multiple of 128 as
             // ceil(rest / T) blocks of a multiple of 128 rows <= T, each the first rows of the T arena; the last rest mod 128
@@ -586,7 +588,7 @@ public:
                 bool even=address[1]>address[0] && pitch>=width_ && bytes>=width_;
                 for(std::uint32_t r=2;even && r<rows;++r) even=address[r]-address[r-1U]==pitch;
                 if(even) {
-                    check(hipMemcpy2DAsync(block_hidden_,static_cast<std::size_t>(width_),reinterpret_cast<const void*>(address[0]),
+                    strix::hip_check(hipMemcpy2DAsync(block_hidden_,static_cast<std::size_t>(width_),reinterpret_cast<const void*>(address[0]),
                         static_cast<std::size_t>(pitch),static_cast<std::size_t>(width_),rows,hipMemcpyDeviceToDevice,stream),"tiled MTP tap rows copy");
                     return;
                 }
@@ -595,7 +597,7 @@ public:
                 const auto c=row(r);
                 const auto source=resolve_dispatch_write(c,0);
                 if(source.bytes<width_)throw std::logic_error("tiled MTP tap row is undersized");
-                check(hipMemcpyAsync(block_hidden_+static_cast<std::size_t>(r)*width_,reinterpret_cast<const void*>(source.address),
+                strix::hip_check(hipMemcpyAsync(block_hidden_+static_cast<std::size_t>(r)*width_,reinterpret_cast<const void*>(source.address),
                     static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP tap copy");
             }
         };
@@ -634,14 +636,14 @@ public:
             if((block.capture || tiled_.cache_tails) && tiled_.cache && !legacy_cache())
                 capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),
                     !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
-            int device=0;check(hipGetDevice(&device),"get priming device");
+            int device=0;strix::hip_check(hipGetDevice(&device),"get priming device");
             const auto submit=[this,device,stream,last,capture=capture_,views=std::move(views),next=std::move(next)] {
                 try {
-                    check(hipSetDevice(device),"bind priming device");
+                    strix::hip_check(hipSetDevice(device),"bind priming device");
                     const bool pending=runtime_.prime_hidden_rows_submit(qualified_,activated_,views,next,producer_rotary_);
-                    check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
+                    strix::hip_check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
                     if(capture) capture->submit_predictor(stream);
-                    if(!pending) check(hipStreamSynchronize(stream),"tiled MTP held copy");
+                    if(!pending) strix::hip_check(hipStreamSynchronize(stream),"tiled MTP held copy");
                     return pending;
                 } catch(...) {if(capture && capture->quarantine) capture->fatal();throw;}
             };
@@ -669,7 +671,7 @@ public:
                 block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
         }
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
-        check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
+        strix::hip_check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held copy");
         pos_+=rows;
         const bool complete=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
@@ -701,7 +703,7 @@ public:
         if(grouped)++grouped_blocks_;
         if(block.final) {
             // STRIX_PREFIX_CACHE_DIGEST=1: also the SHA-256 of the final row's FP32 logits in the receipt.
-            static const bool digest=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
+            static const bool digest=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST", false);
             if(digest) {
                 const auto bytes=std::as_bytes(std::span<const float>(logits));
                 final_logits_digest_=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
@@ -778,7 +780,7 @@ public:
         }
         // STRIX_PREFIX_CACHE_DIGEST=1: the end-of-prompt state digest wherever the component registry exists (a prefix
         // store, --rtx-state-import, STRIX_RTX_EXPORT_STATE or STRIX_PROMPT_STATE_DIGEST).
-        static const bool digest=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
+        static const bool digest=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST", false);
         if(digest) materialize_window();
         if(digest) {
             const auto terminal=adopted_?terminal_logits_digest_:pending_.terminal_logits_digest();
@@ -858,7 +860,6 @@ private:
     std::vector<QwenUnitExec> trace_;
     std::uint64_t request_order_=0;
     bool legacy_cache() const {return tiled_.cache && tiled_.cache->has_store() && tiled_.cache->store().policy().legacy;}
-    static void check(hipError_t e,const char* what){if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));}
     [[nodiscard]] MtpDeviceView view(const std::byte* p) const {return MtpDeviceView{reinterpret_cast<std::uintptr_t>(p),width_,1U};}
     // STRIX_PREFILL_PIPE (bit mask, default 0): 1 = a T block's predictor rows build on the MTP stream while the next
     // block runs (completed before any other use of the predictor, the held row or the prefix cache);
@@ -923,7 +924,7 @@ private:
     // row's, so the state, the predictor rows and the first token are the serial suffix's). Greedy requests only;
     // false (nothing ran) when the suffix has fewer than two rows or no window admits it.
     static bool prompt_window_enabled() {
-        static const bool on=[]{const char* v=std::getenv("STRIX_PROMPT_WINDOW");return !v || v[0]!='0';}();
+        static const bool on=strix::envcfg::flag("STRIX_PROMPT_WINDOW", true);
         return on;
     }
     bool run_window_rows() {
@@ -975,7 +976,7 @@ public:
         if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
         for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(tickets[r].view());next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
-        check(hipMemcpy(held_,reinterpret_cast<const void*>(tickets.back().view().address),static_cast<std::size_t>(width_),
+        strix::hip_check(hipMemcpy(held_,reinterpret_cast<const void*>(tickets.back().view().address),static_cast<std::size_t>(width_),
             hipMemcpyDeviceToDevice),"tiled MTP held window copy");
         pending_=std::move(tickets.back());pos_+=rows;window_rows_+=rows;
         window_pending_=true;
@@ -1017,7 +1018,7 @@ private:
             const std::array<MtpDeviceView,1> one{view(held_)};const std::array<std::uint32_t,1> token{tokens_[static_cast<std::size_t>(pos_)]};
             runtime_.prime_hidden_rows(qualified_,activated_,one,token,producer_rotary_);
         }
-        check(hipMemcpy(held_,reinterpret_cast<const void*>(ticket.view().address),static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
+        strix::hip_check(hipMemcpy(held_,reinterpret_cast<const void*>(ticket.view().address),static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held ticket copy");
         check_yarn_memory();
         pending_=std::move(ticket);++pos_;++serial_rows_;
@@ -1195,13 +1196,13 @@ public:
     EnableContext enable_context;
     // STRIX_BATCH_NGRAM_PEERS=1 (opt-in): each decoding request's n-gram extension also looks up the committed
     // contexts of the other decoding requests (joint speculation across concurrent conversations).
-    bool context_peers = [] { const char* v = std::getenv("STRIX_BATCH_NGRAM_PEERS"); return v && v[0] == '1'; }();
+    bool context_peers = strix::envcfg::flag("STRIX_BATCH_NGRAM_PEERS", false);
     // Strict tool-call frame proposals (strix/mtp_frame_draft.hpp): the template's <tool_call> / </tool_call> token
     // ids (set by the server from its tokenizer; {0, 0}: unavailable) and the engine default: on (exact, the target
     // verifies every row; not slower on the tool-call traces with the committed-prefix gate), STRIX_BATCH_TOOL_DRAFT=0
     // turns it off.
     std::array<std::uint32_t, 2> frame_tokens{};
-    bool tool_draft_default = [] { const char* v = std::getenv("STRIX_BATCH_TOOL_DRAFT"); return !(v && v[0] == '0'); }();
+    bool tool_draft_default = strix::envcfg::flag("STRIX_BATCH_TOOL_DRAFT", true);
     // interleave: a joining request's prompt advances one unit (a tiled block, a tail block or
     // `serial_rows_per_step` serial rows) per step, between the decode cycles of the others; otherwise
     // admit() runs the whole prompt.
@@ -1230,7 +1231,7 @@ public:
     std::function<std::unique_ptr<Slot>()> grow_factory;
     std::function<bool()> growth_memory_ok;
     // STRIX_HTTP_SPARE_SLOTS (default 1; 0 = grow only for queued work): keep one built slot free while capacity remains.
-    bool spare_slot_=[]{const char* v=std::getenv("STRIX_HTTP_SPARE_SLOTS");return !v || v[0]!='0';}();
+    bool spare_slot_=strix::envcfg::flag("STRIX_HTTP_SPARE_SLOTS", true);
     std::size_t slots_capacity = 0;
     // Called only by the engine loop, between steps and outside service callbacks.
     bool add_slot(bool queued) {
@@ -1549,7 +1550,7 @@ private:
             members.push_back({s->greedy.get(), &s->pending, depth(*s), budget(*s), s->request.stop_tokens,
                 static_cast<std::uint32_t>(slot),transactions.back().get()});
         }
-        static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
+        static const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
         auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr,joint?&policy_joint_:nullptr);
         for (std::size_t k = 0; k < live.size(); ++k) live[k]->result.shared_execution.add(results[k].shared);
         for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], std::move(results[k]));
@@ -1818,7 +1819,7 @@ private:
     // prompt's block is the one it would run alone, with the same per-row arithmetic. A prompt whose next unit
     // is serial rows, or a lone block, runs alone as before. Returns false when no group of two or more formed.
     static bool prompt_batch_enabled() {
-        static const bool on = [] { const char* v = std::getenv("STRIX_PROMPT_BATCH"); return !v || v[0] != '0'; }();
+        static const bool on = strix::envcfg::flag("STRIX_PROMPT_BATCH", true);
         return on;
     }
     static std::uint32_t prompt_batch_rows() {
@@ -1902,7 +1903,7 @@ private:
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         stats_.prompt_group_ms += ms;
         // STRIX_PROMPT_BATCH_LOG=1: one stderr line per group (blocks, rows, wall).
-        static const bool log = [] { const char* v = std::getenv("STRIX_PROMPT_BATCH_LOG"); return v && v[0] == '1'; }();
+        static const bool log = strix::envcfg::flag("STRIX_PROMPT_BATCH_LOG", false);
         if (log) {
             std::cerr << "prompt group " << stats_.prompt_groups << ": " << members.size() << " blocks, " << rows << " rows (";
             for (std::size_t k = 0; k < members.size(); ++k) std::cerr << (k ? "+" : "") << members[k].block.rows;
@@ -1915,7 +1916,7 @@ private:
     // and all run in one stream of steps (HipMtpWindowVerifier::prompt_rows_cohort); each prompt's window is the one
     // it runs alone. Returns false when the oldest prompt's next unit is no such window.
     static bool prompt_window_cohort_enabled() {
-        static const bool on = [] { const char* v = std::getenv("STRIX_PROMPT_WINDOW_COHORT"); return !v || v[0] != '0'; }();
+        static const bool on = strix::envcfg::flag("STRIX_PROMPT_WINDOW_COHORT", true);
         return on;
     }
     bool run_prompt_windows(Slot& oldest) {
@@ -1950,7 +1951,7 @@ private:
     void complete_prompt(Slot& s) {
         const auto& m = options_.mtp;
         s.pending = s.prefill->finish(s.prompt_receipt);
-        static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
+        static const bool state_digest=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST", false);
         if(state_digest && s.parents->tiled.cache)
             s.result.prompt_state_digest=model_content_identity_hex(s.parents->tiled.cache->state_digest(s.session->next_position));
         s.result.restored_tokens = s.prefill->restored();
@@ -2039,8 +2040,8 @@ private:
                 s.result.frame_cycles = fd->frame_cycles; s.result.frame_shadow = fd->cycles;
             }
         }
-        static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
-        static const bool final_digest=[] {const char* v=std::getenv("STRIX_FINAL_STATE_DIGEST");return v&&v[0]=='1';}();
+        static const bool state_digest=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST", false);
+        static const bool final_digest=strix::envcfg::flag("STRIX_FINAL_STATE_DIGEST", false);
         if((state_digest || final_digest) && s.parents->tiled.cache) {
             if(s.window && s.window->pending_window()) s.window->flush_pending_window();
             check_service(hipDeviceSynchronize(),"complete final committed state digest");
@@ -2048,7 +2049,7 @@ private:
             s.result.final_state_digest=model_content_identity_hex((prefix_batch_cert_execution_mode(options_)?s.parents->tiled.cache->state_digest(s.session->next_position,s.runtime->next_source_position()):
                 s.parents->tiled.cache->state_digest(s.session->next_position)));
             s.result.final_target_state_digest=model_content_identity_hex(s.parents->tiled.cache->state_digest(s.session->next_position,{},true));
-            static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
+            static const bool components=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS", false);
             if(components) s.result.final_state_components=s.parents->tiled.cache->component_digests(s.session->next_position);
         }
         if(state_digest && prefix_batch_cert_execution_mode(options_) && !s.request.constraint) {
@@ -2127,7 +2128,7 @@ private:
     // STRIX_BATCH_SERVICE_MS=0 and STRIX_BATCH_CANCEL_POINTS=0 retain the synchronous native path.
     double service_ms_=[] {const char* v=std::getenv("STRIX_BATCH_SERVICE_MS");return v?std::max(0.0,std::atof(v)):250.0;}();
     unsigned lookahead_=[] {const char* v=std::getenv("STRIX_BATCH_SERVICE_LOOKAHEAD");return v?static_cast<unsigned>(std::clamp(std::atol(v),0L,64L)):2U;}();
-    bool cancel_points_=[] {const char* v=std::getenv("STRIX_BATCH_CANCEL_POINTS");return !v || v[0]!='0';}();
+    bool cancel_points_=strix::envcfg::flag("STRIX_BATCH_CANCEL_POINTS", true);
     bool engine_call_=false;
     int device_=0;
     std::uint64_t nest_rows_=[] {const char* v=std::getenv("STRIX_BATCH_NEST_ROWS");return v?std::strtoull(v,nullptr,10):2048ULL;}();
@@ -2594,7 +2595,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         pending=run_tiled_mtp_prompt(q.prompt,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
                             r,dispatcher,tiled_held,request_receipt,{},
                             q.constraint?HipMtpHostRowSelector{[state=q.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},q.on_progress);
-                        static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
+                        static const bool state_digest=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST", false);
                         if(state_digest && parents->tiled.cache)
                             out.prompt_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
                         if(q.constraint) q.constraint->commit();
@@ -2665,14 +2666,14 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         }
                         if(const auto* ng=greedy.ngram_stats()){out.ngram_rows=ng->extension_rows;out.ngram_accepted=ng->accepted_rows;}
                         if(const auto* cd=greedy.context_stats()){out.ngram_rows=cd->extension_rows;out.ngram_accepted=cd->accepted_rows;}
-                        static const bool final_digest=[] {const char* v=std::getenv("STRIX_FINAL_STATE_DIGEST");return v&&v[0]=='1';}();
+                        static const bool final_digest=strix::envcfg::flag("STRIX_FINAL_STATE_DIGEST", false);
                         if((state_digest || final_digest) && parents->tiled.cache) {
                             if(window && window->pending_window())window->flush_pending_window();
                             if(hipDeviceSynchronize()!=hipSuccess) throw std::runtime_error("complete final committed state digest");
                             out.final_state_position=session.next_position;
                             out.final_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
                             out.final_target_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position,{},true));
-                            static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
+                            static const bool components=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS", false);
                             if(components) out.final_state_components=parents->tiled.cache->component_digests(session.next_position);
                         }
                         out.paid_drafts=runtime->execution_stats().full_forward_rows-draft_rows_begin;
@@ -2735,7 +2736,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     if(setup.parents->tiled.cache) extend_cache(*setup.parents->tiled.cache,*slot->native,held);
                     install_restore(*slot);
                     // STRIX_HTTP_SLOT_TIMING=1: MTP resources, target capture and window owners of every slot.
-                    static const bool slot_timing=[]{const char* v=std::getenv("STRIX_HTTP_SLOT_TIMING");return v && v[0]=='1';}();
+                    static const bool slot_timing=strix::envcfg::flag("STRIX_HTTP_SLOT_TIMING", false);
                     if(slot_timing) std::fprintf(stderr,"batched MTP slot %zu prepared in %.0f ms\n",index,
                         std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-slot_begin).count());
                     return slot;

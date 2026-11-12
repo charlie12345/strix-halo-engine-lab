@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/file_snapshot.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
@@ -54,7 +56,7 @@ namespace strix::deepseek41 {
 namespace {
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("deepseek41 device forward: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("deepseek41 device forward: ", e, what);
 }
 
 std::uint64_t fnv(const std::vector<float>& v) {
@@ -1056,14 +1058,8 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         return v && *v == '1';
     }());
     // P13 defaults (after P12): HC_SITE, QA_KV, ENGRAM_ASYNC and COMPRESS_RING on, =0 turns each off.
-    m.engram_async = [] {
-        const char* v = std::getenv("STRIX_DS41_ENGRAM_ASYNC");
-        return !(v && *v == '0');
-    }();
-    m.compress_ring = [] {
-        const char* v = std::getenv("STRIX_DS41_COMPRESS_RING");
-        return !(v && *v == '0');
-    }();
+    m.engram_async = strix::envcfg::flag("STRIX_DS41_ENGRAM_ASYNC", true);
+    m.compress_ring = strix::envcfg::flag("STRIX_DS41_COMPRESS_RING", true);
     if (m.split_shared && (I % 64U != 0U || H % 2U != 0U)) throw std::invalid_argument("deepseek41 device forward: shared split geometry");
     if (m.split_shared)
         for (const auto& s : m.plan.steps)
@@ -1857,7 +1853,7 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
         dv.out = m.shared.p;
         ds41::enqueue_routes_product(down_fmt, dv, st);
     };
-    const bool overlap_shared = [] { const char* v = std::getenv("STRIX_DS41_EP_OVERLAP"); return !(v && v[0] == '0'); }();
+    const bool overlap_shared = strix::envcfg::flag("STRIX_DS41_EP_OVERLAP", true);
     const Step* deferred_shared = nullptr;
     std::vector<double> op_exchange;  // op_timing: host seconds in the communicator per plan step
     const bool step_events = m.options.op_timing || (tr && tr->level() == 1);  // one device event after every plan step
@@ -1869,13 +1865,13 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
     // STRIX_DS41_HC_SITE=1: each hyper-connection boundary (the previous sublayer's expansion, this site's mixes, the
     // collapse, the RMSNorm and the A8 of x) as one enqueue_hc_site, same bits. The expansion waits for the next
     // site (or the Engram injection, or the head). Off with op hashes or layer timing, which need every step's output.
-    static const bool hc_site_flag = [] { const char* v = std::getenv("STRIX_DS41_HC_SITE"); return !(v && v[0] == '0'); }();
+    static const bool hc_site_flag = strix::envcfg::flag("STRIX_DS41_HC_SITE", true);
     // STRIX_DS41_QA_KV=1: q_a and kv in one launch over one A8 of the attention input, same bits.
     // QA_KV off by default since P15 (P13/P14: -0.15 to -0.2 ms at R1 without it, 0 at R6); =1 turns it on
-    static const bool qa_kv_flag = [] { const char* v = std::getenv("STRIX_DS41_QA_KV"); return v && v[0] == '1'; }();
+    static const bool qa_kv_flag = strix::envcfg::flag("STRIX_DS41_QA_KV", false);
     // STRIX_DS41_ATTN_A8=1: the attention combine writes the A8 of its output for o_a, and o_a the A8 of its output
     // for o_b (in the product kernel when one block owns whole groups), same bits.
-    static const bool attn_a8 = [] { const char* v = std::getenv("STRIX_DS41_ATTN_A8"); return v && v[0] == '1'; }();
+    static const bool attn_a8 = strix::envcfg::flag("STRIX_DS41_ATTN_A8", false);
     const bool fuse_hc = hc_site_flag && !hashing && !m.options.layer_timing;
     const bool fuse_qa_kv = qa_kv_flag && !hashing;
     struct PendingPost { bool on = false; const float* sub = nullptr; const float* residual = nullptr; const ds41::HcMix* mixes = nullptr; };
@@ -1906,7 +1902,7 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
         late_mix = nullptr;
     };
     // Residual boundary fusions; each flag is independent (QNORM_A8 off by default, ROUTES on by default).
-    static const bool qnorm_a8 = [] { const char* v = std::getenv("STRIX_DS41_R1FUSE_QNORM_A8"); return v && v[0] == '1'; }();
+    static const bool qnorm_a8 = strix::envcfg::flag("STRIX_DS41_R1FUSE_QNORM_A8", false);
     const bool router_routes = ds41::r1fuse_routes();  // STRIX_DS41_R1FUSE_ROUTES: default on, =0 off
     bool q_a8 = false, routes_ready = false;
     const auto route_view = [&] {
@@ -1982,7 +1978,7 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
     // STRIX_DS41_DECODE_PREFETCH: the weights of the steps after `from` (whole tensors in step order, the last one cut)
     // up to prefetch_bytes, on the prefetch stream once the main one reaches this point; routed experts (rows unknown),
     // embeddings, trellis sites (their own pack) and, TP, wo_b (K-halves of every row) are skipped.
-    static const bool past_experts = [] { const char* v = std::getenv("STRIX_DS41_PREFETCH_PAST_EXPERTS"); return v && v[0] == '1'; }();
+    static const bool past_experts = strix::envcfg::flag("STRIX_DS41_PREFETCH_PAST_EXPERTS", false);
     const auto prefetch_after = [&](const Step& from) {
         if (m.prefetch_bytes == 0U) return;
         check(hipEventRecord(m.prefetch_ready, st), "prefetch event");

@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_prefill.hpp"
@@ -49,9 +50,7 @@
 // (--state-in of the whole prompt): equal hashes = prefill and decode agree at that length.
 namespace {
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 
 struct Args {
     std::string model, prompt_path, transport, state_in, state_out, tokens_out, logits_out;
@@ -76,7 +75,7 @@ double since(std::chrono::steady_clock::time_point t0) { return std::chrono::dur
 // Device memory used / total (GiB) and the host's MemAvailable (GiB): one line per stage.
 void memory_line(const char* who, const char* stage) {
     std::size_t free_b = 0, total_b = 0;
-    check(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo");
+    hip_check(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo");
     double avail = 0.0;
     std::ifstream mi("/proc/meminfo");
     for (std::string k; mi >> k;) {
@@ -111,12 +110,12 @@ void barrier(strix::dist::Communicator* comm, std::uint32_t round) {
     if (comm == nullptr) return;
     void* buffers = nullptr;
     hipStream_t stream = nullptr;
-    check(hipMalloc(&buffers, 8), "barrier");
-    check(hipStreamCreate(&stream), "barrier");
-    check(hipMemsetAsync(buffers, 0, 8, stream), "barrier");
+    hip_check(hipMalloc(&buffers, 8), "barrier");
+    hip_check(hipStreamCreate(&stream), "barrier");
+    hip_check(hipMemsetAsync(buffers, 0, 8, stream), "barrier");
     comm->exchange(stream, buffers, static_cast<char*>(buffers) + 4, 4,
                    strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 7U, round});
-    check(hipStreamSynchronize(stream), "barrier");
+    hip_check(hipStreamSynchronize(stream), "barrier");
     (void)hipStreamDestroy(stream);
     (void)hipFree(buffers);
 }

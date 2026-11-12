@@ -21,6 +21,7 @@
 // Stage width, tiling, grid order and LDS layout do not change any (row, output) value: each accumulator sees
 // the same operands in the same K16 order whatever block, launch or row count it lands in.
 
+#include "strix/env_flags.hpp"
 #include <atomic>
 #include <cstdio>
 #include <map>
@@ -47,7 +48,7 @@ static_assert((kBM / kWM) * kWavesN == kThreadsT / 32U);
 __host__ __device__ constexpr std::uint32_t scratch_pitch(std::uint32_t width) { return width + 64U; }
 
 inline bool enabled() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_DENSE", false);
     // GSQ owners must keep their typed projections; these tiled loaders assume Q8_0.
     return on && !qpf2k::suppressed(qpf2k::Item::dense);
 }
@@ -62,7 +63,7 @@ inline bool site_enabled(unsigned bit) {
 // T 512) had them slower than the engine launches (GDN in cold 1.019 / warm 1.042, shared gate|up warm 1.103), every
 // other site and every T >= 1024 faster. Routing only: a call runs either form, the bits are the same.
 inline unsigned min_rows(unsigned bit = 0U) {
-    static const int n = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE_MIN_ROWS"); return v ? std::atoi(v) : -1; }();
+    static const int n = strix::envcfg::integer("STRIX_QPF2K_DENSE_MIN_ROWS", -1);
     if (n >= 0) return static_cast<unsigned>(n);
     return bit == 1U || bit == 16U ? 1024U : 512U;
 }
@@ -158,7 +159,7 @@ template <unsigned BN> struct TileShape {
 // zero scratch and <= 192 VGPRs on each built code object. "+&v": the WMMA's tied, early-clobber D (as LLVM's builtin), so
 // D never shares registers with A/B. Same instruction on the same values: only the register assignment changes.
 inline bool wmma_pin() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_WMMA_PIN"); return !v || v[0] != '0'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_WMMA_PIN", true);
     return on;
 }
 template <unsigned BSlot> __device__ __forceinline__ f8 wmma_pinned(Frag a, Frag b, f8 c) {
@@ -636,7 +637,7 @@ template <class Site> unsigned form(unsigned mode) {
 template <class Site> unsigned mode_of(const Site& site) {
     if constexpr (sizeof(typename Site::Input) == 4U) return kF32;
     else {
-        static const int forced = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE_INLINE"); return v ? std::atoi(v) : -1; }();
+        static const int forced = strix::envcfg::integer("STRIX_QPF2K_DENSE_INLINE", -1);
         if (forced == 0 || forced == 1) return forced ? kBf16 : kPre;
         // rev 6c: BF16 rows always convert while staging. With form 4 (two blocks per WGP) the staging VALU is hidden
         // and the convert launch's DRAM pass is gone (t8 bench: GDN in 17.02 vs 17.80 ms, QSA q|k|v 14.31 vs 15.23 ms
@@ -716,7 +717,7 @@ void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_o
     if (!supported(site, rows, mode)) throw std::invalid_argument("q8_rows tiled: unsupported dense projection");
     if (!raster_m) raster_m = raster(mode);
     // STRIX_QPF2K_DENSE_TRACE=1: one stderr line per site type on its first launch (route witness).
-    static const bool trace = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE_TRACE"); return v && v[0] == '1'; }();
+    static const bool trace = strix::envcfg::flag("STRIX_QPF2K_DENSE_TRACE", false);
     if (trace) {
         static std::atomic<unsigned> launches{0};
         if (launches.fetch_add(1U, std::memory_order_relaxed) == 0U)

@@ -9,8 +9,8 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0x3e34f77a097040d9ULL},
-{"apps/minimax_rank_main.cpp", 0x58f8518bff026bdaULL},
+{"CMakeLists.txt", 0x0b77d67dc6acb6bbULL},
+{"apps/minimax_rank_main.cpp", 0x38254f78be4c8facULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
 {"cmake/StrixSession.cmake", 0x601f2c283c891929ULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
@@ -45,10 +45,11 @@
 {"src/minimax/attn/index_proj.hip", 0x78459dee817467feULL},
 {"src/minimax/attn/index_proj.hpp", 0x393a96aa17edfaddULL},
 {"src/minimax/attn/index_proj_tests.hip", 0x6ea8470ed347627aULL},
-{"src/minimax/attn/msa_fused.hip", 0x5a2e09bce60f36b3ULL},
+{"src/minimax/attn/msa_fused.hip", 0x7d2d669100470a02ULL},
 {"src/minimax/attn/msa_fused.hpp", 0xff7dc628a4f16e10ULL},
 {"src/minimax/attn/msa_fused_tests.hip", 0xd3778b6cb4cd72f7ULL},
 {"src/minimax/attn/msa_inblock_layout.hpp", 0x617784020ff4b04fULL},
+{"src/minimax/attn/msa_select_dump.hpp", 0x4dbfd12e5fbd97c7ULL},
 {"src/minimax/dspark/hip_minimax_dspark.hip", 0xe782acce2a794867ULL},
 {"src/minimax/dspark/hip_minimax_dspark.hpp", 0x07abbf09ee18c203ULL},
 {"src/minimax/dspark/markov_cand.hip", 0xa69626ce88e61fa6ULL},

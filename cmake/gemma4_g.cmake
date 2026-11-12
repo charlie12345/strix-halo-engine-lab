@@ -28,6 +28,7 @@ if(STRIX_FAMILY_GEMMA4 AND BUILD_TESTING)
         add_executable(strix-gemma4-${test_stem}-tests tests/gemma4_session/${test}_tests.cpp)
         target_link_libraries(strix-gemma4-${test_stem}-tests PRIVATE strix_gemma4_engine)
         strix_target_warnings(strix-gemma4-${test_stem}-tests)
+        strix_session_test_style(strix-gemma4-${test_stem}-tests)
         if(test STREQUAL "turn_cache_integration")
             add_test(NAME gemma4-session-${test_stem} COMMAND strix-gemma4-${test_stem}-tests
                 "${CMAKE_CURRENT_BINARY_DIR}/gemma4-turn-cache-fixture")
@@ -39,6 +40,7 @@ if(STRIX_FAMILY_GEMMA4 AND BUILD_TESTING)
     add_executable(strix-gemma4-shared-api-tests tests/gemma4_session/shared_api_tests.cpp)
     target_link_libraries(strix-gemma4-shared-api-tests PRIVATE strix_gemma4_engine)
     strix_target_warnings(strix-gemma4-shared-api-tests)
+    strix_session_test_style(strix-gemma4-shared-api-tests)
     add_test(NAME gemma4-session-shared-api COMMAND strix-gemma4-shared-api-tests
         "${CMAKE_CURRENT_BINARY_DIR}/gemma4-shared-api-fixture")
     set_tests_properties(gemma4-session-shared-api PROPERTIES LABELS "cpu;gemma4;session;api" TIMEOUT 180)
@@ -48,6 +50,7 @@ if(STRIX_FAMILY_GEMMA4 AND BUILD_TESTING)
         G4_SESSION_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
         G4_SESSION_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/gemma4_session/fixtures")
     strix_target_warnings(strix-gemma4-session-tests)
+    strix_session_test_style(strix-gemma4-session-tests)
     if(Python3_Interpreter_FOUND)
         add_test(NAME gemma4-session-tokenizer COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemma4_serve/make_deployment_fixture.py

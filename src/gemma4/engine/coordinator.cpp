@@ -903,7 +903,8 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
             work.push_back(std::move(w));
         }
         const auto target_start = Clock::now();
-        const auto out = plans.empty() ? ForwardResult{0,backend_.config().vocab,5*backend_.config().hidden} : backend_.forward_rows(plans);
+        const auto empty_result = [&] { ForwardResult r; r.vocab = backend_.config().vocab; r.tap_width = 5*backend_.config().hidden; return r; };
+        const auto out = plans.empty() ? empty_result() : backend_.forward_rows(plans);
         const auto verify_ms = elapsed(target_start);
         // A backend that checked its outputs on the device may omit logits/taps no
         // row exported, and returns its greedy winners (the host tie rule).
@@ -993,7 +994,8 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
             // As in the device cycle helper, statistics/output become visible
             // only after both target and draft publications have succeeded.
             if (!w.prefill) add(s.out.acceptance,w.delta);
-            if (!w.retained) ++s.out.target_calls; s.out.target_rows += w.rows;
+            if (!w.retained) ++s.out.target_calls;
+            s.out.target_rows += w.rows;
             s.out.frontier = s.state->frontier();
             if (w.prefill) { if (!s.input_mode) s.prompt_processed += processed; }
             else {

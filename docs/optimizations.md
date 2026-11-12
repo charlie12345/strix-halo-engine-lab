@@ -18,17 +18,19 @@ that it is bit-changing and qualification is in progress. On other routes, inclu
 HTTP and MTP, the row stays `pending` with the same reason as an explicit request's
 decline, keeps FP32 route storage and is not exported or stamped as applied. If no
 provisional or unqualified row runs, the qualification stamp is `qualified`.
-Attention budget, FP16 recurrent chunks and output head remain pending: builtin paths continue,
-with one notice per row and declared targets in `profile.pending`. The FP16 recurrent chunk row
-(`STRIX_QPF2K_GDN_FP16_CHUNK`, [chunked GDN prefill](#qwen-gdn-chunk)) is runnable but awaits fidelity qualification.
+The FP16 recurrent chunk row (`STRIX_QPF2K_GDN_FP16_CHUNK=1`, [chunked GDN prefill](#qwen-gdn-chunk)) and the attention
+budget row (`STRIX_QPF2K_QSA_BUDGET=1536`) are provisional in the same way: fast exports them without `--allow-pending`
+and the stamp lists every applied provisional row (`qualification in progress: qsa_budget,moe_route_bf16,gdn_fp16_chunk`).
+Single-node screen of the three rows together, plain CLI, 8K prompts: pooled KL 0.0040, top-1 agreement 97.5 %,
+NLL change -0.039 on 7 held-out prompts (1,792 teacher-forced rows); prefill 8K / 32K / 128K +7.2 / +7.9 / +7.9 %.
+The output head row remains pending: its builtin path continues, with one notice and its declared target in `profile.pending`.
 `quality` runs default settings with one notice because no quality pack exists.
 
 Explicit environment variables and lever options override the profile, including
 explicit off. `--allow-pending` / `STRIX_QWEN_PROFILE_ALLOW_PENDING=1` applies only
 runnable genuinely pending rows for benchmarks and stamps `unqualified: <rows>`.
 When combined with provisional rows, this follows the qualification-in-progress
-stamp, separated by `; `. Of the three pending rows only the FP16 recurrent chunk row is runnable,
-so with this flag fast also exports `STRIX_QPF2K_GDN_FP16_CHUNK=1` and stamps `unqualified: gdn_fp16_chunk`. The existing
+stamp, separated by `; `. No pending row of the table is runnable today, so this flag does not change fast's resolution. The existing
 `--prefill-moe-route-bf16` contract is preserved. On YaRN, profile rows refused by
 rotary admission stay pending with their reason and are not exported or stamped
 as applied; selection alone cannot cause that refusal. Required assets remain
@@ -570,7 +572,7 @@ The decay-NaN dispatch block pairs of the fused GDN core run 16-row chunks with 
 ### Chunked GDN prefill on FP16 WMMA (FAST)
 
 **Engine:** `qwen`. **Control:** `STRIX_QPF2K_GDN_FP16_CHUNK=1` or `--gdn-fp16-chunk 1`. **Default:** OFF (profile `fast`
-row `gdn_fp16_chunk`, pending qualification).
+row `gdn_fp16_chunk`, provisional: applied by `--profile fast`, qualification in progress).
 
 Replaces conv, recurrence and gated norm of the GDN prefill row route with identity `qwen-gdn-fp16-chunk rev 2`
 ([contract](engine/kernels/gdn-fp16-chunk.md)): 32-row chunks in WY form, FP16 WMMA operands with FP32 accumulation,

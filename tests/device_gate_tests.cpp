@@ -108,6 +108,27 @@ void identities() {
     require(pci_from_parts(0, 0xc5, 0) == "0000:c5:00.0", "pci parts");
 }
 
+void listing() {
+    const auto cards = parse_nvidia_smi("0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, 97887, NVIDIA RTX PRO 6000\r\n"
+                                        "1, GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, 00000000:05:00.0, 24564, NVIDIA GeForce RTX 4090\n\n");
+    require(cards.size() == 2 && cards[0].ordinal == 0 && cards[1].ordinal == 1, "listing size and order");
+    require(cards[0].uuid == normalise_uuid(uuid_a) && cards[0].pci == "0000:01:00.0" && cards[0].name == "NVIDIA RTX PRO 6000", "listing identity");
+    require(cards[1].memory_bytes == (24564ULL << 20U) && cards[1].name == "NVIDIA GeForce RTX 4090" && cards[1].vendor == Vendor::nvidia,
+            "listing memory and name");
+    require(parse_nvidia_smi("").empty(), "empty listing");
+    rejects([] { (void)parse_nvidia_smi("No devices were found\n"); }, "nvidia-smi", "listing without fields");
+    rejects([] { (void)parse_nvidia_smi("0, not-a-uuid, 00000000:01:00.0, 1, card\n"); }, "nvidia-smi", "listing with a bad uuid");
+    rejects([] { (void)parse_nvidia_smi("x, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, 1, card\n"); }, "nvidia-smi",
+            "listing with a bad index");
+    // The listing feeds the same gate: the excluded card is refused whatever its index.
+    const auto d = parse_declaration(lab, "devices.toml");
+    Request request;
+    request.vendor = Vendor::nvidia;
+    require(resolve(&d, cards, request).visible.uuid == normalise_uuid(uuid_a), "listing resolves to the declared card");
+    request.select = "spare";
+    rejects([&] { (void)resolve(&d, cards, request); }, "denied by policy", "listing cannot select the excluded card");
+}
+
 void parser() {
     const auto d = parse_declaration(lab);
     require(d.devices.size() == 2 && d.policies.size() == 1 && d.machine == "workstation", "declaration shape");
@@ -278,6 +299,7 @@ int main() {
 #endif
     try {
         identities();
+        listing();
         parser();
         gate();
         entry_points();

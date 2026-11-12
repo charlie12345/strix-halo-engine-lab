@@ -6560,8 +6560,7 @@ static int run_decode_entry(
                 << "  \"known_prefix_source_logical_weight_bytes_avoided_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->logical_projection_weight_bytes_avoided) << ",\n";
         }
         if (generation_request_timing_enabled)  // shared power receipt of the timed request (strix/power/sampler.hpp)
-            std::cout << "  \"power\":" << strix::power::block_json(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())) << ",
-";
+            std::cout << "  \"power\":" << strix::power::block_json(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())) << ",\n";
         if (generation_request_timing_enabled)
             std::cout << "  \"generation_request_elapsed_ms\":" << generation_request_elapsed_ms << ",\n"
                       << "  \"generation_request_output_tokens\":" << result.generated_tokens.size() << ",\n"

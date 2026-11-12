@@ -1,5 +1,6 @@
 #include "strix/mtp_window_controller.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
+#include "strix/serve/row_budget.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -183,7 +184,12 @@ std::array<std::uint32_t,3> batch_key(std::span<const std::uint32_t> rows) {
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::rule_from_env(bool baseline) {
     const char* v=std::getenv("STRIX_MTP_JOINT_PLAN");
+    if(!v && mtp_serve_row_budget_enabled()) return parse_rule("budget");
     return v?parse_rule(v):parse_rule(baseline?"production":"calibrated-c3");
+}
+bool mtp_serve_row_budget_enabled() noexcept {
+    static const bool on=[]{const char* v=std::getenv("STRIX_SERVE_ROW_BUDGET");return v && v[0]=='1' && v[1]==0;}();
+    return on;
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_view text) {
     Rule rule;
@@ -192,6 +198,7 @@ MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_
     if(text.find("calibrated-c3")!=std::string_view::npos) rule.calibrated_min_members=3;
     if(text.find("cap4")!=std::string_view::npos) rule.cap=4;
     if(text.find("cap2")!=std::string_view::npos) rule.cap=2;
+    if(text.find("budget")!=std::string_view::npos) rule.budget=true;
     return rule;
 }
 std::size_t MtpBatchWindowController::calibration_bin(double p) {
@@ -272,6 +279,79 @@ std::vector<std::uint32_t> MtpBatchWindowController::search(std::span<const Requ
     }
     return best;
 }
+MtpBatchWindowController::BudgetCost MtpBatchWindowController::budget_cost() const {
+    static const BudgetCost pinned=[]{
+        BudgetCost c;const char* v=std::getenv("STRIX_SERVE_ROW_COST");
+        if(v) {char* end=nullptr;const double f=std::strtod(v,&end);
+            if(end && *end==',') {const double r=std::strtod(end+1,nullptr);
+                if(f>0.0 && r>0.0 && std::isfinite(f) && std::isfinite(r)) {c.fixed_ms=f;c.row_ms=r;c.fitted=true;}}}
+        return c;}();
+    if(pinned.fitted) return {pinned.fixed_ms,pinned.row_ms,false};
+    // Least squares of the measured topologies' cycle ms on their physical rows.
+    double n=0.0,sx=0.0,sy=0.0,sxx=0.0,sxy=0.0;
+    for(const auto& [k,v]:costs_) {
+        if(!v.samples()) continue;
+        const double x=2.0*k[0]+4.0*k[1]+8.0*k[2],y=v.value();
+        n+=1.0;sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;
+    }
+    const double det=n*sxx-sx*sx;
+    if(n<2.0 || !(det>0.0)) return {};
+    const double row=(n*sxy-sx*sy)/det,fixed=(sy-row*sx)/n;
+    if(!(row>0.0) || !(fixed>0.0) || !std::isfinite(row) || !std::isfinite(fixed)) return {};
+    return {fixed,row,true};
+}
+std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const Request> q,std::uint32_t budget,bool prior,
+    PlanInfo* info) const {
+    if(q.empty() || q.size()>8U || budget<2U*q.size())
+        throw std::invalid_argument("joint MTP windows require 1..8 requests and two physical rows each");
+    for(const auto& r:q) if(r.limit!=2U && r.limit!=4U && r.limit!=8U)
+        throw std::invalid_argument("joint MTP window limit must be an admitted owner");
+    // accept[0] is the committed target row; row d + 2 is useful when draft d is accepted. Before drafting the
+    // draft's chance is the 0.8 prior, afterwards its own probability, both blended with the slot's history
+    // (the production rule's blend).
+    std::vector<std::array<float,8>> accept(q.size());
+    std::vector<serve::LaneDemand> lanes(q.size());
+    for(std::size_t k=0;k<q.size();++k) {
+        const auto& h=history_.at(q[k].slot);
+        std::uint32_t most=prior?std::min(q[k].limit,std::max(rule_.cap,2U)):q[k].limit;
+        accept[k][0]=1.0F;
+        for(std::size_t d=0;d<7U;++d) {
+            const double p=prior?0.8:d<q[k].probabilities.size()?std::clamp(static_cast<double>(q[k].probabilities[d]),0.0,1.0):0.0;
+            accept[k][d+1U]=static_cast<float>((h.hits[d]+4.0*p)/(h.seen[d]+4.0));
+        }
+        lanes[k]={q[k].slot,most,2U,most,std::span<const float>(accept[k]),0.0};
+    }
+    const auto model=budget_cost();
+    const double draft_ms=prior?(draft_.samples()?draft_.value():1.2):0.0;
+    const serve::CycleCost cost{model.fixed_ms,model.row_ms,0.0,draft_ms};
+    const serve::RowLimits limits{budget,{},static_cast<std::uint32_t>(q.size()),0.0};
+    const auto plan=serve::plan_rows(lanes,cost,limits);
+    // Owners hold 2, 4 or 8 rows: each lane keeps the largest owner inside its planned rows.
+    std::vector<std::uint32_t> out(q.size(),2U);
+    std::uint32_t used=0;
+    for(std::size_t k=0;k<q.size();++k) {
+        const auto r=k<plan.rows.size()?plan.rows[k]:2U;
+        out[k]=r>=8U?8U:r>=4U?4U:2U;
+        used+=out[k];
+    }
+    // Small primaries have exactly four or eight rows (see search): pad the most promising two-row lane, or
+    // keep the two-row chunks when no lane can take four.
+    if(used<9U && used!=4U && used!=8U) {
+        std::size_t best=q.size();
+        for(std::size_t k=0;k<q.size();++k) if(out[k]==2U && q[k].limit>=4U && (!prior || rule_.cap>=4U) && used+2U<=budget &&
+            (best==q.size() || accept[k][1]>accept[best][1])) best=k;
+        if(best!=q.size() && (used+2U==4U || used+2U==8U)) {out[best]=4U;used+=2U;}
+        else std::fill(out.begin(),out.end(),2U);
+    }
+    if(prior) {
+        // Two physical rows are the minimum either way; the one draft that fills the second row is bought only
+        // when its chance beats its cost at the plan's rate.
+        const double rate=plan.expected_ms>0.0?plan.expected_tokens/plan.expected_ms:0.0;
+        for(std::size_t k=0;k<q.size();++k) if(out[k]==2U && static_cast<double>(accept[k][1])<=draft_ms*rate) out[k]=0U;
+    }
+    if(info) *info=estimate(q,out,prior);
+    return out;
+}
 MtpBatchWindowController::PlanInfo MtpBatchWindowController::estimate(std::span<const Request> q,
     std::span<const std::uint32_t> rows,bool prior) const {
     double e=0.0;std::uint32_t drafts=0;
@@ -280,7 +360,7 @@ MtpBatchWindowController::PlanInfo MtpBatchWindowController::estimate(std::span<
 }
 std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Request> q,std::uint32_t budget) {
     plan_members_=q.size();
-    auto out=search(q,budget,true,&last_);
+    auto out=rule_.budget?budget_rows(q,budget,true,&last_):search(q,budget,true,&last_);
     probe_.clear();
     auto& plans=plans_.at(q.size());
     // Bounded exploration samples deeper windows even after a low-acceptance
@@ -309,7 +389,7 @@ std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Reques
 }
 std::vector<std::uint32_t> MtpBatchWindowController::choose(std::span<const Request> q,std::uint32_t budget) const {
     if(!probe_.empty()) return probe_;
-    return search(q,budget,false);
+    return rule_.budget?budget_rows(q,budget,false):search(q,budget,false);
 }
 void MtpBatchWindowController::observe(std::span<const Request> q,std::span<const std::uint32_t> rows,
     std::span<const std::uint32_t> accepted,double draft_ms,double target_ms,std::uint32_t steps) {

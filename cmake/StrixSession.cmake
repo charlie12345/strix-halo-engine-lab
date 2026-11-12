@@ -31,6 +31,11 @@ target_compile_features(strix_session PUBLIC cxx_std_20)
 target_link_libraries(strix_session PUBLIC strix_state_cache)
 set_target_properties(strix_session PROPERTIES CXX_EXTENSIONS OFF)
 strix_session_warnings(strix_session)
+# The execution owner has no dependency on an HTTP implementation. Replay's
+# observed queue and production's queue both link this same host owner archive.
+add_library(strix_session_owner STATIC "${_strix_session_root}/src/serve/session_runtime.cpp")
+target_link_libraries(strix_session_owner PUBLIC strix_session)
+strix_session_warnings(strix_session_owner)
 
 # Central host contract/test registration. Add future cost/config (PR2),
 # protocol (PR3) and runner (PR5) implementations to strix_session above and
@@ -54,6 +59,26 @@ function(strix_session_add_contract_tests)
     endforeach()
 endfunction()
 strix_session_add_contract_tests()
+function(strix_session_add_runtime)
+    add_library(strix_session_runtime INTERFACE)
+    target_link_libraries(strix_session_runtime INTERFACE strix_session_owner strix_serve strix_model_registry)
+    add_library(strix_session_shell STATIC "${_strix_session_root}/src/serve/run.cpp")
+    target_link_libraries(strix_session_shell PUBLIC strix_session_runtime)
+    strix_session_warnings(strix_session_shell)
+    add_executable(strix-serve "${_strix_session_root}/apps/strix_serve_main.cpp")
+    target_link_libraries(strix-serve PRIVATE strix_session_shell)
+    strix_session_warnings(strix-serve)
+    if(BUILD_TESTING)
+        foreach(test runtime http_replay registry turn_cache)
+            add_executable(session_${test}_tests "${_strix_session_root}/tests/session_${test}_tests.cpp")
+            target_link_libraries(session_${test}_tests PRIVATE strix_session_shell)
+            strix_session_warnings(session_${test}_tests)
+            add_test(NAME session_${test} COMMAND session_${test}_tests "${_strix_session_root}")
+            set_tests_properties(session_${test} PROPERTIES LABELS "cpu;session" TIMEOUT 30)
+        endforeach()
+    endif()
+endfunction()
+
 
 # The runtime paths and optional existing launcher target are defined later by
 # the root build. No dependency in the reverse direction through strix_core.

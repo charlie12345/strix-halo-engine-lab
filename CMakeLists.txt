@@ -739,7 +739,11 @@ add_library(strix_serve STATIC
 target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
 target_link_libraries(strix_serve PUBLIC Threads::Threads strix_core strix_serve_json)
+if(WIN32)
+    target_link_libraries(strix_serve PUBLIC ws2_32)
+endif()
 strix_target_warnings(strix_serve)
+strix_session_add_runtime()
 
 add_executable(strix-tokenize apps/tokenize_main.cpp)
 target_link_libraries(strix-tokenize PRIVATE strix_serve)

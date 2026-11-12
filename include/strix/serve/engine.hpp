@@ -20,6 +20,10 @@
 #include <utility>
 #include <vector>
 
+namespace strix::session {
+class EmbedTable;
+}
+
 namespace strix::serve {
 
 class ConstraintProgram;
@@ -185,6 +189,8 @@ struct GenerationJob {
     std::shared_ptr<GenerationContext> family_context;
     std::shared_ptr<GenerationOutput> output = {};
     std::function<bool()> client_gone = {}; // connection lifetime guarded by the shared frontend
+    // Resolves the virtual ids of prompt (strix/session/embed_rows.hpp); null: the prompt holds none.
+    std::shared_ptr<const session::EmbedTable> embeds = {};
 };
 
 struct GenerationStats {

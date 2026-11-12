@@ -2,6 +2,7 @@
 
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/known_prefill_cancelled.hpp"
+#include "strix/known_window_rows_binding.hpp"
 #include "strix/execution_arena.hpp"
 #include "strix/execution_resources.hpp"
 #include "strix/execution_runtime.hpp"
@@ -19,6 +20,7 @@
 namespace strix {
 
 struct CompiledLaunchPlan;
+class KnownWindowRunCache;
 
 // The caller retains all row registries/configs and every resource owner until
 // completion or quiesce_or_fail_stop. The runtime invokes each selected R1
@@ -67,8 +69,8 @@ struct KnownWindowExecutionHooks {
     // only after complete succeeds; default legacy prefill labeling is intact.
     bool record_actual_window_lineage = false;
     // Owner-held memo of the launch plan whose per-step metadata preflight already passed.
-    // Only positions and tokens change between windows of one owner, and every launcher
-    // still validates its own context before enqueueing, so repeat windows skip the
+    // Only positions and tokens change between windows of one owner; launchers either
+    // validate their context or reuse an admitted binding, so repeat windows skip the
     // ~1,750-context preflight (about 8 ms of host time before the first launch).
     std::vector<const void*>* preflight_memo = nullptr;
     // Lineage recipe identities of a memoized plan (keyed like preflight_memo): the recipe
@@ -80,6 +82,13 @@ struct KnownWindowExecutionHooks {
     // that wraps one step) re-runs only the slots whose launcher differs, plus its own
     // structural plan checks; the owner-level admission already passed with the first plan.
     std::vector<std::array<std::uintptr_t, 2>>* preflight_slots = nullptr;
+    // Optional immutable rows bindings, with the same owner lifetime/invalidation as
+    // preflight_memo/preflight_slots. Position-dependent data must be refreshed by launch.
+    KnownWindowRowsBindingCache* rows_binding_cache = nullptr;
+    // Optional owner-local storage, also one per cohort member's owner. Immutable plans,
+    // entry tables and resource bindings have the same lifetime/invalidation contract as
+    // preflight_memo/preflight_slots. Never share a cache between simultaneous runs.
+    KnownWindowRunCache* run_cache = nullptr;
     // Owner-held index of the compiled window's row arena views (alive and unmodified as long as
     // the owner): their buffer lookups are answered from it instead of being indexed per window.
     const ArenaLookupIndex* arena_index = nullptr;
@@ -214,8 +223,22 @@ public:
     void fail();
     [[nodiscard]] KnownWindowResult publish();
 private:
+    friend class KnownWindowRunCache;
     struct State;
     std::unique_ptr<State> state_;
+};
+
+// Keeps admitted host contexts/entry selections across runs, never an active scope,
+// session borrow or callback. A missing/cleared preflight key forces a fresh State.
+class KnownWindowRunCache final {
+public:
+    KnownWindowRunCache();
+    ~KnownWindowRunCache();
+    KnownWindowRunCache(const KnownWindowRunCache&) = delete;
+    KnownWindowRunCache& operator=(const KnownWindowRunCache&) = delete;
+private:
+    friend class KnownWindowRun;
+    std::unique_ptr<KnownWindowRun::State> state_;
 };
 
 struct SpeculativeVerifyExecutionResult {

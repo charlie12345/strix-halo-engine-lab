@@ -8057,23 +8057,11 @@ QsaPrefillPool* qsa_window_pool(const PreparedIndexedLaunch& a, std::uint32_t ra
     const HipIndexedAttentionLauncherConfig& config, std::uint64_t position) {
     static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_POOLED"); return v && v[0] == '1'; }();
     if (!enabled || a.index_dim != 128U || !ratio) return nullptr;
-    if (config.window_pool) return config.window_pool->get(a, ratio, position);
-    static QsaPrefillPool pool;
-    const auto tokens = a.raw_state.bytes / (static_cast<std::uint64_t>(a.index_dim) * sizeof(std::uint16_t));
-    const auto blocks = static_cast<std::uint32_t>(std::min<std::uint64_t>(tokens / ratio, UINT32_MAX));
-    if (blocks > pool.capacity) {
-        if (pool.keys) {
-            check_hip(hipStreamSynchronize(hip_execution_stream()), "QSA window block-pool resize sync");
-            check_hip(hipFree(pool.keys), "QSA window block-pool free");
-            pool = {};
-        }
-        void* keys = nullptr;
-        check_hip(hipMalloc(&keys, static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(float)), "QSA window block-pool allocation");
-        pool.keys = static_cast<float*>(keys);
-        pool.capacity = blocks;
-    }
-    pool.valid = 0;
-    return &pool;
+    // Only the owner's own pool (R2-17): a process-wide fallback buffer was shared by every owner and
+    // resized with a sync of the current stream only, so two owners on different streams could
+    // overwrite each other's keys. Without a per-owner pool the window scores blocks unpooled, which
+    // gives the same block scores bitwise (see above).
+    return config.window_pool ? config.window_pool->get(a, ratio, position) : nullptr;
 }
 template <unsigned Rows>
 void enqueue_qsa_window_rows(std::span<const ExecutionDispatchContext> rows, const HipIndexedAttentionLauncherConfig& config,

@@ -247,6 +247,8 @@ struct HipKnownPrefixWindow::Impl {
     std::vector<const void*> preflight_memo, static_preflight_memo;
     std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>> recipe_memo;
     std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
+    KnownWindowRowsBindingCache rows_binding_cache;
+    KnownWindowRunCache run_cache; // one idle State per owner, including each cohort member
     ArenaLookupIndex arena_index; // the immutable compiled window's arena views
     // Verify windows run each layer's shared expert on a second stream next to the routed experts (see
     // detach_shared). The shared expert reads only the MoE input and writes only its output,
@@ -413,6 +415,7 @@ struct HipKnownPrefixWindow::Impl {
         } else if (deferred_pending >= 0) (void)hipEventSynchronize(deferred_events[static_cast<unsigned>(deferred_pending)]);
         for (auto e : deferred_events) if (e) (void)hipEventDestroy(e);
         if (deferred_slots) (void)hipHostFree(deferred_slots);
+        if (wide_union_host) (void)hipHostFree(wide_union_host);
     }
     bool full_prefill_union() const noexcept {return prefill&&prefill_routed_workspace.owner;}
     // The CSR workspace of a wide cohort union of 9..32 rows enqueued on this owner's stream.
@@ -1442,6 +1445,7 @@ struct HipKnownPrefixWindow::Impl {
         gdn_deferred=primary.gdn_deferred;
         bind_deferred();
         preflight_memo.clear(); static_preflight_memo.clear(); recipe_memo.clear(); preflight_slots.clear();
+        rows_binding_cache.clear();
     }
     void setup_head_rows() {
         if(!window.lm_head_rows_steps) return;
@@ -1523,6 +1527,8 @@ struct HipKnownPrefixWindow::Impl {
         std::uint32_t rows_done = 0;
     };
     DeferredCompletion* deferred_slots = nullptr;
+    // Pinned host copy of a wide cohort union summary, read on this (lead) owner's stream before it completes.
+    q51_known_rows::Summary* wide_union_host = nullptr;
     std::array<hipEvent_t, 2> deferred_events{};
     int deferred_pending = -1;
     unsigned deferred_next = 0;
@@ -1758,6 +1764,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
             hooks.position_reader_implementations = position_readers;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.rows_binding_cache=&rows_binding_cache;
             hooks.arena_index=&arena_index;
             hooks.preflight_only = true;
             if(static_only) {
@@ -2160,6 +2167,8 @@ struct HipKnownPrefixWindow::Impl {
                     };
                 hooks.preflight_memo = &self.preflight_memo; hooks.recipe_memo = &self.recipe_memo;
                 hooks.preflight_slots = &self.preflight_slots; hooks.arena_index = &self.arena_index;
+                hooks.rows_binding_cache = &self.rows_binding_cache;
+                hooks.run_cache = &self.run_cache;
                 hooks.after_step=self.window_observer;
             }
             auto& lead = *members[0].impl;
@@ -2265,6 +2274,17 @@ struct HipKnownPrefixWindow::Impl {
                 struct Reset { bool& flag; ~Reset() { flag = false; } } reset{primary->cohort_member};
                 primary->complete();
             }
+            if (wide_union_rows) {
+                // The last wide union's summary, read on the lead stream; the lead's complete() below fences it.
+                if (!lead.wide_union_host) {
+                    void* p = nullptr;
+                    check(hipHostMalloc(&p, sizeof(q51_known_rows::Summary), hipHostMallocDefault), "allocate wide cohort union summary");
+                    lead.wide_union_host = static_cast<q51_known_rows::Summary*>(p);
+                }
+                check(hipMemcpyAsync(lead.wide_union_host, reinterpret_cast<const void*>(lead.cohort_union(wide_union_rows).memory.arena_base),
+                    sizeof(q51_known_rows::Summary), hipMemcpyDeviceToHost, lead.scope.stream), "read wide cohort routed union metadata");
+            }
+            const bool lead_defers = lead.defer_current; // complete() clears it; a deferred lead leaves its stream running
             for (auto& m : members) {
                 const HipLaunchScope active(m.impl->scope);
                 m.run->complete();
@@ -2272,10 +2292,8 @@ struct HipKnownPrefixWindow::Impl {
             }
             if (wide_union_rows) {
                 // The last wide union's summary (the stream is complete): its rows, assignments and status.
-                q51_known_rows::Summary s{};
-                const auto& ws = lead.cohort_union(wide_union_rows);
-                check(hipMemcpy(&s, reinterpret_cast<const void*>(ws.memory.arena_base), sizeof(s), hipMemcpyDeviceToHost),
-                    "read wide cohort routed union metadata");
+                if (lead_defers) check(hipStreamSynchronize(lead.scope.stream), "complete wide cohort union read");
+                const auto s = *lead.wide_union_host;
                 const auto assignments = wide_union_rows * lead.routed_config.top_k;
                 if (s.status || s.version != 1U || s.logical_rows != wide_union_rows || s.assignments != assignments ||
                     !s.touched || s.touched > assignments || s.batches < s.touched || s.batches > assignments ||
@@ -2447,6 +2465,7 @@ struct HipKnownPrefixWindow::Impl {
                     return prefill_fold(i,rows,full,contexts_of);
                 };
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.rows_binding_cache=&rows_binding_cache;
             hooks.arena_index=&arena_index;
             if(prefill) {
                 hooks.after_step=qrtx_step_dump_observer(prefill_observer,block_rows);
@@ -2482,6 +2501,7 @@ struct HipKnownPrefixWindow::Impl {
             }
             // a window step observer only for windows without a tiled prefill (as 0998a0e5: never over the prefill observer)
             if(!prefill && window_observer) hooks.after_step=window_observer;
+            if(!prefill) hooks.run_cache = &run_cache;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :
@@ -2599,6 +2619,7 @@ struct HipKnownPrefixWindow::Impl {
             };
             hooks.position_reader_implementations = position_readers;
             hooks.preflight_memo = &preflight_memo; hooks.recipe_memo = &recipe_memo; hooks.preflight_slots = &preflight_slots;
+            hooks.rows_binding_cache = &rows_binding_cache;
             hooks.arena_index = &arena_index;
             KnownPrefillSegmentHooks segment_hooks;
             const char* stage_env=std::getenv("STRIX_PLE_STAGE_SERVE");

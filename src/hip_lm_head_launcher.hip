@@ -7,6 +7,7 @@
 #endif
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
+#include "strix/known_window_rows_binding.hpp"
 #include "strix/hip_generation_output.hpp"
 #include "strix/q8_projection_organization.hpp"
 
@@ -1436,12 +1437,14 @@ void lm_head_known_window_rows_preflight(std::span<const ExecutionDispatchContex
     const HipLmHeadLauncherConfig& config) {
     if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture)
         throw std::invalid_argument("known-window launcher preflight requires eager scope");
-    static_cast<void>(prepare_lm_head_rows(rows, config));
+    std::optional<PreparedLmHeadRows> local;
+    static_cast<void>(KnownWindowRowsBindingScope::get(local, [&] { return prepare_lm_head_rows(rows, config); }));
 }
 
 void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipLmHeadLauncherConfig& config) {
-    const auto p = prepare_lm_head_rows(rows, config);
+    std::optional<PreparedLmHeadRows> local;
+    const auto& p = KnownWindowRowsBindingScope::get(local, [&] { return prepare_lm_head_rows(rows, config); });
     const auto stream = hip_execution_stream();
     const auto h = config.hidden_size, v = config.vocab_size;
     check_hip(hipPeekAtLastError(), "known-window LM head rows stale launch error");
@@ -1501,7 +1504,8 @@ void lm_head_known_window_rows_launch_greedy(std::span<const ExecutionDispatchCo
             partials, replies, hip_execution_stream());
         return;
     }
-    const auto p = prepare_lm_head_rows(rows, config);
+    std::optional<PreparedLmHeadRows> local;
+    const auto& p = KnownWindowRowsBindingScope::get(local, [&] { return prepare_lm_head_rows(rows, config); });
     const auto rows_count = static_cast<std::uint32_t>(rows.size());
     const auto bytes = hip_greedy_rows_scratch_bytes(rows_count, config.vocab_size);
     if (!partials.address || partials.address % alignof(LeanGreedy) != 0 || partials.bytes < bytes || !replies)

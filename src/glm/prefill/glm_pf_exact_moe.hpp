@@ -70,7 +70,7 @@ struct Scratch {          // device, per call: quantised activations and the til
 // host_table: [288] routed experts (device trellis/suh/svh pointers). Synchronous (returns after the stream drains).
 // The same conversion into caller-owned buffers: q.wq / q.ws sized as convert() allocates them, q.svh device [288]
 // tables (filled here from host_table's svh). Synchronous. Returns the device seconds.
-double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream);
+double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream, int scale_rule = 0);
 constexpr std::size_t weight_bytes() { return std::size_t{288} * 4096U * 1024U / 2U; }  // per matrix (all three equal)
 constexpr std::size_t scale_bytes(unsigned m) { return std::size_t{288} * (m == 2U ? 4096U * (1024U / 64U) : 1024U * (4096U / 64U)) * 2U; }
 std::size_t scratch_bytes(unsigned max_rows);

@@ -3,6 +3,7 @@
 #include "gemma4/exl3/pack.hpp"
 #include "gemma4/exl3/format.hpp"
 #include "gemma4/features/features.hpp"
+#include "strix/session/speculation_default.hpp"
 
 #include <charconv>
 #include <cstdlib>
@@ -54,7 +55,7 @@ std::string file_hash(const std::filesystem::path& path) { const MappedFile f(pa
 Options parse_options(int argc, char** argv) {
     Options o;
     auto selected = profile::Name::standard;
-    bool dflash_given = false, draft_off = false, allow_pending = false;
+    bool dflash_given = false, draft_off = false, allow_pending = false, no_mtp = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         const auto value = [&]() -> std::string { if (++i == argc) throw std::invalid_argument("missing value for "+arg); return argv[i]; };
@@ -70,6 +71,7 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--draft-rope") o.draft_rope = value();
         else if (arg == "--draft-eagle") o.draft_eagle = value();
         else if (arg == "--draft-mtp") o.draft_mtp = value();
+        else if (strix::session::speculation_opt_out_argument(arg)) no_mtp = true;
         else if (arg == "--chat") o.chat = value();
         else if (arg == "--ids") o.ids = value();
         else if (arg == "--fixture") o.fixtures.emplace_back(value());
@@ -105,6 +107,9 @@ Options parse_options(int argc, char** argv) {
     if (!o.threads || !o.streams || !o.request.max_tokens || o.model.empty() || (o.rope.empty() && !o.deploy_check)) throw std::invalid_argument("model, --rope-tables and positive limits required; use --help");
     if (o.output != "json" && o.output != "ids" && o.output != "text") throw std::invalid_argument("output must be json/ids/text");
     if (o.backend != "host" && o.backend != "device") throw std::invalid_argument("backend must be host/device");
+    // Shared speculation opt-out: same as `--draft off` unless a drafter or STRIX_G4_DRAFT was given explicitly.
+    if ((no_mtp || strix::session::speculation_environment_off(std::getenv(strix::session::speculation_environment))) &&
+        o.draft.empty() && o.draft_eagle.empty() && o.draft_mtp.empty() && !std::getenv("STRIX_G4_DRAFT")) draft_off = true;
     // Explicit options win over the profile; `--draft off` wins over every drafter path.
     profile::Inputs inputs;
     inputs.allow_pending = allow_pending;

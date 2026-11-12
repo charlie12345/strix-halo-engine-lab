@@ -45,6 +45,8 @@
 {"prefill-dense-o", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense o == strix_gemm bitwise (T 9..4096); 4096-row pieces only; mm_defaults.cpp pf_dense_o", ""},
 // src/minimax/engine/engine.hip: MSA scratch cap (STRIX_MM_PF_MSA_SCRATCH_MB) - windows per batch only
 {"prefill-msa-scratch", 'a', "independent MSA windows; batch size only", "msa_fused_tests.hip every-batch bytes (scratch=1/125 and full); mm_defaults.cpp pf_msa_scratch_mb", ""},
+// src/minimax/attn/msa_fused.hip: enqueue_prefill_index (STRIX_IDX_WMMA, default exact), prefill_index_refine_kernel
+{"prefill-index-wmma-exact", 'a', "fixed row+index head; selected block set of the VALU index kernels (WMMA scores, exact rescoring of the cut-off band)", "hip_idx_wmma_tests.hip exact selection at 2K/8K/32K positions; pair state and final-row hashes equal to STRIX_IDX_WMMA=0", ""},
 // src/minimax/moe/mmx_prefill.hip:647
 {"prefill-fuse", 'a', "single-split WMMA+epilogue contract", "prefill gufuse intermediate/producer debug gate in hip-mmx-moe-bench; default OFF; combinations outside gate remain unqualified", ""},
 // src/minimax/moe/mmx_prefill.hip:416

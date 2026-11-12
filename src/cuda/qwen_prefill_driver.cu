@@ -11,6 +11,7 @@
 // Row-independent steps (HC mixes, dense projections, router, shared and routed experts, inject/combine) may run on
 // padded row counts (the MoE needs >= 16 rows, a multiple of 8); steps that carry state across rows (GDN, QSA, PLE)
 // run on the exact rows of the block.
+#include "strix/env_flags.hpp"
 #include "strix/cuda_qwen_prefill.hpp"
 #include <cstdlib>
 #include "strix/moe_route_bf16.hpp"
@@ -210,7 +211,7 @@ __global__ void moe_sticky_kernel(const std::uint32_t* summary, const std::uint3
 // NVTX ranges per op family in run_block / step_tail (profiling: STRIX_QRTX_NVTX=1). Unset: one cached flag test per
 // range, no NVTX call. Ranges cover the host enqueue, so profile with STRIX_QRTX_GRAPHS=0 (a replayed window has none).
 bool nvtx_on() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QRTX_NVTX"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_NVTX", false);
     return on;
 }
 inline void nvtx_push(const char* name) { if (nvtx_on()) nvtxRangePushA(name); }
@@ -1590,7 +1591,7 @@ void Prefill::Impl::step_tail(std::uint32_t rows) {
     a.output = hidden;
     hc::hc_mix(a, tables, stream);
     const void* head = w.get("output.weight");
-    static const bool head1 = [] { const char* v = std::getenv("STRIX_QRTX_HEAD1"); return v && v[0] == '1'; }();
+    static const bool head1 = strix::envcfg::flag("STRIX_QRTX_HEAD1", false);
     if (head1)  // reference seam: the one-row kernel per row
         for (std::uint32_t r = 0; r < rows; ++r)
             hc::lm_head(hidden + std::uint64_t{r} * kHidden, head, hc::kVocab, head_logits + std::uint64_t{r} * hc::kVocab, stream);
@@ -2267,7 +2268,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     std::uint16_t* wide_mlp = m.draft_wide + kWide;
     std::uint16_t* wide_src = m.draft_wide + 2 * kWide;
     std::uint32_t sel[2];
-    static const bool per_step_sync = [] { const char* v = std::getenv("STRIX_QRTX_DRAFT_SYNC"); return v && v[0] == '1'; }();
+    static const bool per_step_sync = strix::envcfg::flag("STRIX_QRTX_DRAFT_SYNC", false);
     const auto mix = [&](const std::uint16_t* in, const float* norm, const float* inject, const hc::HcPacked& packed) {
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = 1;

@@ -16,6 +16,7 @@
 // Draft placement: split = both ranks draft, the drafter's head split by vocabulary (8-byte candidate exchange per
 // Markov step, the rest replicated); rank0 = rank 0 drafts alone and sends the window (k and the drafts) to rank 1.
 #include "strix/deepseek41_device_forward.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_dspark_driver.hpp"
@@ -48,7 +49,7 @@ using clock_type = std::chrono::steady_clock;
 double since(clock_type::time_point t) { return std::chrono::duration<double>(clock_type::now() - t).count(); }
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("dspark rank: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("dspark rank: ", e, what);
 }
 
 struct Args {

@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/file_snapshot.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include "strix/deepseek41_prefill.hpp"
@@ -56,7 +58,7 @@ namespace strix::deepseek41 {
 namespace {
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("deepseek41 prefill: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("deepseek41 prefill: ", e, what);
 }
 
 std::uint64_t fnv_bytes(const void* data, std::size_t n, std::uint64_t h = 14695981039346656037ULL) {
@@ -1874,7 +1876,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     for (std::uint32_t k = 0; k < engram_cols; ++k)
                         m.engram_ahead_requests.push_back({li, nids[std::size_t{t} * per_token + li * engram_cols + k]});
         }
-        static const bool ahead_log = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG"); return v && v[0] == '1'; }();
+        static const bool ahead_log = strix::envcfg::flag("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG", false);
         const auto own_stats = ahead_log ? m.engram_reader->stats() : ds41::EngramReaderStats{};
         const auto start_ahead = [&m, P0, T, own_stats] {  // after this run's own read (the reader serves one caller at a time)
             if (ahead_log) {

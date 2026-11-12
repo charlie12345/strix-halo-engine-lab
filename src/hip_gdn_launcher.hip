@@ -6115,7 +6115,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         return static_cast<std::uint32_t>(n == 4 || n == 2 ? n : 8);
     }();
     if constexpr (Rows == 2U || Rows == 4U || Rows == 8U) {
-        if (qpersist_gdn_tail_enabled() && (parts & 4U) && shape.head_dim == 128U && window_columns == 8U) {
+        if (qpersist_gdn_window_tail_admitted(Rows) && (parts & 4U) && shape.head_dim == 128U && window_columns == 8U) {
             // Alternate recurrence organizations retain their own mapping.
             static const bool alternate = [] {
                 const bool tiled = gdn_window_tiled_enabled();

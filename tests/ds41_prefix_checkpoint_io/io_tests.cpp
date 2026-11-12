@@ -171,7 +171,7 @@ void failures(const fs::path& root) {
             ds::PrefixCache c(options(dir,drop));
             // Existing complete bytes, installed AFTER open so insert really replaces
             // a target. These bytes were made by the actual donor PrefixCache writer.
-            fs::copy(donor,dir,fs::copy_options::overwrite_existing);
+            fs::copy(donor,dir,fs::copy_options::overwrite_existing|fs::copy_options::recursive);
             auto newer=sample(tokens(),8); newer.next_token+=1;
             check(c.insert(newer,9),"fault insertion retains existing index contract"); c.flush();
             const auto s=c.stats(); const bool success=failure==7;
@@ -230,7 +230,7 @@ void block_failures(const fs::path& root) {
         // Prime the clock using a real RAM capture and explicit peer refusal;
         // no unrelated files need deletion before installing the donor fixture.
         check(c.insert(sample(other,8),1),"prime logical clock through real insert");c.flush();c.clear_ram();persist=true;
-        const auto baseline=c.stats();fs::copy(donor,dir,fs::copy_options::overwrite_existing);
+        const auto baseline=c.stats();fs::copy(donor,dir,fs::copy_options::overwrite_existing|fs::copy_options::recursive);
         if(failure<6) w.inject.fail=std::array{io::Operation::allocation,io::Operation::create,io::Operation::write,
             io::Operation::sync,io::Operation::replace,io::Operation::directory_sync}[failure];
         else {w.inject.max_write=3;w.inject.fail_write_at=17;}

@@ -20,6 +20,7 @@
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
 #include "hip_rounded_stage_image.hpp"
+#include "attn_core/selected_flash_prefill.hpp"
 #include "strix/hip_compact_qsa_diagnostic.hpp"
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/qpersist.hpp"

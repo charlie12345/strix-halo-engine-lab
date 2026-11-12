@@ -39,6 +39,11 @@ void embed_admission(const GenerationJob& j, const session::Capabilities& c) {
     } else if (j.embeds) j.embeds->validate(j.prompt);
     else session::reject_embed_ids(j.prompt);
 }
+// Gives back a lease that never ran: nothing was written, so a plain release is right; a store that refuses
+// it quarantines the slot instead of leaking it.
+void drop_unused(session::KvStore& store, session::KvHandle handle) noexcept {
+    try { store.release(handle); } catch (...) { store.invalidate(handle); }
+}
 void admission(const GenerationJob& j, const session::Capabilities& c, const SessionHooks& hooks) {
     const auto& s = j.sampling;
     const auto reject = [](bool bad, const char* field) {
@@ -754,7 +759,7 @@ SessionLease SessionRuntime::activate(std::uint64_t resident_alignment, bool pre
     if (impl_->reserved->job.family_context && !impl_->hooks.validate)
         throw std::invalid_argument("unvalidated family context");
     if (impl_->hooks.validate) impl_->hooks.validate(impl_->reserved->job);
-    if (impl_->reserved->job.embeds) embed_admission(impl_->reserved->job, impl_->caps);
+    if (impl_->hooks.native_validate) embed_admission(impl_->reserved->job, impl_->caps); // admission() ran it otherwise
     const auto started = impl_->hooks.now ? impl_->hooks.now() : std::chrono::steady_clock::now();
     if (resident_alignment && !impl_->cache) throw std::invalid_argument("native retention disabled");
     const auto hit = resident_alignment ? impl_->cache->lookup_resident(impl_->store,
@@ -769,8 +774,13 @@ SessionLease SessionRuntime::activate(std::uint64_t resident_alignment, bool pre
         if (impl_->cache) impl_->cache->invalidate_resident(l->handle);
         if (resident_alignment) ++impl_->misses;
     }
+    // The reservation stays whole until the lane is certain: a refused table gives the lease back and the
+    // caller still owns a reservation it can refuse().
+    if (impl_->reserved->job.embeds) {
+        try { impl_->engine.bind_embeds(l->handle, impl_->reserved->job.embeds); }
+        catch (...) { drop_unused(impl_->store, l->handle); throw; }
+    }
     l->taken = std::move(*impl_->reserved); impl_->reserved.reset();
-    if (l->taken.job.embeds) impl_->engine.bind_embeds(l->handle, l->taken.job.embeds);
     if (!preserve_take_time) l->taken.started = started;
     l->stats.prompt_tokens = l->taken.job.prompt.size();
     SessionLease result{l->taken, l->stats, l->handle};
@@ -817,10 +827,14 @@ SessionLease SessionRuntime::promote(PendingSession h) {
     else admission(taken.job, impl_->caps, impl_->hooks);
     if (taken.job.family_context && !impl_->hooks.validate) throw std::invalid_argument("unvalidated family context");
     if (impl_->hooks.validate) impl_->hooks.validate(taken.job);
-    if (taken.job.embeds && impl_->hooks.native_validate) embed_admission(taken.job, impl_->caps);
+    if (impl_->hooks.native_validate) embed_admission(taken.job, impl_->caps); // admission() ran it otherwise
     auto& l = *impl_->pending.at(h.generation);
     l.handle = impl_->store.acquire();
-    if (taken.job.embeds) impl_->engine.bind_embeds(l.handle, taken.job.embeds);
+    if (taken.job.embeds) {
+        // A refused table gives the lease back; the entry stays pending and can be promoted again or refused.
+        try { impl_->engine.bind_embeds(l.handle, taken.job.embeds); }
+        catch (...) { drop_unused(impl_->store, l.handle); l.handle = {}; throw; }
+    }
     l.stats.prompt_tokens = taken.job.prompt.size();
     // Preserve original queue submission/take clocks, reorder and observation.
     SessionLease result{l.taken, l.stats, l.handle};

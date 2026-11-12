@@ -35,6 +35,13 @@ struct ApiMediaSpan {
 };
 // Produces the embedding rows of one media kind. The service loads one per kind it accepts; the API layer never
 // names a model family, a tower or a file format beyond what this interface states.
+//
+// Contract of a set of adapters:
+//  - Handles: an EmbedTable is keyed by handle, so every adapter of one service interns in the SAME
+//    session::EmbedInterner (one handle space per process). A request whose items come back with one handle
+//    for two digests is refused (500) instead of resolving rows of the wrong item.
+//  - Threads: one ApiService calls encode() of its adapters one at a time. An adapter shared by two services
+//    (or called by anything else) must synchronise itself.
 class ApiMediaAdapter {
 public:
     virtual ~ApiMediaAdapter() = default;
@@ -196,7 +203,11 @@ public:
     ~ApiService();
     void handle(const HttpRequest& request, HttpResponseWriter& response);
     // Prompt tokens of a chat request body exactly as the chat route builds them (for tests and tools).
+    // A body with media parts is refused here (std::invalid_argument): its virtual ids mean nothing without
+    // the table that prepare_chat_prompt returns with them.
     [[nodiscard]] std::vector<std::uint32_t> chat_prompt(const Json& body) const;
+    // The same prompt with what owns it: tokens, stable prefix and, for media, the EmbedTable of its virtual ids.
+    [[nodiscard]] ApiChatPrompt prepare_chat_prompt(const Json& body) const;
     void set_state(std::string state);
 private:
     struct Impl;

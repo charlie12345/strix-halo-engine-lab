@@ -89,7 +89,8 @@ struct FakeAdapter : sv::ApiMediaAdapter {
         r.data.assign(static_cast<std::size_t>(rows) * 2U, 0x3f80);
         sv::ApiMediaSpan span;
         span.cache_hit = !seen_.insert(item.digest).second;
-        span.lease = interner.intern(std::move(r));
+        if (split) others.push_back(std::make_unique<ss::EmbedInterner>());
+        span.lease = (split ? *others.back() : interner).intern(std::move(r));
         span.layout.push_back('<');
         for (const auto id : span.lease.ids()) span.layout.push_back(id);
         span.layout.push_back('>');
@@ -100,6 +101,8 @@ struct FakeAdapter : sv::ApiMediaAdapter {
         return span;
     }
     ss::EmbedInterner interner;
+    std::vector<std::unique_ptr<ss::EmbedInterner>> others;
+    bool split = false; // a new handle space per item: what two adapters with their own interners would do
     int calls = 0;
     std::uint32_t last_budget = 0;
     std::uint64_t epoch_ = 0;
@@ -186,7 +189,7 @@ sv::Json scrub(const sv::Json& value) {
     sv::Json out = sv::Json::object();
     for (const auto& [key, member] : value.as_object()) {
         if (key == "id" || key == "created" || key == "created_at" || key == "completed_at" || key == "request_id" ||
-            key == "timings" || key == "timing" || key == "call_id" || key == "system_fingerprint")
+            key == "timings" || key == "timing" || key == "call_id" || key == "item_id" || key == "response_id" || key == "system_fingerprint")
             continue;
         if (key.size() > 3 && (key.compare(key.size() - 3, 3, "_ms") == 0 || key.find("seconds") != std::string::npos ||
                                key.find("per_second") != std::string::npos || key.find("tps") != std::string::npos))
@@ -213,6 +216,28 @@ double number(const sv::Json& value, std::initializer_list<const char*> path) {
     return v.is_number() ? v.as_double() : -1.0;
 }
 std::size_t embed_ids(const std::vector<std::uint32_t>& ids) { return ss::count_embed_ids(ids); }
+// The events of an SSE body in order: "event name|scrubbed data" per event, ids and clocks removed.
+std::vector<std::string> sse_events(const std::string& body) {
+    std::vector<std::string> out;
+    std::string name;
+    std::size_t at_line = 0;
+    while (at_line < body.size()) {
+        auto end = body.find('\n', at_line);
+        if (end == std::string::npos) end = body.size();
+        std::string line = body.substr(at_line, end - at_line);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        at_line = end + 1;
+        if (line.rfind("event:", 0) == 0) name = line.substr(6);
+        else if (line.rfind("data:", 0) == 0) {
+            auto data = line.substr(5);
+            if (!data.empty() && data[0] == ' ') data.erase(0, 1);
+            try { data = scrub(sv::parse_json(data)).dump(); } catch (const std::exception&) {}
+            out.push_back(name + "|" + data);
+            name.clear();
+        }
+    }
+    return out;
+}
 
 std::string chat_body(const std::string& parts, const std::string& more = {}) {
     return R"({"model":"skeleton","max_tokens":4)" + more + R"(,"messages":[{"role":"user","content":[)" + parts + "]}]}";
@@ -254,6 +279,8 @@ void text_is_unchanged() {
         {"/v1/messages", R"({"model":"skeleton","max_tokens":4,"system":"s","messages":[{"role":"user","content":[{"type":"text","text":"block"}]}]})"},
         {"/v1/responses", R"({"model":"skeleton","max_output_tokens":4,"input":"hi"})"},
         {"/v1/responses", R"({"model":"skeleton","max_output_tokens":4,"input":[{"role":"user","content":[{"type":"input_text","text":"parts"}]}]})"},
+        {"/v1/messages", R"({"model":"skeleton","max_tokens":3,"stream":true,"messages":[{"role":"user","content":"stream"}]})"},
+        {"/v1/responses", R"({"model":"skeleton","max_output_tokens":3,"stream":true,"input":"stream"})"},
         // the placeholder byte in plain text is text while the request holds no media
         {"/v1/chat/completions", std::string(R"({"model":"skeleton","max_tokens":4,"messages":[{"role":"user","content":"a\u001fb"}]})")},
     };
@@ -264,8 +291,16 @@ void text_is_unchanged() {
             if (stable(a) != stable(b)) std::cerr << path << "\n" << stable(a) << "\n" << stable(b) << "\n";
             CHECK(stable(a) == stable(b));
         } else {
+            // the same events in the same order with the same payloads
+            const auto ea = sse_events(a.body), eb = sse_events(b.body);
             CHECK(b.status == 200);
-            CHECK(a.body.find("vision") == std::string::npos && b.body.find("vision") == std::string::npos);
+            CHECK(ea.size() >= 2U);
+            if (ea != eb) {
+                std::cerr << path << ": " << ea.size() << " vs " << eb.size() << " events\n";
+                for (std::size_t i = 0; i < std::min(ea.size(), eb.size()); ++i)
+                    if (ea[i] != eb[i]) { std::cerr << ea[i] << "\n" << eb[i] << "\n"; break; }
+            }
+            CHECK(ea == eb);
         }
         CHECK(b.body.find("\"vision\"") == std::string::npos);
         if (path == "/v1/chat/completions") {
@@ -320,13 +355,20 @@ void images() {
     const auto text_only = sv::parse_json(chat_body(R"({"type":"text","text":"hi"})"));
     const auto with_image = chat_body(R"({"type":"text","text":"hi"},)" + image_part(2, 2));
     const auto base = s.api->chat_prompt(text_only);
-    const auto ids = s.api->chat_prompt(sv::parse_json(with_image));
+    // the vector-only helper refuses media: virtual ids are returned only together with their table
+    bool refused = false;
+    try { (void)s.api->chat_prompt(sv::parse_json(with_image)); } catch (const std::invalid_argument&) { refused = true; }
+    CHECK(refused);
+    const auto prepared = s.api->prepare_chat_prompt(sv::parse_json(with_image));
+    CHECK(prepared.embeds && prepared.embeds->size() == 1U);
+    if (prepared.embeds) prepared.embeds->validate(prepared.tokens); // the returned table resolves the returned ids
+    const auto& ids = prepared.tokens;
     CHECK(ids.size() == base.size() + 6U); // '<' + 4 rows + '>'
     CHECK(embed_ids(ids) == 4U);
     CHECK(ids[base.size()] == '<' && ids.back() == '>' && ss::is_embed_id(ids[base.size() + 1U]));
     CHECK(ss::embed_row(ids[base.size() + 4U]) == 3U);
-    CHECK(s.api->chat_prompt(sv::parse_json(with_image)) == ids); // same image -> same ids
-    const auto other = s.api->chat_prompt(sv::parse_json(chat_body(R"({"type":"text","text":"hi"},)" + image_part(1, 4))));
+    CHECK(s.api->prepare_chat_prompt(sv::parse_json(with_image)).tokens == ids); // same image -> same ids
+    const auto other = s.api->prepare_chat_prompt(sv::parse_json(chat_body(R"({"type":"text","text":"hi"},)" + image_part(1, 4)))).tokens;
     CHECK(embed_ids(other) == 4U && other != ids); // another image -> another handle
 
     const auto chat = s.post("/v1/chat/completions", with_image);
@@ -342,7 +384,7 @@ void images() {
         const auto& image = listed->as_array()[0];
         CHECK(number(image, {"rows"}) == 4.0 && number(image, {"tokens"}) == 6.0);
         CHECK(image.find("grid")->as_array()[0].as_double() == 2.0 && image.find("grid")->as_array()[1].as_double() == 2.0);
-        CHECK(image.find("cache_hit")->as_bool()); // chat_prompt above encoded it first
+        CHECK(image.find("cache_hit")->as_bool()); // prepare_chat_prompt above encoded it first
         CHECK(image.find("digest")->as_string().size() == 16U);
         CHECK(image.find("encode_ms") && image.find("preprocess_ms"));
     }
@@ -433,6 +475,14 @@ void refusals() {
     Service capped({std::make_shared<FakeAdapter>()}, 5);
     CHECK(capped.post("/v1/chat/completions", chat_body(image_part(2, 2))).status == 200);
     CHECK(capped.post("/v1/chat/completions", chat_body(image_part(2, 2) + "," + image_part(1, 2))).status == 400);
+
+    // two handle spaces hand out the same handle for different content: refused, never resolved to the wrong rows
+    auto divided = std::make_shared<FakeAdapter>();
+    divided->split = true;
+    Service two_spaces({divided});
+    CHECK(two_spaces.post("/v1/chat/completions", chat_body(image_part(2, 2))).status == 200);
+    const auto mixed = two_spaces.post("/v1/chat/completions", chat_body(image_part(2, 2) + "," + image_part(1, 3)));
+    CHECK(mixed.status == 500 && mixed.body.find("share one interner") != std::string::npos);
 
     // epoch: without an owner of the cached prefixes media requests stop; text goes on
     adapter->epoch_ = 1;

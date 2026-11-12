@@ -333,7 +333,6 @@ struct ApiMediaKind {
 struct ApiMediaState {
     std::vector<media::MediaItem> items;
     std::vector<const ApiMediaKind*> kinds;     // per item, in the order the canonical parts were met
-    std::vector<std::size_t> ordinals;          // index of the item among the items of its kind
     std::shared_ptr<const session::EmbedTable> table;
     Json body, receipts, listing;               // rewritten request; strix.<name> members; /tokenize entries
     std::vector<std::uint32_t> real;            // the prompt with each virtual id replaced by its real token id
@@ -442,7 +441,6 @@ struct ApiService::Impl {
     std::vector<ApiMediaKind> media_kinds;
     mutable std::mutex media_mutex; // one request encodes at a time; guards the epochs
     mutable std::vector<std::uint64_t> media_epochs; // per kind, the epoch whose cached state is live
-    mutable std::atomic<std::uint64_t> media_requests{0}, media_items{0}, media_rows{0}, media_epoch_changes{0};
 
     void build_media() {
         for (const auto& adapter : config.vision.adapters) {
@@ -496,7 +494,7 @@ struct ApiService::Impl {
             throw ApiError(400, "invalid_request_error", "media parts are written by the server and cannot be sent", "messages");
         std::size_t ordinal = 0;
         for (const auto* seen : req->kinds) if (seen == kind) ++ordinal;
-        req->kinds.push_back(kind); req->ordinals.push_back(ordinal);
+        req->kinds.push_back(kind);
         return kind->adapter->part_text(ordinal);
     }
     // Chat Completions keeps its message list: each canonical part becomes a text part holding the placeholder.
@@ -569,6 +567,10 @@ struct ApiService::Impl {
                 }
                 if (!valid) throw ApiError(500, "server_error", "media adapter returned an invalid span");
                 if (rows > budget || span.layout.size() > room) no_room(i);
+                // one handle space per service: the table is keyed by handle
+                for (const auto& held : leases)
+                    if (held.handle() == span.lease.handle() && held.rows().digest != span.lease.rows().digest)
+                        throw ApiError(500, "server_error", "media adapters of one service must share one interner");
                 room -= span.layout.size(); request_rows -= rows;
                 layouts.push_back(span.layout); leases.push_back(span.lease); spans.push_back(std::move(span));
             }
@@ -579,7 +581,7 @@ struct ApiService::Impl {
                 if (!config.vision.on_epoch)
                     throw ApiError(503, "server_error", "media handle space wrapped and no owner withdraws the cached prefixes; restart the service");
                 config.vision.on_epoch(epoch);
-                media_epochs[k] = epoch; ++media_epoch_changes;
+                media_epochs[k] = epoch;
             }
         }
         session::ExpandedPrompt expanded;
@@ -594,7 +596,6 @@ struct ApiService::Impl {
             if (session::is_embed_id(id)) id = prompt.embeds->find(session::embed_handle(id))->real_token_id;
         req.receipts = Json::object(); req.listing = Json::array();
         std::vector<Json> listed(count);
-        std::uint64_t total = 0;
         for (const auto& entry : media_kinds) {
             Json items = Json::array(); std::uint64_t kind_rows = 0;
             for (std::size_t i = 0; i < count; ++i) {
@@ -622,10 +623,8 @@ struct ApiService::Impl {
             receipt.set("adapter", Json(entry.adapter->identity())); receipt.set("rows", Json(kind_rows));
             receipt.set(entry.kind + "s", std::move(items));
             req.receipts.set(entry.adapter->receipt_name(), std::move(receipt));
-            total += kind_rows;
         }
         for (auto& entry : listed) req.listing.push(std::move(entry)); // /tokenize: prompt order whatever the kind
-        ++media_requests; media_items += count; media_rows += total;
     }
     // strix receipts gain the media members of this request; a text request returns its receipt untouched.
     static Json with_media(Json receipt) {
@@ -2632,8 +2631,13 @@ ApiService::ApiService(ApiConfig config, ApiTokenizerBinding tokenizer, Generati
 ApiService::~ApiService() = default;
 
 std::vector<std::uint32_t> ApiService::chat_prompt(const Json& body) const {
+    auto prompt = prepare_chat_prompt(body);
+    if (prompt.embeds) throw std::invalid_argument("chat_prompt: the body holds media; use prepare_chat_prompt, which returns the table of its virtual ids");
+    return std::move(prompt.tokens);
+}
+ApiChatPrompt ApiService::prepare_chat_prompt(const Json& body) const {
     ApiMediaGuard media_guard;
-    return impl_->chat_prompt(impl_->media_in(body, media::Api::chat_completions)).tokens;
+    return impl_->chat_prompt(impl_->media_in(body, media::Api::chat_completions));
 }
 void ApiService::set_state(std::string state) { const std::lock_guard lock(impl_->mutex); impl_->state = std::move(state); }
 

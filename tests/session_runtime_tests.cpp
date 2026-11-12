@@ -735,6 +735,56 @@ int main() {
             CHECK(failed && failures == 1 && r.pending_count() == 0 && r.live() == 0 && e.releases == 1);
             CHECK(q.snapshot().running == 0 && q.snapshot().failed == 5 && q.snapshot().generated_tokens == 2);
         }
+        {
+            // Embedding rows on the native routes. FakeEngine advertises the capability but keeps the base
+            // bind_embeds, which refuses a table: the injected bind failure.
+            FakeEngine e; e.limits.owner_control = true; e.limits.embed_rows = true; e.limits.max_slots = 1;
+            sv::GenerationQueue q;
+            ss::Policy p; p.enabled = false; p.store = false;
+            sv::SessionHooks h; h.disable_native_cache = true;
+            h.control_turn = [](sv::SessionRuntime&) {};
+            h.native_validate = [](const auto&) {};
+            sv::SessionRuntime r(q, e, e.store, p, h);
+            ss::EmbedInterner interner;
+            ss::EmbedRows rows; rows.digest[0] = 9; rows.rows = 2; rows.width = 2; rows.data.assign(4, 0x3f80);
+            const auto lease = interner.intern(rows);
+            const auto table = std::make_shared<const ss::EmbedTable>(std::vector<ss::EmbedLease>{lease});
+            const std::vector<std::uint32_t> ids{10, ss::embed_id(lease.handle(), 0), ss::embed_id(lease.handle(), 1)};
+            const auto refused_as = [](auto&& call) {
+                try { call(); } catch (const std::invalid_argument&) { return 1; } catch (const std::exception&) { return 2; }
+                return 0;
+            };
+            // activate: a virtual id without a table is refused although native validation accepted the job
+            auto bare = q.submit(job(ids)); CHECK(r.reserve_fifo());
+            CHECK(refused_as([&] { (void)r.activate(0, true); }) == 1);
+            CHECK(r.reservation() && r.live() == 0);
+            r.refuse({}, "virtual id without a table"); CHECK(drain(bare).error == "virtual id without a table");
+            // activate: the bind fails after the lease exists; the lease returns and the request is still refusable
+            auto bound = job(ids); bound.embeds = table;
+            auto failing = q.submit(bound); CHECK(r.reserve_fifo());
+            CHECK(refused_as([&] { (void)r.activate(0, true); }) == 1);
+            CHECK(r.reservation() && r.live() == 0);
+            r.refuse({}, "bind refused"); CHECK(drain(failing).error == "bind refused");
+            // the only slot is free again
+            auto text = q.submit(job()); CHECK(r.reserve_fifo());
+            const auto lane = r.activate(0, true); CHECK(r.live() == 1);
+            r.complete(lane.state, {}, 0); CHECK(r.live() == 0 && drain(text).error.empty());
+            // promote: the same two cases; the pending entry survives the failure
+            auto pending_bare = q.submit(job(ids)); CHECK(r.reserve_fifo());
+            const auto a = r.hold_reservation();
+            CHECK(refused_as([&] { (void)r.promote(a); }) == 1 && r.pending_count() == 1 && r.live() == 0);
+            r.refuse_pending(a, {}, "virtual id without a table"); CHECK(drain(pending_bare).error == "virtual id without a table");
+            auto pending_bound = q.submit(bound); CHECK(r.reserve_fifo());
+            const auto b = r.hold_reservation();
+            CHECK(refused_as([&] { (void)r.promote(b); }) == 1 && r.pending_count() == 1 && r.live() == 0);
+            CHECK(refused_as([&] { (void)r.promote(b); }) == 1 && r.pending_count() == 1); // again: nothing leaked
+            r.refuse_pending(b, {}, "bind refused"); CHECK(drain(pending_bound).error == "bind refused");
+            auto last = q.submit(job()); CHECK(r.reserve_fifo());
+            const auto c = r.hold_reservation();
+            const auto promoted = r.promote(c); CHECK(r.live() == 1 && r.pending_count() == 0);
+            r.complete(promoted.state, {}, 0); CHECK(drain(last).error.empty());
+            CHECK(q.snapshot().running == 0 && q.snapshot().queued == 0);
+        }
         std::cout << "session runtime checks passed\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

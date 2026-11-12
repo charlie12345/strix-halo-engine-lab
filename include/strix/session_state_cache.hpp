@@ -15,7 +15,7 @@ struct SessionCompatibility {
     // Appended fields preserve historical Qwen aggregate initialization and digest bytes.
     std::string family = "qwen";
     std::uint64_t format_version = 1;
-    std::string record; // complete family compatibility record, never just its hash
+    std::string record = {}; // complete family compatibility record, never just its hash
     [[nodiscard]] ModelContentIdentity digest() const;
 };
 struct SessionSuffixPlan { bool tiled = false; std::uint64_t serial_rows = 0; };
@@ -65,7 +65,7 @@ struct SessionCheckpoint {
     SessionCompatibility compatibility;
     SessionFrontier frontier;
     std::vector<SessionSection> sections;
-    std::string id, generation;
+    std::string id = {}, generation = {}; // defaulted: existing aggregate initialisers stay valid
     std::uint32_t rank = 0, world = 1;
 };
 // Shape checks independent of a family's stronger codec/restore validation. No live

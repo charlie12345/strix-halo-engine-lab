@@ -528,6 +528,7 @@ Reuses dense projection tiles across prompt rows while preserving the operand im
 - **Measured gain:** -
 - **Public evidence:** [Qwen results](performance.md#qwen-prefill-and-defaults), [dense selector](../src/hip_dense_f16_tiled.hpp)
 - **WMMA register banks:** form 4 issues its WMMAs with A and B pinned to VGPR banks other than the accumulators' (STRIX_QPF2K_WMMA_PIN). It is an independent switch read once per process, not one of the QPF2K resolver defaults: on unless set to `0`, and `=0` only restores the compiler's register assignment (route selection is unchanged). Register assignment only: the same instructions on the same values. The accumulator bank is chosen by the compiler; `tools/check_wmma_banks.py` checks each build (distinct banks, tied and disjoint D, zero scratch, at most 192 VGPRs).
+- **GDN input vector epilogue:** `STRIX_QPF2K_GDN_VEC_EPILOGUE` defaults ON (only `0` disables it), read once per process; eligible aligned outputs retain the same per-element BF16 rounding and use 16-byte stores through the shared tiled epilogue. `=0` restores the scalar kernels; unpinned scratch-A keeps scalar stores.
 
 <a id="qwen-gdn"></a>
 

@@ -207,3 +207,4 @@
 {"src/xport/stats.hpp", 0x2d491799a3d6a36bULL},
 {"src/xport/transport_backend.hpp", 0xe55fde715548edf1ULL},
 {"src/xport/wire.hpp", 0x7f1782a0671f1afdULL},
+{"src/moe_core/route.hpp", 0x3acb79710ef6b1a8ULL},

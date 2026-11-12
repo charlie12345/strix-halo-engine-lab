@@ -1659,8 +1659,7 @@ struct Bench {
         std::vector<float> out;
         std::vector<std::uint8_t> xt, at, part;
     };
-    PfDump run_dump(Prefill& q, int core, int mtfit = -1, bool raw_tiled = false, int core8 = 0, int gufuse = 0, bool debug_partials = false, float* intermediates = nullptr, bool producer_only = false, int pipe = 0) {
-        (void)core;  // all dumps execute the sole v4 core path
+    PfDump run_dump(Prefill& q, int mtfit = -1, bool raw_tiled = false, int core8 = 0, int gufuse = 0, bool debug_partials = false, float* intermediates = nullptr, bool producer_only = false, int pipe = 0) {
         const int saved_pipe = opt::prefill_pipe_override();
         struct RestorePipe { int value; ~RestorePipe() { opt::set_prefill_pipe(value); } } restore_pipe{saved_pipe};
         opt::set_prefill_pipe(pipe);
@@ -2066,8 +2065,8 @@ struct Bench {
             check_prefill_gufuse(q, "loaded shared rows " + std::to_string(rows));
             if (rows == 97)
                 for (int core : {0, 1, 2}) {
-                    const PfDump a = run_dump(q, core, 0, false, 0, 0);
-                    const PfDump b = run_dump(q, core, 0, false, 0, 1);
+                    const PfDump a = run_dump(q, 0, false, 0, 0);
+                    const PfDump b = run_dump(q, 0, false, 0, 1);
                     check(a.part == b.part && a.xt == b.xt && a.at == b.at && same_bits(a.out, b.out),
                           "gufuse older core fallback " + std::to_string(core));
                 }

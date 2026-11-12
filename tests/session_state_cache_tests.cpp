@@ -292,6 +292,16 @@ int main() {
         session_tail_plan_test();
         sequential_reader_tests(dir/"reader");
         old_format_session_tests(dir/"old-format");
+        {
+            strix::SessionCheckpoint c;
+            strix::SessionCompatibility compat{hash("family model"),hash("family executable"),"family settings",false};
+            c.compatibility=compat;
+            auto envelope=strix::encode_session_checkpoint(c,heap);
+            auto other=compat; other.family="minimax";
+            refused([&]{(void)strix::decode_session_checkpoint(envelope,other);},"family tag ignored");
+            other=compat; other.format_version=2;
+            refused([&]{(void)strix::decode_session_checkpoint(envelope,other);},"schema tag ignored");
+        }
         unbuffered_session_io_tests(dir/"unbuffered",strix::SessionCompatibility{hash("full model content"),hash("exe"),"compiled plan;all env",false});
         const auto aligned=strix::plan_session_suffix(32768,1024,1024,true);
         check(aligned.tiled && aligned.serial_rows==0,"aligned suffix did not tile");
@@ -304,6 +314,7 @@ int main() {
         strix::SessionCheckpoint c;
         c.compatibility=compat; c.frontier.consumed=3; c.frontier.accepted=3;
         c.frontier.emitted=2; c.frontier.pending=99; c.frontier.tokens={7,8,9};
+
         auto payload=heap(4096);
         for(std::uint64_t i=0;i<payload.bytes;++i) payload.data.get()[i]=static_cast<std::byte>(i&255U);
         c.sections.push_back({"target.kv",payload}); c.sections.push_back({"target.fixed",heap(0)});

@@ -47,7 +47,13 @@ changed-history named continuation, heartbeat/quiesce and native failure isolati
 still require qualification. This is a real owner adopter with remaining gates,
 not completion of the full serve/session consolidation.
 
-All native tickets are **NOT RUN**. Each configure, compile, link, per-arm paired
+One ordinary paired ticket was run before and after the adoption: six greedy
+requests (a single prompt, two prompts sharing a 1,280-token cached prefix, an
+exact repeat and a two-turn conversation) returned byte-identical responses,
+usage counts and prefill logit digests. The default paired route keeps the named
+session cache off, so that ticket does not cover parked sessions.
+
+All other native tickets are **NOT RUN**. Each configure, compile, link, per-arm paired
 capture, exact comparison and interleaved complete-workload A/B is a separate
 inclusive <=120-second ticket, including teardown. Missing toolchains, assets,
 hardware or timeout means NOT RUN/incomplete. Required arms are ordinary,

@@ -1557,6 +1557,10 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
 
 int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed process keeps its log
+    // This suite compares the index score buffer byte for byte between the VALU kernels. The default index mode
+    // (WMMA scores + exact rescoring of the cut-off band) keeps the selection, not every score value; its
+    // selection identity is covered by tests/hip_idx_wmma_tests.hip. An explicit STRIX_IDX_WMMA is kept.
+    setenv("STRIX_IDX_WMMA", "0", 0);
     std::mt19937 rng(20261024);
     // Focused producer/index byte checks; omit the unrelated decode suite
     // and the exhaustive complete-prefill matrix. Optional list: pos0:n,pos0:n.

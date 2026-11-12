@@ -111,7 +111,8 @@ void launch_i4_chain(Args a,unsigned grid_tiles,const moe::ExpertSlices& shared,
 void launch_iu4(Args a, unsigned grid_tiles, const moe::ExpertSlices& shared, const iu4::Layer& q, const iu4::Scratch& s,
                 hipStream_t stream) {
     namespace st = strix::core;
-    if(st::moe_i4::enabled()) { launch_i4_chain(a,grid_tiles,shared,q,s,stream); return; }
+    // The paired chain hands the routed down its A4 image; a gate/up-only layer (q.wq[2] == nullptr) takes the calls below.
+    if(q.wq[2] != nullptr && st::moe_i4::enabled()) { launch_i4_chain(a,grid_tiles,shared,q,s,stream); return; }
     wmma_x::iu4_moe_calls.fetch_add(1, std::memory_order_relaxed);
     a.aux_act = false;
     a.aux_combine = aux::enabled_default_on("STRIX_GLM_PF_AUX_COMBINE");
@@ -143,6 +144,16 @@ void launch_iu4(Args a, unsigned grid_tiles, const moe::ExpertSlices& shared, co
                "iu4 routed gate/up");
     }
     launch_linear_w<false, false>(a, shared.gate.bits, stream);  // shared expert only
+    if (q.wq[2] == nullptr) {  // scope gate_up: the routed down keeps its EXL3 weights (FP16 down input, the WMMA-X down call)
+        activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
+        ok(hipGetLastError(), "iu4 R15/down transform (FP16 down input)");
+        launch_linear_w<true>(a, shared.down.bits, stream);
+        if (!a.aux_combine) {
+            combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
+            ok(hipGetLastError(), "iu4 R16");
+        }
+        return;
+    }
     if (fuse) {
         st::moe_i4::reference_activation_kernel<<<dim3(I/128,grid_tiles),256,0,stream>>>(I4ReferenceSchedule{{a.x,a.out,a},s.aq_down,s.as_down});
         ok(hipGetLastError(), "iu4 R15/down transform + quantiser");

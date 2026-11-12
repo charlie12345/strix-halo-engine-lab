@@ -1,5 +1,10 @@
 #pragma once
 
+// HIP TUs: the runtime header must precede the std headers so <cstring> etc. get device overloads.
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#endif
+
 #include <cerrno>
 #include <cctype>
 #include <cmath>
@@ -9,9 +14,12 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 // The one place that reads switches, numbers and choices from the environment. Unset and empty always mean "use the
 // default"; a number, byte count or choice that is set but not understood throws std::invalid_argument naming the
@@ -113,4 +121,78 @@ inline std::size_t env_choice(const char* name, std::size_t fallback, std::initi
     detail::env_reject(name, value, "expected one of " + allowed);
 }
 
+
+// Cached, registered environment reads (R2-15). Call sites keep the result in a
+// function-local `static const` so the process environment is scanned once per
+// switch; every read is recorded so --print-effective-config can list the
+// switches the run actually consulted and the value each one resolved to.
+namespace envcfg {
+
+struct Entry {
+    std::string name;
+    std::string value;  // resolved value as text ("1"/"0" for flags)
+    bool set = false;   // variable present in the environment
+};
+
+inline std::mutex& registry_mutex() { static std::mutex m; return m; }
+inline std::vector<Entry>& registry_entries() { static std::vector<Entry> v; return v; }
+
+inline void record(const char* name, const char* raw, std::string resolved) {
+    std::lock_guard<std::mutex> lock(registry_mutex());
+    for (auto& e : registry_entries())
+        if (e.name == name) { e.value = std::move(resolved); e.set = raw != nullptr; return; }
+    registry_entries().push_back(Entry{name, std::move(resolved), raw != nullptr});
+}
+
+// Snapshot of every switch read so far, in first-read order.
+inline std::vector<Entry> registered() {
+    std::lock_guard<std::mutex> lock(registry_mutex());
+    return registry_entries();
+}
+
+// Line form for --print-effective-config: "env NAME VALUE (set|default)" per
+// switch read so far, in first-read order.
+inline std::string describe() {
+    std::string out;
+    for (const auto& e : registered())
+        out += "env " + e.name + " " + e.value + (e.set ? " (set)\n" : " (default)\n");
+    return out;
+}
+
+// Boolean switch. default_on=true: unset/empty is ON and only "0" disables;
+// default_on=false: only "1" enables. `match` keeps legacy byte-0 readers.
+inline bool flag(const char* name, bool default_on, EnvFlagMatch match = EnvFlagMatch::first_character) {
+    const char* raw = std::getenv(name);
+    const bool on = default_on ? !detail::env_flag_matches(raw, "0", match)
+                               : detail::env_flag_matches(raw, "1", match);
+    record(name, raw, on ? "1" : "0");
+    return on;
+}
+
+// Integer switch: atoi of the value, `fallback` when unset (empty -> 0 like atoi).
+inline int integer(const char* name, int fallback) {
+    const char* raw = std::getenv(name);
+    const int v = raw ? std::atoi(raw) : fallback;
+    record(name, raw, std::to_string(v));
+    return v;
+}
+
+// Raw text switch (nullptr when unset), recorded for the effective config.
+inline const char* text(const char* name) {
+    const char* raw = std::getenv(name);
+    record(name, raw, raw ? raw : "");
+    return raw;
+}
+
+// Choice switch: index of the value in `choices`, `fallback` when unset or unknown.
+inline int choice(const char* name, std::initializer_list<const char*> choices, int fallback) {
+    const char* raw = std::getenv(name);
+    int index = fallback, i = 0;
+    if (raw)
+        for (const char* c : choices) { if (std::strcmp(raw, c) == 0) { index = i; break; } ++i; }
+    record(name, raw, std::to_string(index));
+    return index;
+}
+
+}  // namespace envcfg
 }  // namespace strix

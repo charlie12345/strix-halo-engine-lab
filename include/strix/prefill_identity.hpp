@@ -8,6 +8,7 @@
 // Environment and startup restrictions combine monotonically. The active set names the prefill identity (prefill_identity_name/hash),
 // which receipts and the serving capability endpoint report.
 
+#include "strix/env_flags.hpp"
 #include "strix/decode_numerical_profile.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/qsa_prefill_budget.hpp"
@@ -140,7 +141,7 @@ inline std::uint32_t qsa_union_cap_active() {
         const char* value = std::getenv("STRIX_QPF2K_QSA_UNION_CAP");
         return parse_qsa_union_cap(value ? value : "");
     }();
-    static const bool exact = [] { const char* v = std::getenv("STRIX_PREFILL_EXACT_FP16"); return v && v[0] == '1'; }();
+    static const bool exact = strix::envcfg::flag("STRIX_PREFILL_EXACT_FP16", false);
     return exact || detail::prefill_identity_override().exact ? 0U : cap;
 }
 

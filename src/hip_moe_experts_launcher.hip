@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -2945,7 +2946,7 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     // (codes, deltas, sums, status, intermediates, accumulation, A8 down image, raw dots) are row 0's
     // offsets inside its own temporary. The first and last chunks keep the full admission, every view
     // is then checked row-striped below, and the striped writes are checked against the striped reads.
-    static const bool shared_env = [] { const char* v = std::getenv("STRIX_PREFILL_MOE_SHARED_ADMISSION"); return !v || v[0] != '0'; }();
+    static const bool shared_env = strix::envcfg::flag("STRIX_PREFILL_MOE_SHARED_ADMISSION", true);
     const bool shared = shared_admission && shared_env;
     enum Derived : unsigned { d_codes, d_deltas, d_sums, d_status, d_intermediates, d_accumulation,
         d_down_codes, d_down_deltas, d_down_sums, d_rawdots, derived_count };

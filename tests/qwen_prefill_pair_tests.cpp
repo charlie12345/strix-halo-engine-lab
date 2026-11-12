@@ -92,6 +92,58 @@ void balance_checks() {
     try { (void)choose_cut(costs, legal); } catch (const std::invalid_argument&) { rejected = true; }
     require(rejected);
 }
+void half_cut_checks() {
+    using namespace strix::qwen_pp;
+    using strix::pair::StageCut;
+    require(StageCut::parse("23") == StageCut(23U) && StageCut::parse("22.5") == StageCut(22U, true));
+    require(StageCut(22U, true).text() == "22.5" && StageCut(23U).text() == "23");
+    require(StageCut(23U).wire() == 23U && StageCut(22U, true).wire() == ((1ULL << 32U) | 22U));
+    require(StageCut(22U, true).state_begin() == 23U && StageCut(23U).state_begin() == 23U);
+    require(StageCut(22U).units() < StageCut(22U, true).units() && StageCut(22U, true).units() < StageCut(23U).units());
+    for (const char* bad : {"", "x", "22.", "22.50", "22.5x", ".5", "22,5"}) {
+        bool rejected = false;
+        try { (void)StageCut::parse(bad); } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected);
+    }
+    LegalCuts legal{}; legal.fill(true);
+    LegalCuts legal_half{}; legal_half[22] = true;
+    require(parse_stage_cut(nullptr, legal, legal_half) == StageCut(measured_default_cut));
+    require(parse_stage_cut("24", legal, legal_half) == StageCut(24U));
+    require(parse_stage_cut("22.5", legal, legal_half) == StageCut(22U, true));
+    for (const char* bad : {"21.5", "0.5", "48.5", "22.25", "22.5 "}) {
+        bool rejected = false;
+        try { (void)parse_stage_cut(bad, legal, legal_half); } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected);
+    }
+    // Step topology: whole cuts need the attention mix first; half cuts need the feed-forward mix before its inject.
+    struct Step { std::optional<std::uint32_t> layer; int op; };
+    const std::vector<Step> steps{{1U, 0}, {1U, 1}, {1U, 2}, {1U, 3}, {2U, 1}, {2U, 0}, {2U, 3}, {2U, 2}, {std::nullopt, 2}};
+    const auto whole = legal_cuts(steps, 0, 1, true), half = legal_cuts(steps, 2, 3, false);
+    require(whole[1] && !whole[2] && half[1] && !half[2] && !half[3]);
+    // Costs: 48 equal layers of 2 units whose attention sub-block is 1 unit, tail 1: whole cuts give 48/49 at best,
+    // the half cut 24.5 gives 49/48; with a cheaper attention (0.5) the half cut balances to 48.5/48.5.
+    LayerCosts costs; costs.layers.fill(2.0); costs.lm_head = 1.0;
+    legal_half.fill(true);
+    require(!choose_cut(costs, legal, legal_half).half);            // no attention costs: whole cuts only
+    require(choose_cut(costs, legal).cut == 24U);
+    costs.attention.fill(0.5); costs.has_attention = true;
+    const auto chosen = choose_cut(costs, legal, legal_half);
+    require(chosen.cut == 24U && chosen.half && chosen.a == 48.5 && chosen.b == 48.5);
+    require(chosen.stage() == StageCut(24U, true));
+    const auto explicit_half = predict_cut(costs, StageCut(22U, true));
+    require(explicit_half.half && explicit_half.a == 44.5 && explicit_half.b == 52.5);
+    costs.has_attention = false;                                     // explicit half cut without attention costs
+    require(predict_cut(costs, StageCut(22U, true)).a == 45.0);
+    std::string json = "{\"buckets\":[{\"context\":32768,\"lm_head\":1,\"layers\":{";
+    for (int layer = 0; layer < 48; ++layer) json += (layer ? ",\"" : "\"") + std::to_string(layer) + "\":2";
+    json += "},\"attention\":{";
+    for (int layer = 0; layer < 48; ++layer) json += (layer ? ",\"" : "\"") + std::to_string(layer) + "\":0.5";
+    const auto parsed = parse_costs(json + "}}]}", 32768);
+    require(parsed.has_attention && parsed.attention[47] == 0.5 && choose_cut(parsed, legal, legal_half).half);
+    bool rejected = false;
+    try { (void)parse_costs(json + ",\"48\":1}}]}", 32768); } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected);
+}
 void chunk_checks() {
     using namespace strix::qwen_pp;
     LayerCosts costs; costs.layers.fill(0.001); costs.has_transfer = true;
@@ -354,7 +406,7 @@ void timeline_checks() {
 }
 int main() {
     try {
-        balance_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); timeline_checks(); copy_rows_checks();
+        balance_checks(); half_cut_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); timeline_checks(); copy_rows_checks();
         Wire forward, backward;
         std::mutex received_mutex; std::condition_variable received_cv; std::uint64_t received_chunks = 0;
         const auto abort = [&] { forward.stop(); backward.stop(); };

@@ -4398,6 +4398,54 @@ The load admits the first prefill memory plan that fits, in this order: full scr
 - **Measured gain:** Not stated here.
 - **Implementation / evidence:** [variants](../src/glm/prefill/glm_pf_variants.hpp)
 
+<a id="glm-idx-wmma"></a>
+
+### FAST indexer scores on WMMA (glm-idx-wmma)
+
+**Engine:** `glm`. **Control:** `STRIX_IDX_WMMA`. **Default:** off (opt-in FAST identity).
+
+The prefill DSA indexer scores (per row: ReLU of the 32 head dots times the head weight, summed over heads, for every
+pooled key) run on the shared indexer score core (`src/attn_core/index_score_wmma.hpp`, tile helpers in
+`src/attn_core/wmma_types.hpp` / `wmma_frag.hpp`) instead of the exact v3 kernel: 128 query vectors per work-group
+in registers, 128-key tiles in a swizzled LDS tile, 16x16x16 WMMA with FP32 accumulation, head-sum epilogue in
+registers. Both operands (FP32 queries and pooled keys) are rounded to the operand type: `STRIX_IDX_WMMA=f16` (the
+measured setting: faster and closer) or `=1` / `bf16`. The top-k selection kernels are unchanged.
+`STRIX_IDX_WMMA_AUDIT=1` rescores every call with the exact kernel and prints the per-row top-512 recall
+(diagnostic, synchronous, slow).
+
+- **Preconditions:** prefill indexer rows with more pools than the always-kept set (shorter rows keep the exact path); the `--tf` scoring path does not use it.
+- **Automatic selection:** none (opt-in).
+- **Fallback notice:** each rank prints `prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=...)`. Two ranks: the mode is part of the startup agreement (config bits 15-16); modes without the decode handshake refuse it. GLM takes 0, 1, bf16 or f16; other values fail closed.
+- **Exactness evidence:** FAST identity. Synthetic (strix-hip-idx-wmma-glm-tests): pool recall@512 f16 0.99988 / bf16 0.9991, score rel-L2 f16 1.9e-4 / bf16 1.5e-3. Pair 8K FAST prefill (PF_WMMA=1 config), f16: in-engine recall@512 0.99974 (min 0.9941), prefill-logits KL 0.00052, 64 same-context decode steps KL mean 0.0021 (max 0.036), top-1 100 %, greedy 64/64 ids identical; bf16: KL 0.0011, top-1 98.1 %, greedy diverges at step 51.
+- **Off switch:** unset or STRIX_IDX_WMMA=0 (nothing from the core runs; default bytes unchanged, logits anchor 6f8f5af9ad00aeb1 reproduced).
+- **Measured gain:** Kernel (gfx1151): 4096 x 2048 rows exact v3 2.05 ms -> f16 1.14 ms (1.80x), bf16 1.51 ms; 28672 x 2048 13.9 -> 8.3 ms (1.67x). Pair 8K FAST, f16, fresh process per arm, 2 ABAB pairs: 11.32 -> 11.13 s (-0.19 s, -1.7 %). 32K: 2 pairs -5.24 / +0.80 s, not resolved (arm spread larger than the effect).
+- **MiniMax:** the same core scores the MiniMax MSA prefill index; see [exact index selection through WMMA scores](#minimax-idx-wmma-exact) (default, exact) and its FAST modes.
+- **Implementation / evidence:** [core](../src/attn_core/index_score_wmma.hpp), [mode](../src/attn_core/index_score_mode.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [startup agreement](../apps/glm_rank_startup.hpp), [test](../tests/hip_idx_wmma_tests.hip)
+
+<a id="minimax-idx-wmma-exact"></a>
+
+### Exact index selection through WMMA scores (minimax-idx-wmma-exact)
+
+**Engine:** `minimax`. **Control:** `STRIX_IDX_WMMA`. **Default:** ON (`exact`); `STRIX_IDX_WMMA=0` runs the VALU index kernels.
+
+The MSA prefill index picks, per row and index head, the 15 best 128-position blocks before the newest one. The
+default path scores every block on the shared WMMA index core (`src/attn_core/index_score_wmma.hpp`) with the query
+split into a BF16 value plus the BF16 rounding of its FP32 residual (two WMMA terms per dot, the BF16 keys are the
+cache bits), which bounds the score error by `delta = 2^-13 * |q| * |k| * scale`. A second kernel then finds the
+cut-off of each selection and rescores only the blocks within `2 delta` of it with the arithmetic of the VALU kernel
+(same per-dot FMA order, same maximum). By the band rule in `src/attn_core/index_score_band.hpp` the unchanged
+selection kernel then returns exactly the set of the VALU path, ties included. The score buffer itself holds WMMA
+values outside the band, so byte comparisons of that buffer need `STRIX_IDX_WMMA=0`.
+
+- **Preconditions:** prefill rows with more than 16 blocks (shorter rows select every block and skip the index).
+- **Automatic selection:** always, unless `STRIX_IDX_WMMA` is set.
+- **Fallback notice:** none (same identity). `STRIX_IDX_WMMA_AUDIT=1` rescores every call with the VALU kernel and prints the per-row selection recall (diagnostic, synchronous, slow).
+- **Exactness evidence:** exact identity. Kernel test (strix-hip-idx-wmma-mm-tests): every (row, head) selection equals the VALU selection at 2K, 8K and 32K positions, score error at most 1.8e-5 against a bound of 2 delta. Pair prefill, in-engine audit over 2.2M (row, head, layer) selections on three 8K prompts: recall 1.00000, minimum 1.0000; state, final-row and result hashes equal to the `STRIX_IDX_WMMA=0` run on all three, and equal to the published 8K and 32K anchors in every timing cell.
+- **Off switch:** `STRIX_IDX_WMMA=0`.
+- **Measured gain:** index kernel (gfx1151, 4096 rows x 2 heads): at 8K positions 4.86 -> 1.66 ms (2.9x), at 32K positions 25.6 -> 5.45 ms (4.7x). Pair prefill TTFT 32K, fresh process per cell, 4 pairs in both orders: 57.66 -> 52.62 s (-5.04 s, -8.7 %; pairs -5.24 / -5.06 / -4.84 / -5.01). 8K: 6 pairs, median pair -0.07 s, not resolved (cell spread 12.8-15.9 s).
+- **FAST modes (opt-in, not qualified):** `STRIX_IDX_WMMA=bf16x2` (split query without the rescoring) and `=1` / `bf16` (rounded query) change a few selections (flip rate below 5e-6 and 6e-4) and fail the FAST gate on chat-wrapped prose / code / data at 8K: pooled KL 0.47 / 0.69 (limit 0.02), top-1 agreement 87.6 % / 85.9 % (limit 93 %). They stay switches for measurements only.
+- **Implementation / evidence:** [core](../src/attn_core/index_score_wmma.hpp), [band rule](../src/attn_core/index_score_band.hpp), [mode](../src/attn_core/index_score_mode.hpp), [MiniMax policy and rescoring kernel](../src/minimax/attn/msa_fused.hip), [test](../tests/hip_idx_wmma_tests.hip)
+
 ## Qwen RTX PRO standalone
 
 <a id="qwen-rtx-prefix-cache"></a>

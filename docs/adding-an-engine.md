@@ -27,6 +27,25 @@ build/strix-skeleton-serve --registry-root examples/skeleton_engine \
 curl -s localhost:8080/v1/completions -d '{"model":"skeleton","prompt":"hi","max_tokens":4}'
 ```
 
+### Families already on the layer
+
+Two production families are worked examples of the two ways to adopt it:
+
+- **Gemma4** (single device): the family implements `session::Engine` and the
+  shared `SessionRuntime` drives admission, steps and publication
+  (`src/gemma4/engine/session_service.cpp`).
+- **MiniMax** (two ranks over a pair transport): the family keeps its own
+  planner, because every step is a lockstep exchange with the second rank, and
+  uses the runtime's native control mode. The planner reserves, activates and
+  completes requests through `SessionRuntime`; the queue, the slot store, the
+  resident-prefix cache and the HTTP front end are the shared ones
+  (`src/minimax/serve/minimax_lead.hpp`, `session_service.cpp`,
+  `serve_runtime.cpp`). Rank 1 is the same service in the follower role.
+  `strix-serve --model minimax-m3.1-flash MODEL_DIR --rank R --transport T ...`
+  and the legacy `strix-minimax-serve` spelling start the same service.
+  `docs/engine/minimax-frontend.md` and `docs/engine/minimax-paired-state.md`
+  describe the family side.
+
 ## What a family implements
 
 | Piece | Where | In the example |

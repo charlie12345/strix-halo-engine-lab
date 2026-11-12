@@ -167,7 +167,7 @@ public:
         if (kp && std::string(kp) != "0" && std::string(kp) != "1")
             throw std::invalid_argument("STRIX_GLM_PF_KDA_PACK must be 0 or 1");
         kda_pack_ = kp && std::string(kp) == "1";  // 1 = contiguous KDA projections + pack_qkv (the pre-strided form)
-        kda_wmma_ = kda_wmma::enabled();  // 1 = FAST identity glm-pf-kda-wmma-v1 (f_a / g_a / b / f_b / g_b on WMMA)
+        kda_wmma_ = kda_wmma::enabled();  // FAST identity glm-pf-kda-wmma-v1 (f_a / g_a / b / f_b / g_b on WMMA): default with STRIX_GLM_PF_WMMA=1
         (void)exact::tile_rows();
         route_ids_.resize(R * kTopE);
         route_weights_.resize(R * kTopE);
@@ -277,7 +277,7 @@ public:
             const DenseProj pf{w.f_b, 0, C, f_}, pg{w.g_b, 0, C, g_};
             if (kda_wmma_ && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R) &&
                 kda_wmma::supported(D::WType::F16, kKdaDim, &pf, 1, R) && kda_wmma::supported(D::WType::F16, kKdaDim, &pg, 1, R)) {
-                // FAST (opt-in): the same five projections on the shared dense FP16 WMMA core.
+                // FAST (default with the FAST route): the same five projections on the shared dense FP16 WMMA core.
                 kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream);
                 kda_wmma::dense_group(ta_, kKdaDim, &pf, 1, R, c.stream);
                 kda_wmma::dense_group(tb128_, kKdaDim, &pg, 1, R, c.stream);

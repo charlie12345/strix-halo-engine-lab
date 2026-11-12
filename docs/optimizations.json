@@ -2637,11 +2637,11 @@
     "engine": "glm",
     "name": "FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)",
     "flag_or_env": "STRIX_GLM_PF_KDA_WMMA",
-    "default": "off (opt-in FAST identity)",
-    "exact": "FAST identity (FP16-rounded activations, WMMA FP32 accumulation); kernel gate: against the FP64 value of the contract rel-L2 <= 8.0e-7, against the exact chains rel-L2 <= 2.3e-4 (297 checks); teacher-forced 3 x 256 positions at 8K against FAST without it: KL 0.0038 / 0.0004 / 0.0004 nats, top-1 98.0 / 100 / 100 %, NLL change -0.006 / +0.001 / +0.002 (chat / code / json); unset or 0 keeps the previous bytes.",
+    "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",
+    "exact": "FAST identity (FP16-rounded activations, WMMA FP32 accumulation); kernel gate: against the FP64 value of the contract rel-L2 <= 8.0e-7, against the exact chains rel-L2 <= 2.3e-4 (297 checks); teacher-forced 3 x 256 positions at 8K against FAST without it: KL 0.0038 / 0.0004 / 0.0004 nats, top-1 98.0 / 100 / 100 %, NLL change -0.006 / +0.001 / +0.002 (chat / code / json); the exact route, or 0 with FAST, keeps the previous bytes.",
     "gain": "Pair FAST prefill 8K 9.25 -> 9.05 s (-2.1 %, 2 ABAB pairs: 9.258 / 9.245 vs 9.034 / 9.073); 32K 37.74 -> 37.13 s (-1.6 %; off 37.705 / 37.771, on 36.990 / 37.280 / 37.105; one run of each arm at 41-43 s discarded as a disturbed run); kernels at 4096 rows: f_a + g_a + b 3.06 -> 1.71 ms, f_b / g_b (8192 outputs) 4.06 -> 2.03 ms",
     "preconditions": "KDA layers of the chunked prefill path; FP16 plain weights, widths that are multiples of 16, inputs that are multiples of 128 (other shapes keep the exact kernels).",
-    "off_switch": "STRIX_GLM_PF_KDA_WMMA=0 or unset",
+    "off_switch": "STRIX_GLM_PF_KDA_WMMA=0 (or exact mode)",
     "doc_anchor": "docs/optimizations.md#glm-pf-kda-wmma"
   },
   {

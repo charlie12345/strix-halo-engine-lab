@@ -544,6 +544,10 @@ void test_startup_agreement() {
         auto opt_out = fast;
         opt_out[1] = rd::kPfWmmaConfig;
         pair(fast, opt_out, false, false, true);
+        auto kda = fast;  // the FAST KDA projections are on by default with the FAST route: one rank opting out is refused too
+        kda[1] |= rd::kPfKdaWmmaConfig;
+        pair(kda, kda, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(kda, fast, false, false, true);
     }
     // External Xfer, including fixed and baseline modes, never enters this host handshake.
     for (const auto& extra : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {

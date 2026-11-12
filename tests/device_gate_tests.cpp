@@ -6,6 +6,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #ifdef _MSC_VER
 #include <crtdbg.h>
@@ -289,6 +290,93 @@ void entry_points() {
     int bad_argc = 2;
     rejects([&] { (void)take_command_line(bad_argc, bad_argv); }, "needs a value", "flag without a value");
 }
+
+// NPU and CPU units: declared explicitly, never matched against the GPU listing, shown in the start line.
+void units() {
+    const std::string gpu = std::string("schema = \"strix-devices-v1\"\n[devices.main]\nvendor = \"amd\"\npci = \"0000:c5:00.0\"\n"
+                                        "roles = [\"pair\", \"decode\", \"prefill\", \"aux\"]\nattach = { kind = \"integrated\" }\n");
+    const std::string npu = "[devices.npu]\nkind = \"npu\"\nvendor = \"amd\"\npci = \"0000:c5:00.1\"\narch = \"aie2p\"\nroles = [\"aux\"]\n";
+    const std::string qualified = "driver = \"amdxdna\"\nfirmware = \"1.1.2.64\"\ncorun_qualification = \"E1-test\"\n";
+    const std::string host = "[devices.host]\nkind = \"cpu\"\ncores = \"2-15\"\nroles = [\"host\", \"aux\"]\nbyte_cap_gbytes_ps = 10.0\n";
+
+    const auto all = parse_declaration(gpu + npu + qualified + host);
+    require(all.devices.size() == 3, "three units parse");
+    const Descriptor* cpu = host_unit(all);
+    require(cpu && cpu->id == "host" && cpu->kind == Kind::cpu, "host unit found");
+    require(cpu->cores.size() == 14 && cpu->cores.front() == 2 && cpu->cores.back() == 15 && cpu->cores_text == "2-15", "cores parsed");
+    require(cpu->byte_cap_gbytes_ps == 10.0, "byte cap parsed");
+    require(units_for_role(all, "aux").size() == 3 && units_for_role(all, "host").size() == 1 && units_for_role(all, "decode").size() == 1,
+            "units by role");
+    require(parse_cores("0,4-7,12") == std::vector<std::uint32_t>({0, 4, 5, 6, 7, 12}), "core list");
+    for (const char* bad : {"", "a", "3-1", "1,1", "0-2,2", "1,", "-3", "4096", "1 2"})
+        rejects([&] { (void)parse_cores(bad); }, "cores", "bad core list");
+
+    // An old file is unchanged: kind defaults to gpu, and the receipt carries no units text.
+    const auto old = parse_declaration(gpu);
+    require(old.devices.front().kind == Kind::gpu && host_unit(old) == nullptr, "default kind is gpu, no implicit host");
+    Visible igpu;
+    igpu.ordinal = 0;
+    igpu.vendor = Vendor::amd;
+    igpu.name = "integrated";
+    igpu.pci = "0000:c5:00.0";
+    igpu.integrated = true;
+    const auto plain = resolve(&old, {igpu}, Request{});
+    require(plain.units.empty() && receipt_line(plain).find("units=") == std::string::npos &&
+                receipt_json(plain).find("units") == std::string::npos,
+            "gpu-only receipt unchanged");
+    require(resolve(nullptr, {igpu}, Request{}).units.empty(), "the implicit device brings no npu or cpu");
+
+    const auto bound = resolve(&all, {igpu}, Request{});
+    require(bound.device.id == "main" && bound.units.size() == 2, "gpu bound, two other units listed");
+    const auto line = receipt_line(bound);
+    require(line.find(" units=cpu:host[host,aux cores=2-15 byte_cap=10GB/s],npu:npu[aux qualified=E1-test]") != std::string::npos,
+            "units in the start line");
+    const auto json = receipt_json(bound);
+    require(json.find("\"units\":[{\"id\":\"host\",\"kind\":\"cpu\",\"roles\":\"host,aux\",\"roles_refused\":\"\",\"cores\":\"2-15\","
+                      "\"byte_cap_gbytes_ps\":10}") != std::string::npos &&
+                json.find("\"corun_qualification\":\"E1-test\"}]}") != std::string::npos,
+            "units in the receipt");
+    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "npu", -1, {}}); }, "npu unit, not a GPU", "selecting the npu as the GPU");
+    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "host", -1, {}}); }, "cpu unit, not a GPU", "selecting the cpu as the GPU");
+
+    // An NPU without its qualification parses, is listed, and is refused the role.
+    const auto unqualified = parse_declaration(gpu + npu + "driver = \"amdxdna\"\n");
+    const Descriptor& bare = unqualified.devices.back();
+    require(bare.kind == Kind::npu && role_refusal(bare, "aux").find("needs firmware") != std::string::npos, "npu aux needs firmware");
+    require(units_for_role(unqualified, "aux").size() == 1, "an unqualified npu takes no aux work");
+    require(units_text(resolve(&unqualified, {igpu}, Request{}).units) == "npu:npu[aux(refused)]", "refused role is printed");
+    require(role_refusal(parse_declaration(gpu + npu).devices.back(), "aux").find("needs driver") != std::string::npos, "npu aux needs driver");
+    require(role_refusal(parse_declaration(gpu + npu + "driver = \"d\"\nfirmware = \"f\"\n").devices.back(), "aux").find("corun_qualification") !=
+                std::string::npos,
+            "npu aux needs the co-run qualification");
+    // An excluded unit is not listed and gets no work.
+    const auto off = parse_declaration(gpu + host + "excluded = true\n");
+    require(host_unit(off) == nullptr && resolve(&off, {igpu}, Request{}).units.empty(), "excluded cpu unit");
+
+    // A GPU whose address is declared as an NPU is a wrong file, not an undeclared card.
+    const auto swapped = parse_declaration(std::string("schema = \"strix-devices-v1\"\n[devices.npu]\nkind = \"npu\"\nvendor = \"amd\"\n"
+                                                       "pci = \"0000:c5:00.0\"\nroles = [\"aux\"]\n"));
+    rejects([&] { (void)resolve(&swapped, {igpu}, Request{}); }, "with kind npu, the device is a GPU", "gpu address declared as npu");
+
+    const auto bad = [&](const std::string& text, const char* needle, const char* message) {
+        rejects([&] { (void)parse_declaration(text); }, needle, message);
+    };
+    bad(gpu + "kind = \"tpu\"\n", "expected gpu, npu or cpu", "unknown kind");
+    bad(gpu + npu.substr(0, npu.find("roles")) + "roles = [\"aux\", \"decode\"]\n", "not available to a npu unit", "decode on an npu");
+    bad(gpu + npu.substr(0, npu.find("roles")) + "roles = [\"host\"]\n", "not available to a npu unit", "host on an npu");
+    bad(gpu + "[devices.host]\nkind = \"cpu\"\nroles = [\"prefill\"]\n", "not available to a cpu unit", "prefill on the cpu");
+    bad(std::string("schema = \"strix-devices-v1\"\n[devices.main]\nvendor = \"amd\"\npci = \"0000:c5:00.0\"\nroles = [\"host\"]\n"),
+        "not available to a gpu unit", "host on a gpu");
+    bad(gpu + "cores = \"2-15\"\n", "only a kind = \"cpu\" unit", "cores on a gpu");
+    bad(gpu + "byte_cap_gbytes_ps = 10.0\n", "only a kind = \"cpu\" unit", "byte cap on a gpu");
+    bad(gpu + "driver = \"x\"\n", "only a kind = \"npu\" unit", "driver on a gpu");
+    bad(gpu + host + "pci = \"0000:00:00.0\"\n", "a cpu unit takes no pci", "identity on the cpu");
+    bad(gpu + host + "[devices.host2]\nkind = \"cpu\"\nroles = [\"host\"]\n", "second cpu unit", "two cpu units");
+    bad(gpu + "[devices.npu]\nkind = \"npu\"\nvendor = \"amd\"\nroles = [\"aux\"]\n", "needs an identity", "npu without identity");
+    bad(gpu + "[devices.npu]\nkind = \"npu\"\npci = \"0000:c5:00.1\"\n", "vendor: required", "npu without vendor");
+    bad(gpu + "[devices.host]\nkind = \"cpu\"\ncores = \"15-2\"\n", "reversed range", "reversed cores");
+    bad(gpu + "[devices.host]\nkind = \"cpu\"\nbyte_cap_gbytes_ps = 0\n", "must be positive", "zero byte cap");
+}
 } // namespace
 
 int main() {
@@ -303,6 +391,7 @@ int main() {
         parser();
         gate();
         entry_points();
+        units();
     } catch (const std::exception& e) {
         std::cerr << "device gate tests: " << e.what() << '\n';
         return 1;

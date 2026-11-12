@@ -71,6 +71,9 @@ struct Bound {
     Descriptor device;
     Visible visible;
     std::string source; // declaration path, or "implicit" for the undeclared single integrated device
+    // The declared NPU and CPU units (not excluded), for the lanes that give them work. Empty without a declaration:
+    // a unit that is not a GPU is never implicit.
+    std::vector<Descriptor> units;
 };
 
 // Thrown for every refusal; what() is the one line to show the operator.
@@ -104,7 +107,11 @@ struct Environment {
 
 // "device: id=main vendor=nvidia uuid=GPU-... pci=0000:01:00.0 name="..." arch=sm_120 ordinal=0 attach=pcie gen4 x16
 //  roles=replica,prefill declared=/path/devices.toml"
+// With declared NPU or CPU units the line continues: ` units=npu:npu[aux],cpu:host[host,aux cores=2-15 byte_cap=10GB/s]`
+// (a role the unit may not take yet is printed as `aux(refused)`); the JSON form gains a "units" array.
 [[nodiscard]] std::string receipt_line(const Bound& bound);
+// "npu:npu[aux],cpu:host[host,aux cores=2-15 byte_cap=10GB/s]"; "-" when there is none.
+[[nodiscard]] std::string units_text(const std::vector<Descriptor>& units);
 // {"id":"main","vendor":"nvidia","uuid":"GPU-...","pci":"...","name":"...","attach":"pcie gen4 x16",...}
 [[nodiscard]] std::string receipt_json(const Bound& bound);
 

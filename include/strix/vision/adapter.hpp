@@ -52,9 +52,13 @@ public:
     virtual PositionInputs positions(const EncoderConfig& c, const EncoderWeights& w, const PatchGrid& g) const {
         return default_positions(c, w, g);
     }
-    // Merger / unshuffle / pool + MLP and special rows; linears go through `dense`.
-    virtual void project(EncoderOutput&, DenseOps& dense, ProjectedRows& out) = 0;
+    // Merger / unshuffle / pool + MLP and special rows; linears go through `dense`. The grid is the one the hidden
+    // rows were encoded from (a projector that merges neighbours needs its shape and row order).
+    virtual void project(EncoderOutput&, const PatchGrid&, DenseOps& dense, ProjectedRows& out) = 0;
     virtual SpanLayout layout(const PatchGrid&) const = 0;
+    // Arithmetic policy the tower needs on the device (default: none). A family whose gate fails without a policy
+    // bit states it here, so every service constructs the runner the same way.
+    virtual EncoderOptions device_options() const { return {}; }
 };
 
 }  // namespace strix::vision

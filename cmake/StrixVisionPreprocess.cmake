@@ -31,6 +31,9 @@ if(BUILD_TESTING)
     endif()
     if(MSVC)
         target_compile_options(strix-vision-preprocess-tests PRIVATE /EHsc /utf-8)
+    else()
+        # The test restates fp32 expressions of the library; it must evaluate them the same way.
+        target_compile_options(strix-vision-preprocess-tests PRIVATE -ffp-contract=off -fno-fast-math)
     endif()
     add_test(NAME vision-preprocess
         COMMAND strix-vision-preprocess-tests "${_strix_vision_root}/tests/vision/fixtures")

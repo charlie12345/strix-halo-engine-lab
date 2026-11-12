@@ -38,6 +38,7 @@
 #include "strix/hip_mtp_forward_replay.hpp"
 #include "strix/mtp_forward_golden_file.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
+#include "strix/serve/cycle_receipt.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
 #include "hip_session_store.hpp"
 #include <mutex>
@@ -1423,6 +1424,7 @@ public:
         using clock = std::chrono::steady_clock;
         Slot* prompt = nullptr;
         bool decoding = false;
+        step_prompt_ran_ = false;
         for(auto& owner:slots_) {
             auto& s=*owner;
             if(!s.prefilling || !s.waits_for) continue;
@@ -1450,6 +1452,7 @@ public:
         if (!prompt) prompt_debt_ms_ = 0.0;
         if (prompt && (!decoding || prompt_debt_ms_ <= 0.0)) {
             ++stats_.prompt_steps;
+            step_prompt_ran_ = true;
             // STRIX_BATCH_PROMPT_SMALL=1: T blocks only while nobody decodes; tail-size units in between decode cycles
             // (exact either way: the prompt's rows and bits do not depend on the block sizes)
             const bool small=batch_prompt_small(options_);
@@ -1528,12 +1531,54 @@ private:
         // has no draft sampler, so drafting would give candidates without draft distributions.
         const auto depth = [&m](const Slot& s) { return s.request.sampler && !m.sample_speculation ? 0U : m.candidate_depth; };
         ++stats_.steps;
+        // STRIX_SERVE_RECEIPT=1: one shared cycle receipt per decode round (strix/serve/cycle_receipt.hpp).
+        const bool receipt_on = serve::cycle_receipt_enabled();
+        serve::CycleReceipt receipt;
+        if (receipt_on) {
+            serve_lever_lines();
+            static_cast<void>(hip_mtp_take_serve_draft_ms());
+        }
+        const auto runtime_done = [&](std::span<const HipMtpGreedyCycleResult> results) {
+            if (!receipt_on) return;
+            const auto now = clock::now();
+            receipt.draft_ms = hip_mtp_take_serve_draft_ms();
+            receipt.verify_ms = std::max(0.0, std::chrono::duration<double, std::milli>(now - cycle_start).count() - receipt.draft_ms);
+            std::uint32_t physical = 0, useful = 0;
+            for (const auto& r : results) {
+                // Rows the lane ran in the target forward: its rows of a shared window, else its own window owner
+                // (1 = serial), else the serial rows it consumed. Useful: the pending row plus its drafted candidates.
+                std::uint32_t rows = r.shared.verify_members ? r.shared.verify_rows : r.target_window_rows;
+                if (rows <= 1U) rows = static_cast<std::uint32_t>(std::min<std::uint64_t>(std::max<std::uint64_t>(r.consumed_target_rows,
+                    r.emitted_tokens.empty() ? 0U : 1U), UINT32_MAX));
+                if (rows) ++receipt.lanes;
+                physical += rows;
+                useful += std::min(rows, 1U + r.proposed_candidates);
+                for (std::uint32_t d = 1; d <= r.proposed_candidates; ++d) receipt.add_draft_depth(d);
+                receipt.emitted += static_cast<std::uint32_t>(r.emitted_tokens.size());
+            }
+            receipt.set_rows(physical, useful);
+        };
+        const auto receipt_done = [&] {
+            if (!receipt_on) return;
+            const auto end = clock::now();
+            receipt.total_ms = std::chrono::duration<double, std::milli>(end - cycle_start).count();
+            receipt.host_ms = std::max(0.0, receipt.total_ms - receipt.draft_ms - receipt.verify_ms);
+            receipt.prompt_unit_ran = step_prompt_ran_;
+            receipt.begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(cycle_start.time_since_epoch()).count();
+            receipt.end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count();
+            if (!serve::cycle_ledger().add(receipt)) return;
+            const auto line = serve::format_cycle_receipt(receipt, ++receipt_sequence_);
+            std::fprintf(stderr, "%s\n", line.c_str());
+        };
         if (live.size() == 1U) {
             auto& s = *live.front();
             ++stats_.solo_steps;
             try {
                 auto transaction=s.request.constraint?s.request.constraint->window_transaction():nullptr;
-                apply(s, s.greedy->cycle(s.pending, depth(s), budget(s), s.request.stop_tokens,transaction.get()));
+                auto result = s.greedy->cycle(s.pending, depth(s), budget(s), s.request.stop_tokens,transaction.get());
+                runtime_done(std::span<const HipMtpGreedyCycleResult>(&result, 1U));
+                apply(s, std::move(result));
+                receipt_done();
             } catch(const serve::ConstraintError& e) {
                 if(s.session->health==SerialSessionHealth::poisoned || (s.window && s.window->failed()))throw;
                 constraint_failed(s,e);
@@ -1552,8 +1597,10 @@ private:
         }
         static const bool joint=strix::envcfg::flag("STRIX_MTP_BATCH_JOINT", false);
         auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr,joint?&policy_joint_:nullptr);
+        runtime_done(results);
         for (std::size_t k = 0; k < live.size(); ++k) live[k]->result.shared_execution.add(results[k].shared);
         for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], std::move(results[k]));
+        receipt_done();
         return true;
     }
 
@@ -2120,6 +2167,27 @@ private:
     std::uint32_t serial_rows_per_step_ = 16;
     // Interleaved admission: decode time owed to the requests past their prompt for the prompt units run.
     double prompt_debt_ms_ = 0.0;
+    // STRIX_SERVE_RECEIPT=1: a prompt unit ran in the current step; receipt line numbering.
+    bool step_prompt_ran_ = false;
+    std::uint64_t receipt_sequence_ = 0;
+    // One "serve lever" line per serve lever at the first decode round: the resolved state, so a log shows
+    // which levers a run had active.
+    void serve_lever_lines() {
+        static bool printed = false;
+        if (printed) return;
+        printed = true;
+        const auto line = [](const std::string& name, const char* env, bool active, const std::string& value) {
+            std::fprintf(stderr, "serve lever name=%s env=%s active=%d value=%s\n", name.c_str(), env, active ? 1 : 0, value.c_str());
+        };
+        const auto raw = [](const char* name) { const char* v = std::getenv(name); return std::string(v && *v ? v : "unset"); };
+        line("receipt", "STRIX_SERVE_RECEIPT", true, "1");
+        for (const auto& l : hip_mtp_serve_levers()) line(l.name, l.env.c_str(), l.active, l.value);
+        line("prompt_small", "STRIX_BATCH_PROMPT_SMALL", batch_prompt_small(options_), batch_prompt_small(options_) ? "1" : "0");
+        line("prompt_share", "STRIX_BATCH_PROMPT_SHARE", prompt_share_ > 0.0, std::to_string(prompt_share_));
+        line("service_ms", "STRIX_BATCH_SERVICE_MS", service_ms_ > 0.0, std::to_string(service_ms_));
+        const auto short_first = raw("STRIX_BATCH_SHORT_FIRST_ROWS");
+        line("short_first_rows", "STRIX_BATCH_SHORT_FIRST_ROWS", short_first != "0", short_first == "unset" ? "2048" : short_first);
+    }
     double prompt_share_ = [] {
         const char* v = std::getenv("STRIX_BATCH_PROMPT_SHARE");
         const double x = v ? std::atof(v) : 0.0;
@@ -2776,6 +2844,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 runner.publish_session_stats=std::move(publish_stats);
                 try {parents->serve_batch(runner);}
                 catch(...) {runner.abandon();throw;}
+                serve::dump_cycle_ledger(stderr);
                 assets->validate_assets_unchanged();
                 if(!options.http_serve) return; // the cohort run wrote its own receipt
                 const auto& st=runner.stats();

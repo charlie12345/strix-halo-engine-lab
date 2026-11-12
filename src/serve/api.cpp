@@ -1,6 +1,7 @@
 #include "strix/serve/api.hpp"
 
 #include "strix/serve/chat_template.hpp"
+#include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/json_constraint.hpp"
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
@@ -2439,6 +2440,8 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             if (detail) impl.arm();
             auto data = impl.config.status_data ? impl.config.status_data(impl.queue.snapshot(), impl.queue.stopping(), detail) : impl.status();
             if (impl.config.status_data) deployment_status(data, impl.config.deployment, impl.queue, impl.config.status_slots.value_or(impl.config.http_slots));
+            // STRIX_SERVE_RECEIPT=1: the engine's cycle ledger (tools/serve_bench.py finds it by its schema value).
+            if (cycle_receipt_enabled() && data.is_object() && cycle_ledger().totals().cycles) data.set("cycle_ledger", parse_json(cycle_ledger().json()));
             response.send(200, "application/json", data.dump());
             return;
         }

@@ -7,6 +7,7 @@
 #include "strix/qwen_prefill_balance.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/startup_markers.hpp"
+#include "strix/power/sampler.hpp"
 #include "strix/device_profile.hpp"
 #include "strix/mtp_cost_table_session.hpp"
 #include "http_slot_capacity.hpp"
@@ -6558,6 +6559,8 @@ static int run_decode_entry(
                 << "  \"known_prefix_source_projection_launches_saved_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->projection_launches_saved) << ",\n"
                 << "  \"known_prefix_source_logical_weight_bytes_avoided_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->logical_projection_weight_bytes_avoided) << ",\n";
         }
+        if (generation_request_timing_enabled)  // shared power receipt of the timed request (strix/power/sampler.hpp)
+            std::cout << "  \"power\":" << strix::power::block_json(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())) << ",\n";
         if (generation_request_timing_enabled)
             std::cout << "  \"generation_request_elapsed_ms\":" << generation_request_elapsed_ms << ",\n"
                       << "  \"generation_request_output_tokens\":" << result.generated_tokens.size() << ",\n"

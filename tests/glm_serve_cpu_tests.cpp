@@ -924,6 +924,9 @@ int main() {
         b.identity_hash = 1;
         const auto m = gs::hello_mismatch(a, b);
         CHECK(m.find("slots") != std::string::npos && m.find("identity_hash") != std::string::npos);
+        gs::Hello c = a;
+        c.route_fingerprint = a.route_fingerprint + 1U;  // the peer resolved another numerical route
+        CHECK(gs::hello_mismatch(a, c).find("route_fingerprint") != std::string::npos);
         // RTX import settings: receiver on / 'DSA once', wire version and the attested model SHA must agree on every rank
         {
             auto i0 = a;

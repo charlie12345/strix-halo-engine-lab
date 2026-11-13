@@ -1,3 +1,4 @@
+#include "strix/route_receipt.hpp"
 #include "serve_runtime.hpp"
 #include <stdexcept>
 #ifdef STRIX_MINIMAX_NATIVE
@@ -135,6 +136,11 @@ public:
             eng.abort("DSpark startup mode / assets / protocol mismatch");
             throw std::runtime_error("DSpark startup mode / assets / protocol mismatch");
         }
+        // Shared route receipt: both ranks must have resolved the same numerical route before any product runs.
+        try {
+            const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
+            std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
+        } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
         std::printf("rank %u: load %.1f s, device used %.1f GiB\n", opt.rank, lr.seconds, lr.device_gib);
         std::fflush(stdout);
         // DSpark drafter on both ranks (both run every draft command; the target's residual taps are replicated)

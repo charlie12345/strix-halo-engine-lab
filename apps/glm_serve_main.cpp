@@ -52,6 +52,7 @@
 #include "glm_rank_transport.hpp"
 
 #include "strix/dist/communicator.hpp"
+#include "glm_route_levers.hpp"
 #include "strix/glm/engine.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -960,6 +961,14 @@ int main(int argc, char** argv) {
                      " kmax " + std::to_string(eff.kmax) + " adaptive " + std::to_string(eff.adaptive ? 1 : 0) + "\n";
             hello.identity_hash = gs::fnv1a64(ident);
             if (deployment.plan) hello.identity_hash = gs::fnv1a64(deployment.plan->hash(), hello.identity_hash);
+        }
+        {
+            // Shared route receipt: the same lever keys as the rank CLI. The fingerprint rides in the hello, so two
+            // ranks on different numerical routes refuse to pair.
+            const std::uint64_t fp = strix::glm::record_route_levers("http", opt.rank, eff.prefill, prefill_mode,
+                                                                     ge::identity_mode_name(eng.identity_mode()), opt.max_rows);
+            hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));
+            std::printf("rank %u: route fingerprint %016llx\n", opt.rank, static_cast<unsigned long long>(fp));
         }
         hello.capacity = opt.capacity;
         hello.slots = opt.slots;

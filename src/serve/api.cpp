@@ -3,6 +3,7 @@
 #include "strix/serve/chat_template.hpp"
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/power/sampler.hpp"
+#include "strix/route_receipt.hpp"
 #include "strix/serve/json_constraint.hpp"
 #include "strix/serve/media.hpp"
 #include "strix/serve/request_fields.hpp"
@@ -356,6 +357,7 @@ struct ApiRequestScope {
     ApiRequestObservation observation;
     bool attempted = false, terminal_taken = false;
     const ApiConfig& config;
+    ::strix::route::Totals route_start = ::strix::route::enabled() ? ::strix::route::snapshot() : ::strix::route::Totals{};  // shared route receipt: request window
     void terminal() {
         if (!ticket || terminal_taken) return;
         terminal_taken = true;
@@ -1513,6 +1515,9 @@ struct ApiService::Impl {
         auto data = api_request_scope ? api_request_scope->observation.terminal.timings : Json::object();
         if (!note.empty()) data.set("sampling_note", Json(note));
         if (o && data.is_object()) if (const auto text = power_receipt(*o); !text.empty()) data.set("power", parse_json(text));
+        // Shared route receipt of the request window on this rank: launches and rows by kernel family, bypasses with reasons.
+        if (o && data.is_object() && api_request_scope && ::strix::route::enabled())
+            data.set("route", parse_json(::strix::route::json(::strix::route::delta(::strix::route::snapshot(), api_request_scope->route_start), "request", false)));
         return data;
     }
     void completion_data(Json& out, const Outcome& o, const Json& body, const std::string& note, bool timings = true) const {
@@ -1601,6 +1606,9 @@ struct ApiService::Impl {
         progress.set("engine_reports", Json(config.engine_progress));
         stream.set("progress", std::move(progress));
         out.set("stream", std::move(stream));
+        // Shared route receipt of the request window on this rank (counters and fingerprint).
+        if (o && api_request_scope && ::strix::route::enabled())
+            out.set("route", parse_json(::strix::route::json(::strix::route::delta(::strix::route::snapshot(), api_request_scope->route_start), "request", false)));
         return out;
     }
     Json tool_calls_json(const Json& calls) const {
@@ -2755,6 +2763,8 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             if (cycle_receipt_enabled() && data.is_object() && cycle_ledger().totals().cycles) data.set("cycle_ledger", parse_json(cycle_ledger().json()));
             // Shared power view (sources, latest reading, totals since start); absent with STRIX_POWER_SAMPLER=0.
             if (data.is_object() && power::sampler_enabled()) data.set("power", parse_json(power::status_json()));
+            // Shared route receipt (process totals, levers, explicitly set switches): same view, same access rule as power.
+            if (data.is_object() && ::strix::route::enabled()) data.set("route", parse_json(::strix::route::json()));
             response.send(200, "application/json", data.dump());
             return;
         }

@@ -108,7 +108,7 @@ struct Hello {
     // hand-off wire version; FNV-1a of the --import-model-sha attestation (operator-supplied, see the README).
     std::uint32_t import_flags = 0;
     std::uint32_t import_wire = 0;
-    std::uint32_t import_pad = 0;
+    std::uint32_t route_fingerprint = 0;  // strix/route_receipt.hpp: 32-bit fold of the numerical-route fingerprint
     std::uint64_t import_model_hash = 0;
     std::uint64_t prefix_cache_bytes = 0;
     bool operator==(const Hello&) const = default;
@@ -159,7 +159,7 @@ static_assert(offsetof(Hello, model_hash) == 0 && offsetof(Hello, identity_hash)
                   offsetof(Hello, slots) == 24 && offsetof(Hello, max_rows) == 28 && offsetof(Hello, step_rows) == 32 &&
                   offsetof(Hello, world) == 36 && offsetof(Hello, mtp) == 40 && offsetof(Hello, mtp_kmax) == 44 &&
                   offsetof(Hello, g2) == 48 && offsetof(Hello, import_flags) == 52 && offsetof(Hello, import_wire) == 56 &&
-                  offsetof(Hello, import_pad) == 60 && offsetof(Hello, import_model_hash) == 64 && offsetof(Hello, prefix_cache_bytes) == 72,
+                  offsetof(Hello, route_fingerprint) == 60 && offsetof(Hello, import_model_hash) == 64 && offsetof(Hello, prefix_cache_bytes) == 72,
               "GLMC v7 Hello layout changed: bump kControlVersion and update these offsets");
 
 inline std::uint32_t fnv1a32(std::span<const std::uint32_t> tokens, std::uint32_t h = 2166136261U) {
@@ -219,6 +219,7 @@ inline std::string hello_mismatch(const Hello& mine, const Hello& peer) {
     f("mtp", mine.mtp, peer.mtp);
     f("mtp_kmax", mine.mtp_kmax, peer.mtp_kmax);
     f("g2", mine.g2, peer.g2);
+    f("route_fingerprint", mine.route_fingerprint, peer.route_fingerprint);
     f("import_flags", mine.import_flags, peer.import_flags);
     f("import_wire", mine.import_wire, peer.import_wire);
     f("import_model_hash", mine.import_model_hash, peer.import_model_hash);

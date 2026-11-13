@@ -80,6 +80,9 @@ void layers_and_delta() {
             d.product[static_cast<std::size_t>(Product::moe)][static_cast<std::size_t>(Family::iu4)].rows == 100, "delta product");
     require(d.layer[40][static_cast<std::size_t>(Family::iu4)].rows == 100 && d.layer[39][static_cast<std::size_t>(Family::iu4)].rows == 0, "delta layer");
 
+    const auto brief = strix::serve::parse_json(route::json(first, "request", false));
+    require(brief.find("levers") == nullptr && brief.find("switches") == nullptr && brief.find("fingerprint") != nullptr &&
+            brief.find("layers")->as_array().size() == 2, "brief block: counters and fingerprint only");
     const auto json = strix::serve::parse_json(route::json(first, "request"));
     require(json.find("scope")->as_string() == "request", "scope");
     const auto& runs = json.find("layers")->as_array();

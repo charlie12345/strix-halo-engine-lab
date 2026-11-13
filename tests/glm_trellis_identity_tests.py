@@ -44,7 +44,9 @@ EXPECTED = {'Half2': ('using Half2 =', 'b6555aa71356cdb36d3994f7842cbe84710742e3
  'load_u32': ('__device__ __forceinline__ std::uint32_t load_u32(',
               '4e0f0a28553caff0cb72c7af1d334ef2c5d86db61fe9818c74d2f8593cfc0174'),
  'TileStates': ('template <int Bits> struct TileStates',
-                '798aa9c356d1e7288aa37fbe191906a705d5375287c124ffb21c26b881458607'),
+                # state<J>() returns the extracted State16 (integer conversion = the original mask); original
+                # GLM declaration: 798aa9c356d1e7288aa37fbe191906a705d5375287c124ffb21c26b881458607.
+                '0e06b2816fc08eea101a6184e861161bd664193efabf71154d5f0ba16f276cb9'),
  'reduce4': ('__device__ __forceinline__ float reduce4(',
              '4ad51702f5a02a032a7c3729ec84949e8640c0366e58d31324ffb7cf861fd6d5'),
  'Slot': ('template <int Bits, int R> struct Slot',

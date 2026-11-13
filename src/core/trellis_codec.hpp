@@ -144,6 +144,14 @@ __host__ __device__ __forceinline__ Half2 mul1_pair(std::uint32_t first, std::ui
 }
 __host__ __device__ __forceinline__ Half2 Mul1::pair(std::uint32_t first, std::uint32_t second) { return mul1_pair(first, second); }
 
+// A state as a reader extracted it: only the low 16 bits are the state. Converting to an integer masks; decoders that
+// read only the low 16 bits of the container (hash16: mul1_pair, Mul1::half16) take it as it is and skip the mask.
+struct State16 {
+    std::uint32_t raw;
+    __host__ __device__ __forceinline__ constexpr operator std::uint32_t() const { return raw & 65535U; }
+};
+__forceinline__ __host__ __device__ Half2 mul1_pair(State16 first, State16 second) { return mul1_pair(first.raw, second.raw); }
+
 // The library's three codebooks by id (0, 1: two-half sum codebooks; 2: mul1).
 __host__ __device__ __forceinline__ float codebook_value(std::uint32_t state, int cb) {
     if (cb == 2) return Mul1::value(state);
@@ -232,12 +240,14 @@ template <int Bits> struct TileStates {
         low = __builtin_amdgcn_alignbit(b, c, g.align);
         tail = c << (32U - g.align);
     }
-    template <int J> __device__ __forceinline__ std::uint32_t state() const {
+    // State J as extracted (State16): an integer conversion masks it to 16 bits exactly as before; mul1_pair takes it
+    // unmasked, since hash16 reads only the low 16 bits.
+    template <int J> __device__ __forceinline__ State16 state() const {
         constexpr int offset = J * Bits;
-        if constexpr (offset <= 16) return (high >> (16 - offset)) & 65535U;
-        else if constexpr (offset < 32) return ((high << (offset - 16)) | (low >> (48 - offset))) & 65535U;
-        else if constexpr (offset <= 48) return (low >> (48 - offset)) & 65535U;
-        else return ((low << (offset - 48)) | (tail >> (80 - offset))) & 65535U;
+        if constexpr (offset <= 16) return State16{high >> (16 - offset)};
+        else if constexpr (offset < 32) return State16{(high << (offset - 16)) | (low >> (48 - offset))};
+        else if constexpr (offset <= 48) return State16{low >> (48 - offset)};
+        else return State16{(low << (offset - 48)) | (tail >> (80 - offset))};
     }
 };
 // The same window from raw words issued earlier (align = LaneGeom::align). Plain shifts, not the funnel-shift

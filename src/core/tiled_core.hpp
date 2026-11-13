@@ -49,6 +49,12 @@ template<int CB> __device__ __forceinline__ uint32_t decode_pair(uint32_t first,
         return uint32_t(__builtin_bit_cast(uint16_t, x)) | (uint32_t(__builtin_bit_cast(uint16_t, y)) << 16);
     }
 }
+// The same pair from states as the lane reader extracted them: mul1 reads only the low 16 bits, so no mask.
+template<int CB> __device__ __forceinline__ uint32_t decode_pair(trellis::State16 first, trellis::State16 second) {
+    if constexpr (CB == 2) return __builtin_bit_cast(uint32_t, trellis::mul1_pair(first, second));
+    else return decode_pair<CB>(uint32_t(first), uint32_t(second));
+}
+
 template<int BM, int BN, int WM, int WN, class Operand = PackedF16> struct Geometry {
     static constexpr int KT = Operand::stage_tiles, BK = 16 * KT;
     static constexpr bool iu4 = std::is_same_v<Operand, PackedIU4>;

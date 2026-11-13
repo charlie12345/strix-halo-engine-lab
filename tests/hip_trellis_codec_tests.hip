@@ -65,7 +65,7 @@ template <int Bits, Lane Mode, bool Sink> __global__ void lane_kernel(const std:
     }
     std::uint32_t words[4];
     if constexpr (Mode == Lane::pair) {
-        // The production idiom mul1_pair(t.state<A>(), t.state<B>()).
+        // States taken as extracted (State16): the production idiom mul1_pair(t.state<A>(), t.state<B>()).
         const LaneGeom<Bits> geom(lane);
         const TileStates<Bits> t = align_words<Bits>(LaneWords<Bits>::issue(ring, geom), geom.align);
         words[0] = __builtin_bit_cast(std::uint32_t, mul1_pair(t.template state<0>(), t.template state<1>()));

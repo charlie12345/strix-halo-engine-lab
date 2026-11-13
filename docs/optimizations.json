@@ -2482,9 +2482,9 @@
   {
     "engine": "glm",
     "name": "Prefill dense rows v4 (shared pipelined FMA-rows core)",
-    "flag_or_env": "STRIX_GLM_PF_DENSE_ROWS=4, STRIX_GLM_PF_DENSE_FORM",
-    "default": "off (3)",
-    "exact": "Device test strix-hip-fma-rows-tests: every form byte-identical to v3 over ragged groups, row and column tails, F16 / BF16 / F32 weights, weight row offsets and the production shapes, guard rows untouched (388 + 424 checks on a second node with the final selection, 0 failures); two-node FAST run at 8,192 tokens: logits and state hashes equal to version 3",
+    "flag_or_env": "STRIX_GLM_PF_DENSE_ROWS, STRIX_GLM_PF_DENSE_FORM",
+    "default": "4",
+    "exact": "Device test strix-hip-fma-rows-tests: every form byte-identical to v3 over ragged groups, row and column tails, F16 / BF16 / F32 weights, weight row offsets and the production shapes, guard rows untouched (388 + 424 checks on a second node with the final selection, 0 failures); two-node FAST run at 8,192 tokens: logits and state hashes equal to version 3. Exact two-node run at 8,192 tokens (one arm per run, order v3 / v4 / v4 / v3, first run discarded as a cold start): logits, state and token hashes equal in every run; prefill 12.68 and 12.69 s with v4 against 12.81 s with v3 (646 against 640 tokens/s; 3.76 / 3.88 against 3.90 / 3.98 million GPU clock cycles per token on the two nodes)",
     "gain": "Kernel fixture (one node, interleaved whole-call medians, outputs byte-identical to v3): KDA f_a + g_a + b (4096 inputs, 320 outputs) 3.17 -> 2.56 ms at 4096 rows and 7.04 -> 5.00 ms at 8192 rows; KDA f_b (128 inputs, 8192 outputs, 4096 rows) 4.09 -> 1.71 ms, g_b (4096 outputs) 2.18 -> 0.96 ms; router (4096 inputs, 288 outputs, 4096 rows) 3.03 -> 2.74 ms, at 8192 rows 6.76 -> 4.88 ms; f_b at 8192 rows 12.87 -> 3.14 ms; grouped call at 1024 rows 0.56 -> 0.37 ms and at 256 rows 0.38 -> 0.15 ms. End to end: the two-node FAST run at 8,192 tokens gives the same logits and state hashes with version 4 (that path only runs the router and indexer projections here, so no TTFT change is claimed); the exact-mode end-to-end run is pending, which is why the default stays 3",
     "preconditions": "Exact chunked prefill; chains of at most 4096 inputs.",
     "off_switch": "STRIX_GLM_PF_DENSE_ROWS=3",
@@ -2493,8 +2493,8 @@
   {
     "engine": "glm",
     "name": "Prefill dense rows v3 (grouped projections)",
-    "flag_or_env": "STRIX_GLM_PF_DENSE_ROWS",
-    "default": "3",
+    "flag_or_env": "STRIX_GLM_PF_DENSE_ROWS=3",
+    "default": "superseded by v4",
     "exact": "Device test v3 == v2 bitwise over every tile and the grouped production shapes (417 checks, 0 failures); logits bitwise equal on both ranks at 8K across v3 / v2 / v1.",
     "gain": "8,192-token TTFT at parity with v2 within noise (14.29 vs 14.33 s; 14.80 vs 14.72 s in a second pair run); grouped calls at 8192 rows KDA 9.33 -> 6.77 ms, indexer 8.98 -> 6.62 ms",
     "preconditions": "Exact chunked prefill.",

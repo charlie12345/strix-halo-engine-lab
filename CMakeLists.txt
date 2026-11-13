@@ -2877,6 +2877,9 @@ int main() { return 0; }"
         add_test(NAME strix-hip-hc-recompute-norm-tests COMMAND strix-hip-hc-wide-rows-tests --recompute-norm)
         set_tests_properties(strix-hip-hc-recompute-norm-tests PROPERTIES
             ENVIRONMENT "STRIX_QPF2K_HC_CHECK=0;STRIX_QPF2K_HC_UPCOPY=0;STRIX_HC_WIDE2_OUTPUT_ROWS=32")
+        add_test(NAME strix-hip-hc-recompute-mirror-tests COMMAND strix-hip-hc-wide-rows-tests --recompute-norm)
+        set_tests_properties(strix-hip-hc-recompute-mirror-tests PROPERTIES
+            ENVIRONMENT "STRIX_QPF2K_HC_CHECK=0;STRIX_QPF2K_HC_UPCOPY=0;STRIX_HC_WIDE2_OUTPUT_ROWS=32;STRIX_HC_RECOMPUTE_STREAM_STRIDE=20480")
         add_test(NAME strix-hip-hc-out16-tests COMMAND strix-hip-hc-wide-rows-tests)
         set_tests_properties(strix-hip-hc-out16-tests PROPERTIES ENVIRONMENT "STRIX_PREFILL_EXACT_FP16=0;STRIX_PREFILL_HC_OUTPUT_WMMA=1;STRIX_HCW_OUTPUT=1;STRIX_HC_OUT16_FIXTURES_ONLY=1;STRIX_QPF2K_HC=1;STRIX_QPF2K_HC_LOWBAND=3")
         add_executable(strix-hip-parallel-hyper-projection-tests tests/hip_parallel_hyper_projection_tests.hip)

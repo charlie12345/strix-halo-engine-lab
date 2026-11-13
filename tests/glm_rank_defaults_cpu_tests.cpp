@@ -133,7 +133,7 @@ void test_apply_env_default() {
     CHECK(rd::print(routed).find("capacity-layout=replicated/routed/qwin=2048") != std::string::npos);
     CHECK(rd::print(routed).find("capacity_layout_reason=first-admitted-query-window") != std::string::npos);
     CHECK(rd::print(routed).find("admission and rank vote pending") != std::string::npos);
-    CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "3");
+    CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "4");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "1");
     // Dense rows v4 form selector: governed like the version selectors (default 0 = automatic, 0..7 accepted,
     // anything else refused by the resolver, before any device work).
@@ -392,7 +392,7 @@ void test_scan_and_print() {
     CHECK(s.find("effective prefill=gemv (requested auto, default)\n") != std::string::npos);
     CHECK(s.find("effective identity=r1b (default)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_DIST_CRC_PARALLEL=1 (default, item hp-crc-parallel)\n") != std::string::npos);
-    CHECK(s.find("effective env STRIX_GLM_PF_DENSE_ROWS=3 (default, item pf-dense-rows-v3; resolved v3)\n") != std::string::npos);
+    CHECK(s.find("effective env STRIX_GLM_PF_DENSE_ROWS=4 (default, item pf-dense-rows-v4; resolved v4)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_MIXNORM=1 (default, item pf-mixnorm)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_MLA_GEMM=3 (default, item pf-mla-gemm-v3; resolved v3)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_SUMEXP=1 (default, item pf-sumexp)\n") != std::string::npos);

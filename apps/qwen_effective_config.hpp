@@ -1266,7 +1266,7 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
         // T16384 compiles under the UMA ceiling; the actual requirement replaces the bound below.
         if (rows == 16384U && !candidate.known_prefill_metadata_explicit)
             candidate.known_prefill_metadata_budget = std::min(120*gib,*memory.available);
-        if (!candidate.known_prefill_metadata_explicit) candidate.known_prefill_metadata_budget = gib;
+        if (!candidate.known_prefill_metadata_explicit && rows != 16384U) candidate.known_prefill_metadata_budget = gib;
         if (!candidate.known_prefill_uma_explicit) candidate.known_prefill_uma_budget = std::min(120*gib,*memory.available);
         // Serving retains uniform logits storage and all tail owners. The CLI's
         // compact/pruned 8 GiB ceiling must not force a spurious T8192 fallback.

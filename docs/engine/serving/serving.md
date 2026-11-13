@@ -79,12 +79,30 @@ when it stops.
 
 ## Default prompt prefill
 
-On the qualified native Qwen checkpoint and target, HTTP serving now resolves a known-prefix
-T8192 owner before requests arrive. Keep the required MTP calibration prompt, golden, sidecar,
-pins and window budgets; tiled-prefill organization flags and budgets can be omitted. Unlike
-single-request auto prefill, the server cannot choose T from an incoming prompt at startup.
-It preserves the resolved decode/prefill numerical profiles and explicit context capacity;
-this does not enable automatic FP16 arithmetic. Request prompts must still fit that capacity.
+On the qualified native Qwen checkpoint and target, HTTP serving resolves its known-prefix
+owner before requests arrive. Keep the required MTP calibration prompt, golden, sidecar,
+pins and window budgets; tiled-prefill organization flags and budgets can be omitted.
+
+The server and the single-request command take the route from one rule (`resolve_prompt_route`
+in `apps/qwen_effective_config.hpp`). The single-request command passes its prompt; the server
+cannot see a prompt at startup, so it passes the largest request its context admits, plus its
+own constraints. The server therefore resolves:
+
+- **the primary tile**: T8192, or T16384 when the context admits a request of at least 32,768
+  tokens (the single-request threshold; `STRIX_QPF2K_T16K=1` asks for it from 16,384, any other
+  value disables it) and the T16384 owner fits in memory beside every resident slot
+  (`--http-batch`). Otherwise it falls back to T8192 and then to smaller tiles;
+- **the prefill arithmetic**: the automatic FP16 prefill profile of the single-request route
+  whenever the decode profile is the dense-A8 profile and no prefill profile is explicit
+  (`STRIX_PREFILL_F16=0` declines it);
+- **the decode profile**: a server that sets no `--numerical-profile` and no low-level
+  organization flag takes the single-request decode profile and organization. An explicit
+  profile or organization is preserved as before.
+
+The `Qwen serve-prefill:` line printed at load names the tile and the arithmetic, and gives the
+reason whenever T16384 or the automatic arithmetic is declined. `STRIX_SERVE_T16K=0` keeps the
+T8192 owner. `STRIX_SERVE_ROUTE=0` restores the earlier server rule (T8192, resolved arithmetic
+unchanged). Explicit context capacity is preserved; request prompts must still fit it.
 
 Automatic candidates that would create an extra `STRIX_PROMPT_BATCH_ROWS` owner decline
 with an actionable notice before allocation in both startup and inspection. Unset that

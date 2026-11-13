@@ -1094,7 +1094,7 @@ struct Engine::Impl {
             }
             // No wait per layer: the next layer's slices are read while this one's are prepared and uploaded.
             if (L % 10 == 9) {
-                std::printf("mm rank %u: loaded layers 0-%u, %.1f s, %.1f GiB read, device used %.1f GiB\n", rank, L,
+                std::printf("mm rank %u: queued layers 0-%u, %.1f s, %.1f GiB to read, device used %.1f GiB\n", rank, L,
                             secs(t0, Clock::now()), pack.gib_read(), static_cast<double>(device_used_bytes()) / 1073741824.0);
                 std::fflush(stdout);
             }

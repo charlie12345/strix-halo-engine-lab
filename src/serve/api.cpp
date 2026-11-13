@@ -1360,6 +1360,9 @@ struct ApiService::Impl {
         progress.set("engine_reports", Json(config.engine_progress));
         stream.set("progress", std::move(progress));
         out.set("stream", std::move(stream));
+        // Shared route receipt of the request window on this rank (counters and fingerprint).
+        if (o && api_request_scope && ::strix::route::enabled())
+            out.set("route", parse_json(::strix::route::json(::strix::route::delta(::strix::route::snapshot(), api_request_scope->route_start), "request", false)));
         return out;
     }
     Json tool_calls_json(const Json& calls) const {

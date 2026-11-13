@@ -1854,6 +1854,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Tiled core: the load schedule is a contract trait",
+    "flag_or_env": "none",
+    "default": "on",
+    "exact": "Code motion behind a compile-time trait; gfx1151 assembly of the tiled-core library unit is instruction-identical before and after (392 kernels); strix-hip-iu4-load-cohort-tests pins I32 group sums, FP32 outputs and kernel resources and requires identical bits under late-issue schedules.",
+    "gain": "None claimed. Routed replay of the fixture (4,096 token rows x top-8 over 288 groups, gate/up + down, 41 interleaved rounds): 24.06 / 23.78 ms before, 23.91 ms after. The same kernel with the weights issued late is +7.3 % slower, with every load issued late +9.1 %: that is what the existing overlap is worth, and it was already in place.",
+    "preconditions": "none",
+    "off_switch": "none",
+    "doc_anchor": "docs/optimizations.md#core-load-cohort-schedule"
+  },
+  {
+    "engine": "minimax",
     "name": "Prefill MoE token-major gather",
     "flag_or_env": "STRIX_MMX_PREFILL_GATHER_TOK",
     "default": "1",

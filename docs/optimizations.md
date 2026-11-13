@@ -2903,6 +2903,31 @@ scale now stays F16 in registers until `store()` writes it to LDS after the WMMA
 - **Measured gain:** Grouped IU4 microbench (MiniMax shapes, A B B A): plan 2 gate K6144 N1536 -6.8 % (T4096) / -5.9 % (T8192), down K1536 N6144 -4.9 % / -4.2 %; dense plan 2 -2 to -5 %. TP2 32K TTFT (unfused MoE path, both orders) -0.8 % and -1.5 % against an older binary without the change (that binary also lacks other later commits, so this is an upper bound).
 - **Implementation / evidence:** [core](../src/core/tiled_core.hpp)
 
+<a id="core-load-cohort-schedule"></a>
+
+### Tiled core: the load schedule is a contract trait
+
+**Engine:** `minimax`, `glm` (shared `src/core/tiled_core.hpp`; every non-integer tiled-core plan). **Control:** none. **Default:** on.
+
+The order in which the tiled core issues a stage's raw loads, publishes them to LDS and synchronises the CTA was
+written inline in the kernel body. It is now a schedule type named by the contract (`Contract::Schedule`, default
+`pipeline::CtaStageAhead<>` in `src/core/load_cohort.hpp`): the schedule states which load cohorts are issued ahead
+of the stage's matrix work and how many stages and LDS buffers that keeps live, and the kernel orders its issue,
+publish and barrier accordingly. Loads are grouped in two cohorts (activations with their row scales, weights with
+their column scales) selected at compile time, so a schedule adds no branch to the kernel.
+
+The default schedule is the one the core already ran: the next stage's loads are issued before the current stage's
+matrix work and first read by the LDS store after it. On gfx1151 the 128x128 IU4 plan issues 8 loads after the
+barrier, runs its 64 matrix operations and the K64 scale flush with LDS waits only, then stores with one staggered
+`s_waitcnt vmcnt` per store and one barrier per stage, in both the GLM and the MiniMax chain kernels. A separate
+activation/weight readiness split therefore has nothing left to hide and is not built.
+
+- **Preconditions:** none; code motion behind a compile-time trait.
+- **Exactness evidence:** gfx1151 assembly of the tiled-core library unit is instruction-identical before and after (392 kernels). `strix-hip-iu4-load-cohort-tests` pins the I32 group sums and FP32 outputs of gate/up (K 6144, N 1536) and down (K 1536, N 6144) for four groups of 1, 127, 128 and 129 rows, pins LDS bytes, scratch and a VGPR ceiling of the three library instantiations, and requires the same output bits when the weights or all loads are issued late.
+- **Off switch:** None (no behaviour change).
+- **Measured gain:** none claimed. Routed replay of the fixture (4,096 token rows x top-8 over 288 groups, gate/up + down, 41 interleaved rounds): 24.06 / 23.78 ms before, 23.91 ms after. The same kernel with the weights issued late is +7.3 % slower, with every load issued late +9.1 %: that is what the existing overlap is worth, and it was already in place.
+- **Implementation / evidence:** [schedule](../src/core/load_cohort.hpp), [core](../src/core/tiled_core.hpp), [fixture](../tests/hip_iu4_load_cohort_tests.hip)
+
 <a id="mm-pf-gather-tok"></a>
 
 ### Prefill MoE token-major gather

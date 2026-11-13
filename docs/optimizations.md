@@ -3467,6 +3467,7 @@ chunk, so chunk c's MoE overlaps the TP2 exchange of chunk c-1.
 - **Exactness evidence:** Same bits as the unfused INT4 calls. 8K and 32K state, final-row and token anchors equal; ranks agree in every run.
 - **Off switch:** `STRIX_MOE_I4_CHAIN=0` (unfused calls, same bits)
 - **Measured gain:** 8K prefill 12.12 s vs 12.34 s unfused and 12.76 s vs 12.98 s (-1.7 %, both orders). 32K 55.23 s vs 55.74 s unfused (-0.9 %, mean of six n9 pairs, three in each order: -0.6 % S-first, -1.2 % X-first; single runs vary ±3 %). Gate/up keeps the free plan choice via FP32 gate save to global scratch (`STRIX_MOE_I4_CHAIN_GSAVE`, default on); the register save forced plan 1 (BM64) and cost +1.2 % at 32K. Chain GEMMs reach 31 % (8K) / 32 % (32K) of the iu4 WMMA peak.
+- **Plan policy:** one host decision for every engine (`moe_i4::chain_plan` / `launch_chain` in [moe_i4_chain.hpp](../src/core/moe_i4_chain.hpp), policy in [moe_i4_chain_plan.hpp](../src/core/moe_i4_chain_plan.hpp)): the down runs the call's plan; gate/up shares it when the engine lends gate scratch, else it stays on 64-row tiles with its own tile list. MiniMax lends the scratch by default; GLM lends it only with `STRIX_GLM_I4_CHAIN_GSAVE=1` (its register form is faster, see [toggles](toggles.md)).
 - **Implementation / evidence:** [draft FAST_I4](minimax-grouped-prefill.md#draft-fast_i4)
 
 ## GLM

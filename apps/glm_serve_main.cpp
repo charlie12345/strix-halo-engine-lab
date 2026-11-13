@@ -18,6 +18,7 @@
 //   decode step, default 512; with nothing decoding the whole prompt in one call; 0 = always whole, the OFF switch) --prefill-chunk-mtp 0|1 (chunk MTP-bootstrap prompts too, default 1)
 //   --heartbeat-ms MS (idle heartbeat, default 1000)
 //   --identity / --prefill / --max-rows / --decode-xch / --baseline / --print-effective-config as strix-glm5-rank
+//   --profile default|fast|quality [--allow-pending]: product profile, as strix-glm5-rank (shared resolver)
 //   rank 0: --host ADDR (127.0.0.1) --port P (8080) --model-id ID --max-tokens N (default max_tokens) --api-key-file F
 //   rank 0: --selftest N [--selftest-tokens M] [--selftest-long L (multi-chunk prompt tokens, default 2048; 0 = skip the
 //           interleave levels)] [--selftest-skip-basic (only the long-prompt reference and the staggered arms)]: no HTTP; N built-in prompts at once, then each alone (C=1), then the
@@ -742,7 +743,7 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
-                                 "[--host H] [--port P] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
+                                 "[--host H] [--port P] [--profile default|fast|quality] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
                                  "[--import-listen IP:PORT --import-key FILE --import-model-sha HEX (operator attestation of the producer's "
                                  "model, compared with its hand-off header, not computed from the loaded tensors)]\n", argv[0]);
             return 2;
@@ -788,6 +789,15 @@ int main(int argc, char** argv) {
                 rank_args.push_back(next());
             }
             else if (a == "--baseline") rank_args.push_back(a);
+            // Product profile: resolved by the shared resolver in rd::scan, the same rule as strix-glm5-rank.
+            else if (a == "--allow-pending") rank_args.push_back(a);
+            else if (a == "--profile" || a.rfind("--profile=", 0) == 0) {
+                const std::string name = a == "--profile" ? next() : a.substr(10);
+                if (!strix::profile::is_name(name))
+                    throw std::invalid_argument("--profile must be default, fast or quality (got '" + name + "')");
+                rank_args.push_back("--profile");
+                rank_args.push_back(name);
+            }
             else if (a == "--print-effective-config") { rank_args.push_back(a); print_config = true; }
             else if (a == "--rank") opt.rank = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--transport") transport_spec = next();

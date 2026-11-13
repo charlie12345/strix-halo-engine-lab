@@ -275,8 +275,7 @@ void real_machine_root() {
     options.period_ms = 20;
     Sampler sampler(make_sources(), options);
     for (const auto& s : sampler.sources()) {
-        std::cout << "real machine: " << s.name << (s.available ? " available: " : " unavailable: ") << s.detail << "
-";
+        std::cout << "real machine: " << s.name << (s.available ? " available: " : " unavailable: ") << s.detail << "\n";
 #if defined(__linux__)
         require(s.available || s.detail.find("/sys/") != std::string::npos, "relative system path in: " + s.detail);
 #endif
@@ -290,10 +289,8 @@ void real_machine_root() {
     const auto r = sampler.summarize(t0, Sampler::now_ns(), 0);
     if (r.available)
         std::cout << "real machine: " << r.energy_j << " J, " << r.avg_w << " W avg, " << r.peak_w << " W peak, clock "
-                  << r.gpu_clock_mhz_median << " MHz, " << r.temp_c_max << " C, samples " << r.samples << ", " << r.energy_source << "
-";
-    else std::cout << "real machine: no receipt: " << r.reason << "
-";
+                  << r.gpu_clock_mhz_median << " MHz, " << r.temp_c_max << " C, samples " << r.samples << ", " << r.energy_source << "\n";
+    else std::cout << "real machine: no receipt: " << r.reason << "\n";
 }
 
 // The block JSON: both phases, numbers round-trip through the server's JSON reader.

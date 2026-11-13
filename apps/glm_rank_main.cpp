@@ -382,9 +382,12 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N or --tf, "
                                         "comm exchange) so both ranks are checked to run the same prefill identity");
         // FAST indexer scores (STRIX_IDX_WMMA) change the DSA selection: the same agreement rule as glm-pf-wmma-x.
-        const unsigned idx_wmma = strix::attn_core::idx::wmma_mode();
-        if (idx_wmma > strix::attn_core::idx::kModeF16)
-            throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes bf16 or f16 (bf16x2 and exact need BF16 keys)");
+        // Unset or exact: WMMA scores with exact rescoring of the cut-off, the pool lists of the exact kernels, so it is
+        // not an identity of its own (agreement value 0, like STRIX_IDX_WMMA=0).
+        const unsigned idx_mode = strix::attn_core::idx::wmma_mode(strix::glm::pf::kIndexerWmmaUnsetMode);
+        if (idx_mode == strix::attn_core::idx::kModeBf16x2)
+            throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes 0, bf16, f16 or exact (bf16x2 needs BF16 keys)");
+        const unsigned idx_wmma = idx_mode == strix::attn_core::idx::kModeExact ? 0U : idx_mode;
         if (opt.world == 2 && !startup_handshake && idx_wmma != 0)
             throw std::invalid_argument("STRIX_IDX_WMMA with --world 2 needs the startup agreement (--decode N or --tf, comm exchange) "
                                         "so both ranks are checked to run the same indexer identity");

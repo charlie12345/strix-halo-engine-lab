@@ -36,6 +36,34 @@ flujo de copia separado, CRC32C por pieza y una única confirmación ACK tras to
 las instalaciones H2D. Ambos rangos deben utilizar esta versión del protocolo. El
 coste de memoria es de 32 MiB de memoria del host fijada por cada traspaso activo.
 
+## Piezas de costura en un solo sentido por la ruta de dispositivo
+
+En la ruta de dispositivo (`usb4gpu`), una pieza de costura de más de 64 KiB pasa de la
+instantánea de dispositivo de un rango a la del otro en un solo sentido
+(`dist::Communicator::transfer`): el rango que envía no publica recepción y el que recibe
+no publica transmisión, de modo que nada viaja en el sentido no usado y no hay que retirar
+una recepción anticipada con un intercambio de relleno. La GPU receptora comprueba la
+identidad y la suma de palabras de la trama igual que en un intercambio simétrico, y la
+operación del emisor solo termina contra la recepción que publicó su par.
+
+El CRC-32C de costura de esas piezas se calcula en el dispositivo en ambos extremos
+(`xport::DeviceCrc32c`: un resumen por tramo de 64 KiB, combinados en el host), así que el
+emisor no copia la pieza al host ni el receptor la vuelve a leer. El valor es el CRC-32C
+de host de los mismos bytes, bit a bit; el flujo de control (CRC por pieza, CRC de la trama
+completa, ACK de consumo) no cambia, ni tampoco los logits. Las piezas de 64 KiB o menos y
+el transporte solo de host conservan el camino de host.
+
+`STRIX_PAIR_LINK_ONE_WAY=0` recupera el intercambio simétrico (una carga de relleno de tamaño
+completo en el sentido no usado); ambos rangos deben fijarlo igual. `STRIX_PAIR_LINK_DEVICE_CRC=0`
+recupera el CRC de host con sus copias en el rango que lo fija (el protocolo no cambia, así
+que los rangos pueden diferir). La ejecución imprime una línea
+`qwen-pair link:` con las piezas y los bytes de dispositivo enviados y recibidos por el rango.
+
+El enlace es compartido (`pair::DeviceLink`, `src/xport/pair_device_link.hpp`). La pareja de
+Gemma 4 también lo usa: su transporte predeterminado sigue siendo `usb4auto` (camino de host,
+sin cambios) y `--transport usb4gpu` selecciona la ruta de dispositivo con las mismas piezas
+en un solo sentido y el CRC en dispositivo (su línea de recibo es `g4-pair link:`).
+
 ## Equilibrio de etapas, copias de la costura y línea temporal de la pareja
 
 `STRIX_PAIR_TIMING=1` imprime una línea `pair-timing` por fragmento y rango y una suma por

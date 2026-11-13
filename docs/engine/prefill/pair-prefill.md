@@ -30,6 +30,33 @@ bytes. Final-state wire v2 uses two pinned 16 MiB slots, a separate copy stream,
 CRC32C per piece and one completion ACK after all H2D installs. Both ranks must
 use this wire version. Memory overhead is 32 MiB pinned host per active handoff.
 
+## One-way seam pieces on the device route
+
+On the device route (`usb4gpu`), a seam piece above 64 KiB moves device snapshot to device
+snapshot in one direction only (`dist::Communicator::transfer`): the sending rank posts no
+receive and the receiving rank no transmit, so nothing travels in the unused direction and
+no early receive has to be retired by a scratch exchange. The receiving GPU checks the
+in-band identity and word checksum of the frame as for a symmetric exchange, and the
+sender's operation completes only against the receive its peer posted.
+
+The seam CRC-32C of such a piece is computed on the device at both ends
+(`xport::DeviceCrc32c`: one digest per 64 KiB span, folded on the host), so the piece is
+neither copied to the host by the sender nor read back by the receiver. The value is the
+host CRC-32C of the same bytes, bit for bit; the control stream (piece CRC, whole-frame CRC,
+consumption ACK) is unchanged, and so are the logits. Pieces of 64 KiB or less and the
+host-only transport keep the host path.
+
+`STRIX_PAIR_LINK_ONE_WAY=0` restores the symmetric exchange (a full-size scratch payload in
+the unused direction); both ranks must set it the same way. `STRIX_PAIR_LINK_DEVICE_CRC=0`
+restores the host CRC with its copies on the rank that sets it (the wire does not change, so
+the ranks may differ). The run prints one `qwen-pair link:` line with the pieces and
+the device bytes sent and received by the rank.
+
+The link is shared (`pair::DeviceLink`, `src/xport/pair_device_link.hpp`). The Gemma 4 pair
+uses it too: its default transport stays `usb4auto` (host path, unchanged), and
+`--transport usb4gpu` selects the device route with the same one-way pieces and device CRC
+(its receipt line is `g4-pair link:`).
+
 ## Stage balance, seam copies and the pair timeline
 
 `STRIX_PAIR_TIMING=1` prints one `pair-timing` line per chunk and rank and a per-rank sum

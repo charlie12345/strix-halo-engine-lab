@@ -4837,16 +4837,37 @@ Weights, activations and route weights retain their existing arithmetic.
   covers both down formats, all three tunes, scalar/vector tails, top-k ten, padded tails, RNE ties, subnormals,
   infinities, NaNs, OFF byte equality and both merge/commit branches.
 
-## HC normalized recompute candidate
+## HC normalized recompute
 
-`STRIX_QPF2K_HC_RECOMPUTE_NORM=1` removes FP32 normalized image stores at
-eligible qpf2k HC sites, using the exact inverse already computed in the existing
-producer. Consumers reconstruct values through the same two pinned multiplies.
-Folds, prefetched projection, OUT16 and output3/lowband remain eligible; no launch
-is added. Numerical identity is unchanged. OFF: `=0`; restart. The default remains
-OFF until native equality and interleaved timing establish that ON is not slower.
-Unsupported sites retain the image. At T16384 the net reduction in materialized
-stores is 639.75 MiB/site; allocation reservations are unchanged. No speed claim.
+**Default ON with the WMMA HC output (OUT16).** At eligible qpf2k HC sites the folded inject + norm stores only the
+four stream inverses of each row. The projection and the output rebuild every normalized value with the same two
+pinned multiplies, so the FP32 normalized image (40 KB per row) is neither written nor read. Numerical identity is
+unchanged: every written byte is equal, and the logits are identical at 8K and 32K.
+
+Three parts make the route faster than the image:
+
+- **Full-width projection** (`STRIX_QPF2K_HC_PROJ_TILE`, default 64 rows per block; 32 and 16 selectable, 0 selects
+  the five-column-block form). One block owns 64 rows and all 320 low outputs, so each normalized value is formed
+  once instead of once per column block.
+- **Output epilogue.** The stream loads of a block are issued before the first pinned multiply. Interleaved with
+  the pinned multiplies, each load was waited for alone.
+- **Stream mirror.** Stream rows whose pitch is a multiple of 4096 bytes alias when a block reads many rows at the
+  same column, which is what both consumers do. For such rows the folded inject + norm also stores the stream row
+  into the unused first half of the row in the normalized workspace (pitch 42240 bytes), and the consumers read
+  that copy. Sites without the fold keep the image.
+
+Measured on one node, HC step of 8,192 rows (inject + norm, projection, output):
+
+| stream row pitch | image | recompute | change |
+|---|---|---|---|
+| 20480 bytes (the engine's rows, mirrored) | 8.29 ms | 7.19 ms | -13 % |
+| 20608 bytes (non-aliasing, no mirror) | 8.33 ms | 6.12 ms | -27 % |
+| 20480 bytes without the mirror | 8.28 ms | 10.49 ms | +27 % |
+
+End to end, same binary with the route off and on: 8K prefill -2.3 %, 32K prefill -2.1 %.
+
+OFF: `STRIX_QPF2K_HC_RECOMPUTE_NORM=0`; restart. `=1` also admits the route with the lane-chain output forms, which
+were not measured and therefore keep the image by default. Unsupported sites retain the image.
 See [admission, lifetime, resources and the native ticket](engine/prefill/hc-normalized-recompute.md).
 
 ## HC low-band layout

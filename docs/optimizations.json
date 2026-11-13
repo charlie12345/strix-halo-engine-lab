@@ -2,14 +2,14 @@
   {"engine":"minimax","name":"Packed MoE decode","flag_or_env":"STRIX_PF_P1 bit 0","default":"ON (1)","exact":"Bitwise: exhaustive 65,536-state check K3..K6; MiniMax 8K/32K state and tokens unchanged.","gain":"PAIR -2.3 %, PIPE -4.0 %, 8K TTFT -1.3 %; VGPR 247 -> 239.","preconditions":"Existing MiniMax v4 PAIR/PIPE routes; Simplify and other routes unchanged. Host reads once; restart both ranks.","off_switch":"STRIX_PF_P1=0 (or clear bit 0)","doc_anchor":"docs/optimizations.md#mm-pf-moe-pipe"},
   {
     "engine": "qwen",
-    "name": "HC normalized recompute candidate",
+    "name": "HC normalized recompute",
     "flag_or_env": "STRIX_QPF2K_HC_RECOMPUTE_NORM",
-    "default": "OFF pending native equality and not-slower timing; opt in with =1",
-    "exact": "Same pinned two-multiply expression and numerical identity; compiler, native byte equality, model and complete-workload gates pending.",
-    "gain": "Avoids 640 MiB of FP32 image stores at T16384, adds 0.25 MiB of inverse stores; arena reservation unchanged. No measured speed claim.",
+    "default": "ON with the WMMA HC output (auto); =1 admits it with every eligible output form",
+    "exact": "Bitwise: same pinned two-multiply expression; native fixtures compare every written byte (both stream pitches, all sites); logits identical at 8K and 32K.",
+    "gain": "HC step of 8,192 rows 8.29 -> 7.19 ms (-13 %) with the mirrored 20480-byte stream pitch, 8.33 -> 6.12 ms with a non-aliasing pitch; 8K prefill -2.3 %, 32K -2.1 %.",
     "preconditions": "Uniform BF16 H2560/S4/rank320 fast prefill, FP32 norm weights, prefetched qpf2k projection and OUT16 or 32-row output3. Existing folds and lowband remain eligible; unsupported sites retain the image. Restart.",
     "off_switch": "STRIX_QPF2K_HC_RECOMPUTE_NORM=0",
-    "doc_anchor": "docs/optimizations.md#hc-normalized-recompute-candidate"
+    "doc_anchor": "docs/optimizations.md#hc-normalized-recompute"
   },
   {
     "engine": "qwen",

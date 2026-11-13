@@ -5317,6 +5317,10 @@ if(STRIX_FAMILY_GLM5)
             target_link_libraries(strix-hip-glm5-pf-wmma-tests PRIVATE strix_glm5_engine)
             target_include_directories(strix-hip-glm5-pf-wmma-tests PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")
             list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-wmma-tests)
+            add_executable(strix-hip-glm5-pf-iu4-chain-tests tests/hip_glm_pf_iu4_chain_tests.hip)  # FAST_I4 chain plan policy: bits + timing
+            target_link_libraries(strix-hip-glm5-pf-iu4-chain-tests PRIVATE strix_glm5_engine)
+            target_include_directories(strix-hip-glm5-pf-iu4-chain-tests PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")
+            list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-iu4-chain-tests)
             add_executable(strix-hip-glm5-pf-kda-wmma-tests tests/hip_glm_pf_kda_wmma_tests.hip)  # FAST glm-pf-kda-wmma-v1 contract + drift gate + timing
             target_link_libraries(strix-hip-glm5-pf-kda-wmma-tests PRIVATE strix_glm5_engine)
             list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-kda-wmma-tests)

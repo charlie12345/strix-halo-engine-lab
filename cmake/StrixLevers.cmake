@@ -23,4 +23,7 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME strix-env-switch-census-self-test COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_CURRENT_LIST_DIR}/../tools/env_switch_census.py" --self-test)
     set_tests_properties(strix-env-switch-census-self-test PROPERTIES LABELS "cpu" TIMEOUT 30)
+    add_test(NAME strix-env-switch-census-cli-tests COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_CURRENT_LIST_DIR}/../tests/env_switch_census_tests.py")
+    set_tests_properties(strix-env-switch-census-cli-tests PROPERTIES LABELS "cpu" TIMEOUT 30)
 endif()

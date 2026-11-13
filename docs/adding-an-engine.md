@@ -207,12 +207,25 @@ the result for `--print-effective-config`; `lever::require_consistent` refuses t
 levers that the table declares incompatible. `static_assert(lever::valid(table))`
 checks the table at compile time.
 
+The environment-reading overload is for startup configuration: it allocates and
+records under the shared registry mutex. Capture an owned switch value at startup
+and use the explicit-value overload for per-request or per-launch decisions.
+Existing `profile::Lever` and `profile::DefaultItem` rows in `engine_profile.hpp`
+remain authoritative for profile values, defaults and qualification. Before an
+engine adopts `lever::Decl`, provide a shared adapter deriving the overlapping
+fields from those rows; do not maintain a second set of names or metadata.
+
 Read any other switch through `include/strix/env_flags.hpp`. The
 `strix-env-switch-census` test (`tools/env_switch_census.py --check`) fails when a
 new switch is read with a raw `getenv`, or when one boolean switch is read with two
 different defaults. `tools/env_switch_baseline.txt` lists the switches that are
 still read raw; it only shrinks (`--update` removes migrated names).
 `tools/env_switch_census.py --report` prints the current counts.
+`--seed` creates a baseline only when the destination does not exist. The census
+tracks literal names, including adjacent ordinary string literals; runtime-built
+names and wrapper reads are outside its scope. Escapes in raw literal names are
+rejected because this scanner does not decode C++ escapes. Existing baseline names may gain
+raw read sites, so a passing census is not proof that all configuration is governed.
 
 ## Checklist
 

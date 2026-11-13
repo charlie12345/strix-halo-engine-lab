@@ -37,8 +37,12 @@ HELPER_FILE = "include/strix/env_flags.hpp"
 # code only, and allow any white space (including new lines) between the tokens of a call.
 LEXEME = re.compile(
     r"""//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|'(?:\\[^\n]{1,8}?|[^'\\\n])'""", re.S)
-RAW = re.compile(r'\bgetenv\s*\(\s*"(STRIX_[A-Z0-9_]+)"')
-GOVERNED = re.compile(r'\b(envcfg\s*::\s*[a-z_]+|env_[a-z_0-9]+)\s*\(\s*"(STRIX_[A-Z0-9_]+)"')
+STRING = r'"(?:\\.|[^"\\\n])*"'
+# Consume the entire literal argument: a baselined prefix must not hide a new suffix.
+RAW = re.compile(r'\bgetenv\s*\(\s*((?:' + STRING + r'\s*)+)\)')
+GOVERNED = re.compile(
+    r'\b(envcfg\s*::\s*[a-z_]+|env_[a-z_0-9]+)\s*(?:<[^;{}()]*>\s*)?'
+    r'\(\s*"(STRIX_[A-Z0-9_]+)"')
 TABLE = re.compile(r'\.env\s*=\s*"(STRIX_[A-Z0-9_]+)"')
 FLAG_DEFAULT = re.compile(
     r'\benvcfg\s*::\s*flag\s*\(\s*"(STRIX_[A-Z0-9_]+)"\s*,\s*(true|false)\b'
@@ -76,7 +80,15 @@ def strip_comments(text: str) -> str:
 def scan_text(text: str):
     """Switches of one source text: (raw names, governed names, [(name, 'on'|'off')] of governed flag reads)."""
     code = strip_comments(text)
-    raw = set(RAW.findall(code))
+    raw = set()
+    for argument in RAW.findall(code):
+        # C++ escape decoding is outside this lexical scanner. Fail closed instead
+        # of accepting a baselined prefix of an unsupported constant expression.
+        if "\\" in argument:
+            raise ValueError("unsupported escape in raw getenv literal; use an ordinary literal name")
+        name = "".join(token[1:-1] for token in re.findall(STRING, argument))
+        if NAME.fullmatch(name):
+            raw.add(name)
     governed = {name for helper, name in GOVERNED.findall(code) if helper != "env_reject"}
     governed.update(TABLE.findall(code))
     defaults = []
@@ -98,7 +110,10 @@ def scan(root: Path):
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "STRIX_" not in text:
             continue
-        file_raw, file_governed, file_defaults = scan_text(text)
+        try:
+            file_raw, file_governed, file_defaults = scan_text(text)
+        except ValueError as error:
+            raise ValueError(f"{rel}: {error}") from error
         for name in file_raw:
             raw[name].add(rel)
         for name in file_governed:
@@ -115,6 +130,8 @@ FIXTURES = [
     ('auto v = getenv\n    (\n  "STRIX_A"\n);', {"STRIX_A"}, set(), []),
     ('auto v = std::getenv /* why */ ( /* name */ "STRIX_A");', {"STRIX_A"}, set(), []),
     ('auto v = ::getenv(// name\n "STRIX_A");', {"STRIX_A"}, set(), []),
+    ('auto v = std::getenv("STRIX_BASELINE" "_NEW");', {"STRIX_BASELINE_NEW"}, set(), []),
+    ('auto v = getenv("STRIX_" /* join */ "A" "");', {"STRIX_A"}, set(), []),
     ('// old: getenv("STRIX_A")\nint x = 0;', set(), set(), []),
     ('/* getenv("STRIX_A")\n   getenv("STRIX_B") */ int x = 0;', set(), set(), []),
     ('const char* doc = "see // getenv"; auto v = getenv("STRIX_A");', {"STRIX_A"}, set(), []),
@@ -127,6 +144,11 @@ FIXTURES = [
     ('bool on = strix::envcfg :: flag (\n "STRIX_A" ,\n false );', set(), {"STRIX_A"}, [("STRIX_A", "off")]),
     ('bool on = envcfg::flag /* x */ ("STRIX_A", /* y */ true);', set(), {"STRIX_A"}, [("STRIX_A", "on")]),
     ('bool on = env_flag_default_off ("STRIX_A");', set(), {"STRIX_A"}, [("STRIX_A", "off")]),
+    ('strix::env_number<std::uint32_t>("STRIX_PROBE_DEPTH", 4U);', set(), {"STRIX_PROBE_DEPTH"}, []),
+    ('strix::env_number<std::uint32_t>("STRIX_PROBE_GPU_LINKS", 8U);', set(), {"STRIX_PROBE_GPU_LINKS"}, []),
+    ('strix::env_number<unsigned>("STRIX_PROBE_PAUSE_US", 0U);', set(), {"STRIX_PROBE_PAUSE_US"}, []),
+    ('strix::env_number<double>("STRIX_PROBE_OUTLIER_US", 10000.0);', set(), {"STRIX_PROBE_OUTLIER_US"}, []),
+    ('strix::env_number /* type */ < unsigned >\n ("STRIX_A", 0U);', set(), {"STRIX_A"}, []),
     ('// envcfg::flag("STRIX_A", true)\nint n = envcfg::integer("STRIX_B", 4);', set(), {"STRIX_B"}, []),
     ('{.name = "x", .env\n = "STRIX_A", .default_on = true}', set(), {"STRIX_A"}, []),
     ('detail::env_reject("STRIX_A", value, "why");', set(), set(), []),
@@ -154,11 +176,12 @@ def read_baseline(path: Path) -> set[str]:
             if line.strip() and not line.startswith("#")}
 
 
-def write_baseline(path: Path, names: set[str]) -> None:
+def write_baseline(path: Path, names: set[str], *, exclusive: bool = False) -> None:
     header = ("# Switches read with a raw getenv today (generated: tools/env_switch_census.py --update).\n"
               "# This list only shrinks. A new switch is read through include/strix/env_flags.hpp or declared in a\n"
               "# lever table (include/strix/lever.hpp); it is never added here.\n")
-    path.write_text(header + "".join(name + "\n" for name in sorted(names)), encoding="utf-8", newline="\n")
+    with path.open("x" if exclusive else "w", encoding="utf-8", newline="\n") as output:
+        output.write(header + "".join(name + "\n" for name in sorted(names)))
 
 
 def main() -> int:
@@ -178,7 +201,11 @@ def main() -> int:
 
     if args.self_test:
         return self_test()
-    raw, governed, defaults, inspected = scan(root)
+    try:
+        raw, governed, defaults, inspected = scan(root)
+    except ValueError as error:
+        print(f"env switch census: {error}", file=sys.stderr)
+        return 2
     # A scan that saw nothing proves nothing: a wrong --root or a missing baseline is an error, not a pass.
     if inspected == 0:
         print(f"env switch census: no source files under {root} ({', '.join(SOURCE_DIRS)})", file=sys.stderr)
@@ -192,7 +219,12 @@ def main() -> int:
     stale = sorted(baseline - set(raw))
 
     if args.seed:
-        write_baseline(baseline_path, set(raw))
+        try:
+            write_baseline(baseline_path, set(raw), exclusive=True)
+        except FileExistsError:
+            print(f"env switch census: baseline {baseline_path} already exists; use --update to remove names",
+                  file=sys.stderr)
+            return 2
         print(f"env switch census: baseline seeded with {len(raw)} raw switches")
         return 0
     if args.update:

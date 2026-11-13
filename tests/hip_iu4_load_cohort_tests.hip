@@ -40,7 +40,7 @@ std::uint64_t fnv(const void* p, std::size_t n, std::uint64_t h = 14695981039346
 template<class T> struct Dev {
     T* p = nullptr; std::size_t n = 0;
     explicit Dev(std::size_t count) : n(count) { ok(hipMalloc(reinterpret_cast<void**>(&p), std::max<std::size_t>(count, 1) * sizeof(T)), "hipMalloc"); }
-    ~Dev() { hipFree(p); }
+    ~Dev() { (void)hipFree(p); }
     Dev(const Dev&) = delete; Dev& operator=(const Dev&) = delete;
     void put(const std::vector<T>& v) { ok(hipMemcpy(p, v.data(), v.size() * sizeof(T), hipMemcpyHostToDevice), "upload"); }
     std::uint64_t hash(std::size_t count) const {

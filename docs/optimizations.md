@@ -2911,9 +2911,10 @@ scale now stays F16 in registers until `store()` writes it to LDS after the WMMA
 
 The order in which the tiled core issues a stage's raw loads, publishes them to LDS and synchronises the CTA was
 written inline in the kernel body. It is now a schedule type named by the contract (`Contract::Schedule`, default
-`pipeline::CtaStageAhead<>` in `src/core/load_cohort.hpp`): the kernel supplies `issue`, `publish` and `sync`, the
-schedule orders them around the stage's matrix work. Loads are grouped in two cohorts (activations with their row
-scales, weights with their column scales) selected at compile time, so a schedule adds no branch to the kernel.
+`pipeline::CtaStageAhead<>` in `src/core/load_cohort.hpp`): the schedule states which load cohorts are issued ahead
+of the stage's matrix work and how many stages and LDS buffers that keeps live, and the kernel orders its issue,
+publish and barrier accordingly. Loads are grouped in two cohorts (activations with their row scales, weights with
+their column scales) selected at compile time, so a schedule adds no branch to the kernel.
 
 The default schedule is the one the core already ran: the next stage's loads are issued before the current stage's
 matrix work and first read by the LDS store after it. On gfx1151 the 128x128 IU4 plan issues 8 loads after the
@@ -2922,7 +2923,7 @@ barrier, runs its 64 matrix operations and the K64 scale flush with LDS waits on
 activation/weight readiness split therefore has nothing left to hide and is not built.
 
 - **Preconditions:** none; code motion behind a compile-time trait.
-- **Exactness evidence:** `strix-hip-iu4-load-cohort-tests` pins the I32 group sums and FP32 outputs of gate/up (K 6144, N 1536) and down (K 1536, N 6144) for four groups of 1, 127, 128 and 129 rows, pins LDS bytes, scratch and a VGPR ceiling of the three library instantiations, and requires the same output bits when the weights or all loads are issued late.
+- **Exactness evidence:** gfx1151 assembly of the tiled-core library unit is instruction-identical before and after (392 kernels). `strix-hip-iu4-load-cohort-tests` pins the I32 group sums and FP32 outputs of gate/up (K 6144, N 1536) and down (K 1536, N 6144) for four groups of 1, 127, 128 and 129 rows, pins LDS bytes, scratch and a VGPR ceiling of the three library instantiations, and requires the same output bits when the weights or all loads are issued late.
 - **Off switch:** None (no behaviour change).
 - **Measured gain:** none claimed. Routed replay of the fixture (4,096 token rows x top-8 over 288 groups, gate/up + down, 41 interleaved rounds): 24.06 / 23.78 ms before, 23.91 ms after. The same kernel with the weights issued late is +7.3 % slower, with every load issued late +9.1 %: that is what the existing overlap is worth, and it was already in place.
 - **Implementation / evidence:** [schedule](../src/core/load_cohort.hpp), [core](../src/core/tiled_core.hpp), [fixture](../tests/hip_iu4_load_cohort_tests.hip)

@@ -303,8 +303,8 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
         }
     }
     // Raw loads of one stage. cohort_a: activations (+ IU4 row scales); cohort_b: weights (+ IU4 column
-    // scales). No destination register is read here; store() is each cohort's first use. The order of
-    // issue / store around the stage's matrix work is the contract's load schedule (load_cohort.hpp).
+    // scales). No destination register is read here; store() is each cohort's first use. Which cohorts
+    // are issued before the stage's matrix work is the contract's load schedule (load_cohort.hpp).
     using Schedule = typename pipeline::contract_schedule<Contract>::type;
     static_assert(Schedule::lookahead == 1 && Schedule::lds_stages * G::stage_bytes == G::lds_bytes,
         "one register stage of lookahead, two LDS stage buffers");
@@ -497,11 +497,14 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
     // IU4: fresh I32 per scale group; persists across stages only when g > BK.
     using IU4Sum = int32_t __attribute__((ext_vector_type(8)));
     [[maybe_unused]] IU4Sum sum[IU4 ? MT : 1][IU4 ? NT : 1] = {};
-    auto sync = [] { __syncthreads(); };
-    Schedule::prologue(stages, fetch, store, sync);
+    if (stages > 0) {
+        fetch(0, pipeline::Set<pipeline::cohort_all>{});
+        store(0, 0, pipeline::Set<pipeline::cohort_all>{});
+        __syncthreads();
+    }
     for (int stage = 0; stage < stages; ++stage) {
         const int buffer = stage & 1;
-        Schedule::before_compute(stage, stages, fetch);
+        if constexpr (Schedule::early != 0U) { if (stage + 1 < stages) fetch(stage + 1, pipeline::Set<Schedule::early>{}); }
         const auto* ab = lds + buffer * G::stage_bytes;
         const _Float16* as = reinterpret_cast<const _Float16*>(ab);
         const _Float16* bs = as + BM * STRIDE;
@@ -614,7 +617,11 @@ __attribute__((amdgpu_waves_per_eu(core_waves_per_eu<Contract>()))) void tiled_c
             }
         }
         }
-        Schedule::after_compute(stage, stages, buffer, fetch, store, sync);
+        if (stage + 1 < stages) {
+            if constexpr (Schedule::late != 0U) fetch(stage + 1, pipeline::Set<Schedule::late>{});
+            store(stage + 1, buffer ^ 1, pipeline::Set<pipeline::cohort_all>{});
+        }
+        __syncthreads();
     }
 
     if constexpr (Probe == 1) acc[0][0][0] += float(probe_sink & 1u);

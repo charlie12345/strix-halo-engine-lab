@@ -373,7 +373,9 @@ std::vector<std::unique_ptr<Source>> make_sources(const std::string& root) {
     auto& r = registry();
     const std::lock_guard<std::mutex> lock(r.mutex);
     std::vector<std::unique_ptr<Source>> out;
-    for (const auto& entry : r.kinds) if (entry.second) if (auto source = entry.second(root)) out.push_back(std::move(source));
+    // The real machine is the filesystem root; an empty prefix would make every path relative to the working directory.
+    const std::string base = root.empty() ? std::string("/") : root;
+    for (const auto& entry : r.kinds) if (entry.second) if (auto source = entry.second(base)) out.push_back(std::move(source));
     return out;
 }
 

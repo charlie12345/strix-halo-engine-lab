@@ -63,8 +63,8 @@ public:
     virtual void read(Sample& sample) noexcept = 0;
 };
 
-// root is the filesystem prefix of the system tree ("" on a real machine; a test passes a directory holding a fake
-// sys/ tree).
+// root is the filesystem prefix of the system tree: empty means the real machine ("/"); a test passes a directory
+// holding a fake sys/ tree.
 using SourceFactory = std::function<std::unique_ptr<Source>(const std::string& root)>;
 // Adds a source kind for every sampler made afterwards. The built-in kinds are registered already.
 void register_source(std::string kind, SourceFactory factory);

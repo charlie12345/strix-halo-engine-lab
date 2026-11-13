@@ -3300,6 +3300,20 @@ The pair prefill exchange sends each message as a run of synchronous transport c
 - **Measured gain:** TTFT 1,024 tokens 2.469 -> 2.423 s (414.8 -> 422.6 tok/s, -1.9 %), 4,096 tokens 9.168 -> 9.025 s (446.8 -> 453.9 tok/s, -1.5 %), 8,192 tokens 13.817 / 13.874 -> 13.874 s (592.9 / 590.5 -> 590.5 tok/s, unchanged)
 - **Implementation / evidence:** [exchange options](../src/minimax/pfx/pf_exchange.hpp), [exchange tests](../tests/hip_mm_pfx_tests.hip)
 
+<a id="mm-pfx-joined"></a>
+
+### Prefill exchange joined frame
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PFX_JOINED` (both ranks the same). **Default:** 1.
+
+A prefill exchange message used to be three rendezvous: a header exchange, the chunk exchanges, then a CRC-list exchange. The joined frame carries the identity record behind the last chunk, and with CRC and two or more chunks the CRC list as well, so a message of N chunks is N transport exchanges instead of N + 2 (a one-chunk message with CRC keeps its CRC-list exchange: N + 1). The framing lives in the shared transport code (`src/xport/framed_exchange.hpp`), which also serializes the original form byte for byte; the two ranks agree on the form once, in a hello at the first message, and the joined form is used only when both offer it. Payload bytes, chunk cuts, per-chunk CRCs and validation before consumption are unchanged.
+
+- **Preconditions:** Pair (two-rank) MiniMax prefill; both ranks run the same value (with 0 there is no hello, so a mixed pair fails at the first message instead of exchanging garbage).
+- **Exactness evidence:** Host tests compare the original form against a frozen copy of the previous serializer byte for byte and check the joined form's identity, CRC list and mismatch detection; device exchange tests pass in both forms.
+- **Off switch:** STRIX_MM_PFX_JOINED=0
+- **Measured gain:** Two fewer transport exchanges per message (26 -> 24 for a 4K-token message of 24 chunks); the per-partial trailer no longer allocates two vectors.
+- **Implementation / evidence:** [framed exchange](../src/xport/framed_exchange.hpp), [exchange options](../src/minimax/pfx/pf_exchange.hpp), [framing tests](../tests/xport_minimax_pfx_tests.cpp), [exchange tests](../tests/hip_mm_pfx_tests.hip)
+
 <a id="mm-pf-idx-tile"></a>
 
 ### MSA prefill index query tiles

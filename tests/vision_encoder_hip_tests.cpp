@@ -1,17 +1,21 @@
 // Device self-test of the shared vision encoder: synthetic towers on the HIP runner against the host FP32 reference.
 // Gate (per row of the hidden state and of every tap): cosine mean >= 0.9995, min >= 0.998, relative L2 <= 2 %.
 // Needs a GPU; run it before any family adapter's ticket. Exit 0 = PASS. Every line carries the FNV-1a of the device
-// output bytes, so two builds can be compared bit for bit. `--bench` adds linears at tail shapes and a forward of a
+// output bytes. `--bench OFF_REFERENCE` checks tail linears against a separate OFF capture and adds a forward of a
 // 32 x 1024 tower (SwiGLU 2816, 1,521 patches) with its time.
+// Capture with both STRIX_F16_DENSE_TAIL=0 and STRIX_VISION_GEMM_EPILOGUE=0 using --bench-save-reference FILE.
 #include "strix/vision/embed_cache.hpp"
 
 #include "vision_encoder_toy.hpp"
+#include "dense_fixture_checks.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -129,8 +133,8 @@ bool run(const Case& k, std::uint64_t seed) {
 }
 
 // Projector linears at shapes that exercise the remainder launch and the last partial CTA, plain and split, and the
-// non-finite report. Hashes only (the towers above carry the quality gate).
-void bench_linears(Encoder& enc, const char* tag) {
+// non-finite report. Every output byte is compared with a separately saved OFF arm.
+void bench_linears(Encoder& enc, const char* tag, std::istream* reference, std::ostream* save) {
     vision_toy::Rng rng{977U};
     const unsigned in = 1024;
     std::vector<std::vector<float>> weights;  // the encoder keys its panels by weight address: keep every one alive
@@ -145,21 +149,19 @@ void bench_linears(Encoder& enc, const char* tag) {
             std::vector<float> x(std::size_t{rows} * in), y(std::size_t{rows} * n, -7.0F);
             for (auto& v : x) v = rng.next() * 3.0F;
             enc.linear(tw, tb, x.data(), rows, y.data());
+            dense_fixture::linear_reference(reference, save, y, rows, in, n);
             std::printf("LINEAR %s rows %3u in %u n %4u fnv %016llx\n", tag, rows, in, n, static_cast<unsigned long long>(fnv(y)));
             if (rows != 129U || n != 272U) continue;
             x[5U * in + 7U] = 3.0e38F;  // FP16 overflow in one row: the linear must report it
-            bool threw = false;
-            try {
+            dense_fixture::require_numeric_failure([&] {
                 enc.linear(tw, tb, x.data(), rows, y.data());
-            } catch (const std::exception&) {
-                threw = true;
-            }
-            std::printf("NONFINITE %s rows %u n %u reported %d\n", tag, rows, n, threw ? 1 : 0);
+            });
+            std::printf("NONFINITE %s rows %u n %u reported 1\n", tag, rows, n);
         }
     }
 }
 
-void bench() {
+void bench(std::istream* reference, std::ostream* save) {
     using C = EncoderConfig;
     {
         const C small = tower(128, 2, 352, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 14);
@@ -169,7 +171,7 @@ void bench() {
             opt.split_activations = split;
             Encoder enc(small, opt);
             enc.load(t.w);
-            bench_linears(enc, split ? "split" : "plain");
+            bench_linears(enc, split ? "split" : "plain", reference, save);
         }
     }
     C big = tower(1024, 16, 2816, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 14);
@@ -184,18 +186,19 @@ void bench() {
         enc.load(t.w);
         std::vector<double> ms;
         unsigned long long h = 0;
-        bool same = true;
+        EncoderOutput first;
         for (unsigned i = 0; i < 16U; ++i) {
             EncodeStats st;
             const EncoderOutput o = enc.encode(g, p, st);
             const unsigned long long hi = hash_of(o);
-            same = same && (i == 0 || hi == h);
+            if (i == 0) first = o;
+            dense_fixture::require_repeatable(o, first);
             h = hi;
             if (i) ms.push_back(st.total_ms);  // the first forward pays the workspace
         }
         std::sort(ms.begin(), ms.end());
         std::printf("FORWARD %s layers %u width %u rows %u fnv %016llx repeatable %d  ms min %.3f median %.3f max %.3f\n", split ? "split" : "plain",
-                    big.layers, big.width, g.rows, h, same ? 1 : 0, ms.front(), ms[ms.size() / 2U], ms.back());
+                    big.layers, big.width, g.rows, h, 1, ms.front(), ms[ms.size() / 2U], ms.back());
     }
 }
 
@@ -204,6 +207,11 @@ void bench() {
 int main(int argc, char** argv) {
     using C = EncoderConfig;
     const bool with_bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+    const bool save_bench = argc > 1 && std::strcmp(argv[1], "--bench-save-reference") == 0;
+    if (argc != 1 && (!(with_bench || save_bench) || argc != 3)) {
+        std::fprintf(stderr, "usage: %s [--bench OFF_REFERENCE | --bench-save-reference OFF_REFERENCE]\n", argv[0]);
+        return 1;
+    }
     std::vector<Case> cases;
     cases.push_back({"d64-rms-swiglu-rope", tower(128, 2, 352, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 14), 13, 13, 1, false});
     cases.push_back({"d64-rms-swiglu-tiles", tower(128, 2, 352, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 14), 12, 12, 3, false});
@@ -220,9 +228,26 @@ int main(int argc, char** argv) {
     cases.push_back(clamp);
     bool ok = true;
     try {
+        std::ifstream reference;
+        std::ofstream save;
+        if (save_bench) {
+            dense_fixture::require(!strix::envcfg::flag("STRIX_F16_DENSE_TAIL", true) &&
+                                   !strix::envcfg::flag("STRIX_VISION_GEMM_EPILOGUE", true),
+                                   "reference capture requires both dense tail and vision epilogue switches OFF");
+            save.open(argv[2], std::ios::binary | std::ios::trunc);
+            dense_fixture::require(static_cast<bool>(save), "cannot open reference for writing");
+        } else if (with_bench) {
+            reference.open(argv[2], std::ios::binary);
+            dense_fixture::require(static_cast<bool>(reference), "cannot open OFF reference");
+        }
         std::uint64_t seed = 101;
         for (const auto& k : cases) ok = run(k, seed += 7U) && ok;
-        if (with_bench) bench();
+        if (with_bench || save_bench) bench(with_bench ? &reference : nullptr, save_bench ? &save : nullptr);
+        if (with_bench) dense_fixture::finish_reference(reference);
+        if (save_bench) {
+            save.close();
+            dense_fixture::require(static_cast<bool>(save), "reference close failed");
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());
         return 1;

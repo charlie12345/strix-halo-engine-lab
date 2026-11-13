@@ -2,6 +2,7 @@
 // give the same bytes for the same shape, padding columns and the guard row keep their sentinel, and the remainder
 // rule of plan() is timed against the other widths. Needs a GPU. Exit 0 = PASS.
 #include "core/f16_dense_tall.hpp"
+#include "dense_fixture_checks.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -49,17 +50,21 @@ struct Fixture {
     unsigned rows, in, n;
     float *dx = nullptr, *dy = nullptr;
     _Float16* dw = nullptr;
-    std::vector<float> fill;
+    std::vector<float> fill, reference;
     Fixture(unsigned r, unsigned i, unsigned nn) : rows(r), in(i), n(nn) {
         std::vector<float> x(std::size_t{rows} * in);
         std::vector<_Float16> w(std::size_t{n} * in);
         std::uint64_t s = 0x9E3779B97F4A7C15ULL + rows * 131U + n;
         const auto next = [&] {
             s = s * 6364136223846793005ULL + 1442695040888963407ULL;
-            return static_cast<float>(static_cast<double>(s >> 40U) / 8388608.0 - 1.0);
+            return static_cast<float>(static_cast<int>(s >> 60U) - 8) / 8.0F;
         };
         for (auto& v : x) v = next() * 4.0F;
         for (auto& v : w) v = static_cast<_Float16>(next() * 0.25F);
+        // |product| <= 1 and each product is a multiple of 1/64. At in=1024,
+        // every possible partial sum is exact in FP32; no WMMA oracle is reused.
+        const std::vector<float> wf(w.begin(), w.end());
+        reference = dense_fixture::exact_reference(x, wf, rows, in, n, kPad, kGuard);
         fill.assign(std::size_t{rows + 1U} * (n + kPad), kGuard);
         ok(hipMalloc(&dx, x.size() * 4U), "x");
         ok(hipMalloc(&dw, w.size() * 2U), "w");
@@ -99,6 +104,7 @@ struct Fixture {
         ok(hipDeviceSynchronize(), "sync");
         std::vector<float> y(fill.size());
         ok(hipMemcpy(y.data(), dy, y.size() * 4U, hipMemcpyDeviceToHost), "y download");
+        dense_fixture::check_dense(y, reference, rows, n, kPad, kGuard);
         Result r{1469598103934665603ULL, true, 0.0};
         for (const float f : y) {
             std::uint32_t b;
@@ -107,6 +113,7 @@ struct Fixture {
         }
         for (unsigned q = 0; q <= rows; ++q)
             for (unsigned c = q < rows ? n : 0U; c < n + kPad; ++c) r.sentinels = r.sentinels && y[std::size_t{q} * (n + kPad) + c] == kGuard;
+        // Correctness above is mandatory for every arm; timing is not a verdict.
         double best = 1e30;
         for (unsigned b = 0; b < 5U; ++b) {
             const auto t0 = std::chrono::steady_clock::now();
@@ -153,10 +160,15 @@ int main() {
             std::string line;
             unsigned best = 0;
             double best_ms = 1e30;
-            for (const unsigned tc : {4U, 2U, 1U}) {
-                const auto r = f.run(tc, true, 100U);
-                line += " tc" + std::to_string(tc) + " " + std::to_string(r.ms).substr(0, 6);
-                if (r.ms < best_ms) best_ms = r.ms, best = tc;
+            for (const unsigned tc : {0U, 16U, 4U, 2U, 1U}) {
+                for (const bool skip : {false, true}) {
+                    const auto r = f.run(tc, skip, 100U);
+                    // run() checks the independent reference, live writes and all guards,
+                    // including every remainder; a failure throws to main's nonzero exit.
+                    if (!skip) continue;
+                    line += " tc" + std::to_string(tc) + " " + std::to_string(r.ms).substr(0, 6);
+                    if (r.ms < best_ms) best_ms = r.ms, best = tc;
+                }
             }
             std::printf("TAIL rest %2u  plan tc %u  fastest tc %u |%s\n", rest, tall::plan(rest, 1024U, true).tc, best, line.c_str());
         }

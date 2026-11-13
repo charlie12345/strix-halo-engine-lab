@@ -4445,8 +4445,8 @@ Three changes to the shared dense FP16 WMMA core, built once and adopted by both
    or 4-tile columns from the measured rule: remainder of 1-2 tiles -> 1-tile columns; up to 256 rows -> 2-tile
    columns; above that 2-tile columns up to 5 tiles and 4-tile columns from 6. An 8-tile width is not offered: it
    compiles to 256 VGPRs with 120+ spills.
-3. **Idle-wave skip.** A row wave with no live row keeps its staging and barrier duties and skips its row loads and
-   WMMAs.
+3. **Idle-wave skip.** A row wave with no live row keeps its staging and barrier duties. After the initial row-0
+   fragment load, it skips subsequent row loads and all WMMAs.
 
 | kernel | VGPRs | spills | occupancy | LDS bytes | WMMAs |
 |---|---|---|---|---|---|
@@ -4458,7 +4458,8 @@ Three changes to the shared dense FP16 WMMA core, built once and adopted by both
 | 1-tile | 153 | 0 | 9 | 2,304 | 8 |
 
 - **Preconditions:** none beyond the core's own (FP16 weights, widths multiples of 16).
-- **Exactness:** bit-identical. Core fixture: 25 shapes (rows 1 / 113 / 128 / 129 / 1024 x outputs 16 / 48 / 208 / 272 / 1024), every column width and skip on/off give the same bytes as the previous header, padding sentinels intact. Vision self-test (6 towers) and GLM KDA test (66 hashed cases): identical hashes before, after, and with both switches off.
+- **Exactness checks:** The core fixture compares 25 shapes and all 15 remainders, every column width and skip on/off, against an independent CPU reference using exactly representable bounded inputs, with live-write and padding checks. This does not establish general equivalence to the previous header. Vision tail linears compare all output bytes to a separately saved OFF arm: run `strix-vision-encoder-hip-tests --bench-save-reference linear-off.bin` with both switches OFF, then restart with the desired switches and run `--bench linear-off.bin`. Numeric-error reporting and large-tower repeatability are mandatory. The revised gates still require native execution. Earlier reported vision (6 towers) and GLM KDA (66 cases) before/after/OFF hashes are historical evidence, not results of these revised gates.
+- **Performance scope:** The tail heuristic is measured at input width 1024. Performance at other admitted widths remains unmeasured; this is not a numerical-divergence finding.
 - **Measured (kernel, input width 1024, ms per call):** 129 x 272: 0.0675 -> 0.0636; 129 x 16: 0.0147 -> 0.0091; 129 x 208: 0.0157 -> 0.0123; 1 x 16: 0.0141 -> 0.0065; 1024 x 48: 0.0219 -> 0.0201; shapes with no remainder (n = 1024) and 1024 x 208 are unchanged (+-1 %).
 - **Measured (forward):** 32-layer width-1024 encoder tower, 1,521 rows (every width a multiple of 256, so no remainder launch): median 110.85 / 110.89 -> 110.83 / 110.66 ms (2 ABAB pairs, parity; mean GPU clock 1.12 GHz in both arms, about 124 M GPU clocks per forward). The fused epilogue removes the sum and affine launches without a measurable time change at this size; the store mode is selected once per wave (a per-element mode test cost 5 % of this forward).
 - **Off switch:** `STRIX_F16_DENSE_TAIL=0` (4-tile remainder, no skip), `STRIX_VISION_GEMM_EPILOGUE=0` (GEMM + sum + affine kernels).

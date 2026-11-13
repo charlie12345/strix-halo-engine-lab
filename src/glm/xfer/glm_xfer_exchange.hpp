@@ -13,6 +13,7 @@
 #include "strix/glm/engine.hpp"
 
 #include <array>
+#include <atomic>
 #include <memory>
 
 namespace strix::glm::xfer {
@@ -105,6 +106,9 @@ public:
         attention_bytes_ = bytes;
     }
 
+    // Exchange row fold (xport/row_fold.hpp; STRIX_GLMX_FOLD=rows gives the module its fold slots): process-wide
+    // switch for in-process A/B runs. Same bits either way.
+    static void set_fold_enabled(bool on) { fold_enabled_.store(on, std::memory_order_relaxed); }
 private:
     void boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flags,
                        unsigned rows, unsigned flag_stride, hipStream_t s);
@@ -120,6 +124,7 @@ private:
     const float* produced_ = nullptr;  // the TX slot handed out by producer_slot() for the next boundary
     float* bracket_ = nullptr;  // [max_rows][4][4096], allocated on first boundary()
     bool kwait_ = true, use_bracket_ = false;
+    static inline std::atomic<bool> fold_enabled_{true};
 };
 
 }  // namespace strix::glm::xfer

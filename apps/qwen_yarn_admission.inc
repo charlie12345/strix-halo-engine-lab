@@ -94,6 +94,7 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_PREFIX_BATCH_CERT", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_SERVE_PREFILL", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_SERVE_ROUTE", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_SERVE_PREFILL_ORG", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_SERVE_T16K", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_SERVE_FP16_MTP", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_BATCH_PROMPT_SMALL", YarnEnvironmentClass::nonrotary, ""},

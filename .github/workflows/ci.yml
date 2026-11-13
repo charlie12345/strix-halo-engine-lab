@@ -55,6 +55,22 @@ jobs:
             --junit host-ctest-junit.xml --stage host \
             --output host-ctest-evidence.json
 
+      # MiniMax is not in the default host build (STRIX_FAMILY_MINIMAX is OFF), so its route-identity census and
+      # source receipt are not in the ctest inventory above. The census is a gate. The receipt goes stale with
+      # any edit under MiniMax's source scope by design (it asks for a selector audit before a refresh), so
+      # drift is reported as a warning annotation with the stale paths and does not fail the job.
+      - name: MiniMax route identity census and source receipt drift
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S tests/engine_profile_host -B build/engine-profile-host -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/engine-profile-host --target strix-minimax-route-identity-tests
+          build/engine-profile-host/strix-minimax-route-identity-tests
+          if ! build/engine-profile-host/strix-minimax-route-identity-tests --audit-sources > route-source-audit.log 2>&1; then
+            echo "::warning title=MiniMax source receipt drift::tests/minimax_route_identity_sources.inc does not match this tree. Audit the new selectors, update the registry, then refresh the receipt."
+            cat route-source-audit.log
+          fi
+
       - name: Configure UMA host lab
         run: cmake -S lab/uma_residency -B build/uma-residency -G Ninja -DCMAKE_BUILD_TYPE=Release
 

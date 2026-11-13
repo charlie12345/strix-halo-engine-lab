@@ -135,6 +135,22 @@ void test_apply_env_default() {
     CHECK(rd::print(routed).find("admission and rank vote pending") != std::string::npos);
     CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "3");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "1");
+    // Dense rows v4 form selector: governed like the version selectors (default 0 = automatic, 0..7 accepted,
+    // anything else refused by the resolver, before any device work).
+    CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_FORM").value == "0");
+    CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_DENSE_FORM").value == "0");
+    for (const char* v : {"0", "1", "4", "7"}) {
+        const auto e = resolve({}, {{"STRIX_GLM_PF_DENSE_ROWS", "4"}, {"STRIX_GLM_PF_DENSE_FORM", v}});
+        CHECK(e.env.at("STRIX_GLM_PF_DENSE_FORM").value == v && e.env.at("STRIX_GLM_PF_DENSE_FORM").source == "explicit");
+        CHECK(rd::print(e).find(std::string("effective env STRIX_GLM_PF_DENSE_FORM=") + v + " (explicit, item pf-dense-form-auto; resolved form " + v) != std::string::npos);
+    }
+    for (const char* v : {"8", "-1", "07", "auto", "1 "}) {
+        bool refused = false;
+        try { (void)resolve({}, {{"STRIX_GLM_PF_DENSE_ROWS", "4"}, {"STRIX_GLM_PF_DENSE_FORM", v}}); }
+        catch (const std::invalid_argument&) { refused = true; }
+        CHECK(refused);
+    }
+    CHECK(rd::print(resolve({}, {})).find("effective env STRIX_GLM_PF_DENSE_FORM=0 (default, item pf-dense-form-auto; resolved form 0 (automatic per shape))\n") != std::string::npos);
     for (const char* v : {"1", "2", "3"})
         CHECK(resolve({}, {{"STRIX_GLM_PF_DENSE_ROWS", v}}).env.at("STRIX_GLM_PF_DENSE_ROWS").source == "explicit");
     CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_MIXNORM").value == "1");

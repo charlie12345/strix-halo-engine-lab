@@ -90,8 +90,9 @@ own constraints. The server therefore resolves:
 
 - **the primary tile**: T8192, or T16384 when the context admits a request of at least 32,768
   tokens (the single-request threshold; `STRIX_QPF2K_T16K=1` asks for it from 16,384, any other
-  value disables it) and the T16384 owner fits in memory beside every resident slot
-  (`--http-batch`). Otherwise it falls back to T8192 and then to smaller tiles;
+  value disables it) and the T16384 owner fits in memory beside every requested slot
+  (`--http-batch`) with the file-backed table still resident. Otherwise it falls back to T8192
+  and then to smaller tiles. `STRIX_QPF2K_T16K=1` keeps the plain memory bound;
 - **the prefill arithmetic**: the automatic FP16 prefill profile of the single-request route
   whenever the decode profile is the dense-A8 profile and no prefill profile is explicit
   (`STRIX_PREFILL_F16=0` declines it). A server whose MTP owner is an explicit sidecar keeps this
@@ -105,6 +106,15 @@ The `Qwen serve-prefill:` line printed at load names the tile and the arithmetic
 reason whenever T16384 or the automatic arithmetic is declined. `STRIX_SERVE_T16K=0` keeps the
 T8192 owner. `STRIX_SERVE_ROUTE=0` restores the earlier server rule (T8192, resolved arithmetic
 unchanged). Explicit context capacity is preserved; request prompts must still fit it.
+
+Measured on one Strix Halo node (same binary, `STRIX_SERVE_ROUTE=0` as the earlier rule, context
+33,280, four slots, explicit-sidecar MTP, interleaved runs): time to first token through the
+resident server 6.74-7.35 s versus 9.72-10.10 s for an 8,192-token prompt and 27.4-29.6 s versus
+39.5-41.2 s for a 32,768-token prompt. The served token IDs equal the single-request command's
+for both prompts; with the earlier rule the 32,768-token prompt did not. On that node the
+T16384 owner is declined (it would cost one of four slots), and the load line says so. Decode
+cost per MTP cycle is unchanged; short prompts can produce a different greedy continuation than
+the earlier server arithmetic did, because the prompt arithmetic now is the single-request one.
 
 Automatic candidates that would create an extra `STRIX_PROMPT_BATCH_ROWS` owner decline
 with an actionable notice before allocation in both startup and inspection. Unset that

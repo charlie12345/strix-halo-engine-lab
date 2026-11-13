@@ -19,7 +19,7 @@ namespace strix::core {
 // are untouched; consumers must take the stride from here (pointer + stride), never recompute it from the width.
 struct RowLayoutPolicy {
     std::uint64_t alias_bytes = 4096;     // period of the aliasing resource (page / cache way size)
-    std::uint64_t dealias_bytes = 128;    // step added to an aliasing stride; 0 keeps the tight stride
+    std::uint64_t dealias_bytes = 256;    // step added to an aliasing stride (measured: 256 >= 128 > 192 > 64); 0 = tight
     std::uint32_t min_period = 2;         // rows before a page offset may repeat (2: only exact multiples move)
     std::uint32_t lockstep_rows = 16;     // buffers with fewer rows are never walked in lockstep
 };

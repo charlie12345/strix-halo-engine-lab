@@ -431,10 +431,12 @@ KnownWindowArena build_known_window_arena(
 }
 KnownWindowArena build_known_prefill_arena(
     const ExecutionArenaPlan& serial,std::uint64_t alignment,std::uint32_t logical_rows,
-    std::uint64_t external_qsa_score_bytes, bool terminal_logits, bool materialize_views, std::uint64_t compact_qsa_output_savings) {
+    std::uint64_t external_qsa_score_bytes, bool terminal_logits, bool materialize_views, std::uint64_t compact_qsa_output_savings,
+    const core::RowLayoutPolicy* row_layout) {
     if(logical_rows<16U||logical_rows>known_prefill_max_rows)
         throw std::invalid_argument("known prefill rows must be within "+known_prefill_rows_range());
-    return build_known_rows_arena(serial,alignment,logical_rows,external_qsa_score_bytes,terminal_logits,materialize_views,compact_qsa_output_savings);
+    return build_known_rows_arena(serial,alignment,logical_rows,external_qsa_score_bytes,terminal_logits,materialize_views,compact_qsa_output_savings,
+        row_layout ? *row_layout : core::row_layout_policy());
 }
 
 namespace {

@@ -150,6 +150,7 @@ struct State16 {
     std::uint32_t raw;
     __host__ __device__ __forceinline__ constexpr operator std::uint32_t() const { return raw & 65535U; }
 };
+static_assert(Mul1::kPairIgnoresHighBits, "mul1_pair(State16, State16) passes the states unmasked");
 __forceinline__ __host__ __device__ Half2 mul1_pair(State16 first, State16 second) { return mul1_pair(first.raw, second.raw); }
 
 // The library's three codebooks by id (0, 1: two-half sum codebooks; 2: mul1).

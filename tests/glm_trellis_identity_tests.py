@@ -58,6 +58,13 @@ EXPECTED = {'Half2': ('using Half2 =', 'b6555aa71356cdb36d3994f7842cbe84710742e3
  'vector_splits': ('__host__ __device__ constexpr unsigned vector_splits(',
                    'b1df182d0fd0a443356251c8705c9b4e99a00906a4a2c631aa6017286848dcb2')}
 
+# Codec dependencies of the pinned declarations that the adapter does not import by name: TileStates::state<J>()
+# returns State16, whose integer conversion is the 16-bit mask, and the pair overload passes the states unmasked.
+DEPENDENCIES = {
+ 'State16': ('struct State16', 'e858841c39378d3d13aebc682092e116bc4806706e4abd7a3c6db25ff64393f9'),
+ 'mul1_pair(State16)': ('Half2 mul1_pair(State16 first, State16 second)',
+                        'd6a3ac5a1cffb1b9d23aa45d974c35644f8fbbe4e4f8068541ac0076f22fd93c')}
+
 
 def declaration(source, marker):
     start = source.index(marker)
@@ -95,6 +102,9 @@ def main():
     for name, (marker, expected) in EXPECTED.items():
         actual = sha256(declaration(shared, marker).encode()).hexdigest()
         assert actual == expected, name + " original GLM declaration changed"
+    for name, (marker, expected) in DEPENDENCIES.items():
+        actual = sha256(declaration(shared, marker).encode()).hexdigest()
+        assert actual == expected, name + " codec dependency changed"
     # Permit only imports in the adapter (the split policy is the shared one too).
     remainder = re.sub(r"//[^\n]*", "", adapter)
     remainder = re.sub(r"^using strix::moe_core::\w+;$", "", remainder, flags=re.MULTILINE)
@@ -103,6 +113,7 @@ def main():
     remainder = remainder.replace("namespace strix::glm::moe::dev {", "").replace("}", "")
     assert not remainder.strip(), "adapter must not acquire primitive bodies"
     print("PASS: %d imported primitive declarations match their pinned fingerprints" % len(EXPECTED))
+    print("PASS: %d codec dependency declarations match their pinned fingerprints" % len(DEPENDENCIES))
     print("PASS: thin-adapter contract (imports only)")
 
 

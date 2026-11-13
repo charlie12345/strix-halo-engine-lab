@@ -9,7 +9,7 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0x75782745e431b365ULL},
+{"CMakeLists.txt", 0x17ba1fe9d91177d7ULL},
 {"apps/minimax_rank_main.cpp", 0x38254f78be4c8facULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
 {"cmake/StrixSession.cmake", 0x013e65a3501ef1d9ULL},
@@ -177,7 +177,7 @@
 {"src/moe_core/hip_moe_prefill_p1.inc", 0xe6122cffd2794fd3ULL},
 {"src/moe_core/hip_moe_prefill_p1da16.inc", 0x6b21196c563e6de5ULL},
 {"src/moe_core/int4_layer_policy.hpp", 0xb335f83c65b5040fULL},
-{"src/moe_core/one_split_prefill.hpp", 0xf42e03f4eaf754fdULL},
+{"src/moe_core/one_split_prefill.hpp", 0x9ad2132a98ed27d2ULL},
 {"src/moe_core/qwen_grouped_tiles.inc", 0xd52ef972b05d251dULL},
 {"src/moe_core/qwen_k_scalar_decode.inc", 0xdbccbbb61a21d2f6ULL},
 {"src/moe_core/qwen_k_weight_decode.inc", 0xb3796f17d32c5ef1ULL},

@@ -2,7 +2,8 @@
 
 `src/core/trellis_format.hpp` and `src/core/trellis_codec.hpp` are the one implementation of the EXL3 trellis
 weight format in the engine. GLM, MiniMax, Gemma and the shared tiled core read packed trellis weights through
-it; no family keeps a private reader or codebook.
+it. One private reader remains: the Gemma exact many-row route keeps its `Column` reader (own ring addressing) in
+`src/gemma4/exl3/device.hip`.
 
 ## Format
 
@@ -55,8 +56,9 @@ Layout policy stays with the engine: where the tile row of an input tile starts 
 - `strix-trellis-codec-tests` (CPU): random tensors for Bits 1..8, single tiles and odd tile counts, decoded
   through the host reference, the codebook forms, the reader tables and frozen transcriptions of the decoders the
   codec replaced; all images are bit-identical and equal to hashes recorded from the replaced implementations.
-- `strix-hip-trellis-codec-tests` (device): every reader and codebook combination against the host reference,
-  all 65,536 states per codebook form; `STRIX_TRELLIS_CODEC_BENCH=<repeats>` times each decoder.
+- `strix-hip-trellis-codec-tests` (device): the whole-tile readers and the mul1 codebook forms against the host
+  reference, all 65,536 states per codebook form (the half-tile reader variants and codebooks 0 / 1 are guarded on
+  the CPU by frozen transcriptions and recorded image hashes, not executed on the device); `STRIX_TRELLIS_CODEC_BENCH=<repeats>` times each decoder.
 - `strix-gemma4-exl3-panels-tests`: the packed matrix route against the panel route.
 
 ## Measured

@@ -48,6 +48,7 @@
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
 #include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
+#include "strix/env_flags.hpp"
 #include "glm_rank_startup.hpp"
 #include "glm_rank_transport.hpp"
 
@@ -754,6 +755,7 @@ int main(int argc, char** argv) {
         std::string transport_spec, host = "127.0.0.1", model_id = "glm-5.3-flash", api_key_file;
         unsigned port = 8080, selftest = 0, selftest_tokens = 128, heartbeat_ms = 1000, mtp_cycles = 1, prefill_chunk = 512;
         std::uint64_t prefix_cache_bytes = 4ULL << 30;  // default 4 GiB per rank; --prefix-cache-gib 0 = off
+        bool prefix_cache_pinned = false;                // named by the operator: a deployment plan must hold it
         bool selftest_prefix = false;
         unsigned selftest_long = 2048, selftest_prefix_long = 0;
         bool prefill_chunk_mtp = true, selftest_skip_basic = false;
@@ -802,6 +804,7 @@ int main(int argc, char** argv) {
             else if (a == "--prefill-chunk-mtp") prefill_chunk_mtp = std::stoul(next()) != 0;
             else if (a == "--prefix-cache-gib") {
                 prefix_cache_bytes = gs::prefix_budget_bytes(next());
+                prefix_cache_pinned = true;
             }
             else if (a == "--selftest-prefix") selftest_prefix = true;
             else if (a == "--selftest-prefix-long") selftest_prefix_long = static_cast<unsigned>(std::stoul(next()));
@@ -871,8 +874,9 @@ int main(int argc, char** argv) {
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = mtp_on; opt.spec = mtp_on;
             std::string refusal;
-            if (prefix_cache_bytes || !import_listen.empty() || !rtx_prefill.empty())
-                refusal = "GLM deployment: prefix cache/import peak owners not sized; disable those routes";
+            if (!import_listen.empty() || !rtx_prefill.empty())
+                refusal = "GLM deployment: import peak owners not sized; disable those routes";
+            deployment.prefix_keep = prefix_cache_bytes; deployment.prefix_keep_pinned = prefix_cache_pinned;
             deployment.prepare(opt, eff, transport_spec, refusal);
             if (deployment.check || print_config) return deployment.inspect(opt.rank);
         }
@@ -917,7 +921,10 @@ int main(int argc, char** argv) {
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
-            if (deployment.provider) deployment.resolve_live(opt, *transport);
+            if (deployment.provider) {
+                deployment.resolve_live(opt, *transport);
+                prefix_cache_bytes = deployment.prefix_keep;  // the plan grant (elastic: may be smaller, or 0 = off)
+            }
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
             comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), std::move(opened.direct), opt.exchange_rows);
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(),
@@ -1093,6 +1100,8 @@ int main(int argc, char** argv) {
         lc.batch = !serial;
         lc.short_first = short_first;
         lc.prefix_cache_bytes = prefix_cache_bytes;
+        // Reply-end snapshots (opt-in, exactly "1"; plain decode only: refused under MTP). Rank 1 follows the lead.
+        lc.prefix_reply_store = strix::envcfg::flag("STRIX_GLM_SERVE_REPLY_KEEP", false, strix::EnvFlagMatch::exact);
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
         lc.prefill_chunk_mtp = prefill_chunk_mtp;

@@ -600,11 +600,12 @@ int main() {
     {
         auto entry = [](std::uint64_t id, std::vector<std::uint32_t> ids, bool mtp = false, std::uint64_t identity = 7) {
             gs::PrefixCache::Entry e;
-            e.id = id; e.ids = std::move(ids); e.hash = gs::prefix_hash(e.ids);
+            e.id = id; e.ids = std::move(ids);
             e.mtp = mtp; e.identity = identity; e.frontier = e.ids.size() - (mtp ? 1U : 0U);
             e.state.assign(16, 42);
             return e;
         };
+        const auto one = [](std::size_t key) { return strix::serve::ConversationKeep::charged_bytes(16, key); };
         gs::PrefixCache c(4096);
         CHECK(c.prepare(entry(1, {1, 2}))); c.commit(true);
         CHECK(c.prepare(entry(2, {1, 2, 3}))); c.commit(true);
@@ -615,23 +616,31 @@ int main() {
         CHECK(!c.find(p, true, 7) && !c.find(p, false, 8));
         CHECK(c.prepare(entry(3, {1, 2, 3}, true))); c.commit(true);
         CHECK(c.find(p, true, 7)->frontier == 2);  // A + y0 key; restore at |A|
-        auto collision = entry(4, {9, 9, 9});
-        collision.hash = gs::prefix_hash(std::span(p).first(3));
-        CHECK(c.prepare(std::move(collision))); c.commit(true);
-        CHECK(c.find(p, false, 7)->id == 2);  // matching hash alone is insufficient
-        const auto e = entry(5, {2, 3});
-        gs::PrefixCache lru(e.bytes() * 2);
+        CHECK(c.state(3) && c.state(3)->size() == 16 && !c.state(99));
+        // a weak hash makes every key collide: only the full token compare decides
+        gs::PrefixCache weak(4096, [](std::uint64_t, std::span<const std::uint32_t>) -> std::uint64_t { return 5; });
+        CHECK(weak.prepare(entry(1, {9, 9, 9}))); weak.commit(true);
+        CHECK(weak.prepare(entry(2, {1, 2, 3}))); weak.commit(true);
+        CHECK(weak.find(p, false, 7)->id == 2 && !weak.find(std::vector<std::uint32_t>{9, 9, 8, 1}, false, 7));
+        gs::PrefixCache lru(one(2) * 2);
         CHECK(lru.prepare(entry(1, {1, 2}))); lru.commit(true);
         CHECK(lru.prepare(entry(2, {2, 3}))); lru.commit(true);
         lru.touch(1);
-        CHECK(lru.prepare(entry(3, {3, 4}))); lru.commit(true);
-        CHECK(lru.get(1) && !lru.get(2) && lru.get(3) && lru.evictions == 1);
+        // the lead orders the evictions (LRU: 2); the follower replays them before the paired commit
+        CHECK(lru.prepare(entry(3, {3, 4})));
+        std::vector<std::uint64_t> victims;
+        CHECK(lru.victims(victims) && victims == std::vector<std::uint64_t>{2} && !lru.pending_fits());
+        for (const auto v : victims) CHECK(lru.erase(v));
+        lru.commit(true);
+        CHECK(lru.get(1) && !lru.get(2) && !lru.state(2) && lru.get(3) && lru.stats().evictions == 1);
         auto huge = entry(4, {4, 5}); huge.state.resize(4096);
-        CHECK(!lru.prepare(std::move(huge)) && lru.bytes() == e.bytes() * 2);
+        CHECK(!lru.prepare(std::move(huge)) && lru.bytes() == one(2) * 2);
         CHECK(lru.prepare(entry(5, {5, 6}))); lru.commit(false);
         CHECK(!lru.get(5) && lru.get(1));
-        CHECK(lru.prepare(entry(6, {1, 2}))); lru.commit(true);
-        CHECK(!lru.get(1) && lru.get(6) && lru.get(3) && lru.bytes() == e.bytes() * 2);
+        CHECK(lru.prepare(entry(6, {1, 2})));
+        CHECK(lru.replacement_id() == 1 && lru.victims(victims) && victims == std::vector<std::uint64_t>{1});
+        CHECK(lru.erase(1)); lru.commit(true);
+        CHECK(!lru.get(1) && lru.get(6) && lru.get(3) && lru.bytes() == one(2) * 2);
         CHECK(gs::prefix_budget_bytes("0") == 0 && gs::prefix_budget_bytes("0.5") == (1ULL << 29));
         for (const auto* v : {"-1", "nan", "inf", "1x", "17179869184", "1e-20"})
             CHECK(throws_with([&] { (void)gs::prefix_budget_bytes(v); }, "--prefix-cache-gib"));
@@ -663,7 +672,7 @@ int main() {
         FakeEng e0(1), e1(1);
         gs::PrefixCache k0(4096), k1(4096);
         gs::PrefixCache::Entry e;
-        e.id = 1; e.identity = 7; e.frontier = 2; e.ids = {11, 22}; e.hash = gs::prefix_hash(e.ids);
+        e.id = 1; e.identity = 7; e.frontier = 2; e.ids = {11, 22};
         e0.reset(0); (void)e0.prefill(0, e.ids, 0);
         e.state = e0.state_bytes_upto(0, 2);
         CHECK(k0.prepare(e)); k0.commit(true);

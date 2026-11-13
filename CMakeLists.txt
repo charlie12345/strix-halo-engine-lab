@@ -1757,6 +1757,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-execution-arena-tests)
     add_test(NAME strix-execution-arena-tests COMMAND strix-execution-arena-tests)
 
+    add_executable(strix-row-layout-tests tests/row_layout_tests.cpp)
+    target_link_libraries(strix-row-layout-tests PRIVATE strix_core)
+    strix_target_warnings(strix-row-layout-tests)
+    add_test(NAME strix-row-layout-tests COMMAND strix-row-layout-tests)
+
     add_executable(strix-qsa-score-scratch-tests tests/qsa_score_scratch_tests.cpp)
     target_link_libraries(strix-qsa-score-scratch-tests PRIVATE strix_core)
     strix_target_warnings(strix-qsa-score-scratch-tests)

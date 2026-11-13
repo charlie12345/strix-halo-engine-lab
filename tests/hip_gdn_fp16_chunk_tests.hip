@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "row_fixture_stride.hpp"
+
 // Production definitions the route uses (copied from hip_gdn_launcher.hip).
 enum class GdnRecurrentStorage : std::uint32_t { key_value = 0, value_key = 1 };
 struct GdnPrefillRows { float* qkv; float* z; float* beta; float* gate; float* core; std::uint64_t stride; };
@@ -113,6 +115,9 @@ Layout layout_of(std::uint32_t kh, std::uint32_t vh) {
     g.kh = kh; g.vh = vh; g.kw = std::uint64_t{kh} * kD; g.vw = std::uint64_t{vh} * kD;
     g.conv = 2U * g.kw + g.vw; g.z = g.conv; g.beta = g.z + g.vw; g.gate = g.beta + vh; g.core = (g.gate + vh + 3U) / 4U * 4U;
     g.stride = g.core + g.vw;
+    const auto bytes = fixture_row_stride_bytes(g.stride * 4U);
+    if (bytes % 16U) throw std::invalid_argument("fixture row stride must keep 16-byte rows");
+    g.stride = bytes / 4U;
     return g;
 }
 std::size_t state_index(bool vk, std::uint32_t h, std::uint32_t k, std::uint32_t v) {
@@ -465,6 +470,19 @@ int time_main() {
     });
     std::printf("time T8192 48/16 (median of 20): prep %.3f ms | scan+norm %.3f ms | scan raw %.3f ms | total %.3f ms | "
         "BF16 rows: prep %.3f scan+norm %.3f\n", prep, scan, raw, total, prep16, scan16);
+    // Payload hash (every row's columns up to the tight width, and the state): equal for every stride.
+    const std::uint64_t tight = p.g.core + p.g.vw;
+    std::vector<float> out(p.rows.size()), st(p.state.size());
+    ck(hipMemcpy(out.data(), d.rows, out.size() * 4U, hipMemcpyDeviceToHost), "down rows");
+    ck(hipMemcpy(st.data(), d.state, st.size() * 4U, hipMemcpyDeviceToHost), "down state");
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&](const float* v, std::uint64_t n) {
+        for (std::uint64_t i = 0; i < n; ++i) { h ^= std::bit_cast<std::uint32_t>(v[i]); h *= 1099511628211ULL; }
+    };
+    for (std::uint32_t r = 0; r < p.count; ++r) mix(&out[std::size_t{r} * p.g.stride], tight);
+    mix(st.data(), st.size());
+    std::printf("rows stride_bytes=%llu tight_bytes=%llu hash=%016llx\n", static_cast<unsigned long long>(p.g.stride * 4U),
+        static_cast<unsigned long long>(tight * 4U), static_cast<unsigned long long>(h));
     return 0;
 }
 } // namespace

@@ -87,6 +87,24 @@ report the whole machine; the block does not apportion energy between concurrent
 `STRIX_POWER_SAMPLER=0` turns the sampler, the receipt members and the exit line off. The sampler does not touch
 the device, the model or any arithmetic: token ids and logits are identical with it on or off.
 
+## Measured
+
+Qwen, 8,192-token real-text prompt, one node, default exact route, package energy counter not readable (power
+integral, 10 Hz, 46 samples per prefill):
+
+| run | tok/s | energy | mean / peak power | tok/J | median GPU clock | max temperature |
+|---|---|---|---|---|---|---|
+| prefill, sampler on (1) | 1,755.9 | 576.6 J | 123.6 / 150.0 W | 14.21 | 2,514 MHz | 84 C |
+| prefill, sampler off (1) | 1,752.9 | - | - | - | - | - |
+| prefill, sampler on (2) | 1,744.5 | 580.0 J | 123.5 / 150.7 W | 14.12 | 2,524 MHz | 89 C |
+| prefill, sampler off (2) | 1,733.5 | - | - | - | - | - |
+| prefill of the decode run | 1,747.8 | 587.8 J | 125.4 / 151.7 W | 13.94 | 2,512 MHz | 92 C |
+| decode, 128 tokens, serial greedy | 22.5 | 543.8 J | 95.7 / 150.5 W | 0.235 | 2,873 MHz | 74 C |
+
+The runs alternate on / off in one session. The sampler costs nothing measurable (on 1,750.2 tok/s mean, off
+1,743.2; the spread between repeats of one arm is larger than the difference between arms), and the logits file and
+the generated tokens are byte-identical in all four prefill runs.
+
 ## Adding a device
 
 A new device (a discrete card, an accelerator, another operating system) is one source and one registration; no

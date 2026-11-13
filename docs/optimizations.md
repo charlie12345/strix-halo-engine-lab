@@ -4584,7 +4584,7 @@ clock, the maximum temperature, the sample count and the sources used. See
 - **Automatic selection:** Started by the device gate and by the HTTP server; an engine adds nothing.
 - **Fallback notice:** `"available":false` with the reason per source in the receipt block.
 - **Exactness evidence:** Host-only measurement: no device call, no arithmetic. Qwen 8K prefill, sampler on vs off: logits file and generated tokens byte-identical.
-- **Measured:** Measurement, not a speed lever: makes tok/J comparable across engines and runs.
+- **Measured:** Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.
 - **Off switch:** `STRIX_POWER_SAMPLER=0`.
 
 <a id="qwen-moe-route-bf16"></a>

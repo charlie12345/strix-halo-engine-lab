@@ -2991,7 +2991,7 @@
     "flag_or_env": "STRIX_POWER_SAMPLER",
     "default": "ON when a power source is readable (sampler thread at 100 ms, STRIX_POWER_SAMPLE_MS); every engine CLI and the server report the block strix-power-receipt-v1",
     "exact": "Host-only measurement: no device call, no arithmetic. Qwen 8K prefill, sampler on vs off: logits file and generated tokens byte-identical.",
-    "gain": "Measurement, not a speed lever: makes tok/J comparable across engines and runs.",
+    "gain": "Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.",
     "preconditions": "A readable source: amdgpu hwmon (power, clock, temperature), a readable powercap package energy counter, cpufreq. A missing or unreadable source is reported as unavailable with the reason; the run continues.",
     "off_switch": "STRIX_POWER_SAMPLER=0",
     "doc_anchor": "docs/optimizations.md#platform-power-receipt"

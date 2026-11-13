@@ -220,6 +220,8 @@ inline std::uint64_t compare_ranks(Exchange&& exchange) {
     return out[1];
 }
 
+// Approximate process-window telemetry: independent relaxed loads are not a coherent transaction.
+// Concurrent launches can advance rows, calls and visits at different instants; request windows overlap.
 inline Totals snapshot() {
     Totals t;
     const auto& g = detail::g_table;

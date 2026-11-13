@@ -1721,6 +1721,16 @@ static int run_decode_entry(
         // differently from the same switches), requested vs effective, with the selector's own reason text.
         namespace rr = strix::route;
         rr::set_engine("qwen");
+        // Bind the resolved arithmetic, including governed options and numerical policy values.
+        const auto pair = strix::decode_cli::numerical_profile_pair(options);
+        const auto budget = options.resolved_qsa_prefill_budget.value_or(0U);
+        const auto union_cap = strix::qsa_union_cap_active();
+        rr::lever("qwen.prefill_identity", "resolved",
+                  strix::prefill_identity_name(effective.prefill_option_mask, budget, union_cap) + ":hash=" +
+                  rr::detail::hex(strix::prefill_identity_hash(effective.prefill_option_mask, budget, union_cap)));
+        rr::lever("qwen.numerical_profile_pair", "resolved",
+                  std::to_string(strix::numerical_profile_pair_identity(pair)));
+        rr::lever("qwen.gsq_owner", "resolved", effective.gsq_owner ? "1" : "0");
         const bool automatic = options.automatic_prefill;
         const std::string_view why = effective.reason;
         const auto code = automatic ? rr::Reason::selected :

@@ -4749,7 +4749,7 @@ a pair compare a fingerprint of the numerical levers at start-up and refuse to r
 - **Automatic selection:** Armed by the device gate; the server adds the request window and the status view.
 - **Fallback notice:** A bypass line (product, wanted family, reason, calls, rows) in the block; a fingerprint that differs between the ranks is a start-up error.
 - **Exactness evidence:** Host-only counters: no device call, no arithmetic. Qwen 8K prefill, receipt on vs off: logits file and generated tokens byte-identical in all four runs.
-- **Measured:** Observability, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, receipt on/off interleaved (ABAB): 1,768.7 / 1,772.0 tok/s on vs 1,771.1 / 1,769.2 off (no slowdown).
+- **Measured:** Observability, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, receipt on/off interleaved (ABAB): 1,768.7 / 1,772.0 tok/s on vs 1,771.1 / 1,769.2 off. Qwen has no launch-site hooks, so this workload does not qualify counter overhead on instrumented MiniMax or GLM paths; that native measurement remains open.
 - **Off switch:** `STRIX_ROUTE_RECEIPT=0` (counters and printed block; the rank comparison stays).
 
 <a id="qwen-moe-route-bf16"></a>

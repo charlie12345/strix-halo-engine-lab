@@ -1052,14 +1052,26 @@ struct Engine::Impl {
         rr::set_engine("minimax");
         rr::set_rank(static_cast<int>(opt.rank));
         const char* asked = strix::envcfg::text("STRIX_MMX_MODEL_FORMAT");
+        // Use the same resolved policies as the dispatch sites (including the IU4 override).
+        const bool iu4 = model_fast_i4 && mmoe::prefill_iu4();
+        const auto mask = [](const auto& layers, unsigned first) {
+            std::string value;
+            for (unsigned L = first; L < kLayers; ++L) value += layers.test(L) ? '1' : '0';
+            return value;
+        };
         std::string effective = "exl3";
-        if (model_fast_i4) {
+        if (iu4) {
             effective = std::string("iu4:") + (i4_scope == fast_i4::Scope::all ? "all" : "gate_up") + ":min_rows=" + std::to_string(i4_min_rows) +
-                        ":a8=" + std::to_string(i4_a8) + ":exl3_layers=";
-            for (unsigned L = kFirstMoe; L < kLayers; ++L) effective += i4_exl3_layers.test(L) ? '1' : '0';
+                        ":a8=" + std::to_string(i4_a8) + ":exl3_layers=" + mask(i4_exl3_layers, kFirstMoe);
+            if (i4_a8) effective += ":a8_layers=" + mask(i4_a8_layers, kFirstMoe);
         }
         rr::lever("minimax.moe_prefill_format", asked != nullptr && *asked != 0 ? asked : "default", effective,
-                  model_fast_i4 ? rr::Reason::selected : rr::Reason::disabled);
+                  iu4 ? rr::Reason::selected : rr::Reason::disabled);
+        const unsigned flash = pf_msa_rework != 0 ? pf_msa_flash : 0U;
+        const char* flash_asked = strix::envcfg::text("STRIX_MM_PF_MSA_FLASH");
+        rr::lever("minimax.msa_flash", flash_asked != nullptr ? flash_asked : "default",
+                  std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
+                  flash ? rr::Reason::selected : rr::Reason::disabled);
         rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
         rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
     }

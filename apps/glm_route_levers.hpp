@@ -8,6 +8,8 @@
 
 #include "strix/env_flags.hpp"
 #include "strix/route_receipt.hpp"
+#include "glm/prefill/glm_pf_exact.hpp"
+#include "glm/prefill/glm_pf_wmma.hpp"
 
 namespace strix::glm {
 
@@ -23,12 +25,18 @@ inline std::uint64_t record_route_levers(std::string_view entry, unsigned rank, 
         return std::string(v != nullptr && *v != 0 ? v : "default");
     };
     const std::string wmma = asked("STRIX_GLM_PF_WMMA"), x = asked("STRIX_GLM_PF_EXACT_X"), kda = asked("STRIX_GLM_PF_KDA_WMMA");
+    const bool wmma_on = pf::wmma_x::enabled();
+    // Resolve at both ends of the supported threshold range. Only auto has two routes;
+    // forced routes must never read the unused auto threshold.
+    const auto low = pf::exact::route(0), high = pf::exact::route(65536);
+    const std::string x_effective = low == high ? std::to_string(static_cast<unsigned>(low)) :
+        "auto:min_rows=" + std::to_string(pf::exact::x_auto_rows());
     rr::lever("glm.entry", entry, entry, rr::Reason::selected, false);
     rr::lever("glm.prefill", prefill_requested, prefill_effective);
     rr::lever("glm.identity", identity, identity);
-    rr::lever("glm.pf_wmma", wmma, wmma == "1" ? "f16_wmma" : "exact", wmma == "1" ? rr::Reason::selected : rr::Reason::disabled);
-    rr::lever("glm.pf_kda_wmma", kda, kda);
-    rr::lever("glm.pf_exact_x", x, x + ":min_rows=" + asked("STRIX_GLM_PF_EXACT_X_MIN_ROWS"), rr::Reason::selected, true,
+    rr::lever("glm.pf_wmma", wmma, wmma_on ? "f16_wmma" : "exact", wmma_on ? rr::Reason::selected : rr::Reason::disabled);
+    rr::lever("glm.pf_kda_wmma", kda, pf::kda_wmma::enabled() ? "1" : "0");
+    rr::lever("glm.pf_exact_x", x + ":min_rows=" + asked("STRIX_GLM_PF_EXACT_X_MIN_ROWS"), x_effective, rr::Reason::selected, true,
               "auto takes the X3 route (and the WMMA identity when on) only for calls of at least min_rows rows");
     rr::lever("glm.max_rows", std::to_string(max_rows), std::to_string(max_rows), rr::Reason::selected, false);
     return rr::fingerprint();

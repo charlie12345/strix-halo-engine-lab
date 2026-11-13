@@ -10,6 +10,7 @@
 #include "strix/dist/communicator.hpp"
 #include "xport/ds41_adapter.hpp"
 #include "hip_deepseek41_prefill_xport.hpp"
+#include "core/hip_range_weight_loader.hpp"
 #include "core/hip_host_ready.hpp"
 #include "core/layer_read_ahead.hpp"
 #include <optional>
@@ -180,65 +181,13 @@ private:
     const std::uint8_t* base_ = nullptr;
 };
 
-// Byte ranges of the model file into device memory through two pinned staging buffers, with O_DIRECT (the weights
-// never enter the page cache). The copy of one buffer runs on the loader's own stream while the other is read; a
-// buffer is read into again only after its copy's event, and load() returns after the last copy completed.
-class DirectLoader {
-public:
-    static constexpr std::uint64_t align = 4096, chunk = 128ULL << 20U;
-    explicit DirectLoader(const std::filesystem::path& path) {
-        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd_ < 0) throw std::runtime_error("deepseek41 prefill: cannot open " + path.string());
-        strix::LoaderCapture::record(path, fd_);
-        check(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "loader stream");
-        for (int k = 0; k < 2; ++k) {
-            check(hipHostMalloc(reinterpret_cast<void**>(&buffer_[k]), chunk + 2U * align, hipHostMallocDefault), "staging buffer");
-            check(hipEventCreateWithFlags(&copied_[k], hipEventDisableTiming), "staging event");
-        }
+// Byte ranges of the model file into device memory through the shared weight-load queue (core/weight_load_queue.hpp):
+// O_DIRECT reads on bounded workers, per-ticket pinned staging retired by upload events, an own non-blocking copy
+// stream. load() only queues; ready() is the one wait, at the end of the load or before the first consumer.
+struct DirectLoader : strix::core::HipRangeWeightLoader {
+    explicit DirectLoader(const std::filesystem::path& path) : HipRangeWeightLoader(path.string()) {
+        strix::LoaderCapture::record(path, fd());
     }
-    ~DirectLoader() {
-        if (stream_ != nullptr) (void)hipStreamSynchronize(stream_);
-        for (int k = 0; k < 2; ++k) {
-            if (copied_[k] != nullptr) (void)hipEventDestroy(copied_[k]);
-            if (buffer_[k] != nullptr) (void)hipHostFree(buffer_[k]);
-        }
-        if (stream_ != nullptr) (void)hipStreamDestroy(stream_);
-        if (fd_ >= 0) ::close(fd_);
-    }
-    DirectLoader(const DirectLoader&) = delete;
-    DirectLoader& operator=(const DirectLoader&) = delete;
-    void load(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* device) {
-        std::uint64_t done = 0;
-        while (done < bytes) {
-            const std::uint64_t at = offset + done, base = at & ~(align - 1U), lead = at - base;
-            const std::uint64_t take = std::min(bytes - done, chunk - lead);
-            const std::uint64_t want = (lead + take + align - 1U) & ~(align - 1U);
-            std::uint8_t* buffer = buffer_[next_];
-            if (pending_[next_]) check(hipEventSynchronize(copied_[next_]), "staging reuse");  // its previous copy is done
-            std::uint64_t got = 0;
-            while (got < lead + take) {
-                const auto n = ::pread(fd_, buffer + got, want - got, static_cast<off_t>(base + got));
-                if (n <= 0) throw std::runtime_error("deepseek41 prefill: short read of the weights");
-                got += static_cast<std::uint64_t>(n);
-            }
-            check(hipMemcpyAsync(device + done, buffer + lead, take, hipMemcpyHostToDevice, stream_), "weight upload");
-            check(hipEventRecord(copied_[next_], stream_), "staging event");
-            pending_[next_] = true;
-            next_ ^= 1;
-            done += take;
-        }
-        check(hipStreamSynchronize(stream_), "weight upload");
-        pending_[0] = pending_[1] = false;
-    }
-
-private:
-    int fd_ = -1;
-    hipStream_t stream_ = nullptr;
-    std::uint8_t* buffer_[2] = {nullptr, nullptr};
-    hipEvent_t copied_[2] = {nullptr, nullptr};
-    bool pending_[2] = {false, false};
-    int next_ = 0;
 };
 
 std::uint64_t row_bytes(ds41::WeightFormat f, std::uint32_t width) {
@@ -834,6 +783,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
         DirectLoader loader(gguf);
         std::unique_ptr<DirectLoader> overlay_loader;
         if (m.overlay) overlay_loader = std::make_unique<DirectLoader>(m.overlay->path());
+        const std::function<void()> loaded = [&] { loader.ready(); if (overlay_loader) overlay_loader->ready(); };
         for (const auto& n : names) {
             const auto* t = m.tensors.at(n);
             const auto* over = m.overlay ? m.overlay->find(n) : nullptr;
@@ -850,7 +800,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
                 Dev<std::uint8_t> d(part);
                 auto& from = over != nullptr ? *overlay_loader : loader;
                 ds41::expert_tp::load_part([&from](std::uint64_t at, std::uint64_t count, std::uint8_t* dst) { from.load(at, count, dst); },
-                                           offset, bytes, c.n_routed_experts, down, c.hidden_size, options.rank, d.p, m.stream);
+                                           offset, bytes, c.n_routed_experts, down, c.hidden_size, options.rank, d.p, m.stream, loaded);
                 m.weights.emplace(n, std::move(d));
                 continue;
             }
@@ -880,6 +830,19 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
             (over != nullptr ? *overlay_loader : loader).load(offset, bytes, d.p);
             m.weights.emplace(n, std::move(d));
         }
+        loaded();  // end-of-load publication: the one wait for every tensor queued above
+        const auto ls = loader.stats();
+        std::fprintf(stderr, "deepseek41 prefill %s\n",
+                     strix::core::weight_load_line(ls, loader.peak_pinned_bytes(), loader.options()).c_str());
+    }
+    if (const char* out = strix::envcfg::text("STRIX_LOAD_HASH_OUT")) {  // identity gate: one line per loaded tensor
+        std::FILE* f = std::fopen(out, "w");
+        if (f == nullptr) throw std::runtime_error("STRIX_LOAD_HASH_OUT: cannot write the hash file");
+        for (const auto& [name, d] : m.weights)
+            if (d.owned)
+                std::fprintf(f, "%s %llu %016llx\n", name.c_str(), static_cast<unsigned long long>(d.n),
+                             static_cast<unsigned long long>(strix::core::device_weight_hash64(d.p, d.n)));
+        std::fclose(f);
     }
     {
         std::vector<ds41::EngramTable> tables;
@@ -1479,6 +1442,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             const auto& [offset, bytes] = m.expert_extent.at("blk." + std::to_string(layer) + "." + expert_kind_tensor(kind));
             loader.load(offset, bytes, d.p);
         }
+        loader.ready();
         slot.layer = static_cast<std::int32_t>(layer);
         m.expert_read_seconds += seconds_since(t0);
     };

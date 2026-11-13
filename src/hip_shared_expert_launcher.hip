@@ -1858,9 +1858,10 @@ std::uint64_t known_shared_stride(const ExecutionBufferAddress& first,
                                   const ExecutionBufferAddress& second) {
     if (first.bytes != second.bytes || first.bytes > UINT64_MAX - 255U || second.address <= first.address)
         throw std::invalid_argument("known-window shared R2 row extent/order differs");
+    // The stride is the arena's (row views): tight, or the shared row layout policy's stride for this payload.
     const auto expected = (first.bytes + 255U) / 256U * 256U;
     const auto stride = static_cast<std::uint64_t>(second.address - first.address);
-    if (stride != expected)
+    if (stride != expected && stride != core::physical_row_stride(expected, UINT32_MAX))
         throw std::invalid_argument("known-window shared R2 row stride differs from serial allocation");
     return stride;
 }

@@ -1348,8 +1348,15 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                 return it==result.environment.end() || it->second.empty() || it->second[0]!='0';
             };
             // Opt-in (STRIX_PLE_SERVE_RESERVE=1): on a full node it trades T8192 and slots for a resident table.
+            bool table_reserved=false;
             const auto reserve=result.environment.find("STRIX_PLE_SERVE_RESERVE");
             if(enabled("STRIX_PLE_WARM") && reserve!=result.environment.end() && !reserve->second.empty() && reserve->second[0]=='1')
+                if(const auto table=required.organization.find("target_file_backed_unregistered_bytes");table!=required.organization.end())
+                    { total=add(total,table->second); table_reserved=true; }
+            // The automatic T16384 owner must leave the file-backed table resident beside every requested slot:
+            // without this bound one node at context 33,280 built 3 of 4 slots and re-read part of the table.
+            // STRIX_QPF2K_T16K=1 asks for the owner explicitly and keeps the plain bound.
+            if(rows==16384U && !table_reserved && !env_is(requested,"STRIX_QPF2K_T16K","1"))
                 if(const auto table=required.organization.find("target_file_backed_unregistered_bytes");table!=required.organization.end())
                     total=add(total,table->second);
             const auto fit = [](const char* resource, std::uint64_t need, std::uint64_t limit) {

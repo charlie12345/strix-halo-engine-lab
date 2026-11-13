@@ -35,7 +35,7 @@ bool qpf2k_hc_check() {
 // output forms keep the image (not measured there).
 unsigned qpf2k_hc_recompute_norm_mode() {
     static const unsigned mode = [] {
-        const char* v = std::getenv("STRIX_QPF2K_HC_RECOMPUTE_NORM");
+        const char* v = strix::envcfg::text("STRIX_QPF2K_HC_RECOMPUTE_NORM");
         return !v || !v[0] ? 2U : v[0] != '0' ? 1U : 0U;
     }();
     return mode;
@@ -595,8 +595,7 @@ __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows 
 // LDS: weights 2 x 320 x 40 halves (51.2 KB), rows 2 x R x 40 halves, R x 4 inverses.
 unsigned qpf2k_hc_proj_tile() {
     static const unsigned rows = [] {
-        const char* v = std::getenv("STRIX_QPF2K_HC_PROJ_TILE");
-        const unsigned n = v ? static_cast<unsigned>(std::strtoul(v, nullptr, 0)) : 64U;
+        const unsigned n = static_cast<unsigned>(strix::envcfg::integer("STRIX_QPF2K_HC_PROJ_TILE", 64));
         return n == 16U || n == 32U || n == 64U ? n : 0U;
     }();
     return rows;

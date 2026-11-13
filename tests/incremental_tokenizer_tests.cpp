@@ -332,6 +332,7 @@ double process_cpu_seconds() {
 // one critical job per step, as a decode step does; its step time shows what the tokenizers cost a decode.
 // Every arm checks the stream ids against the one-shot encoding. Not a test.
 int bench_concurrent(const std::string& path, std::size_t words, int rounds) {
+    if (rounds <= 0) throw std::invalid_argument("--bench-concurrent: ROUNDS must be positive");
     using Clock = std::chrono::steady_clock;
     const auto ms = [](Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
     const bool gguf = path.size() > 5U && path.compare(path.size() - 5U, 5U, ".gguf") == 0;
@@ -441,6 +442,16 @@ int bench_concurrent(const std::string& path, std::size_t words, int rounds) {
     std::cout << "ids " << (identical ? "identical" : "DIFFER") << " to the one-shot encoding in every arm\n";
     return identical ? 0 : 1;
 }
+void benchmark_rejects_nonpositive_rounds() {
+    for (const int rounds : {0, -1}) {
+        bool rejected = false;
+        try { (void)bench_concurrent("missing-tokenizer", 100, rounds); }
+        catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()) == "--bench-concurrent: ROUNDS must be positive";
+        }
+        require(rejected, "nonpositive rounds must be rejected before loading assets");
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -450,6 +461,7 @@ int main(int argc, char** argv) {
                                     argc >= 5 ? std::stoi(argv[4]) : 3);
         if (argc >= 3 && std::string(argv[1]) == "--bench")
             return bench(argv[2], argc >= 4 ? static_cast<std::size_t>(std::stoull(argv[3])) : 100000U);
+        benchmark_rejects_nonpositive_rounds();
         equivalence();
         interfaces_and_stream();
     } catch (const std::exception& error) {

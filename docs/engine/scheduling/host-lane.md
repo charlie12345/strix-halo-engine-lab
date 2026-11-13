@@ -11,7 +11,7 @@ Sources: `src/core/host_lane.hpp`, `src/core/byte_budget.hpp`. Test: `strix-host
 | --- | --- | --- |
 | `critical` | short, latency-bound, on the decode path: row folds, constraint masks | at most two; each keeps polling for a short window (200 µs by default) after a job, so back-to-back jobs do not pay a wake-up |
 | `background` | byte-heavy: snapshot packing, checkpoint CRC, cache hashing | sleeping threads (two by default); every job draws the bytes it reads from the byte budget |
-| `latency` | request preparation that is independent between requests: prompt tokenisation | two to four sleeping workers; at most two jobs at once while a session decodes |
+| `latency` | request preparation that is independent between requests: prompt tokenisation | two to four sleeping workers; admission width two during decode, after running jobs drain |
 
 `submit(priority, job)` returns a `std::future` of the job's result; an exception thrown by the job
 travels through that future. Jobs still queued when the lane is destroyed are completed first.
@@ -29,16 +29,21 @@ queued behind them.
 - Workers: a quarter of the hardware threads, between two and four (`latency_threads`). Jobs start in arrival
   order, so independent requests run on different cores at the same time. The workers sleep when idle and
   use the same cores as the background threads when cores are declared.
-- Order inside one request: a job queues its successor as its last action (a chain). Two jobs of one chain
-  are never queued together, so they never run at once, and the chain's slices stay in order. A worker that
-  queues the next job of its chain wakes no other worker: it takes a job itself as soon as it returns.
-- Next to a decode: while the byte budget's decode cap is in force, at most `latency_decode_threads` (two by
-  default) latency jobs run at once. Latency jobs do not draw bytes from the budget (a prompt is kilobytes);
-  the budget's decode state bounds how many of them add memory traffic.
+- Order inside one request: finish all encoder accesses and publication before queuing the successor
+  (a chain). Queue synchronization orders that work. The successor can start on another active worker
+  before its predecessor returns, so cleanup must not access the shared encoder state.
+- Next to a decode: the byte budget's decode cap sets an admission width of `latency_decode_threads`
+  (two by default). Already-running jobs are not preempted; the narrower width applies as they drain.
+  Latency jobs do not draw bytes from the budget. Workers held by the width recheck every 10 ms, including
+  after the decode linger expires; workers with an empty queue sleep without polling.
 - `latency_threads = 0` puts latency jobs back on the critical class (the previous arrangement).
 
 The BPE piece cache that every encoder shares is read without a lock (insert-only table, immutable
 entries), so prompts on different workers do not serialise on it.
+The 200,000-entry threshold is per table, with possible overshoot from concurrent insertions. Each table
+allocates 524,288 atomic pointer slots (4 MiB with 8-byte atomic pointers), plus entries and ID vectors.
+Segments retain retired tables while reading them; a full-table miss refreshes the segment's handle and
+inserts its computed result into the current table. Total live cache memory is not bounded to one table.
 
 `strix-incremental-tokenizer-tests --bench-concurrent TOKENIZER [WORDS] [ROUNDS]` starts 1, 4, 8 and 16
 prompt streams at once for several worker counts, with and without a decode proxy, and prints wall time,
@@ -89,7 +94,7 @@ The process-wide lane (`shared_host_lane()`) is on by default and reads:
 | `STRIX_HOST_LANE_CORES=2-15` | cores the lane may pin | no pinning |
 | `STRIX_HOST_LANE_BACKGROUND=N` | background threads | 2 |
 | `STRIX_HOST_LANE_LATENCY=N` | latency workers, 0 to 8; `0` runs latency jobs on the critical thread (previous behaviour) | a quarter of the hardware threads, 2 to 4 |
-| `STRIX_HOST_LANE_LATENCY_DECODE=N` | latency jobs that may run at once while a session decodes, 1 to 8 | 2 |
+| `STRIX_HOST_LANE_LATENCY_DECODE=N` | admission width during decode, 1 to 8; running jobs drain | 2 |
 | `STRIX_HOST_BYTE_CAP_GBPS=10` | background ceiling while a session decodes; `0` removes the cap | 10 |
 
 ## Receipt fields

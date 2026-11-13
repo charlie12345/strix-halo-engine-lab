@@ -210,8 +210,8 @@ void latency_class_runs_independent_jobs_in_parallel() {
         for (auto& f : met) require(f.get(), "independent latency jobs did not overlap");
         require(lane.stats().latency_peak_running == 3, "latency peak");
 
-        // Chains: each job queues its successor as its last action. Order holds inside a chain and two jobs of
-        // one chain never overlap, while different chains interleave.
+        // Chains: finish protected work before queuing the successor. That work stays ordered;
+        // return/cleanup may overlap the successor, while different chains interleave.
         constexpr int chains = 8, links = 200;
         struct Chain {
             std::vector<int> seen;
@@ -385,6 +385,35 @@ int load(double seconds, unsigned threads, double cap_gbps, std::size_t buffer_m
 }
 } // namespace
 
+// No submission or job completion may be needed to wake the workers after linger expires.
+void latency_resumes_after_decode_linger() {
+    HostLaneConfig config;
+    config.latency_threads = 4;
+    config.latency_decode_threads = 1;
+    std::promise<void> started, release;
+    auto released = release.get_future().share();
+    HostLane lane(config);
+    lane.budget().decode_begin();
+    auto long_job = lane.submit(HostPriority::latency, [&] {
+        started.set_value();
+        (void)released.wait_for(std::chrono::seconds(5));
+    });
+    started.get_future().wait();
+    std::vector<std::future<void>> short_jobs;
+    for (int i = 0; i < 3; ++i) short_jobs.push_back(lane.submit(HostPriority::latency, [] {}));
+    const bool held = short_jobs.front().wait_for(milliseconds(100)) == std::future_status::timeout;
+    lane.budget().decode_end();
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    bool resumed = true;
+    for (auto& job : short_jobs) resumed &= job.wait_until(deadline) == std::future_status::ready;
+    const bool still_blocked = long_job.wait_for(milliseconds(0)) == std::future_status::timeout;
+    release.set_value(); // also let a failing implementation shut down without hanging
+    long_job.get();
+    for (auto& job : short_jobs) job.get();
+    require(held, "latency jobs escaped the active decode cap");
+    require(resumed && still_blocked, "queued latency jobs did not resume after decode linger");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc >= 5 && std::string(argv[1]) == "--load")
@@ -397,6 +426,7 @@ int main(int argc, char** argv) {
         core_lists();
         lane_runs_jobs_and_reports();
         latency_class_runs_independent_jobs_in_parallel();
+        latency_resumes_after_decode_linger();
         lane_disabled_runs_inline();
         lane_pins_to_declared_cores();
     } catch (const std::exception& error) {

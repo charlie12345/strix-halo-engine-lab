@@ -356,14 +356,15 @@ struct BpeTokenizer::Impl {
     // Piece cache: memoises bpe(), which is a pure function of the piece. Encoders on different threads read
     // it at the same time, so a hit takes no lock and writes no shared memory: the table is insert-only with
     // immutable entries published by compare-and-swap. When it reaches its entry limit a new table replaces
-    // it; an encoder keeps the table it started a text segment with alive until that segment is done.
+    // it; readers retain ownership, and a segment refreshes its handle on a full-table miss.
+    // The limit is per table (concurrent inserts may overshoot); retired tables live until readers leave.
     struct PieceTable {
         struct Entry {
             std::size_t hash;
             std::string piece;
             std::vector<std::uint32_t> ids;
         };
-        static constexpr std::size_t slots = std::size_t{1} << 19U, limit = 200000U; // at most 38 % full
+        static constexpr std::size_t slots = std::size_t{1} << 19U, limit = 200000U; // about 38 % at the threshold
         std::unique_ptr<std::atomic<Entry*>[]> table{new std::atomic<Entry*>[slots]()};
         std::atomic<std::size_t> size{0};
         PieceTable() = default;
@@ -395,19 +396,22 @@ struct BpeTokenizer::Impl {
             }
         }
     };
-    mutable std::mutex cache_mutex; // guards the pointer only, once per text segment
+    mutable std::mutex cache_mutex; // guards the pointer at segment start and rollover
     mutable std::shared_ptr<PieceTable> cache = std::make_shared<PieceTable>();
 
     std::shared_ptr<PieceTable> piece_table() const {
         const std::lock_guard lock(cache_mutex);
         return cache;
     }
-    void bpe(std::string_view piece, std::vector<std::uint32_t>& out, const std::shared_ptr<PieceTable>& pieces) const {
+    void bpe(std::string_view piece, std::vector<std::uint32_t>& out, std::shared_ptr<PieceTable>& pieces) const {
         const std::size_t hash = std::hash<std::string_view>{}(piece);
         if (const auto* hit = pieces->find(hash, piece)) {
             out.insert(out.end(), hit->ids.begin(), hit->ids.end());
             return;
         }
+#ifdef STRIX_BPE_CACHE_TEST_MISS
+        STRIX_BPE_CACHE_TEST_MISS(pieces); // standalone host regression observer; absent in production
+#endif
         std::vector<std::string> symbols;
         symbols.reserve(piece.size());
         for (const char ch : piece) symbols.push_back(byte_unicode[static_cast<unsigned char>(ch)]);
@@ -447,15 +451,16 @@ struct BpeTokenizer::Impl {
             if (id != ids.end()) { result.push_back(id->second); continue; }
             throw std::runtime_error("tokenizer: BPE symbol is not in the vocabulary");
         }
-        if (!pieces->insert(hash, piece, result)) {
+        while (!pieces->insert(hash, piece, result)) {
             const std::lock_guard lock(cache_mutex);
-            if (cache == pieces) cache = std::make_shared<PieceTable>(); // full: start again, as the bound requires
+            if (cache == pieces) cache = std::make_shared<PieceTable>();
+            pieces = cache; // another segment may already have replaced it; retry the computed result
         }
         out.insert(out.end(), result.begin(), result.end());
     }
     void encode_plain(std::string_view text, std::vector<std::uint32_t>& out) const {
         const auto points = decode_utf8(text);
-        const std::shared_ptr<PieceTable> pieces = piece_table();
+        std::shared_ptr<PieceTable> pieces = piece_table();
         for (const auto& [begin, end] : pre_kind == PreTokenizer::deepseek ? pre_split_deepseek(points)
                                                                            : pre_split(points, pre_kind == PreTokenizer::glm4))
             bpe(text.substr(begin, end - begin), out, pieces);

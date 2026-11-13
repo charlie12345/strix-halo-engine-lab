@@ -35,9 +35,9 @@ namespace strix::core {
 //   latency    : request preparation that is independent between requests (prompt tokenisation). A bounded
 //                set of workers takes jobs in arrival order, so independent requests run on different cores.
 //                While the byte budget's decode cap is in force the class narrows to
-//                latency_decode_threads running jobs, which bounds the memory traffic it adds next to a
-//                decode. A caller that needs order inside one request queues the next job from the end of
-//                the previous one (a chain), so two jobs of one chain never run at once.
+//                latency_decode_threads admissions; already-running jobs drain without preemption.
+//                A caller that needs order inside one request finishes all shared-state accesses before
+//                queuing the next job (a chain); job return/cleanup may overlap its successor.
 enum class HostPriority { critical, background, latency };
 
 struct HostLaneConfig {
@@ -47,7 +47,7 @@ struct HostLaneConfig {
     unsigned background_threads = 2;
     int latency_threads = -1;            // -1: from the core count (default_latency_threads()); 0: latency
                                          // jobs use the critical class (previous behaviour); clamped to [0, 8]
-    unsigned latency_decode_threads = 2; // latency jobs running at once while a decode is active; [1, latency_threads]
+    unsigned latency_decode_threads = 2; // admission width during decode; running jobs drain; [1, latency_threads]
     double byte_cap_gbytes_ps = 10.0;    // background ceiling while any decode is active; <= 0: never capped
     std::chrono::microseconds critical_spin{200};
 };
@@ -281,7 +281,7 @@ private:
             run(job, background_jobs_, background_busy_ns_);
         }
     }
-    // Jobs that may run at once: every worker, or latency_decode_threads while the decode cap is in force.
+    // Admission width: running jobs are not preempted when the decode cap starts.
     unsigned latency_limit() const {
         return budget_->capped() ? config_.latency_decode_threads : static_cast<unsigned>(config_.latency_threads);
     }
@@ -290,12 +290,15 @@ private:
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
             // At shutdown the limit no longer applies: everything queued is completed.
-            latency_wake_.wait(lock, [&] {
-                if (stop_ || latency_.empty()) return stop_;
-                if (latency_running_ < latency_limit()) return true;
-                if (latency_held_ < 8U) ++latency_held_; // a wake-up was used up by the limit; later starts pass it on
-                return false;
-            });
+            while (!stop_ && (latency_.empty() || latency_running_ >= latency_limit())) {
+                if (latency_.empty()) latency_wake_.wait(lock);
+                else {
+                    if (latency_held_ < 8U) ++latency_held_;
+                    // Decode end and linger expiry do not signal this CV. Recheck only while queued
+                    // work is held by the cap; an empty queue still sleeps without polling.
+                    latency_wake_.wait_for(lock, std::chrono::milliseconds(10));
+                }
+            }
             if (latency_.empty()) return; // stop requested and nothing queued
             Job job = std::move(latency_.front());
             latency_.pop_front();
@@ -335,7 +338,7 @@ private:
 //   STRIX_HOST_LANE_BACKGROUND=N       background threads (default 2)
 //   STRIX_HOST_LANE_LATENCY=N          latency workers (default: a quarter of the cores, 2 to 4); 0 = latency
 //                                      jobs share the critical thread (previous behaviour)
-//   STRIX_HOST_LANE_LATENCY_DECODE=N   latency jobs running at once while a session decodes (default 2)
+//   STRIX_HOST_LANE_LATENCY_DECODE=N   admission width during decode; running jobs drain (default 2)
 //   STRIX_HOST_BYTE_CAP_GBPS=10        background ceiling during decode; 0 = never capped
 inline HostLaneConfig host_lane_config_from_environment() {
     HostLaneConfig config;

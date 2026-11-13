@@ -109,6 +109,7 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | dist_crc_parallel | `STRIX_DIST_CRC_PARALLEL` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_crc_overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_chunk | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
+| minimax-pair | pfx_joined | `STRIX_MM_PFX_JOINED` | 1 | 0 | Prefill exchange wire form: identity and CRC list ride with the last chunk (two rendezvous fewer per message); payload bytes unchanged |
 | qwen | STRIX_QPF2K_SCHED | `STRIX_QPF2K_SCHED` | 14 | 0 | STRIX_QPF2K_SCHED |
 | qwen | STRIX_QPF2K_DENSE | `STRIX_QPF2K_DENSE` | 1 | 0 | STRIX_QPF2K_DENSE |
 | qwen | STRIX_QPF2K_GDN | `STRIX_QPF2K_GDN` | 1 | 0 | STRIX_QPF2K_GDN |

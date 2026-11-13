@@ -11,6 +11,7 @@
 #include "attn_core/sparse_flash_wmma.hpp"
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
+#include "core/fma_rows.hpp"
 
 #include <cstdlib>
 #include <cstdio>
@@ -3055,11 +3056,39 @@ void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsig
     dense_rows_versioned(x, w, wt, in, o0, n, y, rows, s, dense_rows_version());
 }
 
+// Version 4: the same chains on the shared load-pipelined core (src/core/fma_rows.hpp); the core picks the physical form
+// per shape (rows, chain length, group size). STRIX_GLM_PF_DENSE_FORM=1..7 forces one form where the shape admits it
+// (0 / unset = automatic). Shapes outside the v2 / v3 range (in > 4096) keep the version 3 route.
+static ::strix::core::fma_rows::Form dense_form() {
+    static const auto f = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_DENSE_FORM");
+        if (e == nullptr || *e == 0) return ::strix::core::fma_rows::Form::Auto;
+        const std::string v(e);
+        if (v.size() != 1 || v[0] < '0' || v[0] > '7') throw std::invalid_argument("STRIX_GLM_PF_DENSE_FORM must be 0..7");
+        return static_cast<::strix::core::fma_rows::Form>(static_cast<unsigned>(v[0] - '0'));
+    }();
+    return f;
+}
+static ::strix::core::fma_rows::Weight fma_weight(dev::WType wt) {
+    return wt == dev::WType::F16 ? ::strix::core::fma_rows::Weight::F16
+         : wt == dev::WType::BF16 ? ::strix::core::fma_rows::Weight::BF16 : ::strix::core::fma_rows::Weight::F32;
+}
+
 void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y,
                           unsigned rows, hipStream_t s, unsigned version) {
-    if (version < 1 || version > 3) throw std::invalid_argument("glm pf dense_rows version must be 1, 2 or 3");
+    if (version < 1 || version > 4) throw std::invalid_argument("glm pf dense_rows version must be 1, 2, 3 or 4");
     if (rows == 0 || n == 0) return;
     if (in == 0 || in % kGK) throw std::runtime_error("glm pf dense_rows: in must be a positive multiple of 32");
+    if (version == 4) {
+        if (in <= 4096) {
+            ::strix::core::fma_rows::Group g{};
+            g.count = 1; g.w[0] = w; g.y[0] = y; g.o0[0] = o0; g.n[0] = n;
+            ::strix::core::fma_rows::launch_auto(x, fma_weight(wt), in, rows, g, s, dense_form());
+            ok(hipGetLastError(), "glm pf dense_rows v4");
+            return;
+        }
+        version = 3;
+    }
     // Version 3 only changes grouped calls (dense_rows_group): a single projection measured at parity with v2 (router,
     // KDA f_b), so single calls keep the v2 tile under version 3.
     if (version == 3) version = 2;
@@ -3102,10 +3131,25 @@ void dense_rows_group(const float* x, dev::WType wt, unsigned in, const DensePro
 
 void dense_rows_group_versioned(const float* x, dev::WType wt, unsigned in, const DenseProj* p, unsigned count, unsigned rows,
                                 hipStream_t s, unsigned version, unsigned rt, unsigned c) {
-    if (version < 1 || version > 3) throw std::invalid_argument("glm pf dense_rows version must be 1, 2 or 3");
+    if (version < 1 || version > 4) throw std::invalid_argument("glm pf dense_rows version must be 1, 2, 3 or 4");
     if (count == 0 || count > kDenseGroupMax) throw std::invalid_argument("glm pf dense_rows_group: 1..kDenseGroupMax projections");
     if ((rt != 0 && rt != 32 && rt != 64 && rt != 128) || (c != 0 && c != 32 && c != 64) || ((rt == 0) != (c == 0)))
         throw std::invalid_argument("glm pf dense_rows_group: tile rt 32/64/128 with c 32/64, or both 0 (auto)");
+    if (version == 4) {
+        if (in != 0 && in <= 4096 && in % kGK == 0 && rows != 0) {
+            ::strix::core::fma_rows::Group g{};
+            for (unsigned i = 0; i < count; ++i) {
+                if (p[i].n == 0) continue;
+                g.w[g.count] = p[i].w; g.y[g.count] = p[i].y; g.o0[g.count] = p[i].o0; g.n[g.count] = p[i].n;
+                ++g.count;
+            }
+            if (g.count == 0) return;
+            ::strix::core::fma_rows::launch_auto(x, fma_weight(wt), in, rows, g, s, dense_form());
+            ok(hipGetLastError(), "glm pf dense_rows v4");
+            return;
+        }
+        version = 3;
+    }
     if (version != 3 || in > 4096) {
         for (unsigned i = 0; i < count; ++i) dense_rows_versioned(x, p[i].w, wt, in, p[i].o0, p[i].n, p[i].y, rows, s, version);
         return;

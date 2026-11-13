@@ -4035,6 +4035,22 @@ parity and keep the v2 tile.
 - **Measured gain:** TTFT at 8,192 tokens at parity with v2 within noise (14.29 vs 14.33 s; a second pair run 14.80 vs 14.72 s, medians of two runs; 14.49 s with v1). Grouped calls at 8192 rows: KDA 9.33 -> 6.77 ms, indexer 8.98 -> 6.62 ms; at 4096 rows 4.17 -> 2.89 ms and 4.14 -> 2.83 ms
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
+<a id="glm-pf-dense-rows-v4"></a>
+
+### Prefill dense rows v4 (shared pipelined FMA-rows core)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_DENSE_ROWS=4`, `STRIX_GLM_PF_DENSE_FORM`. **Default:** off (3).
+
+The exact dense-row projections (router, KDA, indexer) run on the shared FMA-rows core (`src/core/fma_rows.hpp`): the same ascending fmaf chain per (row, output), with the global loads of the next step issued right after the barrier and held in registers while the wave runs the current FMAs from LDS, and one barrier per stage instead of two. The core picks the physical form per shape from measurements. From 4096 rows, chains of up to 128 inputs keep the activation tile resident in LDS and walk 16 column blocks per work group, and long chains use a 64-row tile (three projections per work group for grouped calls). Below 4096 rows it uses a 128-row tile (16-input stages for short chains), or a 64-row tile when the call has fewer work groups than compute units.
+
+- **Preconditions:** Exact chunked prefill; chains of at most 4096 inputs (longer chains keep the version 3 route).
+- **Automatic selection:** None; opt-in with STRIX_GLM_PF_DENSE_ROWS=4. The form is automatic (rows, chain length, group size); `STRIX_GLM_PF_DENSE_FORM=1..7` forces one form where the shape admits it (1 / 2 = 128- / 64-row tile, 3 = three projections per work group, 4 / 5 / 6 = resident activations with 16 / 8 / 4 column blocks, 7 = 128-row tile with 16-input stages), 0 or unset = automatic.
+- **Fallback notice:** None.
+- **Exactness evidence:** Device test strix-hip-fma-rows-tests: every form byte-identical to v3 over ragged groups, row and column tails, F16 / BF16 / F32 weights, weight row offsets and the production shapes, guard rows untouched (388 + 424 checks on a second node with the final selection, 0 failures); two-node FAST run at 8,192 tokens: logits and state hashes equal to version 3
+- **Off switch:** STRIX_GLM_PF_DENSE_ROWS=3
+- **Measured gain:** Kernel fixture (one node, interleaved whole-call medians, outputs byte-identical to v3): KDA f_a + g_a + b (4096 inputs, 320 outputs) 3.17 -> 2.56 ms at 4096 rows and 7.04 -> 5.00 ms at 8192 rows; KDA f_b (128 inputs, 8192 outputs, 4096 rows) 4.09 -> 1.71 ms, g_b (4096 outputs) 2.18 -> 0.96 ms; router (4096 inputs, 288 outputs, 4096 rows) 3.03 -> 2.74 ms, at 8192 rows 6.76 -> 4.88 ms; f_b at 8192 rows 12.87 -> 3.14 ms; grouped call at 1024 rows 0.56 -> 0.37 ms and at 256 rows 0.38 -> 0.15 ms. End to end: the two-node FAST run at 8,192 tokens gives the same logits and state hashes with version 4 (that path only runs the router and indexer projections here, so no TTFT change is claimed); the exact-mode end-to-end run is pending, which is why the default stays 3
+- **Implementation / evidence:** [shared core](../src/core/fma_rows.hpp), [adapter](../src/glm/prefill/glm_prefill.hip), [device test](../tests/hip_fma_rows_tests.hip)
+
 <a id="glm-pf-dense-rows-v2"></a>
 
 ### Prefill dense rows v2
@@ -4575,7 +4591,7 @@ The load admits the first prefill memory plan that fits, in this order: full scr
 | `MLA_GEMM` | 3, 2, 1 | 3 |
 | `SCORES` | 7, 6, 5, 4, 3, 2 | 7 |
 | `KDA_SCAN` | 5, 3, 1 | 5 |
-| `DENSE_ROWS` | 3, 2, 1 | 3 |
+| `DENSE_ROWS` | 3, 4, 2, 1 | 3 |
 
 - **Preconditions:** Any set value, empty included, must be in the allowed list.
 - **Fallback notice:** None; an unknown or empty value throws `ENV='v' is not a known variant (allowed: ...; unset = D)`.

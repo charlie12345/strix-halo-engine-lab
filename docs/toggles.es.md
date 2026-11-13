@@ -230,6 +230,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_DS41_PREFILL_ROUTER_V2` | deepseek | on | [ds-router-v2](optimizations.md#ds-router-v2) |
 | `STRIX_GLM_PF_ATTN_QWIN` | glm | auto | [glm-pf-attn-qwin](optimizations.md#glm-pf-attn-qwin) |
 | `STRIX_GLM_PF_AUX_COMBINE` | glm | 1 | [glm-pf-aux-combine](optimizations.md#glm-pf-aux-combine) |
+| `STRIX_GLM_PF_DENSE_FORM` | glm | automático (0) | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
 | `STRIX_GLM_PF_DENSE_ROWS` | glm | 3 | [glm-pf-dense-rows-v3](optimizations.md#glm-pf-dense-rows-v3) |
 | `STRIX_GLM_PF_HC_EXPAND_ROWS` | glm | 2 | [glm-pf-hc-expand-rows](optimizations.md#glm-pf-hc-expand-rows) |
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |

@@ -3,6 +3,7 @@
 // tests/hip_glm_prefill_tests.hip (prefill == decode row by row, bitwise). Build with -ffp-contract=off -fno-fast-math
 // -fno-gpu-flush-denormals-to-zero.
 #include "glm/prefill/glm_prefill.hpp"
+#include "attn_core/select.hpp"
 #include "glm/prefill/glm_pf_variants.hpp"
 #include "glm/prefill/glm_pf_workspace.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
@@ -817,80 +818,14 @@ __global__ __launch_bounds__(1024) void idx_select_rows_kernel(const std::uint32
     const unsigned P = (t + 1) / kKpool;
     std::uint32_t* tokens = tokens_all + static_cast<std::size_t>(row) * kMaxTokens;
     if (P <= kIdxPools) {
-        for (unsigned pos = l; pos <= t; pos += 1024) tokens[pos] = pos;
-        if (l == 0) n_all[row] = t + 1;
+        strix::attn_core::select::all_tokens<1024>(l, t, tokens, n_all + row);
         return;
     }
     const std::uint32_t* keys = keys_all + static_cast<std::size_t>(row) * cap;
     const unsigned k = kIdxPools;
-    if (l == 0) {
-        sh_prefix = 0;
-        sh_mask = 0;
-        sh_remaining = k;
-        sh_carry_eq = 0;
-        sh_carry_out = 0;
-    }
-    __syncthreads();
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        for (unsigned d = l; d < 256; d += 1024) hist[d] = 0;
-        __syncthreads();
-        const unsigned prefix = sh_prefix, mask = sh_mask;
-        for (unsigned p = l; p < P; p += 1024)
-            if ((keys[p] & mask) == prefix) atomicAdd(&hist[(keys[p] >> shift) & 255U], 1U);
-        __syncthreads();
-        if (l == 0) {
-            unsigned rem = sh_remaining;
-            for (int d = 255; d >= 0; --d) {
-                if (hist[d] >= rem) {
-                    sh_prefix = prefix | (static_cast<unsigned>(d) << shift);
-                    break;
-                }
-                rem -= hist[d];
-            }
-            sh_remaining = rem;
-            sh_mask = mask | (255U << shift);
-        }
-        __syncthreads();
-    }
-    const unsigned kstar = sh_prefix, take_eq = sh_remaining;
-    for (unsigned base = 0; base < P; base += 1024) {
-        const unsigned p = base + l;
-        const unsigned key = p < P ? keys[p] : 0U;
-        const unsigned eq = (p < P && key == kstar) ? 1U : 0U;
-        scan_eq[l] = eq;
-        __syncthreads();
-        for (unsigned off = 1; off < 1024; off <<= 1U) {
-            const unsigned v = l >= off ? scan_eq[l - off] : 0U;
-            __syncthreads();
-            scan_eq[l] += v;
-            __syncthreads();
-        }
-        const unsigned eq_rank = sh_carry_eq + scan_eq[l] - eq;
-        const unsigned sel = (p < P && (key > kstar || (eq && eq_rank < take_eq))) ? 1U : 0U;
-        scan_sel[l] = sel;
-        __syncthreads();
-        for (unsigned off = 1; off < 1024; off <<= 1U) {
-            const unsigned v = l >= off ? scan_sel[l - off] : 0U;
-            __syncthreads();
-            scan_sel[l] += v;
-            __syncthreads();
-        }
-        if (sel) {
-            const unsigned at = sh_carry_out + scan_sel[l] - 1;
-            for (unsigned j = 0; j < kKpool; ++j) tokens[at * kKpool + j] = p * kKpool + j;
-        }
-        __syncthreads();
-        if (l == 1023) {
-            sh_carry_eq += scan_eq[1023];
-            sh_carry_out += scan_sel[1023];
-        }
-        __syncthreads();
-    }
-    if (l == 0) {
-        unsigned n = sh_carry_out * kKpool;
-        for (unsigned pos = P * kKpool; pos <= t; ++pos) tokens[n++] = pos;
-        n_all[row] = n;
-    }
+    strix::attn_core::select::select_row<strix::attn_core::select::ChunkPolicy<kKpool, false>>(
+        keys, P, t, k, l, tokens, n_all + row,
+        strix::attn_core::select::ChunkStorage{hist, sh_prefix, sh_mask, sh_remaining, sh_carry_eq, sh_carry_out, scan_eq, scan_sel});
 }
 
 // Stable top-k of the retained prefix and the next score window.
@@ -1003,28 +938,6 @@ __global__ __launch_bounds__(1024) void idx_merge_window_kernel(std::uint32_t* k
 // consecutive pools per thread, exclusive counts from a wave scan plus the per-wave totals (4 barriers per round
 // instead of 40).
 constexpr unsigned kSel2Threads = 256, kSel2Waves = kSel2Threads / 32;
-// Exclusive prefix of v over the CTA in thread order; `total` = the CTA sum. ws: kSel2Waves words of LDS.
-__device__ __forceinline__ unsigned sel2_excl_scan(unsigned v, unsigned* ws, unsigned& total) {
-    const unsigned lane = threadIdx.x % 32, w = threadIdx.x / 32;
-    unsigned x = v;
-#pragma unroll
-    for (unsigned off = 1; off < 32; off <<= 1U) {
-        const unsigned y = __shfl_up(x, off, 32);
-        if (lane >= off) x += y;
-    }
-    if (lane == 31) ws[w] = x;
-    __syncthreads();
-    unsigned before = 0, tot = 0;
-#pragma unroll
-    for (unsigned i = 0; i < kSel2Waves; ++i) {
-        const unsigned s = ws[i];
-        tot += s;
-        before += i < w ? s : 0U;
-    }
-    __syncthreads();  // ws is reused by the next scan
-    total = tot;
-    return before + x - v;
-}
 __global__ __launch_bounds__(kSel2Threads) void idx_select_rows_v2_kernel(const std::uint32_t* keys_all, unsigned cap, unsigned t0,
                                                                          std::uint32_t* tokens_all, std::uint32_t* n_all) {
     __shared__ unsigned hist[256];
@@ -1034,74 +947,13 @@ __global__ __launch_bounds__(kSel2Threads) void idx_select_rows_v2_kernel(const 
     const unsigned P = (t + 1) / kKpool;
     std::uint32_t* tokens = tokens_all + static_cast<std::size_t>(row) * kMaxTokens;
     if (P <= kIdxPools) {
-        for (unsigned pos = l; pos <= t; pos += kSel2Threads) tokens[pos] = pos;
-        if (l == 0) n_all[row] = t + 1;
+        strix::attn_core::select::all_tokens<kSel2Threads>(l, t, tokens, n_all + row);
         return;
     }
     const std::uint32_t* keys = keys_all + static_cast<std::size_t>(row) * cap;
-    unsigned prefix = 0, mask = 0, rem = kIdxPools;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        hist[l] = 0;
-        __syncthreads();
-        for (unsigned p = l; p < P; p += kSel2Threads) {
-            const unsigned key = keys[p];
-            if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255U], 1U);
-        }
-        __syncthreads();
-        // thread l holds digit d = 255 - l; cum = count of matching keys with digit >= d. The chosen digit is the one
-        // where cum first reaches rem (= the descending walk of the v1 kernel); rem becomes rem - (cum - h).
-        const unsigned h = hist[255 - l];
-        unsigned tot;
-        const unsigned above = sel2_excl_scan(h, ws, tot);
-        if (above < rem && above + h >= rem) {
-            sh_digit = 255 - l;
-            sh_rem = rem - above;
-        }
-        __syncthreads();
-        prefix |= sh_digit << shift;
-        mask |= 255U << shift;
-        rem = sh_rem;
-        __syncthreads();  // sh_* and hist are rewritten by the next pass
-    }
-    const unsigned kstar = prefix, take_eq = rem;
-    unsigned carry_eq = 0, carry_out = 0;
-    for (unsigned base = 0; base < P; base += 4 * kSel2Threads) {
-        unsigned key[4], eq_n = 0;
-#pragma unroll
-        for (unsigned i = 0; i < 4; ++i) {
-            const unsigned p = base + 4 * l + i;
-            key[i] = p < P ? keys[p] : 0U;
-            eq_n += (p < P && key[i] == kstar) ? 1U : 0U;
-        }
-        unsigned eq_tot;
-        unsigned eq_rank = carry_eq + sel2_excl_scan(eq_n, ws, eq_tot);
-        bool sel[4];
-        unsigned sel_n = 0;
-#pragma unroll
-        for (unsigned i = 0; i < 4; ++i) {
-            const unsigned p = base + 4 * l + i;
-            const bool eq = p < P && key[i] == kstar;
-            sel[i] = p < P && (key[i] > kstar || (eq && eq_rank < take_eq));
-            eq_rank += eq ? 1U : 0U;
-            sel_n += sel[i] ? 1U : 0U;
-        }
-        unsigned sel_tot;
-        unsigned at = carry_out + sel2_excl_scan(sel_n, ws, sel_tot);
-#pragma unroll
-        for (unsigned i = 0; i < 4; ++i)
-            if (sel[i]) {
-                const unsigned p = base + 4 * l + i;
-                for (unsigned j = 0; j < kKpool; ++j) tokens[at * kKpool + j] = p * kKpool + j;
-                ++at;
-            }
-        carry_eq += eq_tot;
-        carry_out += sel_tot;
-    }
-    if (l == 0) {
-        unsigned n = carry_out * kKpool;
-        for (unsigned pos = P * kKpool; pos <= t; ++pos) tokens[n++] = pos;
-        n_all[row] = n;
-    }
+    strix::attn_core::select::select_row<strix::attn_core::select::QuadPolicy<kKpool, kSel2Threads, kSel2Waves>>(
+        keys, P, t, kIdxPools, l, tokens, n_all + row,
+        strix::attn_core::select::QuadStorage{hist, ws, sh_digit, sh_rem});
 }
 
 // ---------------------------------------------------------------- MLA (R13), split in four row-parallel stages

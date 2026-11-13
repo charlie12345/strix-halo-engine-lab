@@ -1,5 +1,6 @@
 // minimax-m3 fused post-exchange kernel (declared order: strix/minimax_moe.hpp).
 #include "strix/hip_minimax_moe.hpp"
+#include "moe_core/route.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"  // dev::transform_block (STRIX_MM_XB_PREP)
 
 #include <cstdint>
@@ -11,6 +12,29 @@ namespace strix::minimax::moe::hip {
 namespace {
 
 constexpr unsigned kWaves = kNormThreads / 32;
+
+// Strided views of one row's scores in the [2][kExperts][rows] scratch.
+struct RowScores {
+    const float* base;
+    std::uint32_t stride;
+    __device__ float operator[](std::uint32_t e) const { return base[static_cast<std::size_t>(e) * stride]; }
+};
+
+template <class Scores>
+struct StridedRoutePolicy {
+    static constexpr unsigned experts = kExperts, top_k = kTopE;
+    static constexpr float sum_eps = kSumEps, route_scale = kRouteScale;
+    Scores sc, ch;
+    unsigned r;
+    std::uint32_t* ids;
+    float* weights;
+    __device__ float score(std::uint32_t e) const { return sc[e]; }
+    __device__ bool better(std::uint32_t e, std::uint32_t pick) const { return ch[e] > ch[pick]; }
+    __device__ void write_id(unsigned k, std::uint32_t id) const { ids[r * kTopE + k] = id; }
+    __device__ void write_weight(unsigned k, std::uint32_t, float weight) const {
+        weights[r * kTopE + k] = weight;
+    }
+};
 
 template <unsigned Ilp>
 __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchangeView v) {
@@ -135,23 +159,7 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
     }
     __syncthreads();
     if (t == 0) {
-        std::uint32_t best[kTopE];
-        for (unsigned k = 0; k < kTopE; ++k) {  // k-th best by (choice desc, id asc) among the not yet taken
-            std::uint32_t pick = kExperts;
-            for (std::uint32_t e = 0; e < kExperts; ++e) {
-                bool taken = false;
-                for (unsigned q = 0; q < k; ++q) taken |= best[q] == e;
-                if (taken) continue;
-                if (pick == kExperts || ch[e] > ch[pick]) pick = e;  // ascending scan: equal choice keeps the smaller id
-            }
-            best[k] = pick;
-        }
-        float sum = 0.0F;
-        for (unsigned k = 0; k < kTopE; ++k) sum = sum + sc[best[k]];
-        for (unsigned k = 0; k < kTopE; ++k) {
-            v.ids[r * kTopE + k] = best[k];
-            v.weights[r * kTopE + k] = (sc[best[k]] / (sum + kSumEps)) * kRouteScale;
-        }
+        strix::moe_core::route_topk(StridedRoutePolicy<const float*>{sc, ch, r, v.ids, v.weights});
     }
 }
 
@@ -210,23 +218,7 @@ __global__ __launch_bounds__(kNormThreads) void router_batch_kernel(
     __syncthreads();
     if (t < R && first + t < rows) {
         const unsigned row = t, r = first + row;
-        std::uint32_t best[kTopE];
-        for (unsigned k = 0; k < kTopE; ++k) {  // k-th best by (choice desc, id asc) among the not yet taken
-            std::uint32_t pick = kExperts;
-            for (std::uint32_t e = 0; e < kExperts; ++e) {
-                bool taken = false;
-                for (unsigned q = 0; q < k; ++q) taken |= best[q] == e;
-                if (taken) continue;
-                if (pick == kExperts || ch[row][e] > ch[row][pick]) pick = e;  // ascending scan: equal choice keeps the smaller id
-            }
-            best[k] = pick;
-        }
-        float sum = 0.0F;
-        for (unsigned k = 0; k < kTopE; ++k) sum = sum + sc[row][best[k]];
-        for (unsigned k = 0; k < kTopE; ++k) {
-            ids[r * kTopE + k] = best[k];
-            weights[r * kTopE + k] = (sc[row][best[k]] / (sum + kSumEps)) * kRouteScale;
-        }
+        strix::moe_core::route_topk(StridedRoutePolicy<const float*>{sc[row], ch[row], r, ids, weights});
     }
 }
 
@@ -289,36 +281,13 @@ __global__ __launch_bounds__(kNormThreads) void router_tiled_kernel(std::uint32_
     }
 }
 
-// Strided views of one row's scores in the [2][kExperts][rows] scratch.
-struct RowScores {
-    const float* base;
-    std::uint32_t stride;
-    __device__ float operator[](std::uint32_t e) const { return base[static_cast<std::size_t>(e) * stride]; }
-};
-
 __global__ __launch_bounds__(256) void router_select_kernel(std::uint32_t rows, const float* scores, std::uint32_t* ids,
                                                             float* weights) {
     const unsigned r = blockIdx.x * 256U + threadIdx.x;
     if (r >= rows) return;
     const RowScores sc{scores + r, rows};
     const RowScores ch{scores + static_cast<std::size_t>(kExperts) * rows + r, rows};
-    std::uint32_t best[kTopE];
-    for (unsigned k = 0; k < kTopE; ++k) {  // k-th best by (choice desc, id asc) among the not yet taken
-        std::uint32_t pick = kExperts;
-        for (std::uint32_t e = 0; e < kExperts; ++e) {
-            bool taken = false;
-            for (unsigned q = 0; q < k; ++q) taken |= best[q] == e;
-            if (taken) continue;
-            if (pick == kExperts || ch[e] > ch[pick]) pick = e;  // ascending scan: equal choice keeps the smaller id
-        }
-        best[k] = pick;
-    }
-    float sum = 0.0F;
-    for (unsigned k = 0; k < kTopE; ++k) sum = sum + sc[best[k]];
-    for (unsigned k = 0; k < kTopE; ++k) {
-        ids[r * kTopE + k] = best[k];
-        weights[r * kTopE + k] = (sc[best[k]] / (sum + kSumEps)) * kRouteScale;
-    }
+    strix::moe_core::route_topk(StridedRoutePolicy<RowScores>{sc, ch, r, ids, weights});
 }
 
 }  // namespace

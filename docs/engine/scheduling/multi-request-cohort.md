@@ -115,7 +115,8 @@ prepare and recurrence of every session run as one launch each (`blockIdx.y` = s
 per-session body for its 2, 4 or 8 rows; `STRIX_COHORT_GDN_SEGMENTS=0` keeps one pair per session). With
 `STRIX_COHORT_QSA_SEGMENTS=1` the state-free QSA sub-parts (norms and rope, block selection, softmax) also run
 once for every row while the KV append, block scores, attention scores and value/gate output stay per session
-(measured neutral, so off by default). The draft chains of a cohort cycle advance
+(measured neutral, so off by default). The shared expert activation and scalar gate, formerly one launch
+per session and layer, run as one launch over per-row addresses. The draft chains of a cohort cycle advance
 depth by depth: step k of every session (each on its own stream) is enqueued before any session waits for
 its step (`STRIX_COHORT_DRAFT_INTERLEAVE=0`: one chain after another). A wide union's status covers all its rows: a failing row fails the
 whole cohort window, as in an 8-row cohort.
@@ -163,6 +164,7 @@ tokens are compared with its own single-request run.
 | `STRIX_COHORT_ROWS=16\|32` | Global row budget per cycle: chunks of up to 8 rows in one stream of steps. |
 | `STRIX_COHORT_WIDE=gdn,qsa,head,moe,combine,inject\|all` | With a budget: the listed steps once for all chunks' rows (9..32). |
 | `STRIX_COHORT_GDN_SEGMENTS=0`, `STRIX_COHORT_DRAFT_INTERLEAVE=0` | Per-session GDN prepare/recurrence; one draft chain after another. |
+| `STRIX_COHORT_SHARED_ACT_MERGED=0` | Shared-expert activation and scalar gate as one launch per session instead of one launch for the rows of every session (default; bitwise equal per row, measured 5.4 ms per cycle at 8 sessions, 1 ms at 2). A/B name `sharedact`. |
 | `STRIX_COHORT_QSA_SEGMENTS=1` | State-free QSA sub-parts once for all rows (neutral). |
 | `STRIX_COHORT_AB=1`, `STRIX_COHORT_AB_OFF=gdnseg,qsaseg,combine,draft,gdn,...` | Measurement: odd cohort cycles run without the listed features (wide families by name); mean cycle ms, tokens and tok/s per parity at exit. |
 | `STRIX_DENSE_A8_WMMA_SMALL=1` | Opt-in: dense A8 Q8_0 projections of 2..8 rows (shared expert, GDN, QSA and PLE producers) run a WMMA tile sized for the real rows instead of the dot4 form; bitwise equal per row. A/B name `densesmall`. |

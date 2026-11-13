@@ -21,7 +21,14 @@ class ConstraintWindowReceipt;
 using ConstraintAheadSubmit = std::function<void(std::function<void()>)>;
 struct ConstraintMaskAhead;
 // Worker-side totals (every walk it ran, used or not); shared with the plans, which may outlive a row.
-struct ConstraintAheadTotals { std::atomic<std::uint64_t> masks{0}, ns{0}; };
+// `observer` (tracing and tests; set before the first plan, must not throw) runs on the walking worker: with 1
+// when it has claimed a slot, then with the phase it published for it (2 built, 3 abandoned).
+struct ConstraintAheadTotals { std::atomic<std::uint64_t> masks{0}, ns{0}; std::function<void(int)> observer; };
+// The serving policy of the two selection levers, read from the environment through the shared registry
+// (strict, recorded): STRIX_CONSTRAINT_MASK_AHEAD (on unless exactly "0") and STRIX_CONSTRAINT_RANKED (decimal
+// 0..4096, default 0 = off). A value that does not parse throws std::invalid_argument naming the variable.
+struct ConstraintSelectionPolicy { bool mask_ahead = true; unsigned ranked = 0; };
+[[nodiscard]] ConstraintSelectionPolicy constraint_selection_policy_from_environment();
 // A branch is a copy of the committed output frontier. Selection advances only
 // that branch; publish it with commit only after the model prefix commits.
 class ConstraintSelection : public std::enable_shared_from_this<ConstraintSelection> {
@@ -74,14 +81,17 @@ public:
     static void retire_ahead(std::shared_ptr<ConstraintMaskAhead>&) noexcept;
     // An empty callback turns mask-ahead off (the default).
     void set_mask_ahead(ConstraintAheadSubmit submit) { ahead_submit_ = std::move(submit); }
+    void set_ahead_observer(std::function<void(int)> observer) { ahead_totals_->observer = std::move(observer); }
     // prepare(state).mask.contains(id) for an answer-phase program state (not reasoning, not terminal) and an ID
     // inside the vocabulary, without building the mask; a full walk may additionally stop on evaluation limits.
     [[nodiscard]] bool admits(const State&, std::uint32_t id) const;
     void set_argmax_first(bool on) noexcept { argmax_first_ = on; }
     // Ranked membership (part of argmax-first): when the row's maximum is refused, the next `count` logits in
     // masked-greedy order (value descending, lowest ID first among equals) are checked with admits(); the
-    // first admitted one is the masked result, so the row needs no mask walk. 0 turns it off; a row whose
-    // `count` best tokens are all refused takes the full mask.
+    // first admitted one is the masked result, so the row needs no mask walk. 0 (the default) turns it off; a
+    // row whose `count` best tokens are all refused takes the full mask. Opt-in because it is not refusal
+    // equivalent: a row whose full walk would stop on an evaluation limit reached by a token outside the
+    // checked ones selects a token here, where argmax-first alone refuses the request.
     void set_ranked(unsigned count) noexcept { ranked_ = count; }
     void commit(const Staged&);
     [[nodiscard]] std::unique_ptr<MtpSelectionTransaction> window_transaction();
@@ -96,7 +106,7 @@ private:
     void advance(Staged&, const State& prior, bool force) const;
     mutable Profile profile_;
     bool argmax_first_ = false;
-    unsigned ranked_ = 32;
+    unsigned ranked_ = 0;
     [[nodiscard]] std::optional<Staged> select_ranked(std::span<const float>, const State&) const;
     void publish_prefix(const std::shared_ptr<Frontier>&, const std::vector<Staged>&);
     std::shared_ptr<const ConstraintSpec> spec_;

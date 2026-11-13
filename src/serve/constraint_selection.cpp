@@ -1,4 +1,5 @@
 #include "strix/serve/constraint_selection.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -43,11 +44,13 @@ struct ConstraintMaskAhead {
             if (retired.load(std::memory_order_acquire)) return;
             int idle = 0;
             if (!s || !s->phase.compare_exchange_strong(idle, 1, std::memory_order_acq_rel)) continue;
+            if (totals->observer) totals->observer(1);
             const auto t0 = std::chrono::steady_clock::now();
             build(*s, true);
             totals->ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
             totals->masks.fetch_add(1, std::memory_order_relaxed);
+            if (totals->observer) totals->observer(s->phase.load(std::memory_order_acquire));
         }
     }
     // The mask of the slot, or the error of its walk rethrown here (where prepare() would have raised it).
@@ -68,6 +71,12 @@ ConstraintSelection::ConstraintSelection(std::shared_ptr<const ConstraintSpec> s
     : spec_(std::move(spec)), trie_(std::move(trie)), tokenizer_(std::move(tokenizer)),
       state_{{}, spec_->starts_in_reasoning, ConstraintCursor(spec_->program ? *spec_->program : compile_json_object())} {}
 
+ConstraintSelectionPolicy constraint_selection_policy_from_environment() {
+    ConstraintSelectionPolicy policy;
+    policy.mask_ahead = envcfg::flag("STRIX_CONSTRAINT_MASK_AHEAD", true, EnvFlagMatch::exact);
+    policy.ranked = envcfg::number<unsigned>("STRIX_CONSTRAINT_RANKED", 0U, 0U, 4096U);
+    return policy;
+}
 ConstraintSelection::Prepared ConstraintSelection::prepare() const { return prepare(state_); }
 ConstraintSelection::Prepared ConstraintSelection::prepare(const State& state) const { return prepare(state, nullptr, 0); }
 void ConstraintSelection::retire_ahead(std::shared_ptr<ConstraintMaskAhead>& plan) noexcept {
@@ -98,8 +107,13 @@ std::shared_ptr<ConstraintMaskAhead> ConstraintSelection::plan_ahead(const State
             if (spec_->end_thinking_id == id) reasoning = false; else ++reasoning_tokens;
         } else {
             if (spec_->end_thinking_id == id || !trie_->contains(id)) break;
+            // A transition that exhausts its evaluation budget ends the chain like a refusal: the slots before
+            // it are safe, and its error belongs to the row that really takes this draft (its mask walk or advance() raises it
+            // there), never to a window that only planned it.
             bool admitted = true;
-            for (const char b : tokenizer_->token_bytes(id)) if (!cursor.advance(static_cast<unsigned char>(b))) { admitted = false; break; }
+            try {
+                for (const char b : tokenizer_->token_bytes(id)) if (!cursor.advance(static_cast<unsigned char>(b))) { admitted = false; break; }
+            } catch (const ConstraintError&) { admitted = false; }
             if (!admitted) break;
         }
     }

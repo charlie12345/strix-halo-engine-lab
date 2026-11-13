@@ -582,13 +582,21 @@ reached by another token, which a membership check does not walk; all routes of 
 Ranked membership extends argmax-first to rows whose maximum is refused. Masked greedy is the first
 admitted token in the order "logit descending, lowest ID among equals", so the row checks the next-best
 logits in that order with the same one-token membership test and takes the first admitted one; no mask is
-walked. `STRIX_CONSTRAINT_RANKED=N` sets how many next-best logits are checked (default 32, 0 = always
-walk the mask); a row whose N next-best tokens are all refused walks the full mask as before. It applies
-where argmax-first applies (finite row, answer phase, no scores or transforms) and has the same single
-difference to a full walk: an evaluation limit reached by a token the row never checks does not stop the
-request. A full mask walk visits the whole token trie, which in a permissive state (inside a string)
-costs far more than a decode step, so this is what keeps schema output at plain decode speed. The profile
-reports these rows as `ranked_rows`.
+walked. It is opt-in: `STRIX_CONSTRAINT_RANKED=N` sets how many next-best logits are checked (a decimal
+number in 0..4096; default 0 = off, the row walks the mask); a row whose N next-best tokens are all
+refused walks the full mask as before. It applies where argmax-first applies (finite row, answer phase,
+no scores or transforms). Token IDs equal those of the mask walk wherever the walk completes. It is off
+by default because refusals are not equal: with argmax-first alone a row whose maximum is refused walks
+the full mask, and that walk stops the request when any token reaches a schema evaluation limit; ranked
+membership only checks the tokens it tries, so such a request continues with the first admitted one.
+Schemas whose walks stay inside their evaluation limits (the usual case) select the same tokens either
+way. A full mask walk visits the whole token trie, which in a permissive state (inside a string) costs
+far more than a decode step, so on such schemas the setting keeps output at plain decode speed. The
+profile reports these rows as `ranked_rows`.
+
+Both settings are read through the shared environment registry: unset or empty means the default, a
+`STRIX_CONSTRAINT_RANKED` value that is not a whole decimal number in range stops the server at startup
+with an error naming the variable, and the resolved values are recorded with the other switches of the run.
 
 Masks one step ahead (default on; `STRIX_CONSTRAINT_MASK_AHEAD=0` turns it off) covers the requests that
 still walk one mask per answer row: scores (`logprobs`), logit transforms, and `--http-selection-fast
@@ -597,6 +605,8 @@ cursors a step can reach are known before its logits are: the committed state fo
 committed state advanced over drafts 0..r-1 for row r of an MTP window. When the step is launched those
 walks are handed to a host worker and run while the GPU executes; the row takes the finished mask, waits
 for the one in progress, or walks an unstarted one itself, and a walk whose step is over is abandoned.
+Planning a draft chain stops at the first draft the schema refuses or whose transition reaches an
+evaluation limit; such a limit stops the request only when a row really takes that draft.
 The mask words, the refusals and where they surface are those of the walk on the selecting thread, so
 token IDs and receipts are identical with the switch on or off. Requests in the argmax-first regime do
 not use the worker: their rows almost never walk a mask, and walks nobody takes only load the host. The

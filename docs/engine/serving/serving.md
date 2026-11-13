@@ -91,7 +91,8 @@ own constraints. The server therefore resolves:
 - **the primary tile**: T8192, or T16384 when the context admits a request of at least 32,768
   tokens (the single-request threshold; `STRIX_QPF2K_T16K=1` asks for it from 16,384, any other
   value disables it) and the T16384 owner fits in memory beside every requested slot
-  (`--http-batch`) with the file-backed table still resident. Otherwise it falls back to T8192
+  (`--http-batch`: each slot's bridge cost plus the retained decode stack of every slot after the
+  first, the equation the runtime slot capacity uses) with the file-backed table still resident. Otherwise it falls back to T8192
   and then to smaller tiles. `STRIX_QPF2K_T16K=1` keeps the plain memory bound;
 - **the prefill arithmetic**: the automatic FP16 prefill profile of the single-request route
   whenever the decode profile is the dense-A8 profile and no prefill profile is explicit

@@ -1219,6 +1219,29 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
         bool decode_adopted = false, governed_mtp_exclusion = false;
         auto adopted_organization = result.organization;
         if (shared_route) {
+            // A governed MTP owner (explicit sidecar) takes the automatic arithmetic without the fast prefill
+            // options its gates have not passed: the exclusion verified bundles already take. The off switch
+            // STRIX_SERVE_FP16_MTP=0 is read before any validation, so it never depends on the option mask.
+            const auto governed_mtp = [](const Options& c) { return c.mtp.enabled && !c.mtp_native_bundle; };
+            const bool governed_fp16 = !env_is(requested,"STRIX_SERVE_FP16_MTP","0");
+            const auto validate_automatic_prefill = [&](Options& c) {
+                try { validate_prefill_numerical_profile_cli(c); }
+                catch (const std::exception&) {
+                    if (!governed_mtp(c)) throw;
+                    const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
+                        prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+                        prefill_option_bit(PrefillOption::index_score_wmma) | (result.prefill_option_mask & kPrefillGdnChunkRev3);
+                    auto governed = c;
+                    governed.prefill_disabled |= excluded;
+                    governed.resolved_prefill_option_mask = result.prefill_option_mask & ~excluded;
+                    bool admitted = true;
+                    try { validate_prefill_numerical_profile_cli(governed); }
+                    catch (const std::exception&) { admitted = false; }
+                    if (!admitted) throw; // the first refusal is the reported reason
+                    c = std::move(governed);
+                    governed_mtp_exclusion = true;
+                }
+            };
             // A server that owns no decode arithmetic takes the single-request decode profile through the same
             // rule; an explicit profile, low-level flags or a non-automatic organization keep the resolved one.
             if (!candidate.numerical_profile_explicit && candidate.numerical_profile != dense_a8_profile &&
@@ -1232,41 +1255,29 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                     single.keep_decode_profile = false;
                     (void)resolve_prompt_route(adopted,requested,capabilities,single);
                     validate_numerical_profile_cli(adopted);
+                    // The combined decode/prefill candidate is validated with the governed exclusions applied.
+                    if (adopted.prefill_profile_automatic) {
+                        if (governed_mtp(adopted) && !governed_fp16) throw std::runtime_error("STRIX_SERVE_FP16_MTP=0");
+                        validate_automatic_prefill(adopted);
+                    }
                     auto validation = organization;
                     apply_numerical_profile(adopted,model,manifest,content,capabilities.a8_runtime,validation);
                     candidate = std::move(adopted);
                     adopted_organization = std::move(organization);
                     decode_adopted = true;
-                } catch (const std::exception& error) { decode_declined = error.what(); }
+                } catch (const std::exception& error) { decode_declined = error.what(); governed_mtp_exclusion = false; }
             }
             fp16_declined = resolve_prompt_route(candidate,requested,capabilities,shape).arithmetic_fallback;
             if (!decode_declined.empty() && !fp16_declined.empty()) fp16_declined += " (" + decode_declined + ")";
             if (candidate.prefill_profile_automatic) {
-                // An arithmetic the serving validators refuse falls back to the resolved one, with its reason.
-                try { validate_prefill_numerical_profile_cli(candidate); }
-                catch (const std::exception& first) {
-                    // A governed MTP owner (explicit sidecar) keeps the automatic arithmetic without the fast
-                    // prefill options its gates have not passed: the exclusion verified bundles already take.
-                    bool retained = false;
-                    if (candidate.mtp.enabled && !candidate.mtp_native_bundle && !env_is(requested,"STRIX_SERVE_FP16_MTP","0")) {
-                        const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
-                            prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
-                            prefill_option_bit(PrefillOption::index_score_wmma) | (result.prefill_option_mask & kPrefillGdnChunkRev3);
-                        auto governed = candidate;
-                        governed.prefill_disabled |= excluded;
-                        governed.resolved_prefill_option_mask = result.prefill_option_mask & ~excluded;
-                        try {
-                            validate_prefill_numerical_profile_cli(governed);
-                            candidate = std::move(governed);
-                            governed_mtp_exclusion = true;
-                            retained = true;
-                        } catch (const std::exception&) {}
-                    }
-                    if (!retained) {
-                        candidate.prefill_numerical_profile.reset();
-                        candidate.prefill_profile_automatic = false;
-                        fp16_declined = first.what();
-                    }
+                // An arithmetic the switch or the serving validators refuse falls back to the resolved one, with its reason.
+                try {
+                    if (governed_mtp(candidate) && !governed_fp16) throw std::runtime_error("STRIX_SERVE_FP16_MTP=0");
+                    validate_automatic_prefill(candidate);
+                } catch (const std::exception& first) {
+                    candidate.prefill_numerical_profile.reset();
+                    candidate.prefill_profile_automatic = false;
+                    fp16_declined = first.what();
                 }
             }
         } else {
@@ -1335,10 +1346,12 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                 build_serial_session_state_layout(model,state_request));
             // The T16384 owner is admitted only beside every resident slot; smaller owners keep their one-slot bound.
             const std::uint64_t slots = rows == 16384U ? std::max<std::uint64_t>(1U,candidate.http_batch) : 1U;
-            if (slots > 1U && (serving.slot_host > UINT64_MAX / slots || serving.slot_device > UINT64_MAX / slots))
-                throw std::overflow_error("prefill reservation overflow");
-            const auto future_host = add(staging,add(serving.shared_host,serving.slot_host * slots));
-            const auto future_device = add(staging,add(serving.shared_device,serving.slot_device * slots));
+            // Same equation as the runtime capacity (strix::serve::resolve_bridge_capacity): every slot pays its
+            // bridge cost and every slot after the first also pays its retained decode/state stack, in both pools.
+            const auto mul = prefill_checked_multiply;
+            const auto extra_stacks = mul(slots - 1U,required.http_slot_retained);
+            const auto future_host = add(staging,add(serving.shared_host,add(mul(slots,serving.slot_host),extra_stacks)));
+            const auto future_device = add(staging,add(serving.shared_device,add(mul(slots,serving.slot_device),extra_stacks)));
             const auto growth = add(scratch,add(required.metadata,add(required.runtime_payload,
                 add(future_host,add(candidate.prefix_cache_host_bytes,candidate.known_prefill_host_headroom)))));
             auto total = add(required.model_backing,add(required.state_d1,add(required.serial_scratch,add(required.external_host,growth))));

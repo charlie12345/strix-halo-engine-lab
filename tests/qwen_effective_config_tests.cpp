@@ -541,8 +541,35 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         startup.options.known_prefix_expert_union && startup.options.known_window_router_rows &&
         startup.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}) &&
         startup.options.prefix_cache_block_rows==0 &&
-        numerical_profile_pair(startup.options).prefill==dense_a8_profile,
-        "serve_prefill_production_mtp_ceilings: preserve explicit route organizations, tails, cache and arithmetic");
+        numerical_profile_pair(startup.options).decode==dense_a8_profile,
+        "serve_prefill_production_mtp_ceilings: preserve explicit route organizations, tails, cache and decode arithmetic");
+    {
+        // Explicit-sidecar MTP: the single-request FP16 prefill arithmetic without the options its gates have not passed.
+        const auto governed_excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
+            prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+            prefill_option_bit(PrefillOption::index_score_wmma);
+        expect(startup.options.prefill_profile_automatic &&
+            startup.options.prefill_numerical_profile==DecodeNumericalProfile::fast_prefill_f16wmma_v1 &&
+            startup.options.resolved_prefill_option_mask && !(*startup.options.resolved_prefill_option_mask & governed_excluded) &&
+            startup.prefill_option_mask==*startup.options.resolved_prefill_option_mask &&
+            startup.serve_prefill_notice.find("governed MTP")!=std::string::npos,
+            "serve_prefill_production_mtp_ceilings: sidecar MTP takes automatic fp16 with the governed exclusions");
+        // STRIX_SERVE_FP16_MTP=0 keeps the resolved arithmetic whatever the option mask already excludes.
+        for (const bool already_excluded : {false,true}) {
+            auto off=request; off.environment["STRIX_SERVE_FP16_MTP"]="0";
+            if (already_excluded) off.environment["STRIX_PREFILL_HC_OUTPUT_WMMA"]="0";
+            const auto kept=resolve(off,memory);
+            expect(kept.options.known_prefix_prefill_rows==8192 && !kept.options.prefill_profile_automatic &&
+                !kept.options.prefill_numerical_profile &&
+                numerical_profile_pair(kept.options).prefill==dense_a8_profile &&
+                kept.serve_prefill_notice.find("automatic fp16 declined: STRIX_SERVE_FP16_MTP=0")!=std::string::npos,
+                already_excluded ? "serve_prefill_production_mtp_ceilings: FP16 MTP off switch wins with hc_output_wmma already excluded"
+                                 : "serve_prefill_production_mtp_ceilings: FP16 MTP off switch keeps the resolved arithmetic");
+            auto on=off; on.environment.erase("STRIX_SERVE_FP16_MTP");
+            expect(resolve(on,memory).options.prefill_profile_automatic,
+                "serve_prefill_production_mtp_ceilings: sidecar MTP keeps automatic fp16 under either option mask");
+        }
+    }
     auto inspect_args=args; inspect_args.emplace_back("--print-effective-config");
     RequestedOptions inspection{parse(inspect_args),request.environment};
     const auto dry=resolve(inspection,memory);
@@ -726,9 +753,11 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         explicit_config.options.known_prefill_metadata_budget==startup.options.known_prefill_metadata_budget &&
         explicit_config.options.known_prefill_uma_budget==startup.options.known_prefill_uma_budget &&
         explicit_config.options.known_prefill_host_headroom==startup.options.known_prefill_host_headroom &&
-        explicit_config.options.known_prefix_tail_rows==startup.options.known_prefix_tail_rows &&
-        numerical_profile_pair(explicit_config.options)==numerical_profile_pair(startup.options),
-        "serve_prefill_production_guards: explicit T/budgets win and automatic organizations preserve arithmetic");
+        explicit_config.options.known_prefix_tail_rows==startup.options.known_prefix_tail_rows,
+        "serve_prefill_production_guards: explicit T/budgets win");
+    expect(numerical_profile_pair(explicit_config.options).decode==numerical_profile_pair(startup.options).decode &&
+        numerical_profile_pair(explicit_config.options).prefill==dense_a8_profile && !explicit_config.options.prefill_profile_automatic,
+        "serve_prefill_production_guards: an explicit tiled configuration keeps its resolved arithmetic");
     // Prefill alone fits at every tile; adding the verified first slot forces
     // a retry under either host-only or GTT-only pressure, including batch 0.
     for (const bool inspect : {false,true}) for (const bool single : {false,true}) {
@@ -3674,6 +3703,72 @@ int main(int argc, char** arguments) {
             expect(fallback.options.known_prefix_prefill_rows==8192 && fallback.options.prefill_profile_automatic &&
                 fallback.serve_prefill_notice.find("T16384:memory")!=std::string::npos,
                 "server falls back to T8192 with the shared arithmetic when T16384 does not fit, and says why");
+        }
+        {
+            // T16384 admission charges the retained stack of every additional slot (the runtime capacity equation):
+            // a margin of two retained stacks beside four slots must fall back to T8192; three admit T16384.
+            auto wide=http; wide.options.context_tokens=40960; wide.environment["STRIX_QPF2K_T16K"]="1";
+            wide.options.http_batch=4;
+            const std::uint64_t stack=256ULL*1024ULL*1024ULL;
+            auto stacked=memory;
+            stacked.estimate=[&](const Options& o) { auto r=memory.estimate(o); r.http_slot_retained=stack; return r; };
+            const auto bare=resolve(wide,memory);
+            expect(bare.options.known_prefix_prefill_rows==16384,"four-slot server admits T16384 when slots retain nothing");
+            const auto bridge_total=bare.host_compilation.at("serve_committed_host_peak_bytes");
+            stacked.available=bridge_total+2U*stack;
+            const auto short_by_one=resolve(wide,stacked);
+            expect(short_by_one.options.known_prefix_prefill_rows==8192 &&
+                short_by_one.serve_prefill_notice.find("T16384:memory:host-available")!=std::string::npos,
+                "T16384 admission falls back to T8192 when the retained stacks of the additional slots do not fit");
+            stacked.available=bridge_total+3U*stack;
+            const auto exact=resolve(wide,stacked);
+            expect(exact.options.known_prefix_prefill_rows==16384 &&
+                exact.host_compilation.at("serve_committed_host_peak_bytes")==bridge_total+3U*stack,
+                "T16384 admission charges exactly (slots - 1) retained stacks");
+            auto one=wide; one.options.http_batch=1;
+            stacked.available=bridge_total;
+            expect(resolve(one,stacked).options.known_prefix_prefill_rows==16384,"a one-slot T16384 server charges no additional stack");
+        }
+        {
+            // Default decode adoption on a valid explicit-sidecar MTP server: the governed exclusions are applied
+            // before the combined decode/prefill candidate is validated, so the adoption is not discarded.
+            auto sidecar_argv=mtp_fixture(); sidecar_argv.insert(sidecar_argv.begin()+5,13,"1");
+            sidecar_argv.insert(sidecar_argv.end(),{"--http-serve","--http-batch","0",
+                "--mtp-window-expert-union","--mtp-window-prefix","--mtp-window-hyper-mix","--mtp-window-qsa-rows"});
+            const auto set_value=[&](const char* flag,const char* value) {
+                const auto it=std::find(sidecar_argv.begin(),sidecar_argv.end(),flag);
+                if(it==sidecar_argv.end()) sidecar_argv.insert(sidecar_argv.end(),{flag,value}); else *(it+1)=value;
+            };
+            for(const auto& [flag,value] : std::vector<std::pair<const char*,const char*>>{
+                {"--mtp-normalized-rounding","bf16-rne"},{"--mtp-sidecar-retained-bytes","3221225472"},
+                {"--mtp-sidecar-setup-bytes","4294967296"},{"--mtp-golden-max-bytes","6442450944"},
+                {"--mtp-replay-host-bytes","6442450944"},{"--mtp-runtime-bytes","134217728"},
+                {"--mtp-target-capture-bytes","268435456"},{"--mtp-candidate-depth","7"},
+                {"--mtp-target-window-rows","8"},{"--mtp-window-arena-bytes","2147483648"},
+                {"--mtp-window-capture-bytes","67108864"},{"--mtp-window-checkpoint-bytes","8589934592"},
+                {"--mtp-window-total-bytes","17179869184"},{"--mtp-window-history-intervals","8192"},
+                {"--mtp-window-expert-union-bytes","65536"},{"--mtp-target-window-rows-set","2,4,8"}}) set_value(flag,value);
+            auto sidecar=RequestedOptions{parse(sidecar_argv),{}};
+            const auto governed_excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
+                prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+                prefill_option_bit(PrefillOption::index_score_wmma);
+            expect(sidecar.options.mtp.enabled && !sidecar.options.mtp_native_bundle &&
+                !sidecar.options.numerical_profile_explicit && sidecar.options.numerical_profile!=dense_a8_profile,
+                "sidecar adoption fixture is an explicit-sidecar MTP server without a decode profile");
+            const auto adopted=resolve(sidecar,memory);
+            expect(adopted.options.numerical_profile==dense_a8_profile && adopted.options.prefill_profile_automatic &&
+                adopted.options.prefill_numerical_profile==DecodeNumericalProfile::fast_prefill_f16wmma_v1 &&
+                adopted.options.resolved_prefill_option_mask && (adopted.options.prefill_disabled & governed_excluded)==governed_excluded &&
+                !(*adopted.options.resolved_prefill_option_mask & governed_excluded) &&
+                adopted.prefill_option_mask==*adopted.options.resolved_prefill_option_mask &&
+                adopted.serve_prefill_notice.find("decode profile dense-a8 automatic")!=std::string::npos &&
+                adopted.serve_prefill_notice.find("governed MTP")!=std::string::npos,
+                "sidecar MTP server adopts dense-A8 decode with automatic fp16 and the governed exclusion mask");
+            sidecar.environment["STRIX_SERVE_FP16_MTP"]="0";
+            const auto kept=resolve(sidecar,memory);
+            expect(kept.options.numerical_profile==sidecar.options.numerical_profile && !kept.options.prefill_profile_automatic &&
+                !kept.options.prefill_numerical_profile,
+                "sidecar MTP server with the FP16 off switch keeps its previous decode and prefill arithmetic");
         }
         expect(fast.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}),
             "HTTP keeps all tail owners for future requests");

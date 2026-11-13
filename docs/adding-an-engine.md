@@ -257,13 +257,37 @@ Read any other switch through `include/strix/env_flags.hpp`. The
 `strix-env-switch-census` test (`tools/env_switch_census.py --check`) fails when a
 new switch is read with a raw `getenv`, or when one boolean switch is read with two
 different defaults. `tools/env_switch_baseline.txt` lists the switches that are
-still read raw; it only shrinks (`--update` removes migrated names).
+still read raw; after introduction it only shrinks (`--update` removes migrated names).
 `tools/env_switch_census.py --report` prints the current counts.
 `--seed` creates a baseline only when the destination does not exist. The census
 tracks literal names, including adjacent ordinary string literals; runtime-built
 names and wrapper reads are outside its scope. Escapes in raw literal names are
 rejected because this scanner does not decode C++ escapes. Existing baseline names may gain
 raw read sites, so a passing census is not proof that all configuration is governed.
+
+### grandfathered at introduction — 2026-11-13
+
+These switches reached main before the census ratchet landed. The explicit
+`python tools/env_switch_census.py --grandfather NAME... --root .` route adds only
+the named switches and refuses any name not currently read raw, without writing
+on refusal. CMake continues to call `--check`, never `--grandfather`.
+
+| Switch | File | Owner area | Status |
+|---|---|---|---|
+| `STRIX_BATCH_NEST_RATIO` | `apps/hip_mtp_decode_bridge.hpp` | Qwen HTTP scheduling | to be governed |
+| `STRIX_GLM_PF_DENSE_FORM` | `src/glm/prefill/glm_prefill.hip` | GLM prefill | to be governed |
+| `STRIX_HOST_WAIT` | `src/device/hip_gate.cpp`, `src/device/hip_gate_none.cpp` | Shared device host-wait policy | to be governed |
+| `STRIX_MM_PF_MSA_FLASH` | `src/minimax/engine/engine.hip` | MiniMax prefill | to be governed |
+| `STRIX_MM_PF_MSA_FLASH_LAYERS` | `src/minimax/engine/engine.hip` | MiniMax prefill | to be governed |
+| `STRIX_MSA_TEST_FLASH` | `src/minimax/attn/msa_fused_tests.hip` | MiniMax attention qualification | to be governed |
+| `STRIX_PREFILL_FINAL_CONE` | `src/known_prefix_prefill_runtime.cpp` | Shared known-prefix prefill | to be governed |
+| `STRIX_PREFILL_FINAL_CONE_ROWS` | `src/known_prefix_prefill_runtime.cpp` | Shared known-prefix prefill | to be governed |
+| `STRIX_PROMPT_BATCH_LOG` | `apps/hip_mtp_decode_bridge.hpp` | Qwen HTTP scheduling | to be governed |
+
+`STRIX_GLM_ABA_FOLD` in `apps/glm_rank_main.cpp` instead uses `envcfg::flag`
+with exact matching: only `"1"` enables it, as before. `--update` removed
+`STRIX_CONSTRAINT_MASK_AHEAD`, `STRIX_CONSTRAINT_RANKED` and `STRIX_DS41_PF_CORE`
+because they are no longer read raw.
 
 ## Checklist
 

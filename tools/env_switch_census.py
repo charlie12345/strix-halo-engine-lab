@@ -12,6 +12,7 @@ Every switch read from the environment is one of:
     through env_flags.hpp or declared in a table, so the raw set can only shrink;
   * one boolean switch is read through the governed helpers with two different defaults.
 Baseline names that are no longer read raw are reported and removed with --update (never added by hand).
+--grandfather NAME... explicitly admits pre-introduction raw reads; never use it in the CMake test.
 
 --self-test runs the scanner on its fixtures (positive and negative).
 --report prints the counts; --tsv FILE writes one row per switch (name, class, read sites, documented).
@@ -178,8 +179,8 @@ def read_baseline(path: Path) -> set[str]:
 
 def write_baseline(path: Path, names: set[str], *, exclusive: bool = False) -> None:
     header = ("# Switches read with a raw getenv today (generated: tools/env_switch_census.py --update).\n"
-              "# This list only shrinks. A new switch is read through include/strix/env_flags.hpp or declared in a\n"
-              "# lever table (include/strix/lever.hpp); it is never added here.\n")
+              "# After introduction this list only shrinks. New switches use include/strix/env_flags.hpp or a\n"
+              "# lever table (include/strix/lever.hpp). Explicit introduction exceptions use --grandfather.\n")
     with path.open("x" if exclusive else "w", encoding="utf-8", newline="\n") as output:
         output.write(header + "".join(name + "\n" for name in sorted(names)))
 
@@ -191,6 +192,8 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--update", action="store_true", help="drop baseline names that are no longer read raw")
+    mode.add_argument("--grandfather", nargs="+", metavar="NAME",
+                      help="explicitly admit named pre-introduction switches currently read raw (not for CI)")
     mode.add_argument("--seed", action="store_true", help="write the baseline from the current tree (first use only)")
     mode.add_argument("--self-test", action="store_true", help="run the scanner on its fixtures")
     parser.add_argument("--report", action="store_true")
@@ -226,6 +229,17 @@ def main() -> int:
                   file=sys.stderr)
             return 2
         print(f"env switch census: baseline seeded with {len(raw)} raw switches")
+        return 0
+    if args.grandfather:
+        requested = set(args.grandfather)
+        invalid = sorted(requested - set(raw))
+        if invalid:
+            print(f"env switch census: cannot grandfather names not currently read raw: {', '.join(invalid)}",
+                  file=sys.stderr)
+            return 2
+        write_baseline(baseline_path, baseline | requested)
+        for name in sorted(requested - baseline):
+            print(f"env switch census: grandfathered {name} ({', '.join(sorted(raw[name]))})")
         return 0
     if args.update:
         write_baseline(baseline_path, baseline & set(raw))

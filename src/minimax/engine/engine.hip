@@ -506,6 +506,7 @@ struct Engine::Impl {
     std::vector<hipEvent_t> xb_attn_ev;  // per layer: q/k/v and index projections done (the warm's gate), re-recorded each step
     std::uint64_t xb_warm_o_count = 0;
     bool xb_prep = false;      // STRIX_MM_XB_PREP=1: the FFN post_exchange writes the next layer's q/k/v input transform (no prepare launch)
+    bool xb_fold = true;       // exchange row fold when the module has fold slots (STRIX_MMX_FOLD=rows)
     bool xb_prepped = false;   // the next q/k/v call's inputs were transformed by the post_exchange just enqueued
     unsigned xb_layers = 0;    // layers of the current layers_forward call (the fold needs a next layer)
     bool index_attn = true;  // STRIX_MM_INDEX_PROJ (runtime; default attn = index_proj, decode and prefill)
@@ -1478,6 +1479,9 @@ struct Engine::Impl {
             xb_tx = nullptr;
             xb_pt = {};
             xb_published = false;
+            // STRIX_MMX_FOLD=N (xport row fold): for at most N rows the pair sum p0 + p1 is computed by the exchange
+            // progress thread before the RX flag; post_exchange reads one folded slot (x = h + folded, same bits).
+            if (xb_fold && xf->can_fold(bytes)) xf->fold_next(strix::xport::RowFold::sum_f32);
             const auto xticket = inplace
                 ? backend.post_publish(tag, bytes, self_pub ? mx::Publish::producer : mx::Publish::kernel)
                 : backend.post_copy(tag, local, bytes);
@@ -1500,6 +1504,10 @@ struct Engine::Impl {
             wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
             pv.part0 = opt.rank == 0 ? local : peer;
             pv.part1 = opt.rank == 0 ? peer : local;
+            if (const void* folded = xf->last_folded()) {
+                pv.part0 = static_cast<const float*>(folded);
+                pv.part1 = nullptr;
+            }
             pv.weights = wts4_d;
             xb_prepped = false;
             if (xb_prep && which == 1 && layer + 1 < xb_layers && linears_opt) {  // fold the next layer's q/k/v prepare
@@ -3387,6 +3395,8 @@ void Engine::set_xb_inplace(bool on) { impl_->xb_inplace = on; }
 bool Engine::xb_inplace() const { return impl_->xb_inplace; }
 std::pair<std::uint64_t, std::uint64_t> Engine::xb_counts() const { return {impl_->xb_count[0], impl_->xb_count[1]}; }
 void Engine::set_xb_prep(bool on) { impl_->xb_prep = on; }
+void Engine::set_xb_fold(bool on) { impl_->xb_fold = on; }
+bool Engine::xb_fold() const { return impl_->xb_fold; }
 bool Engine::xb_prep() const { return impl_->xb_prep; }
 std::uint64_t Engine::xb_prep_count() const { return impl_->xb_count[2]; }
 void Engine::set_xb_publish(bool on) {

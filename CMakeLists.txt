@@ -389,7 +389,7 @@ target_include_directories(strix_xport INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_compile_features(strix_xport INTERFACE cxx_std_20)
 target_sources(strix_xport INTERFACE
     src/xport/borrowed_transport.hpp include/strix/dist/transport.hpp
-    src/xport/channel.hpp src/xport/channel_communicator.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
+    src/xport/channel.hpp src/xport/row_fold.hpp src/xport/channel_communicator.hpp src/xport/channel_device.hpp src/xport/wire.hpp src/xport/small_progress.hpp
     src/xport/transport_backend.hpp src/xport/staging.hpp src/xport/stats.hpp src/xport/backend.hpp src/xport/communicator_backend.hpp
     src/xport/ds41_adapter.hpp src/xport/kvshard_channel.hpp src/xport/kvshard_channel_hip.hpp
     include/strix/dist/host_wait.hpp include/strix/dist/transport_caps.hpp)
@@ -515,6 +515,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-xport-glm-wire-tests)
     add_test(NAME strix-xport-glm-wire-tests COMMAND strix-xport-glm-wire-tests)
     set_tests_properties(strix-xport-glm-wire-tests PROPERTIES LABELS "cpu;xport;exactness")
+    add_executable(strix-xport-row-fold-tests tests/xport_row_fold_tests.cpp)
+    target_link_libraries(strix-xport-row-fold-tests PRIVATE strix_xport)
+    strix_target_warnings(strix-xport-row-fold-tests)
+    add_test(NAME strix-xport-row-fold-tests COMMAND strix-xport-row-fold-tests)
+    set_tests_properties(strix-xport-row-fold-tests PROPERTIES LABELS "cpu;xport;exactness")
     add_executable(strix-xport-minimax-wire-tests tests/xport_minimax_wire_tests.cpp)
     target_link_libraries(strix-xport-minimax-wire-tests PRIVATE strix_xport)
     strix_target_warnings(strix-xport-minimax-wire-tests)

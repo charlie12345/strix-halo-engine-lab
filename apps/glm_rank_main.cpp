@@ -1216,8 +1216,12 @@ int main(int argc, char** argv) {
                 const bool b = k % 2 == 1;
                 // STRIX_GLM_ABA_XBPUB=1: the same series over the decode producer publication instead (A off, B on).
                 static const bool xbpub = std::getenv("STRIX_GLM_ABA_XBPUB") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_XBPUB")) == "1";
+                // STRIX_GLM_ABA_FOLD=1: the same series over the exchange row fold (A off, B on; needs STRIX_GLMX_FOLD=rows).
+                static const bool xfold = std::getenv("STRIX_GLM_ABA_FOLD") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_FOLD")) == "1";
                 if (xbpub) {
                     ge::set_decode_producer_publish(b ? 1 : 0);
+                } else if (xfold) {
+                    strix::glm::xfer::XferExchange::set_fold_enabled(b);
                 } else {
                     TB::set_table_enabled(b);
                     if (b) FA::set_scores_auto();
@@ -1247,6 +1251,7 @@ int main(int argc, char** argv) {
             TB::set_table_enabled(true);
             FA::set_scores_auto();
             ge::set_decode_producer_publish(-1);
+            strix::glm::xfer::XferExchange::set_fold_enabled(true);
         }
         // --aba-xch N: in-process A B A B A B A of the decode exchange, A = CommExchange (the Communicator), B =
         // XferExchange borrowing the communicator's transport (one load, same session). Per run: reset slots 0..R-1 and

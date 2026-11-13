@@ -1016,14 +1016,16 @@ struct MaskCache {
     std::list<Entry> lru;
     std::unordered_multimap<std::size_t, std::list<Entry>::iterator> index;
     std::size_t used = 0, budget;
+    ConstraintMemoStats totals;
     explicit MaskCache(std::size_t bytes) : budget(bytes) {}
     bool get(const std::string& key, AllowedTokens& mask) {
         std::lock_guard lock(mutex);
         const auto [first, last] = index.equal_range(std::hash<std::string>{}(key));
         for (auto it = first; it != last; ++it) if (it->second->key == key) {
             mask = it->second->mask;
-            lru.splice(lru.begin(), lru, it->second); return true;
+            lru.splice(lru.begin(), lru, it->second); ++totals.hits; return true;
         }
+        ++totals.misses;
         return false;
     }
     void put(std::string key, std::shared_ptr<const unsigned char> trie, const AllowedTokens& mask) {
@@ -1312,6 +1314,8 @@ struct ConstraintProgramCache::Impl {
     std::list<Entry> lru; // most recently used first
     std::unordered_multimap<std::size_t, std::list<Entry>::iterator> index;
     ConstraintProgramCacheStats totals;
+    void (*before_compile)(void*) = nullptr;
+    void* compile_context = nullptr;
 
     std::list<Entry>::iterator find(std::size_t hash, const std::string& key) {
         const auto [first, last] = index.equal_range(hash);
@@ -1325,14 +1329,18 @@ struct ConstraintProgramCache::Impl {
         return lru.erase(entry);
     }
     // Finished entries leave from the cold end; an entry that is still compiling has waiters and stays.
-    void trim() {
+    bool reserve(std::size_t bytes) {
+        const auto fits = [&] {
+            return lru.size() < config.max_programs && totals.key_bytes <= config.key_bytes - bytes;
+        };
         auto it = lru.end();
-        while (it != lru.begin() && (lru.size() > config.max_programs || totals.key_bytes > config.key_bytes)) {
+        while (it != lru.begin() && !fits()) {
             --it;
             if (!it->ready) continue;
             it = erase(it);
             ++totals.evictions;
         }
+        return fits();
     }
     static void field(std::string& key, std::size_t value) { key += std::to_string(value); key.push_back(','); }
     static std::string key_of(const Json& schema, const ConstraintLimits& l) {
@@ -1347,6 +1355,7 @@ struct ConstraintProgramCache::Impl {
         return key;
     }
     Program compile(const Json& schema, const ConstraintLimits& limits, bool cached) {
+        if (before_compile) before_compile(compile_context);
         ConstraintLimits effective = limits;
         if (cached && effective.mask_cache_bytes == 0) effective.mask_cache_bytes = config.mask_cache_bytes;
         return std::make_shared<const ConstraintProgram>(compile_json_schema(schema, effective));
@@ -1355,8 +1364,13 @@ struct ConstraintProgramCache::Impl {
 // The limits struct is serialized field by field into the key; a new field must be added there too.
 static_assert(sizeof(ConstraintLimits) == 12 * sizeof(std::size_t), "ConstraintProgramCache key: add the new limit");
 
-ConstraintProgramCache::ConstraintProgramCache(ConstraintProgramCacheConfig config) : impl_(std::make_unique<Impl>()) {
+ConstraintProgramCache::ConstraintProgramCache(ConstraintProgramCacheConfig config)
+    : ConstraintProgramCache(config, nullptr, nullptr) {}
+ConstraintProgramCache::ConstraintProgramCache(ConstraintProgramCacheConfig config, void (*before_compile)(void*), void* context)
+    : impl_(std::make_unique<Impl>()) {
     impl_->config = config;
+    impl_->before_compile = before_compile;
+    impl_->compile_context = context;
 }
 ConstraintProgramCache::~ConstraintProgramCache() = default;
 const ConstraintProgramCacheConfig& ConstraintProgramCache::config() const { return impl_->config; }
@@ -1398,9 +1412,19 @@ std::shared_ptr<const ConstraintProgram> ConstraintProgramCache::json_schema(con
             return program.get(); // rethrows the compilation error of the request that started it
         }
         ++impl.totals.misses;
-        impl.totals.key_bytes += key.size();
+        if (!impl.reserve(key.size())) {
+            ++impl.totals.uncached;
+            lock.unlock();
+            return impl.compile(schema, limits, false);
+        }
         impl.lru.push_front({key, promise.get_future().share(), false});
-        impl.index.emplace(hash, impl.lru.begin());
+        try {
+            impl.index.emplace(hash, impl.lru.begin());
+        } catch (...) {
+            impl.lru.pop_front();
+            throw;
+        }
+        impl.totals.key_bytes += key.size();
     }
     const auto begin = std::chrono::steady_clock::now();
     const auto elapsed = [&] {
@@ -1412,7 +1436,6 @@ std::shared_ptr<const ConstraintProgram> ConstraintProgramCache::json_schema(con
         impl.totals.compile_ns += elapsed();
         impl.find(hash, key)->ready = true;
         promise.set_value(program);
-        impl.trim();
         return program;
     } catch (...) {
         std::lock_guard lock(impl.mutex);
@@ -1430,6 +1453,8 @@ ConstraintProgramCache& shared_constraint_program_cache() {
         if (!enabled) config.max_programs = 0;
         config.mask_cache_bytes = static_cast<std::size_t>(
             env_bytes("STRIX_CONSTRAINT_MASK_MEMO_BYTES", config.mask_cache_bytes, 0, std::uint64_t{1} << 30U));
+        envcfg::record("STRIX_CONSTRAINT_MASK_MEMO_BYTES", envcfg::text("STRIX_CONSTRAINT_MASK_MEMO_BYTES"),
+                       std::to_string(config.mask_cache_bytes));
         return config;
     }());
     return cache;
@@ -1498,6 +1523,12 @@ struct ConstraintAccess {
     static auto identity(const TokenByteTrie& t) { return t.identity_; }
     static const auto& state(const ConstraintCursor& c) { return *c.state_; }
 };
+ConstraintMemoStats ConstraintProgram::memo_stats() const {
+    const auto cache = ConstraintAccess::cache(*this);
+    if (!cache) return {};
+    std::lock_guard lock(cache->mutex);
+    return cache->totals;
+}
 namespace {
 std::optional<AllowedTokens> walk_allowed(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie,
                                           std::span<const std::uint32_t> eos_ids, const std::atomic<bool>* stop);

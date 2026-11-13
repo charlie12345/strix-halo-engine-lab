@@ -43,7 +43,10 @@ struct ConstraintCompilationStats {
     std::size_t expansion_stack_high_water = 0;
     std::size_t compilation_steps = 0;
 };
+struct ConstraintMemoStats { std::uint64_t hits = 0, misses = 0; };
 class ConstraintProgram {
+public:
+    ConstraintMemoStats memo_stats() const;
 private:
     friend ConstraintProgram compile_json_schema(const Json&, const ConstraintLimits&, ConstraintCompilationStats*);
     explicit ConstraintProgram(std::shared_ptr<const ConstraintData> data) : data_(std::move(data)) {}
@@ -77,6 +80,7 @@ ConstraintProgram compile_json_object();
 //   bound  : at most max_programs entries and key_bytes of retained schema text, least recently used out
 //            first; each cached program has a mask memo of mask_cache_bytes unless the caller's limits
 //            name their own. A schema whose text exceeds a quarter of key_bytes is compiled and not kept.
+//            Pending entries count toward both bounds; if they fill the cache, new keys are not kept.
 //   errors : a failed compilation throws what compile_json_schema() throws and is not kept.
 // Concurrent requests for a schema that is being compiled wait for that one compilation.
 struct ConstraintProgramCacheConfig {
@@ -90,7 +94,7 @@ struct ConstraintProgramCacheStats {
     std::uint64_t misses = 0;     // compiled here
     std::uint64_t failures = 0;   // compilations that threw
     std::uint64_t evictions = 0;
-    std::uint64_t uncached = 0;   // compiled without an entry (sharing off or schema text too large)
+    std::uint64_t uncached = 0;   // compiled without an entry (disabled, oversized, or pending capacity)
     std::uint64_t compile_ns = 0; // time in compile_json_schema() over all misses
     std::size_t programs = 0, key_bytes = 0;
 };
@@ -108,6 +112,9 @@ public:
     const ConstraintProgramCacheConfig& config() const;
     void clear(); // drops finished entries; requests keep the programs they hold
 private:
+    friend struct ConstraintProgramCacheTestAccess;
+    // A per-instance compilation barrier for deterministic host tests; never set by serving.
+    ConstraintProgramCache(ConstraintProgramCacheConfig, void (*before_compile)(void*), void* context);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -146,7 +153,7 @@ private:
     std::size_t vocab_size_ = 0;
     std::vector<Node> nodes_{1};
     std::vector<bool> members_;
-    std::shared_ptr<const unsigned char> identity_ = std::make_shared<const unsigned char>(0);
+    std::shared_ptr<const unsigned char> identity_ = std::make_shared<const unsigned char>(static_cast<unsigned char>(0));
     friend struct ConstraintAccess;
 };
 struct AllowedTokens {

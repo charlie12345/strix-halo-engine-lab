@@ -595,13 +595,17 @@ Schema programs are shared between requests (`ConstraintProgramCache`, default o
 does not depend on the request, so requests with the same schema and limits use one program: the schema is
 compiled once, and concurrent requests for a schema that is being compiled wait for that one compilation.
 The key is the semantics version, every limit and the schema text (`Json::dump()`), compared in full; the
-cache holds at most 16 programs, least recently used out first, and a failed compilation is not kept.
+cache holds at most 16 entries and 4 MiB of keys, including pending compilations. Ready entries leave
+least recently used first; when pending entries fill either bound, new keys compile without retention.
+A failed compilation is not kept. These bounds cover cache retention, not programs still held by requests.
 Each shared program carries a mask memo (`STRIX_CONSTRAINT_MASK_MEMO_BYTES`, 8 MiB by default, `0` off)
 keyed by the exact serialized cursor state and the identity of the token trie, so a request that reaches a
 state another request with the same tokenizer already walked takes the stored mask instead of walking the
 trie again. The cursor, the output budget and the EOS overlay stay per request, and the masks are the ones
 a per-request compilation produces (`strix-serve-json-constraint-tests`; `--bench-program-cache` measures
-compile, first mask and first string-state mask for repeated identical-schema requests).
+compile, first mask and first string-state mask for repeated identical-schema requests). Both cache
+settings resolve once on first use and enter the environment registry then; startup inspection before
+that point does not report them.
 
 Masks one step ahead (default on; `STRIX_CONSTRAINT_MASK_AHEAD=0` turns it off) covers the requests that
 still walk one mask per answer row: scores (`logprobs`), logit transforms, and `--http-selection-fast

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/deepseek41_attention_state.hpp"
+#include "strix/session/embed_splice.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -287,6 +288,21 @@ public:
     // cache, so the next run's read is served from host memory (the same bytes; nothing else changes). A next run with
     // other tokens or boundaries reads what the cache misses as before. STRIX_DS41_ENGRAM_LOOKAHEAD=0: ignored.
     void set_engram_lookahead(std::span<const std::uint32_t> next);
+    // Provided embedding rows of the next run (run / extend / begin_run / begin_extend; one run only): the run's rows
+    // named by the splice take their layer-0 input from it instead of the embedding table (every residual stream
+    // copy; width = hidden size; checked before the run computes anything, std::invalid_argument). The run's `tokens`
+    // hold a vocabulary id for those rows too (session::resolve_embed_run gives both). Rows of a segment with
+    // `extras` are image rows: the routers use their image bias and the Engram treats them as dead n-gram
+    // positions; a segment without it is handled exactly as the token rows it replaces. Positions are the prompt
+    // index, as for text. A caller that keeps a token history for import_state / the decode engines marks image
+    // rows with ds41::engram_dead_token. With two ranks both must be given the same splice. Not during a task.
+    void set_embed_rows(session::EmbedSplice splice);
+    // The embedding table's rows of `tokens`, [tokens][hidden] IEEE binary16 bits (identity gates of the splice).
+    [[nodiscard]] std::vector<std::uint16_t> embedding_rows(std::span<const std::uint32_t> tokens) const;
+    // Device bytes the splice staging can reach for runs with at most `rows` provided rows.
+    [[nodiscard]] static constexpr std::uint64_t embed_staging_bytes(std::uint64_t rows, std::uint64_t hidden) noexcept {
+        return session::embed_splice_staging_bytes(rows, hidden) + 256U;
+    }
     // The next run (run / extend / begin) is followed by `next_rows` more rows of the same sequence and nobody reads its
     // decode state, logits or seed: its decoder layers then skip their cone (only the first decoder layer's compressed-KV /
     // index-key entries of every row, which the later runs read, are computed). Admitted only for the full layer set with

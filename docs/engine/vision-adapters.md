@@ -132,3 +132,44 @@ and in the attention operands, or a judgement on the language model's output ins
 Measured tower time on one node (warm, no per-layer synchronisation): 111 ms for 1,521 patches (the minimum
 image), 388 ms for 3,888, 1,907 ms for 9,216 (the token cap); about 2.1 x, 1.8 x and 1.4 x that with split
 activations. The aligner adds 22 to 83 ms.
+
+## Image rows in the language model prefill
+
+An encoded image reaches the language model as rows of its hidden width that replace the embedding-table rows of
+part of a prefill run. The mechanism is shared; a family only states its per-row extras.
+
+| Piece | Where | What it does |
+|---|---|---|
+| `vision::span_embed_rows` | `include/strix/vision/embed_span.hpp` | `layout()` + the rows of `encode_cached` become one `session::EmbedRows` (roles, positions, the token id the rows stand for) |
+| `session::resolve_embed_run` | `include/strix/session/embed_splice.hpp` | the ids of one run become vocabulary ids plus an `EmbedSplice`: segments of consecutive run rows that read consecutive provided rows, checked against the family's rules (width, row order, positions, deep rows) |
+| `session::enqueue_embed_splice` | `src/session/embed_splice.hip` | device copy of one segment into the layer-0 input, BF16 or binary16 to FP32, into every residual stream copy of a row; no index arrays |
+
+A run without a virtual id resolves to the same ids and an empty splice, and the embed stage then launches and
+uploads nothing: text prompts are unchanged bit for bit.
+
+### DeepSeek V4.1
+
+`DevicePrefill::set_embed_rows(splice)` names the provided rows of the next run. The run looks every token up as
+before, overwrites the spliced rows, and for segments marked `extras` (every row of an image span: start, image,
+row ends, end)
+
+- sets the per-row image flag, so the routers add their image bias for those rows;
+- treats the rows as dead n-gram positions: no Engram n-gram reads through one, and its own n-grams are padding.
+  A token history kept for the decode engines marks such rows with `ds41::engram_dead_token`.
+
+Positions are the prompt index, as for text; `resolve_embed_run` refuses a span that is not in row order. A
+segment without `extras` is handled exactly as the token rows it replaces, which is what the identity gate uses:
+
+```
+strix-deepseek41-prefill MODEL.gguf --prompt IDS --rows N --layers L --embed-identity A:B
+```
+
+runs the prompt once from the table and then with rows `[A, B)` provided: the table's own rows must reproduce
+every bit (logits, next token, stream hashes, attention state), shifted rows must change the logits, rows cut to
+eight significant bits must give the same bits as binary16 and as BF16, and a text run after an image run must
+again equal the first.
+
+Memory: `deepseek41::vision_memory` (`src/deepseek41/vision_splice.hpp`) lists the device bytes image input adds
+once per rank (tower panels and workspace from `vision::plan`, the aligner panels, the splice staging at the
+longest run) and the host bytes of one largest image; `add_vision_capacity` adds them to the pools of a slot
+capacity report. No served route enables image input yet.

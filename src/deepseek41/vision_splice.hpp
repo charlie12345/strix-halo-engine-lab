@@ -36,10 +36,11 @@ struct VisionMemory {
     std::uint64_t tower_workspace = 0;   // vision::plan: fixed + MLP chunk buffers at the largest image
     std::uint64_t projector_panels = 0;  // aligner panels, built on the first projection (not in vision::plan)
     std::uint64_t splice_staging = 0;    // DevicePrefill staging of provided rows, at its bound
+    std::uint64_t splice_growth = 0;     // old allocation remains live while replacement is allocated
     // host, per image a lane references (EmbedTable rows; the EmbedCache has its own budget)
     std::uint64_t rows_per_image = 0;
     [[nodiscard]] std::uint64_t device_once() const noexcept {
-        return tower_weights + tower_workspace + projector_panels + splice_staging;
+        return tower_weights + tower_workspace + projector_panels + splice_staging + splice_growth;
     }
 };
 
@@ -53,6 +54,7 @@ struct VisionMemory {
     m.tower_workspace = p.workspace_bytes();
     m.projector_panels = adapter.projector_weight_elements() * 2U;
     m.splice_staging = session::embed_splice_staging_bytes(max_run_rows, c.projection_size) + 256U;
+    m.splice_growth = m.splice_staging;  // conservative peak: both allocations can approach the bound
     m.rows_per_image = std::uint64_t{adapter.max_span_rows()} * c.projection_size * 2U;
     return m;
 }

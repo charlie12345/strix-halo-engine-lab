@@ -1860,11 +1860,30 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         if (m.hasher->positions() != P0) throw std::logic_error("deepseek41 prefill: Engram history out of step");
         const std::uint32_t per_token = m.hasher->layers() * engram_cols;
         std::vector<std::uint64_t> ids(std::size_t{T} * per_token), one(per_token);  // [row][layer][column] of this run
+        // Gate only: plain history is the negative control; a full padding sequence is the dead-row oracle.
+        std::optional<ds41::EngramHasher> plain_hasher;
+        std::vector<std::uint64_t> padding_row, plain_row;
+        bool dead_matches = true, dead_differs = false;
+        if (m.options.verify_embed_extras && !embeds.empty()) {
+            plain_hasher = *m.hasher;
+            plain_row.resize(per_token);
+            ds41::EngramHasher padding(m.model.engram);
+            const auto all = padding.hash_sequence(std::vector<std::uint32_t>(m.model.engram.max_ngram_size, m.model.engram.pad_id));
+            padding_row.assign(all.end() - per_token, all.end());
+        }
         for (std::uint32_t t = 0; t < T; ++t) {
             // a provided (image) row is a dead n-gram position
             m.hasher->push(!embed_extras.empty() && embed_extras[t] != 0U ? ds41::engram_dead_token(tokens[t]) : tokens[t], one);
+            if (plain_hasher) {
+                plain_hasher->push(tokens[t], plain_row);
+                if (embed_extras[t] != 0U) {
+                    dead_matches = dead_matches && one == padding_row;
+                    dead_differs = dead_differs || one != plain_row;
+                }
+            }
             std::copy(one.begin(), one.end(), ids.begin() + static_cast<std::ptrdiff_t>(std::size_t{t} * per_token));
         }
+        result.embed_dead_hash_checked = dead_matches && dead_differs;
         for (std::uint32_t li = 0; li < m.model.engram.layer_ids.size(); ++li) {
             if (m.model.engram.layer_ids[li] >= m.options.layers) continue;
             engram_layers.push_back(li);
@@ -2025,8 +2044,33 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             embed_local[global_row[l]] = l;
             if (!embed_extras.empty()) embed_flags[l] = embed_extras[global_row[l]];
         }
+        // A shorter replacement must also erase flags beyond its own rows before declaring the buffer clean.
+        if (m.image_rows_set) m.image_rows.zero(st);
         if (Tn != 0U) m.image_rows.upload(embed_flags, st);
         m.image_rows_set = std::find(embed_flags.begin(), embed_flags.end(), std::uint8_t{1}) != embed_flags.end();
+        if (m.options.verify_embed_extras && m.image_rows_set) {
+            // Known-effect fixture on an actual uploaded image flag: zero scores, text selects 0, image selects 1.
+            const auto at = static_cast<std::size_t>(std::find(embed_flags.begin(), embed_flags.end(), std::uint8_t{1}) - embed_flags.begin());
+            Dev<float> x(256), weight(256 * 256), bias(256), image_bias(256), scores(256), weights(1);
+            Dev<std::uint32_t> selected(1);
+            x.zero(st);
+            weight.zero(st);
+            std::vector<float> b(256, 0.0F), bi(256, 0.0F);
+            b[0] = 2.0F;
+            bias.upload(b, st);
+            bi[1] = 2.0F;
+            image_bias.upload(bi, st);
+            ds41::RouterView v;
+            v.x = x.p; v.weight = weight.p; v.bias = bias.p; v.bias_image = image_bias.p;
+            v.image_rows = m.image_rows.p + at;
+            v.rows = 1; v.hidden = 256; v.experts = 256; v.top_k = 1;
+            v.scores = scores.p; v.ids = selected.p; v.weights = weights.p;
+            ds41::enqueue_prefill_router(v, st);
+            const auto image_id = download(selected.p, 1, st).front();
+            v.image_rows = nullptr;
+            ds41::enqueue_prefill_router(v, st);
+            result.embed_image_router_checked = image_id == 1U && download(selected.p, 1, st).front() == 0U;
+        }
         std::size_t embed_at = 0;
         for (const auto& seg : embeds.segments)
             for (std::uint32_t i = 0; i < seg.rows; ++i)

@@ -83,6 +83,7 @@ struct PrefillOptions {
     bool expert_tp = false;
     bool engram_direct_io = true;        // Engram rows from the NVMe with O_DIRECT (else the file mapping)
     bool stream_hashes = false;          // FNV of the last row's residual stream after each layer (gate against decode)
+    bool verify_embed_extras = false;    // identity gate only: independent dead-hash and device image-router probes
     bool gather_logits = true;           // world 2: exchange the vocabulary slices so both ranks hold every logit
     bool timing = false;                 // per-layer wall times (synchronises at every layer end)
     // Exact suffix replay (the full 40 layers only): decoder layers compute only the cone of rows the final state and
@@ -138,6 +139,7 @@ struct PrefillResult {
     std::uint32_t next_token = 0;
     bool decoder_deferred = false;     // set_decoder_deferral admitted: no logits / next token / seed, decode state completed by the next run
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
+    bool embed_dead_hash_checked = false, embed_image_router_checked = false; // verify_embed_extras evidence
     double seconds = 0.0, engram_seconds = 0.0, head_seconds = 0.0;
     double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the Engram layers)
     std::vector<PrefillLayerTiming> layers;

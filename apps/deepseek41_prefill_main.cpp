@@ -91,6 +91,11 @@ struct Args {
     std::uint32_t ttft_warmup = 0, ttft_decode = 0;
 };
 
+void validate_embed_identity_args(const Args& a) {
+    if (a.embed_identity && (a.ttft || a.world != 1U))
+        throw std::invalid_argument("--embed-identity requires --world 1 without --ttft-timing");
+}
+
 // --ttft-timing: wall time of each stage (host clock), printed as "ttft <stage>: <ms since the previous line> ms (at <ms
 // since main> ms)".
 struct TtftClock {
@@ -248,7 +253,8 @@ strix::deepseek41::PrefillOptions options(const Args& a, std::size_t rows) {
     o.tp_attention = a.tp;
     o.row_split = a.row_split;
     o.stream_experts = a.stream_experts;
-    o.stream_hashes = a.reference || !a.hashes_out.empty();
+    o.stream_hashes = a.embed_identity || a.reference || !a.hashes_out.empty();
+    o.verify_embed_extras = a.embed_identity;
     o.timing = a.timing;
     o.cone = a.cone;
     o.routing_loads = a.loads;
@@ -540,7 +546,7 @@ int task_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, const std::v
 //              stream hashes, the attention state hashes)
 //   control  : the rows of the neighbouring tokens -> must differ (the splice is what the layers read)
 //   bf16     : rows cut to 8 significant bits, once as binary16 and once as BF16 -> equal to each other
-//   image    : the table's rows as image rows (image router bias, dead n-gram positions) -> runs, reported
+//   image    : finite logits, independent image-router and dead-hash evidence, and an observable image effect
 //   text     : the plain prompt after the image run -> every bit of the first plain run
 // Exit code 0 only when all of them hold.
 int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, const std::vector<std::uint32_t>& prompt,
@@ -548,6 +554,8 @@ int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, co
     namespace ss = strix::session;
     const std::uint32_t A = a.embed_a, B = a.embed_b;
     if (A >= B || B > prompt.size()) throw std::invalid_argument("--embed-identity: need A < B <= rows");
+    if (a.layers == 0U || ref.stream_hashes.size() != a.layers)
+        throw std::runtime_error("--embed-identity: missing reference stream hashes");
     const auto fnv = [](const auto& v) -> std::uint64_t {  // logits, or the labelled state hashes
         std::uint64_t h = 14695981039346656037ULL;
         const auto mix = [&h](std::uint64_t b, int bytes) {
@@ -587,6 +595,8 @@ int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, co
         }
         Out o;
         o.r = pre.run(prompt);
+        if (o.r.stream_hashes.size() != a.layers)
+            throw std::runtime_error("--embed-identity: missing arm stream hashes");
         o.state = pre.state_hashes();
         std::printf("embed-identity %-8s next %u logits %016llx state %016llx\n", name, o.r.next_token,
                     static_cast<unsigned long long>(fnv(o.r.logits)), static_cast<unsigned long long>(fnv(o.state)));
@@ -608,9 +618,11 @@ int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, co
     std::vector<std::uint16_t> shifted(rows.size());  // row i <- the row of token i + 1 (cyclic)
     for (std::uint32_t i = 0; i < B - A; ++i)
         std::memcpy(shifted.data() + std::size_t{i} * width, rows.data() + std::size_t{(i + 1U) % (B - A)} * width, std::size_t{width} * 2U);
-    const bool movable = shifted != rows;  // one distinct token only: nothing to tell apart
+    const bool movable = shifted != rows;  // an unchanged control cannot establish substitution
     const Out control = run("control", &shifted, ss::EmbedRowFormat::f16, false);
-    verdict("control", !movable || std::memcmp(control.r.logits.data(), ref.logits.data(), ref.logits.size() * sizeof(float)) != 0);
+    verdict("control", movable && control.r.logits.size() == ref.logits.size() &&
+                       std::memcmp(control.r.logits.data(), ref.logits.data(), ref.logits.size() * sizeof(float)) != 0);
+    if (!movable) std::printf("embed-identity control inconclusive: choose an interval with distinct embedding rows\n");
 
     std::vector<std::uint16_t> cut(rows.size()), cut_bf16(rows.size());
     for (std::size_t i = 0; i < rows.size(); ++i) {
@@ -637,12 +649,26 @@ int embed_identity_gate(const Args& a, strix::deepseek41::DevicePrefill& pre, co
     const Out image = run("image", &rows, ss::EmbedRowFormat::f16, true);
     bool finite = !image.r.logits.empty();
     for (const float v : image.r.logits) finite = finite && std::isfinite(v);
-    verdict("image", finite);
+    verdict("image-router", image.r.embed_image_router_checked);
+    verdict("image-dead", image.r.embed_dead_hash_checked);
+    verdict("image", finite && !same(image, ref, ref_state));
     std::printf("embed-identity image    logits %s the plain run\n",
                 fnv(image.r.logits) == fnv(ref.logits) ? "equal to" : "differ from");
 
+    // Keep the same allocation: long image -> short text -> long text must restore the original result.
+    if (prompt.size() > 1U) (void)pre.run(std::span<const std::uint32_t>(prompt.data(), prompt.size() / 2U));
     const Out text = run("text", nullptr, ss::EmbedRowFormat::bf16, false);
     verdict("text", same(text, ref, ref_state));
+    (void)run("image-again", &rows, ss::EmbedRowFormat::f16, true);
+    if (prompt.size() > 1U) {
+        ss::EmbedSplice short_splice;
+        short_splice.width = width;
+        short_splice.format = ss::EmbedRowFormat::f16;
+        short_splice.segments.push_back({0, 1, rows.data(), false});
+        pre.set_embed_rows(std::move(short_splice));
+        (void)pre.run(std::span<const std::uint32_t>(prompt.data(), prompt.size() / 2U));
+    }
+    verdict("text-after-short-splice", same(run("text", nullptr, ss::EmbedRowFormat::bf16, false), ref, ref_state));
     std::printf("embed-identity rows [%u, %u) of %zu, width %u, staging %.2f MiB: %s\n", A, B, prompt.size(), width,
                 static_cast<double>(strix::deepseek41::DevicePrefill::embed_staging_bytes(B - A, width)) / 1048576.0,
                 bad == 0 ? "PASS" : "FAIL");
@@ -971,6 +997,7 @@ int main(int argc, char** argv) try {
         else throw std::invalid_argument("unknown argument " + s);
     }
     if (a.model.empty() || a.prompt_path.empty()) throw std::invalid_argument("usage: strix-deepseek41-prefill MODEL.gguf --prompt FILE ...");
+    validate_embed_identity_args(a);
     if (!a.task_levels.empty() && a.mem_guard_gib > 0.0 && std::getenv("STRIX_DS41_PREFILL_MEM_GUARD_GIB") == nullptr)  // the prefill checks its exact bytes too
         ::setenv("STRIX_DS41_PREFILL_MEM_GUARD_GIB", std::to_string(a.mem_guard_gib).c_str(), 1);
     ttft_clock.on = a.ttft;

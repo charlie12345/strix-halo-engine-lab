@@ -165,11 +165,20 @@ strix-deepseek41-prefill MODEL.gguf --prompt IDS --rows N --layers L --embed-ide
 ```
 
 runs the prompt once from the table and then with rows `[A, B)` provided: the table's own rows must reproduce
-every bit (logits, next token, stream hashes, attention state), shifted rows must change the logits, rows cut to
-eight significant bits must give the same bits as binary16 and as BF16, and a text run after an image run must
-again equal the first.
+every bit (logits, next token, one stream hash per layer, attention state). Shifted rows must change the logits;
+one-row or identical-row controls fail as inconclusive. Rows cut to eight significant bits must give the same
+bits as binary16 and as BF16. The image arm requires finite logits and an observable change, plus independent
+checks: actual dead-position hashes equal a full-padding oracle and differ from plain history; a device router
+fixture using an uploaded image flag selects expert 1 with image bias and expert 0 with text bias. These are
+internal wiring checks, not model-fidelity qualification. Long text after an image run and a shorter text run
+must equal the first run, also when the shorter run has an extras-disabled splice. Choose an interval extending
+beyond the prompt midpoint to exercise the stale-tail case. Stream hashes are enabled automatically.
+The gate rejects `--ttft-timing` and worlds other than 1 before loading assets.
+
+Image serving remains unqualified: span-role and dead-position semantics need model-contract evidence.
+Extend boundaries, cancellation, two-rank splitting and old-binary text equality need separate qualification.
 
 Memory: `deepseek41::vision_memory` (`src/deepseek41/vision_splice.hpp`) lists the device bytes image input adds
 once per rank (tower panels and workspace from `vision::plan`, the aligner panels, the splice staging at the
-longest run) and the host bytes of one largest image; `add_vision_capacity` adds them to the pools of a slot
+longest run plus a conservative second staging allocation during growth) and the host bytes of one largest image; `add_vision_capacity` adds them to the pools of a slot
 capacity report. No served route enables image input yet.

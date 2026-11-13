@@ -104,7 +104,8 @@ void memory_terms() {
     CHECK(m.projector_panels / (1U << 20U) == 140);  // (9216 + 5120) x 5120 FP16
     CHECK(m.splice_staging == 4096ULL * 5120U * 2U + 256U);
     CHECK(m.rows_per_image == std::uint64_t{adapter.max_span_rows()} * 5120U * 2U);
-    CHECK(m.device_once() == m.tower_weights + m.tower_workspace + m.projector_panels + m.splice_staging);
+    CHECK(m.splice_growth == m.splice_staging);
+    CHECK(m.device_once() == m.tower_weights + m.tower_workspace + m.projector_panels + 2U * m.splice_staging);
 
     const std::uint64_t GiB = 1ULL << 30U;
     serve::CapacityPool device{"device", 8 * GiB, 1 * GiB, {GiB / 4, 0}};

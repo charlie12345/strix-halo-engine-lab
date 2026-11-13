@@ -2,6 +2,7 @@
 
 #include "strix/serve/chat_template.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/power/sampler.hpp"
 #include "strix/serve/json_constraint.hpp"
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
@@ -289,6 +290,7 @@ struct RecentRequest {
     std::optional<double> first_token_ms;
     std::uint64_t imported = 0;
     std::string response_id;
+    std::string power;  // strix-power-receipt-v1 of the request (empty: no readable power source)
 };
 
 std::vector<std::string> stop_strings(const Json* stop) {
@@ -406,6 +408,8 @@ struct ApiService::Impl {
     std::string state = "idle";
     std::uint64_t requests_total = 0, requests_failed = 0;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    // The shared power sampler runs from server start (a device bind has usually started it already).
+    const bool power_started = (power::start_process_sampler(), true);
     const std::string instance = random_id("").substr(0, 16);  // this process's engine instance, chosen once (status, metrics)
     const std::int64_t start_unix = unix_now();
     std::int64_t armed_unix = 0;  // when this service armed the instrumentation's current period (0: armed elsewhere)
@@ -1256,13 +1260,21 @@ struct ApiService::Impl {
         if (!config.compact_chat_envelope || config.timed_completion_envelope) usage.set("prompt_tokens_details", std::move(details));
         return usage;
     }
-    Json timing_data(const std::string& note) const {
+    // Shared power receipt of a finished request: its decode and prefill windows, counted back from now.
+    static std::string power_receipt(const Outcome& o) {
+        if (!power::process_sampler()) return {};
+        const auto computed = o.stats.prompt_tokens - std::min(o.stats.prompt_tokens, o.stats.cached_tokens + o.stats.imported_tokens);
+        return power::block_json(power::request_block(power::Sampler::now_ns(), power::Phase{o.stats.prefill_ms, computed},
+                                                      power::Phase{o.stats.decode_ms, o.output_tokens}));
+    }
+    Json timing_data(const std::string& note, const Outcome* o = nullptr) const {
         auto data = api_request_scope ? api_request_scope->observation.terminal.timings : Json::object();
         if (!note.empty()) data.set("sampling_note", Json(note));
+        if (o && data.is_object()) if (const auto text = power_receipt(*o); !text.empty()) data.set("power", parse_json(text));
         return data;
     }
     void completion_data(Json& out, const Outcome& o, const Json& body, const std::string& note, bool timings = true) const {
-        if (timings) out.set("timings", timing_data(note));
+        if (timings) out.set("timings", timing_data(note, &o));
         if (bool_or(body, "return_token_ids", false)) {
             Json ids = Json::array();
             for (auto id : o.token_ids) ids.push(Json(static_cast<std::uint64_t>(id)));
@@ -1787,7 +1799,7 @@ struct ApiService::Impl {
             usage.set("input_tokens_details", std::move(details)); usage.set("output_tokens", Json(o.output_tokens));
             usage.set("output_tokens_details", Json::object()); usage.set("total_tokens", Json(o.stats.prompt_tokens + o.output_tokens));
             out.set("usage", std::move(usage)); out.set("strix", config.stream_receipts || spec ? receipt(run, note, chat, limit, params, spec) : engine_json(o, note, chat));
-            if (run && config.timed_completion_envelope) out.set("timings", timing_data(note));
+            if (run && config.timed_completion_envelope) out.set("timings", timing_data(note, &o));
             return out;
         };
         // a call whose frame did not close (cut by the budget, a stop string or EOS) is not marked completed
@@ -2175,7 +2187,7 @@ struct ApiService::Impl {
             out.set("stop_sequence", outcome.matched.empty() ? Json() : Json(outcome.matched));
             out.set("usage", usage(outcome));
             out.set("strix", (config.stream_receipts ? receipt(&outcome, note, body, limit, sampling_params) : engine_json(outcome, note, body)));
-            if (config.timed_completion_envelope) out.set("timings", timing_data(note));
+            if (config.timed_completion_envelope) out.set("timings", timing_data(note, &outcome));
             response.send(200, "application/json", out.dump());
             finish_entry(entry, outcome);
             return;
@@ -2284,6 +2296,7 @@ struct ApiService::Impl {
         entry.queue_ms = o.stats.queue_ms; entry.prefill_ms = o.stats.prefill_ms; entry.decode_ms = o.stats.decode_ms;
         entry.imported = o.stats.imported_tokens;  // every record (its prefill rate); reported as a field only when observed
         if (o.observed) { entry.armed = true; entry.first_token_ms = o.stats.first_token_ms; }
+        if (o.error.empty()) entry.power = power_receipt(o);
         record(entry);
     }
 
@@ -2333,6 +2346,7 @@ struct ApiService::Impl {
                 e.set("first_token_ms", r.first_token_ms ? Json(*r.first_token_ms) : Json());
                 if (!r.response_id.empty()) e.set("response_id", Json(r.response_id));
             }
+            if (!r.power.empty()) e.set("power", parse_json(r.power));
             list.push(std::move(e));
         }
         out.set("requests", std::move(list));
@@ -2472,6 +2486,8 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             if (impl.config.status_data) deployment_status(data, impl.config.deployment, impl.queue, impl.config.status_slots.value_or(impl.config.http_slots));
             // STRIX_SERVE_RECEIPT=1: the engine's cycle ledger (tools/serve_bench.py finds it by its schema value).
             if (cycle_receipt_enabled() && data.is_object() && cycle_ledger().totals().cycles) data.set("cycle_ledger", parse_json(cycle_ledger().json()));
+            // Shared power view (sources, latest reading, totals since start); absent with STRIX_POWER_SAMPLER=0.
+            if (data.is_object() && power::sampler_enabled()) data.set("power", parse_json(power::status_json()));
             response.send(200, "application/json", data.dump());
             return;
         }

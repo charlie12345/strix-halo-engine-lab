@@ -4,6 +4,7 @@
 #include "glm/prefill/glm_moe_traits.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/common/glm_math.hpp"
+#include "strix/env_flags.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
 #include "glm/prefill/glm_pf_wmma_x.hpp"
 #ifndef STRIX_GLM_PF_IU4_LIB

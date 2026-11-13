@@ -36,7 +36,9 @@ struct StridedRoutePolicy {
     }
 };
 
-template <unsigned Ilp>
+// Sum: exchange row fold (xport/row_fold.hpp). part0 is the folded slot = rank 0's partial + rank 1's partial, already
+// added by the exchange progress thread with the same binary32 addition; part1 is null. x = h + folded: same bits.
+template <unsigned Ilp, bool Sum = false>
 __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchangeView v) {
     __shared__ __attribute__((aligned(16))) float hs[kHidden];  // 16-byte aligned: mode 2 stages float4 rows here
     __shared__ __attribute__((aligned(16))) float ys[kHidden];
@@ -63,7 +65,7 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
     }
     float* h = v.h + static_cast<std::size_t>(r) * kHidden;
     const float* p0 = v.part0 + static_cast<std::size_t>(r) * kHidden;
-    const float* p1 = v.part1 + static_cast<std::size_t>(r) * kHidden;
+    const float* p1 = Sum ? nullptr : v.part1 + static_cast<std::size_t>(r) * kHidden;
     float acc = 0.0F;
     if constexpr (Ilp == 2) {  // STRIX_MM_XB_POSTILP mode 2: the partials (GPU-uncached exchange slots) staged into LDS
         // with coalesced 16-byte loads (4x fewer uncached requests), then the plain chain reads them from LDS: same
@@ -72,15 +74,19 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         const auto* p0v = reinterpret_cast<const float4*>(p0);
         const auto* p1v = reinterpret_cast<const float4*>(p1);
         for (unsigned k = t; k < kHidden / 4U; k += kNormThreads) {
-            const float4 x0 = p0v[k], x1 = p1v[k];
-            reinterpret_cast<float4*>(hs)[k] = x0;
-            reinterpret_cast<float4*>(ys)[k] = x1;
+            if constexpr (Sum) {
+                reinterpret_cast<float4*>(hs)[k] = p0v[k];
+            } else {
+                const float4 x0 = p0v[k], x1 = p1v[k];
+                reinterpret_cast<float4*>(hs)[k] = x0;
+                reinterpret_cast<float4*>(ys)[k] = x1;
+            }
         }
         __syncthreads();
 #pragma unroll
         for (unsigned q = 0; q < kPer; ++q) {
             const unsigned j = t + q * kNormThreads;
-            const float x = hv[q] + (hs[j] + ys[j]);
+            const float x = Sum ? hv[q] + hs[j] : hv[q] + (hs[j] + ys[j]);
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
@@ -94,19 +100,19 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
             const unsigned j = t + q * kNormThreads;
             a[q] = h[j];
             b[q] = p0[j];
-            c[q] = p1[j];
+            c[q] = Sum ? 0.0F : p1[j];
         }
 #pragma unroll
         for (unsigned q = 0; q < kPer; ++q) {
             const unsigned j = t + q * kNormThreads;
-            const float x = a[q] + (b[q] + c[q]);
+            const float x = Sum ? a[q] + b[q] : a[q] + (b[q] + c[q]);
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
         }
     } else {
         for (unsigned j = t; j < kHidden; j += kNormThreads) {
-            const float x = h[j] + (p0[j] + p1[j]);
+            const float x = Sum ? h[j] + p0[j] : h[j] + (p0[j] + p1[j]);
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
@@ -297,6 +303,7 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
         const auto* hb = reinterpret_cast<const char*>(v.h);
         const auto* he = hb + std::size_t{v.rows} * kHidden * sizeof(float);
         for (const float* p : {v.part0, v.part1}) {
+            if (p == nullptr) continue;  // folded exchange: one slot
             const auto* pb = reinterpret_cast<const char*>(p);
             const auto* pe = pb + std::size_t{v.rows} * kHidden * sizeof(float);
             if (pb < he && hb < pe) throw std::invalid_argument("minimax post-exchange: ilp form with h overlapping a partial");
@@ -304,7 +311,11 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
     }
     if (v.ilp == 2 && ((reinterpret_cast<std::uintptr_t>(v.part0) | reinterpret_cast<std::uintptr_t>(v.part1)) & 15U) != 0)
         throw std::invalid_argument("minimax post-exchange: ilp mode 2 needs 16-byte aligned partials");
-    if (v.ilp == 2) hipLaunchKernelGGL(post_exchange_kernel<2>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    if (v.part1 == nullptr) {  // folded exchange: part0 is the pair sum
+        if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else hipLaunchKernelGGL((post_exchange_kernel<0, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    } else if (v.ilp == 2) hipLaunchKernelGGL(post_exchange_kernel<2>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     else if (v.ilp == 1) hipLaunchKernelGGL(post_exchange_kernel<1>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     else hipLaunchKernelGGL(post_exchange_kernel<0>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     const hipError_t e = hipGetLastError();

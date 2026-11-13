@@ -104,7 +104,7 @@ public:
     ResizeRule resize() const override { return {tower_.cfg.patch, 0, 0, 1024, 0.0F}; }
     PatchGrid patches(const Image&) const override { throw std::logic_error("toy adapter has no image path"); }
     void bind(WeightSource&, EncoderWeights&) override {}
-    void project(EncoderOutput& h, DenseOps& dense, ProjectedRows& out) override {
+    void project(EncoderOutput& h, const PatchGrid&, DenseOps& dense, ProjectedRows& out) override {
         ++projections;
         const Tensor w{tower_.projector.data(), Tensor::Type::f32, tower_.projector_out, tower_.cfg.width};
         std::vector<float> y(std::size_t{h.rows} * tower_.projector_out);

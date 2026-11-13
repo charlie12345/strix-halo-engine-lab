@@ -5,6 +5,7 @@
 #include "activation_quant.hpp"
 #include "linear_plan.hpp"
 #include "moe_i4_arithmetic.hpp"
+#include "moe_i4_chain_plan.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -262,6 +263,52 @@ template<bool Pair,class Binding> hipError_t launch(int plan,const Binding& b,co
         case 2:return launch<2,Pair,false>(b,w,tiles,ntiles,max_tiles,gq,gs,aq,as,nullptr,stream);
         default:return hipErrorInvalidValue;
     }
+}
+// The chain's plan for a call (moe_i4_chain_plan.hpp) under STRIX_MOE_I4_CHAIN_GSAVE. scratch_floats: FP32 values
+// of gate scratch the caller can lend for the paired launch; pair_slots: pair indices the binding can return.
+template<class Binding> ChainPlan chain_plan(int requested,std::size_t scratch_floats,std::size_t pair_slots) {
+    return chain_plan(requested,gsave_enabled(),scratch_floats,chain_gsave_floats(pair_slots,Binding::I));
+}
+// Tile list capacity every launch of the plan fits in, the register-save fallback (plan 1 at most) included.
+inline unsigned chain_max_tiles(const ChainPlan& p,std::size_t map_rows,int experts) {
+    const auto pt=iu4_grouped_max_tiles(map_rows,experts,p.paired<1 ? p.paired : 1), dt=iu4_grouped_max_tiles(map_rows,experts,p.down);
+    return unsigned(pt>dt ? pt : dt);
+}
+struct ChainStatus { hipError_t status; const char* stage; };
+// Paired gate/up then routed down on one plan decision: one tile build when the plan is shared (GSave admitted or
+// plan <= 1), else the register-save paired launch on plan 1 and a second tile build for the down. gsave: the
+// admitted scratch (used only when p.gsave). A scratch-form kernel the device does not admit (spill or residency,
+// rejected before anything is enqueued) falls back to that register-save form. between(): called after the paired
+// launch is enqueued (phase marks).
+template<class Binding,class Between> ChainStatus launch_chain(const ChainPlan& p,const Binding& b,const Weights& w,
+    const IU4Group* groups,int experts,IU4GroupTile* tiles,uint32_t* ntiles,std::size_t map_rows,const uint8_t* gq,const float* gs,
+    uint8_t* aq,float* as,float* gsave,hipStream_t stream,Between between) {
+    if (p.gsave && !gsave) return {hipErrorInvalidValue,"chain gate scratch"};
+    int paired=p.paired;
+    auto pt=unsigned(iu4_grouped_max_tiles(map_rows,experts,paired));
+    const auto dt=unsigned(iu4_grouped_max_tiles(map_rows,experts,p.down));
+    auto status=build_iu4_grouped_tiles(groups,experts,paired,tiles,ntiles,pt,stream);
+    if (status!=hipSuccess) return {status,"chain tiles"};
+    status=launch<true>(paired,b,w,tiles,ntiles,pt,gq,gs,aq,as,stream,p.gsave ? gsave : nullptr);
+    if (status==hipErrorNotSupported && p.gsave && paired>1) {
+        paired=1; pt=unsigned(iu4_grouped_max_tiles(map_rows,experts,paired));
+        status=build_iu4_grouped_tiles(groups,experts,paired,tiles,ntiles,pt,stream);
+        if (status!=hipSuccess) return {status,"chain tiles"};
+        status=launch<true>(paired,b,w,tiles,ntiles,pt,gq,gs,aq,as,stream);
+    }
+    if (status!=hipSuccess) return {status,"chain paired gate/up"};
+    between();
+    if (paired!=p.down) {
+        status=build_iu4_grouped_tiles(groups,experts,p.down,tiles,ntiles,dt,stream);
+        if (status!=hipSuccess) return {status,"chain down tiles"};
+    }
+    status=launch<false>(p.down,b,w,tiles,ntiles,dt,nullptr,nullptr,aq,as,stream);
+    return {status,"chain down"};
+}
+template<class Binding> ChainStatus launch_chain(const ChainPlan& p,const Binding& b,const Weights& w,
+    const IU4Group* groups,int experts,IU4GroupTile* tiles,uint32_t* ntiles,std::size_t map_rows,const uint8_t* gq,const float* gs,
+    uint8_t* aq,float* as,float* gsave,hipStream_t stream) {
+    return launch_chain(p,b,w,groups,experts,tiles,ntiles,map_rows,gq,gs,aq,as,gsave,stream,[] {});
 }
 // Paired gate/up whose epilogue writes the FP16 down input rows at16[pair*I] (no A4 image, no down call):
 // one kernel reads the gate and up INT4 weights and applies the SwiGLU/down-transform epilogue.

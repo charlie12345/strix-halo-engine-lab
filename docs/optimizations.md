@@ -4320,7 +4320,27 @@ exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select ot
 - **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
 - **Off switch:** STRIX_GLM_PF_WMMA=0 (also overrides `--profile fast`); without a named fast profile, unset keeps it off
 - **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
-- **Implementation / evidence:** [core](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
+- **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
+
+<a id="glm-pf-wmma-live-fragments"></a>
+
+### Folded F16 WMMA core: skip row fragments that hold no row
+
+**Engine:** `glm` (shared core `moe_core::folded_f16`). **Control:** `STRIX_GLM_PF_WMMA_LIVE_FRAG`. **Default:** on wherever the FAST WMMA prefill cores run.
+
+The folded F16 core (FP16 trellis weights x FP16 rows, K in 64-wide stages, one LDS stage, H128 epilogue) now lives once in
+`src/moe_core/grouped_f16.hpp` with decode, fold, input and output traits; GLM binds its trellis decode and policies.
+A ragged tile runs on the smallest row class that covers it (64 rows for 33-64, 128 rows for 65-128), so up to three
+16-row fragments per wave hold no row. Their WMMA chains computed values that were never stored. The core now counts
+the live fragments once per tile (wave-uniform) and skips the chains of the dead ones. Full tiles keep the branch-free
+loop; only a wave with a dead fragment takes the predicated loop.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1` (FAST prefill). Applies to routed MoE groups, the shared expert's last slice and the last tile of a dense call.
+- **Exactness evidence:** Bitwise to the glm-pf-wmma-x identity: live fragments keep every operand and the order of their chain; skipped accumulators stay +0 and are never stored. `hip_glm_pf_wmma_tests`: the form with all fragments computed equals the default on every buffer for group sizes 1-64, the 64/65/127/128/129/192/193/255/256/257/1100 edges, uniform classes of 33-112 rows per expert and lognormal routing (MoE 828 checks, dense 480 checks). Pair 8K: logits, state and token hashes equal the previous binary.
+- **Off switch:** `STRIX_GLM_PF_WMMA_LIVE_FRAG=0` (computes every fragment, same bits)
+- **Measured gain:** Whole MoE call on one node, every expert holding the same number of rows, skip vs all fragments: 33 rows 18.91 vs 21.23 ms (-11 %), 48: -11 %, 65: 29.03 vs 35.48 ms (-18 %), 80: -21 %, 96: -10 %, 112: -4 %. Lognormal routing: 2048 rows 26.80 vs 27.51 ms (-2.6 %), 4096 rows 48.62 vs 50.10 ms (-3.0 %); full tiles are unchanged (all-fragments form equals the previous binary within run noise).
+- **Resources:** no kernel gains a register spill; the 128-row gate/up kernel uses 238 VGPR (239 before), occupancy and LDS bytes are unchanged.
+- **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [test](../tests/hip_glm_pf_wmma_tests.hip)
 
 <a id="glm-pf-kda-wmma"></a>
 

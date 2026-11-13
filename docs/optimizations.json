@@ -2657,6 +2657,17 @@
   },
   {
     "engine": "glm",
+    "name": "Folded F16 WMMA core: skip row fragments that hold no row",
+    "flag_or_env": "STRIX_GLM_PF_WMMA_LIVE_FRAG",
+    "default": "on wherever the FAST WMMA prefill cores run",
+    "exact": "Bitwise to the glm-pf-wmma-x identity (all-fragments form equal on every buffer; pair 8K logits, state and token hashes equal the previous binary).",
+    "gain": "Whole MoE call, one node, uniform rows per expert, skip vs all fragments: 33 rows -11 %, 48 -11 %, 65 -18 %, 80 -21 %, 96 -10 %, 112 -4 %. Lognormal routing: 2048 rows 26.80 vs 27.51 ms (-2.6 %), 4096 rows 48.62 vs 50.10 ms (-3.0 %); full tiles are unchanged (all-fragments form equals the previous binary within run noise).",
+    "preconditions": "STRIX_GLM_PF_WMMA=1 (FAST prefill); ragged tiles of routed MoE groups, shared slices and dense calls.",
+    "off_switch": "STRIX_GLM_PF_WMMA_LIVE_FRAG=0 (computes every fragment, same bits)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-wmma-live-fragments"
+  },
+  {
+    "engine": "glm",
     "name": "FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)",
     "flag_or_env": "STRIX_GLM_PF_KDA_WMMA",
     "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",

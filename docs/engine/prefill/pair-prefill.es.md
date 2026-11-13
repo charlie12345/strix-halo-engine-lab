@@ -38,20 +38,28 @@ coste de memoria es de 32 MiB de memoria del host fijada por cada traspaso activ
 
 ## Piezas de costura en un solo sentido por la ruta de dispositivo
 
-En la ruta de dispositivo (`usb4gpu`), una pieza de costura de más de 64 KiB pasa de la
-instantánea de dispositivo de un rango a la del otro en un solo sentido
-(`dist::Communicator::transfer`): el rango que envía no publica recepción y el que recibe
-no publica transmisión, de modo que nada viaja en el sentido no usado y no hay que retirar
-una recepción anticipada con un intercambio de relleno. La GPU receptora comprueba la
+Con `usb4gpu`, una pieza de más de 64 KiB solo admite transferencia en un sentido si
+el comunicador selecciona una ruta exclusivamente de dispositivo y el backend la soporta
+(`dist::Communicator::transfer`). El emisor no publica recepción ni el receptor transmisión.
+Una recepción anticipada existente se retira una vez mediante un intercambio simétrico de
+relleno; las siguientes piezas en un sentido no anticipan otra recepción. La GPU receptora comprueba la
 identidad y la suma de palabras de la trama igual que en un intercambio simétrico, y la
 operación del emisor solo termina contra la recepción que publicó su par.
 
 El CRC-32C de costura de esas piezas se calcula en el dispositivo en ambos extremos
 (`xport::DeviceCrc32c`: un resumen por tramo de 64 KiB, combinados en el host), así que el
-emisor no copia la pieza al host ni el receptor la vuelve a leer. El valor es el CRC-32C
+preparador del emisor no copia la pieza al host ni el del receptor la vuelve a leer.
+Esto no excluye copias de host en la ruta alternativa del transporte. El valor es el CRC-32C
 de host de los mismos bytes, bit a bit; el flujo de control (CRC por pieza, CRC de la trama
-completa, ACK de consumo) no cambia, ni tampoco los logits. Las piezas de 64 KiB o menos y
+completa, ACK de consumo) no cambia; la igualdad nativa de logits sigue pendiente. Las piezas de 64 KiB o menos y
 el transporte solo de host conservan el camino de host.
+
+Las rutas de host o mixtas rechazan `transfer()` y usan el intercambio simétrico alternativo,
+con tráfico de relleno en sentido inverso. Con flujos de host disponibles, la tabla
+predeterminada selecciona una ruta mixta por encima de 1 MiB: una pieza completa de 16 MiB
+usa esa alternativa, con preparación en host para la parte mixta. Seleccionar `usb4gpu`
+no demuestra una transferencia sin copias ni en un solo sentido; hay que consultar la tabla
+de rutas y los contadores reales de transferencias en un sentido y de bytes.
 
 `STRIX_PAIR_LINK_ONE_WAY=0` recupera el intercambio simétrico (una carga de relleno de tamaño
 completo en el sentido no usado); ambos rangos deben fijarlo igual. `STRIX_PAIR_LINK_DEVICE_CRC=0`
@@ -61,8 +69,16 @@ que los rangos pueden diferir). La ejecución imprime una línea
 
 El enlace es compartido (`pair::DeviceLink`, `src/xport/pair_device_link.hpp`). La pareja de
 Gemma 4 también lo usa: su transporte predeterminado sigue siendo `usb4auto` (camino de host,
-sin cambios) y `--transport usb4gpu` selecciona la ruta de dispositivo con las mismas piezas
-en un solo sentido y el CRC en dispositivo (su línea de recibo es `g4-pair link:`).
+sin cambios) y `--transport usb4gpu` usa las mismas reglas de admisión, alternativa y CRC
+en dispositivo (su línea de recibo es `g4-pair link:`).
+
+Ambos controles están ON por defecto en el código; la cualificación nativa está pendiente.
+Las pruebas de combinación CRC en CPU y preparación con vectores no ejecutan `DeviceCrc32c`,
+`Communicator::transfer` ni colas GPU. Se requieren comparaciones nativas de CRC, ambos
+sentidos, varios bloques, reutilización de ranuras, transiciones desde recepción anticipada,
+rutas de host/mixtas, CRC OFF independiente y cierre tras fallos, con contadores reales de
+ruta/bytes e igualdad completa de tokens, logits y estado para la carga de trabajo.
+Compilar los kernels no demuestra esos requisitos.
 
 ## Equilibrio de etapas, copias de la costura y línea temporal de la pareja
 

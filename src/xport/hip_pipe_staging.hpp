@@ -71,7 +71,11 @@ public:
     }
     void route_device(std::function<bool(std::size_t)> routed) override {
         routed_ = std::move(routed);
-        if (routed_ && !crc_.allocated()) { select_device(); crc_.allocate(capacity_); }
+        // DeviceLink's size rule is monotone: if the largest possible piece is
+        // ineligible (host-only, CRC OFF, or a small arena), no piece needs CRC storage.
+        if (routed_ && routed_(std::min(capacity_, seam_piece_bytes)) && !crc_.allocated()) {
+            select_device(); crc_.allocate(capacity_);
+        }
     }
     bool device_routed(std::size_t, std::size_t bytes) override { return routed_ && routed_(bytes); }
     std::uint32_t device_crc(std::size_t offset, std::size_t bytes, bool received) override {

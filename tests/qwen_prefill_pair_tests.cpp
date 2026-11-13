@@ -373,7 +373,8 @@ void device_checked_piece_checks() {
     struct Staging final : PipeStaging {
         std::vector<std::byte> host, device;
         std::function<bool(std::size_t)> rule;
-        unsigned host_reads = 0, device_crcs = 0, uploads = 0;
+        std::atomic<unsigned> host_reads{0}, device_crcs{0}, uploads{0};
+        std::atomic<unsigned>* received_crcs = nullptr;
         std::span<std::byte> resize(std::size_t size) override { host.assign(size, std::byte{0}); device.assign(size, std::byte{0}); return host; }
         void copy(bool, std::size_t, void*, std::size_t) override {}
         void seal(std::size_t) override {}
@@ -386,7 +387,8 @@ void device_checked_piece_checks() {
         void read_device_piece(std::size_t, std::size_t) override { throw std::logic_error("device-checked piece read back to the host"); }
         void route_device(std::function<bool(std::size_t)> routed) override { rule = std::move(routed); }
         bool device_routed(std::size_t, std::size_t bytes) override { return rule && rule(bytes); }
-        std::uint32_t device_crc(std::size_t offset, std::size_t bytes, bool) override {
+        std::uint32_t device_crc(std::size_t offset, std::size_t bytes, bool received) override {
+            if (received) ++*received_crcs;
             ++device_crcs; return folded_crc(std::span(device).subspan(offset, bytes));
         }
     };
@@ -394,9 +396,10 @@ void device_checked_piece_checks() {
     for (unsigned mode = 0; mode < 3U; ++mode) {
         Wire forward, backward, payload;
         const auto abort = [&] { forward.stop(); backward.stop(); payload.stop(); };
-        std::atomic<unsigned> moved{0};
+        std::atomic<unsigned> moved{0}, send_attempts{0}, receive_attempts{0}, received_crcs{0};
         const auto routed = [&](bool sending, PipeStaging& staging, std::size_t offset, std::size_t size) {
             if (!rule(size)) return false;
+            if (sending) ++send_attempts; else ++receive_attempts;
             if (mode == 2U) return false; // a transport that declines a device-checked piece is a logic error
             auto bytes = std::span(static_cast<std::byte*>(staging.device_piece(offset)), size);
             if (sending) {
@@ -406,7 +409,11 @@ void device_checked_piece_checks() {
             } else { payload.receive(bytes); ++moved; }
             return true;
         };
-        const auto make = [&] { auto staging = std::make_shared<Staging>(); staging->route_device(rule); return staging; };
+        const auto make = [&] {
+            auto staging = std::make_shared<Staging>();
+            staging->received_crcs = &received_crcs;
+            staging->route_device(rule); return staging;
+        };
         Pipe producer(0, 1, [&](auto bytes) { forward.send(bytes); }, [&](auto bytes) { backward.receive(bytes); }, abort,
             24, make, {}, routed);
         Pipe consumer(1, 1, [&](auto bytes) { backward.send(bytes); }, [&](auto bytes) { forward.receive(bytes); }, abort,
@@ -419,20 +426,48 @@ void device_checked_piece_checks() {
         const auto expected = source.device;
         SeamCrc reference; reference.update(expected);
         producer.release(0);
-        bool rejected = false;
-        try {
-            auto& received = consumer.acquire(0);
-            const auto& staging = static_cast<const Staging&>(*received.staging);
+        PipeFrame* received = nullptr;
+        std::exception_ptr acquisition_error;
+        try { received = &consumer.acquire(0); }
+        catch (...) { acquisition_error = std::current_exception(); }
+        // Assertions must never be caught as evidence of pipe rejection.
+        if (mode == 0U) {
+            if (acquisition_error) std::rethrow_exception(acquisition_error);
+            require(received != nullptr);
+            const auto& staging = static_cast<const Staging&>(*received->staging);
             require(staging.device == expected);
-            require(received.header[40] == reference.value()); // the whole-frame CRC is the host CRC of the same bytes
+            require(received->header[40] == reference.value()); // the whole-frame CRC is the host CRC of the same bytes
             const std::size_t pieces = (expected.size() + seam_piece_bytes - 1U) / seam_piece_bytes;
             const std::size_t last = expected.size() - (pieces - 1U) * seam_piece_bytes;
             const unsigned device_pieces = static_cast<unsigned>(pieces - (rule(last) ? 0U : 1U));
             require(moved == device_pieces && staging.device_crcs == device_pieces && source.device_crcs == device_pieces);
+            require(send_attempts == device_pieces && receive_attempts == device_pieces && received_crcs == device_pieces);
             require(source.host_reads == pieces - device_pieces && staging.uploads == pieces - device_pieces);
             consumer.release(0); consumer.finish(1); producer.finish(1);
-        } catch (const std::exception&) { rejected = true; }
-        require(rejected == (mode != 0U));
+        } else {
+            require(received == nullptr && acquisition_error != nullptr);
+            std::string reason;
+            try { std::rethrow_exception(acquisition_error); }
+            catch (const std::runtime_error& error) { reason = error.what(); }
+            if (mode == 1U) {
+                require(reason == "pair prefill seam piece CRC mismatch");
+                require(moved == 1U && receive_attempts == 1U && received_crcs == 1U);
+                require(send_attempts >= 1U && source.device_crcs >= 1U);
+            } else {
+                require(reason == "fake transport closed");
+                // The decline originates on the producer, before it sends a payload.
+                // A peer abort alone cannot prove that the guard ran.
+                bool declined = false;
+                try { producer.finish(1); }
+                catch (const std::logic_error& error) {
+                    declined = std::string_view(error.what()) ==
+                        "pair prefill device-checked piece was not moved by the transport";
+                }
+                require(declined);
+                require(send_attempts == 1U && source.device_crcs == 1U && source.host_reads == 0U);
+                require(moved == 0U && received_crcs == 0U);
+            }
+        }
     }
 }
 
@@ -501,8 +536,11 @@ void timeline_checks() {
     for (const char* needle : {"rank=0 step=2 ", "rank=1 step=2 ", "rank=0 sum steps=3", "rank=1 sum steps=3"})
         require(lines.find(needle) != std::string::npos);
 }
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--device-checked-only") {
+            device_checked_piece_checks(); return 0;
+        }
         balance_checks(); half_cut_checks(); chunk_checks(); blocked_send_overlap_checks(); crc_checks(); fault_checks(); routed_piece_checks(); crc_fold_checks(); device_checked_piece_checks(); timeline_checks(); copy_rows_checks();
         Wire forward, backward;
         std::mutex received_mutex; std::condition_variable received_cv; std::uint64_t received_chunks = 0;

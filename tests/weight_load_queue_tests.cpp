@@ -17,6 +17,10 @@
 #include <malloc.h>
 #endif
 
+#if defined(__GNUC__) && !defined(__clang__)
+// The replaced operator new / delete below are a malloc / free pair; GCC reports the inlined pair as mismatched.
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 // Fault injection: while armed, allocation number `at` (and, sticky, every later one) fails, on any thread.
 static std::atomic<long long> g_alloc_at{-1}, g_alloc_seen{0};
 static std::atomic<bool> g_alloc_sticky{false}, g_alloc_hit{false};

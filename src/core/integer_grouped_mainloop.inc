@@ -80,7 +80,8 @@ auto* tile = lds + StageBytes;
 const auto* own_row = ad.weight_row(at, first_col + int(pair * 32) + lane);
 Raw ahead{};
 TileRegs tile_next{};
-if constexpr (Direct) ahead = Operand::load_raw(own_row, q);
+// A wave whose first group is past a narrow row (inputs < 256) has no group at all: it must not read past the row.
+if constexpr (Direct) { if (q < groups) ahead = Operand::load_raw(own_row, q); }
 else tile_next = load_tile(0);
 V8 magic{Ops::dot_magic, Ops::dot_magic, Ops::dot_magic, Ops::dot_magic,
          Ops::dot_magic, Ops::dot_magic, Ops::dot_magic, Ops::dot_magic};

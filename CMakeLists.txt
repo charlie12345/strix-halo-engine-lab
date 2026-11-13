@@ -5324,6 +5324,9 @@ if(STRIX_FAMILY_GLM5)
             add_executable(strix-hip-glm5-pf-kda-wmma-tests tests/hip_glm_pf_kda_wmma_tests.hip)  # FAST glm-pf-kda-wmma-v1 contract + drift gate + timing
             target_link_libraries(strix-hip-glm5-pf-kda-wmma-tests PRIVATE strix_glm5_engine)
             list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-kda-wmma-tests)
+            add_executable(strix-hip-fma-rows-tests tests/hip_fma_rows_tests.hip)  # shared exact FMA-rows core: bitwise gate + timing
+            target_link_libraries(strix-hip-fma-rows-tests PRIVATE strix_glm5_engine)
+            list(APPEND strix_glm5_hip_targets strix-hip-fma-rows-tests)
             add_executable(strix-hip-glm5-pf-moe-tests tests/hip_glm_pf_moe_tests.hip)
             target_link_libraries(strix-hip-glm5-pf-moe-tests PRIVATE strix_glm5_engine)
             target_include_directories(strix-hip-glm5-pf-moe-tests PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")

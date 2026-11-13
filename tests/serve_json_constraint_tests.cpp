@@ -28,6 +28,15 @@
 // node/bucket insertion. Fail only once so exception cleanup can allocate.
 namespace allocation_failure {
 thread_local std::ptrdiff_t remaining = -1;
+
+// Keep free out of new-expression call sites: GCC otherwise diagnoses the
+// inlined replacement delete as mismatched, despite the malloc-backed new.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void deallocate(void* p) noexcept { std::free(p); }
 }
 void* operator new(std::size_t bytes) {
     if (allocation_failure::remaining >= 0 && allocation_failure::remaining-- == 0) {
@@ -38,10 +47,10 @@ void* operator new(std::size_t bytes) {
     throw std::bad_alloc();
 }
 void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p) noexcept { allocation_failure::deallocate(p); }
+void operator delete[](void* p) noexcept { allocation_failure::deallocate(p); }
+void operator delete(void* p, std::size_t) noexcept { allocation_failure::deallocate(p); }
+void operator delete[](void* p, std::size_t) noexcept { allocation_failure::deallocate(p); }
 
 namespace strix::serve {
 struct ConstraintProgramCacheTestAccess {

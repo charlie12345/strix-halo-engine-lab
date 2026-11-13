@@ -663,6 +663,22 @@ inline bool single_session_mtp_route(const Options& o, const Environment& enviro
         o.rotary.mode() != RotaryMode::yarn && !explicit_execution_control(environment) &&
         qualified_checkpoint_content(manifest, verified_content) && capabilities.target_qualified;
 }
+// One organisation value, one application: the single-request route and the resident server both come here after
+// their route is admitted. provenance limits the source rows this call may rewrite (an earlier application keeps its own).
+inline unsigned apply_prefill_organization(EffectiveConfig& result, const Environment& requested,
+    const qpf2k::Organization& policy, unsigned provenance) {
+    const unsigned injected = qpf2k::apply_organization(policy, [&](const char* name) -> const char* {
+        const auto it = result.environment.find(name);
+        return it == result.environment.end() ? nullptr : it->second.c_str();
+    }, [&](const char* name, const char* value) { result.environment.emplace(name, value); return true; });
+    for (const auto& entry : qpf2k::defaults)
+        if ((provenance & qpf2k::bit(entry.item)) && result.environment.contains(entry.name)) result.sources[entry.name] =
+            injected & qpf2k::bit(entry.item) ? OptionSource::automatic : OptionSource::explicit_value;
+    if (result.environment.contains("STRIX_QPF2K_MOE_DEFAULTED"))
+        result.sources["STRIX_QPF2K_MOE_DEFAULTED"] = requested.contains("STRIX_QPF2K_MOE_DEFAULTED") ?
+            OptionSource::explicit_value : OptionSource::automatic;
+    return injected;
+}
 inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view verified_content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
@@ -684,17 +700,8 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         result.environment["STRIX_QWEN_ROPE_YARN"] = "off";
         result.sources["STRIX_QWEN_ROPE_YARN"] = OptionSource::explicit_value;
     }
-    const auto inject = [&](unsigned allowed) {
-        const unsigned injected = qpf2k::initialize([&](const char* name) -> const char* {
-            const auto it = result.environment.find(name);
-            return it == result.environment.end() ? nullptr : it->second.c_str();
-        }, [&](const char* name, const char* value) { result.environment.emplace(name, value); return true; }, allowed);
-        for (const auto& entry : qpf2k::defaults)
-            if (result.environment.contains(entry.name)) result.sources[entry.name] =
-                injected & qpf2k::bit(entry.item) ? OptionSource::automatic : OptionSource::explicit_value;
-        if (result.environment.contains("STRIX_QPF2K_MOE_DEFAULTED"))
-            result.sources["STRIX_QPF2K_MOE_DEFAULTED"] = request.environment.contains("STRIX_QPF2K_MOE_DEFAULTED") ?
-                OptionSource::explicit_value : OptionSource::automatic;
+    const auto inject = [&](const qpf2k::Organization& policy) {
+        (void)apply_prefill_organization(result, request.environment, policy, ~0U);
     };
     // Baseline disables the new policy and all controlled environment items;
     // argv organization/arithmetic still goes through the historical resolver.
@@ -723,8 +730,8 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         if (o.mtp_native_bundle && o.mtp.enabled && !o.known_prefix_window)
             throw std::invalid_argument("automatic prompt route declined with the drafter bundle (" + reason + ")");
         result.reason = std::move(reason);
-        if (!baseline) inject(qpf2k::historical_items |
-            (single_session_mtp ? qpf2k::bit(qpf2k::Item::dispatch_fuse) : 0U));
+        if (!baseline) inject(qpf2k::Organization{qpf2k::historical_items |
+            (single_session_mtp ? qpf2k::bit(qpf2k::Item::dispatch_fuse) : 0U), ~0U});
         if (o.prefill_profile_deferred && !o.numerical_profile_explicit) o.numerical_profile = dense_a8_profile;
         const auto schedule = result.environment.find("STRIX_QPF2K_SCHED");
         const bool injected_gsq = qpf2k::has_gsq_gate(manifest) && schedule != result.environment.end() &&
@@ -943,7 +950,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                 result.organization = std::move(organization);
                 result.reason = rows == 16384U ? (explicit_t16k ? "opt-in-t16k" : "automatic-t16k") : "qualified-prompt";
                 result.admitted = true;
-                inject(~0U);
+                inject(qpf2k::admitted_organization(qpf2k::PrefillOwner::single_request));
                 return result;
             } catch (const std::overflow_error&) { throw; }
               catch (const KnownPrefillBudgetExceeded&) { failed_reason = "insufficient-memory"; }
@@ -1419,6 +1426,18 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             result.arithmetic_fallback = o.prefill_profile_automatic ? std::string() : fp16_declined;
             if (rows == 16384U) result.t16k_policy_source = env_is(requested,"STRIX_QPF2K_T16K","1") ?
                 OptionSource::explicit_value : OptionSource::automatic;
+            // The admitted owner takes the same prefill organisation value as the single-request route.
+            // STRIX_SERVE_PREFILL_ORG=0 (or the earlier rule, STRIX_SERVE_ROUTE=0) keeps the startup items only;
+            // each item keeps its own "0" switch, and GSQ owners filter injected values in their readers.
+            if (shared_route && !env_is(requested,"STRIX_SERVE_PREFILL_ORG","0")) {
+                const auto policy = qpf2k::admitted_organization(qpf2k::PrefillOwner::resident_server);
+                const unsigned taken = apply_prefill_organization(result,requested,policy,policy.items);
+                unsigned count = 0U;
+                for (unsigned bits = taken; bits; bits &= bits - 1U) ++count;
+                const auto pipe = result.environment.find("STRIX_PREFILL_PIPE");
+                arithmetic += "; prefill organization shared with the single-request route (" + std::to_string(count) +
+                    " items automatic, row pipeline " + (pipe == result.environment.end() ? std::string("0") : pipe->second) + ")";
+            } else arithmetic += "; prefill organization startup items only";
             return notice("automatic T" + std::to_string(rows) + "; " + attempts + arithmetic);
         } catch (const std::exception& error) {
             attempts += "T" + std::to_string(rows) + ":" + error.what() + "; ";

@@ -3690,6 +3690,51 @@ int main(int argc, char** arguments) {
             expect(legacy.options.known_prefix_prefill_rows==8192 && !legacy.options.prefill_profile_automatic &&
                 legacy.serve_prefill_notice.find("arithmetic preserved")!=std::string::npos,
                 "server route off switch keeps the earlier owner and arithmetic");
+            {
+                // One prefill organisation value: the admitted server owner takes the items the single-request route takes.
+                const auto policy=qpf2k::admitted_organization(qpf2k::PrefillOwner::resident_server);
+                const auto single_policy=qpf2k::admitted_organization(qpf2k::PrefillOwner::single_request);
+                expect(policy.items==qpf2k::prefill_organization_items && (single_policy.items&policy.items)==policy.items &&
+                    !(policy.items&(qpf2k::bit(qpf2k::Item::ple_reclaim)|qpf2k::bit(qpf2k::Item::cohort_lean)|
+                        qpf2k::bit(qpf2k::Item::rows_lean)|qpf2k::bit(qpf2k::Item::dispatch_fuse)|qpf2k::bit(qpf2k::Item::dense_rows))),
+                    "server organisation is a subset of the single-request one without reclamation or decoding items");
+                const auto organised=[&](const EffectiveConfig& c,bool want,const char* skip=nullptr) {
+                    for(const auto& entry:qpf2k::defaults) {
+                        if(skip && std::string_view(skip)==entry.name) continue;
+                        const bool has=c.environment.contains(entry.name);
+                        if(policy.items&qpf2k::bit(entry.item)) {
+                            if(has!=want) return false;
+                            if(want && c.sources.at(entry.name)!=OptionSource::automatic) return false;
+                            if(want && c.environment.at(entry.name)!=(entry.item==qpf2k::Item::pipe?std::string("18"):std::string(entry.on))) return false;
+                        } else if(!(qpf2k::historical_items&qpf2k::bit(entry.item)) && has) return false;
+                    }
+                    return true;
+                };
+                const auto shared=resolve(http,memory);
+                expect(shared.options.known_prefix_prefill_rows && organised(shared,true) &&
+                    shared.serve_prefill_notice.find("prefill organization shared with the single-request route (11 items automatic, row pipeline 18)")!=std::string::npos,
+                    "admitted server owner takes the shared prefill organisation and prints it");
+                for(const auto& entry:qpf2k::defaults)
+                    if(qpf2k::historical_items&qpf2k::bit(entry.item))
+                        expect(!shared.environment.contains(entry.name) || shared.sources.at(entry.name)==OptionSource::automatic,
+                            "startup items keep their automatic provenance after the organisation is applied");
+                auto off=http; off.environment["STRIX_SERVE_PREFILL_ORG"]="0";
+                const auto startup_only=resolve(off,memory);
+                expect(organised(startup_only,false) &&
+                    startup_only.serve_prefill_notice.find("prefill organization startup items only")!=std::string::npos,
+                    "server organisation off switch keeps the startup items only");
+                expect(organised(legacy,false),"earlier server rule takes no organisation item");
+                off=http; off.environment["STRIX_QSA_NORM_GROUP"]="0"; off.environment["STRIX_PREFILL_PIPE"]="2";
+                const auto item_off=resolve(off,memory);
+                expect(item_off.environment.at("STRIX_QSA_NORM_GROUP")=="0" && item_off.environment.at("STRIX_PREFILL_PIPE")=="2" &&
+                    item_off.sources.at("STRIX_QSA_NORM_GROUP")==OptionSource::explicit_value &&
+                    item_off.sources.at("STRIX_PREFILL_PIPE")==OptionSource::explicit_value &&
+                    item_off.environment.at("STRIX_QSA_ATTEND_BATCH")=="1" &&
+                    item_off.serve_prefill_notice.find("(9 items automatic, row pipeline 2)")!=std::string::npos,
+                    "explicit item values survive the shared organisation");
+                off=http; off.environment["STRIX_QPF2K_DEFAULTS"]="0";
+                expect(organised(resolve(off,memory),false),"defaults off switch also suppresses the server organisation");
+            }
             pinned=http; pinned.environment["STRIX_PREFILL_F16"]="0";
             const auto no_f16=resolve(pinned,memory);
             expect(!no_f16.options.prefill_numerical_profile &&

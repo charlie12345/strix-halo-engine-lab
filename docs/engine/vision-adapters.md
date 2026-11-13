@@ -69,22 +69,32 @@ Measured on the tensors: the patch weight is laid out (channel, y, x) (neighbour
 those axes and not along the alternative); the aligner input is channel-major, index `c * 9 + slot` (the column
 norms follow a 3 x 3 pattern in the slot and are flat otherwise).
 
-**Not stated by the file** and not yet compared with the upstream processor and model code. Each is a field of
-`deepseek41::VisionRecipe`, part of the adapter identity, and an option of the reference tool:
+**Not stated by the file.** These come from the reference implementation that ships inside the checkpoint
+(`inference/image_processor.py`, `inference/vision.py`, at the revision named by the file's
+`general.source.url` and `general.source.revision`); `tools/vision/ds41_ref.py upstream` runs that code on the
+vision tensors and `compare` measures our rows against it. Each is a field of `deepseek41::VisionRecipe` or a
+rule of the adapter, and part of the adapter identity:
 
-| Parameter | Value used | Basis |
+| Parameter | Value | Status against the reference code |
 |---|---|---|
-| Resize rule | both sides to multiples of 42, area within [295936, 1024 x 42 x 42], aspect kept | the file's limits; the rounding rule is assumed |
-| Resampler | bicubic with antialias | assumed |
-| Mean, standard deviation | 0.5, 0.5 per channel | assumed |
-| SwiGLU halves | first half of `mlp.w1` is the gate | assumed |
-| Rotary layout | row angles then column angles, pairs `(i, i + 32)` | assumed |
-| Aligner activation | GELU | assumed |
-| Slot order in a 3 x 3 cell | `dy * 3 + dx` | assumed (channel-major is measured) |
-| Span | start, each grid row followed by the row end, end | assumed |
+| Canvas size | an image under 295936 pixels is scaled up (`int()` of each side); each side is rounded up to a multiple of 14, not of 42; a canvas whose span would exceed 1024 rows is shrunk to the largest one that fits; an extreme aspect ratio collapses to one column or one row of cells | was wrong (both sides to multiples of 42, aspect not kept), corrected |
+| Placement | the image keeps its aspect ratio inside the canvas (`ImageOps.pad`): bicubic with antialias, centred, margin grey 127, sizes and offsets rounded half to even | was wrong (stretched to the canvas), corrected |
+| Mean, standard deviation | 0.5, 0.5 per channel, as `(v / 255 - 0.5) / 0.5` with a true division | confirmed; the reciprocal form differed in the last place |
+| Pixel precision | the normalised pixels are rounded to BF16 before the patch embedding | was missing, corrected |
+| Row limit | the whole span (image rows, row ends, start, end) is at most 1024 rows | was wrong (1024 image rows), corrected |
+| Partial cells | a grid that is not a multiple of 3 is completed with zero rows on the right and at the bottom before the aligner | was missing, corrected |
+| SwiGLU halves | first half of `mlp.w1` is the gate | confirmed |
+| Rotary layout | row angles then column angles, 16 frequencies per axis, pairs `(i, i + 32)` | confirmed |
+| Aligner activation | GELU (exact, erf) | confirmed |
+| Slot order in a 3 x 3 cell | `c * 9 + dy * 3 + dx` (`unfold` on channel, y, x) | confirmed |
+| Span | start, each grid row followed by the row end (also the last), end; 1D positions | confirmed |
 
-The gate that compares these rows with the upstream implementation is still owed; until it has run, image
-input for this family is not advertised by any service.
+The reference rounds every linear to BF16; the adapter's FP32 reference rows are compared with the reference code
+run in FP32, and its own BF16 run measures what that arithmetic alone moves (see the status table). The
+transformers package has no model code for this family: the checkpoint's own files are the reference.
+
+Image input for this family is still not advertised by any service: the judge of the device arithmetic on images
+with flat areas (per-row minimum or a language-model gate) is an open decision, see the status table.
 
 ### Gate
 
@@ -92,6 +102,8 @@ input for this family is not advertised by any service.
 python3 tools/vision/ds41_ref.py images --out REF
 python3 tools/vision/ds41_ref.py preprocess --out REF
 python3 tools/vision/ds41_ref.py encode --out REF --model VISION.gguf
+python3 tools/vision/ds41_ref.py upstream --out REF --model-dir CHECKPOINT [--dtype bf16] [--patches ours]
+python3 tools/vision/ds41_ref.py compare --out REF --a "" --b upstream
 strix-deepseek41-vision-gate --model VISION.gguf --ref REF --backend host --only rings_graph
 strix-deepseek41-vision-gate-hip --model VISION.gguf --ref REF --backend hip
 ```
@@ -110,7 +122,10 @@ cosine at least 0.99999 per row; device backend mean cosine at least 0.9995, min
 | Preprocessing against Pillow, 6 images | patch tensor bit-equal |
 | Host FP32 tower + adapter against the numpy implementation | cosine 1.000000, relative L2 0.00000 (rows differ only by their BF16 storage) |
 | Device arithmetic `vision-f16-v1`, 7 images | single FP16 operands: 4 pass, 3 fail the row minimum; split activations: 1 of the 5 run fails it |
-| Upstream processor and model | not run |
+| Reference processor (checkpoint code), 6 images | patch tensor bit-equal (maximum difference 0), same grids, including grids with partial cells |
+| Reference model in FP32, 7 images, same patches | tower and rows cosine 1.000000, row minimum at least 0.999994, relative L2 at most 0.0002; special rows bit-equal |
+| Reference processor + model in FP32 against `preprocess` + `encode`, 6 images | rows cosine 1.000000, row minimum at least 0.999999, relative L2 at most 0.0001 |
+| Reference model in its own BF16 arithmetic against its FP32 run, 7 images | row minimum 0.69 to 0.997, relative L2 2.4 % to 18 %: no image meets the device thresholds |
 
 The device failures are on images with large flat areas (a smooth gradient, an upscaled 16 x 16 image, smooth
 rings): the mean cosine stays at or above 0.998 while single rows fall far below it (row minimum 0.925, 0.996 and

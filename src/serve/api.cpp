@@ -3,6 +3,7 @@
 #include "strix/serve/chat_template.hpp"
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/power/sampler.hpp"
+#include "strix/route_receipt.hpp"
 #include "strix/serve/json_constraint.hpp"
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
@@ -333,6 +334,7 @@ struct ApiRequestScope {
     ApiRequestObservation observation;
     bool attempted = false, terminal_taken = false;
     const ApiConfig& config;
+    route::Totals route_start = route::enabled() ? route::snapshot() : route::Totals{};  // shared route receipt: request window
     void terminal() {
         if (!ticket || terminal_taken) return;
         terminal_taken = true;
@@ -1271,6 +1273,9 @@ struct ApiService::Impl {
         auto data = api_request_scope ? api_request_scope->observation.terminal.timings : Json::object();
         if (!note.empty()) data.set("sampling_note", Json(note));
         if (o && data.is_object()) if (const auto text = power_receipt(*o); !text.empty()) data.set("power", parse_json(text));
+        // Shared route receipt of the request window on this rank: launches and rows by kernel family, bypasses with reasons.
+        if (o && data.is_object() && api_request_scope && route::enabled())
+            data.set("route", parse_json(route::json(route::delta(route::snapshot(), api_request_scope->route_start), "request", false)));
         return data;
     }
     void completion_data(Json& out, const Outcome& o, const Json& body, const std::string& note, bool timings = true) const {
@@ -2488,6 +2493,8 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             if (cycle_receipt_enabled() && data.is_object() && cycle_ledger().totals().cycles) data.set("cycle_ledger", parse_json(cycle_ledger().json()));
             // Shared power view (sources, latest reading, totals since start); absent with STRIX_POWER_SAMPLER=0.
             if (data.is_object() && power::sampler_enabled()) data.set("power", parse_json(power::status_json()));
+            // Shared route receipt (process totals, levers, explicitly set switches): same view, same access rule as power.
+            if (data.is_object() && route::enabled()) data.set("route", parse_json(route::json()));
             response.send(200, "application/json", data.dump());
             return;
         }

@@ -2,6 +2,7 @@
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
 #include "glm/prefill/glm_pf_wmma_x.hpp"
+#include "strix/route_receipt.hpp"
 #include <strix_trellis.h>
 #include <algorithm>
 #include <cstdlib>
@@ -299,6 +300,14 @@ void linear_rows(const engine::Linear& l, const float* x, std::size_t xs, float*
     const unsigned core = selected == Route::x3r8 && wmma_x::enabled() && m.input % 64U == 0 ? 5U : selected == Route::x3r8 ? 4U : selected == Route::x3 ? 3U :
         selected == Route::x2 ? 1U : (selected == Route::x ? 0U : tm);
     if (core == 5U) wmma_x::dense_calls.fetch_add(1, std::memory_order_relaxed);
+    // Shared route receipt (count only): the family of this call, and the reason a requested WMMA identity was bypassed.
+    if (core == 5U) ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::f16_wmma, rows);
+    else {
+        ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::exact, rows);
+        if (wmma_x::enabled())
+            ::strix::route::bypass(::strix::route::Product::dense, ::strix::route::Family::f16_wmma,
+                          selected == Route::x3r8 ? ::strix::route::Reason::shape : rows < x_auto_rows() ? ::strix::route::Reason::short_call : ::strix::route::Reason::wrong_route, rows);
+    }
     if (core == 5U && aux::input_admitted(m.output) && aux::enabled("STRIX_GLM_PF_AUX_INPUT")) {
 #define CASE(B) case B: launch_w<B, true>(m, t, y, ys, rows, s, x, xs); break
         switch (m.bits) {

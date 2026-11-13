@@ -30,6 +30,8 @@
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/deploy/device.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/route_receipt.hpp"
 
 #include <strix_trellis.h>
 
@@ -993,6 +995,7 @@ struct Engine::Impl {
         lib.release_staging();
         alloc();
         if (model_fast_i4) setup_fast_i4();
+        route_levers();  // shared route receipt: requested vs effective, part of the rank fingerprint
         LoadReport r;
         r.seconds = secs(t0, Clock::now());
         r.gib_read = pack.gib_read();
@@ -1038,6 +1041,28 @@ struct Engine::Impl {
         std::fflush(stdout);
     }
     bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers && !i4_exl3_layers.test(L); }
+    // Shared route receipt (strix/route_receipt.hpp): why a MoE layer's prefill runs IU4 or keeps the EXL3 operator.
+    strix::route::Reason route_i4_reason(unsigned L, bool i4) const {
+        using R = strix::route::Reason;
+        return i4 ? R::selected : !model_fast_i4 || !mmoe::prefill_iu4() ? R::disabled : !pf_i4_rows ? R::short_call :
+               i4_exl3_layers.test(L) ? R::layer_mask : R::no_match;
+    }
+    void route_levers() const {
+        namespace rr = strix::route;
+        rr::set_engine("minimax");
+        rr::set_rank(static_cast<int>(opt.rank));
+        const char* asked = strix::envcfg::text("STRIX_MMX_MODEL_FORMAT");
+        std::string effective = "exl3";
+        if (model_fast_i4) {
+            effective = std::string("iu4:") + (i4_scope == fast_i4::Scope::all ? "all" : "gate_up") + ":min_rows=" + std::to_string(i4_min_rows) +
+                        ":a8=" + std::to_string(i4_a8) + ":exl3_layers=";
+            for (unsigned L = kFirstMoe; L < kLayers; ++L) effective += i4_exl3_layers.test(L) ? '1' : '0';
+        }
+        rr::lever("minimax.moe_prefill_format", asked != nullptr && *asked != 0 ? asked : "default", effective,
+                  model_fast_i4 ? rr::Reason::selected : rr::Reason::disabled);
+        rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
+        rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
+    }
     // Timing collection is nonblocking. At prompt completion the existing prefill fence makes
     // every sample available; no host fence is introduced for conversion or prefetch.
     void jit_collect(bool report = false) {
@@ -1683,6 +1708,7 @@ struct Engine::Impl {
                                       hipMemcpyDeviceToDevice, nullptr), "trace ids");
             out = send_buffer(n);
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
             stage_ffn(L, n, out, i4);
             if (i4 != nullptr) jit_release(L);
             exchange_post(n, L, 1, out, y.w_next, nullptr, nullptr);
@@ -2620,6 +2646,7 @@ struct Engine::Impl {
                 send(c, 0, L, o);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
             const auto post_router = [&](std::size_t c) {
                 use(c);
                 const auto view = recv(c);

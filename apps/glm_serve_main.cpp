@@ -52,7 +52,9 @@
 #include "glm_rank_transport.hpp"
 
 #include "strix/dist/communicator.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/glm/engine.hpp"
+#include "strix/route_receipt.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/glm_chat.hpp"
@@ -960,6 +962,25 @@ int main(int argc, char** argv) {
                      " kmax " + std::to_string(eff.kmax) + " adaptive " + std::to_string(eff.adaptive ? 1 : 0) + "\n";
             hello.identity_hash = gs::fnv1a64(ident);
             if (deployment.plan) hello.identity_hash = gs::fnv1a64(deployment.plan->hash(), hello.identity_hash);
+        }
+        {
+            // Shared route receipt: the levers that decide the prefill arithmetic, requested vs effective. Their
+            // fingerprint rides in the hello, so two ranks on different numerical routes refuse to pair.
+            namespace rr = strix::route;
+            rr::set_engine("glm");
+            rr::set_rank(static_cast<int>(opt.rank));
+            const auto asked = [](const char* name) { const char* v = strix::envcfg::text(name); return std::string(v != nullptr && *v != 0 ? v : "default"); };
+            const std::string wmma = asked("STRIX_GLM_PF_WMMA"), x = asked("STRIX_GLM_PF_EXACT_X");
+            rr::lever("glm.prefill", prefill_mode, prefill_mode);
+            rr::lever("glm.identity", ge::identity_mode_name(eng.identity_mode()), ge::identity_mode_name(eng.identity_mode()));
+            rr::lever("glm.pf_wmma", wmma, wmma == "1" ? "f16_wmma" : "exact", wmma == "1" ? rr::Reason::selected : rr::Reason::disabled);
+            rr::lever("glm.pf_kda_wmma", asked("STRIX_GLM_PF_KDA_WMMA"), asked("STRIX_GLM_PF_KDA_WMMA"));
+            rr::lever("glm.pf_exact_x", x, x + ":min_rows=" + asked("STRIX_GLM_PF_EXACT_X_MIN_ROWS"), rr::Reason::selected, true,
+                      "auto takes the X3 route (and the WMMA identity when on) only for calls of at least min_rows rows");
+            rr::lever("glm.serve_max_rows", std::to_string(opt.max_rows), std::to_string(opt.max_rows), rr::Reason::selected, false);
+            const std::uint64_t fp = rr::fingerprint();
+            hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));
+            std::printf("rank %u: route fingerprint %016llx\n", opt.rank, static_cast<unsigned long long>(fp));
         }
         hello.capacity = opt.capacity;
         hello.slots = opt.slots;

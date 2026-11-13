@@ -168,7 +168,7 @@ tokens are compared with its own single-request run.
 | `STRIX_COHORT_QSA_SEGMENTS=1` | State-free QSA sub-parts once for all rows (neutral). |
 | `STRIX_COHORT_AB=1`, `STRIX_COHORT_AB_OFF=gdnseg,qsaseg,combine,draft,gdn,...` | Measurement: odd cohort cycles run without the listed features (wide families by name); mean cycle ms, tokens and tok/s per parity at exit. |
 | `STRIX_DENSE_A8_WMMA_SMALL=1` | Opt-in: dense A8 Q8_0 projections of 2..8 rows (shared expert, GDN, QSA and PLE producers) run a WMMA tile sized for the real rows instead of the dot4 form; bitwise equal per row. A/B name `densesmall`. |
-| `STRIX_COHORT_QSA2_MERGED=1` | Opt-in: QSA part 2 of every cohort segment in merged launches for any segment sizes; bitwise equal. Off while a QSA pool check switch is set. A/B name `qsa2`. |
+| `STRIX_COHORT_QSA2_MERGED=0\|1` | QSA part 2 of every cohort segment in merged launches (any segment sizes; bitwise equal). Default: automatic, merged with three or more sessions (paired, per cycle: -0.7 ms at three, -2.2 at four, -4.0 at six, -8.0 at eight) and per session with two (merged costs 1.6 ms more there). `1` forces it, `0` turns it off. Off while a QSA pool check switch is set. A/B name `qsa2`. |
 | `STRIX_COHORT_GDN_ANYSEG=1` | Opt-in: GDN part 2 (prepare and recurrence) fused for segments of 1..8 rows, not only 2, 4 or 8; bitwise equal. A/B name `anyseg`. |
 | `STRIX_COHORT_AUTO=0` | Turns the automatic per-cycle policy off: one 8-row cohort per cycle unless the switches above are set. |
 | `STRIX_COHORT_WIDE_LOG=1` | Per cohort call (first 4, then every 256th): chunks, rows and steps run wide, per chunk and per request; at exit, calls and mean wall ms per row total, chunk count and wide or not. |

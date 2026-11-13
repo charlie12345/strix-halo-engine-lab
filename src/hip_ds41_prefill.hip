@@ -738,8 +738,8 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
         throw std::invalid_argument("ds41 prefill gate/up view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
     // Rank fixture at 2048 and 4096 rows in 16-row batches, shared core against the kernels below (same bits): Q8_0 (the
-    // shared expert) -0.6..-3.0 % -> default; IQ2_XXS +0.4 % (mean of eight cells, -0.0..+1.2 %; the same kernel in two
-    // arms differs by 0.2 %) -> stays on the kernels below.
+    // shared expert) -0.6..-3.0 % -> default; IQ2_XXS +0.3 % at 4096 rows (five cells, -0.0..+0.4 %; one kernel in two
+    // arms differs by up to 0.2 % there and 0.9 % at 2048 rows) -> stays on the kernels below until it is equal.
     const bool faster_form = format == WeightFormat::q8_0 && view.routes.batch_rows == 16U && !fast_moe() && view.hidden <= 5120U;
     if (pf_core_for(faster_form) || fast_i4()) {
         if (view.hidden > 5120U) throw std::invalid_argument("ds41 prefill gate/up view: shared core width");

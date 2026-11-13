@@ -1338,7 +1338,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
         }
         if (policy_.disk_directory.empty() || (eligible && (!policy_.certified_disk || policy_.legacy))) continue;
         std::error_code error;
-        const auto known = prepared_disk ? ticket.disk[k - 1] : PrefixLookupTicket::disk_unknown;
+        const std::uint8_t known = prepared_disk ? ticket.disk[k - 1] : std::uint8_t{PrefixLookupTicket::disk_unknown};
         if (known == PrefixLookupTicket::disk_absent) continue;
         if (known == PrefixLookupTicket::disk_unknown &&
             !std::filesystem::exists(checkpoint_path(policy_.disk_directory, digest), error)) continue;

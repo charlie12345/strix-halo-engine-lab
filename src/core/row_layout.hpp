@@ -38,15 +38,18 @@ inline constexpr std::uint64_t kRowAlignment = 64;
 }
 
 // `tight` is the stride the buffer would have without the policy (payload rounded to the buffer's own alignment).
-// `alignment` is the row alignment the buffer's kernels require (a power of two, at least 64; the known-rows arena
-// needs 256): the step is rounded up to it, so every row keeps that alignment. The result is >= tight, congruent to
+// `alignment` is the row alignment the buffer's kernels require (the known-rows arena normally needs 256).
+// Unsupported de-aliasing alignments keep the tight layout. Otherwise the step is rounded up to it. The result is >= tight, congruent to
 // it modulo `alignment`, and equal to it when rows < lockstep_rows, when the policy is off, or when the tight stride
 // does not alias.
 [[nodiscard]] constexpr std::uint64_t physical_row_stride(const RowLayoutPolicy& p, std::uint64_t tight,
                                                           std::uint64_t rows, std::uint64_t alignment = kRowAlignment) {
-    if (!row_layout_valid(p) || alignment < kRowAlignment || (alignment & (alignment - 1U)) || alignment >= p.alias_bytes)
+    if (!row_layout_valid(p) || !alignment)
         throw std::invalid_argument("row layout policy is invalid");
     if (!tight || !p.dealias_bytes || rows < p.lockstep_rows) return tight;
+    // Arena alignment accepts any nonzero multiple of its serial alignment. Optimization eligibility
+    // must not narrow that contract, including page-aligned and non-power-of-two arenas.
+    if (alignment < kRowAlignment || (alignment & (alignment - 1U)) || alignment >= p.alias_bytes) return tight;
     const auto step = (p.dealias_bytes + alignment - 1U) / alignment * alignment;
     // A step that is itself a multiple of the period can never leave it; an aligned buffer cannot exceed
     // alias_bytes / alignment distinct offsets either.
@@ -57,6 +60,20 @@ inline constexpr std::uint64_t kRowAlignment = 64;
         if (n > p.alias_bytes / kRowAlignment || stride > UINT64_MAX - step) throw std::overflow_error("row layout stride overflows");
         stride += step;
     }
+    return stride;
+}
+
+// Validate retained row views, independently of the process policy that may have built other arenas.
+// Callers also validate ownership, containing allocation bounds and uniformity over the full stripe.
+[[nodiscard]] constexpr std::uint64_t retained_row_stride(
+    std::uintptr_t first, std::uint64_t first_bytes, std::uintptr_t second, std::uint64_t second_bytes,
+    std::uint64_t alignment = 256U) {
+    if (!alignment || !first || !first_bytes || first_bytes != second_bytes || second <= first ||
+        first % alignment || second % alignment || first_bytes > UINTPTR_MAX - first || second_bytes > UINTPTR_MAX - second)
+        throw std::invalid_argument("retained row extent/order/alignment is invalid");
+    const auto stride = static_cast<std::uint64_t>(second - first);
+    if (stride < first_bytes || stride % alignment)
+        throw std::invalid_argument("retained rows overlap or have an unaligned stride");
     return stride;
 }
 

@@ -14,7 +14,7 @@ void expect(bool condition, const char* message) {
 }
 }  // namespace
 
-int main() {
+int main() try {
     using strix::core::RowLayoutPolicy;
     using strix::core::physical_row_stride;
     using strix::core::row_alias_period;
@@ -80,7 +80,53 @@ int main() {
     for (std::size_t i = 0; i < window.physical.allocations.size(); ++i)
         expect(window.row_stride[i] == strix::find_arena_allocation(serial, window.physical.allocations[i].use)->bytes,
             "closed windows of two, four or eight rows keep the tight stride");
+
+    // The arena contract permits page alignment and arbitrary nonzero serial multiples.
+    for (const std::uint64_t alignment : {1U, 64U, 192U, 4096U, 8192U}) {
+        strix::ExecutionArenaPlan aligned;
+        aligned.alignment = alignment;
+        aligned.total_bytes = aligned.naive_nonaliased_bytes = alignment;
+        auto allocation = stream;
+        allocation.bytes = alignment;
+        aligned.allocations = {allocation};
+        const auto closed = strix::build_known_window_arena(aligned, alignment, 2);
+        expect(closed.row_stride[0] == alignment, "closed arena preserves its alignment contract");
+        for (const RowLayoutPolicy layout : {RowLayoutPolicy{}, RowLayoutPolicy{4096, 0, 2, 16}}) {
+            const auto prefill = strix::build_known_prefill_arena(aligned, alignment, 16, 0, false, true, 0, &layout);
+            expect(prefill.row_stride[0] == alignment && prefill.physical.total_bytes == 16U * alignment &&
+                prefill.row_view[15].allocations[0].offset == 15U * alignment,
+                "prefill preserves valid alignments with padding on and off");
+        }
+    }
+
+    // Exercise the host validation shared by both expert launchers with an explicit arena policy.
+    serial.allocations = {stream};
+    serial.allocations[0].bytes = serial.total_bytes = serial.naive_nonaliased_bytes = 5120;
+    const RowLayoutPolicy explicit_layout{4096, 256, 16, 16};
+    const auto explicit_arena = strix::build_known_prefill_arena(serial, 256, 16, 0, false, true, 0, &explicit_layout);
+    expect(explicit_arena.row_stride[0] == 5376, "explicit policy pads the hidden row");
+    for (std::uint32_t r = 1; r < 16; ++r) {
+        const auto& a = explicit_arena.row_view[r - 1].allocations[0];
+        const auto& b = explicit_arena.row_view[r].allocations[0];
+        expect(strix::core::retained_row_stride(65536U + a.offset, a.bytes, 65536U + b.offset, b.bytes) == 5376,
+            "expert consumer validation accepts explicit arena strides independent of process defaults");
+    }
+    const auto rejects = [&](std::uintptr_t first, std::uint64_t bytes, std::uintptr_t second, std::uint64_t other_bytes) {
+        bool invalid = false;
+        try { (void)strix::core::retained_row_stride(first, bytes, second, other_bytes); }
+        catch (const std::invalid_argument&) { invalid = true; }
+        expect(invalid, "expert consumer rejects malformed row views");
+    };
+    rejects(65536, 5120, 65536 + 5376, 5119); // different payloads
+    rejects(65536, 5120, 65536 - 5376, 5120); // reversed rows
+    rejects(65536, 5120, 65536 + 5121, 5120); // unaligned row
+    rejects(65537, 5120, 65537 + 5376, 5120); // unaligned base
+    rejects(65536, 5120, 65536 + 256, 5120);  // overlap
+    rejects(65536, 5120, UINTPTR_MAX - 255U, 5120); // wrapping extent
     if (failures) return 1;
     std::cout << "row layout tests passed\n";
     return 0;
+} catch (const std::exception& error) {
+    std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
+    return 1;
 }

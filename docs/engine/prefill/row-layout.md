@@ -5,12 +5,14 @@ more rows at once) touches addresses one row stride apart. When the stride is a 
 those addresses share a page offset and the rows of a tile compete for the same cache sets and translation
 entries. The values are unaffected; only time is lost.
 
-`src/core/row_layout.hpp` is the one place that decides the physical stride of a row:
+`src/core/row_layout.hpp` supplies the shared physical stride policy for the known-rows arena and detached
+shared-expert workspace. Other row-buffer owners have not adopted it:
 
 - `physical_row_stride(policy, tight, rows, alignment)` keeps the logical width and the buffer's row alignment and
   adds a step to a stride that would repeat a page offset sooner than `min_period` rows. The step is rounded up to
   the buffer's alignment, so 64-byte rows stay 64-byte aligned and the known-rows arena keeps its 256-byte rows.
 - Buffers with fewer than 16 rows (closed windows of two, four or eight rows) keep the tight stride.
+- Alignments that cannot use de-aliasing keep the tight layout, including page-aligned arenas.
 - Consumers take the stride from the row views (pointer + stride). Code that used to recompute the 256-byte rounded
   width now reads the views or calls the policy.
 
@@ -23,9 +25,15 @@ The known-rows arena (`build_known_prefill_arena`) takes every stride from the p
 |---|---|---|
 | `STRIX_ROW_DEALIAS_BYTES` | 256 | Step added to an aliasing stride (multiple of 64). `0` restores the tight strides. |
 | `STRIX_ROW_DEALIAS_PERIOD` | 2 | Rows before a page offset may repeat. 2 moves exact page multiples only; 16 also moves strides such as 5,120 bytes. |
-| `STRIX_ROW_LAYOUT_VERBOSE` | off | Prints payload, stride and page period of every row buffer. |
+| `STRIX_ROW_LAYOUT_VERBOSE` | off | Prints payload, stride and page period of known-rows arena buffers. |
 
-## Measurements (one node, bitwise-identical logits and token ids in every run)
+## Reported measurements (combined code)
+
+These author-reported timings used this layout change together with another PR; the exact combined revision
+was not recorded here. They do not establish a speedup for this isolated change and were not independently
+reproduced in the host review. The GDN fixture hash covers final buffers after several timed variants, not an
+independent equality verdict for each variant or the convolution-history payload. Native token, logit and
+complete-state equality and GPU tail behavior remain qualification requirements.
 
 Qwen row buffers at 8,192 rows: two stream slots of 20,480 bytes and the MLP intermediate of 176,128 bytes were
 exact page multiples and move to 20,736 and 176,384 bytes. Cost: 256 bytes per arena row (324,352 to 324,608, +0.08 %).

@@ -2659,14 +2659,12 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
                 current.bytes > row_memory.arena_bytes - (current.address - row_memory.arena_base) ||
                 current.allocation_generation != row_memory.allocation_generation || base[v].bytes > UINT64_MAX - 255U)
                 throw std::invalid_argument("known-window routed rows view exceeds retained physical allocation");
-            // The stripe is the arena's: the stride is read from the row views (row 1 - row 0) and must be one of the
-            // two strides the shared row layout policy can produce for this payload, never a recomputed width.
+            // Validate the retained arena's stride, including explicit per-arena policies.
             const auto tight = (base[v].bytes + 255U) / 256U * 256U;
             const std::array row1{out.rows[r ? 1U : 0U].hidden, out.rows[r ? 1U : 0U].route_indices, out.rows[r ? 1U : 0U].route_weights,
                 out.rows[r ? 1U : 0U].output, out.rows[r ? 1U : 0U].temporary};
-            const auto stride = r && !cohort ? row1[v].address - base[v].address : tight;
-            if (stride != tight && stride != core::physical_row_stride(tight, UINT32_MAX, 256U))
-                throw std::invalid_argument("known-window routed rows stride is not a row layout stride");
+            const auto stride = r && !cohort ? core::retained_row_stride(
+                base[v].address, base[v].bytes, row1[v].address, row1[v].bytes) : tight;
             // Rows of different cohort sessions live in different arenas; every union kernel
             // addresses rows through per-row pointers, so only one session's window keeps the stripe.
             if (current.bytes != base[v].bytes || (!cohort && (stride > (UINTPTR_MAX - base[v].address) / rows.size() ||

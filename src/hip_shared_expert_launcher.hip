@@ -1856,14 +1856,7 @@ void known_shared_range(KnownSharedSpan view) {
 }
 std::uint64_t known_shared_stride(const ExecutionBufferAddress& first,
                                   const ExecutionBufferAddress& second) {
-    if (first.bytes != second.bytes || first.bytes > UINT64_MAX - 255U || second.address <= first.address)
-        throw std::invalid_argument("known-window shared R2 row extent/order differs");
-    // The stride is the arena's (row views): tight, or the shared row layout policy's stride for this payload.
-    const auto expected = (first.bytes + 255U) / 256U * 256U;
-    const auto stride = static_cast<std::uint64_t>(second.address - first.address);
-    if (stride != expected && stride != core::physical_row_stride(expected, UINT32_MAX, 256U))
-        throw std::invalid_argument("known-window shared R2 row stride differs from serial allocation");
-    return stride;
+    return core::retained_row_stride(first.address, first.bytes, second.address, second.bytes);
 }
 const ExecutionMemoryBinding& known_shared_memory(const ExecutionDispatchContext& row) {
     if (!row.resources || !row.resources->scratch || !row.arena)

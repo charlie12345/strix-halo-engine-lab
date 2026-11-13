@@ -111,7 +111,7 @@ void set_fast_i4(int mode); // 1 on, 0 off, -1 environment
 [[nodiscard]] bool fast_i4();
 // STRIX_DS41_PF_CORE: which prefill products run on the shared tiled core (src/core, policy interface v1) instead of
 // the kernels described above: 0 none, moe (expert gate/up and down), dense (dense Q8_0 x A8), 1 both. Unset: per form,
-// the shared core where it is measured faster (today the Q8_0 down of the shared expert). The same bits either way.
+// the shared core where it is measured faster (today the Q8_0 gate/up and down of the shared expert). The same bits.
 // Test override: 1 on (every product), 0 off, -1 environment. pf_core / pf_core_dense: the product is named on.
 void set_pf_core(int mode);
 [[nodiscard]] bool pf_core();       // expert products (gate/up, down)

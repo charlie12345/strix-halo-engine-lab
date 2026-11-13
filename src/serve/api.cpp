@@ -334,7 +334,7 @@ struct ApiRequestScope {
     ApiRequestObservation observation;
     bool attempted = false, terminal_taken = false;
     const ApiConfig& config;
-    route::Totals route_start = route::enabled() ? route::snapshot() : route::Totals{};  // shared route receipt: request window
+    ::strix::route::Totals route_start = ::strix::route::enabled() ? ::strix::route::snapshot() : ::strix::route::Totals{};  // shared route receipt: request window
     void terminal() {
         if (!ticket || terminal_taken) return;
         terminal_taken = true;
@@ -1274,8 +1274,8 @@ struct ApiService::Impl {
         if (!note.empty()) data.set("sampling_note", Json(note));
         if (o && data.is_object()) if (const auto text = power_receipt(*o); !text.empty()) data.set("power", parse_json(text));
         // Shared route receipt of the request window on this rank: launches and rows by kernel family, bypasses with reasons.
-        if (o && data.is_object() && api_request_scope && route::enabled())
-            data.set("route", parse_json(route::json(route::delta(route::snapshot(), api_request_scope->route_start), "request", false)));
+        if (o && data.is_object() && api_request_scope && ::strix::route::enabled())
+            data.set("route", parse_json(::strix::route::json(::strix::route::delta(::strix::route::snapshot(), api_request_scope->route_start), "request", false)));
         return data;
     }
     void completion_data(Json& out, const Outcome& o, const Json& body, const std::string& note, bool timings = true) const {
@@ -2494,7 +2494,7 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             // Shared power view (sources, latest reading, totals since start); absent with STRIX_POWER_SAMPLER=0.
             if (data.is_object() && power::sampler_enabled()) data.set("power", parse_json(power::status_json()));
             // Shared route receipt (process totals, levers, explicitly set switches): same view, same access rule as power.
-            if (data.is_object() && route::enabled()) data.set("route", parse_json(route::json()));
+            if (data.is_object() && ::strix::route::enabled()) data.set("route", parse_json(::strix::route::json()));
             response.send(200, "application/json", data.dump());
             return;
         }

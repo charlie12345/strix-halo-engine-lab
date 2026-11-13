@@ -39,7 +39,7 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
         }
         state.bound = std::move(chosen);
         power::start_process_sampler();  // shared power receipt: every binary that binds a device samples from here on
-        route::arm_exit_print();         // shared route receipt: printed once when the process exits
+        ::strix::route::arm_exit_print();         // shared route receipt: printed once when the process exits
     } else if (const auto status = hipSetDevice(state.bound->visible.ordinal); status != hipSuccess) {
         fail(std::string("hipSetDevice failed: ") + hipGetErrorString(status));
     }

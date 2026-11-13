@@ -142,7 +142,7 @@ inline void set_engine(std::string_view engine) {
 inline void launched(Product p, Family f, std::uint64_t rows) {
     if (!enabled()) return;
     detail::add(detail::g_table.product[static_cast<std::size_t>(p)][static_cast<std::size_t>(f)], rows);
-    if (const int L = detail::t_layer; L >= 0) detail::add(detail::g_table.layer[L][static_cast<std::size_t>(f)], rows);
+    if (const int L = detail::t_layer; L >= 0) detail::add(detail::g_table.layer[static_cast<std::size_t>(L)][static_cast<std::size_t>(f)], rows);
 }
 // A call that wanted family `wanted` and did not get it, with the reason of the deciding branch.
 inline void bypass(Product p, Family wanted, Reason why, std::uint64_t rows) {

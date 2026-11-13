@@ -63,12 +63,13 @@ public:
         // selecting thread as before. The walks run on the host lane's background threads: one walk can take far
         // longer than a decode step, which the lane's critical threads (row folds) must never wait for. A lane that
         // runs jobs inline (STRIX_HOST_LANE=0, no background threads) gives nothing to run ahead on.
-        const char* ahead=std::getenv("STRIX_CONSTRAINT_MASK_AHEAD");
+        // Ranked membership (opt-in, with --http-selection-fast): STRIX_CONSTRAINT_RANKED=N checks the N next-best
+        // logits of a refused row before walking a mask (0..4096; default 0 = always walk, the refusals of a full
+        // walk). Both settings are read strictly and recorded by the shared environment registry.
+        const auto policy=serve::constraint_selection_policy_from_environment();
         const auto& lane=core::shared_host_lane().config();
-        ahead_=(!ahead || std::string_view(ahead)!="0") && lane.enabled && lane.background_threads>0;
-        // Ranked membership (exact, part of --http-selection-fast): STRIX_CONSTRAINT_RANKED=N checks the N next-best
-        // logits of a refused row before walking a mask (default 32, 0 = always walk).
-        if(const char* ranked=std::getenv("STRIX_CONSTRAINT_RANKED")) ranked_=static_cast<unsigned>(std::min(std::strtoul(ranked,nullptr,10),4096UL));
+        ahead_=policy.mask_ahead && lane.enabled && lane.background_threads>0;
+        ranked_=policy.ranked;
         std::fprintf(stderr,"constraint mask ahead: %s, ranked membership: %u\n",ahead_?"on":"off",argmax_first_?ranked_:0U);
     }
     bool available(std::span<const std::uint32_t> stops) const {
@@ -93,7 +94,7 @@ private:
     std::shared_ptr<const serve::BpeTokenizer> tokenizer_;
     std::shared_ptr<const serve::TokenByteTrie> trie_;
     bool argmax_first_;
-    unsigned ranked_=32;
+    unsigned ranked_=0;
     bool ahead_=false;
 };
 // Execution failures stop the server; constraint refusals carry request-local receipts.

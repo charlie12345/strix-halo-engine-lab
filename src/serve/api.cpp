@@ -2,7 +2,9 @@
 
 #include "strix/serve/chat_template.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/power/sampler.hpp"
 #include "strix/serve/json_constraint.hpp"
+#include "strix/serve/media.hpp"
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
 
@@ -289,6 +291,7 @@ struct RecentRequest {
     std::optional<double> first_token_ms;
     std::uint64_t imported = 0;
     std::string response_id;
+    std::string power;  // strix-power-receipt-v1 of the request (empty: no readable power source)
 };
 
 std::vector<std::string> stop_strings(const Json* stop) {
@@ -323,6 +326,28 @@ struct ApiConnection {
 };
 struct ApiRequestScope;
 thread_local ApiRequestScope* api_request_scope = nullptr;
+// Media of the request this thread serves. Empty items: the request is text and nothing below runs.
+struct ApiMediaKind {
+    std::shared_ptr<ApiMediaAdapter> adapter;
+    std::string kind;
+    std::uint32_t placeholder = 0;
+};
+struct ApiMediaState {
+    std::vector<media::MediaItem> items;
+    std::vector<const ApiMediaKind*> kinds;     // per item, in the order the canonical parts were met
+    std::shared_ptr<const session::EmbedTable> table;
+    Json body, receipts, listing;               // rewritten request; strix.<name> members; /tokenize entries
+    std::vector<std::uint32_t> real;            // the prompt with each virtual id replaced by its real token id
+};
+thread_local ApiMediaState* api_media = nullptr;
+struct ApiMediaGuard {
+    ApiMediaState state;
+    ApiMediaState* previous = api_media;
+    ApiMediaGuard() { api_media = &state; }
+    ~ApiMediaGuard() { api_media = previous; }
+    ApiMediaGuard(const ApiMediaGuard&) = delete;
+    ApiMediaGuard& operator=(const ApiMediaGuard&) = delete;
+};
 struct ApiRequestScope {
     const HttpRequest& request;
     std::shared_ptr<ApiConnection> connection;
@@ -406,6 +431,8 @@ struct ApiService::Impl {
     std::string state = "idle";
     std::uint64_t requests_total = 0, requests_failed = 0;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    // The shared power sampler runs from server start (a device bind has usually started it already).
+    const bool power_started = (power::start_process_sampler(), true);
     const std::string instance = random_id("").substr(0, 16);  // this process's engine instance, chosen once (status, metrics)
     const std::int64_t start_unix = unix_now();
     std::int64_t armed_unix = 0;  // when this service armed the instrumentation's current period (0: armed elsewhere)
@@ -414,6 +441,205 @@ struct ApiService::Impl {
     std::atomic<std::uint64_t> chat_sequence{0};
     Json capabilities_document;
     std::string capabilities_id;
+    // Media kinds with a loaded adapter (ApiConfig::vision). Empty: no code below touches a request.
+    std::vector<ApiMediaKind> media_kinds;
+    mutable std::mutex media_mutex; // one request encodes at a time; guards the epochs
+    mutable std::vector<std::uint64_t> media_epochs; // per kind, the epoch whose cached state is live
+
+    void build_media() {
+        for (const auto& adapter : config.vision.adapters) {
+            if (!adapter) throw std::invalid_argument("media adapter is null");
+            ApiMediaKind entry;
+            entry.kind = adapter->kind();
+            if (entry.kind.empty() || adapter->identity().empty()) throw std::invalid_argument("media adapter needs a kind and an identity");
+            for (const auto& other : media_kinds)
+                if (other.kind == entry.kind) throw std::invalid_argument("two media adapters for kind " + entry.kind);
+            if (!tokenizer) throw std::invalid_argument("media adapter requires a tokenizer");
+            const auto ids = tokenizer->encode(adapter->placeholder(), true);
+            if (ids.size() != 1U || session::is_embed_id(ids[0])) throw std::invalid_argument("media placeholder of kind " + entry.kind + " must tokenize to one id");
+            for (const auto& other : media_kinds)
+                if (other.placeholder == ids[0]) throw std::invalid_argument("media kinds share a placeholder id");
+            entry.placeholder = ids[0];
+            entry.adapter = adapter;
+            media_epochs.push_back(adapter->epoch());
+            media_kinds.push_back(std::move(entry));
+        }
+    }
+    const ApiMediaKind* media_kind(std::string_view kind) const {
+        for (const auto& entry : media_kinds) if (entry.kind == kind) return &entry;
+        return nullptr;
+    }
+    // Front doors call this first. Without an adapter, or for a body without media, the caller's body comes back
+    // (the same object: text requests take the path they always took).
+    const Json& media_in(const Json& raw, media::Api api) const {
+        if (media_kinds.empty() || !api_media) return raw;
+        media::Normalized normalized;
+        try { normalized = media::normalize(raw, api, config.vision.media); }
+        catch (const media::MediaError& e) { throw ApiError(e.status, "invalid_request_error", e.what(), e.param); }
+        if (normalized.items.empty()) return raw;
+        auto& req = *api_media;
+        req = ApiMediaState{};
+        req.items = std::move(normalized.items);
+        req.body = api == media::Api::chat_completions ? chat_media_text(normalized.body) : std::move(normalized.body);
+        return req.body;
+    }
+    // The renderer text of a canonical media part {"type":<kind>,"media":k}; nullopt for every other part, which
+    // keeps the handling it had. Parts are consumed in prompt order, so a part the normalizer did not write
+    // (another role, a forged index) cannot pass.
+    std::optional<std::string> media_text(const Json& part) const {
+        auto* req = api_media;
+        if (!req || req->items.empty() || !part.is_object()) return std::nullopt;
+        const auto* index = part.find("media"); const auto* type = part.find("type");
+        if (!index || !index->is_number() || !type || !type->is_string()) return std::nullopt;
+        const auto* kind = media_kind(type->as_string());
+        if (!kind) return std::nullopt;
+        const auto next = req->kinds.size();
+        if (next >= req->items.size() || index->as_double() != static_cast<double>(next))
+            throw ApiError(400, "invalid_request_error", "media parts are written by the server and cannot be sent", "messages");
+        std::size_t ordinal = 0;
+        for (const auto* seen : req->kinds) if (seen == kind) ++ordinal;
+        req->kinds.push_back(kind);
+        return kind->adapter->part_text(ordinal);
+    }
+    // Chat Completions keeps its message list: each canonical part becomes a text part holding the placeholder.
+    Json chat_media_text(const Json& body) const {
+        const auto* messages = body.find("messages");
+        if (!messages || !messages->is_array()) return body;
+        Json converted = Json::array();
+        for (const auto& message : messages->as_array()) {
+            const auto* content = message.is_object() ? message.find("content") : nullptr;
+            if (!content || !content->is_array()) { converted.push(message); continue; }
+            Json parts = Json::array(); bool changed = false;
+            for (const auto& part : content->as_array()) {
+                if (auto text = media_text(part)) {
+                    Json t = Json::object(); t.set("type", Json("text")); t.set("text", Json(std::move(*text)));
+                    parts.push(std::move(t)); changed = true;
+                } else parts.push(part);
+            }
+            if (!changed) { converted.push(message); continue; }
+            Json copy = Json::object();
+            for (const auto& [key, value] : message.as_object()) copy.set(key, key == "content" ? parts : value);
+            converted.push(std::move(copy));
+        }
+        Json out = Json::object();
+        for (const auto& [key, value] : body.as_object()) out.set(key, key == "messages" ? converted : value);
+        return out;
+    }
+    // Rendered tokens -> prompt ids: every placeholder becomes the ids of its item (one virtual id per row).
+    void expand_media(ApiChatPrompt& prompt) const {
+        auto& req = *api_media;
+        const auto bad = [](const std::string& message) { throw ApiError(400, "invalid_request_error", message, "messages"); };
+        const auto count = req.items.size();
+        if (req.kinds.size() != count) bad("a media part is in a place this request does not accept");
+        const auto first = req.kinds[0]->placeholder;
+        std::size_t found = 0;
+        for (auto& id : prompt.tokens) {
+            if (session::is_embed_id(id)) bad("the prompt holds a reserved id");
+            for (const auto& entry : media_kinds) {
+                if (id != entry.placeholder) continue;
+                if (found >= count || req.kinds[found] != &entry) bad("the prompt text holds a reserved media placeholder");
+                ++found; id = first;
+                break;
+            }
+        }
+        if (found != count) bad("the rendered prompt does not hold one placeholder per media part");
+        const auto text_tokens = prompt.tokens.size() - count;
+        std::uint64_t room = context_tokens > text_tokens ? context_tokens - text_tokens : 0;
+        std::uint64_t request_rows = config.vision.max_request_rows ? config.vision.max_request_rows : std::numeric_limits<std::uint64_t>::max();
+        std::vector<std::vector<std::uint32_t>> layouts;
+        std::vector<session::EmbedLease> leases;
+        std::vector<ApiMediaSpan> spans;
+        const auto no_room = [&](std::size_t i) {
+            throw ApiError(400, "invalid_request_error", "media rows do not fit the context of " + std::to_string(context_tokens) + " tokens", req.items[i].param);
+        };
+        {
+            std::lock_guard lock(media_mutex);
+            for (std::size_t i = 0; i < count; ++i) {
+                auto& adapter = *req.kinds[i]->adapter;
+                const auto budget = static_cast<std::uint32_t>(std::min<std::uint64_t>({adapter.max_rows(), room, request_rows, session::kEmbedMaxRows}));
+                if (!budget) no_room(i);
+                ApiMediaSpan span;
+                try { span = adapter.encode(req.items[i], budget); }
+                catch (const media::MediaError& e) { throw ApiError(e.status, "invalid_request_error", e.what(), e.param.empty() ? req.items[i].param : e.param); }
+                // an adapter refuses content it cannot represent with std::invalid_argument: the client's fault
+                catch (const std::invalid_argument& e) { throw ApiError(400, "invalid_request_error", e.what(), req.items[i].param); }
+                std::uint64_t rows = 0;
+                bool valid = static_cast<bool>(span.lease) && !span.layout.empty();
+                for (const auto id : span.layout) {
+                    if (!valid) break;
+                    if (!session::is_embed_id(id)) { valid = id != first; continue; }
+                    valid = session::embed_handle(id) == span.lease.handle() && session::embed_row(id) < span.lease.rows().rows;
+                    ++rows;
+                }
+                if (!valid) throw ApiError(500, "server_error", "media adapter returned an invalid span");
+                if (rows > budget || span.layout.size() > room) no_room(i);
+                // one handle space per service: the table is keyed by handle
+                for (const auto& held : leases)
+                    if (held.handle() == span.lease.handle() && held.rows().digest != span.lease.rows().digest)
+                        throw ApiError(500, "server_error", "media adapters of one service must share one interner");
+                room -= span.layout.size(); request_rows -= rows;
+                layouts.push_back(span.layout); leases.push_back(span.lease); spans.push_back(std::move(span));
+            }
+            // A wrapped handle space reuses ids: cached state of the earlier epoch goes before this request runs.
+            for (std::size_t k = 0; k < media_kinds.size(); ++k) {
+                const auto epoch = media_kinds[k].adapter->epoch();
+                if (epoch == media_epochs[k]) continue;
+                if (!config.vision.on_epoch)
+                    throw ApiError(503, "server_error", "media handle space wrapped and no owner withdraws the cached prefixes; restart the service");
+                config.vision.on_epoch(epoch);
+                media_epochs[k] = epoch;
+            }
+        }
+        session::ExpandedPrompt expanded;
+        try { expanded = session::expand_embed_rows(prompt.tokens, first, layouts); }
+        catch (const std::invalid_argument& e) { throw ApiError(500, "server_error", std::string("media expansion failed: ") + e.what()); }
+        prompt.stable_prefix = static_cast<std::uint32_t>(expanded.map_offset(prompt.stable_prefix));
+        prompt.tokens = std::move(expanded.tokens);
+        prompt.embeds = std::make_shared<const session::EmbedTable>(std::move(leases));
+        req.table = prompt.embeds;
+        req.real = prompt.tokens;
+        for (auto& id : req.real)
+            if (session::is_embed_id(id)) id = prompt.embeds->find(session::embed_handle(id))->real_token_id;
+        req.receipts = Json::object(); req.listing = Json::array();
+        std::vector<Json> listed(count);
+        for (const auto& entry : media_kinds) {
+            Json items = Json::array(); std::uint64_t kind_rows = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                if (req.kinds[i] != &entry) continue;
+                const auto& run = expanded.runs[i]; const auto& span = spans[i]; const auto& item = req.items[i];
+                static const char* const digits = "0123456789abcdef";
+                std::string digest;
+                for (std::size_t b = 0; b < 8; ++b) { digest += digits[item.digest[b] >> 4]; digest += digits[item.digest[b] & 15]; }
+                Json grid = Json::array(); grid.push(Json(static_cast<std::uint64_t>(span.grid_h))); grid.push(Json(static_cast<std::uint64_t>(span.grid_w)));
+                Json r = Json::object();
+                r.set("index", Json(static_cast<std::uint64_t>(i))); r.set("rows", Json(static_cast<std::uint64_t>(run.rows)));
+                r.set("tokens", Json(static_cast<std::uint64_t>(run.size))); r.set("grid", std::move(grid));
+                r.set("preprocess_ms", Json(span.preprocess_ms)); r.set("encode_ms", Json(span.encode_ms));
+                r.set("cache_hit", Json(span.cache_hit)); r.set("digest", Json(digest));
+                items.push(std::move(r));
+                Json l = Json::object();
+                l.set("index", Json(static_cast<std::uint64_t>(i))); l.set("type", Json(entry.kind));
+                l.set("offset", Json(static_cast<std::uint64_t>(run.offset))); l.set("tokens", Json(static_cast<std::uint64_t>(run.size)));
+                l.set("rows", Json(static_cast<std::uint64_t>(run.rows)));
+                listed[i] = std::move(l);
+                kind_rows += run.rows;
+            }
+            if (items.size() == 0U) continue;
+            Json receipt = Json::object();
+            receipt.set("adapter", Json(entry.adapter->identity())); receipt.set("rows", Json(kind_rows));
+            receipt.set(entry.kind + "s", std::move(items));
+            req.receipts.set(entry.adapter->receipt_name(), std::move(receipt));
+        }
+        for (auto& entry : listed) req.listing.push(std::move(entry)); // /tokenize: prompt order whatever the kind
+    }
+    // strix receipts gain the media members of this request; a text request returns its receipt untouched.
+    static Json with_media(Json receipt) {
+        if (!api_media || !api_media->receipts.is_object() || !receipt.is_object()) return receipt;
+        Json out = Json::object(); // receipts can be shared objects: never edit in place
+        for (const auto& [key, value] : receipt.as_object()) out.set(key, value);
+        for (const auto& [key, value] : api_media->receipts.as_object()) out.set(key, value);
+        return out;
+    }
 
     void build_capabilities() {
         Json out = Json::object();
@@ -484,6 +710,19 @@ struct ApiService::Impl {
         out.set("default_thinking", Json(config.default_thinking));
         out.set("function_tools", Json(true)); out.set("plaintext_reasoning", Json(true));
         out.set("developer_role", Json("leading_system_message"));
+        for (const auto& entry : media_kinds) {
+            const auto& options = config.vision.media;
+            out.set(entry.adapter->input_capability(), Json(true));
+            Json m = Json::object();
+            m.set("adapter", Json(entry.adapter->identity()));
+            m.set("max_items", Json(static_cast<std::uint64_t>(options.limits.max_images)));
+            m.set("max_item_bytes", Json(static_cast<std::uint64_t>(options.limits.max_image_bytes)));
+            m.set("max_pixels", Json(static_cast<std::uint64_t>(options.limits.max_pixels)));
+            m.set("max_rows_per_item", Json(static_cast<std::uint64_t>(entry.adapter->max_rows())));
+            m.set("max_request_rows", Json(static_cast<std::uint64_t>(config.vision.max_request_rows)));
+            m.set("remote_fetch", Json(options.fetch.mode == media::FetchMode::allowlist && options.fetcher ? "allowlist" : "off"));
+            out.set(entry.adapter->receipt_name(), std::move(m));
+        }
         if (config.capabilities_extra) {
             config.capabilities_extra(out);
             Json canonical = Json::object();
@@ -557,6 +796,7 @@ struct ApiService::Impl {
     Impl(ApiConfig c, std::shared_ptr<const ApiTokenizer> t, GenerationQueue& q, std::uint64_t context, bool samples)
         : config(std::move(c)), tokenizer(std::move(t)), queue(q), context_tokens(context), engine_samples(samples),
           expiry_seconds(expiry_from(config.observe_expiry_seconds)) {
+        build_media();
         if (config.capabilities) build_capabilities();
     }
 
@@ -682,7 +922,26 @@ struct ApiService::Impl {
 
     // ---- chat ----
     using ChatPrompt = ApiChatPrompt;
+    // tool_choice "none": the history stays renderable, a closing instruction replaces the removed definitions when
+    // the history holds tool activity, and a call the model still emits is withheld (parsed_output). Requests
+    // without tool_choice "none" take render_chat_prompt unchanged.
     ChatPrompt chat_prompt(const Json& body) const {
+        auto out = chat_prompt_text(body);
+        if (api_media && !api_media->items.empty()) expand_media(out);
+        return out;
+    }
+    ChatPrompt chat_prompt_text(const Json& body) const {
+        if (!tool_choice_is_none(body)) return render_chat_prompt(body);
+        const auto* messages = body.find("messages");
+        auto hinted = messages ? messages_with_no_tools_hint(*messages, config.no_tools_hint ? std::string_view(*config.no_tools_hint) : std::string_view(no_tools_hint))
+                               : std::optional<Json>{};
+        ChatPrompt out;
+        if (hinted) { Json copy = body; copy.set("messages", std::move(*hinted)); out = render_chat_prompt(copy); }
+        else out = render_chat_prompt(body);
+        out.tools_off = true;
+        return out;
+    }
+    ChatPrompt render_chat_prompt(const Json& body) const {
         if (!tokenizer) throw ApiError(503, "server_error", "tokenizer is unavailable");
         if (config.prepare_chat) return family_call([&] { return config.prepare_chat(body); });
         const auto* messages = body.find("messages");
@@ -697,8 +956,7 @@ struct ApiService::Impl {
             normalized.push(std::move(copy));
         }
         input.messages = normalized;
-        const auto* tool_choice = body.find("tool_choice");
-        const bool tools_off = tool_choice && tool_choice->is_string() && tool_choice->as_string() == "none";
+        const bool tools_off = tool_choice_is_none(body);
         if (const auto* tools = body.find("tools"); tools && tools->is_array() && !tools_off) input.tools = *tools;
         const auto* kwargs = body.find("chat_template_kwargs");
         const auto kwarg = [&](std::string_view key) -> const Json* {
@@ -1161,6 +1419,7 @@ struct ApiService::Impl {
             job.cache_retention = retain->as_bool() ? CacheRetention::retain : CacheRetention::no_store;
         }
         job.prompt = std::move(prompt);
+        if (api_media && api_media->table) job.embeds = api_media->table; // resolves the virtual ids of this prompt
         job.stable_prefix = stable_prefix;
         job.max_tokens = max_tokens;
         job.stop_tokens = config.stop_tokens;
@@ -1243,13 +1502,21 @@ struct ApiService::Impl {
         if (!config.compact_chat_envelope || config.timed_completion_envelope) usage.set("prompt_tokens_details", std::move(details));
         return usage;
     }
-    Json timing_data(const std::string& note) const {
+    // Shared power receipt of a finished request: its decode and prefill windows, counted back from now.
+    static std::string power_receipt(const Outcome& o) {
+        if (!power::process_sampler()) return {};
+        const auto computed = o.stats.prompt_tokens - std::min(o.stats.prompt_tokens, o.stats.cached_tokens + o.stats.imported_tokens);
+        return power::block_json(power::request_block(power::Sampler::now_ns(), power::Phase{o.stats.prefill_ms, computed},
+                                                      power::Phase{o.stats.decode_ms, o.output_tokens}));
+    }
+    Json timing_data(const std::string& note, const Outcome* o = nullptr) const {
         auto data = api_request_scope ? api_request_scope->observation.terminal.timings : Json::object();
         if (!note.empty()) data.set("sampling_note", Json(note));
+        if (o && data.is_object()) if (const auto text = power_receipt(*o); !text.empty()) data.set("power", parse_json(text));
         return data;
     }
     void completion_data(Json& out, const Outcome& o, const Json& body, const std::string& note, bool timings = true) const {
-        if (timings) out.set("timings", timing_data(note));
+        if (timings) out.set("timings", timing_data(note, &o));
         if (bool_or(body, "return_token_ids", false)) {
             Json ids = Json::array();
             for (auto id : o.token_ids) ids.push(Json(static_cast<std::uint64_t>(id)));
@@ -1269,7 +1536,8 @@ struct ApiService::Impl {
             config.timed_completion_envelope ? "invalid_request_error" : "server_error", o.error, "", o.stats.error_code);
     }
     // "return_token_ids": true adds the generated token IDs (stop token included) for exactness checks.
-    static Json engine_json(const Outcome& o, const std::string& note, const Json& body) {
+    static Json engine_json(const Outcome& o, const std::string& note, const Json& body) { return with_media(engine_json_text(o, note, body)); }
+    static Json engine_json_text(const Outcome& o, const std::string& note, const Json& body) {
         Json e = Json::object();
         if (bool_or(body, "return_token_ids", false)) {
             Json ids = Json::array();
@@ -1300,6 +1568,9 @@ struct ApiService::Impl {
     }
     // The applied policy: alone at the start of a stream (o == nullptr), after the engine members at its end.
     Json receipt(const Outcome* o, const std::string& note, const Json& body, std::uint32_t limit, const ResolvedSampling& resolved, std::shared_ptr<const ConstraintSpec> spec = {}) const {
+        return with_media(receipt_text(o, note, body, limit, resolved, std::move(spec)));
+    }
+    Json receipt_text(const Outcome* o, const std::string& note, const Json& body, std::uint32_t limit, const ResolvedSampling& resolved, std::shared_ptr<const ConstraintSpec> spec = {}) const {
         if (spec && !config.stream_receipts) {
             Json out = Json::object();
             selection_json(out, *spec, o && o->stats.constraint ? *o->stats.constraint : initial_verdict(*spec));
@@ -1348,6 +1619,16 @@ struct ApiService::Impl {
     }
 
     AssistantOutput parsed_output(const Outcome& o, const ChatPrompt& prompt) const {
+        if (o.constraint && (o.constraint->program || o.constraint->thinking)) return parsed_turn(o, prompt);
+        auto parsed = parsed_turn(o, prompt);
+        if (prompt.tools_off) withhold_tool_calls(parsed, withheld_marker(prompt));
+        return parsed;
+    }
+    // The marker the stream splitter holds the text from: with tool_choice "none" the family's withhold marker.
+    const std::string& withheld_marker(const ChatPrompt& prompt) const {
+        return prompt.tools_off && !config.tools_off_marker.empty() ? config.tools_off_marker : config.tool_call_marker;
+    }
+    AssistantOutput parsed_turn(const Outcome& o, const ChatPrompt& prompt) const {
         if (o.family) {
             auto parsed = o.family->parsed;
             parsed.content = o.text; parsed.reasoning = o.reasoning;
@@ -1394,7 +1675,9 @@ struct ApiService::Impl {
         return error;
     }
 
-    void chat_completions(const HttpRequest&, HttpResponseWriter& response, const Json& body) {
+    void chat_completions(const HttpRequest&, HttpResponseWriter& response, const Json& request_body) {
+        ApiMediaGuard media_guard;
+        const Json& body = media_in(request_body, media::Api::chat_completions);
         const auto prompt = chat_prompt(body);
         if (const auto* n = body.find("n"); n && n->is_number() && n->as_int() != 1)
             throw ApiError(400, "invalid_request_error", "only n = 1 is supported", "n");
@@ -1490,12 +1773,13 @@ struct ApiService::Impl {
             return chunk(std::move(first), Json());
         };
         if (!config.compact_chat_envelope) start_stream();  // existing default event after headers
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         std::int64_t streamed_tool_index=0;
         const auto send_deltas = [&](const std::vector<ChatSplitter::Delta>& deltas) {
             if (!config.compact_chat_envelope && !start_stream()) return false;
             for (const auto& d : deltas) {
                 Json delta = Json::object();
+                if (d.tool_calls.size() && prompt.tools_off) continue;
                 if (d.tool_calls.size()) {
                     auto calls=tool_calls_json(d.tool_calls);
                     for(auto& call:calls.as_array())call.set("index",Json(streamed_tool_index++));
@@ -1506,7 +1790,7 @@ struct ApiService::Impl {
             return true;
         };
         auto outcome = drive(ticket, stops, [&](const std::string& text) {
-                if (!config.timed_completion_envelope) return send_deltas(splitter.push(text));
+                if (!config.timed_completion_envelope || prompt.tools_off) return send_deltas(splitter.push(text));
                 std::vector<ChatSplitter::Delta> one;
                 one.push_back(ChatSplitter::Delta{false,text});
                 return send_deltas(one); },
@@ -1519,7 +1803,8 @@ struct ApiService::Impl {
             finish_entry(entry, outcome);
             return;
         }
-        if (!config.timed_completion_envelope && !outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if ((!config.timed_completion_envelope || prompt.tools_off) && !outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if (prompt.tools_off && outcome.error.empty()) if (const auto held = parsed_output(outcome, prompt).withheld; !held.empty()) send_deltas({{false, held}});
         std::string finish = public_finish(outcome);
         if (!outcome.error.empty()) {
             Json error = Json::object();
@@ -1632,6 +1917,7 @@ struct ApiService::Impl {
             if (!value.is_array()) reject(param, "content must be text or an array of text parts");
             std::string text;
             for (const auto& part : value.as_array()) {
+                if (auto placed = media_text(part)) { text += *placed; continue; }
                 const auto* type = part.find("type"); const auto* t = part.find("text");
                 if (!type || !type->is_string() || !t || !t->is_string()) reject(param, "only plaintext parts are supported");
                 const auto& kind = type->as_string();
@@ -1706,8 +1992,10 @@ struct ApiService::Impl {
                 } else {
                     if (!calls.count(id) || !outputs.insert(id).second) reject(param + ".call_id", "unresolved or duplicate call_id");
                     const auto* output = item.find("output");
-                    if (!output || !output->is_string()) reject(param + ".output", "function output must be a string");
-                    m = message("tool", output->as_string()); m.set("tool_call_id", *call_id);
+                    // a list is a media-bearing output (serve::media wrote its canonical parts); text stays a string
+                    const bool listed = output && output->is_array() && api_media && !api_media->items.empty();
+                    if (!output || (!output->is_string() && !listed)) reject(param + ".output", "function output must be a string");
+                    m = message("tool", listed ? text_parts(*output, param + ".output", false) : output->as_string()); m.set("tool_call_id", *call_id);
                 }
             } else reject(param + ".type", "unsupported input item type " + kind);
             if (has_reasoning && m.find("role")->as_string() == "assistant") {
@@ -1720,7 +2008,9 @@ struct ApiService::Impl {
         return chat;
     }
 
-    void responses(const HttpRequest&, HttpResponseWriter& response, const Json& body) {
+    void responses(const HttpRequest&, HttpResponseWriter& response, const Json& request_body) {
+        ApiMediaGuard media_guard;
+        const Json& body = media_in(request_body, media::Api::responses);
         const auto chat = responses_to_chat(body);
         const auto prompt = chat_prompt(chat);
         std::string note;
@@ -1762,7 +2052,7 @@ struct ApiService::Impl {
             usage.set("input_tokens_details", std::move(details)); usage.set("output_tokens", Json(o.output_tokens));
             usage.set("output_tokens_details", Json::object()); usage.set("total_tokens", Json(o.stats.prompt_tokens + o.output_tokens));
             out.set("usage", std::move(usage)); out.set("strix", config.stream_receipts || spec ? receipt(run, note, chat, limit, params, spec) : engine_json(o, note, chat));
-            if (run && config.timed_completion_envelope) out.set("timings", timing_data(note));
+            if (run && config.timed_completion_envelope) out.set("timings", timing_data(note, &o));
             return out;
         };
         // a call whose frame did not close (cut by the budget, a stop string or EOS) is not marked completed
@@ -1848,7 +2138,7 @@ struct ApiService::Impl {
             auto p = fields(); p.set("part", part(reasoning, "")); event("response.content_part.added", std::move(p));
         };
         start_stream();  // the first event right after the headers, as before; keepalive comments follow it
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         const auto deltas = [&](const std::vector<ChatSplitter::Delta>& values) {
             if (!start_stream()) return false;
             for (const auto& d : values) {
@@ -1870,6 +2160,7 @@ struct ApiService::Impl {
         const std::string status = spec ? response_status(o) : !o.error.empty() ? "failed" : o.finish == "length" || cut_call(parsed) ? "incomplete" : "completed";
         // items end completed or incomplete; a failure is the response's status
         const std::string item_status = status == "completed" ? "completed" : "incomplete";
+        if (!parsed.withheld.empty() && o.error.empty()) deltas({{false, parsed.withheld}});
         if (pending_scores.size()) deltas({{false, ""}});
         close(item_status);
         if (!saw_message && o.error.empty()) { add(false); close(item_status); }
@@ -2012,7 +2303,8 @@ struct ApiService::Impl {
             for (const auto& block : content->as_array()) {
                 const auto* type = block.find("type");
                 const auto kind = type && type->is_string() ? type->as_string() : std::string{};
-                if (kind == "text") { if (const auto* t = block.find("text"); t && t->is_string()) text += t->as_string(); }
+                if (auto placed = media_text(block)) text += *placed;
+                else if (kind == "text") { if (const auto* t = block.find("text"); t && t->is_string()) text += t->as_string(); }
                 else if (kind == "thinking") { if (const auto* t = block.find("thinking"); t && t->is_string()) reasoning += t->as_string(); }
                 else if (kind == "tool_use") {
                     Json function = Json::object();
@@ -2024,7 +2316,10 @@ struct ApiService::Impl {
                     std::string result;
                     if (const auto* c = block.find("content")) {
                         if (c->is_string()) result = c->as_string();
-                        else if (c->is_array()) for (const auto& part : c->as_array()) if (const auto* t = part.find("text"); t && t->is_string()) result += t->as_string();
+                        else if (c->is_array()) for (const auto& part : c->as_array()) {
+                            if (auto inner = media_text(part)) result += *inner;
+                            else if (const auto* t = part.find("text"); t && t->is_string()) result += t->as_string();
+                        }
                     }
                     if (!text.empty()) { Json m = Json::object(); m.set("role", *role); m.set("content", Json(text)); messages.push(std::move(m)); text.clear(); }
                     Json m = Json::object(); m.set("role", Json("tool")); m.set("content", Json(result));
@@ -2073,7 +2368,9 @@ struct ApiService::Impl {
         return chat;
     }
 
-    void messages(const HttpRequest&, HttpResponseWriter& response, const Json& body) {
+    void messages(const HttpRequest&, HttpResponseWriter& response, const Json& request_body) {
+        ApiMediaGuard media_guard;
+        const Json& body = media_in(request_body, media::Api::messages);
         refuse_unexecuted(body, false, false);
         bool thinking = false;
         auto chat = anthropic_to_chat(body, thinking);
@@ -2149,7 +2446,7 @@ struct ApiService::Impl {
             out.set("stop_sequence", outcome.matched.empty() ? Json() : Json(outcome.matched));
             out.set("usage", usage(outcome));
             out.set("strix", (config.stream_receipts ? receipt(&outcome, note, body, limit, sampling_params) : engine_json(outcome, note, body)));
-            if (config.timed_completion_envelope) out.set("timings", timing_data(note));
+            if (config.timed_completion_envelope) out.set("timings", timing_data(note, &outcome));
             response.send(200, "application/json", out.dump());
             finish_entry(entry, outcome);
             return;
@@ -2191,7 +2488,7 @@ struct ApiService::Impl {
             event("content_block_start", start);
         };
         start_stream();  // the first event right after the headers, as before; keepalive comments follow it
-        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
+        ChatSplitter splitter(prompt.thinking, withheld_marker(prompt));
         const auto send_deltas = [&](const std::vector<ChatSplitter::Delta>& deltas) {
             if (!start_stream()) return false;
             for (const auto& d : deltas) {
@@ -2221,6 +2518,7 @@ struct ApiService::Impl {
             return;
         }
         if (!outcome.family && (!spec || (!spec->program && !spec->thinking))) send_deltas(splitter.finish());
+        if (prompt.tools_off && outcome.error.empty()) if (const auto held = parsed_output(outcome, prompt).withheld; !held.empty()) send_deltas({{false, held}});
         bool tools = false;
         if (splitter.saw_tools() || (outcome.family && outcome.family->parsed.tool_calls.size())) {
             const auto parsed = parsed_output(outcome, prompt);
@@ -2257,6 +2555,7 @@ struct ApiService::Impl {
         entry.queue_ms = o.stats.queue_ms; entry.prefill_ms = o.stats.prefill_ms; entry.decode_ms = o.stats.decode_ms;
         entry.imported = o.stats.imported_tokens;  // every record (its prefill rate); reported as a field only when observed
         if (o.observed) { entry.armed = true; entry.first_token_ms = o.stats.first_token_ms; }
+        if (o.error.empty()) entry.power = power_receipt(o);
         record(entry);
     }
 
@@ -2306,6 +2605,7 @@ struct ApiService::Impl {
                 e.set("first_token_ms", r.first_token_ms ? Json(*r.first_token_ms) : Json());
                 if (!r.response_id.empty()) e.set("response_id", Json(r.response_id));
             }
+            if (!r.power.empty()) e.set("power", parse_json(r.power));
             list.push(std::move(e));
         }
         out.set("requests", std::move(list));
@@ -2376,7 +2676,15 @@ ApiService::ApiService(ApiConfig config, ApiTokenizerBinding tokenizer, Generati
     : impl_(std::make_unique<Impl>(std::move(config), std::move(tokenizer.value), queue, context_tokens, engine_samples)) {}
 ApiService::~ApiService() = default;
 
-std::vector<std::uint32_t> ApiService::chat_prompt(const Json& body) const { return impl_->chat_prompt(body).tokens; }
+std::vector<std::uint32_t> ApiService::chat_prompt(const Json& body) const {
+    auto prompt = prepare_chat_prompt(body);
+    if (prompt.embeds) throw std::invalid_argument("chat_prompt: the body holds media; use prepare_chat_prompt, which returns the table of its virtual ids");
+    return std::move(prompt.tokens);
+}
+ApiChatPrompt ApiService::prepare_chat_prompt(const Json& body) const {
+    ApiMediaGuard media_guard;
+    return impl_->chat_prompt(impl_->media_in(body, media::Api::chat_completions));
+}
 void ApiService::set_state(std::string state) { const std::lock_guard lock(impl_->mutex); impl_->state = std::move(state); }
 
 void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_response) {
@@ -2445,6 +2753,8 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             if (impl.config.status_data) deployment_status(data, impl.config.deployment, impl.queue, impl.config.status_slots.value_or(impl.config.http_slots));
             // STRIX_SERVE_RECEIPT=1: the engine's cycle ledger (tools/serve_bench.py finds it by its schema value).
             if (cycle_receipt_enabled() && data.is_object() && cycle_ledger().totals().cycles) data.set("cycle_ledger", parse_json(cycle_ledger().json()));
+            // Shared power view (sources, latest reading, totals since start); absent with STRIX_POWER_SAMPLER=0.
+            if (data.is_object() && power::sampler_enabled()) data.set("power", parse_json(power::status_json()));
             response.send(200, "application/json", data.dump());
             return;
         }
@@ -2468,6 +2778,11 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             if (impl.config.capabilities && !impl.config.minimal_metadata) model.set("capabilities_id", Json(impl.capabilities_id));
             if (!impl.config.minimal_metadata) model.set("owned_by", Json("strix"));
             model.set("context_length", Json(impl.context_tokens));
+            if (!impl.media_kinds.empty()) {
+                Json adapters = Json::object();
+                for (const auto& entry : impl.media_kinds) adapters.set(entry.kind, Json(entry.adapter->identity()));
+                model.set("media_adapters", std::move(adapters));
+            }
             Json data = Json::array(); data.push(std::move(model));
             Json out = Json::object(); out.set("object", Json("list")); out.set("data", std::move(data));
             response.send(200, "application/json", out.dump());
@@ -2498,12 +2813,24 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
         else if (request.path == "/v1/messages") impl.messages(request, response, body);
         else if (request.path == "/tokenize") {
             std::vector<std::uint32_t> ids;
-            if (const auto* messages = body.find("messages")) { static_cast<void>(messages); ids = impl.chat_prompt(body).tokens; }
+            ApiMediaGuard media_guard;
+            if (const auto* messages = body.find("messages")) {
+                static_cast<void>(messages);
+                ids = impl.chat_prompt(impl.media_in(body, media::Api::chat_completions)).tokens;
+                if (media_guard.state.table) ids = media_guard.state.real; // real ids only; the rows are listed below
+            }
             else if (const auto* text = body.find(impl.config.tokenize_text_field ? "text" : "prompt"); text && text->is_string()) ids = impl.tokenizer->encode(text->as_string(), true);
             else throw ApiError(400, "invalid_request_error", impl.config.tokenize_text_field ? "text required" : "tokenize takes a prompt string or chat messages");
             Json tokens = Json::array();
             for (const auto id : ids) tokens.push(Json(static_cast<std::uint64_t>(id)));
             Json out = Json::object(); out.set("tokens", std::move(tokens)); if (!impl.config.tokenize_text_field) out.set("count", Json(static_cast<std::uint64_t>(ids.size())));
+            if (media_guard.state.table) {
+                Json images = Json::array(), other = Json::array();
+                for (const auto& entry : media_guard.state.listing.as_array())
+                    (entry.find("type")->as_string() == "image" ? images : other).push(entry);
+                out.set("images", std::move(images));
+                if (other.size() > 0U) out.set("media", std::move(other));
+            }
             response.send(200, "application/json", out.dump());
         } else if (request.path == "/detokenize") {
             const auto* tokens = body.find("tokens");

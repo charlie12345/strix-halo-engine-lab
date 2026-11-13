@@ -88,7 +88,7 @@ CachedEncode encode_cached(VisionAdapter& adapter, EncoderBackend& backend, cons
     const EncoderConfig config = adapter.config();
     EncoderOutput hidden = backend.encode(grid, adapter.positions(config, weights, grid));
     ProjectedRows projected;
-    adapter.project(hidden, backend, projected);
+    adapter.project(hidden, grid, backend, projected);
     if (projected.bf16.size() != std::size_t{projected.rows} * projected.width) throw std::logic_error("vision adapter: projected row shape");
     for (const auto& d : projected.deep)
         if (d.size() != projected.bf16.size()) throw std::logic_error("vision adapter: deepstack row shape");

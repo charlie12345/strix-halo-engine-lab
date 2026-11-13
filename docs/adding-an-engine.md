@@ -112,6 +112,44 @@ and the receiver rewrites the ids with `remap_embed_ids`.
 A prompt without virtual ids takes the same path as before, with or without a bound
 table: ids, state and results are unchanged.
 
+#### Serving media through the API
+
+The API layer needs one object per media kind, `ApiMediaAdapter`
+(`include/strix/serve/api.hpp`), registered in `ApiConfig::vision.adapters`:
+
+| Member | Meaning |
+|---|---|
+| `kind()` | the canonical part type it consumes (`"image"`) |
+| `identity()` | weights digest and arithmetic id; shown in `/v1/models` and part of the capabilities hash |
+| `placeholder()` | text that tokenizes to exactly one id; marks where the rows of one item go |
+| `part_text(n)` | what the renderer receives for the n-th item (default: the placeholder alone) |
+| `max_rows()` | upper bound of the rows of one item |
+| `encode(item, row_budget)` | preprocess, encode or hit a cache, intern; returns the lease and the id layout |
+| `epoch()` | the interner epoch; when it moves, `ApiConfig::vision.on_epoch` withdraws cached prefixes |
+
+With an adapter loaded, the three front doors (`/v1/chat/completions`, `/v1/messages`,
+`/v1/responses`) pass the body through `serve::media::normalize`, hand the renderer
+`part_text` in place of each media part, replace each placeholder token by the ids of
+its item and submit the job with `GenerationJob::embeds`. `SessionRuntime` checks the
+ids against the table before a lane exists and calls `bind_embeds`. `usage` counts the
+rows, the `strix` receipt gains a member per kind (`vision`), and `/tokenize` returns
+real ids plus an `images` array. The capability `image_input` is true only then.
+
+Without an adapter nothing above runs: media parts get the refusal they always got,
+and text requests are unchanged with or without one. Remote image URLs are off unless
+the service sets a fetch policy and a fetcher.
+
+The service that loads an adapter also folds its identity into the prefix format id
+(`embed_format_id`), so a change of tower or weights invalidates image-bearing
+prefixes through the key. Adapters shared across services must synchronize their own
+encoding and epoch state; kinds in one request must use a shared handle namespace.
+The epoch callback synchronizes with the cache owner and completes withdrawal before
+returning. The API mutex alone does not protect runtime caches.
+
+Fake-encoder and skeleton tests qualify request plumbing only. They do not establish
+real embedding consumption, decoder safety, model fidelity, epoch-cache invalidation
+on a production runtime, or GPU qualification.
+
 ### Backend operations
 
 A family asks a `session::Backend` (`include/strix/session/backend.hpp`) for:

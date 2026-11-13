@@ -9,6 +9,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <vector>
 #include <poll.h>
 #include <sys/socket.h>
@@ -22,7 +23,7 @@ bool lean_mode() { const char* v=std::getenv("STRIX_TEST_GPU_QUEUE_LEAN");return
 struct Fixture {
     std::shared_ptr<void> driver;
     bool gpu_idle=true,change_identity=false,auto_complete=false;
-    int mutate_event=0,submit_again=0;unsigned long mutate_cleanup=0;
+    int mutate_event=0,submit_again=0,event_error=0;unsigned long mutate_cleanup=0;
     unsigned ioctls=0,owned_ioctls=0,events=0,identity_checks=0; bool corrupt_reset=false;
     std::unique_ptr<LinuxGpuQueue> queue;
     Fixture(unsigned depth=8,unsigned frames=32,bool reverse=false,bool lean=lean_mode()) {
@@ -32,6 +33,7 @@ struct Fixture {
         expected.lean=lean;expected.identity_interval=std::chrono::hours(1); // cases choose their own re-check interval
         const auto call=[this](unsigned long command,void* argument){
             ++ioctls;events+=command==SGU_IOC_EVENT;
+            if(command==SGU_IOC_EVENT&&event_error){const int error=event_error;event_error=0;return GpuQueueSyscall{-1,error};}
             if(command==SGU_IOC_SUBMIT&&submit_again){--submit_again;return GpuQueueSyscall{-1,EAGAIN};}
             if(command==SGU_IOC_EVENT&&auto_complete)queue_fixture_complete_pending(driver.get());
             int result=queue_fixture_ioctl(driver.get(),command,argument);
@@ -178,8 +180,7 @@ void counts() {
         assert(f.queue->release());
     }
 }
-// Lean still notices a replaced owner between transitions: on the first hot operation after the re-check
-// interval, and before an unexpected ioctl failure is reported.
+// Expired intervals check ownership; malformed successful replies still fail validation.
 void lean_recheck() {
     {
         Fixture f(8,32,false,true);
@@ -198,12 +199,44 @@ void lean_recheck() {
         f.change_identity=false;assert(f.queue->release());
     }
     {
-        Fixture f(8,32,false,true);f.start(); // interval one hour: only the error path re-checks
+        Fixture f(8,32,false,true);f.start(); // interval one hour: successful malformed replies do not re-check
         auto op=f.queue->prepare(1,0,1,4097,32);assert(f.queue->submit(op));
         const auto checks=f.identity_checks;
         f.mutate_event=8;queue_fixture_complete(f.driver.get(),op.direction,op.slot); // a foreign reply: no ioctl error, no re-check
         rejects([&]{static_cast<void>(f.queue->poll());});assert(f.identity_checks==checks&&f.queue->failed());
         static_cast<void>(f.queue->release());
+    }
+}
+void lean_ioctl_errors() {
+    for(const bool replaced:{false,true}) {
+        Fixture f(8,32,false,true);f.start(); // one hour: exercise only the error-triggered check
+        auto op=f.queue->prepare(1,0,1,4097,32);assert(f.queue->submit(op));
+        const auto checks=f.identity_checks,events=f.events;
+        f.change_identity=replaced;f.event_error=EBADF;
+        bool caught=false;
+        try { static_cast<void>(f.queue->poll()); }
+        catch(const std::system_error& error) {
+            assert(!replaced);
+            assert(error.code()==std::error_code(EBADF,std::generic_category()));
+            caught=true;
+        }
+        catch(const std::runtime_error& error) {
+            assert(replaced&&std::string(error.what())=="injected owner replacement");
+            caught=true;
+        }
+        assert(caught&&f.identity_checks>checks&&f.queue->failed());
+        assert(f.events==events+1&&f.event_error==0);
+        f.change_identity=false;assert(f.queue->release());
+    }
+    for(const int error:{EAGAIN,EINTR}) {
+        Fixture f(8,32,false,true);f.start();
+        auto op=f.queue->prepare(1,0,1,4097,32);assert(f.queue->submit(op));
+        const auto checks=f.identity_checks,events=f.events;
+        f.change_identity=true;f.event_error=error;
+        assert(!f.queue->poll());
+        assert(f.identity_checks==checks&&!f.queue->failed());
+        assert(f.events==events+1&&f.event_error==0);
+        f.change_identity=false;f.finish(op);f.consume(op);assert(f.queue->release());
     }
 }
 void wire() {
@@ -331,6 +364,7 @@ int main(int argc,char** argv) {
     else if(name=="failed_dependency")failed_dependency();else if(name=="recovery")recovery();else if(name=="stop_retention")stop_retention();
     else if(name.starts_with("ambiguous"))ambiguous_cleanup(name);
     else if(name.starts_with("paired"))paired(name);
+    else if(name=="lean_ioctl_errors")lean_ioctl_errors();
     else if(name=="identity")identity();else if(name=="lean")lean();else if(name=="lean_recheck")lean_recheck();else if(name=="counts")counts();else if(name=="wire")wire();else if(name.starts_with("session"))session(name);
     else if(name.starts_with("corruption"))corruption(std::stoi(name.substr(10)));else assert(false);
     std::cout<<"PASS "<<name<<'\n';

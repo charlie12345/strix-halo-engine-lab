@@ -65,7 +65,7 @@ class LinuxGpuQueueTests(unittest.TestCase):
 for case in CASES:
     setattr(LinuxGpuQueueTests, 'test_' + case, lambda self, case=case: self.run_case(case))
 # The same cases on the lean hot path (identity is per call there by design: covered by 'lean').
-for case in (*(c for c in CASES if c != 'identity'), 'lean', 'lean_recheck'):
+for case in (*(c for c in CASES if c != 'identity'), 'lean', 'lean_recheck', 'lean_ioctl_errors'):
     setattr(LinuxGpuQueueTests, 'test_lean_' + case, lambda self, case=case: self.run_case(case, lean=True))
 
 if __name__ == '__main__':

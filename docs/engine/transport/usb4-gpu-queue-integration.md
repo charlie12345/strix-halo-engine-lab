@@ -42,6 +42,13 @@ the identity check before and after every hot ioctl. `GpuQueueExpected::lean` se
 mode per queue and `identity_interval` the re-check interval; the adapter's own default
 remains the per-call check.
 
+Lean admission uses the engine's `gpu-lean` transport capability in
+`options.transport_capabilities`, not a driver-advertised lean feature. The
+driver's QUERY/QUEUE capability checks still apply. Lean assumes exclusive
+descriptor ownership: another owner closing, replacing or changing descriptor
+flags between checks can affect an ioctl before detection. An error-triggered
+check cannot undo that ioctl; the strict-mode escape hatch remains available.
+
 This implementation uses **completed batch windows**, not a sliding/adaptive
 slot-refill scheduler. Both imported allocations drain controller access before
 GPU consumers run, avoiding a deadlock on allocation-wide implicit reservation

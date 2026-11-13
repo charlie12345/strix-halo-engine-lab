@@ -162,8 +162,9 @@ OpenedLink open_link(const Usb4LayoutStream& stream, const Usb4AutoOptions& opti
     link.expected.ring_frames = q.ring_frames;
     link.expected.depth = setup.depth;
     link.expected.terminal = transport::GpuQueueTerminal::kernel_header;
-    // The queue's hot path (with the gpu-lean capability): FD and pool identity are checked at session transitions,
-    // at most every 100 ms in between and before an ioctl error is reported, and no EVENT is asked while nothing is
+    // gpu-lean is an engine transport policy gate, not a driver feature; QUERY/QUEUE capability checks still apply.
+    // With exclusive descriptor ownership, FD and pool identity are checked at session transitions, on the next hot
+    // operation after 100 ms and before unexpected ioctl errors (except EAGAIN/EINTR); no EVENT is asked while nothing is
     // in flight. Operation identity, fences and every reply field are checked on every call either way.
     // STRIX_DIST_GPU_QUEUE_LEAN=0: every PREPARE/SUBMIT/EVENT/RETIRE re-checks the descriptor around the ioctl.
     static const bool lean = envcfg::flag("STRIX_DIST_GPU_QUEUE_LEAN", true);

@@ -234,6 +234,7 @@ struct EngineOps {
         eng.reset(slot);
         spec.at(slot) = {};
     }
+    static std::uint64_t prefix_state_bound(std::uint64_t p) { return gs::prefix_snapshot_bound(p); }
     std::vector<std::uint8_t> state_bytes_upto(std::uint32_t slot, std::uint64_t p) {
         return eng.state_bytes_upto(slot, p);
     }
@@ -1381,7 +1382,7 @@ int main(int argc, char** argv) {
                             selftest_prefix_long > 0 ? selftest_long_prompts(*tokenizer, std::min(selftest, opt.slots), selftest_prefix_long) : prompts;
                         result.exact = gs::run_prefix_selftest(queue, prefix_prompts, selftest_tokens, gs::default_stop_ids(), tokenizer->encode("\nPlease continue briefly.", false),
                             [&lead] { lead.clear_prefix_cache(); }, [&lead] { return lead.stats().prefix_hits; },
-                            [](const std::string& line) { std::printf("%s\n", line.c_str()); });
+                            [](const std::string& line) { std::printf("%s\n", line.c_str()); }, lc.prefix_reply_store && !lc.mtp);
                     } else result = gs::run_selftest(queue, prompts, selftest_tokens, gs::default_stop_ids(), serial ? 1U : opt.slots,
                                               [](const std::string& line) { std::printf("%s\n", line.c_str()); }, hooks);
                 } catch (const std::exception& e) {

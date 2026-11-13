@@ -10,7 +10,7 @@
 // restore frontier (rows held by the snapshot) is below the prompt size; the longest such key wins.
 #include <cstdint>
 #include <list>
-#include <optional>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -62,6 +62,9 @@ public:
     explicit ConversationKeep(std::uint64_t budget = 0, PrefixBlockHash hash = nullptr);
 
     static std::uint64_t charged_bytes(std::uint64_t payload_bytes, std::size_t key_tokens) noexcept {
+        constexpr auto max = std::numeric_limits<std::uint64_t>::max();
+        if (payload_bytes > max - kEntryOverhead ||
+            key_tokens > (max - kEntryOverhead - payload_bytes) / sizeof(std::uint32_t)) return max;
         return payload_bytes + key_tokens * sizeof(std::uint32_t) + kEntryOverhead;
     }
 
@@ -76,12 +79,14 @@ public:
     // makes room: the equal-key entry first, then LRU; false when leases make that impossible. The caller erases
     // the victims (on every rank), then commit(true) admits the candidate; commit(false) drops it.
     bool prepare(KeepCandidate candidate);
-    bool has_pending() const { return pending_.has_value(); }
-    std::uint64_t pending_bytes() const { return pending_ ? pending_->bytes : 0; }
+    bool has_pending() const { return !pending_.empty(); }
+    std::uint64_t pending_bytes() const { return has_pending() ? pending_.front().bytes : 0; }
+    // Before allocating a payload, bound retained + staging ownership by the grant.
+    bool can_stage(std::uint64_t payload_bound, std::size_t tokens) const;
     std::uint64_t replacement_id() const;  // kept entry with the pending key (0: none)
     bool victims(std::vector<std::uint64_t>& out) const;
     bool pending_fits() const;  // no equal key left and bytes + pending <= budget
-    bool commit(bool accept);   // accept with !pending_fits() discards and returns false
+    bool commit(bool accept) noexcept;   // allocation-free transfer of the prepared node
 
     // Single-process convenience: prepare + victims + erase + commit.
     bool store(KeepCandidate candidate);
@@ -111,7 +116,7 @@ private:
     std::uint64_t budget_ = 0, bytes_ = 0;
     PrefixBlockHash hash_;
     std::list<KeepEntry> entries_;  // front = least recently used
-    std::optional<KeepEntry> pending_;
+    std::list<KeepEntry> pending_;  // node allocated before the paired vote; commit only splices
     KeepStats counters_;
 };
 

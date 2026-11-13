@@ -40,8 +40,14 @@ const KeepEntry* ConversationKeep::get(std::uint64_t id) const {
     return nullptr;
 }
 
+bool ConversationKeep::can_stage(std::uint64_t payload_bound, std::size_t tokens) const {
+    const auto charge = charged_bytes(payload_bound, tokens);
+    return payload_bound != 0 && charge >= payload_bound && bytes_ <= budget_ &&
+        pending_bytes() <= budget_ - bytes_ && charge <= budget_ - bytes_ - pending_bytes();
+}
+
 bool ConversationKeep::prepare(KeepCandidate c) {
-    pending_.reset();
+    pending_.clear();
     const auto bytes = charged_bytes(c.payload_bytes, c.ids.size());
     if (!budget_ || c.payload_bytes == 0 || c.id == 0 || get(c.id) || bytes > budget_) {
         ++counters_.refused;
@@ -56,20 +62,20 @@ bool ConversationKeep::prepare(KeepCandidate c) {
     e.bytes = bytes;
     e.hash = key_hash(c.identity, c.ids);
     e.ids = std::move(c.ids);
-    pending_ = std::move(e);
+    pending_.push_back(std::move(e));
     return true;
 }
 
 std::uint64_t ConversationKeep::replacement_id() const {
-    if (!pending_) return 0;
+    if (pending_.empty()) return 0;
     for (const auto& e : entries_)
-        if (e.hash == pending_->hash && e.identity == pending_->identity && e.ids == pending_->ids) return e.id;
+        if (e.hash == pending_.front().hash && e.identity == pending_.front().identity && e.ids == pending_.front().ids) return e.id;
     return 0;
 }
 
 bool ConversationKeep::victims(std::vector<std::uint64_t>& out) const {
     out.clear();
-    if (!pending_) return false;
+    if (pending_.empty()) return false;
     std::uint64_t held = bytes_;
     if (const auto r = replacement_id()) {
         const auto* e = get(r);
@@ -78,35 +84,35 @@ bool ConversationKeep::victims(std::vector<std::uint64_t>& out) const {
         held -= e->bytes;
     }
     for (const auto& e : entries_) {
-        if (held + pending_->bytes <= budget_) break;
+        if (held + pending_.front().bytes <= budget_) break;
         if (e.leases || std::find(out.begin(), out.end(), e.id) != out.end()) continue;
         out.push_back(e.id);
         held -= e.bytes;
     }
-    return held + pending_->bytes <= budget_;
+    return held + pending_.front().bytes <= budget_;
 }
 
 bool ConversationKeep::pending_fits() const {
-    return pending_ && replacement_id() == 0 && bytes_ <= budget_ && budget_ - bytes_ >= pending_->bytes;
+    return !pending_.empty() && replacement_id() == 0 && bytes_ <= budget_ && budget_ - bytes_ >= pending_.front().bytes;
 }
 
-bool ConversationKeep::commit(bool accept) {
+bool ConversationKeep::commit(bool accept) noexcept {
     const bool ok = accept && pending_fits();
     if (accept && !ok) ++counters_.refused;
     if (ok) {
-        bytes_ += pending_->bytes;
+        bytes_ += pending_.front().bytes;
         ++counters_.stores;
-        ++counters_.stores_by_kind[static_cast<std::size_t>(pending_->kind)];
-        entries_.push_back(std::move(*pending_));
+        ++counters_.stores_by_kind[static_cast<std::size_t>(pending_.front().kind)];
+        entries_.splice(entries_.end(), pending_);
     }
-    pending_.reset();
+    pending_.clear();
     return ok;
 }
 
 bool ConversationKeep::store(KeepCandidate candidate) {
     if (!prepare(std::move(candidate))) return false;
     std::vector<std::uint64_t> v;
-    if (!victims(v)) { pending_.reset(); ++counters_.refused; return false; }
+    if (!victims(v)) { pending_.clear(); ++counters_.refused; return false; }
     const auto replaced = replacement_id();
     for (const auto id : v) erase(id, id == replaced ? KeepEvict::replaced : KeepEvict::lru);
     return commit(true);
@@ -131,7 +137,7 @@ void ConversationKeep::touch(std::uint64_t id) {
 
 void ConversationKeep::clear() {
     entries_.clear();
-    pending_.reset();
+    pending_.clear();
     bytes_ = 0;
 }
 

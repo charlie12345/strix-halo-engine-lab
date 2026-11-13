@@ -127,6 +127,7 @@ public:
     [[nodiscard]] std::uint64_t prefill_reuse_rows() const;  // finest exact resume alignment: one prefill chunk
     // Conversation mode only (both ranks voted): a resident prefill may restart at any row, not only a chunk
     // boundary. The suffix then tiles from that row, so it is NOT the cold chunking. Default off.
+    [[nodiscard]] bool prefill_int4_regime(std::uint64_t prompt_rows) const;
     void set_unaligned_resume(bool on);
     [[nodiscard]] bool unaligned_resume() const;
     [[nodiscard]] std::uint64_t prefill_rows_left() const;  // rows from the open chunk / group to the end (0: none open)

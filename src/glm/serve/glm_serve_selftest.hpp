@@ -105,7 +105,7 @@ inline bool run_prefix_selftest(strix::serve::GenerationQueue& queue,
                                const std::vector<std::vector<std::uint32_t>>& prompts, std::uint32_t max_tokens,
                                const std::vector<std::uint32_t>& stops, const std::vector<std::uint32_t>& followup,
                                const std::function<void()>& clear, const std::function<std::uint64_t()>& hits,
-                               const std::function<void(const std::string&)>& out, bool expect_reply = false) {
+                               const std::function<void(const std::string&)>& out, bool expect_reply) {
     unsigned equal = 0, total = 0, reply_hits = 0, reply_cases = 0;
     std::uint64_t warm_hits = 0;
     // expect_reply: the server runs with the reply-end store on (plain decode): a follow-up turn (previous prompt +
@@ -163,7 +163,7 @@ inline bool run_prefix_selftest(strix::serve::GenerationQueue& queue,
             clear();
             const auto cold = run(next[i]);
             compare(second[i], cold);
-            if (expect_reply && cold.tokens.size() >= 3 && cold.error.empty()) reply_hit(second[i], prompts[i].size());
+            if (expect_reply && first[i].tokens.size() >= 2 && first[i].error.empty()) reply_hit(second[i], prompts[i].size());
             // PC3 timing: the turn-2 request served from the cache vs the same request with the cache cleared.
             const auto& w = second[i].stats;
             auto cache = [](const strix::serve::GenerationStats& s) {

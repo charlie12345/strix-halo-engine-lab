@@ -9,7 +9,10 @@ all of it again; with one it restores the longest kept prefix and prefills only 
 nothing family specific: longest strict-prefix lookup with a token compare, a byte ledger with a budget, LRU order,
 leases (an entry being restored is never a victim), a two-phase store with an ordered victim list that a second
 rank can replay, reclaim and shrink plans for memory pressure, and statistics. Families keep their own payload
-(KV rows, recurrent state, index tables) under an opaque id.
+(KV rows, recurrent state, index tables) under an opaque id. This index owns immutable whole-lane
+snapshot retention; `session::PrefixCache` owns certified block/resident-slot lookup through `KvStore`.
+They do not share payload ownership or admit each other's entries. Consolidating their eviction policies
+needs a separate ownership design before additional adapters are added.
 
 The budget is a capacity term: `keep_budget_grant` / `with_keep_budget` in `include/strix/serve/slot_capacity.hpp`
 grant what is left after headroom and the live slots, and the slot report charges the grant before it counts
@@ -19,7 +22,10 @@ slots (`keep=` / `keep_bytes`). A smaller grant shrinks the cache, never the slo
 
 The prompt snapshot cache (`--prefix-cache-gib`, default 4 GiB per rank) is an adapter over the shared policy.
 In a deployment plan it is the owner `prefix_keep`: elastic by default, mandatory when the operator names a size;
-the pair uses the smaller rank grant. When a rank is short of host memory, kept entries are evicted before a
+the pair uses the smaller rank grant. Retained entries plus a pending snapshot must fit that grant:
+the adapter checks a conservative full-layout size bound before copying, and refuses a store that
+would exceed it, without evicting existing entries. Preparation allocates all nodes before voting;
+commit transfers their ownership without allocation, and abort destroys the pending payload. When the lead observes host memory pressure at admission, kept entries are evicted before a
 request or its snapshot is refused.
 
 A follow-up turn hits only if its prompt extends the kept key. With MTP the key is the prompt plus the first

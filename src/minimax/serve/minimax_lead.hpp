@@ -97,6 +97,7 @@ struct Shared {
     bool prefix_reuse = false; // negotiated once, both ranks and alignment
     bool conversation = false; // negotiated once, both ranks, needs prefix_reuse
     strix::session::Identity prefix_identity;
+    std::function<bool(std::uint64_t)> prefill_int4_regime;
     std::uint32_t dspark_live = 0, dspark_contexts = 0;
     std::unordered_map<const sv::GenerationTicket*, Extra> extras;
 };
@@ -225,6 +226,12 @@ private:
     sv::SessionHooks owner_hooks() {
         sv::SessionHooks h;
         h.identity = sh_.prefix_identity;
+        h.resident_identity = [this](const sv::GenerationJob& job) {
+            auto id = sh_.prefix_identity;
+            if (sh_.prefill_int4_regime)
+                id.profile += sh_.prefill_int4_regime(job.prompt.size()) ? ":int4" : ":native";
+            return id;
+        };
         h.control_turn = [this](sv::SessionRuntime&) { control_turn(); };
         h.closing = [this] { close_native(); };
         h.failed = [this] { eng_.abort("control channel: protocol failure"); };

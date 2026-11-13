@@ -74,6 +74,8 @@ struct SessionTurnCache {
 struct SessionHooks {
     // Required stable model/profile/physical-format/rank identity for caching.
     session::Identity identity;
+    // Certifies the arithmetic selected by the original full prompt, including reply retention.
+    std::function<session::Identity(const GenerationJob&)> resident_identity;
     // Additional family admission checks, always before acquire/restore/prefill.
     std::function<void(const GenerationJob&)> validate;
     // Typed family context must be checked by validate. opened binds a freshly

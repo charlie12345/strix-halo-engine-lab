@@ -105,6 +105,7 @@ struct SessionRuntime::Impl {
         std::stop_source cancel;
         bool done = false, receipt_done = false, cache_cleanup = false;
         std::string publication_error;
+        session::Identity resident_identity;
         bool resident_reply_hit = false;  // the resident hit reused consumed reply rows
         std::optional<SessionTurnCache> turn;
         SessionView view() const { return {taken.job, handle, stats, offset, rng, phase_remaining}; }
@@ -265,7 +266,7 @@ struct SessionRuntime::Impl {
                         throw std::logic_error("decode rows cannot certify a resident prefill prefix");
                     const auto certificate = store.release_resident(l.handle, resident_rows);
                     try {
-                        if (cache->admit_resident(store, l.handle, certificate->tokens(), hooks.identity, reply_rows)) {
+                        if (cache->admit_resident(store, l.handle, certificate->tokens(), l.resident_identity, reply_rows)) {
                             ++resident_kept; if (reply_rows) ++resident_reply_kept;
                         }
                     }
@@ -785,8 +786,10 @@ SessionLease SessionRuntime::activate(std::uint64_t resident_alignment, bool pre
     if (impl_->hooks.native_validate) embed_admission(impl_->reserved->job, impl_->caps); // admission() ran it otherwise
     const auto started = impl_->hooks.now ? impl_->hooks.now() : std::chrono::steady_clock::now();
     if (resident_alignment && !impl_->cache) throw std::invalid_argument("native retention disabled");
+    l->resident_identity = impl_->hooks.resident_identity ?
+        impl_->hooks.resident_identity(impl_->reserved->job) : impl_->hooks.identity;
     const auto hit = resident_alignment ? impl_->cache->lookup_resident(impl_->store,
-        impl_->reserved->job.prompt, impl_->hooks.identity, resident_alignment) : session::ResidentHit{};
+        impl_->reserved->job.prompt, l->resident_identity, resident_alignment) : session::ResidentHit{};
     if (hit.entry) {
         // Remove the descriptor BEFORE a new lease or native mutation exists.
         impl_->cache->invalidate_resident(hit.entry->source);

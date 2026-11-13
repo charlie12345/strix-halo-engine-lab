@@ -395,11 +395,12 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             ch.tokens(prompt, c.plen, sender);
             bool ok = false;
             try {
-                if constexpr (requires { eng.state_bytes_upto(c.pslot, c.ppos); }) {
+                if constexpr (requires { eng.state_bytes_upto(c.pslot, c.ppos); eng.prefix_state_bound(c.ppos); }) {
                     bool available = false;
                     if constexpr (requires { eng.prefix_store_allowed(); }) available = eng.prefix_store_allowed();
                     else available = prefix_memory_available();
-                    if (available) {
+                    cache->commit(false);
+                    if (available && cache->can_stage(eng.prefix_state_bound(c.ppos), prompt.size())) {
                         PrefixCache::Entry e;
                         e.id = c.prefix_id;
                         e.identity = c.prefix_identity;

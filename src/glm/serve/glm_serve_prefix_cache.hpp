@@ -8,7 +8,7 @@
 #include <sstream>
 #include <cmath>
 #include <stdexcept>
-#include <unordered_map>
+#include <list>
 #include <optional>
 #include <span>
 #include <string>
@@ -55,6 +55,15 @@ inline std::optional<std::uint64_t> prefix_memory_bytes() {
     return prefix_memory_bytes(f);
 }
 
+inline std::uint64_t prefix_snapshot_bound(std::uint64_t p) {
+    // Full 45-layer layout + MTP, world=1 and unsharded: upper bound for every served layout.
+    // 34 KDA layers; 11 DSA plus one MTP DSA. Include the seven-word shard header.
+    constexpr std::uint64_t fixed = 34ULL * (64ULL * 128 * 128 * 4 + 3ULL * 64 * 128 * 3 * 4) + 7 * 8;
+    constexpr std::uint64_t per_row = 12ULL * (512 * 2 + 128 * 2 * 2 + 128);
+    if (p > (UINT64_MAX - fixed) / per_row) return UINT64_MAX;
+    return fixed + p * per_row;
+}
+
 class PrefixCache {
 public:
     using Kind = strix::serve::KeepKind;
@@ -77,22 +86,21 @@ public:
     }
     const strix::serve::KeepEntry* get(std::uint64_t id) const { return keep_.get(id); }
     const std::vector<std::uint8_t>* state(std::uint64_t id) const {
-        const auto i = payload_.find(id);
-        return i == payload_.end() ? nullptr : &i->second;
+        for (const auto& p : payload_) if (p.first == id) return &p.second;
+        return nullptr;
     }
     std::uint64_t replacement_id() const { return keep_.replacement_id(); }
     std::uint64_t oldest() const { return keep_.oldest(); }
     bool erase(std::uint64_t id, bool pressure = false) {
         if (!keep_.erase(id, pressure ? strix::serve::KeepEvict::pressure : strix::serve::KeepEvict::lru)) return false;
-        payload_.erase(id);
+        payload_.remove_if([id](const auto& p) { return p.first == id; });
         return true;
     }
     void touch(std::uint64_t id) { keep_.touch(id); }
     bool acquire(std::uint64_t id) { return keep_.acquire(id); }
     void release(std::uint64_t id) { keep_.release(id); }
     bool prepare(Entry e) {
-        pending_state_.clear();
-        pending_id_ = 0;
+        commit(false);
         strix::serve::KeepCandidate c;
         c.id = e.id;
         c.identity = key_of(e.mtp, e.identity);
@@ -100,24 +108,25 @@ public:
         c.ids = std::move(e.ids);
         c.frontier = e.frontier;
         c.payload_bytes = e.state.size();
-        if (!keep_.prepare(std::move(c))) return false;
-        pending_state_ = std::move(e.state);
-        pending_id_ = e.id;
+        if (!keep_.can_stage(c.payload_bytes, c.ids.size())) return false;
+        try {
+            pending_payload_.emplace_back(e.id, std::move(e.state));
+            if (!keep_.prepare(std::move(c))) { commit(false); return false; }
+        } catch (...) { commit(false); return false; }
         return true;
     }
     // Ordered eviction list that makes room for the prepared entry (lead only; the follower replays the erasures).
     bool victims(std::vector<std::uint64_t>& out) const { return keep_.victims(out); }
     bool pending_fits() const { return keep_.pending_fits(); }
-    void commit(bool accept) {
-        const auto pid = pending_id_;
-        pending_id_ = 0;
-        if (keep_.commit(accept) && pid) payload_[pid] = std::move(pending_state_);
-        pending_state_.clear();
+    void commit(bool accept) noexcept {
+        if (keep_.commit(accept)) payload_.splice(payload_.end(), pending_payload_);
+        pending_payload_.clear(); // destroy the owner, including vector capacity
     }
+    bool can_stage(std::uint64_t bytes, std::size_t tokens) const { return keep_.can_stage(bytes, tokens); }
     std::vector<std::uint64_t> reclaim_plan(std::uint64_t target) const { return keep_.reclaim_plan(target); }
     std::vector<std::uint64_t> shrink_plan() const { return keep_.shrink_plan(); }
     void set_budget(std::uint64_t b) { keep_.set_budget(b); }
-    void clear() { keep_.clear(); payload_.clear(); pending_state_.clear(); }
+    void clear() { commit(false); keep_.clear(); payload_.clear(); }
     std::uint64_t bytes() const { return keep_.bytes(); }
     std::uint64_t pending_bytes() const { return keep_.pending_bytes(); }
     std::uint64_t budget() const { return keep_.budget(); }
@@ -127,10 +136,8 @@ public:
     const strix::serve::ConversationKeep& keep() const { return keep_; }
 
 private:
-    std::uint64_t pending_id_ = 0;
     strix::serve::ConversationKeep keep_;
-    std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> payload_;
-    std::vector<std::uint8_t> pending_state_;
+    std::list<std::pair<std::uint64_t, std::vector<std::uint8_t>>> payload_, pending_payload_;
 };
 
 }  // namespace strix::glm::serve

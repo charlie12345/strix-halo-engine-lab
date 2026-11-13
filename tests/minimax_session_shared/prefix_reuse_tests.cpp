@@ -118,6 +118,15 @@ struct OwnerAssets final : ms::ServiceAssets {
 };
 int main() try {
     {
+        // The 6000 -> 9000 / 8192 threshold case scaled to the fixture's four-row chunks.
+        Fixture f; f.shared.prefill_int4_regime = [](std::uint64_t rows) { return rows >= 8; };
+        auto a = f.submit({1,2,3,4,5,6}); f.finish(a);
+        auto b = f.submit({1,2,3,4,5,6,7,8,9}); f.finish(b);
+        need(b->stats().cached_tokens == 0, "threshold crossing must decline the old four-row prefix");
+        auto c = f.submit({1,2,3,4,5,6,7,8,9,10}); f.finish(c);
+        need(c->stats().cached_tokens == 8, "same effective regime still reuses its resident prefix");
+    }
+    {
         OwnerAssets assets;
         need(assets.named->owner()==assets.runtime().cache_owner() && assets.cache_owner==assets.named->owner(),
             "production service factories inject one named/resident owner");

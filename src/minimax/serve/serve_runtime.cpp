@@ -183,6 +183,7 @@ public:
             std::printf("minimax serve: conversation cache off (peer vote differs); chunk-aligned reuse stays\n");
         run.prefix_reuse = prefix_agreed;
         shared.prefix_reuse = prefix_agreed;
+        shared.prefill_int4_regime = [&eng](std::uint64_t rows) { return eng.prefill_int4_regime(rows); };
         run.conversation = conversation_agreed;
         shared.conversation = conversation_agreed;
         eng.set_unaligned_resume(conversation_agreed);

@@ -3414,6 +3414,9 @@ std::uint64_t Engine::prefill_reuse_rows() const {
     // is already narrower, so the group width does not enter the alignment (kReuseChunks bounds it at one chunk).
     return std::uint64_t{impl_->opt.max_rows} * std::min(impl_->pf_group, strix::pair::prefill_group::kReuseChunks);
 }
+bool Engine::prefill_int4_regime(std::uint64_t prompt_rows) const {
+    return impl_->model_fast_i4 && prompt_rows >= impl_->i4_min_rows && mmoe::prefill_iu4();
+}
 void Engine::set_unaligned_resume(bool on) { impl_->unaligned_resume = on; }
 bool Engine::unaligned_resume() const { return impl_->unaligned_resume; }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }

@@ -4337,6 +4337,29 @@ memory. The absorb and out GEMMs stay on the exact v3 kernels (an f16 WMMA versi
 - **Measured gain:** Layer bench (C 2048 rows, gfx1151): scores+softmax+o-bar 17.3 -> 6.7 us/row at the 8K position, 22.9 -> 7.2 at 32K (2.6x / 3.2x); MLA total 21.3 -> 11.2 / 27.3 -> 11.4 us/row. Pair FAST, fresh process per arm: 8K prefill 10.600 -> 9.695 s (-0.905 s, -8.5 %, 2 ABAB pairs, with the removed WMMA GEMM); 32K 44.30 -> 40.26 s (-4.03 s, -9.1 %; one F / core / F set: 43.54, 40.26, 45.05 s). FAST_I4 not measured.
 - **Implementation / evidence:** [core](../src/attn_core/sparse_flash_wmma.hpp), [helpers](../src/attn_core/flash_tile.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_attn_core_sparse_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip)
 
+<a id="mm-pf-msa-flash"></a>
+
+### FAST key-split MSA attention core (mm-pf-msa-flash)
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_FLASH` (0 | 1 | 2), `STRIX_MM_PF_MSA_FLASH_LAYERS`. **Default:** off (opt-in FAST identity); when on, layers 40-59.
+
+The prefill MSA attention of a (row, KV group) - 16 query heads over the row's selected 128-key blocks - runs as one
+flash kernel on the shared key-split core (`src/attn_core/sparse_flash_keysplit.hpp`) instead of the exact in-block
+kernel (mode 10): one work-group = 4 waves, each wave owns every fourth 16-key tile and runs a complete flash step on
+it (bf16 WMMA QK straight from the key rows, FP32 online softmax inside the wave, bf16 WMMA PV from a wave-private
+transposed value tile), with no barrier in the key loop; the four per-wave states are merged once per row. Selection,
+block lists and the K/V caches are the exact path's. Value 1 rounds queries and probabilities to bf16 (16 WMMA per
+tile); value 2 carries both as two bf16 terms, hi + lo (32 WMMA per tile, operand rounding 2^-17 instead of 2^-9).
+
+- **Preconditions:** prefill windows of more than 8 rows with the in-block MSA mode active (`STRIX_MM_PF_MSA_REWORK` not 0); other windows keep the exact kernel.
+- **Automatic selection:** per layer when enabled: layers 40-59 use the flash core, the others the exact kernel. `STRIX_MM_PF_MSA_FLASH_LAYERS` (layer-set grammar, e.g. `30-59`) changes the layers. Unset, every layer keeps the exact kernel, so exact mode keeps its bytes. It is not a default of the FAST_I4 format: there the same layer set changes the output more than the gate allows (see evidence).
+- **Why per layer:** the kernel is accurate (see evidence), but any non-identical attention output changes the top-16 block selection of some later rows, and that divergence grows with the number of layers downstream. On 8K prompts the full depth fails the FAST gate with either operand form, layers 20-59 fail, layers 40-59 pass with both forms on the EXL3 format. With the FAST_I4 format the INT4 MoE layers (38-59) amplify the same change: layers 40-59, 50-59 and 55-59 all fail against the FAST_I4 run.
+- **Fallback notice:** each rank prints `prefill identity mm-pf-msa-flash FAST (..., N-term operands, L layers)` when it is on.
+- **Exactness evidence:** FAST identity. Device unit (flash vs exact in-block kernel, same caches and selections, dense rows, dense/sparse boundary, sparse rows, masked last block, single-tile rows): row/head rel-L2 max 2.4e-3 (value 1), 4.2e-6 (value 2); all-equal scores 1e-7; one dominant key 8.6e-3 / 1.3e-5. Pair 8K chat prose / code / data, last 256 rows each, both ranks, against the exact run (pooled KL <= 0.02, top-1 >= 93 %, dNLL <= 0.01): value 2 on layer 59 only KL 0.00000, top-1 100 %; layers 40-59 KL 0.0013, top-1 99.7 %, dNLL -0.003 (pass; value 1 on the same layers: KL 0.0012, top-1 99.7 %, dNLL +0.0004, pass); layers 20-59 KL 0.110 (fail); all layers KL 0.589 (value 2) / 0.697 (value 1) (fail). FAST_I4 format, value 1, against the FAST_I4 run: layers 40-59 KL 0.079, top-1 92.7 % (fail); layers 50-59 KL 0.046, top-1 94.5 %, dNLL +0.039 (fail); layers 55-59 KL 0.011, top-1 96.6 %, dNLL +0.013 (fail on dNLL); against the exact run the 40-59 arm is KL 0.084, top-1 92.1 % where FAST_I4 alone is KL 0.099, top-1 90.6 % (same 8K prompts).
+- **Off switch:** STRIX_MM_PF_MSA_FLASH=0 (or exact mode)
+- **Measured gain:** Device unit, 4,096 rows at the 8K position, whole prefill attention call (prep + index + selection + attend), all layers on the flash core: 33.9 -> 16.6 ms (value 1), 23.0 ms (value 2). Pair, FAST_I4 format, layers 40-59, one fresh process per arm, both orders (state hashes repeat per arm): 8K TTFT 12.289 / 12.281 s -> 11.703 / 11.637 s (value 1, -5.0 %), 11.865 / 11.819 s (value 2, -3.6 %); 32K 49.867 / 49.927 s -> 46.270 / 47.440 s (value 1, -6.1 %). Resources (gfx1151): value 1 206 VGPR, 5 waves per SIMD, 25,088 B LDS; value 2 219 VGPR, 4 waves, 29,184 B; no spills, no barrier in the key loop.
+- **Implementation / evidence:** [core](../src/attn_core/sparse_flash_keysplit.hpp), [softmax step](../src/attn_core/online_softmax.hpp), [MiniMax policy](../src/minimax/attn/msa_flash_policy.hpp), [launch](../src/minimax/attn/msa_fused.hip), [test](../src/minimax/attn/msa_fused_tests.hip)
+
 <a id="glm-serve-g2"></a>
 
 ### Server batched MTP verify

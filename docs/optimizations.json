@@ -732,6 +732,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Uniform DA16 activation issue (expert down)",
+    "flag_or_env": "STRIX_QPF2K_MOE_DA16_ISSUE",
+    "default": "automatic (on for the XOR-row tune 88)",
+    "exact": "Bitwise: routed-expert fixture (every written view, the CSR words and the certificate word; header reuse on and off; certificate off, armed and unproven; DA16 image poisoned before each run) identical with the item on and off on a real layer at 4,096 and 8,192 rows and on synthetic layers; 8K and 32K terminal FP32 logits and generated tokens identical with =0, unset and =1.",
+    "gain": "down phase -0.7 % to -1.5 % at 3,072 to 4,864 rows per chunk (routed call -0.26 % to -0.39 %; real layer, ABBA); no repeatable change at 2,048 rows or at 6,144 and 8,192-row chunks",
+    "preconditions": "DA16 expert down entries (base, certificate, BF16 route, one-byte route), automatic for tune 88 (64-assignment batches with XOR rows), =1 for every tune; LDS-epilogue tiers, the tile-64 remainder and the P1 item keep the masked issue.",
+    "off_switch": "STRIX_QPF2K_MOE_DA16_ISSUE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-moe-da16-issue"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA attend-union merge",
     "flag_or_env": "STRIX_QSA_UNION_MERGE",
     "default": "1 (from 49,152 blocks; range form below)",

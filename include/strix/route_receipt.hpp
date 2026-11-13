@@ -65,7 +65,7 @@ struct Totals {
     std::array<std::array<Count, kReasons>, kProducts> bypass{};
     std::array<std::array<std::uint8_t, kReasons>, kProducts> wanted{};  // family the bypassed call asked for
     std::array<std::array<Count, kFamilies>, kLayers> layer{};
-    std::array<std::uint8_t, kLayers> layer_reason{};                   // last reason recorded for the layer
+    std::array<std::array<std::uint64_t, kReasons>, kLayers> layer_reason{};  // layer visits by reason
     [[nodiscard]] bool empty() const {
         for (const auto& p : product) for (const auto& c : p) if (c.launches) return false;
         for (const auto& p : bypass) for (const auto& c : p) if (c.launches) return false;
@@ -86,7 +86,7 @@ struct Table {
     Cell bypass[kProducts][kReasons];
     std::atomic<std::uint8_t> wanted[kProducts][kReasons];
     Cell layer[kLayers][kFamilies];
-    std::atomic<std::uint8_t> layer_reason[kLayers];
+    std::atomic<std::uint64_t> layer_reason[kLayers][kReasons];
 };
 inline Table g_table;
 inline std::atomic<int> g_on{-1};
@@ -95,7 +95,7 @@ inline thread_local int t_layer = -1;
 // Never destroyed: the exit print reads them after other statics are gone.
 inline std::mutex& lever_mutex() { static auto* m = new std::mutex; return *m; }
 inline std::vector<Lever>& levers() { static auto* v = new std::vector<Lever>; return *v; }
-inline std::string& engine_name() { static auto* s = new std::string; return *s; }
+inline char g_engine[32] = {};  // written once at start-up under lever_mutex
 inline int resolve_on() {
     const int on = envcfg::flag("STRIX_ROUTE_RECEIPT", true) ? 1 : 0;
     g_on.store(on, std::memory_order_relaxed);
@@ -135,7 +135,9 @@ inline void set_rank(int rank) { detail::g_rank.store(rank, std::memory_order_re
 inline int rank() { return detail::g_rank.load(std::memory_order_relaxed); }
 inline void set_engine(std::string_view engine) {
     std::lock_guard<std::mutex> lock(detail::lever_mutex());
-    detail::engine_name() = engine;
+    const std::size_t n = engine.size() < sizeof detail::g_engine - 1 ? engine.size() : sizeof detail::g_engine - 1;
+    std::memcpy(detail::g_engine, engine.data(), n);
+    detail::g_engine[n] = 0;
 }
 
 // One executed launch (or one logical call that enqueued a family) of `rows` logical rows.
@@ -152,14 +154,14 @@ inline void bypass(Product p, Family wanted, Reason why, std::uint64_t rows) {
     detail::g_table.wanted[pi][ri].store(static_cast<std::uint8_t>(wanted), std::memory_order_relaxed);
 }
 
-// Attributes the launches of this thread to one layer until the scope ends, and records why the layer runs the
+// Attributes the launches of this thread to one layer until the scope ends, and counts why the layer runs the
 // family it runs (selected = the requested family).
 class LayerScope {
 public:
     LayerScope(unsigned layer, Reason why) : previous_(detail::t_layer) {
         if (layer >= kLayers || !enabled()) return;
         detail::t_layer = static_cast<int>(layer);
-        detail::g_table.layer_reason[layer].store(static_cast<std::uint8_t>(why), std::memory_order_relaxed);
+        detail::g_table.layer_reason[layer][static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
     }
     ~LayerScope() { detail::t_layer = previous_; }
     LayerScope(const LayerScope&) = delete;
@@ -231,11 +233,11 @@ inline Totals snapshot() {
     }
     for (std::size_t l = 0; l < kLayers; ++l) {
         for (std::size_t f = 0; f < kFamilies; ++f) t.layer[l][f] = get(g.layer[l][f]);
-        t.layer_reason[l] = g.layer_reason[l].load(std::memory_order_relaxed);
+        for (std::size_t r = 0; r < kReasons; ++r) t.layer_reason[l][r] = g.layer_reason[l][r].load(std::memory_order_relaxed);
     }
     return t;
 }
-// now - before (the counters of a window). Wanted families and layer reasons are those of `now`.
+// now - before (the counters of a window). Wanted families are those of `now`.
 inline Totals delta(const Totals& now, const Totals& before) {
     Totals d = now;
     const auto sub = [](Count& a, const Count& b) { a.launches -= b.launches; a.rows -= b.rows; };
@@ -243,8 +245,10 @@ inline Totals delta(const Totals& now, const Totals& before) {
         for (std::size_t f = 0; f < kFamilies; ++f) sub(d.product[p][f], before.product[p][f]);
         for (std::size_t r = 0; r < kReasons; ++r) sub(d.bypass[p][r], before.bypass[p][r]);
     }
-    for (std::size_t l = 0; l < kLayers; ++l)
+    for (std::size_t l = 0; l < kLayers; ++l) {
         for (std::size_t f = 0; f < kFamilies; ++f) sub(d.layer[l][f], before.layer[l][f]);
+        for (std::size_t r = 0; r < kReasons; ++r) d.layer_reason[l][r] -= before.layer_reason[l][r];
+    }
     return d;
 }
 // Test helper: zero the counters and forget the levers.
@@ -257,7 +261,7 @@ inline void reset() {
     }
     for (std::size_t l = 0; l < kLayers; ++l) {
         for (std::size_t f = 0; f < kFamilies; ++f) zero(g.layer[l][f]);
-        g.layer_reason[l].store(0);
+        for (std::size_t r = 0; r < kReasons; ++r) g.layer_reason[l][r].store(0);
     }
     std::lock_guard<std::mutex> lock(detail::lever_mutex());
     detail::levers().clear();
@@ -274,7 +278,7 @@ inline std::string json(const Totals& t, std::string_view scope = "process", boo
     detail::put(out, scope);
     {
         std::lock_guard<std::mutex> lock(detail::lever_mutex());
-        if (!detail::engine_name().empty()) { out += ",\"engine\":"; detail::put(out, detail::engine_name()); }
+        if (detail::g_engine[0] != 0) { out += ",\"engine\":"; detail::put(out, detail::g_engine); }
     }
     if (rank() >= 0) out += ",\"rank\":" + std::to_string(rank());
     out += ",\"counters\":";
@@ -332,20 +336,31 @@ inline std::string json(const Totals& t, std::string_view scope = "process", boo
             out += "\",\"reason\":\""; out += name(static_cast<Reason>(r));
             out += "\",\"calls\":" + std::to_string(c.launches) + ",\"rows\":" + std::to_string(c.rows) + "}";
         }
-    // Layers: runs of consecutive layers that ran the same families for the same reason.
+    // Layers: runs of consecutive layers that ran the same families for the same reasons.
     out += "],\"layers\":[";
     first = true;
     const auto mask = [&](std::size_t l) { unsigned m = 0; for (std::size_t f = 0; f < kFamilies; ++f) if (t.layer[l][f].launches) m |= 1U << f; return m; };
+    const auto why = [&](std::size_t l) { unsigned m = 0; for (std::size_t r = 0; r < kReasons; ++r) if (t.layer_reason[l][r]) m |= 1U << r; return m; };
     for (std::size_t l = 0; l < kLayers;) {
         const unsigned m = mask(l);
         if (!m) { ++l; continue; }
         std::size_t end = l + 1;
-        while (end < kLayers && mask(end) == m && t.layer_reason[end] == t.layer_reason[l]) ++end;
+        const unsigned w = why(l);
+        while (end < kLayers && mask(end) == m && why(end) == w) ++end;
         if (!first) out += ',';
         first = false;
-        out += "{\"layers\":\"" + std::to_string(l) + (end - l > 1 ? "-" + std::to_string(end - 1) : "") + "\",\"reason\":\"";
-        out += name(static_cast<Reason>(t.layer_reason[l] < kReasons ? t.layer_reason[l] : 0));
-        out += '"';
+        out += "{\"layers\":\"" + std::to_string(l) + (end - l > 1 ? "-" + std::to_string(end - 1) : "") + "\",\"reasons\":{";
+        bool first_reason = true;
+        for (std::size_t r = 0; r < kReasons; ++r) {
+            if (!(w & (1U << r))) continue;
+            std::uint64_t visits = 0;
+            for (std::size_t k = l; k < end; ++k) visits += t.layer_reason[k][r];
+            out += first_reason ? "\"" : ",\"";
+            first_reason = false;
+            out += name(static_cast<Reason>(r));
+            out += "\":" + std::to_string(visits);
+        }
+        out += '}';
         for (std::size_t f = 0; f < kFamilies; ++f) {
             if (!(m & (1U << f))) continue;
             Count sum;

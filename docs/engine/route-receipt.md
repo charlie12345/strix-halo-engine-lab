@@ -11,7 +11,7 @@ which took effect, and why anything was declined. The code is one header,
   `head`, `core`) and kernel family (`exact`, `f16_wmma`, `iu4`, `fma_rows`, `fallback`).
 - **Bypasses**: a call that asked for one family and ran another, with the family it wanted, the reason of the
   deciding branch, the number of calls and their rows.
-- **Layers**: runs of consecutive layers that ran the same families for the same reason.
+- **Layers**: runs of consecutive layers that ran the same families for the same reasons, with the visits per reason.
 - **Levers**: requested value, effective value, reason code and, where the selector has one, its own reason text.
 - **Switches**: every governed switch that was set explicitly (the registry of `strix/env_flags.hpp`), and how many
   ran on their defaults.

@@ -87,10 +87,24 @@ void layers_and_delta() {
     require(json.find("scope")->as_string() == "request", "scope");
     const auto& runs = json.find("layers")->as_array();
     require(runs.size() == 2, "two layer runs");
-    require(runs[0].find("layers")->as_string() == "3-37" && runs[0].find("reason")->as_string() == "layer_mask" &&
+    require(runs[0].find("layers")->as_string() == "3-37" && runs[0].find("reasons")->find("layer_mask")->as_int() == 35 &&
             runs[0].find("exact")->find("launches")->as_int() == 35 && runs[0].find("iu4") == nullptr, "exact run");
-    require(runs[1].find("layers")->as_string() == "38-56" && runs[1].find("reason")->as_string() == "selected" &&
+    require(runs[1].find("layers")->as_string() == "38-56" && runs[1].find("reasons")->find("selected")->as_int() == 19 &&
             runs[1].find("iu4")->find("rows")->as_int() == 19 * 4096, "iu4 run");
+    // A later short request (every layer on the exact operator) adds its own reason; it does not relabel the long one.
+    const auto long_request = route::snapshot();
+    for (unsigned l = 3; l < 57; ++l) {
+        const route::LayerScope scope(l, Reason::short_call);
+        route::launched(Product::moe, Family::exact, 8);
+    }
+    const auto total = strix::serve::parse_json(route::json(route::snapshot()));
+    const auto& all = total.find("layers")->as_array();
+    require(all.size() == 2 && all[1].find("reasons")->find("selected")->as_int() == 20 && all[1].find("reasons")->find("short_call")->as_int() == 19 &&
+            all[1].find("iu4")->find("launches")->as_int() == 20 && all[1].find("exact")->find("launches")->as_int() == 19, "process totals keep both reasons");
+    const auto window = strix::serve::parse_json(route::json(route::delta(route::snapshot(), long_request), "request", false));
+    const auto& short_runs = window.find("layers")->as_array();
+    require(short_runs.size() == 1 && short_runs[0].find("layers")->as_string() == "3-56" && short_runs[0].find("reasons")->find("short_call")->as_int() == 54 &&
+            short_runs[0].find("reasons")->find("selected") == nullptr && short_runs[0].find("iu4") == nullptr, "request window: only its own reason");
     const auto moe_exact = json.find("products")->find("moe")->find("exact");
     require(moe_exact->find("launches")->as_int() == 36 && moe_exact->find("rows")->as_int() == 35 * 4096 + 7, "unscoped launch counted once");
 }

@@ -305,6 +305,13 @@ window stream shared by all slots. The calibration replay runs once.
   decode rounds between its units; it then decodes with the others and the long block resumes. One nested
   prompt per pause; T8192 with the default tails and the dense-A8 prefill only (other routes decline, counted
   in `nest_skip_reasons`).
+- Join rule (`include/strix/serve/prompt_join.hpp`, `STRIX_BATCH_NEST_RATIO`, default 4, `0` = always nest): a
+  request is nested only when its uncached rows are at most 1/ratio of the paused unit's rows (a short prompt
+  behind a long block). A larger one waits for the unit boundary, where its blocks join the other prompts' next
+  blocks in one segmented prefill ([prompt groups](../prefill/prompt-batch.md)); it is counted under
+  `nest_skip_reasons.group`. Nesting every arrival made a burst a serial stack of whole prompts, each alone, with
+  the paused prompt waiting for all of them. Scheduling only: a prompt's units, rows and bits are those of a solo
+  run under either choice.
 - Cancellation (`STRIX_BATCH_CANCEL_POINTS`, default 1) is observed at those layer boundaries: the request's
   partial block is discarded (nothing is published to the prefix cache), the shared prefill storage is reset
   and the slot starts fresh. Groups and window cohorts finish their unit first.

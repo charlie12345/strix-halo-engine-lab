@@ -972,8 +972,16 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
                     const auto bad = bit_mismatches(codes, ref_codes) + bit_mismatches(deltas, ref_deltas) + bit_mismatches(sums, ref_sums) +
                         bit_mismatches(raw, ref_raw);
                     expect(bad == 0U, label + " T=" + std::to_string(rows) + " arm " + arms[arm].name + ": outputs differ from arm " + arms[0].name);
+                    const auto fnv = [](const auto& v) {
+                        std::uint64_t h = 1469598103934665603ULL;
+                        const auto* p = reinterpret_cast<const unsigned char*>(v.data());
+                        for (std::size_t i = 0; i < v.size() * sizeof(v[0]); ++i) h = (h ^ p[i]) * 1099511628211ULL;
+                        return h;
+                    };
                     std::cout << "RANK-CHECK " << label << " T=" << rows << " arm " << arms[arm].name << " vs " << arms[0].name << ": "
-                              << (bad == 0U ? "bit-identical" : "MISMATCH " + std::to_string(bad)) << " (A8 codes/deltas/sums, raw)\n";
+                              << (bad == 0U ? "bit-identical" : "MISMATCH " + std::to_string(bad)) << " (A8 codes/deltas/sums, raw)" << std::hex
+                              << " fnv codes " << fnv(codes) << " group sums " << fnv(sums) << " deltas " << fnv(deltas) << " raw " << fnv(raw)
+                              << std::dec << '\n';
                 }
             }
         const double ops_gu = 2.0 * static_cast<double>(entries) * 2.0 * e.inter * e.hidden;

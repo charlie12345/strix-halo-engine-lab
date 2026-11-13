@@ -706,15 +706,27 @@ bool fast_i4() {
     const char* e = std::getenv("STRIX_DS41_FAST_I4");
     return fast_i4_mode < 0 ? (e && std::strcmp(e, "1") == 0) : fast_i4_mode != 0;
 }
-// STRIX_DS41_PF_CORE=1 (default off) or set_pf_core(1 / 0; -1 = the environment): routed and shared expert prefill and the
-// dense Q8_0 x A8 prefill on the shared tiled core. Same bits as the default kernels; slower today, so opt-in. FAST_I4
-// runs only on the shared core and implies it for the expert products.
+// STRIX_DS41_PF_CORE (read per call) or set_pf_core(1 / 0; -1 = the environment): which prefill products run on the shared
+// tiled core (src/core) instead of the kernels of this file. 0 = none, moe = the routed and shared expert gate/up and down,
+// dense = the dense Q8_0 x A8 products, 1 = both; a named product takes every format the core has (and rejects a width it
+// cannot take). Unset: per form, the shared core where it is measured at least as fast as the kernel here (pf_core_for's argument
+// at the call sites), the kernels of this file for everything else. The same bits either way. FAST_I4 runs only on the
+// shared core and implies it for the expert products.
 int pf_core_mode = -1;
 void set_pf_core(int mode) { pf_core_mode = mode; }
-bool pf_core() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_PF_CORE"); return e != nullptr && std::strcmp(e, "1") == 0; }();
-    return pf_core_mode < 0 ? env : pf_core_mode != 0;
+// 1 = named on, 0 = named off, -1 = not named (decided per form)
+int pf_core_request(bool dense) {
+    if (pf_core_mode >= 0) return pf_core_mode != 0 ? 1 : 0;
+    const int c = strix::envcfg::choice("STRIX_DS41_PF_CORE", {"0", "1", "moe", "dense"}, -1);
+    if (c < 0) return -1;
+    return c == 1 || c == (dense ? 3 : 2) ? 1 : 0;
 }
+bool pf_core_for(bool faster_form) {
+    const int r = pf_core_request(false);
+    return r > 0 || (r < 0 && faster_form);
+}
+bool pf_core() { return pf_core_request(false) > 0; }
+bool pf_core_dense() { return pf_core_request(true) > 0; }
 void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view, void* stream) {
     require_routes(view.routes);
     const auto elements = block_elements(format);
@@ -725,7 +737,12 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill gate/up view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    if (pf_core() || fast_i4()) {
+    // Rank fixture at 2048 and 4096 rows in 16-row batches, shared core against the kernels below (same bits): Q8_0 (the
+    // shared expert) -0.8..-2.1 %, IQ2_XXS equal (median +0.3 % of six cells, 1014 against 1018 instructions per chunk) ->
+    // default for both.
+    const bool faster_form = view.routes.batch_rows == 16U && !fast_moe() && view.hidden <= 5120U &&
+        (format == WeightFormat::q8_0 || (format == WeightFormat::iq2_xxs && view.hidden % 1024U == 0U));
+    if (pf_core_for(faster_form) || fast_i4()) {
         if (view.hidden > 5120U) throw std::invalid_argument("ds41 prefill gate/up view: shared core width");
         if (format == WeightFormat::iq2_xxs) launch_gate_up_core<WeightFormat::iq2_xxs>(view, queue);
         else if (format == WeightFormat::q8_0) launch_gate_up_core<WeightFormat::q8_0>(view, queue);
@@ -790,7 +807,10 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill down view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    if (pf_core() || fast_i4()) {
+    // Rank fixture as in gate/up: Q8_0 (the shared expert) -6.3..-7.6 % -> default; Q2_K -0.1..+1.4 % (five of six cells
+    // slower) -> stays on the kernels below.
+    const bool faster_form = format == WeightFormat::q8_0 && view.routes.batch_rows == 16U && !fast_moe() && view.width <= 5120U;
+    if (pf_core_for(faster_form) || fast_i4()) {
         if (view.width > 5120U) throw std::invalid_argument("ds41 prefill down view: shared core width");
         if (format == WeightFormat::q2_k) launch_down_core<WeightFormat::q2_k>(view, queue);
         else if (format == WeightFormat::q8_0) launch_down_core<WeightFormat::q8_0>(view, queue);

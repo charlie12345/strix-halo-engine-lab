@@ -141,7 +141,14 @@ the service sets a fetch policy and a fetcher.
 
 The service that loads an adapter also folds its identity into the prefix format id
 (`embed_format_id`), so a change of tower or weights invalidates image-bearing
-prefixes through the key.
+prefixes through the key. Adapters shared across services must synchronize their own
+encoding and epoch state; kinds in one request must use a shared handle namespace.
+The epoch callback synchronizes with the cache owner and completes withdrawal before
+returning. The API mutex alone does not protect runtime caches.
+
+Fake-encoder and skeleton tests qualify request plumbing only. They do not establish
+real embedding consumption, decoder safety, model fidelity, epoch-cache invalidation
+on a production runtime, or GPU qualification.
 
 ### Backend operations
 

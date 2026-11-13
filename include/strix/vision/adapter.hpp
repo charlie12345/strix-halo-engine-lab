@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,6 +23,37 @@ struct ResizeRule {
     unsigned max_rows = 0;
     float max_aspect = 0.0F;  // 0 = unlimited
 };
+
+// Checked geometry of a patch grid, for every adapter method that takes one (project(), layout(), a patch builder).
+// A grid is supplied by a caller, so nothing about it is assumed: all products are formed in 64 bits before they are
+// compared. Throws std::invalid_argument ("vision patch grid: ...").
+inline constexpr std::uint64_t kMaxGridAxis = 65536;  // PatchGrid::y / ::x are 16-bit patch coordinates
+struct MergedGrid {
+    unsigned grid_h = 0, grid_w = 0, tokens = 0;  // after the merge x merge grouping
+};
+// Axis bounds alone: for a patch builder, before it allocates or narrows a coordinate.
+inline void check_grid_axes(std::uint64_t grid_h, std::uint64_t grid_w) {
+    if (grid_h == 0 || grid_w == 0) throw std::invalid_argument("vision patch grid: an empty axis");
+    if (grid_h > kMaxGridAxis || grid_w > kMaxGridAxis)
+        throw std::invalid_argument("vision patch grid: an axis of more than " + std::to_string(kMaxGridAxis) + " patches");
+}
+// The whole grid: positive axes inside the coordinate width, both multiples of `merge`, rows == grid_h * grid_w,
+// coordinate vectors absent or one per row, and at most `max_tokens` merged image rows.
+inline MergedGrid checked_merged_grid(const PatchGrid& grid, unsigned merge, std::uint64_t max_tokens) {
+    if (merge == 0) throw std::invalid_argument("vision patch grid: a zero merge factor");
+    check_grid_axes(grid.grid_h, grid.grid_w);
+    if (grid.grid_h % merge != 0 || grid.grid_w % merge != 0)
+        throw std::invalid_argument("vision patch grid: an axis is not a multiple of the merge factor");
+    if (std::uint64_t{grid.grid_h} * grid.grid_w != grid.rows)
+        throw std::invalid_argument("vision patch grid: rows differ from grid_h * grid_w");
+    if (grid.y.size() != grid.x.size() || (!grid.y.empty() && grid.y.size() != grid.rows))
+        throw std::invalid_argument("vision patch grid: coordinates differ from the row count");
+    const std::uint64_t mh = grid.grid_h / merge, mw = grid.grid_w / merge;
+    if (mh * mw > max_tokens)
+        throw std::invalid_argument("vision patch grid: " + std::to_string(mh * mw) + " image rows, the limit is " +
+                                    std::to_string(max_tokens));
+    return {static_cast<unsigned>(mh), static_cast<unsigned>(mw), static_cast<unsigned>(mh * mw)};
+}
 
 // Tensor lookup of one checkpoint (GGUF, safetensors, pack). Views stay valid while the source lives.
 class WeightSource {
@@ -52,9 +84,13 @@ public:
     virtual PositionInputs positions(const EncoderConfig& c, const EncoderWeights& w, const PatchGrid& g) const {
         return default_positions(c, w, g);
     }
-    // Merger / unshuffle / pool + MLP and special rows; linears go through `dense`.
-    virtual void project(EncoderOutput&, DenseOps& dense, ProjectedRows& out) = 0;
+    // Merger / unshuffle / pool + MLP and special rows; linears go through `dense`. The grid is the one the hidden
+    // rows were encoded from (a projector that merges neighbours needs its shape and row order).
+    virtual void project(EncoderOutput&, const PatchGrid&, DenseOps& dense, ProjectedRows& out) = 0;
     virtual SpanLayout layout(const PatchGrid&) const = 0;
+    // Arithmetic policy the tower needs on the device (default: none). A family whose gate fails without a policy
+    // bit states it here, so every service constructs the runner the same way.
+    virtual EncoderOptions device_options() const { return {}; }
 };
 
 }  // namespace strix::vision

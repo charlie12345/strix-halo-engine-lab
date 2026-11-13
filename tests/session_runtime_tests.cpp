@@ -757,13 +757,16 @@ int main() {
             // activate: a virtual id without a table is refused although native validation accepted the job
             auto bare = q.submit(job(ids)); CHECK(r.reserve_fifo());
             CHECK(refused_as([&] { (void)r.activate(0, true); }) == 1);
-            CHECK(r.reservation() && r.live() == 0);
+            CHECK(r.reservation() && r.live() == 0 && e.initializes == 0);
             r.refuse({}, "virtual id without a table"); CHECK(drain(bare).error == "virtual id without a table");
             // activate: the bind fails after the lease exists; the lease returns and the request is still refusable
             auto bound = job(ids); bound.embeds = table;
             auto failing = q.submit(bound); CHECK(r.reserve_fifo());
-            CHECK(refused_as([&] { (void)r.activate(0, true); }) == 1);
-            CHECK(r.reservation() && r.live() == 0);
+            for (unsigned attempt = 1; attempt <= 6; ++attempt) {
+                CHECK(refused_as([&] { (void)r.activate(0, true); }) == 1);
+                CHECK(r.reservation() && r.live() == 0);
+                CHECK(e.initializes == attempt && e.releases == attempt);
+            }
             r.refuse({}, "bind refused"); CHECK(drain(failing).error == "bind refused");
             // the only slot is free again
             auto text = q.submit(job()); CHECK(r.reserve_fifo());
@@ -772,18 +775,51 @@ int main() {
             // promote: the same two cases; the pending entry survives the failure
             auto pending_bare = q.submit(job(ids)); CHECK(r.reserve_fifo());
             const auto a = r.hold_reservation();
+            const auto before_bare = e.initializes;
             CHECK(refused_as([&] { (void)r.promote(a); }) == 1 && r.pending_count() == 1 && r.live() == 0);
+            CHECK(e.initializes == before_bare);
             r.refuse_pending(a, {}, "virtual id without a table"); CHECK(drain(pending_bare).error == "virtual id without a table");
             auto pending_bound = q.submit(bound); CHECK(r.reserve_fifo());
             const auto b = r.hold_reservation();
-            CHECK(refused_as([&] { (void)r.promote(b); }) == 1 && r.pending_count() == 1 && r.live() == 0);
-            CHECK(refused_as([&] { (void)r.promote(b); }) == 1 && r.pending_count() == 1); // again: nothing leaked
+            const auto before_bound = e.releases;
+            for (unsigned attempt = 1; attempt <= 6; ++attempt) {
+                CHECK(refused_as([&] { (void)r.promote(b); }) == 1 && r.pending_count() == 1 && r.live() == 0);
+                CHECK(e.releases == before_bound + attempt);
+            }
             r.refuse_pending(b, {}, "bind refused"); CHECK(drain(pending_bound).error == "bind refused");
             auto last = q.submit(job()); CHECK(r.reserve_fifo());
             const auto c = r.hold_reservation();
             const auto promoted = r.promote(c); CHECK(r.live() == 1 && r.pending_count() == 0);
             r.complete(promoted.state, {}, 0); CHECK(drain(last).error.empty());
             CHECK(q.snapshot().running == 0 && q.snapshot().queued == 0);
+        }
+        {
+            // Native hooks cannot bypass the engine's embed capability, with or without a table.
+            FakeEngine e; e.limits.owner_control = true; e.limits.embed_rows = false;
+            sv::GenerationQueue q;
+            ss::Policy p; p.enabled = false; p.store = false;
+            sv::SessionHooks h; h.disable_native_cache = true;
+            h.control_turn = [](sv::SessionRuntime&) {};
+            h.native_validate = [](const auto&) {};
+            sv::SessionRuntime r(q, e, e.store, p, h);
+            ss::EmbedInterner interner;
+            ss::EmbedRows rows; rows.rows = 1; rows.width = 1; rows.data = {0x3f80};
+            const auto lease = interner.intern(rows);
+            const auto table = std::make_shared<const ss::EmbedTable>(std::vector<ss::EmbedLease>{lease});
+            for (const bool with_table : {false, true}) for (const bool pending : {false, true}) {
+                auto request = job({ss::embed_id(lease.handle(), 0)});
+                if (with_table) request.embeds = table;
+                auto ticket = q.submit(request); CHECK(r.reserve_fifo());
+                const auto held = pending ? r.hold_reservation() : sv::PendingSession{};
+                bool refused = false;
+                try { if (pending) (void)r.promote(held); else (void)r.activate(0, true); }
+                catch (const std::invalid_argument&) { refused = true; }
+                CHECK(refused && e.initializes == 0 && e.releases == 0 && r.live() == 0);
+                if (pending) r.refuse_pending(held, {}, "unsupported embeds");
+                else r.refuse({}, "unsupported embeds");
+                CHECK(drain(ticket).error == "unsupported embeds");
+            }
+            CHECK(q.snapshot().running == 0 && r.pending_count() == 0);
         }
         std::cout << "session runtime checks passed\n";
         return 0;

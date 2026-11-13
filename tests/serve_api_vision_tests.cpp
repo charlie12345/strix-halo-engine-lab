@@ -69,8 +69,9 @@ std::string data_url(unsigned w, unsigned h) { return "data:image/png;base64," +
 
 // The adapter of the test: rows = width x height of the file, spliced between two real ids.
 struct FakeAdapter : sv::ApiMediaAdapter {
-    explicit FakeAdapter(std::string name = "fake-tower-v1", std::string media_kind = "image", std::string mark = "\x1f")
-        : name_(std::move(name)), kind_(std::move(media_kind)), mark_(std::move(mark)) {}
+    explicit FakeAdapter(std::string name = "fake-tower-v1", std::string media_kind = "image", std::string mark = "\x1f",
+                         std::uint32_t capacity = ss::kEmbedMaxHandles)
+        : interner(capacity), name_(std::move(name)), kind_(std::move(media_kind)), mark_(std::move(mark)) {}
     std::string kind() const override { return kind_; }
     std::string identity() const override { return name_; }
     std::string placeholder() const override { return mark_; }
@@ -190,10 +191,9 @@ sv::Json scrub(const sv::Json& value) {
     sv::Json out = sv::Json::object();
     for (const auto& [key, member] : value.as_object()) {
         if (key == "id" || key == "created" || key == "created_at" || key == "completed_at" || key == "request_id" ||
-            key == "timings" || key == "timing" || key == "call_id" || key == "item_id" || key == "response_id" || key == "system_fingerprint")
+            key == "timings" || key == "timing" || key == "call_id" || key == "item_id" || key == "response_id")
             continue;
-        if (key.size() > 3 && (key.compare(key.size() - 3, 3, "_ms") == 0 || key.find("seconds") != std::string::npos ||
-                               key.find("per_second") != std::string::npos || key.find("tps") != std::string::npos))
+        if (key == "queue_ms" || key == "prefill_ms" || key == "decode_ms" || key == "decode_tokens_per_second")
             continue;
         out.set(key, scrub(member));
     }
@@ -245,6 +245,50 @@ std::string chat_body(const std::string& parts, const std::string& more = {}) {
 }
 std::string image_part(unsigned w, unsigned h) {
     return R"({"type":"image_url","image_url":{"url":")" + data_url(w, h) + R"("}})";
+}
+
+// The comparison must retain generated content, token ids, finish reasons, usage and event order.
+void sse_comparison_contract() {
+    const std::string original = R"({"id":"a","created":1,"delta":"hello","token_ids":[1,2],"finish_reason":"stop","usage":{"total_tokens":2}})";
+    const auto stream = [](const std::string& data) { return "event: delta\ndata: " + data + "\n\nevent: done\ndata: [DONE]\n\n"; };
+    const auto baseline = sse_events(stream(original));
+    auto changed = sv::parse_json(original);
+    changed.set("id", sv::Json("b")); changed.set("created", sv::Json(2));
+    CHECK(sse_events(stream(changed.dump())) == baseline);
+    for (const auto* field : {"delta", "token_ids", "finish_reason", "usage"}) {
+        changed = sv::parse_json(original); changed.set(field, sv::Json("changed"));
+        CHECK(sse_events(stream(changed.dump())) != baseline);
+    }
+    CHECK(sse_events("event: done\ndata: [DONE]\n\nevent: delta\ndata: " + original + "\n\n") != baseline);
+    CHECK(sse_events("event: delta\ndata: " + original + "\n\n") != baseline);
+}
+
+void prepared_prompt_lifetime() {
+    sv::ApiChatPrompt prepared;
+    {
+        auto adapter = std::make_shared<FakeAdapter>("small-interner", "image", "\x1f", 2);
+        Service service({adapter});
+        auto body = sv::parse_json(chat_body(image_part(2, 2)));
+        body.set("tool_choice", sv::Json("none"));
+        prepared = service.api->prepare_chat_prompt(body);
+        CHECK(prepared.tools_off && prepared.embeds && embed_ids(prepared.tokens) == 4U);
+        // Force repeated wrap/reuse of the other handle while the returned table pins this image.
+        for (unsigned i = 1; i <= 8; ++i) {
+            ss::EmbedRows rows; rows.digest[0] = static_cast<std::uint8_t>(i);
+            rows.rows = 1; rows.width = 1; rows.data = {0x4000};
+            const auto other = adapter->interner.intern(std::move(rows));
+            CHECK(other.handle() != prepared.embeds->leases()[0].handle());
+            prepared.embeds->validate(prepared.tokens);
+        }
+        CHECK(adapter->interner.epoch() > 0);
+    }
+    // No service, adapter, or interner remains: only the public result owns the rows.
+    CHECK(static_cast<bool>(prepared.embeds));
+    if (prepared.embeds) {
+        prepared.embeds->validate(prepared.tokens);
+        const auto* rows = prepared.embeds->find(prepared.embeds->leases()[0].handle());
+        CHECK(rows && rows->rows == 4 && rows->width == 2 && rows->data == std::vector<std::uint16_t>(8, 0x3f80));
+    }
 }
 
 // 1. No adapter: every front door answers what it answered before the media layer existed.
@@ -513,6 +557,8 @@ int main() {
     try {
         without_adapter();
         text_is_unchanged();
+        sse_comparison_contract();
+        prepared_prompt_lifetime();
         capabilities();
         images();
         refusals();

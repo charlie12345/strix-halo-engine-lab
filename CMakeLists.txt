@@ -1083,6 +1083,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-prefix-state-cache-tests)
     add_test(NAME strix-prefix-state-cache-tests COMMAND strix-prefix-state-cache-tests)
+    # Prepared lookups (prepare_lookup + find_longest(ticket)) against recorded one-step lookups.
+    add_executable(strix-prefix-lookup-ticket-tests tests/prefix_lookup_ticket_tests.cpp)
+    target_link_libraries(strix-prefix-lookup-ticket-tests PRIVATE strix_core strix_serve)
+    strix_target_warnings(strix-prefix-lookup-ticket-tests)
+    add_test(NAME strix-prefix-lookup-ticket-tests COMMAND strix-prefix-lookup-ticket-tests)
+    set_tests_properties(strix-prefix-lookup-ticket-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
         --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
     add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests

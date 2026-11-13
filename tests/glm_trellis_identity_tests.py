@@ -6,9 +6,11 @@ byte-identical to moe_core before extraction (LF-normalized, no token rewriting)
 This establishes source construction identity, not compiled/device qualification.
 Shared primitives that later gained a host emulation are compared through their device
 view: `__host__ ` dropped and only the `__HIP_DEVICE_COMPILE__` branch kept.
-Four entries are pinned as forwards to the single core implementation instead of the
-original body: materialize and hadamard128 (core/hadamard.hpp), hash16 and mul1_pair
-(core/packed_decoder.hpp). vector_splits is the shared policy (same body as GLM's).
+Two entries are pinned as forwards to the single core implementation instead of the
+original body: materialize and hadamard128 (core/hadamard.hpp). The codec primitives
+(hash16, mul1_pair, LaneGeom, the address helpers, TileStates) are the original bodies,
+moved into src/core/trellis_codec.hpp (the codec shared by every engine) and fingerprinted
+there. vector_splits is the shared policy (same body as GLM's).
 """
 from hashlib import sha256
 from pathlib import Path
@@ -30,9 +32,9 @@ EXPECTED = {'Half2': ('using Half2 =', 'b6555aa71356cdb36d3994f7842cbe84710742e3
  'transform_block_values': ('__device__ __forceinline__ void transform_block_values(',
                             '9d05fdb97c360160fc2c8c0e98fc4a01987b1695418105a95a26a006b12a3df3'),
  'hash16': ('template <std::uint32_t Multiplier> __device__ __forceinline__ std::uint32_t hash16(',
-            '8ba64955d16c0d7f7e520fd2d0ff4c29958e5c2b7a0b397e893a82c45dfcf1cc'),
+            'd7d2186bbf360419b55b3641173e4f7f3ac2bde1bb3ad5d3b09b9f91cc8f539c'),
  'mul1_pair': ('__device__ __forceinline__ Half2 mul1_pair(',
-               'cf030fbbaaadd7c20b0649de6718bd3783fc341b766d44fd409c3c3fdcb901c4'),
+               'bab89ad1a2099b6e9ac8d5cda86ec31f71542b00023b3304c7fad1077fc1fbab'),
  'LaneGeom': ('template <int Bits> struct LaneGeom',
               'a09fa525682d8ce3bc2d6445f64e4337d053decda5d0f6adac692cbf48f8ce50'),
  'GlobalU32': ('using GlobalU32 =', '732234177a16c9da5fe7baa7eb767daf261bf72946839196da7828adb63342cf'),
@@ -83,7 +85,9 @@ def device_view(source):
 
 def main():
     adapter = (ROOT / "src/glm/moe/glm_trellis_device.hpp").read_text()
-    shared = device_view((ROOT / "src/moe_core/exl3_trellis.hpp").read_text())
+    # The codec primitives (hash16 .. TileStates) live in the shared codec header; moe_core re-exports them.
+    shared = device_view((ROOT / "src/moe_core/exl3_trellis.hpp").read_text() +
+                         (ROOT / "src/core/trellis_codec.hpp").read_text())
     imports = re.findall(r"^using strix::moe_core::(\w+);$", adapter, re.MULTILINE)
     assert sorted(imports) == sorted(EXPECTED), imports
     for name, (marker, expected) in EXPECTED.items():

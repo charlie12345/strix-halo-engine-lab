@@ -2360,6 +2360,20 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -Wsign-conversion -Wshadow -Werror -Wrange-loop-construct -ffp-contract=off -fno-fast-math)
         add_test(NAME strix-moe-mul1-pair-decode-tests COMMAND strix-moe-mul1-pair-decode-tests)
         set_tests_properties(strix-moe-mul1-pair-decode-tests PROPERTIES LABELS "cpu;moe;exactness")
+        # Shared trellis codec (src/core/trellis_codec.hpp): CPU reference/geometry gate and the device gate/bench.
+        add_executable(strix-trellis-codec-tests tests/trellis_codec_tests.hip)
+        target_include_directories(strix-trellis-codec-tests PRIVATE src)
+        set_target_properties(strix-trellis-codec-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        target_compile_options(strix-trellis-codec-tests PRIVATE
+            -Wsign-conversion -Wshadow -Werror -Wrange-loop-construct -ffp-contract=off -fno-fast-math)
+        add_test(NAME strix-trellis-codec-tests COMMAND strix-trellis-codec-tests)
+        set_tests_properties(strix-trellis-codec-tests PROPERTIES LABELS "cpu;core;exactness")
+        add_executable(strix-hip-trellis-codec-tests tests/hip_trellis_codec_tests.hip)
+        target_include_directories(strix-hip-trellis-codec-tests PRIVATE src)
+        set_target_properties(strix-hip-trellis-codec-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        target_compile_options(strix-hip-trellis-codec-tests PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math)
+        add_test(NAME strix-hip-trellis-codec-tests COMMAND strix-hip-trellis-codec-tests)
+        set_tests_properties(strix-hip-trellis-codec-tests PROPERTIES LABELS "gpu;core;exactness")
         # Some HIP SDKs reject RDNA wave64 at preprocessing time. Test that
         # fallback only when the installed SDK supports building it.
         include(CMakePushCheckState)

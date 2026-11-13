@@ -4485,9 +4485,9 @@ The load admits the first prefill memory plan that fits, in this order: full scr
 
 <a id="glm-idx-wmma"></a>
 
-### FAST indexer scores on WMMA (glm-idx-wmma)
+### Indexer scores on WMMA: exact selection by default, FAST modes opt-in (glm-idx-wmma)
 
-**Engine:** `glm`. **Control:** `STRIX_IDX_WMMA`. **Default:** off (opt-in FAST identity).
+**Engine:** `glm`. **Control:** `STRIX_IDX_WMMA`. **Default:** ON (`exact`, same selected pools as the exact kernels); `=0` runs the exact v3 kernel alone; `=f16` / `=1` / `bf16` are opt-in FAST identities.
 
 The prefill DSA indexer scores (per row: ReLU of the 32 head dots times the head weight, summed over heads, for every
 pooled key) run on the shared indexer score core (`src/attn_core/index_score_wmma.hpp`, tile helpers in
@@ -4498,12 +4498,23 @@ measured setting: faster and closer) or `=1` / `bf16`. The top-k selection kerne
 `STRIX_IDX_WMMA_AUDIT=1` rescores every call with the exact kernel and prints the per-row top-512 recall
 (diagnostic, synchronous, slow).
 
+**Exact mode (default).** The scores come from the FP16 WMMA kernel; a second kernel (`idx_refine_rows_kernel`) then
+brackets the cut-off of each row (the 512th largest key, three histogram passes), bounds the row's score error by
+`delta = sum_h |w_h| * f16_dot_error(|q_h|, max_p |k_p|) / sqrt(128)` (operand rounding 2^-11 per operand plus an
+accumulation allowance, `src/attn_core/index_score_band.hpp`) and recomputes every pool within `2 delta` of the
+cut-off with the dot and head chains of the exact v3 kernel. By the band rule the unchanged selection and window-merge
+kernels then return the pool lists of the exact path, ties included. With several pool windows the retained
+candidates are rescored through their pool ids; when the pools are staged one window at a time, a row that still
+has windows to come rescores everything at or above the cut-off band, so the keys it retains are exact values. A row
+whose bound is not finite (operand outside the FP16 range, non-finite input) rescores all of its pools. The key
+buffer holds WMMA values outside the band, so byte comparisons of that buffer need `STRIX_IDX_WMMA=0`.
+
 - **Preconditions:** prefill indexer rows with more pools than the always-kept set (shorter rows keep the exact path); the `--tf` scoring path does not use it.
-- **Automatic selection:** none (opt-in).
-- **Fallback notice:** each rank prints `prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=...)`. Two ranks: the mode is part of the startup agreement (config bits 15-16); modes without the decode handshake refuse it. GLM takes 0, 1, bf16 or f16; other values fail closed.
-- **Exactness evidence:** FAST identity. Synthetic (strix-hip-idx-wmma-glm-tests): pool recall@512 f16 0.99988 / bf16 0.9991, score rel-L2 f16 1.9e-4 / bf16 1.5e-3. Pair 8K FAST prefill (PF_WMMA=1 config), f16: in-engine recall@512 0.99974 (min 0.9941), prefill-logits KL 0.00052, 64 same-context decode steps KL mean 0.0021 (max 0.036), top-1 100 %, greedy 64/64 ids identical; bf16: KL 0.0011, top-1 98.1 %, greedy diverges at step 51.
-- **Off switch:** unset or STRIX_IDX_WMMA=0 (nothing from the core runs; default bytes unchanged, logits anchor 6f8f5af9ad00aeb1 reproduced).
-- **Measured gain:** Kernel (gfx1151): 4096 x 2048 rows exact v3 2.05 ms -> f16 1.14 ms (1.80x), bf16 1.51 ms; 28672 x 2048 13.9 -> 8.3 ms (1.67x). Pair 8K FAST, f16, fresh process per arm, 2 ABAB pairs: 11.32 -> 11.13 s (-0.19 s, -1.7 %). 32K: 2 pairs -5.24 / +0.80 s, not resolved (arm spread larger than the effect).
+- **Automatic selection:** exact mode always, unless `STRIX_IDX_WMMA` is set. The FAST modes are opt-in.
+- **Fallback notice:** exact mode: none (same identity, agreement value 0 like `STRIX_IDX_WMMA=0`). FAST modes: each rank prints `prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=...)`; two ranks: the mode is part of the startup agreement (config bits 15-16); modes without the decode handshake refuse it. GLM takes 0, 1, bf16, f16 or exact; other values fail closed.
+- **Exactness evidence:** FAST identity. Synthetic (strix-hip-idx-wmma-glm-tests): pool recall@512 f16 0.99988 / bf16 0.9991, score rel-L2 f16 1.9e-4 / bf16 1.5e-3. Pair 8K FAST prefill (PF_WMMA=1 config), f16: in-engine recall@512 0.99974 (min 0.9941), prefill-logits KL 0.00052, 64 same-context decode steps KL mean 0.0021 (max 0.036), top-1 100 %, greedy 64/64 ids identical; bf16: KL 0.0011, top-1 98.1 %, greedy diverges at step 51. **Exact mode:** exact identity. Kernel test: token lists equal to the v3 path entry for entry at six shapes (single window, several windows, windows staged one at a time; 300 to 2048 rows, up to 30720 positions). Pair prefill 8K, exact profile: logits, state and decoded tokens equal on both ranks against `STRIX_IDX_WMMA=0`, and the teacher-forced logits of the last 512 rows are byte-identical on both ranks. Pair FAST-profile prefill at 8K, 20K and 32K: logits and state hashes equal on both ranks. In-engine audit (8K, 22 calls, 67.5K rows): top-512 recall 1.00000 on every row; 11.0 % of the scores are rescored.
+- **Off switch:** `STRIX_IDX_WMMA=0` (nothing from the core runs: the exact v3 kernel alone).
+- **Measured gain:** Kernel (gfx1151): 4096 x 2048 rows exact v3 2.05 ms -> f16 1.14 ms (1.80x), bf16 1.51 ms; 28672 x 2048 13.9 -> 8.3 ms (1.67x). Pair 8K FAST, f16, fresh process per arm, 2 ABAB pairs: 11.32 -> 11.13 s (-0.19 s, -1.7 %). 32K: 2 pairs -5.24 / +0.80 s, not resolved (arm spread larger than the effect). **Exact mode:** kernel (gfx1151): 4096 x 2048 rows 2.02 -> 1.70 ms (1.19x), 28672 x 2048 rows 13.70 -> 9.87 ms (1.39x; windows staged one at a time 13.76 -> 10.10 ms, 1.36x). Pair FAST-profile prefill 8K, three prefills per process, last repetition: 8.568 / 8.567 s with `=0`, 8.529 / 8.530 / 8.563 s by default (-0.03 s, -0.3 %). 32K, fresh process per cell: 35.80 to 36.75 s with `=0` (4 cells), 35.41 to 36.76 s by default (3 cells): not resolved, the cell spread is larger than the effect (the indexer is about 1.3 s of the 32K prefill).
 - **MiniMax:** the same core scores the MiniMax MSA prefill index; see [exact index selection through WMMA scores](#minimax-idx-wmma-exact) (default, exact) and its FAST modes.
 - **Implementation / evidence:** [core](../src/attn_core/index_score_wmma.hpp), [mode](../src/attn_core/index_score_mode.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [startup agreement](../apps/glm_rank_startup.hpp), [test](../tests/hip_idx_wmma_tests.hip)
 

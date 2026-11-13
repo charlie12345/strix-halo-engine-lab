@@ -20,6 +20,7 @@
 #include <cstring>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace strix::xport {
@@ -30,16 +31,23 @@ inline constexpr std::uint64_t kFrameHelloMagic = 0x314c4548454d5246ULL; // "FRM
 struct FrameHello {
     std::uint64_t magic = kFrameHelloMagic;
     std::uint32_t forms = 0, reserved = 0;
-    std::uint64_t zero[6] = {};
+    std::uint64_t layout = 0;  // the caller's framing invariants (chunk size, CRC mode): equal on both ranks
+    std::uint64_t zero[5] = {};
 };
 static_assert(sizeof(FrameHello) == 64);
+// `layout`: whatever fixes the part sizes of every later message. It is agreed here, before any payload moves: the
+// joined form checks the identity only behind the payload, and ranks that split a message differently would stall.
 template<class Wire>
-[[nodiscard]] std::uint32_t negotiate_frame_forms(Wire&& wire, std::uint32_t offered) {
+[[nodiscard]] std::uint32_t negotiate_frame_forms(Wire&& wire, std::uint32_t offered, std::uint64_t layout = 0) {
     FrameHello mine, peer;
     mine.forms = offered;
+    mine.layout = layout;
     wire(std::as_bytes(std::span(&mine, 1)), std::as_writable_bytes(std::span(&peer, 1)));
     if (peer.magic != kFrameHelloMagic || peer.reserved != 0U)
         throw std::runtime_error("framed exchange: the peer sent no frame hello (the ranks disagree on the framing switch)");
+    if (peer.layout != layout)
+        throw std::runtime_error("framed exchange: the ranks disagree on the frame layout (chunk size or CRC mode): mine " +
+                                 std::to_string(layout) + " / peer " + std::to_string(peer.layout));
     return offered & peer.forms;
 }
 

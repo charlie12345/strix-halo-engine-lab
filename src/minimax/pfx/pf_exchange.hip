@@ -409,7 +409,9 @@ void Exchanger::process(const Job& job) {
     try {
         if (!negotiated_) {
             // Once per connection, before the first exchange: both ranks offer their forms and use the common ones.
-            if (options_.joined) forms_ = xport::negotiate_frame_forms(wire, xport::frame_rendezvous | xport::frame_joined);
+            // mine.chunk = the wire chunk size | the CRC bit: the two values that fix every later part size.
+            if (options_.joined)
+                forms_ = xport::negotiate_frame_forms(wire, xport::frame_rendezvous | xport::frame_joined, mine.chunk);
             negotiated_ = true;
         }
         if ((forms_ & xport::frame_joined) != 0) {

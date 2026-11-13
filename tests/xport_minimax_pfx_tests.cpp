@@ -193,6 +193,14 @@ void check_hello() {
     bool refused = false;
     try { static_cast<void>(negotiate_frame_forms(old, frame_rendezvous | frame_joined)); } catch (const std::runtime_error&) { refused = true; }
     require(refused);
+    // Ranks with different chunk sizes / CRC modes are refused at the hello, before any payload moves.
+    const auto other = [&](std::span<const std::byte>, std::span<std::byte> in) {
+        FrameHello peer; peer.forms = frame_rendezvous | frame_joined; peer.layout = 4194304; std::memcpy(in.data(), &peer, sizeof(peer));
+    };
+    refused = false;
+    try { static_cast<void>(negotiate_frame_forms(other, frame_rendezvous | frame_joined, 1048576)); } catch (const std::runtime_error&) { refused = true; }
+    require(refused);
+    require(negotiate_frame_forms(other, frame_rendezvous | frame_joined, 4194304) == (frame_rendezvous | frame_joined));
 }
 } // namespace
 int main() {

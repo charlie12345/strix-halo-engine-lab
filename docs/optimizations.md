@@ -4623,6 +4623,7 @@ The load admits the first prefill memory plan that fits, in this order: full scr
 | `SCORES` | 7, 6, 5, 4, 3, 2 | 7 |
 | `KDA_SCAN` | 5, 3, 1 | 5 |
 | `DENSE_ROWS` | 3, 4, 2, 1 | 3 |
+| `DENSE_FORM` | 0, 1, 2, 3, 4, 5, 6, 7 (physical form of `DENSE_ROWS=4`; 0 = automatic per shape) | 0 |
 
 - **Preconditions:** Any set value, empty included, must be in the allowed list.
 - **Fallback notice:** None; an unknown or empty value throws `ENV='v' is not a known variant (allowed: ...; unset = D)`.

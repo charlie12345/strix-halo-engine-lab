@@ -715,6 +715,7 @@ struct Engine::Impl {
     };
     std::array<PfFences, 2> pf_fences{};
     bool pf_comm_inflight = false;
+    bool unaligned_resume = false;             // conversation mode: a resident prefill may restart mid-chunk
     bool pf_group_explicit = false;            // STRIX_MM_PF_GROUP given (then a narrower exchange depth is an error)
     unsigned pf_group = strix::pair::prefill_group::kDefault;  // STRIX_MM_PF_GROUP: chunks interleaved together (2..8;
                                                // clamped to the prompt's chunk count, and to the exchange depth)
@@ -2432,7 +2433,8 @@ struct Engine::Impl {
         task.toks.assign(toks.begin(), toks.end());
         task.pos0 = pos0;
         pf_i4_chain = mmoe::prefill_i4_chain(toks.size());
-        pf_i4_rows = toks.size() >= i4_min_rows;
+        // The kernel route is a property of the whole prompt, not of the suffix a resident restart leaves to compute.
+        pf_i4_rows = pos0 + toks.size() >= i4_min_rows;
         task.chunks = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
         task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
@@ -3410,7 +3412,7 @@ void Engine::prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t gene
     auto& m = *impl_;
     if (id == 0 || m.task.open) throw std::logic_error("prefill begin: task identity");
     if (resident > m.opt.capacity || tokens.size() > m.opt.capacity - resident ||
-        (resident != 0 && resident % prefill_reuse_rows() != 0))
+        (resident != 0 && !m.unaligned_resume && resident % prefill_reuse_rows() != 0))
         throw std::invalid_argument("prefill begin: prefix range / alignment");
     if (parent != 0) {
         if (!m.parked.open || m.parked.id != parent || id == parent || slot == m.parked.slot ||
@@ -3446,11 +3448,16 @@ LoaderSnapshot Engine::draft_loader_snapshot() const {
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
 std::uint64_t Engine::prefill_reuse_rows() const {
-    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping. The alignment stays at
-    // the width the default used to have (2 chunks): a wider group changes the schedule, not the chunk bits
-    // (group 2 and 4 give identical state hashes), and a resumed prefill's first group is already narrower.
+    // One chunk: a restart at a multiple of max_rows tiles exactly like the cold prefill. A wider group changes the
+    // schedule, not the chunk bits (group 2 and 4 give identical state hashes), and a resumed prefill's first group
+    // is already narrower, so the group width does not enter the alignment (kReuseChunks bounds it at one chunk).
     return std::uint64_t{impl_->opt.max_rows} * std::min(impl_->pf_group, strix::pair::prefill_group::kReuseChunks);
 }
+bool Engine::prefill_int4_regime(std::uint64_t prompt_rows) const {
+    return impl_->model_fast_i4 && prompt_rows >= impl_->i4_min_rows && mmoe::prefill_iu4();
+}
+void Engine::set_unaligned_resume(bool on) { impl_->unaligned_resume = on; }
+bool Engine::unaligned_resume() const { return impl_->unaligned_resume; }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
 const std::uint16_t* Engine::embed_row(std::uint32_t token) const {
     if (token >= kVocab) throw std::out_of_range("embed_row");

@@ -178,12 +178,21 @@ public:
             (std::string(session_switch) == "1" || std::string(session_switch) == "on"));
         bool prefix_agreed = false;
         const bool prefix_requested = session_config.reason != "baseline" && lead::prefix_cache_requested();
+        bool conversation_agreed = false;
+        const bool conversation_requested = prefix_requested && lead::conversation_cache_requested();
         const bool session_vote = ms::session_hello(eng, session_config.reason != "baseline" &&
-            (session_config.enabled || session_explicit), prefix_requested, &prefix_agreed, eng.prefill_reuse_rows());
+            (session_config.enabled || session_explicit), prefix_requested, &prefix_agreed, eng.prefill_reuse_rows(),
+            conversation_requested, &conversation_agreed);
         if (prefix_requested && !prefix_agreed)
             std::printf("minimax serve: prefix reuse off (peer vote or prefill alignment differs)\n");
+        if (conversation_requested && !conversation_agreed)
+            std::printf("minimax serve: conversation cache off (peer vote differs); chunk-aligned reuse stays\n");
         run.prefix_reuse = prefix_agreed;
         shared.prefix_reuse = prefix_agreed;
+        shared.prefill_int4_regime = [&eng](std::uint64_t rows) { return eng.prefill_int4_regime(rows); };
+        run.conversation = conversation_agreed;
+        shared.conversation = conversation_agreed;
+        eng.set_unaligned_resume(conversation_agreed);
         if (prefix_agreed) {
             const auto snapshot = eng.loader_snapshot();
             strix::verify_loader_snapshot(snapshot);

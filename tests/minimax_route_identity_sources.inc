@@ -9,7 +9,7 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0x75782745e431b365ULL},
+{"CMakeLists.txt", 0xee7055a423517e9eULL},
 {"apps/minimax_rank_main.cpp", 0x38254f78be4c8facULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
 {"cmake/StrixSession.cmake", 0x013e65a3501ef1d9ULL},
@@ -88,7 +88,7 @@
 {"src/minimax/moe/mmx_moe.hip", 0xe43940e96d991005ULL},
 {"src/minimax/moe/mmx_moe.hpp", 0x05698ea07b619950ULL},
 {"src/minimax/moe/mmx_moe_traits.hpp", 0x752acd9908f944c4ULL},
-{"src/minimax/moe/mmx_prefill.hip", 0x7883f02f6f00b70dULL},
+{"src/minimax/moe/mmx_prefill.hip", 0xf606b4d8cad1ab84ULL},
 {"src/minimax/moe/mmx_prefill.hpp", 0x717689a69f23e7b7ULL},
 {"src/minimax/moe/mmx_prefill_core.hpp", 0x38f69d5b1d6f1403ULL},
 {"src/minimax/moe/mmx_prefill_iu4.inc", 0x595797b070512642ULL},
@@ -157,7 +157,7 @@
 {"src/moe_core/decode_schedule.hpp", 0x11d945bbc7e75567ULL},
 {"src/moe_core/device_plan.hpp", 0x2d54a065e6c9a0e8ULL},
 {"src/moe_core/device_plan_index.hpp", 0x123ba19e0be85987ULL},
-{"src/moe_core/exl3_trellis.hpp", 0x26e02004b39a5b6bULL},
+{"src/moe_core/exl3_trellis.hpp", 0x5fc38e991faf2a23ULL},
 {"src/moe_core/grouped_core.hpp", 0x5d1db0eeac22398dULL},
 {"src/moe_core/grouped_f16.hpp", 0xd4c01c860bfe9c98ULL},
 {"src/moe_core/grouped_integer_decode.hpp", 0xe4193b966715f39cULL},
@@ -177,7 +177,7 @@
 {"src/moe_core/hip_moe_prefill_p1.inc", 0xe6122cffd2794fd3ULL},
 {"src/moe_core/hip_moe_prefill_p1da16.inc", 0x091be5b8b77cbcb5ULL},
 {"src/moe_core/int4_layer_policy.hpp", 0xb335f83c65b5040fULL},
-{"src/moe_core/one_split_prefill.hpp", 0xf42e03f4eaf754fdULL},
+{"src/moe_core/one_split_prefill.hpp", 0x9ad2132a98ed27d2ULL},
 {"src/moe_core/qwen_grouped_tiles.inc", 0xd794a6688fa1cc08ULL},
 {"src/moe_core/qwen_k_scalar_decode.inc", 0xdbccbbb61a21d2f6ULL},
 {"src/moe_core/qwen_k_weight_decode.inc", 0xb3796f17d32c5ef1ULL},

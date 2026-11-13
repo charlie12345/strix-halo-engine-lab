@@ -21,8 +21,11 @@ class ConstraintWindowReceipt;
 using ConstraintAheadSubmit = std::function<void(std::function<void()>)>;
 struct ConstraintMaskAhead;
 // Worker-side totals (every walk it ran, used or not); shared with the plans, which may outlive a row.
-// `observer` (tracing and tests; set before the first plan, must not throw) runs on the walking worker: with 1
-// when it has claimed a slot, then with the phase it published for it (2 built, 3 abandoned).
+// `observer` (tracing and tests; set before the first plan, must not throw): on the walking worker with 1 when it
+// has claimed a slot, then with the phase it published for it (2 built, 3 abandoned); on the selecting thread
+// with 4 when a row finds its walk in flight and is about to wait for it. Calls can run concurrently (several
+// workers and the selecting thread) and after the plan was retired or the selection destroyed, for as long as
+// submitted jobs are outstanding: whatever the callback captures must be thread-safe and outlive those jobs.
 struct ConstraintAheadTotals { std::atomic<std::uint64_t> masks{0}, ns{0}; std::function<void(int)> observer; };
 // The serving policy of the two selection levers, read from the environment through the shared registry
 // (strict, recorded): STRIX_CONSTRAINT_MASK_AHEAD (on unless exactly "0") and STRIX_CONSTRAINT_RANKED (decimal

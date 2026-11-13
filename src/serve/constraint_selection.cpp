@@ -58,6 +58,7 @@ struct ConstraintMaskAhead {
         int phase = 0;
         if (s.phase.compare_exchange_strong(phase, 1, std::memory_order_acq_rel)) build(s, false);
         else {
+            if (phase == 1 && totals->observer) totals->observer(4);
             for (; phase == 1; phase = s.phase.load(std::memory_order_acquire)) s.phase.wait(phase, std::memory_order_acquire);
             if (phase == 3) build(s, false); else from_worker = true;
         }

@@ -943,11 +943,24 @@ struct WalkPool {
     }
     ~WalkPool() { { std::lock_guard lock(m); stop = true; } cv.notify_all(); for (auto& t : threads) t.join(); }
     void submit(std::function<void()> job) { { std::lock_guard lock(m); q.push_back(std::move(job)); } cv.notify_one(); }
-    void drain() { std::unique_lock lock(m); idle.wait(lock, [this] { return q.empty() && busy == 0; }); }
+    // Bounded: a lost job or notification fails the test instead of hanging it.
+    void drain() {
+        std::unique_lock lock(m);
+        if (!idle.wait_for(lock, std::chrono::seconds(120), [this] { return q.empty() && busy == 0; })) throw std::runtime_error("walk pool did not drain in time");
+    }
 };
 void wait_for(const std::atomic<int>& value, int target) {
-    for (int seen = value.load(); seen < target; seen = value.load()) value.wait(seen);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (value.load() < target) {
+        if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("walk gate not reached in time");
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
 }
+// Opens a gate when the scope ends, so held workers are released (and their pool can join) on a failed check too.
+struct OpenGate {
+    std::atomic<int>& gate;
+    ~OpenGate() { gate.store(1); gate.notify_all(); }
+};
 // The worker / selector interleavings of mask-ahead, each forced with gates instead of left to the scheduler:
 // two workers walking at once, a row arriving while its walk is in flight, a plan retired under its walkers, and
 // a walk error produced on the worker and raised by the row.
@@ -960,15 +973,18 @@ void mask_ahead_overlap() {
     ConstraintSpec spec; spec.eos_ids = {eos};
     spec.program = std::make_shared<ConstraintProgram>(compile_json_schema(parse_json("{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}}")));
     const auto favor = [&](std::uint32_t id) { std::vector<float> row(n, -1.0F); row[id] = 2.0F; return row; };
-    // claimed: walks a worker has started; gate 0 holds every started walk before its first step.
-    std::atomic<int> claimed{0}, built{0}, abandoned{0}, gate{0};
+    // claimed: walks a worker has started; gate 0 holds every started walk before its first step. waited: rows
+    // that found their walk in flight; the first of them opens the gate, from inside the wait branch.
+    std::atomic<int> claimed{0}, built{0}, abandoned{0}, gate{0}, waited{0};
     {
         WalkPool pool(2);
+        OpenGate open_gate{gate};
         auto serial = f.selection(copy_spec(spec)), windowed = f.selection(copy_spec(spec));
         serial->set_argmax_first(false); windowed->set_argmax_first(false);
         windowed->set_mask_ahead([&](std::function<void()> job) { pool.submit(std::move(job)); });
         windowed->set_ahead_observer([&](int phase) {
-            if (phase == 1) { claimed.fetch_add(1); claimed.notify_all(); gate.wait(0); }
+            if (phase == 1) { claimed.fetch_add(1); gate.wait(0); }
+            else if (phase == 4) { waited.fetch_add(1); gate.store(1); gate.notify_all(); }
             else if (phase == 2) built.fetch_add(1);
             else abandoned.fetch_add(1);
         });
@@ -986,12 +1002,10 @@ void mask_ahead_overlap() {
             t->reset(); t->expect(drafts);
             wait_for(claimed, 2);
             check(claimed.load() == 2 && built.load() == 0 && abandoned.load() == 0, "two workers hold a walk each at the same time");
-            std::atomic<int> entering{0};
-            std::thread release([&] { entering.wait(0); std::this_thread::sleep_for(std::chrono::milliseconds(5)); gate.store(1); gate.notify_all(); });
-            entering.store(1); entering.notify_all();
-            // Slot 0 is worker-owned and unfinished here: the row waits for it instead of walking.
+            // Slot 0 is worker-owned and held at the gate: only the row's own wait branch opens it, so the row
+            // cannot return without having waited for the in-flight walk.
             check(t->select(rows[0]) == want[0].token, "a row that waited for an in-flight walk equals the serial row");
-            release.join();
+            check(waited.load() == 1, "the row entered the wait for its in-flight walk");
             check(t->select(rows[1]) == want[1].token && t->select(rows[2]) == want[2].token, "rows after concurrent walks equal the serial rows");
             auto receipt = t->seal(); check(receipt->size() == 3, "overlap window receipt size"); receipt->publish();
             for (const auto& staged : want) serial->commit(staged);
@@ -1006,14 +1020,14 @@ void mask_ahead_overlap() {
         {
             auto [rows, want] = window({4, 1});
             const std::array<std::uint32_t, 2> drafts{want[0].token, want[1].token};
-            const int before = claimed.load(), finished = built.load();
+            const int before = claimed.load(), finished = built.load(), waits = waited.load();
             gate.store(0);
             t->reset(); t->expect(drafts);
             wait_for(claimed, before + 2);
             t->reset();
             gate.store(1); gate.notify_all();
             pool.drain();
-            check(claimed.load() == before + 2 && abandoned.load() == 2 && built.load() == finished, "walks of a retired plan are abandoned");
+            check(claimed.load() == before + 2 && abandoned.load() == 2 && built.load() == finished && waited.load() == waits, "walks of a retired plan are abandoned");
             check(t->select(rows[0]) == want[0].token && t->select(rows[1]) == want[1].token, "rows after a retired plan equal the serial rows");
             t->seal()->publish();
             for (const auto& staged : want) serial->commit(staged);

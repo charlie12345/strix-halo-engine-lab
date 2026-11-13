@@ -954,6 +954,8 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-selection-transaction-tests PRIVATE strix_serve)
     strix_target_warnings(strix-mtp-selection-transaction-tests)
     add_test(NAME strix-mtp-selection-transaction-tests COMMAND strix-mtp-selection-transaction-tests)
+    # Its worker/selector gates are bounded; this bounds a wait inside the selection itself.
+    set_tests_properties(strix-mtp-selection-transaction-tests PROPERTIES TIMEOUT 900)
 
     add_executable(strix-serve-json-constraint-tests tests/serve_json_constraint_tests.cpp)
     target_link_libraries(strix-serve-json-constraint-tests PRIVATE strix_serve)

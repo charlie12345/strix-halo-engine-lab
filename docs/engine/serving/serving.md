@@ -94,7 +94,9 @@ own constraints. The server therefore resolves:
   (`--http-batch`). Otherwise it falls back to T8192 and then to smaller tiles;
 - **the prefill arithmetic**: the automatic FP16 prefill profile of the single-request route
   whenever the decode profile is the dense-A8 profile and no prefill profile is explicit
-  (`STRIX_PREFILL_F16=0` declines it);
+  (`STRIX_PREFILL_F16=0` declines it). A server whose MTP owner is an explicit sidecar keeps this
+  arithmetic with `hc_output_wmma`, `index_proj_wmma`, `index_score_wmma` and `gdn_fp16_chunk` off, the
+  exclusion verified bundles already take (`STRIX_SERVE_FP16_MTP=0` declines the arithmetic instead);
 - **the decode profile**: a server that sets no `--numerical-profile` and no low-level
   organization flag takes the single-request decode profile and organization. An explicit
   profile or organization is preserved as before.

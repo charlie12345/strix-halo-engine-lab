@@ -181,7 +181,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE", "STRIX_PREFIX_FAIR_RECLAIM_IDLE",
-            "STRIX_SERVE_PREFILL", "STRIX_SERVE_ROUTE", "STRIX_SERVE_T16K", "STRIX_PLE_WARM", "STRIX_PLE_SERVE_RESERVE", "STRIX_PLE_REWARM", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
+            "STRIX_SERVE_PREFILL", "STRIX_SERVE_ROUTE", "STRIX_SERVE_T16K", "STRIX_SERVE_FP16_MTP", "STRIX_PLE_WARM", "STRIX_PLE_SERVE_RESERVE", "STRIX_PLE_REWARM", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
             "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
@@ -1216,7 +1216,7 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
         }
         auto candidate = o;
         std::string fp16_declined, decode_declined;
-        bool decode_adopted = false;
+        bool decode_adopted = false, governed_mtp_exclusion = false;
         auto adopted_organization = result.organization;
         if (shared_route) {
             // A server that owns no decode arithmetic takes the single-request decode profile through the same
@@ -1244,10 +1244,29 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             if (candidate.prefill_profile_automatic) {
                 // An arithmetic the serving validators refuse falls back to the resolved one, with its reason.
                 try { validate_prefill_numerical_profile_cli(candidate); }
-                catch (const std::exception& error) {
-                    candidate.prefill_numerical_profile.reset();
-                    candidate.prefill_profile_automatic = false;
-                    fp16_declined = error.what();
+                catch (const std::exception& first) {
+                    // A governed MTP owner (explicit sidecar) keeps the automatic arithmetic without the fast
+                    // prefill options its gates have not passed: the exclusion verified bundles already take.
+                    bool retained = false;
+                    if (candidate.mtp.enabled && !candidate.mtp_native_bundle && !env_is(requested,"STRIX_SERVE_FP16_MTP","0")) {
+                        const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
+                            prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+                            prefill_option_bit(PrefillOption::index_score_wmma) | (result.prefill_option_mask & kPrefillGdnChunkRev3);
+                        auto governed = candidate;
+                        governed.prefill_disabled |= excluded;
+                        governed.resolved_prefill_option_mask = result.prefill_option_mask & ~excluded;
+                        try {
+                            validate_prefill_numerical_profile_cli(governed);
+                            candidate = std::move(governed);
+                            governed_mtp_exclusion = true;
+                            retained = true;
+                        } catch (const std::exception&) {}
+                    }
+                    if (!retained) {
+                        candidate.prefill_numerical_profile.reset();
+                        candidate.prefill_profile_automatic = false;
+                        fp16_declined = first.what();
+                    }
                 }
             }
         } else {
@@ -1372,7 +1391,10 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             if (o.prefill_profile_automatic) {
                 result.sources["--prefill-numerical-profile"] = OptionSource::automatic;
                 arithmetic = std::string("arithmetic fp16 (automatic, same rule as the single-request route") +
-                    (decode_adopted ? "; decode profile dense-a8 automatic)" : ")");
+                    (decode_adopted ? "; decode profile dense-a8 automatic" : "") +
+                    (governed_mtp_exclusion ? "; governed MTP: hc_output_wmma, index_proj_wmma, index_score_wmma and "
+                        "gdn_fp16_chunk stay off)" : ")");
+                if (governed_mtp_exclusion) result.prefill_option_mask = *o.resolved_prefill_option_mask;
             } else if (!fp16_declined.empty()) arithmetic += "; automatic fp16 declined: " + fp16_declined;
             result.arithmetic_fallback = o.prefill_profile_automatic ? std::string() : fp16_declined;
             if (rows == 16384U) result.t16k_policy_source = env_is(requested,"STRIX_QPF2K_T16K","1") ?

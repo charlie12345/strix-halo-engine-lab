@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -13,6 +14,11 @@ namespace strix::deepseek41 {
 namespace {
 
 [[noreturn]] void bad(const std::string& what) { throw std::invalid_argument("deepseek41 vision: " + what); }
+
+std::int64_t checked_size(double value) {
+    if (!std::isfinite(value) || value < 0.0 || value >= 0x1p63) bad("resize size is out of range");
+    return static_cast<std::int64_t>(value);
+}
 
 const char* filter_name(vision::Filter f) {
     switch (f) {
@@ -62,6 +68,8 @@ VisionAdapter::VisionAdapter(VisionConfig config, std::string weights_sha256_hex
         bad("incomplete configuration");
     // The file states no rule for a bounded aspect ratio; refuse one instead of guessing it.
     if (config_.max_wh_ratio != 0) bad("a bounded width/height ratio is not supported");
+    // The resize planner reserves a final newline even for recipes that omit it.
+    if (config_.max_image_tokens < 4) bad("image token budget must fit at least four span rows");
     for (const float m : recipe_.mean)
         if (!std::isfinite(m)) bad("recipe mean");
     for (const float s : recipe_.stddev)
@@ -105,6 +113,13 @@ unsigned VisionAdapter::span_rows(unsigned grid_h, unsigned grid_w) const noexce
 // The limit of the checkpoint counts the whole span: image rows, row ends, start and end.
 unsigned VisionAdapter::max_span_rows() const noexcept { return config_.max_image_tokens; }
 
+vision::MergedGrid VisionAdapter::checked_grid(const vision::PatchGrid& grid) const {
+    const auto merged = vision::checked_merged_grid(grid, config_.downsample_ratio, max_span_rows(), true);
+    const auto newlines = merged.grid_h - (recipe_.newline_after_last_row ? 0U : 1U);
+    if (std::uint64_t{merged.tokens} + newlines + 2U > max_span_rows()) bad("the image span exceeds the row limit");
+    return merged;
+}
+
 std::uint64_t VisionAdapter::projector_weight_elements() const noexcept {
     const std::uint64_t p = config_.projection_size;
     return p * config_.aligner_inputs() + p * p;
@@ -129,8 +144,8 @@ vision::Size VisionAdapter::target(int width, int height) const {
     std::int64_t w = width, h = height;
     if (static_cast<std::uint64_t>(w * h) < config_.min_pixels) {
         const double ratio = std::pow(static_cast<double>(config_.min_pixels) / static_cast<double>(w * h), 0.5);
-        w = static_cast<std::int64_t>(static_cast<double>(w) * ratio);  // int(): truncation
-        h = static_cast<std::int64_t>(static_cast<double>(h) * ratio);
+        w = checked_size(static_cast<double>(w) * ratio);  // int(): truncation
+        h = checked_size(static_cast<double>(h) * ratio);
     }
     const auto span = [&](std::int64_t canvas_h, std::int64_t canvas_w) {
         const std::int64_t mh = (canvas_h / patch + down - 1) / down, mw = (canvas_w / patch + down - 1) / down;
@@ -141,6 +156,7 @@ vision::Size VisionAdapter::target(int width, int height) const {
         const double r = static_cast<double>(h) / static_cast<double>(w);
         const double max_w = std::sqrt(static_cast<double>(limit - 2) / r + 0.25) - 0.5;
         const double max_h = max_w * r;
+        if (!std::isfinite(max_w) || !std::isfinite(max_h)) bad("resize size is out of range");
         if (max_w < 1.0) {  // very tall: one column
             best_h = (limit - 2) / 2 * cell;
             best_w = cell;
@@ -151,11 +167,12 @@ vision::Size VisionAdapter::target(int width, int height) const {
             const double beta = std::min(std::floor(max_w) * static_cast<double>(cell) / static_cast<double>(w),
                                          std::floor(max_h) * static_cast<double>(cell) / static_cast<double>(h));
             const double scaled_h = static_cast<double>(h) * beta, scaled_w = static_cast<double>(w) * beta;
-            best_h = static_cast<std::int64_t>(std::floor(scaled_h / static_cast<double>(patch))) * patch;
-            best_w = static_cast<std::int64_t>(std::floor(scaled_w / static_cast<double>(patch))) * patch;
+            best_h = checked_size(std::floor(scaled_h / static_cast<double>(patch))) * patch;
+            best_w = checked_size(std::floor(scaled_w / static_cast<double>(patch))) * patch;
         }
     }
-    if (best_w <= 0 || best_h <= 0 || span(best_h, best_w) > limit)
+    if (best_w <= 0 || best_h <= 0 || best_w > std::numeric_limits<int>::max() ||
+        best_h > std::numeric_limits<int>::max() || span(best_h, best_w) > limit)
         bad("the image does not fit " + std::to_string(config_.max_image_tokens) + " span rows");
     return {static_cast<int>(best_w), static_cast<int>(best_h)};
 }
@@ -190,8 +207,7 @@ vision::PatchGrid VisionAdapter::patches(const vision::Image& image) const {
         g.y[r] = static_cast<std::uint16_t>(r / g.grid_w);
         g.x[r] = static_cast<std::uint16_t>(r % g.grid_w);
     }
-    const vision::MergedGrid merged = vision::checked_merged_grid(g, config_.downsample_ratio, config_.max_image_tokens, true);
-    if (span_rows(merged.grid_h, merged.grid_w) > max_span_rows()) bad("the image span exceeds the row limit");
+    (void)checked_grid(g);
     return g;
 }
 
@@ -231,7 +247,7 @@ void VisionAdapter::project(vision::EncoderOutput& hidden, const vision::PatchGr
                             vision::ProjectedRows& out) {
     if (!aligner_w1_) bad("project() before bind()");
     const unsigned R = config_.downsample_ratio, W = config_.hidden_size, P = config_.projection_size;
-    const vision::MergedGrid merged_grid = vision::checked_merged_grid(grid, R, config_.max_image_tokens, true);
+    const vision::MergedGrid merged_grid = checked_grid(grid);
     if (hidden.width != W || hidden.rows != grid.rows || hidden.hidden.size() != std::size_t{hidden.rows} * W)
         bad("the encoder output does not match the patch grid");
     const unsigned mh = merged_grid.grid_h, mw = merged_grid.grid_w, tokens = merged_grid.tokens;
@@ -288,8 +304,7 @@ vision::EncoderOptions VisionAdapter::device_options() const {
 }
 
 vision::SpanLayout VisionAdapter::layout(const vision::PatchGrid& grid) const {
-    const unsigned R = config_.downsample_ratio;
-    const vision::MergedGrid merged = vision::checked_merged_grid(grid, R, config_.max_image_tokens, true);
+    const vision::MergedGrid merged = checked_grid(grid);
     using Role = vision::SpanLayout::Role;
     vision::SpanLayout s;
     s.grid_h = merged.grid_h;

@@ -22,6 +22,7 @@ All dumps are little-endian raw arrays; cases.txt lists one image per line:
 """
 import argparse
 import hashlib
+import json
 import math
 import os
 import struct
@@ -275,6 +276,7 @@ def cmd_preprocess(args):
         px.tofile(os.path.join(args.out, name + ".pixels.u8"))
         np.ascontiguousarray(patches, dtype="<f4").tofile(os.path.join(args.out, name + ".patches.f32"))
         c[1:8] = [w, h, tw, th, gh, gw, span_rows_of(gh, gw, args.downsample) - (1 if args.no_last_newline else 0)]
+        write_layout(args.out, name, "", args.downsample, {"patches": patches.shape[1]}, args)
         print("preprocess %-14s %4dx%-4d -> %4dx%-4d grid %3dx%-3d rows %4d" % (name, w, h, tw, th, gh, gw, c[7]))
     write_cases(args.out, cases)
     import PIL
@@ -435,6 +437,10 @@ def cmd_encode(args):
         name, gh, gw = c[0], c[5], c[6]
         if args.only and name not in args.only.split(","):
             continue
+        metadata = read_layout(args.out, name, "")
+        if metadata and (metadata["downsample"] != cfg["down"] or
+                         metadata["recipe"]["no_last_newline"] != args.no_last_newline):
+            raise ValueError("%s: preprocessing layout differs from encoder recipe" % name)
         patches = np.fromfile(os.path.join(args.out, name + ".patches.f32"), dtype="<f4").reshape(gh * gw, -1)
         t0 = time.time()
         hidden, rows = encode_one(g, cfg, patches, gh, gw, args, os.path.join(args.out, name + ".resume") if args.resume else None)
@@ -443,6 +449,9 @@ def cmd_encode(args):
         if not args.no_write:
             np.ascontiguousarray(hidden, dtype="<f4").tofile(os.path.join(args.out, name + ".hidden.f32"))
             np.ascontiguousarray(rows, dtype="<f4").tofile(os.path.join(args.out, name + ".rows.f32"))
+            write_layout(args.out, name, "", cfg["down"],
+                         {"patches": patches.shape[1], "hidden": hidden.shape[1], "rows": rows.shape[1]}, args,
+                         metadata.get("recipe"))
         # Row norms next to the learned rows' norms: a plausibility figure for the recipe options, not a gate.
         norms = np.linalg.norm(rows.astype(np.float64), axis=1)
         image = np.sort(norms[1:-1])
@@ -461,18 +470,41 @@ def tag_suffix(tag):
     return "." + tag if tag else ""
 
 
+def read_layout(folder, name, tag):
+    path = os.path.join(folder, name + tag_suffix(tag) + ".layout.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_layout(folder, name, tag, downsample, widths, args, preprocessing=None):
+    keys = ("mean", "std", "filter", "pad_fill", "pixels_f32", "gate_second", "rope_adjacent",
+            "aligner_act", "unshuffle_col_major", "no_last_newline")
+    recipe = {k: getattr(args, k) for k in keys if hasattr(args, k)}
+    metadata = {"downsample": downsample, "widths": widths, "recipe": recipe}
+    if preprocessing is not None:
+        metadata["preprocessing"] = preprocessing
+    with open(os.path.join(folder, name + tag_suffix(tag) + ".layout.json"), "w") as f:
+        json.dump(metadata, f, sort_keys=True)
+
+
 def read_grids(folder, tag):
-    """name -> (grid_h, grid_w, merged_h, merged_w) of the dumps with this tag ('' = the adapter's own)."""
+    """Keep recorded span rows and per-case recipe/width metadata; legacy untagged dumps used merge=3."""
     grids = {}
     if not tag:
         for c in read_cases(folder):
-            grids[c[0]] = (c[5], c[6], -(-c[5] // 3), -(-c[6] // 3))
+            metadata = read_layout(folder, c[0], tag)
+            down = metadata.get("downsample", 3)
+            if down <= 0:
+                raise ValueError("invalid dump merge factor")
+            grids[c[0]] = ((c[5], c[6], -(-c[5] // down), -(-c[6] // down), c[7]), metadata)
         return grids
     with open(os.path.join(folder, tag + ".cases.txt")) as f:
         for line in f:
             t = line.split()
             if t and not t[0].startswith("#"):
-                grids[t[0]] = tuple(int(x) for x in t[1:5])
+                grids[t[0]] = (tuple(int(x) for x in t[1:6]), read_layout(folder, t[0], tag))
     return grids
 
 
@@ -560,6 +592,8 @@ def cmd_upstream(args):
         rows[kinds == processor.IMAGE_NEW_LINE] = tensors["image_newline"].float()
         np.ascontiguousarray(hidden.float().numpy(), dtype="<f4").tofile(os.path.join(args.out, "%s.%s.hidden.f32" % (name, tag)))
         np.ascontiguousarray(rows.numpy(), dtype="<f4").tofile(os.path.join(args.out, "%s.%s.rows.f32" % (name, tag)))
+        write_layout(args.out, name, tag, r,
+                     {"patches": 3 * p * p, "hidden": hidden.shape[1], "rows": rows.shape[1]}, args)
         done[name] = "%s %d %d %d %d %d" % (name, gh, gw, mh, mw, kinds.numel())
         with open(cases_file, "w", newline="\n") as f:
             f.write("\n".join(done.values()) + "\n")
@@ -579,37 +613,67 @@ def cmd_compare(args):
     """Compares two dump sets (tags; '' = the adapter's own dumps). b is the reference of the relative figures."""
     ga, gb = read_grids(args.out, args.a), read_grids(args.out, args.b)
     print("# compare a='%s' against b='%s': cosine, relative L2, per-row cosine mean / min (worst row)" % (args.a, args.b))
-    for name in ga:
-        if name not in gb:
+    compared = skipped = failed = 0
+    strict = getattr(args, "strict", False)
+    threshold = getattr(args, "max_rel_l2", 0.0)
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("max-rel-l2 must be finite and nonnegative")
+    for name in sorted(ga.keys() | gb.keys()):
+        if name not in ga or name not in gb:
+            skipped += 3
             continue
-        if ga[name] != gb[name]:
-            print("%-13s GRID DIFFERS: a %dx%d (merged %dx%d), b %dx%d (merged %dx%d)" % ((name,) + ga[name] + gb[name]))
+        grid_a, meta_a = ga[name]
+        grid_b, meta_b = gb[name]
+        if grid_a != grid_b:
+            print("%-13s GRID/LAYOUT DIFFERS: %s vs %s" % (name, grid_a, grid_b))
+            skipped += 3
             continue
-        gh, gw, mh, mw = ga[name]
+        gh, gw, mh, mw, span = grid_a
+        last_newline = span == mh * (mw + 1) + 2
+        if min(gh, gw, mh, mw) <= 0 or span not in (mh * (mw + 1) + 1, mh * (mw + 1) + 2):
+            raise ValueError("%s: invalid recorded span layout" % name)
+        for metadata in (meta_a, meta_b):
+            no_last = metadata.get("recipe", {}).get("no_last_newline")
+            if no_last is not None and no_last == last_newline:
+                raise ValueError("%s: span disagrees with recorded recipe" % name)
         for kind in ("patches", "hidden", "rows"):
             fa = os.path.join(args.out, name + tag_suffix(args.a) + "." + kind + ".f32")
             fb = os.path.join(args.out, name + tag_suffix(args.b) + "." + kind + ".f32")
             if not (os.path.exists(fa) and os.path.exists(fb)):
+                skipped += 1
                 continue
             a, b = np.fromfile(fa, dtype="<f4"), np.fromfile(fb, dtype="<f4")
             if a.size != b.size:
                 print("%-13s %-7s SIZE DIFFERS %d vs %d" % (name, kind, a.size, b.size))
+                skipped += 1
                 continue
-            n = gh * gw if kind != "rows" else mh * (mw + 1) + 2
+            n = gh * gw if kind != "rows" else span
+            for values, metadata in ((a, meta_a), (b, meta_b)):
+                width = metadata.get("widths", {}).get(kind)
+                if values.size == 0 or values.size % n or (width is not None and values.size != n * width):
+                    raise ValueError("%s %s: invalid feature width" % (name, kind))
+                if strict and width is None:
+                    raise ValueError("%s %s: strict comparison requires recorded feature widths" % (name, kind))
             a, b = a.reshape(n, -1), b.reshape(n, -1)
             if kind == "rows":
                 image = np.ones(n, dtype=bool)
                 image[0] = image[-1] = False
-                image[np.arange(mh) * (mw + 1) + mw + 1] = False
+                image[np.arange(mh if last_newline else mh - 1) * (mw + 1) + mw + 1] = False
                 special = float(np.abs(a[~image] - b[~image]).max())
                 extra = "  special rows max abs diff %.3g" % special
                 if special != 0.0:
-                    extra += "  (DIFFERENT WEIGHTS: the two dump sets do not come from the same checkpoint)"
+                    extra += "  (special rows differ; check weights and layout)"
                 a, b = a[image], b[image]
             else:
                 extra = "  max abs diff %.3g" % float(np.abs(a - b).max())
             cos, rel, mean, low, worst = row_stats(a, b)
+            compared += 1
+            if not all(math.isfinite(v) for v in (cos, rel, mean, low)) or rel > threshold or (kind == "rows" and special != 0):
+                failed += 1
             print("%-13s %-7s cos %.6f relL2 %.5f rows mean %.6f min %.6f (row %d)%s" % (name, kind, cos, rel, mean, low, worst, extra))
+    print("compared %d, skipped %d, outside threshold %d" % (compared, skipped, failed))
+    if strict and (compared == 0 or skipped or failed):
+        raise ValueError("strict comparison failed: missing coverage or numerical mismatch")
 
 
 def main():
@@ -646,6 +710,8 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--a", default="", help="tag of the first dump set ('' = preprocess/encode)")
     p.add_argument("--b", default="upstream", help="tag of the reference dump set")
+    p.add_argument("--strict", action="store_true", help="require nonempty complete coverage and numerical agreement")
+    p.add_argument("--max-rel-l2", type=float, default=0.0, help="strict relative L2 limit; special rows must match exactly")
     p.set_defaults(fn=cmd_compare)
     args = ap.parse_args()
     args.fn(args)

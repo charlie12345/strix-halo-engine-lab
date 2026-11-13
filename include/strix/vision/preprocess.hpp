@@ -65,6 +65,7 @@ struct ResizePolicy {
 [[nodiscard]] Image pad_center(const Image& image, int width, int height, std::array<std::uint8_t, 3> fill);
 // Largest size of the image's aspect ratio inside the canvas (PIL `ImageOps.contain`): one side is the canvas side,
 // the other is rounded half to even and is 0 when an extreme aspect ratio leaves less than half a pixel.
+// Requires FE_TONEAREST (the default floating-point rounding mode) for half-even sizing.
 [[nodiscard]] Size contain_size(int width, int height, int canvas_width, int canvas_height);
 // PIL `ImageOps.pad(image, (canvas_width, canvas_height), method, color=fill)`: contain-resize, then centre on the
 // canvas; the margin offset is rounded half to even (pad_center rounds it down). Bit-equal to PIL with antialias.

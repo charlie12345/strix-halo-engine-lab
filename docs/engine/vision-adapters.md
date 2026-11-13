@@ -108,6 +108,14 @@ strix-deepseek41-vision-gate --model VISION.gguf --ref REF --backend host --only
 strix-deepseek41-vision-gate-hip --model VISION.gguf --ref REF --backend hip
 ```
 
+Dump comparison retains the recorded span count, including recipes without a final newline. New dumps
+write per-case `.layout.json` files with merge factor, recipe and feature widths. Legacy untagged dumps
+without that metadata retain the default merge factor of three; regenerate non-default dumps before comparison.
+`compare` reports compared/skipped tensor counts. `--strict --max-rel-l2 LIMIT` requires nonempty,
+complete coverage, recorded feature widths, finite numerical results within that limit and exact special rows
+(the default limit is zero). This checks dump agreement; source and weight provenance still need independent
+verification, particularly when assembling a dump set with `--only`.
+
 `encode` is an independent FP32 implementation in numpy, not the upstream code: it proves the wiring of the
 shared tower and of the adapter, and it is the FP32 reference the device arithmetic (`vision-f16-v1`, class
 FAST) is judged against. Thresholds: preprocessing max difference 1e-6 on the patch tensor; host backend

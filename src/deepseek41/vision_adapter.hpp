@@ -60,6 +60,7 @@ public:
     [[nodiscard]] const VisionRecipe& recipe() const noexcept { return recipe_; }
 
 private:
+    [[nodiscard]] vision::MergedGrid checked_grid(const vision::PatchGrid& grid) const;
     VisionConfig config_;
     std::string sha_;
     VisionRecipe recipe_;

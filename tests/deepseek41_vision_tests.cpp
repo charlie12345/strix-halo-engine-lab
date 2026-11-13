@@ -567,6 +567,50 @@ void test_patches_and_projector() {
 
 // Malformed inputs an external audit found accepted (each of these failed before its fix).
 void test_refusals() {
+    // Minimum complete span must be rejected before resize floating-point arithmetic.
+    for (unsigned budget = 1; budget < 4; ++budget) {
+        auto small = real_config();
+        small.max_image_tokens = budget;
+        small.min_pixels = 1764;
+        CHECK(throws([&] { ds::VisionAdapter bad(small, kSha); }, "four span rows"));
+    }
+    auto minimum = real_config();
+    minimum.max_image_tokens = 4;
+    minimum.min_pixels = 1764;
+    CHECK(ds::VisionAdapter(minimum, kSha).target(42, 42) == (vision::Size{42, 42}));
+
+    // Image rows alone fit 1024; the complete span does not, including partial merge cells.
+    const File grid_file = small_file();
+    auto grid_config = ds::validate_vision(grid_file.info()).config;
+    grid_config.max_image_tokens = 1024;
+    ds::VisionAdapter grid_adapter(grid_config, kSha);
+    auto grid_weights = grid_file.weights();
+    vision::EncoderWeights encoder_weights;
+    grid_adapter.bind(grid_weights, encoder_weights);
+    vision::ReferenceEncoder grid_dense(grid_adapter.config(), encoder_weights);
+    for (unsigned side : {95U, 96U}) {
+        vision::PatchGrid grid;
+        grid.grid_h = grid.grid_w = side;
+        grid.rows = side * side;
+        vision::EncoderOutput hidden;
+        hidden.width = grid_config.hidden_size;
+        hidden.rows = grid.rows;
+        hidden.hidden.assign(std::size_t{hidden.rows} * hidden.width, 0.0F);
+        vision::ProjectedRows out;
+        for (bool coordinates : {false, true}) {
+            if (coordinates) {
+                grid.y.resize(grid.rows);
+                grid.x.resize(grid.rows);
+                for (unsigned row = 0; row < grid.rows; ++row) {
+                    grid.y[row] = static_cast<std::uint16_t>(row / side);
+                    grid.x[row] = static_cast<std::uint16_t>(row % side);
+                }
+            }
+            CHECK(throws([&] { (void)grid_adapter.layout(grid); }, "span exceeds"));
+            CHECK(throws([&] { grid_adapter.project(hidden, grid, grid_dense, out); }, "span exceeds"));
+            CHECK(out.bf16.empty());
+        }
+    }
     // Recipe identity: neighbouring representable floats are different recipes, non-finite values are refused.
     ds::VisionRecipe base, near_mean, near_std;
     near_mean.mean[0] = std::nextafter(base.mean[0], 1.0F);

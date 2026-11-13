@@ -1,6 +1,7 @@
 # Weight load queue
 
-One queue loads model weights for every engine: file ranges are read by a bounded set of workers into
+One shared queue loads model weights (MiniMax and DeepSeek V4.1 use it today; GLM, Qwen and Gemma still
+have their own loaders and move to it next): file ranges are read by a bounded set of workers into
 per-ticket staging and copied to device memory on a copy stream of their own, so reading the next tensor
 overlaps the upload (and any CPU conversion) of the previous ones. Engines describe what to load; they do
 not own read loops, bounce buffers or staging buffers.
@@ -38,10 +39,20 @@ first failure the remaining tickets are cancelled instead of read. If a copy was
 could not be recorded, the uploader waits for the stream before it gives the staging back. Destroying the
 queue joins the workers and waits for the copy stream, so no copy outlives its staging.
 
+- Bookkeeping memory is taken at `submit` (and, in the HIP uploader, before the first copy is enqueued):
+  an allocation failure fails that call and can never return staging that a copy still reads.
+- A failed upload wait while a worker waits for staging is a ticket failure like any other.
+- `cancel()` is the non-throwing exit for destructors and failure paths: unread tickets fail, the workers
+  go idle and submitted copies complete; it does not wait for consumers of held tickets. `publish()` is
+  the fallible step and belongs on the success path.
+- A worker thread that cannot start makes the constructor throw after joining the started ones.
+
 ## Adapters
 
 - File range to device pointer (`HipRangeWeightLoader`): `load(offset, bytes, device)` queues, `ready()`
-  is the one wait. Ranges are cut into pieces and small consecutive ranges share one ticket. DeepSeek
+  is the one wait. Ranges are cut into pieces and small consecutive ranges share one ticket
+  (`WeightRangeTickets`, host only): boundaries follow the aligned staging a ticket takes, so any budget
+  of at least 1 MiB loads any range; a smaller budget is refused before loading. DeepSeek
   V4.1 (prefill, batch forward and device forward) loads through it.
 - MiniMax builds one manifest per EXL3 slice (reads, tile gather, three parts). Raw device slices are
   uploaded by the queue; prepared linears use held tickets, so the next slices are read while the

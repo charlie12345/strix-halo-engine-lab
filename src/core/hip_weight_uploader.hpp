@@ -48,12 +48,17 @@ public:
     Token submit(const std::uint8_t* staging, const Copy* copies, std::size_t count) override {
         bind();
         std::lock_guard<std::mutex> lock(m_);  // the copies and their event are adjacent on the stream
+        // All bookkeeping memory is taken before the first copy is enqueued: once a copy references the staging,
+        // nothing here can fail without the stream being quiet first (and retire() never allocates).
+        spare_.reserve(spare_.size() + live_.size() + 1);
+        const auto slot = live_.emplace(next_, nullptr).first;
         hipEvent_t event = nullptr;
         if (!spare_.empty()) {
             event = spare_.back();
             spare_.pop_back();
-        } else {
-            ok(hipEventCreateWithFlags(&event, hipEventDisableTiming), "ready event");
+        } else if (const hipError_t made = hipEventCreateWithFlags(&event, hipEventDisableTiming); made != hipSuccess) {
+            live_.erase(slot);
+            ok(made, "ready event");
         }
         hipError_t e = hipSuccess;
         for (std::size_t i = 0; i < count && e == hipSuccess; ++i)
@@ -64,9 +69,10 @@ public:
             // A copy may already reference the staging: the stream is quiet before the caller gets it back.
             (void)hipStreamSynchronize(stream_);
             spare_.push_back(event);
+            live_.erase(slot);
             ok(e, "weight upload");
         }
-        live_.emplace(next_, event);
+        slot->second = event;
         return next_++;
     }
     bool done(Token token) override {

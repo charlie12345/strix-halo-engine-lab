@@ -14,30 +14,17 @@ class HipRangeWeightLoader {
 public:
     static constexpr std::uint64_t default_staging_bytes = std::uint64_t{512} << 20;
     explicit HipRangeWeightLoader(const std::string& path, std::uint64_t staging_bytes = default_staging_bytes)
-        : source_(path), queue_(uploader_, weight_load_options_from_environment(staging_bytes)) {
-        // One ticket's staging is its piece plus alignment slack and the pool's size class (25 %): eight tickets fit.
-        const std::uint64_t budget = queue_.options().staging_budget_bytes;
-        piece_ = std::clamp<std::uint64_t>(budget / 12, std::uint64_t{1} << 20, std::uint64_t{64} << 20) & ~(WeightLoadManifest::page - 1);
-    }
+        : source_(path), queue_(uploader_, weight_load_options_from_environment(staging_bytes)), tickets_(queue_) {}
     HipRangeWeightLoader(const HipRangeWeightLoader&) = delete;
     HipRangeWeightLoader& operator=(const HipRangeWeightLoader&) = delete;
     [[nodiscard]] int fd() const { return source_.fd(); }
     [[nodiscard]] bool direct() const { return source_.direct(); }
 
     // Queues the copy; `device` must stay allocated until ready().
-    void load(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* device) {
-        for (std::uint64_t done = 0; done < bytes;) {
-            const std::uint64_t n = std::min(piece_, bytes - done);
-            if (pending_ != 0 && pending_ + n > piece_) flush();
-            current_.upload(current_.read(source_, offset + done, n), n, device + done);
-            pending_ += n;
-            done += n;
-            if (pending_ >= piece_) flush();
-        }
-    }
+    void load(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* device) { tickets_.load(source_, offset, bytes, device); }
     // Everything queued so far is in device memory; rethrows the first read or upload failure.
     void ready() {
-        flush();
+        tickets_.flush();
         queue_.publish();
     }
     [[nodiscard]] WeightLoadStats stats() const { return queue_.stats(); }
@@ -45,17 +32,10 @@ public:
     [[nodiscard]] std::uint64_t peak_pinned_bytes() const { return uploader_.peak_pinned_bytes(); }
 
 private:
-    void flush() {
-        if (pending_ == 0) return;
-        (void)queue_.submit(std::move(current_));
-        current_ = WeightLoadManifest{};
-        pending_ = 0;
-    }
     FileWeightSource source_;
     HipWeightUploader uploader_;
     WeightLoadQueue queue_;  // destroyed first: joins its workers and drains the copies
-    WeightLoadManifest current_;
-    std::uint64_t pending_ = 0, piece_ = 0;
+    WeightRangeTickets tickets_;  // piece and ticket boundaries from the aligned staging size
 };
 
 // One line per load for receipts: wall time, read rate, summed worker times, peak pinned staging.

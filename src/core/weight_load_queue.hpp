@@ -158,8 +158,18 @@ public:
 
     WeightLoadQueue(WeightUploader& uploader, WeightLoadOptions options) : up_(uploader), opt_(options) {
         if (opt_.workers == 0) opt_.workers = 1;
-        workers_.reserve(opt_.workers);
-        for (unsigned i = 0; i < opt_.workers; ++i) workers_.emplace_back([this] { work(); });
+        try {
+            workers_.reserve(opt_.workers);
+            for (unsigned i = 0; i < opt_.workers; ++i) workers_.emplace_back([this] { work(); });
+        } catch (...) {  // a thread did not start: the destructor will not run, so the started ones are joined here
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                stop_ = true;
+            }
+            cv_.notify_all();
+            for (auto& t : workers_) t.join();
+            throw;
+        }
     }
     ~WeightLoadQueue() {
         {
@@ -188,19 +198,49 @@ public:
             throw std::invalid_argument("weight load: one ticket needs more staging than the budget; split it");
         if (manifest.held_ && !manifest.copies_.empty()) throw std::invalid_argument("weight load: a held ticket has no uploads");
         std::lock_guard<std::mutex> lock(m_);
-        if (stats_.tickets == 0) t0_ = Clock::now();
-        ++stats_.tickets;
+        // Every ticket owns at most one staging buffer, which is in exactly one of free_ / flying_ / its record. The
+        // room for it is taken here, where a failed allocation only fails this submit: the workers then move buffers
+        // between the lists without allocating, so no failure can return staging that a copy still reads.
+        room(free_, recs_.size() + 1);
+        room(flying_, recs_.size() + 1);
         recs_.emplace_back();
         recs_.back().manifest = std::move(manifest);
+        if (stats_.tickets == 0) t0_ = Clock::now();
+        ++stats_.tickets;
         cv_.notify_all();
         return recs_.size() - 1;
+    }
+    // Abandons the load without throwing (destructors, failure paths): tickets not yet read fail, the workers go
+    // idle and every submitted copy completed before this returns, so the destinations may be freed afterwards.
+    // The queue stays cancelled: wait / take / publish of an unfinished ticket throw, held staging is still released
+    // by release() or the destructor.
+    void cancel() noexcept {
+        std::unique_lock<std::mutex> lock(m_);
+        cancel_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return next_ == recs_.size() && active_ == 0; });
+        lock.unlock();
+        try {
+            up_.drain();
+        } catch (...) {  // the uploader quiesces its stream before it reports a failure
+        }
+        lock.lock();
+        reap(true);
+    }
+    // The staging the pool keeps for a ticket that needs `need` bytes (its size class).
+    [[nodiscard]] static std::uint64_t staging_class_bytes(std::uint64_t need) { return class_bytes(need); }
+    // The largest ticket staging a resident budget admits; 0 when the budget is below the smallest size class.
+    [[nodiscard]] static std::uint64_t max_ticket_staging_bytes(std::uint64_t budget) {
+        std::uint64_t step = std::uint64_t{1} << 20;
+        while (step * 8 <= budget) step *= 2;
+        return budget / step * step;
     }
     // Tensor-ready: the ticket's bytes are in device memory (a held ticket: read and converted).
     void wait(Ticket t) {
         std::unique_lock<std::mutex> lock(m_);
         Rec& r = rec(t);
         cv_.wait(lock, [&] { return r.state >= State::flying; });
-        if (r.state == State::failed) std::rethrow_exception(r.error);
+        if (r.state == State::failed) failed(r);
         if (r.state != State::flying) return;
         const auto token = r.token;
         lock.unlock();
@@ -219,7 +259,7 @@ public:
         std::unique_lock<std::mutex> lock(m_);
         Rec& r = rec(t);
         cv_.wait(lock, [&] { return r.state >= State::flying; });
-        if (r.state == State::failed) std::rethrow_exception(r.error);
+        if (r.state == State::failed) failed(r);
         if (r.state != State::held) throw std::logic_error("weight load: take() of a ticket that is not held");
         return r.buffer.p;
     }
@@ -242,13 +282,14 @@ public:
         reap(true);
         if (stats_.tickets != 0) stats_.wall_seconds = std::chrono::duration<double>(Clock::now() - t0_).count();
         if (error_) std::rethrow_exception(error_);
+        if (cancel_) throw std::runtime_error("weight load: the load was cancelled");
     }
     // With options.hash: the hash of the ticket's uploaded (or output) ranges, in manifest order.
     [[nodiscard]] std::uint64_t hash(Ticket t) {
         std::unique_lock<std::mutex> lock(m_);
         Rec& r = rec(t);
         cv_.wait(lock, [&] { return r.state >= State::flying; });
-        if (r.state == State::failed) std::rethrow_exception(r.error);
+        if (r.state == State::failed) failed(r);
         return r.hash;
     }
     [[nodiscard]] WeightLoadStats stats() const {
@@ -282,6 +323,13 @@ private:
         while (step * 8 <= need) step *= 2;
         return (need + step - 1) / step * step;
     }
+    template<class V> static void room(V& v, std::size_t n) {
+        if (v.capacity() < n) v.reserve(std::max(n, v.capacity() * 2));
+    }
+    [[noreturn]] static void failed(const Rec& r) {
+        if (r.error) std::rethrow_exception(r.error);
+        throw std::runtime_error("weight load: the load was cancelled");
+    }
     Rec& rec(Ticket t) {
         if (t >= recs_.size()) throw std::out_of_range("weight load: unknown ticket");
         return recs_[t];
@@ -306,6 +354,7 @@ private:
         const auto t0 = Clock::now();
         bool waited = false;
         for (;;) {
+            if (cancel_) throw std::runtime_error("weight load: the load was cancelled");
             std::size_t best = free_.size();
             for (std::size_t i = 0; i < free_.size(); ++i)
                 if (free_[i].cap >= cap && free_[i].cap <= 2 * cap && (best == free_.size() || free_[i].cap < free_[best].cap)) best = i;
@@ -347,7 +396,12 @@ private:
             if (!flying_.empty()) {  // the oldest copy in flight frees staging next
                 const auto token = flying_.front().token;
                 lock.unlock();
-                up_.wait(token);
+                try {
+                    up_.wait(token);
+                } catch (...) {  // the caller handles the failure with the lock held, like every other exit
+                    lock.lock();
+                    throw;
+                }
                 lock.lock();
                 reap(false);
                 continue;
@@ -402,6 +456,8 @@ private:
         WeightUploader::Token token = 0;
         const bool fly = !m.held_ && !m.copies_.empty();
         if (fly) token = up_.submit(b.p, m.copies_.data(), m.copies_.size());
+        // From here the copies may read the staging: nothing below can fail (submit() took the room in flying_ and
+        // free_), so the buffer reaches the pool only through its ready event.
         std::lock_guard<std::mutex> lock(m_);
         stats_.read_seconds += read_s;
         stats_.convert_seconds += convert_s;
@@ -433,30 +489,33 @@ private:
             ++active_;
             Buffer b;
             std::exception_ptr error = error_;  // after a failure the rest of the load is cancelled, not read
-            if (!error) {
+            bool failed_ticket = cancel_ || error != nullptr;
+            if (!failed_ticket) {
                 admitting_ = true;
                 try {
                     b = admit(lock, r.manifest.staging_bytes());
                 } catch (...) {
                     error = std::current_exception();
+                    failed_ticket = true;
                 }
                 admitting_ = false;
                 cv_.notify_all();
             }
-            if (!error) {
+            if (!failed_ticket) {
                 lock.unlock();
                 try {
                     run(t, r, b);
-                } catch (...) {
+                } catch (...) {  // before the copies were submitted (see run): the staging is not referenced
                     error = std::current_exception();
+                    failed_ticket = true;
                 }
                 lock.lock();
             }
-            if (error) {
-                if (b.p != nullptr) free_.push_back(b);
+            if (failed_ticket) {
+                if (b.p != nullptr) free_.push_back(b);  // room taken by submit(): does not allocate
                 r.error = error;
                 r.state = State::failed;
-                if (!error_) error_ = error;
+                if (!error_ && error) error_ = error;
             }
             r.manifest = WeightLoadManifest{};  // the record keeps only its state
             --active_;
@@ -470,7 +529,7 @@ private:
     std::condition_variable cv_;
     std::deque<Rec> recs_;
     std::size_t next_ = 0, active_ = 0;
-    bool admitting_ = false, stop_ = false;
+    bool admitting_ = false, stop_ = false, cancel_ = false;
     std::vector<Buffer> free_;
     std::vector<Flying> flying_;
     std::uint64_t resident_ = 0;
@@ -478,6 +537,49 @@ private:
     WeightLoadStats stats_;
     Clock::time_point t0_{};
     std::vector<std::thread> workers_;
+};
+
+// File byte ranges -> tickets: a long range is cut into pieces and small consecutive ranges share one ticket.
+// Pieces and ticket boundaries follow the staging a ticket really takes (alignment slack and at least one page per
+// read included), so every ticket fits the largest size class of the budget, whatever the budget and the offsets.
+class WeightRangeTickets {
+public:
+    explicit WeightRangeTickets(WeightLoadQueue& queue) : queue_(queue) {
+        const std::uint64_t budget = queue.options().staging_budget_bytes;
+        const std::uint64_t most = WeightLoadQueue::max_ticket_staging_bytes(budget);
+        if (most <= slack) throw std::invalid_argument("weight load: the staging budget is below 1 MiB");
+        // One ticket's staging is its piece plus alignment slack and the pool's size class (25 %): eight tickets fit.
+        const std::uint64_t wanted = std::clamp<std::uint64_t>(budget / 12, std::uint64_t{1} << 20, std::uint64_t{64} << 20);
+        piece_ = std::min(wanted & ~(WeightLoadManifest::page - 1), most - slack);
+        limit_ = std::min(most, 2 * piece_);
+    }
+    // Queues the copy of [offset, offset + bytes) of `source` to `device`; nothing waits.
+    void load(const WeightSource& source, std::uint64_t offset, std::uint64_t bytes, void* device) {
+        for (std::uint64_t done = 0; done < bytes;) {
+            const std::uint64_t n = std::min(piece_, bytes - done);
+            if (pending_ != 0 && (pending_ + n > piece_ || current_.staging_bytes() + n + slack > limit_)) flush();
+            current_.upload(current_.read(source, offset + done, n), n, static_cast<std::uint8_t*>(device) + done);
+            pending_ += n;
+            done += n;
+            if (pending_ >= piece_) flush();
+        }
+    }
+    // Submits the ranges gathered so far as one ticket.
+    void flush() {
+        if (pending_ == 0) return;
+        WeightLoadManifest m = std::move(current_);
+        current_ = WeightLoadManifest{};
+        pending_ = 0;
+        (void)queue_.submit(std::move(m));
+    }
+    [[nodiscard]] std::uint64_t piece_bytes() const { return piece_; }
+
+private:
+    // One read takes at most its bytes + the lead and the tail of an aligned window + the round-up to a page.
+    static constexpr std::uint64_t slack = 2 * WeightLoadManifest::page;
+    WeightLoadQueue& queue_;
+    WeightLoadManifest current_;
+    std::uint64_t pending_ = 0, piece_ = 0, limit_ = 0;
 };
 
 }  // namespace strix::core

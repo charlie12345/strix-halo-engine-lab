@@ -281,6 +281,14 @@ public:
             std::fprintf(stderr, "strix-minimax %s\n", strix::core::weight_load_line(st, load_->up.peak_pinned_bytes(), load_->queue.options()).c_str());
         load_.reset();
     }
+    // Failure-path cleanup (destructors): the queue is cancelled and its copies drained, nothing is prepared or
+    // published and nothing throws. Linears still pending stay unfilled: their owner is being unwound.
+    void drop_staging() noexcept {
+        if (!load_) return;
+        load_->queue.cancel();
+        pending_.clear();
+        load_.reset();
+    }
     // out[t][N] = in[t][I] @ W; gemv (the decode entry point) when `gemv`, else gemm.
     void mm(const Lin& l, const float* in, float* out, std::uint64_t t, bool gemv) {
         if (t == 0) return;
@@ -3148,7 +3156,7 @@ struct Engine::Impl {
         }
         struct Release {  // the pinned staging buffer and the whole-trellis host copy go on every exit
             Lib& l;
-            ~Release() { l.release_staging(); }
+            ~Release() { l.drop_staging(); }  // a failed attach: no publication here, a destructor must not throw
         } release{lib};
         const std::uint64_t v0 = opt.rank == 0 ? 0 : kVocabPad;
         std::uint64_t bits = 0;
@@ -3174,6 +3182,7 @@ struct Engine::Impl {
             dheads.push_back(std::move(dh));
             bits = l.bits;
         }
+        lib.release_staging();  // success path: the fallible publication happens here, not in ~Release
         dhead_sel = static_cast<int>(dheads.size()) - 1;
         std::printf("rank %u: DSpark draft-only head #%d %s (K%llu, %s, vocabulary [%llu, %llu)), %.1f ms\n", opt.rank, dhead_sel, dir.c_str(),
                     static_cast<unsigned long long>(bits), spec.c_str(), static_cast<unsigned long long>(v0),

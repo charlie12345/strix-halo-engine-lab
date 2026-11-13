@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <new>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -15,8 +17,37 @@
 #include <malloc.h>
 #endif
 
+// Fault injection: while armed, allocation number `at` (and, sticky, every later one) fails, on any thread.
+static std::atomic<long long> g_alloc_at{-1}, g_alloc_seen{0};
+static std::atomic<bool> g_alloc_sticky{false}, g_alloc_hit{false};
+void* operator new(std::size_t bytes) {
+    const long long at = g_alloc_at.load();
+    if (at >= 0) {
+        const long long i = g_alloc_seen.fetch_add(1);
+        if (i == at || (i > at && g_alloc_sticky.load())) {
+            g_alloc_hit = true;
+            throw std::bad_alloc();
+        }
+    }
+    if (void* p = std::malloc(bytes != 0 ? bytes : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+
 namespace {
 using namespace strix::core;
+
+struct FailAllocation {
+    FailAllocation(long long at, bool sticky) {
+        g_alloc_seen = 0;
+        g_alloc_hit = false;
+        g_alloc_sticky = sticky;
+        g_alloc_at = at;
+    }
+    ~FailAllocation() { g_alloc_at = -1; }
+    [[nodiscard]] bool hit() const { return g_alloc_hit.load(); }
+};
 
 void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
@@ -79,6 +110,11 @@ public:
     }
     void release(std::uint8_t* staging, std::uint64_t bytes) noexcept override {
         live_bytes -= bytes;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            for (const auto& [token, other] : pending_)
+                if (other.staging == staging) recycled = true;  // freed while a copy still reads it
+        }
 #ifdef _MSC_VER
         _aligned_free(staging);
 #else
@@ -87,24 +123,30 @@ public:
     }
     Token submit(const std::uint8_t* staging, const Copy* copies, std::size_t count) override {
         std::lock_guard<std::mutex> lock(m_);
+        for (const auto& [token, other] : pending_)
+            if (other.staging == staging) recycled = true;  // staging reused while a copy still reads it
         Pending p;
         p.staging = staging;
         p.copies.assign(copies, copies + count);
         p.due = std::chrono::steady_clock::now() + delay_;
         pending_.emplace(next_, std::move(p));
+        ++open;
         return next_++;
     }
     bool done(Token token) override {
         std::lock_guard<std::mutex> lock(m_);
+        if (fail_wait && pending_.count(token) != 0) return false;
         return finish(token, false);
     }
     void wait(Token token) override {
         std::lock_guard<std::mutex> lock(m_);
+        if (fail_wait && pending_.count(token) != 0) throw std::runtime_error("injected upload wait failure");
         (void)finish(token, true);
     }
     void retire(Token token) noexcept override {
         std::lock_guard<std::mutex> lock(m_);
         if (pending_.count(token) != 0) late_retire = true;  // retired before its copy completed: a queue bug
+        --open;
     }
     void drain() override {
         std::lock_guard<std::mutex> lock(m_);
@@ -113,7 +155,10 @@ public:
     }
     std::atomic<std::uint64_t> live_bytes{0}, peak_bytes{0};
     std::uint64_t drains = 0;
-    bool late_retire = false;
+    long long open = 0;  // tokens submitted and not retired: 0 once the queue is gone
+    bool late_retire = false, recycled = false;
+    std::atomic<bool> fail_wait{false};  // a copy never reports done and its wait throws (drain still completes it)
+    [[nodiscard]] bool clean() const { return open == 0 && !late_retire && !recycled && live_bytes == 0; }
 
 private:
     struct Pending {
@@ -241,6 +286,166 @@ void failure_cancels() {
     WeightLoadManifest bad;
     require(throws([&] { bad.upload(0, 1, nullptr); }), "a null destination is rejected");
 }
+
+std::vector<WeightLoadQueue::Ticket> submit_rows(WeightLoadQueue& q, const MemorySource& s, std::uint8_t* dev, unsigned count,
+                                                 std::uint64_t stride, std::uint64_t bytes) {
+    std::vector<WeightLoadQueue::Ticket> t;
+    for (unsigned i = 0; i < count; ++i) {
+        WeightLoadManifest m;
+        m.upload(m.read(s, i * stride, bytes), bytes, dev + i * stride);
+        t.push_back(q.submit(std::move(m)));
+    }
+    return t;
+}
+
+// Audit P1: an allocation failure anywhere in a load with delayed copies (queue bookkeeping included) may fail the
+// load, never recycle or leak staging that a copy still reads.
+void allocation_failures() {
+    const MemorySource s(128 * 1024, 1, 7);
+    constexpr unsigned rows = 8;
+    constexpr std::uint64_t row = 10000;
+    for (int sticky = 0; sticky < 2; ++sticky) {
+        for (long long at = 0;; ++at) {
+            std::vector<std::uint8_t> dev(s.size());
+            HostUploader up(std::chrono::milliseconds(1));
+            bool hit = false, published = false;
+            {
+                FailAllocation arm(at, sticky != 0);
+                try {
+                    WeightLoadQueue q(up, {3, std::uint64_t{2} << 20, nullptr, false});
+                    (void)submit_rows(q, s, dev.data(), rows, row, row);
+                    q.publish();
+                    published = true;
+                } catch (const std::exception&) {
+                }
+                hit = arm.hit();
+            }
+            require(up.clean(), "an allocation failure never recycles, leaks or frees staging in flight");
+            require(hit || published, "a load without an injected failure publishes");
+            if (published) require(std::memcmp(dev.data(), s.bytes(), rows * row) == 0, "published bytes are the file's");
+            if (!hit) break;
+        }
+    }
+}
+
+// Audit P2: a worker thread that does not start is an exception, not std::terminate.
+void worker_start_failure() {
+    HostUploader up;
+    for (long long at = 0; at <= 4; ++at) {  // the worker list, then one allocation per worker thread
+        FailAllocation arm(at, false);
+        const bool threw = throws([&] { WeightLoadQueue q(up, {4, std::uint64_t{2} << 20, nullptr, false}); });
+        require(threw && arm.hit(), "a worker that does not start is an exception, with the started ones joined");
+    }
+}
+
+// Audit P1: a throwing upload wait while a worker waits for staging (one buffer, several workers) is a propagated
+// failure: the worker handles it with the queue lock held.
+void failed_upload_wait() {
+    const MemorySource s(std::size_t{1} << 20, 1, 9);
+    std::vector<std::uint8_t> dev(s.size());
+    HostUploader up(std::chrono::milliseconds(1));
+    up.fail_wait = true;
+    {
+        WeightLoadQueue q(up, {4, std::uint64_t{1} << 20, nullptr, false});
+        const auto t = submit_rows(q, s, dev.data(), 16, 4096, 4096);
+        require(throws([&] { q.publish(); }), "publication rethrows the failed upload wait");
+        unsigned failed = 0;
+        for (const auto x : t) failed += throws([&] { q.wait(x); }) ? 1U : 0U;
+        require(failed == 15, "the ticket that waited and every later one fail; the one in flight completed");
+        require(std::memcmp(dev.data(), s.bytes(), 4096) == 0, "the ticket in flight was drained");
+    }
+    require(up.clean(), "staging and tokens are returned after a failed wait");
+}
+
+// Audit P1: cleanup after a load error does not throw (it runs in destructors) and does not wait for consumers.
+void cancel_in_cleanup() {
+    MemorySource s(std::size_t{1} << 20, 1, 11);
+    s.fail_at = 300000;
+    std::vector<std::uint8_t> dev(s.size());
+    HostUploader up(std::chrono::milliseconds(1));
+    {
+        WeightLoadQueue q(up, {3, std::uint64_t{2} << 20, nullptr, false});
+        static_assert(noexcept(q.cancel()), "cancel is the destructor-safe exit");
+        struct Cleanup {
+            WeightLoadQueue& q;
+            ~Cleanup() { q.cancel(); }
+        };
+        bool caught = false;
+        try {
+            const Cleanup cleanup{q};
+            WeightLoadManifest held;
+            held.output(held.read(s, 0, 1000), 1000);
+            held.hold();
+            const auto h = q.submit(std::move(held));
+            (void)submit_rows(q, s, dev.data(), 20, 20000, 1000);  // rows 15.. are past fail_at
+            (void)q.take(h);                                       // never released: the consumer is unwinding
+            q.publish();
+        } catch (const std::runtime_error&) {
+            caught = true;
+        }
+        require(caught, "the read failure reaches the caller through the cleanup");
+        require(throws([&] { q.publish(); }), "a cancelled queue does not publish");
+        const auto late = submit_rows(q, s, dev.data(), 1, 0, 1000);
+        require(throws([&] { q.wait(late[0]); }), "a ticket submitted after the cancel fails");
+    }
+    require(up.clean(), "a cancelled load returns its staging");
+    HostUploader up2;
+    {
+        WeightLoadQueue q(up2, {2, std::uint64_t{1} << 20, nullptr, false});
+        WeightLoadManifest held;
+        held.output(held.read(s, 0, 1000), 1000);
+        held.hold();
+        const auto h = q.submit(std::move(held));
+        (void)q.take(h);  // holds the whole budget: the next ticket waits for staging
+        const auto t = submit_rows(q, s, dev.data(), 3, 1000, 1000);
+        q.cancel();
+        require(throws([&] { q.wait(t[0]); }) && throws([&] { q.wait(t[2]); }), "tickets waiting for staging are cancelled");
+    }
+    require(up2.clean(), "held staging goes back with the queue");
+}
+
+// Audit P2: ranges become tickets by their aligned staging size, so a small budget and tiny ranges both fit.
+void small_budget_ranges() {
+    const MemorySource s(std::size_t{3} << 20, 4096, 13);
+    constexpr std::uint64_t mib = std::uint64_t{1} << 20;
+    {
+        HostUploader up;
+        std::vector<std::uint8_t> dev(mib);
+        {
+            WeightLoadQueue q(up, {2, mib, nullptr, false});
+            WeightRangeTickets r(q);
+            r.load(s, 32, mib, dev.data());  // window 1 MiB + 4096: more than the only size class of this budget
+            r.flush();
+            q.publish();
+            require(q.stats().tickets == 2, "the range is cut to fit the aligned staging");
+        }
+        require(std::memcmp(dev.data(), s.bytes() + 32, mib) == 0 && up.peak_bytes <= mib && up.clean(), "1 MiB budget load");
+    }
+    {
+        HostUploader up;
+        constexpr unsigned count = 4000;
+        std::vector<std::uint8_t> dev(count * 16);
+        {
+            WeightLoadQueue q(up, {3, 2 * mib, nullptr, false});
+            WeightRangeTickets r(q);
+            for (unsigned i = 0; i < count; ++i) r.load(s, 100 + i * 600, 16, dev.data() + i * 16);  // a page each
+            r.flush();
+            q.publish();
+            require(q.stats().tickets > 1, "tiny ranges are grouped by staging, not by payload");
+        }
+        bool same = true;
+        for (unsigned i = 0; i < count; ++i) same = same && std::memcmp(dev.data() + i * 16, s.bytes() + 100 + i * 600, 16) == 0;
+        require(same && up.peak_bytes <= 2 * mib && up.clean(), "tiny ranges inside a 2 MiB budget");
+    }
+    HostUploader up;
+    WeightLoadQueue small(up, {1, mib / 2, nullptr, false});
+    require(throws([&] { WeightRangeTickets r(small); }), "a budget below the smallest size class is refused before loading");
+    WeightLoadQueue usual(up, {1, 512 * mib, nullptr, false});
+    require(WeightRangeTickets(usual).piece_bytes() == ((512 * mib / 12) & ~std::uint64_t{4095}), "usual budgets keep their piece");
+    require(WeightLoadQueue::max_ticket_staging_bytes(100 * mib) == 96 * mib &&
+                WeightLoadQueue::staging_class_bytes(WeightLoadQueue::max_ticket_staging_bytes(100 * mib)) <= 100 * mib,
+            "the largest ticket of a budget is a size class inside it");
+}
 }  // namespace
 
 int main() {
@@ -257,6 +462,11 @@ int main() {
         identical_bytes(4096, true, 6, std::uint64_t{1} << 20);
         held_in_order();
         failure_cancels();
+        allocation_failures();
+        worker_start_failure();
+        failed_upload_wait();
+        cancel_in_cleanup();
+        small_budget_ranges();
     } catch (const std::exception& e) {
         std::cerr << "weight load queue tests: " << e.what() << "\n";
         return 1;

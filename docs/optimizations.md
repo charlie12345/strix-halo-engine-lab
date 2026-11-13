@@ -939,6 +939,23 @@ When a chunk averages fewer than 96 assignments per expert (fewer than 4,915 row
 - **Measured gain:** routed call −2.6 % to −8.2 % at 3,072 to 4,864 rows (512 experts, top-10, real layers, ABBA); +1 % to +5 % at 1,024 to 2,048 rows (hence the threshold); no change at 8,192-row chunks.
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
+<a id="qwen-moe-da16-issue"></a>
+
+### Uniform DA16 activation issue (expert down)
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_DA16_ISSUE`. **Default:** automatic (on for the XOR-row tune 88).
+
+The expert down kernel keeps two register stages of global loads in flight while the WMMA step runs. Each thread used to skip its two activation-image loads when its part lay past the end of the batch, which put the loads of every fetch in an exec-masked region behind a skip branch. With the item on, every thread issues both loads through the pointer the kernel already clamps to the first row of the batch, so a fetch is one straight block. Rows past the batch stage a copy of the first row instead of zeros; no store and no certificate check reads them. The barrier, the global loads, the K pipeline and the issue policy (`GroupedF16Issue`, `GroupedF16ActivationIssue`) live in the shared grouped F16 support, so another grouped body adopts the policy instead of copying the scheduler.
+
+- **Preconditions:** DA16 expert down entries (base, certificate, BF16 route, one-byte route). The LDS-epilogue tier kernels, the tile-64 remainder and the P1 item keep the masked issue.
+- **Automatic selection:** Unset selects the uniform issue for tune 88 (64-assignment batches with XOR rows: 3,072 to 4,914 rows per chunk for 512 experts, top-10) and the masked issue for tunes 80 and 82. `=1` selects it for every tune, `=0` for none.
+- **Fallback notice:** The masked kernels are the previous kernels with unchanged machine code.
+- **Exactness evidence:** Bitwise: routed-expert fixture (every written view, the CSR words and the certificate word; header reuse on and off; certificate off, armed and unproven; DA16 image poisoned before each run) identical with the item on and off on a real layer at 4,096 and 8,192 rows and on synthetic Q4_K/Q5_K x Q5_1/Q8_0 layers; 8K and 32K terminal FP32 logits and generated tokens identical with `=0`, unset and `=1`.
+- **Off switch:** STRIX_QPF2K_MOE_DA16_ISSUE=0
+- **Measured gain:** down phase -0.7 % at 3,072 rows, -1.2 % at 4,096 and -1.5 % at 4,864 (routed call -0.26 % to -0.39 %; real layer, ABBA, 30 repetitions). No repeatable change at 2,048 rows (tune 80) or at 6,144 and 8,192 rows (tune 82), so 8K and longer prompts in 8,192-row chunks are unaffected.
+- **Not adopted:** making the wait before each stage exact as well (ordered prologue fetches plus a branch-free tail fetch; no `vmcnt(0)` left in the K loop) measured +1.1 % on the down phase at 8,192 rows and +2.2 % with full batches, and nothing beyond the uniform loads at 4,096 rows.
+- **Implementation / evidence:** [shared scheduler](../src/moe_core/grouped_f16.hpp), [down body](../src/moe_core/hip_moe_da16_down_body.inc)
+
 <a id="qwen-qsa-union-merge"></a>
 
 ### QSA attend-union merge

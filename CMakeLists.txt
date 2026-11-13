@@ -3095,6 +3095,9 @@ int main() { return 0; }"
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-q8-rows-projection-tests)
         add_test(NAME strix-hip-q8-rows-projection-tests COMMAND strix-hip-q8-rows-projection-tests)
+        # The same byte gate with the stepped LDS windows forced for every window they can hold.
+        add_test(NAME strix-hip-q8-rows-projection-stepped-tests COMMAND strix-hip-q8-rows-projection-tests)
+        set_tests_properties(strix-hip-q8-rows-projection-stepped-tests PROPERTIES ENVIRONMENT "STRIX_Q8_ROWS_STEPPED=1")
 
         # External fixtures pin compressed bits and identify the materialized
         # reference separately. Never register a GPU invocation with CTest.

@@ -350,7 +350,8 @@ KnownWindowArena build_known_rows_arena(
         }
         // The shared row layout policy decides the physical stride: the payload rounded to the arena alignment,
         // moved off page multiples for row counts that kernels walk in lockstep (core/row_layout.hpp).
-        const auto stride = core::physical_row_stride(layout, align_up(allocation.bytes, alignment), logical_rows);
+        const auto stride = core::physical_row_stride(layout, align_up(allocation.bytes, alignment), logical_rows,
+            alignment < core::kRowAlignment ? core::kRowAlignment : alignment);
         allocation.bytes = 0;
         for(std::uint32_t row=0;row<logical_rows;++row) allocation.bytes=checked_add(allocation.bytes,stride);
         allocation.offset = 0;

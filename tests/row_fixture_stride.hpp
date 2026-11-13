@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <cstdint>
 
-#include "strix/env_flags.hpp"
+#include "../include/strix/env_flags.hpp"
 
 // Pitch sweep (timing only): STRIX_ROW_FIXTURE_ROUND_BYTES=N rounds the row stride up to a multiple of N bytes and
 // STRIX_ROW_FIXTURE_PAD_BYTES=M adds M more. Unset keeps the tight stride. The payload columns never move.

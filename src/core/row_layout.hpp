@@ -38,18 +38,24 @@ inline constexpr std::uint64_t kRowAlignment = 64;
 }
 
 // `tight` is the stride the buffer would have without the policy (payload rounded to the buffer's own alignment).
-// The result is >= tight, congruent to it modulo 64, and equal to it when rows < lockstep_rows, when the policy is
-// off, or when the tight stride does not alias.
+// `alignment` is the row alignment the buffer's kernels require (a power of two, at least 64; the known-rows arena
+// needs 256): the step is rounded up to it, so every row keeps that alignment. The result is >= tight, congruent to
+// it modulo `alignment`, and equal to it when rows < lockstep_rows, when the policy is off, or when the tight stride
+// does not alias.
 [[nodiscard]] constexpr std::uint64_t physical_row_stride(const RowLayoutPolicy& p, std::uint64_t tight,
-                                                          std::uint64_t rows) {
-    if (!row_layout_valid(p)) throw std::invalid_argument("row layout policy is invalid");
+                                                          std::uint64_t rows, std::uint64_t alignment = kRowAlignment) {
+    if (!row_layout_valid(p) || alignment < kRowAlignment || (alignment & (alignment - 1U)) || alignment >= p.alias_bytes)
+        throw std::invalid_argument("row layout policy is invalid");
     if (!tight || !p.dealias_bytes || rows < p.lockstep_rows) return tight;
+    const auto step = (p.dealias_bytes + alignment - 1U) / alignment * alignment;
+    // A step that is itself a multiple of the period can never leave it; an aligned buffer cannot exceed
+    // alias_bytes / alignment distinct offsets either.
+    const auto reach = p.min_period < p.alias_bytes / alignment ? std::uint64_t{p.min_period} : p.alias_bytes / alignment;
+    if (row_alias_period(step, p.alias_bytes) < reach) throw std::invalid_argument("row layout step cannot leave the period");
     auto stride = tight;
-    // dealias_bytes has period >= min_period, so at most alias_bytes / 64 steps are ever needed.
-    for (std::uint64_t step = 0; row_alias_period(stride, p.alias_bytes) < p.min_period; ++step) {
-        if (step > p.alias_bytes / kRowAlignment || stride > UINT64_MAX - p.dealias_bytes)
-            throw std::overflow_error("row layout stride overflows");
-        stride += p.dealias_bytes;
+    for (std::uint64_t n = 0; row_alias_period(stride, p.alias_bytes) < reach; ++n) {
+        if (n > p.alias_bytes / kRowAlignment || stride > UINT64_MAX - step) throw std::overflow_error("row layout stride overflows");
+        stride += step;
     }
     return stride;
 }
@@ -71,7 +77,7 @@ inline constexpr std::uint64_t kRowAlignment = 64;
     return resolved;
 }
 
-[[nodiscard]] inline std::uint64_t physical_row_stride(std::uint64_t tight, std::uint64_t rows) {
-    return physical_row_stride(row_layout_policy(), tight, rows);
+[[nodiscard]] inline std::uint64_t physical_row_stride(std::uint64_t tight, std::uint64_t rows, std::uint64_t alignment) {
+    return physical_row_stride(row_layout_policy(), tight, rows, alignment);
 }
 }  // namespace strix::core

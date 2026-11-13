@@ -609,7 +609,7 @@ struct HipKnownPrefixWindow::Impl {
             auto& d = detach_state();
             if (d.pending[layer]) throw std::logic_error("known prefill shared expert detached twice before its combine");
             const auto row_bytes = resolve_dispatch_temporary(rows[0], 0).bytes;
-            const auto stride = core::physical_row_stride((row_bytes + 255U) / 256U * 256U, rows.size());
+            const auto stride = core::physical_row_stride((row_bytes + 255U) / 256U * 256U, rows.size(), 256U);
             if (!row_bytes || stride > UINT64_MAX / rows.size()) throw std::invalid_argument("known prefill shared workspace rows overflow");
             const auto need = stride * rows.size();
             if (d.prefill_workspace_bytes < need) {

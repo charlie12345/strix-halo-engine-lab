@@ -2665,7 +2665,7 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
             const std::array row1{out.rows[r ? 1U : 0U].hidden, out.rows[r ? 1U : 0U].route_indices, out.rows[r ? 1U : 0U].route_weights,
                 out.rows[r ? 1U : 0U].output, out.rows[r ? 1U : 0U].temporary};
             const auto stride = r && !cohort ? row1[v].address - base[v].address : tight;
-            if (stride != tight && stride != core::physical_row_stride(tight, UINT32_MAX))
+            if (stride != tight && stride != core::physical_row_stride(tight, UINT32_MAX, 256U))
                 throw std::invalid_argument("known-window routed rows stride is not a row layout stride");
             // Rows of different cohort sessions live in different arenas; every union kernel
             // addresses rows through per-row pointers, so only one session's window keeps the stripe.

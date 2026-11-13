@@ -27,6 +27,8 @@ int main() {
     static_assert(row_alias_period(20480) == 1 && row_alias_period(20608) == 32 && row_alias_period(20544) == 64 &&
                   row_alias_period(5120) == 4 && row_alias_period(42240) == 16, "alias periods");
     constexpr RowLayoutPolicy wide{4096, 64, 64, 16};
+    static_assert(physical_row_stride(page, 20480, 8192, 256) == 20736 && physical_row_stride(wide, 20480, 8192, 256) == 20736 &&
+                  physical_row_stride(wide, 5120, 8192, 256) == 5376, "the step is rounded up to the buffer's row alignment");
     for (std::uint64_t tight = 64; tight <= 3U * 65536U; tight += 64) {
         for (const auto& p : {page, wide, RowLayoutPolicy{4096, 192, 16, 16}, RowLayoutPolicy{4096, 256, 16, 16}}) {
             const auto stride = physical_row_stride(p, tight, 2048);
@@ -62,7 +64,7 @@ int main() {
         for (std::size_t i = 0; i < arena.physical.allocations.size(); ++i) {
             const auto& physical = arena.physical.allocations[i];
             const auto* original = strix::find_arena_allocation(serial, physical.use);
-            const auto expected = original ? physical_row_stride(policy, original->bytes, rows) : 0;
+            const auto expected = original ? physical_row_stride(policy, original->bytes, rows, 256) : 0;
             expect(original && arena.row_stride[i] == expected && physical.bytes == expected * rows,
                 "every prefill row stride is the policy's stride");
             expect(!policy.dealias_bytes || arena.row_stride[i] % 4096 != 0, "no prefill row stride is a page multiple");

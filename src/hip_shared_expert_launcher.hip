@@ -1861,7 +1861,7 @@ std::uint64_t known_shared_stride(const ExecutionBufferAddress& first,
     // The stride is the arena's (row views): tight, or the shared row layout policy's stride for this payload.
     const auto expected = (first.bytes + 255U) / 256U * 256U;
     const auto stride = static_cast<std::uint64_t>(second.address - first.address);
-    if (stride != expected && stride != core::physical_row_stride(expected, UINT32_MAX))
+    if (stride != expected && stride != core::physical_row_stride(expected, UINT32_MAX, 256U))
         throw std::invalid_argument("known-window shared R2 row stride differs from serial allocation");
     return stride;
 }
@@ -2393,7 +2393,7 @@ void shared_expert_known_prefill_rows_launch_detached(std::span<const ExecutionD
     static_cast<void>(known_shared_rows_stream());
     // Compact rows: one row's workspace view rounded up to 256 bytes (the arena's row stride spans the whole row view).
     const auto row_bytes = resolve_dispatch_temporary(rows[0], 0).bytes;
-    const auto stride = core::physical_row_stride((row_bytes + 255U) / 256U * 256U, rows.size());
+    const auto stride = core::physical_row_stride((row_bytes + 255U) / 256U * 256U, rows.size(), 256U);
     if (!stream || !workspace || workspace % 256U || !row_bytes || row_bytes > views.shape.workspace_stride_bytes ||
         stride > UINT64_MAX / rows.size() || workspace_bytes < stride * rows.size() || workspace_bytes > UINTPTR_MAX - workspace)
         throw std::invalid_argument("detached known shared prefill workspace is invalid");

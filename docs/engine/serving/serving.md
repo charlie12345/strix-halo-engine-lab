@@ -108,6 +108,18 @@ reason whenever T16384 or the automatic arithmetic is declined. `STRIX_SERVE_T16
 T8192 owner. `STRIX_SERVE_ROUTE=0` restores the earlier server rule (T8192, resolved arithmetic
 unchanged). Explicit context capacity is preserved; request prompts must still fit it.
 
+An admitted server owner also takes the prefill organization of the single-request route: one
+policy value, applied by both after route admission. It covers row-loop steps as registered
+batches and one strided tap copy (`STRIX_PREFILL_PIPE` bits 16 and 2), attention stage batching
+(`STRIX_QSA_NORM_GROUP`, `STRIX_QSA_ATTEND_BATCH`, `STRIX_QSA_INDEX_ROWS`, `STRIX_QSA_SCORE_PARK`,
+`STRIX_QPF2K_SCORE_ROWS`), table batching (`STRIX_PREFILL_PLE_BATCH`) and the expert header and
+merge policies (`STRIX_QPF2K_MOE_HDR`, `STRIX_QPF2K_MOE_XOR64`, `STRIX_QPF2K_MOE_MC`,
+`STRIX_QPF2K_SHARED_PRE`). These change launches, copies and scheduling, not arithmetic. The
+server does not take the reclamation or decoding items of the single-request route. The load
+line reports how many items were applied and the row-pipeline mask. `STRIX_SERVE_PREFILL_ORG=0`
+keeps the startup items only; each item keeps its own `0` switch, and `STRIX_QPF2K_DEFAULTS=0`
+disables all of them.
+
 Measured on one Strix Halo node (same binary, `STRIX_SERVE_ROUTE=0` as the earlier rule, context
 33,280, four slots, explicit-sidecar MTP, interleaved runs): time to first token through the
 resident server 6.74-7.35 s versus 9.72-10.10 s for an 8,192-token prompt and 27.4-29.6 s versus

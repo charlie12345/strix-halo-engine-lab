@@ -23,21 +23,36 @@ The interface is `strix::vision::VisionAdapter` (`include/strix/vision/adapter.h
 3. **`bind()`**: map tensor names to `EncoderWeights` through a `WeightSource`. `GgufWeights` returns a tensor
    with GGUF dimensions `(d0, ..., dn)` as the matrix `[dn][d0 * ... * d(n-1)]`, which is the source framework's
    `[out][in...]` weight; a flattened convolution weight therefore has features in (channel, frame, y, x) order,
-   the order `vision::patchify` emits.
+   the order `vision::patchify` emits. Open the file with a `vision::HostBudget`: the file length is checked
+   against `max_bytes` (and against `exact_bytes`, the pinned length, when the family pins its file) before a byte
+   is allocated, then the bounded header is validated, then the bytes are read.
 4. **`patches()`**: `ResizePolicy::target`, `vision::resize`, `vision::normalize`, `vision::patchify`, then the
-   patch coordinates. Refuse an image the rule cannot represent with `std::invalid_argument`.
+   patch coordinates. Refuse an image the rule cannot represent with `std::invalid_argument`. Call
+   `vision::check_grid_axes` before the resample: a patch coordinate is 16 bits, so an axis is at most 65,536
+   patches whatever the token limit allows.
 5. **`project()`**: receives the tower output and the grid it came from. Build the projector input (merge,
    unshuffle, pool), call `dense.linear` for every linear so the host reference and the device share the graph,
-   and write the rows in span order, special rows included.
+   and write the rows in span order, special rows included. The grid is a caller's argument: start with
+   `vision::checked_merged_grid(grid, merge, max_tokens)` (64-bit products, positive axes, `rows` equal to the
+   product, the token limit) and size every buffer from its result. `layout()` does the same.
 6. **`layout()`**: the same span as roles and positions. Row count and order must equal what `project()` writes.
 7. **`device_options()`** (optional): a policy bit of the device arithmetic the tower needs, found by the gate.
 8. **`identity()`**: the weights digest plus everything that changes the rows. Cached rows and prefix entries
-   are keyed by it, so a changed parameter can never reuse old rows.
+   are keyed by it, so a changed parameter can never reuse old rows. State a float parameter by its bit
+   pattern, not by a rounded decimal, and refuse a non-finite one.
 9. **Tests**: a host test on a small synthetic tower with the real tensor names (projector against a direct
-   computation, layout, resize table, cache key), and a gate on the real file.
+   computation, layout, resize table, cache key, refusal of malformed grids and files), and a gate on the real
+   file. Gates compare tensors with `vision::abs_diff` (`include/strix/vision/compare.hpp`): a NaN or an infinity
+   on either side is a failure, it never disappears in a maximum.
 
 A family that needs something the interface does not carry extends the shared interface; it does not work around
 it inside the adapter.
+
+Open before a tower is served: the cache key ends with `EncoderBackend::arithmetic()`, one constant string per
+backend class. It does not state the options a device backend was built with (`EncoderOptions`, for example split
+activations), so two device backends with different options share keys today. The effective options have to become
+part of that string, and the backend has to be built from `device_options()` in one place, before any served path
+shares a cache between differently built backends.
 
 ## DeepSeek V4.1
 

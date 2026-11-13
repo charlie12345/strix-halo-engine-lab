@@ -1,5 +1,6 @@
 #include "vision_adapter.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -39,10 +40,11 @@ void copy_row(const vision::Tensor& row, std::uint16_t* dst, std::size_t width) 
 }  // namespace
 
 std::string VisionRecipe::id() const {
+    // Exact float bits: two recipes that differ in the last place normalise pixels differently, so they are two keys.
+    const auto bits = [](float v) { return std::bit_cast<std::uint32_t>(v); };
     char text[192];
-    std::snprintf(text, sizeof text, "m%.4g,%.4g,%.4g-s%.4g,%.4g,%.4g-%s%s-g%d-p%d-a%d-u%d-n%d", static_cast<double>(mean[0]),
-                  static_cast<double>(mean[1]), static_cast<double>(mean[2]), static_cast<double>(stddev[0]),
-                  static_cast<double>(stddev[1]), static_cast<double>(stddev[2]), filter_name(resampler.filter),
+    std::snprintf(text, sizeof text, "m%08x,%08x,%08x-s%08x,%08x,%08x-%s%s-g%d-p%d-a%d-u%d-n%d", bits(mean[0]), bits(mean[1]),
+                  bits(mean[2]), bits(stddev[0]), bits(stddev[1]), bits(stddev[2]), filter_name(resampler.filter),
                   resampler.antialias ? "-aa" : "", swiglu_gate_first ? 1 : 0,
                   rope_pairing == vision::EncoderConfig::RopePairing::half ? 0 : 1, static_cast<int>(aligner_activation),
                   unshuffle_row_major ? 1 : 0, newline_after_last_row ? 1 : 0);
@@ -57,8 +59,10 @@ VisionAdapter::VisionAdapter(VisionConfig config, std::string weights_sha256_hex
         bad("incomplete configuration");
     // The file states no rule for a bounded aspect ratio; refuse one instead of guessing it.
     if (config_.max_wh_ratio != 0) bad("a bounded width/height ratio is not supported");
+    for (const float m : recipe_.mean)
+        if (!std::isfinite(m)) bad("recipe mean");
     for (const float s : recipe_.stddev)
-        if (!(s > 0.0F)) bad("recipe std");
+        if (!(s > 0.0F) || !std::isfinite(s)) bad("recipe std");
 }
 
 vision::EncoderConfig VisionAdapter::config() const {
@@ -139,6 +143,9 @@ vision::Size VisionAdapter::target(int width, int height) const {
 vision::PatchGrid VisionAdapter::patches(const vision::Image& image) const {
     if (image.width <= 0 || image.height <= 0 || image.rgb.size() != image.pixels() * 3U) bad("empty image");
     const vision::Size t = target(image.width, image.height);
+    // Before any resample or allocation: the grid must fit the 16-bit patch coordinates of the shared representation.
+    vision::check_grid_axes(static_cast<std::uint64_t>(t.height) / config_.patch_size,
+                            static_cast<std::uint64_t>(t.width) / config_.patch_size);
     const vision::Image resized = image.width == t.width && image.height == t.height
                                       ? image
                                       : vision::resize(image, t.width, t.height, recipe_.resampler);
@@ -162,6 +169,7 @@ vision::PatchGrid VisionAdapter::patches(const vision::Image& image) const {
         g.y[r] = static_cast<std::uint16_t>(r / g.grid_w);
         g.x[r] = static_cast<std::uint16_t>(r % g.grid_w);
     }
+    (void)vision::checked_merged_grid(g, config_.downsample_ratio, config_.max_image_tokens);
     return g;
 }
 
@@ -201,10 +209,10 @@ void VisionAdapter::project(vision::EncoderOutput& hidden, const vision::PatchGr
                             vision::ProjectedRows& out) {
     if (!aligner_w1_) bad("project() before bind()");
     const unsigned R = config_.downsample_ratio, W = config_.hidden_size, P = config_.projection_size;
-    if (hidden.width != W || hidden.rows != grid.rows || grid.rows != grid.grid_h * grid.grid_w || grid.grid_h % R != 0 ||
-        grid.grid_w % R != 0 || hidden.hidden.size() != std::size_t{hidden.rows} * W)
+    const vision::MergedGrid merged_grid = vision::checked_merged_grid(grid, R, config_.max_image_tokens);
+    if (hidden.width != W || hidden.rows != grid.rows || hidden.hidden.size() != std::size_t{hidden.rows} * W)
         bad("the encoder output does not match the patch grid");
-    const unsigned mh = grid.grid_h / R, mw = grid.grid_w / R, tokens = mh * mw;
+    const unsigned mh = merged_grid.grid_h, mw = merged_grid.grid_w, tokens = merged_grid.tokens;
     const std::size_t in = std::size_t{W} * R * R;
 
     // Pixel unshuffle on the raster grid: merged row (my, mx), feature c * R * R + (dy, dx).
@@ -257,11 +265,11 @@ vision::EncoderOptions VisionAdapter::device_options() const {
 
 vision::SpanLayout VisionAdapter::layout(const vision::PatchGrid& grid) const {
     const unsigned R = config_.downsample_ratio;
-    if (grid.grid_h == 0 || grid.grid_w == 0 || grid.grid_h % R != 0 || grid.grid_w % R != 0) bad("layout of an unmerged grid");
+    const vision::MergedGrid merged = vision::checked_merged_grid(grid, R, config_.max_image_tokens);
     using Role = vision::SpanLayout::Role;
     vision::SpanLayout s;
-    s.grid_h = grid.grid_h / R;
-    s.grid_w = grid.grid_w / R;
+    s.grid_h = merged.grid_h;
+    s.grid_w = merged.grid_w;
     s.real_token_id = config_.image_token_id;  // every row of the span is the image token to id-keyed logic
     const unsigned rows = span_rows(s.grid_h, s.grid_w), stride = s.grid_w + 1U;  // a grid row and its row end
     s.role.assign(rows, Role::image);

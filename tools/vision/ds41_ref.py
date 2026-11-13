@@ -18,6 +18,7 @@ All dumps are little-endian raw arrays; cases.txt lists one image per line:
   name width height resized_w resized_h grid_h grid_w span_rows graph_only
 """
 import argparse
+import hashlib
 import math
 import os
 import struct
@@ -92,6 +93,15 @@ class Gguf:
             item, n = self._unpack("<IQ")
             return [self._value(item) for _ in range(n)]
         return self._unpack(_SCALAR[kind])[0]
+
+    def digest(self):
+        """SHA-256 of the whole file (computed once)."""
+        if getattr(self, "_digest", None) is None:
+            h = hashlib.sha256()
+            for start in range(0, self.data.shape[0], 64 << 20):
+                h.update(self.data[start:start + (64 << 20)])
+            self._digest = h.hexdigest()
+        return self._digest
 
     def f32(self, name):
         """Tensor as FP32 in the source framework's shape (GGUF dimensions reversed)."""
@@ -266,6 +276,44 @@ def rope(v, cos, sin, adjacent):
     return out
 
 
+# A saved residual stream is only as good as the computation that made it. The key names everything the stream
+# depends on; a state with another key (or none) is refused, never mixed into a new run.
+STATE_VERSION = "ds41-ref-state-1"
+STATE_SECONDS = 10.0  # least time between two saves
+
+
+def state_key(g, cfg, patches, gh, gw, args):
+    h = hashlib.sha256()
+    tower = ",".join("%s=%r" % (k, cfg[k]) for k in ("layers", "width", "heads", "mlp", "eps", "theta"))
+    text = "%s|%s|%s|grid=%dx%d|gate_second=%d|rope_adjacent=%d|" % (
+        STATE_VERSION, g.digest(), tower, gh, gw, bool(args.gate_second), bool(args.rope_adjacent))
+    h.update(text.encode("utf-8"))
+    h.update(np.ascontiguousarray(patches, dtype="<f4").tobytes())
+    return h.hexdigest()
+
+
+def save_state(path, x, layer, key):
+    np.savez(path + ".tmp.npz", x=x, layer=layer, key=np.array(key))
+    os.replace(path + ".tmp.npz", path + ".npz")
+
+
+def load_state(path, key, shape, layers):
+    """(x, first layer) of a state saved by the same computation; ValueError for anything else."""
+    with np.load(path + ".npz", allow_pickle=False) as state:
+        names = set(state.files)
+        if names != {"x", "layer", "key"}:
+            raise ValueError("%s.npz is not a state of this tool version: remove it to start over" % path)
+        saved, x, layer = str(state["key"]), state["x"], state["layer"]
+    if saved != key:
+        raise ValueError("%s.npz is from another computation (weights, patches, grid or tower options differ): "
+                         "remove it to start over" % path)
+    if layer.shape != () or layer.dtype.kind not in "iu" or not 0 < int(layer) < layers:
+        raise ValueError("%s.npz: layer outside 1..%d" % (path, layers - 1))
+    if x.shape != tuple(shape) or x.dtype != np.float32 or not np.isfinite(x).all():
+        raise ValueError("%s.npz: the saved stream is not a finite float32 %s array" % (path, tuple(shape)))
+    return x, int(layer)
+
+
 def encode_one(g, cfg, patches, gh, gw, args, checkpoint=None):
     L, W, H, M, R = cfg["layers"], cfg["width"], cfg["heads"], cfg["mlp"], cfg["down"]
     D, N, eps = W // H, gh * gw, float(cfg["eps"])
@@ -280,11 +328,10 @@ def encode_one(g, cfg, patches, gh, gw, args, checkpoint=None):
     scale = np.float32(1.0 / math.sqrt(D))
     # A long image may not fit one time-limited run: the residual stream is saved between layers and resumed.
     first, saved = 0, time.time()
+    key = state_key(g, cfg, patches, gh, gw, args) if checkpoint else None
     if checkpoint and os.path.exists(checkpoint + ".npz"):
-        state = np.load(checkpoint + ".npz")
-        if state["x"].shape == x.shape:
-            x, first = state["x"], int(state["layer"])
-            print("  resumed at layer %d" % first)
+        x, first = load_state(checkpoint, key, x.shape, L)
+        print("  resumed at layer %d" % first)
     pool = ThreadPoolExecutor(max_workers=min(H, os.cpu_count() or 1))
     for l in range(first, L):
         p = "vision.blocks.%d." % l
@@ -308,9 +355,8 @@ def encode_one(g, cfg, patches, gh, gw, args, checkpoint=None):
         m = h @ g.f32(p + "mlp.w1.weight").T
         gate, up = (m[:, M:], m[:, :M]) if args.gate_second else (m[:, :M], m[:, M:])
         x = x + (silu(gate) * up) @ g.f32(p + "mlp.w2.weight").T
-        if checkpoint and l + 1 < L and time.time() - saved > 10.0:
-            np.savez(checkpoint + ".tmp.npz", x=x, layer=l + 1)
-            os.replace(checkpoint + ".tmp.npz", checkpoint + ".npz")
+        if checkpoint and l + 1 < L and time.time() - saved >= STATE_SECONDS:
+            save_state(checkpoint, x.astype(np.float32, copy=False), l + 1, key)
             saved = time.time()
     pool.shutdown()
     if checkpoint and os.path.exists(checkpoint + ".npz"):

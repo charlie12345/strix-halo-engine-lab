@@ -1,24 +1,41 @@
 #include "strix/vision/gguf_weights.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <istream>
 #include <limits>
 #include <streambuf>
+#include <string>
 #include <stdexcept>
 #include <utility>
 
 namespace strix::vision {
 namespace {
 
-std::vector<std::byte> read_all(const std::filesystem::path& path) {
+// Admission before allocation: nothing is allocated from the file's own length until that length is inside the
+// budget and the header (bounded by `limits`) describes a well-formed file of exactly that length.
+std::vector<std::byte> read_all(const std::filesystem::path& path, const gguf::Limits& limits, const HostBudget& budget) {
+    const std::string name = path.filename().string();
     std::ifstream in(path, std::ios::in | std::ios::binary);
-    if (!in) throw std::runtime_error("vision weights: cannot open " + path.filename().string());
+    if (!in) throw std::runtime_error("vision weights: cannot open " + name);
     in.seekg(0, std::ios::end);
     const auto end = in.tellg();
-    if (end < 0) throw std::runtime_error("vision weights: cannot size " + path.filename().string());
+    if (end < 0) throw std::runtime_error("vision weights: cannot size " + name);
+    const auto size = static_cast<std::uint64_t>(end);
+    if (budget.exact_bytes != 0 && size != budget.exact_bytes)
+        throw std::invalid_argument("vision weights: " + name + " is " + std::to_string(size) + " bytes, the admitted file is " +
+                                    std::to_string(budget.exact_bytes));
+    if (size > budget.max_bytes || std::cmp_greater(size, std::numeric_limits<std::size_t>::max()) ||
+        std::cmp_greater(size, std::numeric_limits<std::streamsize>::max()))
+        throw std::invalid_argument("vision weights: " + name + " is " + std::to_string(size) + " bytes, over the host budget of " +
+                                    std::to_string(budget.max_bytes));
     in.seekg(0, std::ios::beg);
-    std::vector<std::byte> bytes(static_cast<std::size_t>(end));
+    (void)gguf::read(in, size, limits);  // throws on a malformed header; the tensor table is re-read from the bytes
+    in.clear();
+    in.seekg(0, std::ios::beg);
+    if (!in) throw std::runtime_error("vision weights: cannot rewind " + name);
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
     std::size_t done = 0;
     while (done < bytes.size()) {  // bounded chunks: one read of several GiB is not portable
         const std::size_t chunk = std::min<std::size_t>(bytes.size() - done, std::size_t{256} << 20U);
@@ -51,7 +68,8 @@ gguf::FileInfo parse(const std::vector<std::byte>& bytes, const gguf::Limits& li
 
 }  // namespace
 
-GgufWeights::GgufWeights(const std::filesystem::path& path, const gguf::Limits& limits) : bytes_(read_all(path)) {
+GgufWeights::GgufWeights(const std::filesystem::path& path, const gguf::Limits& limits, const HostBudget& budget)
+    : bytes_(read_all(path, limits, budget)) {
     info_ = parse(bytes_, limits);
     index();
 }

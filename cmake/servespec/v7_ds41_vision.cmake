@@ -28,6 +28,19 @@ if(TARGET deepseek41-vision AND NOT MSVC)
     target_compile_options(deepseek41-vision PRIVATE -ffp-contract=off -fno-fast-math)
 endif()
 
+if(BUILD_TESTING)
+    # Resume state of the reference tool (tools/vision/ds41_ref.py): needs numpy, as the tool does.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import numpy"
+            RESULT_VARIABLE strix_ds41_ref_numpy OUTPUT_QUIET ERROR_QUIET)
+        if(strix_ds41_ref_numpy EQUAL 0)
+            add_test(NAME deepseek41-vision-ref COMMAND "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/deepseek41_vision_ref_tests.py")
+        endif()
+    endif()
+endif()
+
 if(BUILD_TESTING AND TARGET strix_deepseek41_vision)
     # Real-file gate (needs the admitted vision file and the dumps of tools/vision/ds41_ref.py): not a CTest test.
     add_executable(strix-deepseek41-vision-gate "${CMAKE_SOURCE_DIR}/tests/deepseek41_vision_gate.cpp")

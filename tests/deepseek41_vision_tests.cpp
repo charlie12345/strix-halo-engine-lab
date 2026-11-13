@@ -4,6 +4,7 @@
 #include "../src/deepseek41/vision_adapter.hpp"
 
 #include "strix/deepseek41_model.hpp"
+#include "strix/vision/compare.hpp"
 #include "strix/vision/embed_cache.hpp"
 #include "strix/vision/encoder.hpp"
 #include "strix/vision/gguf_weights.hpp"
@@ -13,7 +14,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -367,7 +371,7 @@ void test_tables() {
     const vision::SpanLayout t = ds::VisionAdapter(real_config(), kSha, open).layout(g);
     CHECK(t.rows() == 183 && t.role[181] == Role::image && t.role[182] == Role::end);
     g.grid_w = 40;
-    CHECK(throws([&] { (void)a.layout(g); }, "unmerged"));
+    CHECK(throws([&] { (void)a.layout(g); }, "merge factor"));
 }
 
 void test_patches_and_projector() {
@@ -479,14 +483,132 @@ void test_patches_and_projector() {
     CHECK(throws([&] { (void)adapter.patches(vision::Image{}); }, "empty image"));
 }
 
+// Malformed inputs an external audit found accepted (each of these failed before its fix).
+void test_refusals() {
+    // Recipe identity: neighbouring representable floats are different recipes, non-finite values are refused.
+    ds::VisionRecipe base, near_mean, near_std;
+    near_mean.mean[0] = std::nextafter(base.mean[0], 1.0F);
+    near_std.stddev[2] = std::nextafter(base.stddev[2], 1.0F);
+    CHECK(base.id() != near_mean.id() && base.id() != near_std.id() && near_mean.id() != near_std.id());
+    CHECK(base.id() == ds::VisionRecipe{}.id());
+    ds::VisionRecipe nan_mean, inf_std;
+    nan_mean.mean[1] = std::numeric_limits<float>::quiet_NaN();
+    inf_std.stddev[0] = std::numeric_limits<float>::infinity();
+    CHECK(throws([&] { ds::VisionAdapter bad(real_config(), kSha, nan_mean); }, "recipe mean"));
+    CHECK(throws([&] { ds::VisionAdapter bad(real_config(), kSha, inf_std); }, "recipe std"));
+
+    // A reference with a NaN is a failed comparison, never a silent pass.
+    const std::vector<float> got{1.0F, 2.0F, 3.0F};
+    std::vector<float> want = got;
+    CHECK(vision::abs_diff(got, want, 1e-6).pass);
+    want[1] = std::numeric_limits<float>::quiet_NaN();
+    const vision::AbsDiff nan_ref = vision::abs_diff(got, want, 1e-6);
+    CHECK(!nan_ref.pass && nan_ref.non_finite == 1);
+    CHECK(!vision::abs_diff(want, got, 1e-6).pass && !vision::abs_diff(want, want, 1e-6).pass);
+    want[1] = std::numeric_limits<float>::infinity();
+    CHECK(!vision::abs_diff(got, want, 1e-6).pass);
+    want[1] = 2.5F;
+    const vision::AbsDiff off = vision::abs_diff(got, want, 1e-6);
+    CHECK(!off.pass && off.over == 1 && off.non_finite == 0 && off.worst == 0.5);
+    CHECK(!vision::abs_diff(std::span<const float>(got).first(2), want, 1e-6).pass);
+
+    // A legal file geometry (patch 1, ratio 8, 16384 rows) admits an 8 x 65544 image without a resize; its patch
+    // row is wider than a patch coordinate can state.
+    ds::VisionConfig thin = real_config();
+    thin.patch_size = 1;
+    thin.downsample_ratio = 8;
+    thin.max_image_tokens = 16384;
+    thin.min_pixels = 64;
+    const ds::VisionAdapter thin_adapter(thin, kSha);
+    vision::Image strip;
+    strip.width = 65544;
+    strip.height = 8;
+    strip.rgb.assign(std::size_t{65544} * 8U * 3U, 0);
+    CHECK(thin_adapter.target(strip.width, strip.height) == (vision::Size{65544, 8}));
+    CHECK(throws([&] { (void)thin_adapter.patches(strip); }, "axis"));
+
+    // Grid products that wrap 32 bits: 196608 = 3 * 65536 per axis, so rows and merged tokens wrap to 0.
+    const ds::VisionAdapter a(real_config(), kSha);
+    vision::PatchGrid wrap;
+    wrap.grid_h = wrap.grid_w = 196608;
+    wrap.rows = wrap.grid_h * wrap.grid_w;
+    CHECK(wrap.rows == 0);
+    CHECK(throws([&] { (void)a.layout(wrap); }, "patch grid"));
+    vision::PatchGrid many;  // every product fits, the row count is over the file's limit
+    many.grid_h = many.grid_w = 99;
+    many.rows = 99 * 99;
+    CHECK(throws([&] { (void)a.layout(many); }, "image rows"));
+    vision::PatchGrid zero;
+    CHECK(throws([&] { (void)a.layout(zero); }, "patch grid"));
+    vision::PatchGrid lying;  // rows that are not grid_h * grid_w
+    lying.grid_h = lying.grid_w = 39;
+    lying.rows = 3;
+    CHECK(throws([&] { (void)a.layout(lying); }, "patch grid"));
+
+    const File f = small_file();
+    const ds::VisionModel model = ds::validate_vision(f.info());
+    vision::GgufWeights source = f.weights();
+    ds::VisionAdapter bound(model.config, kSha);
+    vision::EncoderWeights weights;
+    bound.bind(source, weights);
+    vision::ReferenceEncoder backend(bound.config(), weights);
+    vision::EncoderOutput empty;
+    empty.width = model.config.hidden_size;
+    vision::ProjectedRows out;
+    CHECK(throws([&] { bound.project(empty, wrap, backend, out); }, "patch grid"));
+    CHECK(throws([&] { bound.project(empty, zero, backend, out); }, "patch grid"));
+
+    // A weight file's length is checked against the host budget and the admitted length before anything is read.
+    const std::string good = f.bytes();
+    const std::filesystem::path dir = std::filesystem::temp_directory_path();
+    const std::filesystem::path good_path = dir / "strix-ds41-vision-test.gguf", junk_path = dir / "strix-ds41-vision-junk.gguf";
+    const auto put_file = [](const std::filesystem::path& p, const std::string& bytes) {
+        std::ofstream o(p, std::ios::out | std::ios::binary | std::ios::trunc);
+        o.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    };
+    put_file(good_path, good);
+    put_file(junk_path, std::string(4096, '\x5a'));
+    const gguf::Limits limits = ds::vision_reader_limits();
+    vision::HostBudget exact, under, other;
+    exact.exact_bytes = good.size();
+    under.max_bytes = good.size() - 1U;
+    other.exact_bytes = good.size() + 32U;
+    {
+        vision::GgufWeights from_file(good_path, limits, exact);
+        CHECK(from_file.bytes().size() == good.size() && std::memcmp(from_file.bytes().data(), good.data(), good.size()) == 0);
+        CHECK(from_file.has("image_start") && from_file.info().tensors.size() == 26);
+        vision::HostBudget fits;
+        fits.max_bytes = good.size();
+        CHECK(vision::GgufWeights(good_path, limits, fits).bytes().size() == good.size());
+    }
+    CHECK(throws([&] { vision::GgufWeights w(good_path, limits, under); }, "host budget"));
+    CHECK(throws([&] { vision::GgufWeights w(good_path, limits, other); }, "admitted file"));
+    vision::HostBudget tiny;
+    tiny.max_bytes = 1024;
+    CHECK(throws([&] { vision::GgufWeights w(junk_path, limits, tiny); }, "host budget"));  // refused unread, not parsed
+    bool malformed = false;  // inside the budget: the header is what refuses it
+    try {
+        vision::GgufWeights w(junk_path, limits);
+    } catch (const std::exception& e) {
+        malformed = std::strstr(e.what(), "host budget") == nullptr;
+    }
+    CHECK(malformed);
+    CHECK(throws([&] { vision::GgufWeights w(dir / "strix-ds41-vision-absent.gguf", limits); }, "cannot open"));
+    std::error_code ignored;
+    std::filesystem::remove(good_path, ignored);
+    std::filesystem::remove(junk_path, ignored);
+}
+
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // a crash keeps the failures printed before it
     try {
         test_validate();
         test_weight_source();
         test_tables();
         test_patches_and_projector();
+        test_refusals();
     } catch (const std::exception& e) {
         std::printf("FAIL exception: %s\n", e.what());
         return 1;

@@ -15,6 +15,7 @@
 
 #include "strix/deepseek41_model.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/vision/compare.hpp"
 #include "strix/vision/encoder.hpp"
 #include "strix/vision/gguf_weights.hpp"
 #include "strix/vision/image.hpp"
@@ -227,7 +228,10 @@ int run(int argc, char** argv) {
 
     // Admission: the pinned byte count and SHA-256, then the strict structural validation.
     auto t0 = Clock::now();
-    vision::GgufWeights source{std::filesystem::path(model), ds::vision_reader_limits()};
+    // The pinned length is checked on the open file, before a byte of it is read into memory.
+    vision::HostBudget budget;
+    if (!unpinned) budget.exact_bytes = ds::pinned_file(ds::PinnedFileKind::vision_bf16).bytes;
+    vision::GgufWeights source{std::filesystem::path(model), ds::vision_reader_limits(), budget};
     const double read_ms = ms_since(t0);
     t0 = Clock::now();
     const ModelContentIdentity sha = sha256_bytes_fast(std::span<const std::byte>(source.bytes()));
@@ -295,20 +299,16 @@ int run(int argc, char** argv) {
             const vision::PatchGrid ours = adapter.patches(image);
             const double pre_ms = ms_since(t0);
             const vision::Size target = adapter.target(image.width, image.height);
-            double worst = 0.0;
-            std::size_t over = 0;
             const bool shape = ours.grid_h == c.grid_h && ours.grid_w == c.grid_w && target.width == c.resized_w &&
                                target.height == c.resized_h && ours.data.size() == ref_patches.size();
-            if (shape)
-                for (std::size_t i = 0; i < ref_patches.size(); ++i) {
-                    const double d = std::fabs(static_cast<double>(ours.data[i]) - static_cast<double>(ref_patches[i]));
-                    worst = std::max(worst, d);
-                    over += d > 1e-6;
-                }
-            const bool pass = shape && worst <= 1e-6;
+            // A NaN or infinity on either side fails here (it would vanish in a max or a > reduction).
+            const vision::AbsDiff diff = shape ? vision::abs_diff(ours.data, ref_patches, 1e-6) : vision::AbsDiff{};
+            const double worst = diff.worst;
+            const std::size_t over = diff.over;
+            const bool pass = shape && diff.pass;
             ok = ok && pass;
-            std::printf("preprocess %-14s %4dx%-4d -> %4dx%-4d grid %3ux%-3u  max|diff| %.3g  over %zu  %.1f ms  %s\n", c.name.c_str(),
-                        image.width, image.height, target.width, target.height, ours.grid_h, ours.grid_w, worst, over, pre_ms,
+            std::printf("preprocess %-14s %4dx%-4d -> %4dx%-4d grid %3ux%-3u  max|diff| %.3g  over %zu  non-finite %zu  %.1f ms  %s\n", c.name.c_str(),
+                        image.width, image.height, target.width, target.height, ours.grid_h, ours.grid_w, worst, over, diff.non_finite, pre_ms,
                         pass ? "PASS" : "FAIL");
         }
 

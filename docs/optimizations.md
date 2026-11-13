@@ -4427,6 +4427,42 @@ stay on the exact kernels: they select experts and tokens, where a flip is not a
 - **Measured:** Pair FAST prefill 8K 9.25 -> 9.05 s (-2.1 %, 2 ABAB pairs: 9.258 / 9.245 vs 9.034 / 9.073); 32K 37.74 -> 37.13 s (-1.6 %; off 37.705 / 37.771, on 36.990 / 37.280 / 37.105; one run of each arm at 41-43 s discarded as a disturbed run); kernels at 4096 rows: f_a + g_a + b 3.06 -> 1.71 ms, f_b / g_b (8192 outputs) 4.06 -> 2.03 ms.
 - **Off switch:** `STRIX_GLM_PF_KDA_WMMA=0` (or exact mode). `=1` forces it; both ranks of a pair must resolve the same value (checked by the startup agreement).
 
+<a id="f16-dense-epilogue-tail"></a>
+
+### Dense FP16 core: store policy, sized remainder launch, idle-wave skip (f16-dense-epilogue-tail)
+
+**Engine:** shared core (`src/core/f16_dense_tall.hpp`); users: vision encoder linears, GLM FAST KDA projections.
+**Controls:** `STRIX_F16_DENSE_TAIL`, `STRIX_VISION_GEMM_EPILOGUE`. **Default:** both on (bit-identical to off).
+
+Three changes to the shared dense FP16 WMMA core, built once and adopted by both users:
+
+1. **Store policy.** The core takes a `Store` (default `RawStore`: `y[r][c] = sum`). An adapter's policy applies its
+   epilogue in the same store. The vision GEMM uses it to finish the linear in place ((high + low) * scale + bias,
+   + residual, non-finite report), so the separate sum and affine kernels are no longer launched. Same operations in
+   the same order, no FMA contraction: the bytes do not change.
+2. **Sized remainder launch.** Outputs beyond the 16-tile columns used to run in 4-tile columns with the full
+   36,864-byte LDS block. LDS is now `Storage<TC>` (2,304 bytes per column tile) and `plan(tiles, rows)` picks 1-, 2-
+   or 4-tile columns from the measured rule: remainder of 1-2 tiles -> 1-tile columns; up to 256 rows -> 2-tile
+   columns; above that 2-tile columns up to 5 tiles and 4-tile columns from 6. An 8-tile width is not offered: it
+   compiles to 256 VGPRs with 120+ spills.
+3. **Idle-wave skip.** A row wave with no live row keeps its staging and barrier duties and skips its row loads and
+   WMMAs.
+
+| kernel | VGPRs | spills | occupancy | LDS bytes | WMMAs |
+|---|---|---|---|---|---|
+| 16-tile, before | 192 | 0 | 6 | 36,864 | 128 |
+| 4-tile, before | 224 | 0 | 6 | 36,864 | 32 |
+| 16-tile | 193 | 0 | 6 | 36,864 | 128 |
+| 4-tile | 249 | 0 | 5 | 9,216 | 32 |
+| 2-tile | 193 | 0 | 7 | 4,608 | 16 |
+| 1-tile | 153 | 0 | 9 | 2,304 | 8 |
+
+- **Preconditions:** none beyond the core's own (FP16 weights, widths multiples of 16).
+- **Exactness:** bit-identical. Core fixture: 25 shapes (rows 1 / 113 / 128 / 129 / 1024 x outputs 16 / 48 / 208 / 272 / 1024), every column width and skip on/off give the same bytes as the previous header, padding sentinels intact. Vision self-test (6 towers) and GLM KDA test (66 hashed cases): identical hashes before, after, and with both switches off.
+- **Measured (kernel, input width 1024, ms per call):** 129 x 272: 0.0675 -> 0.0636; 129 x 16: 0.0147 -> 0.0091; 129 x 208: 0.0157 -> 0.0123; 1 x 16: 0.0141 -> 0.0065; 1024 x 48: 0.0219 -> 0.0201; shapes with no remainder (n = 1024) and 1024 x 208 are unchanged (+-1 %).
+- **Measured (forward):** 32-layer width-1024 encoder tower, 1,521 rows (every width a multiple of 256, so no remainder launch): median 110.85 / 110.89 -> 110.83 / 110.66 ms (2 ABAB pairs, parity; mean GPU clock 1.12 GHz in both arms, about 124 M GPU clocks per forward). The fused epilogue removes the sum and affine launches without a measurable time change at this size; the store mode is selected once per wave (a per-element mode test cost 5 % of this forward).
+- **Off switch:** `STRIX_F16_DENSE_TAIL=0` (4-tile remainder, no skip), `STRIX_VISION_GEMM_EPILOGUE=0` (GEMM + sum + affine kernels).
+
 <a id="glm-pf-attn-wmma"></a>
 
 ### FAST fused MLA/DSA attention core (glm-pf-attn-wmma)

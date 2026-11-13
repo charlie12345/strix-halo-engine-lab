@@ -253,6 +253,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MMX_PREFILL_TAIL_STREAM` | minimax | 1 | [mm-pf-tail-stream](optimizations.md#mm-pf-tail-stream) |
 | `STRIX_MM_PFX` | minimax | on | [mm-rank-pfx](optimizations.md#mm-rank-pfx) |
 | `STRIX_MM_PFX_CHUNK` | minimax | 4194304 | [mm-pfx-chunk](optimizations.md#mm-pfx-chunk) |
+| `STRIX_MM_PFX_JOINED` | minimax | 1 | [mm-pfx-joined](optimizations.md#mm-pfx-joined) |
 | `STRIX_MM_PF_ASYNC_START` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_ATTEND4` | minimax | 1 | [mm-pf-attend4](optimizations.md#mm-pf-attend4) |
 | `STRIX_MM_PF_DENSE_O` | minimax | 1 | [mm-pf-dense-o](optimizations.md#mm-pf-dense-o) |

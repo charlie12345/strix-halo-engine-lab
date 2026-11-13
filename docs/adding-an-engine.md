@@ -233,6 +233,62 @@ boundary:
 The CPU backend is a correctness reference for the contracts and for host tests. It
 is not a production inference path.
 
+## Levers and switches
+
+A lever is an implementation choice with an off switch. Declare it as one row of a
+`strix::lever::Decl` table (`include/strix/lever.hpp`): its `STRIX_*` switch, its
+exactness class (`bitwise`: on by default; `bit_changing`: off until the engine's
+gate opens), its default, and, when it wins only in some regimes, the crossover on
+one axis (rows, context tokens or concurrent streams). `lever::select` is the
+decision rule (explicit switch, then gate, then regime, then default) and records
+the result for `--print-effective-config`; `lever::require_consistent` refuses two
+levers that the table declares incompatible. `static_assert(lever::valid(table))`
+checks the table at compile time.
+
+The environment-reading overload is for startup configuration: it allocates and
+records under the shared registry mutex. Capture an owned switch value at startup
+and use the explicit-value overload for per-request or per-launch decisions.
+Existing `profile::Lever` and `profile::DefaultItem` rows in `engine_profile.hpp`
+remain authoritative for profile values, defaults and qualification. Before an
+engine adopts `lever::Decl`, provide a shared adapter deriving the overlapping
+fields from those rows; do not maintain a second set of names or metadata.
+
+Read any other switch through `include/strix/env_flags.hpp`. The
+`strix-env-switch-census` test (`tools/env_switch_census.py --check`) fails when a
+new switch is read with a raw `getenv`, or when one boolean switch is read with two
+different defaults. `tools/env_switch_baseline.txt` lists the switches that are
+still read raw; after introduction it only shrinks (`--update` removes migrated names).
+`tools/env_switch_census.py --report` prints the current counts.
+`--seed` creates a baseline only when the destination does not exist. The census
+tracks literal names, including adjacent ordinary string literals; runtime-built
+names and wrapper reads are outside its scope. Escapes in raw literal names are
+rejected because this scanner does not decode C++ escapes. Existing baseline names may gain
+raw read sites, so a passing census is not proof that all configuration is governed.
+
+### grandfathered at introduction — 2026-11-13
+
+These switches reached main before the census ratchet landed. The explicit
+`python tools/env_switch_census.py --grandfather NAME... --root .` route adds only
+the named switches and refuses any name not currently read raw, without writing
+on refusal. CMake continues to call `--check`, never `--grandfather`.
+
+| Switch | File | Owner area | Status |
+|---|---|---|---|
+| `STRIX_BATCH_NEST_RATIO` | `apps/hip_mtp_decode_bridge.hpp` | Qwen HTTP scheduling | to be governed |
+| `STRIX_GLM_PF_DENSE_FORM` | `src/glm/prefill/glm_prefill.hip` | GLM prefill | to be governed |
+| `STRIX_HOST_WAIT` | `src/device/hip_gate.cpp`, `src/device/hip_gate_none.cpp` | Shared device host-wait policy | to be governed |
+| `STRIX_MM_PF_MSA_FLASH` | `src/minimax/engine/engine.hip` | MiniMax prefill | to be governed |
+| `STRIX_MM_PF_MSA_FLASH_LAYERS` | `src/minimax/engine/engine.hip` | MiniMax prefill | to be governed |
+| `STRIX_MSA_TEST_FLASH` | `src/minimax/attn/msa_fused_tests.hip` | MiniMax attention qualification | to be governed |
+| `STRIX_PREFILL_FINAL_CONE` | `src/known_prefix_prefill_runtime.cpp` | Shared known-prefix prefill | to be governed |
+| `STRIX_PREFILL_FINAL_CONE_ROWS` | `src/known_prefix_prefill_runtime.cpp` | Shared known-prefix prefill | to be governed |
+| `STRIX_PROMPT_BATCH_LOG` | `apps/hip_mtp_decode_bridge.hpp` | Qwen HTTP scheduling | to be governed |
+
+`STRIX_GLM_ABA_FOLD` in `apps/glm_rank_main.cpp` instead uses `envcfg::flag`
+with exact matching: only `"1"` enables it, as before. `--update` removed
+`STRIX_CONSTRAINT_MASK_AHEAD`, `STRIX_CONSTRAINT_RANKED` and `STRIX_DS41_PF_CORE`
+because they are no longer read raw.
+
 ## Checklist
 
 1. `models/<model>.toml`, registry row, CMake option `STRIX_FAMILY_<NAME>`.

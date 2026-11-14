@@ -23,6 +23,7 @@
 #include "strix/ds41_weight_overlay.hpp"
 #include "strix/hip_ds41_attention.hpp"
 #include "strix/hip_ds41_formats.hpp"
+#include "strix/ds41_fast_profile.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 #include "strix/hip_ds41_rn_table.hpp"
@@ -530,7 +531,26 @@ struct DevicePrefill::Impl {
     // window K/V of the layer is written before its attention windows, which then depend only on the layer's caches and
     // run on several lanes. Its live window goes to the layer's decode ring at the end.
     Dev<std::uint8_t> prefill_ring;
+    // ds41-attn-bf16flash-v1: BF16 mirrors of the ring (per entry, as written) and of the layer's compressed cache
+    Dev<std::uint16_t> ring16, kv16;
+    bool flash_run = false;   // this run starts a new prompt (every ring entry it reads is written, and mirrored, by it)
+    bool flash_attn_at(std::uint32_t layer) const {
+        if (!flash_run || !options.fast_attention_flash || !fast_attn_at(layer)) return false;
+        if (ring16.p == nullptr) throw std::logic_error("ds41-attn-bf16flash-v1: missing ring mirror");
+        return true;
+    }
     std::uint32_t prefill_capacity = 0;
+    void prepare_flash_mirrors() {
+        if (ring16.p != nullptr) return;
+        std::uint32_t ratio = 0;
+        for (const auto& role : roles) if (role.ratio != 0U && (ratio == 0U || role.ratio < ratio)) ratio = role.ratio;
+        const std::size_t rows = std::size_t{prefill_capacity} - options.window_rows - ds41::attn::kWindow;
+        Dev<std::uint16_t> ring(std::size_t{prefill_capacity} * ds41::attn::kHeadDim);
+        Dev<std::uint16_t> compressed_mirror(ratio != 0U ? (rows / ratio + 1U) * ds41::attn::kHeadDim : 0U);
+        ring.zero(stream);
+        ring16 = std::move(ring);
+        kv16 = std::move(compressed_mirror);
+    }
     // in-run snapshots (set_snapshot_points): the points of the next run, those of the last run and their rings
     // (point-major, one ring_capacity ring per layer)
     std::vector<std::uint32_t> snap_next, snap_points;
@@ -661,7 +681,10 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")options.fp16_dense=true;
     if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")options.bf16_attention=true;
-    if (const char* e = std::getenv("STRIX_DS41_FAST_ATTN"); e != nullptr && std::string(e) == "1") options.fast_attention = true;
+    if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
+        options.fast_attention = true;
+        if (e[0] == '2') options.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
+    }
     // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
     // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
     // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
@@ -893,6 +916,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     m.prefill_capacity = static_cast<std::uint32_t>(T + W + attn::kWindow);
     m.prefill_ring = Dev<std::uint8_t>(std::size_t{m.prefill_capacity} * attn::kWindowEntryBytes);
     m.prefill_ring.zero(m.stream);
+    if (m.options.fast_attention && m.options.fast_attention_flash) m.prepare_flash_mirrors();
     check(hipEventCreateWithFlags(&m.chunk_ready, hipEventDisableTiming), "event");
     check(hipStreamCreateWithFlags(&m.comm_stream, hipStreamNonBlocking), "comm stream");
     for (auto& e : m.half_ready) check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "event");
@@ -1406,6 +1430,8 @@ void DevicePrefill::set_dense_select(bool on) {
 }
 
 void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
+    if (impl_->task) throw std::logic_error("cannot change precision during a prefill task");
+    if (p.fast_attention && p.fast_attention_flash) impl_->prepare_flash_mirrors();
     set_precision_for_new_sequence(p.fp16_dense, p.bf16_attention);
     auto& o = impl_->options;
     o.fp16_projections = p.fp16_projections;
@@ -1419,7 +1445,10 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.null_seed = p.null_seed;
     o.trace = p.trace;
     o.fast_attention = p.fast_attention;
+    o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
+    o.fast_dense = p.fast_dense;
+    ds41::set_fast_dense(p.fast_dense ? 1 : 0);
     ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
 }
 
@@ -1490,6 +1519,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     namespace attn = ds41::attn;
     const std::uint32_t T = static_cast<std::uint32_t>(tokens.size());  // rows of this run, at positions [P0, P0 + T)
     const std::uint32_t P0 = start;
+    m.flash_run = P0 == 0U;
+    bool flash_reported = false;
     const std::uint32_t max_rows = m.options.max_rows != 0U ? m.options.max_rows : m.options.max_positions;
     if (T == 0U || T > max_rows || std::uint64_t{P0} + T > m.options.max_positions)
         throw std::invalid_argument("deepseek41 prefill: rows outside 1..max_rows or positions beyond max_positions");
@@ -2363,6 +2394,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     v.capacity = m.prefill_capacity;
                     v.ring = m.prefill_ring.p;
                     attn::hip::enqueue_window_write(v, st);
+                    if (m.flash_attn_at(layer))   // the entries just written, as BF16
+                        attn::hip::enqueue_attention_flash_mirror({m.prefill_ring.p, m.ring16.p, v.pos, n, m.prefill_capacity, true}, st);
                 };
                 const auto compress = [&](const float* ckv, const float* cscore, std::uint32_t w0, std::uint32_t n) {
                     attn::hip::CompressView v{};
@@ -2505,6 +2538,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     if (peer_ring + peer_comp) {
                         final_entries_kernel<false><<<peer_ring + peer_comp, 128, 0, st>>>(fe);
                         check(hipGetLastError(), "final entries unpack");
+                        // Both exchange paths join here. Publish received keys to the mirror on st before chunk_ready.
+                        if (peer_ring && m.flash_attn_at(layer))
+                            attn::hip::enqueue_attention_flash_mirror(
+                                {m.prefill_ring.p, m.ring16.p, fe.ring_pos, peer_ring, m.prefill_capacity, true}, st);
                     }
                     if (carry_words && !last_local) {
                         const std::size_t peer_carry = std::size_t{peer_words} - carry_words;
@@ -2548,6 +2585,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     const std::size_t at = std::size_t{owner_window(k)} * W * D;
                     if (w0 >= R0.k0) ring_write((mine ? m.kv.p : m.peer_kv.p) + at, w0, n, rope_rows + w0);
                     if (r.owns_kv) compress((mine ? m.ckv.p : m.peer_ckv.p) + at, (mine ? m.cscore.p : m.peer_cscore.p) + at, w0, n);
+                }
+                if (m.flash_attn_at(layer) && r.ratio != 0U) {   // the layer's compressed entries so far, as BF16
+                    const std::uint32_t entries = T / m.roles[static_cast<std::size_t>(r.kv_source)].ratio;
+                    attn::hip::enqueue_attention_flash_mirror({m.attn[static_cast<std::size_t>(r.kv_source)].kv_cache.p, m.kv16.p, nullptr, entries, 0U, false}, st);
                 }
                 mark_part(1);
                 if (defer && layer >= first_decoder) return;  // deferred: the compressed entries are in; no rows, no ring save
@@ -2670,7 +2711,16 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             v.sums = m.osums.p + std::size_t{w0 - r0} * QL / 32U;
                         }
                         if(m.bf16_at(layer)) attn::hip::enqueue_attention_bf16_prefill(v,ls);
-                        else if (m.fast_attn_at(layer)) attn::hip::enqueue_attention_f16wmma_prefill(v, ls);
+                        else if (m.flash_attn_at(layer)) {
+                            if (heads % 32U != 0U) throw std::invalid_argument("ds41-attn-bf16flash-v1: requires a multiple of 32 heads");
+                            v.ring16 = m.ring16.p;
+                            v.kv16 = m.kv16.p;
+                            attn::hip::enqueue_attention_flash_prefill(v, ls);
+                            if (!flash_reported) {
+                                std::fprintf(stderr, "deepseek41 prefill effective attention: ds41-attn-bf16flash-v1\n");
+                                flash_reported = true;
+                            }
+                        } else if (m.fast_attn_at(layer)) attn::hip::enqueue_attention_f16wmma_prefill(v, ls);
                         else attn::hip::enqueue_attention(v, ls);
                     }
                     close_halves();  // the previous chunk's wo_b halves crossed meanwhile; y_own is free again

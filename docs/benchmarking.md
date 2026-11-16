@@ -95,3 +95,5 @@ Served runs share the ticket deadline and require both ranks, telemetry and comp
 TURBO ablations are provisional experiments, not qualification evidence. `no-gdn_chunk` removes the dependent GDN gates as well as the chunk kernel. Groups after the first have a default anchor but no full-bundle anchor; do not claim marginal gains under drift without adding an `all` anchor and rotating arm order. Pending manifest rows are inspection-only until their adapters and qualification gates exist.
 
 MiniMax TURBO flash is pending adapter admission/export; its manifest is inspection-only (`bash scripts/bench/turbo/ablate.sh arms minimax --pending`). Qwen single-process power reports lack prefill execution timestamps, so length-matrix receipts remain invalid when no independently timed prefill line is available. Final-report arrival must not anchor prefill telemetry.
+
+For controlled exact/onfly decode diagnosis, see [the TURBO decode measurement kit](../scripts/bench/turbo/README.md) (header layout census, small-row projection benchmark and diagnostic trace adapters).

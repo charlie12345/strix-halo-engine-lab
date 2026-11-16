@@ -26,6 +26,14 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/wd4389> $<$<COMPILE_LANGUAGE:CXX>:/wd4459>)
 endif()
 
+# Isolated shared CUDA-core qualification, with no model/runtime dependency.
+option(STRIX_CUDA_NVFP4_ONLY "Build only shared NVFP4 host/native checks" OFF)
+if(STRIX_CUDA_NVFP4_ONLY)
+    enable_testing()
+    add_subdirectory(tests/nvfp4)
+    return()
+endif()
+
 option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
 
 # Standalone CUDA Qwen prefill and host-only scheduling/codec checks.

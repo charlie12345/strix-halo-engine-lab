@@ -439,6 +439,7 @@ private:
         std::vector<std::uint64_t> capture_points;
         double prefix_restore_ms = 0, prefix_capture_ms = 0;
         qc::Stream stream;
+        std::unique_ptr<qc::ContextDraft> ctx;  // context copy/n-gram drafter of this request (STRIX_QRTX_CONTEXT_DRAFT)
         serve::GenerationStats st;
         Clock::time_point t0, t_decode;
         double prefill_gpu_ms = 0;   // overlapped chunks: GPU time on the prefill stream (events)
@@ -685,7 +686,13 @@ private:
         s.st.prefill_ms = std::chrono::duration<double, std::milli>(s.t_decode - s.t0).count();
         if (job.on_progress) job.on_progress({serve::GenerationPhase::decode, s.n, 0, s.n});
         s.phase = Phase::decode;
-        s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max};
+        s.ctx.reset();
+        if (mtp_ && context_mode_ != qc::ContextMode::off) {
+            // the drafter's context is what the session holds; the pending (last prompt) token joins at the first step
+            s.ctx = std::make_unique<qc::ContextDraft>(context_mode_);
+            s.ctx->drafter.reset(std::span<const std::uint32_t>(job.prompt.data(), s.n - 1));
+        }
+        s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get()};
         s.st.finish = "length";
         if (job.max_tokens == 0) finish(s, {}, "length");
     }
@@ -748,11 +755,14 @@ private:
                 finish(s, step.error, "length");
                 continue;
             }
-            if (lone) dh_->finish_fixed(opt.depth, step.tokens.size() - 1, std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
-                                        step.drafted == opt.depth && step.rows == opt.depth + 1U);
+            // Context windows do not measure predictor acceptance or its whole-step cost.
+            if (lone && step.drafted > 0 && step.context_proposed == 0) dh_->finish_fixed(opt.depth, step.mtp_accepted, std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
+                                        step.drafted == opt.depth && step.mtp_proposed == opt.depth && step.rows == opt.depth + 1U);
             ++s.st.cycles;
-            s.st.proposed += step.drafted;
-            s.st.accepted += step.tokens.size() - 1;
+            s.st.proposed += step.mtp_proposed;
+            s.st.accepted += step.mtp_accepted;
+            s.st.ngram_rows += step.context_proposed;
+            s.st.ngram_accepted += step.context_accepted;
             s.rows += step.rows;
             s.window_sessions += step.window_sessions;
             s.max_window_sessions = std::max<std::uint64_t>(s.max_window_sessions, step.window_sessions);
@@ -797,7 +807,12 @@ private:
             static_cast<double>(e_.session_bytes(s.session)) / 1048576.0, s.admit_free_mib, live_slots());
         std::string extra = head;
         for (std::size_t i = 0; i < s.emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(s.emitted[i]);
-        extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
+        extra += "]";
+        if (s.ctx) extra += std::string(",\"context_draft\":\"") + qc::context_mode_name(context_mode_) + "\",\"copy_first_steps\":" +
+            std::to_string(s.ctx->copy_first_steps) + ",\"context_extended_steps\":" + std::to_string(s.ctx->extended_steps) +
+            ",\"context_rows\":" + std::to_string(s.ctx->context_rows) + ",\"copy_first_accepted\":" + std::to_string(s.ctx->context_accepted) +
+            ",\"context_host_us\":" + std::to_string(static_cast<long long>(s.ctx->host_us));
+        extra += ",\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
             + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + "}";
         st.engine_extra.emplace_back("rtx", extra);
         queue_.finish(*s.job, std::move(st), error);
@@ -811,6 +826,7 @@ private:
     px::Cache& cache_;
     std::vector<Slot> slots_;
     bool mtp_ = false;
+    const qc::ContextMode context_mode_ = qc::context_mode_default();
     std::unique_ptr<strix::MtpDepthHost> dh_;  // measured-cost lone-stream depth (STRIX_MTP_CONTROLLER=depth)
     std::uint32_t max_chunk_ = 1024, auto_rows_ = 256, first_rows_ = 0, fit_n_ = 0, inflight_steps_ = 0;
     Slot* inflight_ = nullptr;  // overlap: the slot whose chunk is on the prefill stream
@@ -844,7 +860,10 @@ int main(int argc, char** argv) {
             return plan.decision.ok ? 0 : 3;
         }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
-        if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth << std::endl;
+        if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth
+            << ", context_draft=" << qc::context_mode_name(qc::context_mode_default())
+            << ", context_draft_effective=" << qc::context_mode_name(o.http_slots > 1 ? qc::context_mode_default() : qc::ContextMode::off)
+            << ", context_draft_applicable=" << (o.http_slots > 1 ? "cohort" : "no (single-slot loop)") << std::endl;
         qp::Prefill engine(o.engine);
         o.engine.max_positions = engine.max_positions();  // resolved limit for admission, cache and capabilities
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;

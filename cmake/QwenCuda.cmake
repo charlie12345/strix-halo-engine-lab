@@ -57,7 +57,8 @@ add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
 # Shared MTP window controllers (also linked by the HIP engine): measured-cost depth/rows policy and its host adapter.
-add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp)
+add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp
+            src/mtp_context_draft.cpp)
 target_include_directories(strix_mtp_depth PUBLIC include)
 add_executable(qwen_mtp_depth_host_test tests/cuda/qwen_mtp_depth_host_test.cpp)
 target_link_libraries(qwen_mtp_depth_host_test PRIVATE strix_mtp_depth)
@@ -83,7 +84,7 @@ add_executable(qwen_session_reservation_test tests/session_reservation_tests.cpp
 target_include_directories(qwen_session_reservation_test PRIVATE include)
 add_test(NAME qwen_session_reservation COMMAND qwen_session_reservation_test)
 add_executable(qwen_cohort_e2e tests/cuda/qwen_cohort_e2e.cu)
-target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
+target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff strix_mtp_depth)
 # Multi-segment QSA core == per-segment layer_core on random data (device, no model): qwen_qsa_multi_test <tables dir>
 add_executable(qwen_qsa_multi_test tests/cuda/qwen_qsa_multi_test.cu)
 target_link_libraries(qwen_qsa_multi_test PRIVATE strix_qwen_cuda)

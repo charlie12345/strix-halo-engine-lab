@@ -603,6 +603,18 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-env-flags-tests)
     add_test(NAME strix-env-flags-tests COMMAND strix-env-flags-tests)
     set_tests_properties(strix-env-flags-tests PROPERTIES LABELS "cpu;env")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    find_program(STRIX_PFAB_TEST_BASH NAMES bash)
+    if(Python3_Interpreter_FOUND AND STRIX_PFAB_TEST_BASH)
+        foreach(case summary pair)
+            add_test(NAME strix-pfab-kit-tests-${case} COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/bench/pfab/tests/test_pfab_kit.py"
+                ${case} "${STRIX_PFAB_TEST_BASH}")
+            set_tests_properties(strix-pfab-kit-tests-${case} PROPERTIES
+                ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1;PFAB_TEST_TMP=${CMAKE_CURRENT_BINARY_DIR}")
+        endforeach()
+        set_tests_properties(strix-pfab-kit-tests-pair PROPERTIES TIMEOUT 90)
+    endif()
     add_executable(strix-chunk-contract-tests tests/chunk_contract_tests.cpp)
     target_include_directories(strix-chunk-contract-tests PRIVATE src)
     target_compile_features(strix-chunk-contract-tests PRIVATE cxx_std_20)
@@ -5575,6 +5587,51 @@ if(STRIX_FAMILY_GLM5)
         target_compile_features(strix-glm5-rank-defaults-cpu-tests PRIVATE cxx_std_20)
         strix_target_warnings(strix-glm5-rank-defaults-cpu-tests)
         add_test(NAME strix-glm5-rank-defaults-cpu-tests COMMAND strix-glm5-rank-defaults-cpu-tests)
+        # GLM MLA dispatch (host-only): the real explicit/automatic entry points of glm_prefill.hip, compiled with a
+        # recording stub; exact version APIs never take FAST, resolved switches are cached (no copied dispatch logic).
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/glm/prefill/glm_prefill.hip" strix_glm_mla_prefill_src)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/glm/prefill/glm_prefill.hip")
+        string(FIND "${strix_glm_mla_prefill_src}" "\nvoid mla_attention_rows_versions(" strix_glm_mla_begin)
+        if(strix_glm_mla_begin LESS 0)
+            message(FATAL_ERROR "glm_prefill.hip: MLA explicit entry points missing")
+        endif()
+        string(SUBSTRING "${strix_glm_mla_prefill_src}" ${strix_glm_mla_begin} -1 strix_glm_mla_wrappers)
+        string(REPLACE "}  // namespace strix::glm::pf" "" strix_glm_mla_wrappers "${strix_glm_mla_wrappers}")
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/glm_mla_dispatch/mla_wrappers.inc" "${strix_glm_mla_wrappers}")
+        add_executable(strix-glm-mla-dispatch-host-tests tests/glm_mla_dispatch_host_tests.cpp)
+        target_compile_features(strix-glm-mla-dispatch-host-tests PRIVATE cxx_std_20)
+        target_include_directories(strix-glm-mla-dispatch-host-tests PRIVATE src include
+            "${CMAKE_CURRENT_BINARY_DIR}/glm_mla_dispatch")
+        strix_target_warnings(strix-glm-mla-dispatch-host-tests)
+        foreach(mode inherit off force)
+            add_test(NAME strix-glm-mla-dispatch-host-tests-${mode} COMMAND strix-glm-mla-dispatch-host-tests ${mode})
+            set_tests_properties(strix-glm-mla-dispatch-host-tests-${mode} PROPERTIES TIMEOUT 10)
+        endforeach()
+        # Compile the real overlap diagnostic guard with host-only recording work.
+        string(FIND "${strix_glm_mla_prefill_src}" "static void topk_overlap_diag(" strix_glm_overlap_begin)
+        string(FIND "${strix_glm_mla_prefill_src}" "    unsigned long long z[2][4] = {};" strix_glm_overlap_end)
+        if(strix_glm_overlap_begin LESS 0 OR strix_glm_overlap_end LESS 0 OR
+           strix_glm_overlap_end LESS_EQUAL strix_glm_overlap_begin)
+            message(FATAL_ERROR "glm_prefill.hip: overlap host guard boundaries missing")
+        endif()
+        math(EXPR strix_glm_overlap_length "${strix_glm_overlap_end} - ${strix_glm_overlap_begin}")
+        string(SUBSTRING "${strix_glm_mla_prefill_src}" ${strix_glm_overlap_begin}
+            ${strix_glm_overlap_length} strix_glm_overlap_guard)
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/glm_env_arms/overlap_guard.inc"
+            "${strix_glm_overlap_guard}(void)tokens; (void)n; (void)C; (void)s; ++diagnostic_calls;\n}\n")
+        add_executable(strix-glm-env-arms-host-tests tests/glm_env_arms_host_tests.cpp)
+        target_compile_features(strix-glm-env-arms-host-tests PRIVATE cxx_std_20)
+        target_include_directories(strix-glm-env-arms-host-tests PRIVATE include
+            "${CMAKE_CURRENT_BINARY_DIR}/glm_env_arms")
+        if(MSVC)
+            target_compile_definitions(strix-glm-env-arms-host-tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endif()
+        strix_target_warnings(strix-glm-env-arms-host-tests)
+        foreach(case no-arms governed-snapshot overlap-cache)
+            add_test(NAME strix-glm-env-arms-host-tests-${case} COMMAND strix-glm-env-arms-host-tests ${case})
+            set_tests_properties(strix-glm-env-arms-host-tests-${case} PROPERTIES TIMEOUT 10)
+        endforeach()
         if(TARGET strix_serve)
             # strix-glm5-serve control channel, lead / follower protocol and scheduling on a fake engine (host-only)
             if(NOT MSVC)  # the GLM host arithmetic uses compiler builtins
@@ -5694,6 +5751,9 @@ if(STRIX_FAMILY_GLM5)
             add_executable(strix-hip-glm5-pf-kda-wmma-tests tests/hip_glm_pf_kda_wmma_tests.hip)  # FAST glm-pf-kda-wmma-v1 contract + drift gate + timing
             target_link_libraries(strix-hip-glm5-pf-kda-wmma-tests PRIVATE strix_glm5_engine)
             list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-kda-wmma-tests)
+            add_executable(strix-hip-glm5-pf-mla-wmma-tests tests/hip_glm_pf_mla_wmma_tests.hip)  # FAST glm-pf-mla-wmma-v1 contract + drift gate + timing
+            target_link_libraries(strix-hip-glm5-pf-mla-wmma-tests PRIVATE strix_glm5_engine)
+            list(APPEND strix_glm5_hip_targets strix-hip-glm5-pf-mla-wmma-tests)
             add_executable(strix-hip-fma-rows-tests tests/hip_fma_rows_tests.hip)  # shared exact FMA-rows core: bitwise gate + timing
             target_link_libraries(strix-hip-fma-rows-tests PRIVATE strix_glm5_engine)
             list(APPEND strix_glm5_hip_targets strix-hip-fma-rows-tests)

@@ -1068,6 +1068,24 @@ private:
     std::chrono::steady_clock::time_point start_;
 };
 
+// UMA admission charges both device and host payloads conservatively against each
+// memory limit. These allocations are absent from the stack/tiled-owner probe.
+inline std::uint64_t mtp_wide_copy_retained_bytes(const ModelContract& model,
+    const SerialSessionStateLayout& layout, std::span<const std::uint32_t> sizes) {
+    if(sizes.empty()) return 0;
+    const auto rows=sizes.front();
+    if(!rows || !model.hc_count || model.hidden_size>UINT64_MAX/model.hc_count/2U/rows)
+        throw std::overflow_error("MTP wide hidden rows overflow");
+    std::uint64_t snapshot=0;
+    for(const auto& allocation:layout.allocations) {
+        if(allocation.component==SessionStateComponent::attention_kv || allocation.component==SessionStateComponent::sparse_index) continue;
+        snapshot=http_slot_retained_bytes(snapshot,allocation.bytes,0,0,0);
+    }
+    return http_slot_retained_bytes(static_cast<std::uint64_t>(model.hidden_size)*model.hc_count*2U*rows,
+        hip_greedy_rows_scratch_bytes(hip_greedy_rows_max,static_cast<std::uint32_t>(model.vocab_size)),
+        sizeof(HipGreedyRowsReply)*rows,sizeof(float)*model.vocab_size,snapshot);
+}
+
 // --mtp-copy-wide-rows N[,M]: the wide copy verify over the tiled tail owner of exactly each listed size (descending;
 // null when none). Each needs the all-rows output policy and the decode catalog: no split prefill profile hands the
 // session to another execution.
@@ -1161,6 +1179,11 @@ public:
         std::shared_ptr<HipMtpWindowVerifier> window;
         std::byte* held = nullptr; // h_{P-1} of the tiled prompt
         std::unique_ptr<HipMtpGreedyRuntime> greedy;
+        // Built with the admitted slot, before request execution. Slot zero shares its workspace with the
+        // single-request session runner over the same target. wide_ok: this request's drafter is the
+        // CLI's =wide/=copy configuration (greedy, no constraint, no sampler, not opted out).
+        std::shared_ptr<MtpWideCopyCycle> wide;
+        bool wide_ok = false;
         HipMtpTargetHiddenTicket pending;
         OutputLogitsChain output_chain;
         bool active = false;     // the slot holds a request (prefilling or decoding)
@@ -1201,6 +1224,11 @@ public:
     using EnableContext = std::function<void(HipMtpGreedyRuntime&, std::span<const std::uint32_t>, const std::shared_ptr<TokenSampler>&,
         std::optional<bool>)>;
     EnableContext enable_context;
+    // Wide copy cycle (mtp_wide_copy_rows_effective, empty = off): the sizes and the CLI drafter configuration
+    // (enable_wide = the CLI's enable_ngram for the request's prompt). Runs only while exactly one slot is active.
+    std::vector<std::uint32_t> wide_rows;
+    std::function<void(HipMtpGreedyRuntime&,std::span<const std::uint32_t>)> enable_wide;
+    std::uint64_t wide_cycles = 0;
     // STRIX_BATCH_NGRAM_PEERS=1 (opt-in): each decoding request's n-gram extension also looks up the committed
     // contexts of the other decoding requests (joint speculation across concurrent conversations).
     bool context_peers = strix::envcfg::flag("STRIX_BATCH_NGRAM_PEERS", false);
@@ -1527,6 +1555,14 @@ public:
         else (void)run_decode_round();
     }
 private:
+    // The wide copy cycle runs only for the one live request of the whole runner: no other slot holds a request
+    // (decoding, prefilling or paused), so the shared tail-owner scratch it uses cannot alias another slot's prompt.
+    [[nodiscard]] bool wide_allowed(const Slot& s) const {
+        if (wide_rows.empty() || !s.wide || !s.wide_ok || s.request.constraint || s.request.sampler || !s.greedy) return false;
+        if (prefix_batch_cert_execution_mode(options_) && prompt_terminal_digest_enabled()) return false; // no per-row output digests
+        for (const auto& o : slots_) if (o.get() != &s && o->active) return false;
+        return !paused_;
+    }
     bool run_decode_round() {
         using clock=std::chrono::steady_clock;
         last_decode_round_=clock::now();
@@ -1627,9 +1663,16 @@ private:
             ++stats_.solo_steps;
             try {
                 auto transaction=s.request.constraint?s.request.constraint->window_transaction():nullptr;
-                auto result = s.greedy->cycle(s.pending, depth(s), budget(s), s.request.stop_tokens,transaction.get());
+                std::optional<HipMtpGreedyCycleResult> wide_result;
+                if (wide_allowed(s)) {
+                    wide_result = s.wide->cycle(*s.greedy, s.pending, budget(s), s.request.stop_tokens);
+                    if (wide_result) ++wide_cycles;
+                }
+                const bool wide_used = wide_result.has_value();
+                auto result = wide_result ? std::move(*wide_result)
+                    : s.greedy->cycle(s.pending, depth(s), budget(s), s.request.stop_tokens,transaction.get());
                 runtime_done(std::span<const HipMtpGreedyCycleResult>(&result, 1U));
-                apply(s, std::move(result));
+                apply(s, std::move(result), wide_used);
                 receipt_done();
             } catch(const serve::ConstraintError& e) {
                 if(s.session->health==SerialSessionHealth::poisoned || (s.window && s.window->failed()))throw;
@@ -2087,7 +2130,10 @@ private:
                 s.parents->resources, *s.dispatcher, s.parents);
             if (s.window) s.greedy->use_window_verifier(s.window);
             if (m.draft_chain) s.greedy->set_draft_min_probability(mtp_draft_min_probability(m));
-            if (!s.request.constraint && enable_context) enable_context(*s.greedy, s.request.prompt, s.request.sampler, s.request.ngram_draft);
+            s.wide_ok = !wide_rows.empty() && enable_wide && !s.request.constraint && !s.request.sampler && s.window &&
+                !s.window->survival_controller() && m.draft_chain && !(s.request.ngram_draft && !*s.request.ngram_draft);
+            if (s.wide_ok) enable_wide(*s.greedy, s.request.prompt);
+            else if (!s.request.constraint && enable_context) enable_context(*s.greedy, s.request.prompt, s.request.sampler, s.request.ngram_draft);
             if (s.request.draft_depth_max) s.greedy->set_draft_depth_max(s.request.draft_depth_max);
             if (!s.request.constraint && (s.request.tool_draft ? *s.request.tool_draft : tool_draft_default) && frame_tokens[0] != frame_tokens[1] &&
                 !s.request.sampler && s.window && !s.window->survival_controller() && m.draft_chain) {
@@ -2113,7 +2159,7 @@ private:
         }
         emitted(s, first);
     }
-    void apply(Slot& s, HipMtpGreedyCycleResult result) {
+    void apply(Slot& s, HipMtpGreedyCycleResult result, bool wide = false) {
         if (result.emitted_tokens.empty() && !result.selection_failure) throw std::runtime_error("batched MTP generation made no completed target progress");
         if(result.selection_receipt){result.selection_receipt->publish();result.selection_receipt.reset();}
         if(result.selection_failure.has_value()) {
@@ -2132,7 +2178,7 @@ private:
         s.result.proposed += result.proposed_candidates;
         s.result.accepted += result.accepted_candidates;
         s.result.generated_tokens += result.emitted_tokens.size();
-        ++s.chosen_rows[std::clamp<std::uint32_t>(result.target_window_rows, 1U, 8U)];
+        if (!wide) ++s.chosen_rows[std::clamp<std::uint32_t>(result.target_window_rows, 1U, 8U)]; // wide: not an 8-row window
         emitted(s, result.emitted_tokens);
     }
     // Publishes tokens and ends the request at a stop token, its budget, the context, or a cancel.
@@ -2627,8 +2673,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             if(draft_sampler && m.sample_speculation)draft_runtime.set_draft_sampler(draft_sampler);
         };
         const auto enable_draft=[&](std::span<const std::uint32_t> prompt) {enable_draft_on(*runtime,prompt,sampler);};
-        // --mtp-copy-wide-rows (single requests; the batched route rejects it): null when off.
-        const auto wide_copy=qualify?std::unique_ptr<MtpWideCopyCycle>{}:make_mtp_wide_copy(*parents,m.copy_wide_rows,*target);
+        // Resolve once for CLI, single HTTP (including capacity fallback) and batch slots.
+        const auto wide_rows=mtp_wide_copy_rows_effective(options);
+        const std::shared_ptr<MtpWideCopyCycle> wide_copy=qualify?std::unique_ptr<MtpWideCopyCycle>{}:
+            make_mtp_wide_copy(*parents,wide_rows,*target);
         if(tiled_prompt) {
             calibration_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-calibration_start).count();
             // The calibration rows only qualified the predictor: start the real prompt from a fresh
@@ -2845,6 +2893,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 auto first=std::make_unique<MtpBatchRunner::Slot>();
                 first->parents=parents;first->session=&session;first->dispatcher=&dispatcher;
                 first->native=native;first->target=target;first->window=window;first->held=tiled_held;
+                first->wide=wide_copy;
                 parents->tiled.window=window.get();
                 slots.push_back(std::move(first));
                 const auto install_restore = [&](MtpBatchRunner::Slot& slot) {
@@ -2870,6 +2919,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     if(deferred_status)own_d1={setup.parents->resources.session_state_layout,&generations};
                     slot->target=HipMtpTargetHidden::create(model,compiled,own.memory,own.model,own.allocator,
                         retained_rows,m.target_capture_bytes,own_d1);
+                    slot->wide=make_mtp_wide_copy(*slot->parents,wide_rows,*slot->target);
                     if(m.window_rows) {
                         if(!setup.make_window)throw std::invalid_argument("batched MTP slot has no window factory");
                         slot->window=setup.make_window(slot->target);
@@ -2910,6 +2960,21 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     const std::string mode=mode_env?mode_env:"";
                     const bool engine_on=mode=="1" || mode=="on" || mode=="ctx";
                     const bool use_context=mode=="ctx" || m.ngram_context;
+                    runner.wide_rows=wide_rows;
+                    if(!runner.wide_rows.empty()) {
+                        // Startup check of the owners the wide cycle needs (same lookup the cycle builds from), so a
+                        // configuration that cannot run it fails here and not on a request.
+                        // split prefill profile: the decode-profile wide owners (tiled.wide), else the all-rows tail owners
+                        const bool split_profile=static_cast<bool>(parents->tiled.prefill_execution_identity);
+                        const auto& owners=split_profile?parents->tiled.wide:parents->tiled.tails;
+                        for(const auto rows:runner.wide_rows) {
+                            const auto t=std::find_if(owners.begin(),owners.end(),[&](const auto& x){return x.rows==rows && x.owner;});
+                            if(t==owners.end() || (!split_profile && t->owner->output_policy()!=KnownWindowOutputPolicy::all_rows))
+                                throw std::invalid_argument(split_profile ? "--mtp-copy-wide-rows: no decode-profile wide owner of a listed size on the server"
+                                                                  : "--mtp-copy-wide-rows requires an all-rows tiled tail block of each listed size on the server");
+                        }
+                        runner.enable_wide=[&enable_ngram](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt){enable_ngram(greedy,prompt);};
+                    }
                     runner.enable_context=[engine_on,use_context,ngram_config,&m](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt,
                         const std::shared_ptr<TokenSampler>& request_sampler,std::optional<bool> request) {
                         if(!(request?*request:engine_on) || request_sampler || !greedy.window_verifier() ||

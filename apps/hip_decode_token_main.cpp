@@ -1189,6 +1189,7 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
     c.cohort=strix::decode_cli::MtpBatchRunner::prompt_window_cohort(); c.small=number("STRIX_BATCH_PROMPT_SMALL",0)!=0;
     c.windows=number("STRIX_PROMPT_WINDOW",1)!=0;
     c.nest_rows=number("STRIX_BATCH_NEST_ROWS",2048); c.short_rows=number("STRIX_BATCH_SHORT_FIRST_ROWS",2048);
+    if(options.batch_cache_solo && runner==strix::decode_cli::CacheRunner::batch_mtp) {c.groups=false;c.cohort=false;c.nest_rows=0;}
     c.lookahead=number("STRIX_BATCH_SERVICE_LOOKAHEAD",2); c.cancel=number("STRIX_BATCH_CANCEL_POINTS",1)!=0;
     c.interleave=number("STRIX_BATCH_INTERLEAVE",options.http_serve?1:0);
     const char* service=std::getenv("STRIX_BATCH_SERVICE_MS"); c.service_ms=service?std::max(0.0,std::atof(service)):250;
@@ -4598,7 +4599,7 @@ static int run_decode_entry(
                 ? capacity.slots : 0U;
             const bool pool_fallback = !single_route && !batch_slots &&
                 qsa_mtp_pool_single_fallback_pending(options, strix::qpf2k::has_gsq_gate(manifest));
-            options.http_batch = static_cast<std::uint32_t>(batch_slots);
+            resolve_batch_cache_scheduler(options, requested_environment, static_cast<std::uint32_t>(batch_slots));
             if (pool_fallback) {
                 // Batch sizing excluded the pool; the single runner keeps it only if its one slot still fits with it.
                 const auto single = resolve_http_bridge_capacity(retained, prompt_memory.serving(options),

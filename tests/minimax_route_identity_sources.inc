@@ -2,6 +2,8 @@
 // changed/new selectors, update their allow-table and tests, then update hashes.
 // Additional linked host dependency census (source coverage only; fingerprint
 // admission remains PENDING, with no numerical/native qualification):
+// include/strix/route_receipt.hpp; include/strix/serve/token_memo.hpp;
+// src/serve/token_memo.cpp; include/strix/serve/bpe_tokenizer.hpp;
 // cmake/StrixStateCache.cmake; include/strix/prefix_state_cache.hpp;
 // src/prefix_state_cache.cpp; include/strix/session_state_cache.hpp;
 // src/session_state_cache.cpp; include/strix/rotary_descriptor.hpp;
@@ -119,9 +121,9 @@
 {"src/minimax/moe/mmx_moe.hip", 0xe43940e96d991005ULL},
 {"src/minimax/moe/mmx_moe.hpp", 0x05698ea07b619950ULL},
 {"src/minimax/moe/mmx_moe_traits.hpp", 0x8dc548751f4e9c34ULL},
-{"src/minimax/moe/mmx_prefill.hip", 0x9b5192bfa09db95dULL},
-{"src/minimax/moe/mmx_prefill.hpp", 0x1b737da8ad30103dULL},
-{"src/minimax/moe/mmx_prefill_core.hpp", 0x969e06b21a3e8979ULL},
+{"src/minimax/moe/mmx_prefill.hip", 0x0aed2a32372a23c6ULL},
+{"src/minimax/moe/mmx_prefill.hpp", 0x07dd7f09a2d65704ULL},
+{"src/minimax/moe/mmx_prefill_core.hpp", 0xde21cc79800243f4ULL},
 {"src/minimax/moe/mmx_prefill_iu4.inc", 0xdb25d34a9233aff9ULL},
 {"src/minimax/moe/mmx_trellis_device.hpp", 0x11cfbcfe7d145fe4ULL},
 {"src/minimax/pfx/pf_crc.cpp", 0xefbe65eb2a3ec54dULL},
@@ -175,7 +177,7 @@
 {"src/moe_core/device_plan.hpp", 0xd11705be6d35d151ULL},
 {"src/moe_core/device_plan_index.hpp", 0x123ba19e0be85987ULL},
 {"src/moe_core/exl3_trellis.hpp", 0x609c2bb7f95699c4ULL},
-{"src/moe_core/grouped_core.hpp", 0x80e99be3df2f4e6dULL},
+{"src/moe_core/grouped_core.hpp", 0xb3b2397545ca754bULL},
 {"src/moe_core/grouped_f16.hpp", 0xd4c01c860bfe9c98ULL},
 {"src/moe_core/grouped_integer_decode.hpp", 0xe4193b966715f39cULL},
 {"src/moe_core/grouped_policy.hpp", 0xf13a686d282542d3ULL},

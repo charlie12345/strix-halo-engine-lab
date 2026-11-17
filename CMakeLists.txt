@@ -391,7 +391,7 @@ add_library(strix_core STATIC
     src/transport.cpp
 )
 endif()
-target_include_directories(strix_core PUBLIC include)
+target_include_directories(strix_core PUBLIC include src)
 target_compile_features(strix_core PUBLIC cxx_std_20)
 target_link_libraries(strix_core PUBLIC Threads::Threads strix_state_cache)
 if(STRIX_USE_OPENSSL_SHA256)
@@ -1492,6 +1492,7 @@ if(BUILD_TESTING)
         set_tests_properties(strix-turbo-kit-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 120)
     endif()
     target_link_libraries(strix-decode-optimization-profile-tests PRIVATE strix_core)
+    target_include_directories(strix-decode-optimization-profile-tests PRIVATE src)
     strix_target_warnings(strix-decode-optimization-profile-tests)
     add_test(NAME strix-decode-optimization-profile-tests COMMAND strix-decode-optimization-profile-tests)
     add_executable(strix-decode-optimization-profile-a8-cli-tests tests/decode_optimization_profile_tests.cpp)
@@ -1499,6 +1500,18 @@ if(BUILD_TESTING)
     target_link_libraries(strix-decode-optimization-profile-a8-cli-tests PRIVATE strix_core)
     strix_target_warnings(strix-decode-optimization-profile-a8-cli-tests)
     add_test(NAME strix-decode-optimization-profile-a8-cli-tests COMMAND strix-decode-optimization-profile-a8-cli-tests)
+    foreach(target IN ITEMS strix-turbo-audit730-host-tests strix-turbo-audit730-a8-host-tests)
+        add_executable(${target} tests/audit730_host_tests.cpp)
+        target_compile_features(${target} PRIVATE cxx_std_20)
+        target_include_directories(${target} PRIVATE include src)
+        if(MSVC)
+            target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endif()
+        strix_target_warnings(${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
+    endforeach()
+    target_compile_definitions(strix-turbo-audit730-a8-host-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
     add_executable(strix-spec-v1-integration-tests tests/spec_v1_integration_tests.cpp)
     target_link_libraries(strix-spec-v1-integration-tests PRIVATE strix_core)
     strix_target_warnings(strix-spec-v1-integration-tests)
@@ -2538,6 +2551,12 @@ if(BUILD_TESTING)
         add_test(NAME strix-runtime-inventory-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/runtime_inventory_tests.py)
         # Option qualification kit (needs numpy). Package imports, so run from the source root.
+        add_test(NAME strix-turbo-bar-python-tests
+            COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s tools/qualification/turbo_bar/tests
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+        add_test(NAME strix-turbo-bench-python-tests
+            COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s scripts/bench/turbo
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
         add_test(NAME strix-option-qual-core-tests
             COMMAND ${Python3_EXECUTABLE} -B -m unittest tools.qualification.option_qual.tests.test_core
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

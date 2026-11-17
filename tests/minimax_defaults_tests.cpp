@@ -122,7 +122,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_PIPE", "0"},
     {"STRIX_MM_PF_HEADLESS", "0"},
     {"STRIX_MM_PF_DENSE_MLP", "0"},         {"STRIX_MMX_PF_ORDER", "adaptive"},
-    {"STRIX_MM_PF_FLASH_KEYS", "0"},
+    {"STRIX_MM_PF_FLASH_KEYS", "0"},         {"STRIX_MM_PF_MSA_RG_ROWS", "4"},
 };
 // Cache identity field of the default chunk-invariant linear order (table item pf_order).
 const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v1";
@@ -772,6 +772,9 @@ void test_fast_prefill_profile() {
         const EnvMap two_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "2"}};
         const auto two = md::prefill_policy(lookup(two_env));
         check(two.msa_flash == 2 && two.msa_flash_asked == "2" && two.policies == "msa-flash-bf16-2term-l40-59", "fast profile: explicit 2 wins");
+        const EnvMap rg_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "3"}};
+        const auto rg = md::prefill_policy(lookup(rg_env));
+        check(rg.msa_flash == 3 && rg.policies == "msa-flash-bf16-rg4-l40-59", "fast profile: explicit 3 = row-group form");
         const EnvMap legacy_env{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "50-59"}};
         const auto legacy = md::prefill_policy(lookup(legacy_env));
         check(legacy.msa_flash == 1 && legacy.policies == "msa-flash-bf16-l50-59", "fast profile: the legacy opt-in still runs, named by its layers");
@@ -794,7 +797,7 @@ void test_fast_prefill_profile() {
     }
     {
         bool threw = false;
-        const EnvMap bad_mode{{"STRIX_MM_PF_MSA_FLASH", "3"}}, bad_layers{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "70"}};
+        const EnvMap bad_mode{{"STRIX_MM_PF_MSA_FLASH", "4"}}, bad_layers{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "70"}};
         try { (void)md::prefill_policy(lookup(bad_mode)); } catch (const std::invalid_argument&) { threw = true; }
         check(threw, "fast profile: invalid flash mode rejected");
         threw = false;

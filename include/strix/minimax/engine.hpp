@@ -234,8 +234,12 @@ public:
     void set_prefill_dense_mlp(bool on);  // STRIX_MM_PF_DENSE_MLP, default on: layers 0..2 dense MLP on the v4 core (== strix_gemm bits)
     void set_prefill_flash_keys(unsigned mode);  // STRIX_MM_PF_FLASH_KEYS, default 2 (key halves): FAST flash key-load schedule (same bits)
     unsigned prefill_flash_keys() const;
+    void set_prefill_rg_rows(unsigned rows);  // STRIX_MM_PF_MSA_RG_ROWS: 0 auto (8 dense windows, 4 sparse), 4, 8 (same bits)
+    unsigned prefill_rg_rows() const;
+    void set_prefill_msa_flash(unsigned mode);  // A/B only: the FAST flash mode (0 off, 1, 2, 3 row groups) of the flash layers
+    unsigned prefill_msa_flash() const;
     unsigned prefill_flash_mode() const;  // effective FAST admission: 0 = declined, 1/2 = operand terms
-    std::array<std::uint64_t, 3> prefill_flash_launches() const;  // successful submissions by key schedule
+    std::array<std::uint64_t, 7> prefill_flash_launches() const;  // submissions: key schedules 0/1/2, modes 11/12, mode 13 rows 4/8
     [[nodiscard]] bool prefill_dense_mlp() const;
     [[nodiscard]] std::uint64_t prefill_dense_mlp_count() const;  // submitted dense MLP pieces; read between tasks
     [[nodiscard]] std::uint64_t prefill_headless_chunks() const;  // cumulative successful cache-only chunks on this rank

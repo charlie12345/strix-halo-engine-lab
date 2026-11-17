@@ -106,6 +106,8 @@ constexpr Item kItems[] = {
      "Prefill: exact (== strix_gemm bitwise, the pf_dense_qkv contract); dense MLP of layers 0-2 on the v4 core for 4096-row pieces"},
     {"pf_flash_keys", "STRIX_MM_PF_FLASH_KEYS", "2", "0",
      "Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves)"},
+    {"pf_msa_rg_rows", "STRIX_MM_PF_MSA_RG_ROWS", "auto", "4",
+     "Prefill: schedule only, same bits (row-group flash mode 3 output independent of rows); auto = 8 rows per work-group on dense windows, 4 on sparse rows (attn_core RowGroup Rows; bench scripts/bench/mmattn)"},
     {"pf_headless", "STRIX_MM_PF_HEADLESS", "1", "0",
      "Prefill: exact (state + final rows fnv identical); last layer cache-only for every chunk but the last (strix/prefill_headless.hpp)"},
     {"pf_attend4", "STRIX_MM_PF_ATTEND4", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
@@ -221,7 +223,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     const fp::Member& flash = kFastMembers[0];
     const char* raw = env(flash.env);
     if (fp::set(raw) && std::strcmp(raw, "0") != 0 && !fp::accepted(flash, raw))
-        throw std::invalid_argument("STRIX_MM_PF_MSA_FLASH must be 0, 1 or 2");
+        throw std::invalid_argument("STRIX_MM_PF_MSA_FLASH must be 0, 1, 2 or 3");
     PrefillPolicy p;
     // The MSA flash member runs on the exact EXL3 MoE base only (its gate fails on FAST_I4); an explicit value still wins.
     const bool i4 = fast_i4_format(env);
@@ -254,7 +256,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     if (p.msa_flash != 0)
         p.policies = p.msa_flash == 1 && msa_flash_policy(p.msa_flash_layers) != nullptr
                          ? std::string(msa_flash_policy(p.msa_flash_layers))
-                         : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : "") + "-l" + p.msa_flash_layers;
+                         : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : p.msa_flash == 3 ? "-rg4" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
     // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).

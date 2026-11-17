@@ -3379,6 +3379,18 @@ static bool fast_dense_on() {
     // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
     return effective_fast(&PrefillPrecision::fast_dense, fast_dense_mode, env.get());
 }
+static bool valid_q8_0_a8_dense_prefill_view(const Q8A8DensePrefillView& v) {
+    const std::uint32_t row_width = v.row_width ? v.row_width : v.width;
+    return v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 &&
+           v.x_stride >= v.width && v.x_stride % 16U == 0 && v.out_stride >= v.count &&
+           reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 && row_width % 32U == 0 && v.k_offset % 32U == 0 &&
+           std::uint64_t{v.k_offset} + v.width <= row_width &&
+           (!v.a8_codes || (v.a8_deltas && v.a8_sums && !v.accumulate && v.count % 32U == 0 &&
+                            v.a8_stride >= v.count && v.a8_stride % 32U == 0)) &&
+           (v.k_parts == 1U || (v.k_parts == 2U && !v.accumulate && !v.a8_codes && v.row_width &&
+                                std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
+                                std::uint64_t{v.x_stride} >= 2ULL * v.width));
+}
 static strix::core::f16_dense_tall::q8a8::View fast_dense_view(const Q8A8DensePrefillView& v) {
     strix::core::f16_dense_tall::q8a8::View f{};
     f.weight = v.weight, f.codes = v.codes, f.deltas = v.deltas, f.out = v.out;
@@ -3388,15 +3400,25 @@ static strix::core::f16_dense_tall::q8a8::View fast_dense_view(const Q8A8DensePr
     f.accumulate = v.accumulate ? 1U : 0U;
     return f;
 }
-static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
+static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream, unsigned groups = 1U, std::size_t weight_group_bytes = 0U) {
     static strix::lever_cache<unsigned> min_rows_cache{[] { return fast_profile::dense_min_rows(); }};
     const unsigned min_rows = min_rows_cache.get();
     namespace q8a8 = strix::core::f16_dense_tall::q8a8;
-    const q8a8::View f = fast_dense_view(v);
+    q8a8::View f = fast_dense_view(v);
+    if (groups > 1U) f.batch = groups, f.batch_in = v.width, f.batch_out = v.count, f.batch_weight_bytes = weight_group_bytes;
     if (v.rows < min_rows || !q8a8::supported(f)) return false;
     q8a8::enqueue_parts(f, v.k_parts, as_stream(stream));
     hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
     return true;
+}
+bool enqueue_q8_0_a8_fast_dense_groups(const Q8A8DensePrefillView& v, unsigned groups, std::size_t weight_group_bytes, void* stream) {
+    // STRIX_DS41_FAST_DENSE_BATCH (default on; 0 = one launch per group, the previous form): scheduling only, same bits
+    static strix::lever_cache<bool> batch_cache{[] { return strix::envcfg::flag("STRIX_DS41_FAST_DENSE_BATCH", true); }};
+    const bool batch = batch_cache.get();
+    if (!valid_q8_0_a8_dense_prefill_view(v) || v.exact || !batch || groups < 2U || !fast_dense_on() || v.k_parts != 1U || v.accumulate ||
+        std::uint64_t{v.width} * groups > v.x_stride || std::uint64_t{v.count} * groups > v.out_stride)
+        return false;
+    return enqueue_fast_dense(v, stream, groups, weight_group_bytes);
 }
 
 // q_b's operand image for the flash core's query_op (hip_ds41_attention_flash.inl FlashAttentionQ16Policy): the pair
@@ -3426,15 +3448,7 @@ bool enqueue_q_b_rope_image(const Q8A8DensePrefillView& v, std::uint16_t* image,
 }
 
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
-    require(v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 && v.x_stride >= v.width &&
-                v.x_stride % 16U == 0 && v.out_stride >= v.count && reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 &&
-                (!v.row_width || (v.row_width % 32U == 0 && v.k_offset % 32U == 0 && v.k_offset + v.width <= v.row_width)) &&
-                (!v.a8_codes || (v.a8_deltas && v.a8_sums && !v.accumulate && v.count % 32U == 0 && v.a8_stride >= v.count &&
-                                 v.a8_stride % 32U == 0)) &&
-                (v.k_parts == 1U || (v.k_parts == 2U && !v.accumulate && !v.a8_codes && v.row_width &&
-                                     std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
-                                     std::uint64_t{v.x_stride} >= 2ULL * v.width)),
-            "Q8_0 x A8 dense prefill view");
+    require(valid_q8_0_a8_dense_prefill_view(v), "Q8_0 x A8 dense prefill view");
     if (!v.exact && fast_dense_on() && enqueue_fast_dense(v, stream)) return false;
     if (pf_core_dense()) return enqueue_q8_0_a8_dense_prefill_core(v, stream);
     if (v.k_parts == 2U) {

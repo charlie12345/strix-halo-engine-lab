@@ -108,6 +108,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_MARKOV", "full"},           {"STRIX_MM_MARKOV_C", "1024"},      {"STRIX_MM_MARKOV_H", "2048"},
     {"STRIX_MM_MARKOV_TOPC", "v1"},
     {"STRIX_MM_PF_ATTEND4", "0"},          {"STRIX_MM_PF_ROUTER_BATCH", "0"},  {"STRIX_MMX_PREFILL_MTFIT", "0"},
+    {"STRIX_MM_PF_MSA_Q16", "0"},
     {"STRIX_MM_PF_MSA_REWORK", "0"},       {"STRIX_MMX_PREFILL_PIPE", "0"},    {"STRIX_MM_PF_KV_TILE", "off"},
     {"STRIX_MM_PF_ASYNC_START", "0"}, {"STRIX_MM_PF_LATE_SRC_FENCE", "0"},
     {"STRIX_MM_PF_TX_UNCACHED", "0"},      {"STRIX_DIST_CRC_PARALLEL", "0"},   {"STRIX_DIST_HOST_CRC_OVERLAP", "0"},
@@ -674,6 +675,32 @@ void test_turbo_product_profile() {
           "turbo: unbuilt onfly is printed as pending, never run silently");
 }
 
+// Split-producer chunk frames: one lever row, one policy for the rank CLI and serve entry points.
+void test_split_frame() {
+    namespace sx = strix::xport;
+    const auto& row = md::split_frame_row();
+    check(std::string(row.name) == "mm_split_frame" && row.regime.crossover == 4, "split frame row");
+    const auto unset = sx::split_frame_policy(row, nullptr);
+    check(!unset.on(1) && !unset.on(4) && !unset.on(8) && !unset.on(1024), "unqualified split frame stays off by default");
+    check(!sx::split_frame_policy(row, "").on(8), "empty split frame stays off");
+    check(!sx::split_frame_policy(row, "0").on(8), "split frame explicit 0");
+    check(sx::split_frame_policy(row, "1").on(2) && !sx::split_frame_policy(row, "1").on(1), "split frame explicit 1, never 1 row");
+    bool rejected = false;
+    try { (void)sx::split_frame_policy(row, "maybe"); } catch (const std::exception&) { rejected = true; }
+    check(rejected, "split frame invalid text rejected");
+    // Both entry points end with the same effective value (one cached resolution; the env is read once).
+    (void)::unsetenv("STRIX_XPORT_SPLIT_ROWS");
+    char flag[] = "--print-effective-config", app[] = "strix-minimax-rank", m[] = "M", r0[] = "0", tr[] = "usb4-auto", out[] = "OUT";
+    char rank_flag[] = "--rank";
+    char* rank_argv[] = {app, m, r0, tr, out, flag};
+    char* serve_argv[] = {app, m, rank_flag, r0, flag};
+    (void)md::print_or_apply("rank", 6, rank_argv);
+    const auto a = md::split_frame_policy();
+    (void)md::print_or_apply("serve", 5, serve_argv);
+    const auto b = md::split_frame_policy();
+    check(a.mode == b.mode && a.crossover == b.crossover && a.mode == unset.mode, "rank and serve resolve the same split policy");
+}
+
 // FAST prefill profile (mm_profile_table.hpp): bundle expansion, explicit-OFF precedence, FAST_I4 exclusion, legacy
 // field omission with every row OFF, rank agreement.
 void test_fast_prefill_profile() {
@@ -1060,6 +1087,7 @@ int main(int argc, char** argv) {
         test_session_startup();
         test_apply();
         test_entry_points_host_defaults();
+        test_split_frame();
         test_fast_prefill_profile();
         test_tp2_exchange_format();
         test_router_wmma();

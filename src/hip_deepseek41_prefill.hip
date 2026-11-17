@@ -365,7 +365,8 @@ bool prefill_o_low_a8_fused() {
 }
 // STRIX_DS41_PREFILL_HC_FUSE (read per call; default on, =0 off): the attention's hc expansion also computes the ffn
 // site's mixes (one enqueue_hc_site, no re-read of the stream), and each site's collapse is read by its RMSNorm (no x
-// round trip); same kernels' arithmetic, same bits
+// round trip), and the ffn site reads the MoE canonical rank sum's three terms in place (no stored y); same kernels'
+// arithmetic, same bits
 bool prefill_hc_fuse() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_HC_FUSE");
     return !(v && v[0] == '0');
@@ -811,56 +812,7 @@ struct DevicePrefill::Impl {
     // requested options: the constructor and DevicePrefill::apply_levers both call this (one resolver, one set of defaults).
     // Not here (they size buffers or select what is loaded; reload): EXPERT_TP, WINDOW, SLABS, OVERLAY, STAGED_HALF, MEM_GUARD.
     void resolve_levers(PrefillOptions& opts, const PrefillOptions& req) {
-        opts.fp16_dense = req.fp16_dense;
-        opts.bf16_attention = req.bf16_attention;
-        opts.fast_attention = req.fast_attention;
-        opts.fast_attention_flash = req.fast_attention_flash;
-        opts.fp16_projections = req.fp16_projections;
-        opts.fp16_min_rows = req.fp16_min_rows;
-        opts.approx_layer_first = req.approx_layer_first;
-        opts.approx_layer_end = req.approx_layer_end;
-        opts.fp16_keep_a8 = req.fp16_keep_a8;
-        opts.fp16_fast = req.fp16_fast;
-        opts.fp16_wsplit = req.fp16_wsplit;
-        if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")opts.fp16_dense=true;
-        if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")opts.bf16_attention=true;
-        if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
-            opts.fast_attention = true;
-            if (e[0] == '2') opts.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
-        }
-        opts.fast_dense = req.fast_dense || ds41::fast_profile::dense_on();
-        opts.fast_moe = req.fast_moe || ds41::fast_profile::moe_on();
-        opts.fast_engram = req.fast_engram || ds41::fast_profile::engram_on();
-        static strix::lever_cache<bool> shared_on{[] { return ds41::fast_profile::shared_on(); }};
-        opts.fast_shared = req.fast_shared || shared_on.get();
-        opts.fast_moe_f16 = req.fast_moe_f16 || ds41::fast_profile::moe_f16_on();
-        // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
-        // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
-        // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_PROJ"); e != nullptr && *e != 0) {
-            std::uint32_t mask = 0;
-            std::stringstream ss(e);
-            for (std::string t; std::getline(ss, t, ',');) {
-                if (t == "q_a") mask |= 1U;
-                else if (t == "kv") mask |= 2U;
-                else if (t == "q_b") mask |= 4U;
-                else if (t == "o_a") mask |= 8U;
-                else if (t == "o_b") mask |= 16U;
-                else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
-            }
-            opts.fp16_projections = mask;
-        }
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
-            opts.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
-            char* end = nullptr;
-            opts.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
-            if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
-            opts.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
-        }
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") opts.fp16_keep_a8 = true;
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") opts.fp16_fast = true;
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") opts.fp16_wsplit = true;
+        DevicePrefill::resolve_option_levers(opts, req);  // the PrefillOptions part (header: shared with the serve)
         const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_PERSIST");
         moe_persist = !(v != nullptr && v[0] == '0');
         v = std::getenv("STRIX_DS41_PREFILL_ASYNC_GATHER");
@@ -2593,12 +2545,32 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     bool hc_mixed = false;  // hc_fuse: the next site's mixes came with the expansion before it
     const bool hc_collapse = hc_fuse && prefill_hc_collapse();
     bool hc_collapsed = false;  // hc_collapse: the next site's collapsed rows are in x (written with the expansion)
+    // hc_fuse, world 2: the MoE step's canonical rank sum y = (shared + low) + high is not stored; the ffn hc_post reads its
+    // three terms where it read y (HcSiteView::sub_low / sub_high: the same expression and order, same bits). The terms, and
+    // the staged half-sum lease holding one of them, wait here for that step; any other step stores y first (the old form).
+    // The terms' buffers are rewritten only by the next layer's MoE; no task cut() lies between the sum and that hc_post.
+    struct PendingSum {
+        int layer = -1;
+        std::uint32_t o0 = 0, rows = 0;
+        const float *shared = nullptr, *low = nullptr, *high = nullptr;
+    } pending_sum;
+    std::optional<xport::Ds41HalfSumStagedExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>> half_sum_lease;
+    const auto settle_sum = [&](bool store) {  // store: y = the canonical sum (no reader takes the terms)
+        if (pending_sum.layer >= 0 && store)
+            ds41::enqueue_canonical_sum(pending_sum.shared, pending_sum.low, pending_sum.high, std::size_t{pending_sum.rows} * H,
+                                        m.y.p + std::size_t{pending_sum.o0} * H, st);
+        pending_sum = PendingSum{};
+        if (half_sum_lease) half_sum_lease->release(st);
+        half_sum_lease.reset();
+    };
     // the collapse's mixes of a site from row r0 (attn: the previous layer's ffn mixes, identity before the first)
     const auto collapse_mixes = [&](const std::string& site, std::uint32_t r0) -> const ds41::HcMix* {
         return site == "attn" ? (m.identity_pre ? nullptr : m.mix_ffn.p + r0) : m.mix_attn.p + r0;
     };
     for (const auto& s : m.plan.steps) {
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
+        // the MoE sum's only reader is this layer's ffn hc_post: every other step sees y stored
+        if (pending_sum.layer >= 0 && !(s.op == Op::hc_post && s.site == "ffn" && s.layer == pending_sum.layer)) settle_sum(true);
         m.dense_exact = s.layer >= 0 && layer >= m.exact_dense_from;
         if (defer && (s.layer < 0 ? s.op == Op::head || s.op == Op::argmax : layer >= first_decoder)) {
             // deferred decoder: only a compressed-KV source's attention input and its compressor run (no head)
@@ -3397,12 +3369,22 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                                   nx->site == (attn ? "ffn" : "attn") && nx->layer == s.layer + (attn ? 0 : 1) &&
                                   (attn || (layer + 1U < m.options.layers && lrows[layer + 1U].o0 == o0 &&
                                             m.options.null_ulp_layer != static_cast<int>(layer)));
+            // ffn: the MoE step's canonical sum read in place (its three terms over these rows) by the collapse site or the
+            // expansion alone (enqueue_hc_site takes the terms only there), else y stored
+            const bool sum_in = !attn && pending_sum.layer == s.layer && pending_sum.o0 == o0 && pending_sum.rows == no &&
+                                (!next_mix || (hc_collapse && lrows[layer + 1U].x0 == o0));
+            if (!sum_in) settle_sum(true);
+            const float* sub = sum_in ? pending_sum.shared : m.y.p + std::size_t{o0} * H;
+            const float* sub_low = sum_in ? pending_sum.low : nullptr;
+            const float* sub_high = sum_in ? pending_sum.high : nullptr;
             if (next_mix) {
                 // as enqueue_hc_expand + enqueue_hc_mixes (the next hc_mix is skipped)
                 ds41::HcSiteView v;
                 v.rows = no;
                 v.hidden = H;
-                v.sub = m.y.p + std::size_t{o0} * H;
+                v.sub = sub;
+                v.sub_low = sub_low;
+                v.sub_high = sub_high;
                 v.residual = stream_now() + std::size_t{o0} * stream_row;
                 v.expand_mixes = (attn ? m.mix_attn.p : m.mix_ffn.p) + o0;
                 v.stream = m.streams[next].p + std::size_t{o0} * stream_row;
@@ -3427,9 +3409,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 ds41::enqueue_hc_site(v, st);
                 hc_mixed = true;
             } else if (no > 0U)
-                ds41::enqueue_hc_expand(m.y.p + std::size_t{o0} * H, stream_now() + std::size_t{o0} * stream_row,
+                ds41::enqueue_hc_expand(sub, stream_now() + std::size_t{o0} * stream_row,
                                         (s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p) + o0, no, H, m.streams[next].p + std::size_t{o0} * stream_row,
-                                        st);
+                                        st, sub_low, sub_high);
+            settle_sum(false);  // the terms are read (stream order): the staged half-sum lease goes back
             m.cur = next;
             if (s.site == "ffn") {
                 m.identity_pre = false;
@@ -3690,6 +3673,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 in.deltas = m.xdeltas.p + std::size_t{o0} * H / 32U;
                 in.shared = m.shared.p + std::size_t{o0} * H;
                 float* y = m.y.p + std::size_t{o0} * H;
+                // world 2, y = (shared + low) + high of this rank's rows (low: rank 0's half on both ranks); hc_fuse: not
+                // stored, this layer's ffn hc_post reads the three terms in place (pending_sum), same bits
+                const auto sum_rows = [&](const float* low, const float* high) {
+                    if (no == 0U) return;
+                    if (hc_fuse) pending_sum = PendingSum{s.layer, o0, no, in.shared, low, high};
+                    else ds41::enqueue_canonical_sum(in.shared, low, high, std::size_t{no} * H, y, st);
+                };
                 float* own = m.half_own.p + std::size_t{o0} * H;
                 float* other = m.half_other.p + std::size_t{o0} * H;
                 // world 2: chunk ch's half sums cross in pieces of C rows (messages <= 21 MB) on the communication stream,
@@ -3709,7 +3699,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     check(hipStreamWaitEvent(st, m.half_received, 0), "half join");
                     const float* low = (m.options.rank == 0U ? own : other) + std::size_t{r0} * H;
                     const float* high = (m.options.rank == 0U ? other : own) + std::size_t{r0} * H;
-                    ds41::enqueue_canonical_sum(in.shared + std::size_t{r0} * H, low, high, std::size_t{n} * H, y + std::size_t{r0} * H, st);
+                    if (!hc_fuse)  // hc_fuse: sum_rows after the last chunk (the same terms, row for row)
+                        ds41::enqueue_canonical_sum(in.shared + std::size_t{r0} * H, low, high, std::size_t{n} * H, y + std::size_t{r0} * H, st);
                 };
                 if (split) {
                     // the MoE input of the peer's output rows; this rank's half of the peer's rows first, sent while this
@@ -3754,8 +3745,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                                            ? static_cast<float*>(prefill_wire.send_staging(half_bytes))
                                            : nullptr;
                     const bool staged = peer_half != nullptr;
-                    std::optional<xport::Ds41HalfSumStagedExchange<PrefillRawCommunicator, hipStream_t, dist::Tag>>
-                        prefill_half_exchange;
+                    // held past this step when the ffn hc_post reads the sum in place (settle_sum releases it there)
+                    auto& prefill_half_exchange = half_sum_lease;
                     if (!staged) peer_half = m.half_other.p;
                     if (joint) {  // one expert pass over [peer rows; own rows], the peer rows' half sums first
                         cut(PrefillUnitLevel::finest, s.layer, "moe.joint");
@@ -3781,8 +3772,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         const auto* recv = static_cast<const float*>(prefill_half_exchange->finish(st));
                         const float* low = me == 0U ? m.half_own.p : recv;
                         const float* high = me == 0U ? recv : m.half_own.p;
-                        if (no > 0U) ds41::enqueue_canonical_sum(in.shared, low, high, std::size_t{no} * H, y, st);
-                        prefill_half_exchange->release(st);
+                        sum_rows(low, high);
+                        if (pending_sum.layer < 0) {  // stored (or no rows): the lease goes back now
+                            prefill_half_exchange->release(st);
+                            prefill_half_exchange.reset();
+                        }
                         if (!m.moe_persist || m.options.stream_experts) check(hipStreamSynchronize(st), "moe");
                         return;
                     }
@@ -3799,7 +3793,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     check(hipStreamWaitEvent(st, m.half_received, 0), "half join");
                     const float* low = me == 0U ? m.half_own.p : m.half_recv.p;
                     const float* high = me == 0U ? m.half_recv.p : m.half_own.p;
-                    if (no > 0U) ds41::enqueue_canonical_sum(in.shared, low, high, std::size_t{no} * H, y, st);
+                    sum_rows(low, high);
                     // a per-layer scratch is freed here; with streamed experts the slot is overwritten next
                     if (!m.moe_persist || m.options.stream_experts) check(hipStreamSynchronize(st), "moe");
                     return;
@@ -3820,6 +3814,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     if (ch > 0U) exchange_chunk(ch - 1U);
                 }
                 if (m.distributed() && chunks > 0U) exchange_chunk(chunks - 1U);
+                if (hc_fuse && m.distributed() && chunks > 0U)  // every chunk joined on st: the whole rows' terms
+                    sum_rows(m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own);
                 // a per-layer scratch is freed here; with streamed experts the slot is overwritten next
                 if (!m.moe_persist || m.options.stream_experts) check(hipStreamSynchronize(st), "moe");
             });
@@ -3984,6 +3980,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         }
     }
+    settle_sum(true);  // a plan ending at a MoE step (no hc_post after it): y as the old form left it
     join_engram(0xFFFFFFFFU);
     if (seed_n != 0U && !defer) {
         for (std::uint32_t j = 0; j < 3U; ++j)

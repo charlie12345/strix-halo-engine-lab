@@ -11,11 +11,14 @@
 
 #include <algorithm>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <tuple>
 #include <vector>
 
 #include "strix/cuda_core/nvfp4.hpp"
+#include "strix/cuda/core/nvfp4_tile_cuda.hpp"
+namespace ftile = ::strix::cuda::core::nvfp4::tile;  // FAST4 operand layouts and kernels (shared CUDA core)
 #include "../common.cuh"
 
 namespace strix::cuda_core {
@@ -41,6 +44,31 @@ struct BigCtx {
     std::uint64_t scales_bytes = 0;
     float* rscale = nullptr;  // f8 activation row scales [rows_pad]
     std::uint64_t rscale_bytes = 0;
+    BigOperandCache* cache = nullptr;  // resident expanded operands shared with other contexts (not owned)
+};
+// Resident expanded operands (dense_big.hpp): one arena, one entry per (weight data, operand class), filled on first use.
+struct BigOperandCache {
+    struct Entry {
+        std::uint64_t offset = 0;
+        std::uint32_t out = 0, in = 0;
+        operand_cache::EntryState state;
+        cudaEvent_t filled = nullptr;
+    };
+    std::mutex mu;
+    int device = -1;
+    bool reserved = false;
+    void* arena = nullptr;
+    BigCacheReport report;
+    std::map<std::pair<const void*, int>, Entry> entries;
+    ~BigOperandCache() {
+        int previous = -1;
+        (void)cudaGetDevice(&previous);
+        if (device != -1) (void)cudaSetDevice(device);
+        for (auto& kv : entries)
+            if (kv.second.filled) (void)cudaEventDestroy(kv.second.filled);
+        if (arena) (void)cudaFree(arena);
+        if (previous != -1) (void)cudaSetDevice(previous);
+    }
 };
 
 namespace {
@@ -540,6 +568,36 @@ cudaError_t grow(void** p, std::uint64_t* have, std::uint64_t need) {
     return cudaSuccess;
 }
 
+// The resident operand of w (class k) when ctx has a cache that admitted it: the first use enqueues `expand(dst)` on s and records
+// the entry event; later uses (any stream) wait on it. *out = nullptr: not cached here, the caller expands into its scratch.
+template <class Expand>
+cudaError_t cached_operand(BigCtx& S, const DenseWeight& w, operand_cache::Kind k, cudaStream_t s, Expand&& expand, unsigned char** out) {
+    *out = nullptr;
+    BigOperandCache* C = S.cache;
+    if (C == nullptr || !C->reserved || C->arena == nullptr || C->device != S.device) return cudaSuccess;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (auto e = cudaStreamIsCapturing(s, &cap); e != cudaSuccess) return e;
+    if (cap != cudaStreamCaptureStatusNone) return cudaSuccess;
+    std::lock_guard<std::mutex> lock(C->mu);
+    const auto it = C->entries.find({w.data, static_cast<int>(k)});
+    if (it == C->entries.end()) return cudaSuccess;
+    auto& en = it->second;
+    if (en.out != w.out || en.in != w.in) return cudaErrorInvalidValue;  // key reused by another weight: never serve stale bytes
+    unsigned char* dst = static_cast<unsigned char*>(C->arena) + en.offset;
+    if (operand_cache::on_use(en.state) == operand_cache::Use::fill) {
+        cudaError_t e = expand(dst);
+        if (e == cudaSuccess) e = cudaEventRecord(en.filled, s);
+        if (e != cudaSuccess) {
+            operand_cache::on_fill_failed(en.state);
+            return e;
+        }
+    } else if (auto e = cudaStreamWaitEvent(s, en.filled, 0); e != cudaSuccess) {
+        return e;
+    }
+    *out = dst;
+    return cudaSuccess;
+}
+
 const Table* get_table(BigCtx& ctx, Mode mode, std::uint32_t out, std::uint32_t in, int bkb) {
     const std::uint32_t nkb = in >> 5;
     std::uint32_t key2 = 0;
@@ -667,6 +725,82 @@ void dense_big_ctx_destroy(BigCtx* ctx) {
     delete ctx;
 }
 
+BigOperandCache* dense_big_cache_create() { return new BigOperandCache(); }
+void dense_big_cache_destroy(BigOperandCache* cache) { delete cache; }
+void dense_big_ctx_attach_cache(BigCtx* ctx, BigOperandCache* cache) {
+    if (ctx) ctx->cache = cache;
+}
+
+cudaError_t dense_big_cache_reserve(BigOperandCache* cache, const DenseWeight* weights, std::size_t n, BigClass cls, operand_cache::Mode mode,
+                                    std::uint64_t cap_bytes, BigCacheReport* report) {
+    if (cache == nullptr || (n > 0 && weights == nullptr)) return cudaErrorInvalidValue;
+    std::lock_guard<std::mutex> lock(cache->mu);
+    if (cache->reserved) {
+        if (report) *report = cache->report;
+        return cudaSuccess;
+    }
+    int device = -1;
+    if (auto e = cudaGetDevice(&device); e != cudaSuccess) return e;
+    // the operand class dense_big_gemm uses for each weight (q8_0 always folds; nvfp4 is e4m3 under FAST8, the e2m1 W tile under
+    // FAST4, f16 otherwise)
+    const bool f8 = cls == BigClass::fast8, f4 = cls == BigClass::fast4;
+    std::vector<operand_cache::Candidate> cand;
+    std::vector<std::pair<const DenseWeight*, operand_cache::Kind>> who;
+    for (std::size_t i = 0; i < n; ++i) {
+        const DenseWeight& w = weights[i];
+        if (!dense_big_supported(w)) continue;
+        operand_cache::Kind k;
+        if (w.format == WeightFormat::nvfp4) k = f4 ? operand_cache::Kind::e2m1_tile : f8 ? operand_cache::Kind::e4m3 : operand_cache::Kind::f16;
+        else if (w.format == WeightFormat::q8_0) k = operand_cache::Kind::q8_bf16;
+        else continue;  // bf16: the GEMM reads the weight directly
+        if (!operand_cache::admits(mode, k)) continue;
+        cand.push_back({w.data, operand_cache::entry_bytes(k, w.out, w.in)});
+        who.emplace_back(&w, k);
+    }
+    std::size_t free_b = 0, total_b = 0;
+    if (auto e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) return e;
+    BigCacheReport rep;
+    rep.f8 = f8;
+    rep.f4 = f4;
+    rep.budget_bytes = operand_cache::budget(mode, free_b, total_b, cap_bytes);
+    const operand_cache::Plan p = operand_cache::plan(cand, rep.budget_bytes);
+    rep.wanted_bytes = p.wanted_bytes;
+    rep.arena_bytes = p.arena_bytes;
+    rep.admitted = p.admitted;
+    rep.rejected = p.rejected;
+    if (p.arena_bytes > 0 && cudaMalloc(&cache->arena, p.arena_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();  // not sticky: degrade to per-call expansion, report nothing resident
+        cache->arena = nullptr;
+        rep.rejected += rep.admitted;
+        rep.admitted = 0;
+        rep.arena_bytes = 0;
+    }
+    if (cache->arena != nullptr) {
+        for (std::size_t i = 0; i < who.size(); ++i) {
+            if (p.offset[i] == operand_cache::kNone) continue;
+            const auto key = std::make_pair(who[i].first->data, static_cast<int>(who[i].second));
+            if (cache->entries.count(key)) continue;  // duplicate weight: one entry
+            BigOperandCache::Entry en;
+            en.offset = p.offset[i];
+            en.out = who[i].first->out;
+            en.in = who[i].first->in;
+            if (auto e = cudaEventCreateWithFlags(&en.filled, cudaEventDisableTiming); e != cudaSuccess) {
+                for (auto& kv : cache->entries) (void)cudaEventDestroy(kv.second.filled);
+                cache->entries.clear();
+                (void)cudaFree(cache->arena);
+                cache->arena = nullptr;
+                return e;
+            }
+            cache->entries.emplace(key, en);
+        }
+    }
+    cache->device = device;
+    cache->reserved = true;
+    cache->report = rep;
+    if (report) *report = rep;
+    return cudaSuccess;
+}
+
 cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out, cudaStream_t s, BigCtx* ctx, bool f8) {
     if (f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (rows == 0 || in % 32 != 0 || terms < 1 || terms > 3) return cudaErrorInvalidValue;
@@ -704,12 +838,102 @@ cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in
     return cudaSuccess;
 }
 
+bool dense_big_fast4_supported() {
+#if defined(STRIX_CUDA_FAST8_SM120A)
+    return ftile::supported();
+#else
+    return false;
+#endif
+}
+
+cudaError_t dense_big_split4(const float* x, std::uint32_t rows, std::uint32_t in, BigAct* out, cudaStream_t s, BigCtx* ctx) {
+    if (!dense_big_fast4_supported()) return cudaErrorNotSupported;
+    if (x == nullptr || out == nullptr || rows == 0 || in % ftile::kK != 0) return cudaErrorInvalidValue;
+    Scratch& S = ctx ? *ctx : scratch();
+    if (auto e = bind_device(S); e != cudaSuccess) return e;
+    const std::uint32_t rp = ftile::rows_padded(rows);
+    if (auto e = grow(&S.planes[1], &S.planes_bytes[1], ftile::x_tile_bytes(rp, in)); e != cudaSuccess) return e;
+    if (auto e = grow(reinterpret_cast<void**>(&S.rscale), &S.rscale_bytes, static_cast<std::uint64_t>(rp) * 4); e != cudaSuccess) return e;
+    if (auto e = ftile::quantize_enqueue(x, rows, in, static_cast<std::uint8_t*>(S.planes[1]), S.rscale, s); e != cudaSuccess) return e;
+    *out = BigAct{};
+    out->planes = S.planes[1];
+    out->rows = rows;
+    out->rows_pad = rp;
+    out->in = in;
+    out->terms = 1;
+    out->f16 = true;  // the nvfp4 weight class
+    out->f4 = true;
+    return cudaSuccess;
+}
+
+namespace {
+// W tile operand of w: the resident entry (repacked once) or, without a cache, a per-call repack into the context scratch at `slot`
+// (0 or 1, so a fused gate/up call keeps both operands live).
+cudaError_t tile_operand(Scratch& S, const DenseWeight& w, cudaStream_t s, int slot, const std::uint8_t** out) {
+    const auto repack = [&](unsigned char* d) {
+        return ftile::repack_enqueue(static_cast<const std::uint8_t*>(w.data), w.out, w.in, d, s);
+    };
+    unsigned char* res = nullptr;
+    if (auto e = cached_operand(S, w, operand_cache::Kind::e2m1_tile, s, repack, &res); e != cudaSuccess) return e;
+    if (res == nullptr) {
+        const std::uint64_t bytes = ftile::w_tile_bytes(w.out, w.in);
+        if (auto e = grow(&S.wexp, &S.wexp_bytes, 2 * bytes); e != cudaSuccess) return e;
+        res = static_cast<unsigned char*>(S.wexp) + slot * bytes;
+        if (auto e = repack(res); e != cudaSuccess) return e;
+    }
+    *out = res;
+    return cudaSuccess;
+}
+cudaError_t gemm4(Scratch& S, const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t s) {
+    ftile::GemmArgs g;
+    if (auto e = tile_operand(S, w, s, 0, &g.w); e != cudaSuccess) return e;
+    g.x = static_cast<const std::uint8_t*>(a.planes);
+    g.rs = S.rscale;
+    g.aux = aux;
+    g.y = y;
+    g.gs = w.gscale;
+    g.out = w.out;
+    g.in = w.in;
+    g.rows = a.rows;
+    g.rows_pad = a.rows_pad;
+    g.epi = epi == BigEpi::residual ? ftile::Epi::residual : epi == BigEpi::silu_mul ? ftile::Epi::silu_mul : ftile::Epi::store;
+    return ftile::gemm_enqueue(g, s);
+}
+}  // namespace
+
+cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, float* y, cudaStream_t s, BigCtx* ctx) {
+    if (!a.f4 || !dense_big_fast4_supported()) return cudaErrorInvalidValue;
+    if (gate.format != WeightFormat::nvfp4 || up.format != WeightFormat::nvfp4 || gate.out != up.out || gate.in != up.in ||
+        a.in != gate.in || !dense_big_supported(gate) || !dense_big_supported(up))
+        return cudaErrorInvalidValue;
+    Scratch& S = ctx ? *ctx : scratch();
+    if (auto e = bind_device(S); e != cudaSuccess) return e;
+    ftile::GemmArgs g;
+    if (auto e = tile_operand(S, gate, s, 0, &g.w); e != cudaSuccess) return e;
+    if (auto e = tile_operand(S, up, s, 1, &g.w2); e != cudaSuccess) return e;
+    g.x = static_cast<const std::uint8_t*>(a.planes);
+    g.rs = S.rscale;
+    g.y = y;
+    g.gs = gate.gscale;
+    g.gs2 = up.gscale;
+    g.out = gate.out;
+    g.in = gate.in;
+    g.rows = a.rows;
+    g.rows_pad = a.rows_pad;
+    g.epi = ftile::Epi::glu;
+    return ftile::gemm_enqueue(g, s);
+}
+
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t s, BigCtx* ctx) {
     if (a.f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (!dense_big_supported(w) || a.in != w.in || a.f16 != (w.format == WeightFormat::nvfp4)) return cudaErrorInvalidValue;
     if (epi != BigEpi::none && aux == nullptr) return cudaErrorInvalidValue;
     Scratch& S = ctx ? *ctx : scratch();
     if (auto e = bind_device(S); e != cudaSuccess) return e;
+    if (a.f4) {
+        if (w.format != WeightFormat::nvfp4 || !dense_big_fast4_supported()) return cudaErrorInvalidValue;
+        return gemm4(S, w, a, y, aux, epi, s);
+    }
     BigArgs ba{};
     ba.P = static_cast<const std::uint16_t*>(a.planes);
     ba.y = y;
@@ -726,25 +950,54 @@ cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, cons
         ba.A = static_cast<const std::uint16_t*>(w.data);
     } else if (w.format == WeightFormat::q8_0) {
         mode = kFold;
-        if (auto e = grow(&S.wexp, &S.wexp_bytes, elems * 2); e != cudaSuccess) return e;
-        if (auto e = grow(reinterpret_cast<void**>(&S.scales), &S.scales_bytes, elems / 32 * 4); e != cudaSuccess) return e;
         const std::size_t nb = elems / 32;
-        expand_q8_kernel<<<static_cast<unsigned>((nb + 255) / 256), 256, 0, s>>>(static_cast<const unsigned char*>(w.data), nb,
-                                                                               static_cast<std::uint16_t*>(S.wexp), S.scales);
-        if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-        ba.A = static_cast<const std::uint16_t*>(S.wexp);
-        ba.scales = S.scales;
+        const std::uint64_t soff = operand_cache::scales_offset(operand_cache::Kind::q8_bf16, w.out, w.in);
+        const auto expand_q8 = [&](std::uint16_t* vals, float* scales) {
+            expand_q8_kernel<<<static_cast<unsigned>((nb + 255) / 256), 256, 0, s>>>(static_cast<const unsigned char*>(w.data), nb, vals, scales);
+            return cudaGetLastError();
+        };
+        unsigned char* res = nullptr;
+        if (auto e = cached_operand(S, w, operand_cache::Kind::q8_bf16, s,
+                                    [&](unsigned char* d) { return expand_q8(reinterpret_cast<std::uint16_t*>(d), reinterpret_cast<float*>(d + soff)); }, &res);
+            e != cudaSuccess)
+            return e;
+        if (res != nullptr) {
+            ba.A = reinterpret_cast<const std::uint16_t*>(res);
+            ba.scales = reinterpret_cast<float*>(res + soff);
+        } else {
+            if (auto e = grow(&S.wexp, &S.wexp_bytes, elems * 2); e != cudaSuccess) return e;
+            if (auto e = grow(reinterpret_cast<void**>(&S.scales), &S.scales_bytes, elems / 32 * 4); e != cudaSuccess) return e;
+            if (auto e = expand_q8(static_cast<std::uint16_t*>(S.wexp), S.scales); e != cudaSuccess) return e;
+            ba.A = static_cast<const std::uint16_t*>(S.wexp);
+            ba.scales = S.scales;
+        }
     } else if (a.f8) {
-        if (auto e = grow(&S.wexp, &S.wexp_bytes, elems * 2); e != cudaSuccess) return e;
-        if (auto e = nvfp4_expand_e4m3(w, S.wexp, s); e != cudaSuccess) return e;
-        ba.A = static_cast<const std::uint16_t*>(S.wexp);
+        unsigned char* res = nullptr;
+        if (auto e = cached_operand(S, w, operand_cache::Kind::e4m3, s, [&](unsigned char* d) { return nvfp4_expand_e4m3(w, d, s); }, &res);
+            e != cudaSuccess)
+            return e;
+        if (res != nullptr) {
+            ba.A = reinterpret_cast<const std::uint16_t*>(res);
+        } else {
+            if (auto e = grow(&S.wexp, &S.wexp_bytes, elems * 2); e != cudaSuccess) return e;
+            if (auto e = nvfp4_expand_e4m3(w, S.wexp, s); e != cudaSuccess) return e;
+            ba.A = static_cast<const std::uint16_t*>(S.wexp);
+        }
         ba.rscale = S.rscale;
         return launch8<4, 2, 3>(ba, w.out, a.rows, s);
     } else {
         mode = kSplit;
-        if (auto e = grow(&S.wexp, &S.wexp_bytes, elems * 2); e != cudaSuccess) return e;
-        if (auto e = nvfp4_expand_f16(w, S.wexp, s); e != cudaSuccess) return e;
-        ba.A = static_cast<const std::uint16_t*>(S.wexp);
+        unsigned char* res = nullptr;
+        if (auto e = cached_operand(S, w, operand_cache::Kind::f16, s, [&](unsigned char* d) { return nvfp4_expand_f16(w, d, s); }, &res);
+            e != cudaSuccess)
+            return e;
+        if (res != nullptr) {
+            ba.A = reinterpret_cast<const std::uint16_t*>(res);
+        } else {
+            if (auto e = grow(&S.wexp, &S.wexp_bytes, elems * 2); e != cudaSuccess) return e;
+            if (auto e = nvfp4_expand_f16(w, S.wexp, s); e != cudaSuccess) return e;
+            ba.A = static_cast<const std::uint16_t*>(S.wexp);
+        }
     }
     const int bkb = (w.in % 128 == 0 && a.terms <= 2 && g_bkb2) ? 2 : 1;
     const Table* tb = get_table(S, mode, w.out, w.in, bkb);

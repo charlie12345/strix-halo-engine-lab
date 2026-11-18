@@ -19,8 +19,11 @@
 
 #include "strix/cuda_core/attention_policy.hpp"
 #include "strix/cuda_core/dense.hpp"
+#include "strix/cuda_core/operand_cache_plan.hpp"
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
+
+namespace strix::spec { class DraftRows; }
 
 namespace strix::qwen35 {
 
@@ -35,8 +38,15 @@ enum class TurboWeights : std::uint8_t { off, native, onfly, converted };
 // fast: flash + activation split of ONE bf16 term (mma1; nvfp4 weights are unchanged: their activation is f16 already).
 // fast2: flash + two bf16 terms (mma2).
 // fast8: fast + nvfp4 weights on the e4m3 x e4m3 mma (activation per-row e4m3, weight e2m1*e4m3 rounded to e4m3): TURBO/FAST, quality-gated.
-enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8 };
+// fast4: fast + nvfp4 weights on the block-scaled e2m1 x e2m1 mma (activation per-row NVFP4: row scale, e4m3 per 16, e2m1), gate and
+//        up fused (strix/cuda/core/nvfp4_tile.hpp, nvfp4-tile-mma-f32-v1): W4A4 FAST, quality-gated, opt-in only.
+enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8, fast4 };
 [[nodiscard]] const char* prefill_arith_name(PrefillArith a);
+// GDN delta rule of the large-M prefill (non-exact prefill policies only; the exact policy keeps the decode windows):
+//   serial  = the decode recurrence row by row (gdn.hpp gdn_prefill_layer), bitwise equal to the windows.
+//   chunk16 = FAST gdn-chunk16-f32-v1 (strix/cuda_core/gdn_chunk.hpp): 16-row chunks, FP32, all SMs; bits differ (identity
+//             suffix -gdnc16), opt-in until its logit gate passes.
+enum class PrefillGdn : std::uint8_t { serial, chunk16 };
 
 struct EngineOptions {
     cuda_core::DenseArith dense_arithmetic = cuda_core::dense_arith();
@@ -53,6 +63,7 @@ struct EngineOptions {
     // multi_gemv (above) is also the TURBO multi-launch lever.
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
+    PrefillGdn prefill_gdn = PrefillGdn::serial;  // ignored (and not in the identity) under prefill_arith exact
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
     // rows <= prefill_chunk whose flash grid fills whole waves (4096 -> 3968 on 188 SMs: flash +16 % at 128K, bench). 0 = off
@@ -71,17 +82,24 @@ struct EngineOptions {
     cuda_core::FlashTail flash_tail = cuda_core::FlashTail::split;
     // attn8: e4m3 flash attention over an e4m3 shadow of the KV cache (bit-changing, own identity suffix "-a8"; FAST gate required).
     bool prefill_attn8 = false;
+    // Resident expanded prefill operands (strix/cuda_core/operand_cache_plan.hpp, shared dense_big core): each NVFP4 / q8_0 weight
+    // is expanded into its MMA operand once per engine instead of once per chunk, slot and request. Bitwise neutral (same bytes,
+    // same kernel). auto = FAST8 e4m3 operands only (the measured per-call cost), on = also the exact f16 / q8 operands; both
+    // under free VRAM - max(4 GiB, 10 % total) and prefill_operand_cache_cap_mib (0 = no cap). off = per-call expansion.
+    cuda_core::operand_cache::Mode prefill_operand_cache = cuda_core::operand_cache::Mode::automatic;
+    std::uint32_t prefill_operand_cache_cap_mib = 0;
 };
 
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
 [[nodiscard]] inline std::string engine_identity(const EngineOptions& o) {
     static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
-    static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8"};
+    static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
     const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
     // a non-exact prefill policy is a different arithmetic identity (prefix caches never mix them)
     const std::string pf = o.prefill_arith == PrefillArith::exact
         ? ""
-        : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "");
+        : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
+              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1" + pf;
     // converted packs hold the onfly bytes: same arithmetic identity as onfly (prefix caches may be shared)
@@ -156,6 +174,12 @@ public:
     };
     MtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
                     bool want_top = true);  // want_top=false: skip lm_head + argmax (logits/top null): KV/hidden only
+    // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
+    // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
+    // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits
+    // then hold the compact rows. nullptr = the full head (default). Requires an NVFP4 lm_head; the caller keeps `rows`
+    // alive while set. Drafts only steer acceptance: verify emits the target's own tokens either way.
+    void set_draft_rows(strix::spec::DraftRows* rows);
 
     // Host copies (synchronize the stream).
     void read_logits(const RowsOut& o, std::uint32_t row, float* host_vocab) const;

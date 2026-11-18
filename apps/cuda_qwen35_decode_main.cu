@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
         bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
-        std::string flash_pipe, flash_tail, pf_attn8, dump_cont;
+        std::string flash_pipe, flash_tail, pf_attn8, dump_cont, pf_ocache, pf_ocache_cap;
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
         std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
@@ -182,6 +182,8 @@ int main(int argc, char** argv) {
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
             else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
             else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
+            else if (a == "--prefill-operand-cache") pf_ocache = next();          // auto|on|off: resident expanded weights (bitwise neutral)
+            else if (a == "--prefill-operand-cache-cap-mib") pf_ocache_cap = next();  // arena cap in MiB, 0 = budget only
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
             else if (a == "--prefill-wave-min") pf_wave_min = strix::core::parse_u32(next());  // 0 = off; wave-aligned steps
             else if (a == "--prefill-dump") pf_dump = next();  // last-token logits of the LAST prefill (float32 [vocab])
@@ -265,7 +267,8 @@ int main(int argc, char** argv) {
             else if (pf_arith == "fast") opt.prefill_arith = q::PrefillArith::fast;
             else if (pf_arith == "fast2") opt.prefill_arith = q::PrefillArith::fast2;
             else if (pf_arith == "fast8") opt.prefill_arith = q::PrefillArith::fast8;
-            else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8");
+            else if (pf_arith == "fast4") opt.prefill_arith = q::PrefillArith::fast4;
+            else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8|fast4");
         }
         opt.prefill_chunk = pf_chunk;
         opt.prefill_wave_min_tokens = pf_wave_min;
@@ -273,6 +276,7 @@ int main(int argc, char** argv) {
         opt.prefill_inflight = pf_inflight;
         opt.prefill_ramp = pf_ramp;
         q::resolve_flash_controls(opt, flash_pipe, flash_tail, pf_attn8);
+        q::resolve_operand_cache(opt, pf_ocache, pf_ocache_cap);
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;

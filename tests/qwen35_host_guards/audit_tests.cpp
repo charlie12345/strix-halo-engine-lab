@@ -2,6 +2,7 @@
 #include "strix/cuda_core/dense_big.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "../../src/core/dense_linear.hpp"
+#include "strix/env_flags.hpp"
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
@@ -69,7 +70,10 @@ struct Engine {
 #include "audit_engine.inc"
 };
 
-using WideScratch = core::DenseWideScratch;
+// engine.hip WideScratch: the dense scratch plus the x16 tile buffer of the IU4 wide windows (_Float16 there; the audit
+// never stores a tile, so a 16-bit stand-in keeps this host test free of _Float16).
+using Half = std::uint16_t;
+struct WideScratch : core::DenseWideScratch { Half* xt = nullptr; };
 using hipStream_t = void*;
 struct Tensor { unsigned fmt = 30, inputs = 1, outputs = 1; };
 unsigned limit = 0;
@@ -78,10 +82,10 @@ std::vector<unsigned> seen;
 std::vector<const void*> scratch_seen;
 struct Iu4Scratch { void *xh = nullptr, *g = nullptr, *u = nullptr; };
 void linear16(const Tensor&, const float*, float* out, unsigned rows, hipStream_t, const Iu4Scratch&) {
-    // Model the existing dispatcher's physical row rounding.
-    unsigned physical = 1;
-    while (physical < rows) physical *= 2;
-    runtime_require(out >= base_out && out + physical <= base_out + limit);
+    // The dispatcher computes the 1/2/4/8/16 bucket but stores only `rows` rows (dense_linear::kernel and
+    // dense_linear_iu4 `nrows` guards); pad rows are only read, inside the engine's 16-row scratch.
+    runtime_require(rows >= 1U && rows <= 16U);
+    runtime_require(out >= base_out && out + rows <= base_out + limit);
     seen.push_back(rows);
 }
 void glu16(const Tensor& g, const Tensor&, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4) {
@@ -91,7 +95,19 @@ void wide_quant(const float*, unsigned, unsigned, hipStream_t, const WideScratch
 void wide_dense(const Tensor&, float*, unsigned, hipStream_t, const WideScratch& w) { scratch_seen.push_back(w.codes); }
 // The IU4 wide windows take only type-200 weights; the audited tensors are bf16 / q8_0, as in the real predicate.
 bool wide_iu4_ok(const Tensor& t, const WideScratch& w, unsigned) { return w.codes && t.fmt == 200U; }
-void wide_iu4(const Tensor&, const float*, float*, unsigned, hipStream_t) { runtime_require(false); }
+void wide_iu4(const Tensor&, const float*, float*, unsigned, hipStream_t, const Half* = nullptr) { runtime_require(false); }
+// x16 tile form of the IU4 wide windows (core/f16_dense_tall.hpp producers); unreachable here (no type-200 weights).
+bool wide_iu4_x16(const Tensor&, const WideScratch&, unsigned) { return false; }
+struct SiluMul {};
+namespace strix::core::f16_dense_tall {
+struct TileRne {};
+void enqueue_x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
+template <class F, class Q = TileRne> void enqueue_x16_tiles_map2(const float*, const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
+}
+// engine.hip tile quantiser policy of the x16 producers (STRIX_DENSE_FAST4_EMU gate instrument): the default cast only.
+template <class Q> struct WithQ { using type = Q; };
+template <class K> void with_tile_quantiser(K&& k) { k(WithQ<core::f16_dense_tall::TileRne>{}); }
+void x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
 void silu_mul_host(const float*, const float*, float*, std::size_t) {}
 #include "audit_hip.inc"
 #include "audit_cli.inc"
@@ -139,9 +155,17 @@ int main() {
         glu(Tensor{}, Tensor{}, v.data(), v.data(), n, nullptr, WideScratch{}, Iu4Scratch{});
         unsigned sum = 0; for (auto count : seen) sum += count;
         check(sum == 2 * n, "686-2 exact logical tails");
+        // hip_dense_dec4: a window of <= 16 rows is ONE call (one weight pass), never a power-of-two split; wider
+        // windows keep 16-row sweeps and a power-of-two tail (no call rounds a tail past the window).
+        bool shape = n > 16U ? true : seen == std::vector<unsigned>{n, n};
+        if (n > 16U)
+            for (std::size_t i = 0; i < seen.size(); ++i) shape = shape && (seen[i] & (seen[i] - 1U)) == 0U;
+        check(shape, "dec4 one call per <= 16-row window, power-of-two tails above");
     }
     std::int8_t ca = 0, cb = 0;
-    WideScratch a{&ca, nullptr, nullptr, nullptr}, b{&cb, nullptr, nullptr, nullptr};
+    WideScratch a, b;
+    a.codes = &ca;
+    b.codes = &cb;
     Tensor q8{8, 128, 16};
     linear(q8, nullptr, nullptr, 64, nullptr, a, Iu4Scratch{});
     linear(q8, nullptr, nullptr, 32, nullptr, b, Iu4Scratch{});

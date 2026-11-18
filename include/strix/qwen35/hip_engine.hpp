@@ -16,6 +16,8 @@
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
 
+namespace strix::spec { class DraftRows; }
+
 namespace strix::qwen35 {
 
 struct HipEngineOptions {
@@ -65,6 +67,8 @@ public:
     [[nodiscard]] std::uint32_t prefill_rows() const;  // widest forward_commit window (options)
     [[nodiscard]] std::uint32_t committed() const;
     [[nodiscard]] std::uint64_t weight_bytes() const;          // bytes read per pass (all weights but the embedding table)
+    [[nodiscard]] std::uint64_t head_weight_bytes() const;     // output head bytes (read by every full-head row pass)
+    [[nodiscard]] std::uint64_t mtp_weight_bytes() const;      // MTP layer bytes (0 before load_mtp)
     [[nodiscard]] std::uint64_t state_bytes_per_pass() const;  // GDN state read + write per pass
     [[nodiscard]] std::uint32_t kv_bytes_per_position() const;
     void reset();  // committed length 0, recurrent state zero, window discarded
@@ -101,6 +105,16 @@ public:
     // norm launch per pass; the logits path is unchanged). Without load_mtp nothing changes.
     void load_mtp(const std::string& path);
     [[nodiscard]] bool has_mtp() const;
+    // True when the GGUF at `path` carries the next-token-prediction layer itself (blk.<last>.nextn.eh_proj; the IU4 pack
+    // keeps it as Q8_0), so load_mtp(path) needs no side file. Header read only.
+    [[nodiscard]] static bool has_mtp_layer(const std::string& path);
+    // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one IU4 tile column of the head,
+    // include/strix/qwen35/iu4_draft_head.hpp): before each head launch the engine gathers the rows' new tile columns into a
+    // compact head (device-to-device, no re-quantisation) and maps the argmax back to token ids on the device, so
+    // HipMtpOut::top stays a token id; HipMtpOut::logits then hold the compact rows. nullptr = the full head (default).
+    // Requires an IU4 lm_head; the caller keeps `rows` alive while set. Drafts only steer acceptance: verify emits the
+    // target's own greedy tokens either way.
+    void set_draft_rows(strix::spec::DraftRows* rows);
     [[nodiscard]] static constexpr std::uint32_t mtp_max_rows() { return 16U; }
     // Row r runs at position pos0 + r with input token next_tokens[r] (the token FOLLOWING the hidden's position) and
     // hidden_dev[r] = the trunk hidden of position pos0 + r. Rows are causal inside the call; earlier positions must have been

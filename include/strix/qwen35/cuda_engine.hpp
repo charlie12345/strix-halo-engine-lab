@@ -22,6 +22,7 @@
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/operand_cache_plan.hpp"
 #include "strix/qwen35/config.hpp"
+#include "strix/split_k_policy.hpp"
 #include "strix/qwen35/engine_types.hpp"
 
 namespace strix::spec { class DraftRows; }
@@ -107,6 +108,12 @@ struct EngineOptions {
     // under free VRAM - max(4 GiB, 10 % total) and prefill_operand_cache_cap_mib (0 = no cap). off = per-call expansion.
     cuda_core::operand_cache::Mode prefill_operand_cache = cuda_core::operand_cache::Mode::automatic;
     std::uint32_t prefill_operand_cache_cap_mib = 0;
+    // NVFP4 GEMV split-K policy (strix/split_k_policy.hpp; resolved by the profile resolver strix/profiles/qwen_dense_cuda.hpp, lever split_k): exact = target
+    // 1000 (today's bits); fast = FAST nvfp4-splitk-fast-v1 (per-shape targets for the device, identity suffix "-skf1").
+    // Process-wide: the policy is core state (nvfp4_set_split_profile), so every live CudaEngine of a process shares one
+    // split policy and the last init() wins. The "-skf1" suffix names the request; on a device without FAST rows the bits
+    // are EXACT (print_split_policy reports the effective policy and the device key).
+    split_k::Profile nvfp4_split = split_k::Profile::exact;
 };
 
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
@@ -120,14 +127,19 @@ struct EngineOptions {
         : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
               (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
-    if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1" + pf;
+    // the FAST split policy changes the NVFP4 GEMV summation order (decode, verify and the exact prefill's split ranges)
+    const std::string sk = o.nvfp4_split == split_k::Profile::fast ? "-skf1" : "";
+    if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1" + pf + sk;
     // converted packs hold the onfly bytes: same arithmetic identity as onfly (prefix caches may be shared)
-    return "qwen35-turbo-nvfp4-onfly-rtn16-v2-retained-" + a + (o.turbo_lm_head ? "" : "-lmhead-bf16") + pf;
+    return "qwen35-turbo-nvfp4-onfly-rtn16-v2-retained-" + a + (o.turbo_lm_head ? "" : "-lmhead-bf16") + pf + sk;
 }
 // Writes the onfly NVFP4 weights of the BF16 gguf `src` as a converted pack at `out` (use with TurboWeights::converted). Returns bytes.
 std::uint64_t save_converted_pack(const std::string& src, const std::string& out, const EngineOptions& opt);
 // Effective-config text (identity, prefix-cache key, every lever).
 void print_effective_config(const EngineOptions& o, const char* dense_arith, std::FILE* f);
+// The "  split-k:" line of the effective config: the split policy the device really runs (identity, SM count, compute
+// capability); FAST requested on a device without rows prints "FAST requested, bits EXACT". Turbo weights only.
+void print_split_policy(const EngineOptions& o, std::FILE* f);
 
 // Outputs of the last forward (device pointers, valid until the next forward on this engine).
 struct RowsOut {

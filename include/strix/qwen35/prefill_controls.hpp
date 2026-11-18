@@ -39,4 +39,8 @@ void resolve_operand_cache(Options& options, std::string_view mode, std::string_
     options.prefill_operand_cache = m;
     options.prefill_operand_cache_cap_mib = cap;
 }
+
+// The bit-changing tier levers (prefill_arith, prefill_gdn, prefill_attn8, split_k) are resolved by the ONE product
+// profile resolver of this engine (strix/profiles/qwen_dense_cuda.hpp: --profile exact|fast + per-lever overrides), shared
+// by the decode and the speculative CLI. The scheduling-only controls above stay here.
 }  // namespace strix::qwen35

@@ -1654,6 +1654,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-turbo-bundle-tests)
     add_test(NAME strix-turbo-bundle-tests COMMAND strix-turbo-bundle-tests)
     set_tests_properties(strix-turbo-bundle-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
+    # FAST gate v2, engine side: shared MoE route record / replay / one-ulp null tap.
+    add_executable(strix-moe-route-file-tests tests/moe_route_file_tests.cpp)
+    target_link_libraries(strix-moe-route-file-tests PRIVATE strix_core)
+    strix_target_warnings(strix-moe-route-file-tests)
+    add_test(NAME strix-moe-route-file-tests COMMAND strix-moe-route-file-tests)
+    set_tests_properties(strix-moe-route-file-tests PROPERTIES LABELS "cpu;gate" TIMEOUT 60)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-turbo-kit-tests COMMAND ${Python3_EXECUTABLE} -B
@@ -2734,6 +2740,10 @@ if(BUILD_TESTING)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
         set_tests_properties(strix-option-qual-core-tests strix-option-qual-end-to-end-tests PROPERTIES
             TIMEOUT 3600 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+        # FAST gate v2 statistics (per-window null-relative KL, held-out dNLL + se, route replay bookkeeping).
+        add_test(NAME strix-fast-gate-v2-tests
+            COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s tools/strix-gate -p test_gate_v2.py
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endif()
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-dual-transport-runner-tests

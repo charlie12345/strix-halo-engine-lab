@@ -24,13 +24,14 @@ def write_routes(path, calls):
             f.write(np.array([layer, ids.shape[0], ids.shape[1], 0], "<u4").tobytes() + ids.tobytes() + w.tobytes())
 
 
-def window(name, n, kl, top1, dnll, null_kl, rng, hit=0.5):
+def window(name, n, kl, top1, dnll, null_kl, rng, hit=0.5, scale=0.05, null_top1=None):
     agree = np.arange(n) < round(top1 * n)
-    d = np.full(n, dnll) + rng.normal(scale=0.05, size=n)
+    d = np.full(n, dnll) + rng.normal(scale=scale, size=n)
     d -= d.mean() - dnll  # exact mean
     nll_ref = np.full(n, 1.0)
     hits = np.arange(n) < round(hit * n)
-    w = v2.window_stats(name, np.full(n, kl), agree, nll_ref, nll_ref + d, [null_kl], hits, hits)
+    w = v2.window_stats(name, np.full(n, kl), agree, nll_ref, nll_ref + d, [null_kl], hits, hits,
+                        null_top1s=None if null_top1 is None else [null_top1])
     w["_rows"] = {"kl": np.full(n, kl), "agree": agree, "dnll": d}
     return w
 
@@ -50,11 +51,35 @@ class Statistics(unittest.TestCase):
         with self.assertRaises(v2.GateError):
             v2.window_stats("x", [0.0], [True], [1.0], [1.0], [])
 
-    def test_top1_and_dnll_stay_absolute_per_window(self):
-        w = window("w", 256, 0.001, 0.92, 0.0, 0.5, self.rng)
+    def test_top1_and_dnll_fail_per_window_when_significant(self):
+        w = window("w", 256, 0.001, 0.85, 0.0, 0.5, self.rng)     # 15 % disagreement on 256 rows: limit 0.07 + 2 x 0.016
         self.assertEqual((w["checks"]["top1"], w["pass"]), (False, False))
-        w = window("w", 256, 0.001, 0.99, 0.02, 0.5, self.rng)
+        w = window("w", 256, 0.001, 0.99, 0.02, 0.5, self.rng)    # se 0.003: limit 0.01 + 0.006
         self.assertEqual((w["checks"]["dnll"], w["pass"]), (False, False))
+        # the Qwen 32K receipt that failed (256 rows, dNLL +0.051 se 0.0045) still fails
+        w = window("w", 256, 0.001, 0.99, 0.051, 0.5, self.rng, scale=0.072)
+        self.assertAlmostEqual(w["dnll_se"], 0.0045, delta=0.001)
+        self.assertFalse(w["checks"]["dnll"])
+
+    def test_window_resolution_and_null_relative_top1(self):
+        # DS41 D1 s8k-a: 63 rows, dNLL +0.030 se ~0.02 is inside the window's resolution (the one-ulp null failed this rule)
+        w = window("s8k-a", 63, 0.0139, 0.9365, 0.030, 0.0117, self.rng, scale=0.157)
+        self.assertAlmostEqual(w["dnll_se"], 0.0198, delta=0.005)
+        self.assertGreater(w["dnll_limit"], 0.03)
+        self.assertTrue(w["checks"]["dnll"])
+        w = window("big", 63, 0.0139, 0.99, 0.10, 0.0117, self.rng, scale=0.157)   # a real +0.10 nat loss still fails
+        self.assertFalse(w["checks"]["dnll"])
+        # d32a-o16384: 10 of 63 flips where the null itself flips 5 of 63 (high-entropy window): L = 1.5 x 0.079
+        w = window("o16384", 63, 0.0304, 0.8413, -0.016, 0.0293, self.rng, null_top1=0.9206)
+        self.assertAlmostEqual(w["null_top1"], 0.9206)
+        self.assertTrue(w["checks"]["top1"])
+        w = window("o16384", 63, 0.0304, 0.8413, -0.016, 0.0293, self.rng)      # without the null's top-1: fails
+        self.assertFalse(w["checks"]["top1"])
+        w = window("bad", 63, 0.0304, 0.70, -0.016, 0.0293, self.rng, null_top1=0.9206)   # 30 % flips: fails
+        self.assertFalse(w["checks"]["top1"])
+        line = v2.window_line(window("o16384", 63, 0.0304, 0.8413, -0.016, 0.0293, self.rng, null_top1=0.9206))
+        self.assertIn("(limit 0.7993, null 0.9206)", line)
+        self.assertIn("null 0.9206", line)
 
     def test_pooled_rows_se_and_absolute_kl(self):
         ws = [window(f"w{i}", 256, 0.015, 0.97, 0.002, 0.001, self.rng) for i in range(3)]

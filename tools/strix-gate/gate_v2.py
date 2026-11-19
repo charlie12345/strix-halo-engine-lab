@@ -6,6 +6,10 @@ that the reference's own chaos is not charged to the lever:
   R1 MoE engines: the lever arm replays the reference's expert routes (ids and weights); the route flip rate of the
      free-running lever arm, over the free-running null arm's, must be <= 1.5 (reported per window and pooled).
   R2 per window: KL <= max(0.02, 1.5 x the null arm's KL on that window); the pooled KL limit stays 0.02.
+     Top-1 and dNLL per window fail only when the window's own rows show the excess (one-sided, z = 2): disagreement
+     > L + z x sqrt(L (1 - L) / rows) with L = max(0.07, 1.5 x the null arm's disagreement), dNLL > 0.01 + z x se.
+     A 63-row window has dNLL se ~0.02, twice the limit: the absolute form failed the exact one-ulp null itself on 7 of
+     16 DS41 windows. The pooled top-1 and dNLL limits stay absolute (>= 800 rows pooled, se ~0.005).
   R3 dNLL on held-out ids (labels that neither arm generated), at least 800 scored rows pooled, standard error shown.
 
   python gate_v2.py qual OUT --ref REF --cand FAST --null NULL [--cand-free FASTF --null-free NULLF] [--json F]
@@ -25,7 +29,8 @@ import sys
 
 import numpy as np
 
-LIMITS = {"max_kl": 0.02, "min_top1": 0.93, "max_dnll": 0.01, "null_factor": 1.5, "max_flip_ratio": 1.5, "min_rows": 800}
+LIMITS = {"max_kl": 0.02, "min_top1": 0.93, "max_dnll": 0.01, "null_factor": 1.5, "max_flip_ratio": 1.5, "min_rows": 800,
+          "window_z": 2.0}
 ROUTE_MAGIC = b"STXROUT1"
 RECEIPT = re.compile(rb"^strix-route-file/v1 (\{.*\})\s*$", re.M)
 MIN_LABEL_ROWS = 32  # below this the held-out check cannot tell greedy ids from text
@@ -43,8 +48,10 @@ def mean_se(x):
     return float(x.mean()), se
 
 
-def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit_cand=None, limits=LIMITS):
-    """One window: R2 KL limit relative to this window's null, absolute top-1 and dNLL, dNLL standard error."""
+def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit_cand=None, limits=LIMITS, null_top1s=None):
+    """One window: R2 KL limit relative to this window's null; top-1 and dNLL fail only when significant on its rows.
+
+    null_top1s: the null arms' top-1 agreement on this window (None: the null-relative top-1 term is absent)."""
     kl, agree = np.asarray(kl, np.float64), np.asarray(agree, bool)
     d = np.asarray(nll_cand, np.float64) - np.asarray(nll_ref, np.float64)
     if not null_kls:
@@ -52,12 +59,21 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
     null_kl = float(np.mean(null_kls))
     kl_limit = max(limits["max_kl"], limits["null_factor"] * null_kl)
     dnll, se = mean_se(d)
+    z = limits.get("window_z", LIMITS["window_z"])
+    null_dis = 1.0 - float(np.mean(null_top1s)) if null_top1s else 0.0
+    dis_limit = max(1.0 - limits["min_top1"], limits["null_factor"] * null_dis)
+    # one-sided binomial score test of "disagreement <= dis_limit" on this window's rows
+    top1_limit = 1.0 - min(1.0, dis_limit + z * math.sqrt(dis_limit * (1.0 - dis_limit) / max(int(agree.size), 1)))
+    dnll_limit = limits["max_dnll"] + (z * se if math.isfinite(se) else 0.0)
     w = {"name": name, "rows": int(kl.size), "dnll_rows": int(d.size), "kl": float(kl.mean()), "top1": float(agree.mean()),
-         "dnll": dnll, "dnll_se": se, "null_kl": null_kl, "kl_limit": kl_limit}
+         "dnll": dnll, "dnll_se": se, "null_kl": null_kl, "kl_limit": kl_limit, "top1_limit": top1_limit,
+         "dnll_limit": dnll_limit}
+    if null_top1s:
+        w["null_top1"] = 1.0 - null_dis
     if hit_ref is not None:
         w["label_is_ref_top1"] = float(np.mean(hit_ref))
         w["label_is_cand_top1"] = float(np.mean(hit_cand))
-    w["checks"] = {"kl": w["kl"] <= kl_limit, "top1": w["top1"] >= limits["min_top1"], "dnll": dnll <= limits["max_dnll"]}
+    w["checks"] = {"kl": w["kl"] <= kl_limit, "top1": w["top1"] >= top1_limit, "dnll": dnll <= dnll_limit}
     w["pass"] = all(w["checks"].values())
     return w
 
@@ -175,8 +191,10 @@ def window_line(w, flips=None):
         fl = (f"; flips free cand {flips['cand']['rate']:.3e} null {flips['null']['rate']:.3e} ratio "
               f"{flip_ratio(flips['cand'], flips['null']):.2f}")
     bad = [k for k, ok in w["checks"].items() if not ok]
+    nt = f", null {w['null_top1']:.4f}" if "null_top1" in w else ""
     return (f"window {w['name']}: rows {w['rows']} KL {w['kl']:.5f} (limit {w['kl_limit']:.5f} = max(0.02, 1.5 x null "
-            f"{w['null_kl']:.5f})) top-1 {w['top1']:.4f} dNLL {w['dnll']:+.5f} se {w['dnll_se']:.5f}{fl} -> "
+            f"{w['null_kl']:.5f})) top-1 {w['top1']:.4f} (limit {w['top1_limit']:.4f}{nt}) dNLL {w['dnll']:+.5f} se "
+            f"{w['dnll_se']:.5f} (limit {w['dnll_limit']:+.5f}){fl} -> "
             f"{'PASS' if w['pass'] else 'FAIL ' + ','.join(bad)}")
 
 
@@ -272,9 +290,10 @@ def qual(a):
         route = lambda arm: out / "routes" / f"{case}.{arm}.rte"  # noqa: E731
         err = lambda arm: (out / "log" / f"{case}.{arm}.stderr").read_bytes()  # noqa: E731
         ra, _ = reduce_pair(logit(a.ref), logit(a.cand), a.format, **kw)
-        nulls = [reduce_pair(logit(a.ref), logit(n), a.format, **kw)[0]["kl_rc"].mean() for n in a.null]
-        w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"], [float(x) for x in nulls],
-                         ra["top1_r_is_label"], ra["top1_c_is_label"])
+        nulls = [reduce_pair(logit(a.ref), logit(n), a.format, **kw)[0] for n in a.null]
+        w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
+                         [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
+                         null_top1s=[float(x["agree"].mean()) for x in nulls])
         w["_rows"] = {"kl": ra["kl_rc"], "agree": ra["agree"].astype(bool), "dnll": ra["nll_c"] - ra["nll_r"]}
         moe = route(a.ref).exists()
         f = None

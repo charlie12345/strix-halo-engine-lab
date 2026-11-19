@@ -348,6 +348,71 @@ hardware, gpu_clock_mhz), `routes` {effective_config: lines of `--effective-conf
 `metrics` (mean + 95 % interval for T and R), `checks`, `tasks`, `controls`, `performance` (`--perf JSON`: tok_s,
 bytes_per_token, ttft_ms, p95_ms; absent keys are null and listed in `missing`).
 
+## FAST gate v2: `gate_v2.py`
+
+A FAST lever changes result bits. The gate asks whether its arithmetic moves the model's predictions more than the
+limits allow. On long prompts and on MoE models, two things unrelated to the lever can make that ruler fail:
+
+- **Routing chaos.** A MoE router picks a few experts per token from hundreds. A rounding-sized change upstream flips
+  some picks, and the flips cascade through the layers. Even a change that is only a different summation order
+  (exact class) moves the logits this way, so the plain gate charges the lever for the reference's own chaos.
+- **Biased labels and too few rows.** dNLL taken on the reference's own greedy tokens is pushed up by any change.
+  With 64-256 rows its standard error is as large as the 0.01 limit.
+
+v2 keeps the limits: KL <= 0.02, top-1 >= 0.93 and dNLL <= 0.01, applied both pooled and **per window** (per prompt).
+It changes what they are measured on:
+
+| rule | what is measured |
+|---|---|
+| R1 route replay (MoE engines) | The lever arm replays the reference's expert ids and weights at every router call, so KL, top-1 and dNLL measure arithmetic, not route flips. Separately, the route flip rate of the lever running free (its own routes) is divided by the flip rate of the null arm running free. That ratio must be <= 1.5. |
+| R2 null-relative window KL | For each window, the KL limit is max(0.02, 1.5 x the null arm's KL on that same window). The null is a one-ulp perturbation, measured under the same replay as the lever. The pooled KL limit stays an absolute 0.02. Top-1 and dNLL limits stay absolute per window. |
+| R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses labels that all equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
+
+Exit 0 = PASS, 1 = FAIL, 2 = no verdict. No verdict is given in these cases:
+- fewer than 800 pooled rows;
+- no null arm;
+- labels that are greedy ids;
+- a replay that did not consume the whole reference record;
+- a null that moved no weight;
+- route files that describe different router call sequences.
+
+The receipt prints, per window:
+- rows;
+- KL with its limit and that window's null KL;
+- top-1;
+- dNLL with its standard error;
+- flip rates and their ratio;
+- the replay record counts.
+
+Then it prints the pooled line.
+
+**Engine side (shared route tap).** A MoE backend binds `include/strix/moe/route_file.hpp` in one place, right after
+its router writes the selected ids and weights. Three environment switches drive it:
+- `STRIX_MOE_ROUTES_OUT=FILE` records each router call.
+- `STRIX_MOE_ROUTES_IN=FILE` replays the calls. The layer, row count and top-k of every call must match the record,
+  otherwise the run stops with an error.
+- `STRIX_MOE_ROUTE_NULL=LAYER:SEED` is the one-ulp null. Every selected weight of that layer moves by one FP32 ulp, up
+  or down by a seeded hash.
+
+At exit the process prints one `strix-route-file/v1 {json}` line on stderr. It holds the records written and consumed,
+the local flips per layer (the arm's own picks against the replayed ones) and the null's nudge count. With no switch
+set, the tap does nothing. Replay needs eager execution; a captured graph is refused.
+
+```sh
+# option_qual runner output (arms: REF {"routes":{"out":true}}, NULL {"routes":{"in":"REF"},
+#   "env":{"STRIX_MOE_ROUTE_NULL":"0:1"}}, FAST {"routes":{"in":"REF"}}, FASTF / NULLF {"routes":{"out":true}})
+python tools/strix-gate/gate_v2.py qual OUT --ref REF --cand FAST --null NULL --cand-free FASTF --null-free NULLF
+# sealed strix-fast-dump arms
+python tools/strix-gate/fast_logit_gate.py compare REF CAND --ranks 0 --tokens p=p.u32 --rule v2 --null-arm NULL \
+    [--route-flips p=ref.rte,cand_free.rte,null_free.rte]
+```
+
+Qwen HIP kit: `scripts/bench/qwen/fast-gate-v2.sh` (one model load per GPU ticket, resumable; arms in
+`fast-gate-v2-arms.json`: REF, NULL, FAST, the free-running FASTF / NULLF, and the single levers Q / G / R).
+
+A lever that passes v2 and has a measured speed gain is qualified per prompt-length regime (the profile table's
+`fast_regimes` rows) and runs under `--profile fast`.
+
 ## GLM scored prefill compare: `glm_score_nll.py`
 
 The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and

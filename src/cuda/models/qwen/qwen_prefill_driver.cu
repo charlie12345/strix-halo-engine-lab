@@ -31,6 +31,7 @@
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/mtp_draft_split.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
+#include "strix/cuda/core/moe_route_tap.hpp"
 #include "strix/cuda/core/nvfp4_a8_cuda.hpp"
 #include "strix/gguf_reader.hpp"
 #include "qwen_tier_adapter.hpp"
@@ -1375,6 +1376,9 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         std::fwrite(head, 4, 6, m.trace_file);
         m.use_graphs = false;  // the per-layer copies below are eager-only
     }
+    // FAST gate v2 route tap (STRIX_MOE_ROUTES_OUT / _IN, STRIX_MOE_ROUTE_NULL): the tap syncs and copies per router
+    // call, so decode windows run eager (a set_graphs(true) later makes the tap refuse the capture).
+    if (strix::cuda::core::route_tap_active()) m.use_graphs = false;
     {
         std::size_t free_now = 0, total_now = 0;
         if (cudaMemGetInfo(&free_now, &total_now) == cudaSuccess && m.plan.card.free > free_now) m.engine_bytes = m.plan.card.free - free_now;
@@ -1656,6 +1660,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         nv.push("moe_route");
         hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), moe_rows, logits, stream);
         hc::route_select(logits, moe_rows, kTopK, true, tables, routes, route_w, stream);
+        strix::cuda::core::route_tap(l, moe_rows, kTopK, routes, route_w, stream);  // inactive: one cached test
         nv.pop();
         if (trace_file) ck(cudaMemcpyAsync(trace_host + std::uint64_t{l} * rows * kTopK, routes, std::uint64_t{rows} * kTopK * 4,
                                            cudaMemcpyDeviceToHost, stream), "expert trace");

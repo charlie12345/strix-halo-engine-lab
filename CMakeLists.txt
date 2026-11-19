@@ -4518,6 +4518,12 @@ if(BUILD_TESTING)
     add_executable(strix-engram-inject-tests tests/engram_inject_tests.cpp)
     target_link_libraries(strix-engram-inject-tests PRIVATE strix_ds41_layer)
     strix_target_warnings(strix-engram-inject-tests)
+    # Bitwise declared-order checks: the transcribed reference and the header-inline shared reference compile in this
+    # TU, the re-bound ds41::engram_inject in strix_ds41_layer (-ffp-contract=off). Without the same flag a toolchain
+    # whose target has FMA fuses multiply-adds in this TU only and the arms differ.
+    if(NOT MSVC)
+        target_compile_options(strix-engram-inject-tests PRIVATE -ffp-contract=off)
+    endif()
     add_test(NAME strix-engram-inject-tests COMMAND strix-engram-inject-tests)
     add_executable(strix-engram-row-prep-tests tests/engram_row_prep_tests.cpp)
     target_link_libraries(strix-engram-row-prep-tests PRIVATE strix_ds41_layer)

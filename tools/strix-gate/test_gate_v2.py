@@ -40,6 +40,15 @@ class Statistics(unittest.TestCase):
     def setUp(self):
         self.rng = np.random.default_rng(3)
 
+    def test_null_equal_to_reference_is_refused(self):
+        # GLM b8 (refx_moe): a one-f32-ulp residual flip under FP16 input staging left the null bitwise equal to the
+        # reference; its KL 0 would floor the limit at 0.02 while the FP16-ulp null of the same window has KL 0.49.
+        with self.assertRaises(v2.GateError):
+            v2.null_moved("b8", [0.0])
+        with self.assertRaises(v2.GateError):
+            v2.null_moved("b8", [0.4945, 0.0])
+        v2.null_moved("b8", [0.4945, 1e-9])
+
     def test_per_window_kl_limit_is_null_relative(self):
         noisy = window("ho7-01", 256, 0.040, 0.95, 0.0, 0.030, self.rng)   # chaotic window: limit 1.5 x 0.030 = 0.045
         self.assertAlmostEqual(noisy["kl_limit"], 0.045)

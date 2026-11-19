@@ -260,6 +260,15 @@ def read_trace_diag(paths):
     return out
 
 
+def null_moved(name, null_kls):
+    """A null arm equal to the reference (KL exactly 0 on every row) measured nothing: its perturbation was absorbed
+    (e.g. one f32 ulp under an FP16 input rounding). Refuse it (no verdict) instead of flooring the null-relative limit."""
+    for i, k in enumerate(null_kls):
+        if float(k) == 0.0:
+            raise GateError(f"{name}: null arm {i} equals the reference (KL 0 on every row): the perturbation was absorbed, "
+                            "not a null (re-run it with a step that survives the consumer's input rounding)")
+
+
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
@@ -291,6 +300,7 @@ def qual(a):
         err = lambda arm: (out / "log" / f"{case}.{arm}.stderr").read_bytes()  # noqa: E731
         ra, _ = reduce_pair(logit(a.ref), logit(a.cand), a.format, **kw)
         nulls = [reduce_pair(logit(a.ref), logit(n), a.format, **kw)[0] for n in a.null]
+        null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
                          null_top1s=[float(x["agree"].mean()) for x in nulls])

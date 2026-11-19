@@ -24,6 +24,7 @@
 #include "glm/engine/glm_fast_i4_pack.hpp"
 #include "core/host_free_memory.hpp"
 #include "core/iu4.hpp"
+#include "core/null_perturb.hpp"
 #include "moe_core/int4_layer_policy.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
@@ -2448,14 +2449,16 @@ struct Engine::Impl {
             if (layer_dump != nullptr)
                 hip_ok(hipMemcpyAsync(layer_dump->data() + static_cast<std::size_t>(li) * kHc * kHidden, X, kHc * kHidden * 4,
                                       hipMemcpyDeviceToHost, stream), "layer dump");
-            if (null_layer == static_cast<int>(li))  // test hook: +1 ulp on stream 0 of the row at null_pos
+            // Test hook (gate null): one FP16 ulp on stream 0 of the row at null_pos. Every consumer stages its input as
+            // FP16, so a one-f32-ulp flip was absorbed and the null equalled the reference bitwise (core/null_perturb.hpp).
+            if (null_layer == static_cast<int>(li))
                 for (unsigned q = 0; q < R; ++q)
                     if (rows[q].pos == null_pos) {
                         float* at = X + (static_cast<std::size_t>(q) * kHc) * kHidden + null_elem;
                         std::uint32_t bits = 0;
                         hip_ok(hipMemcpyAsync(&bits, at, 4, hipMemcpyDeviceToHost, stream), "null flip read");
                         hip_ok(hipStreamSynchronize(stream), "null flip sync");
-                        bits += 1;
+                        bits = strix::core::fp16_ulp_up_bits(bits);
                         hip_ok(hipMemcpyAsync(at, &bits, 4, hipMemcpyHostToDevice, stream), "null flip write");
                         hip_ok(hipStreamSynchronize(stream), "null flip sync");
                     }

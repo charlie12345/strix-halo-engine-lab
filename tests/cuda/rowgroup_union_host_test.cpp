@@ -1,10 +1,11 @@
-// Host oracle for the row-group union (src/cuda/core/rowgroup_union.hpp), the invariant of the shared row-group attention core:
+// Host oracle for the row-group union (strix/attn_rowgroup_union.hpp), the invariant of the shared row-group attention core:
 //   every row r sees exactly its own selected keys (with multiplicity) among the union entries carrying mask bit r;
 //   for strictly ascending lists the union is the sorted set union, no key twice, positions 0..U-1 all written.
 // The device union_body (core/attention_rowgroup.cuh) runs these same functions in parallel: owned flags, per-list exclusive
 // prefix of owned keys, rank_and_mask scatter; a non-ascending list switches the tile to the concatenation. This test runs
 // that algorithm sequentially and compares it with std::set reasoning. No GPU.
-#include "../../src/cuda/core/rowgroup_union.hpp"
+#include "strix/attn_rowgroup_union.hpp"
+#include "../../src/cuda/core/rowgroup_union.hpp"  // forwarding declarations
 
 #include <algorithm>
 #include <cstdint>
@@ -14,7 +15,13 @@
 #include <set>
 #include <vector>
 
-namespace rg = strix::cuda::core::rowgroup;
+namespace rg = strix::attn::rowgroup;
+// Same entity: two non-type template arguments naming the same function are the same specialization.
+template <auto A, auto B> struct SameEntity { static constexpr bool value = false; };
+template <auto A> struct SameEntity<A, A> { static constexpr bool value = true; };
+static_assert(SameEntity<&rg::lower_bound, &strix::cuda::core::rowgroup::lower_bound>::value &&
+              SameEntity<&rg::owned, &strix::cuda::core::rowgroup::owned>::value,
+              "the forwarding declarations name the shared functions");
 
 namespace {
 constexpr unsigned R = 4, Cap = 2051;
@@ -153,10 +160,10 @@ int main() {
         ++c;
         std::vector<std::vector<std::uint32_t>> in(R);
         for (unsigned r = 0; r < R; ++r) {
-            const unsigned size = k % 5 == 0 ? Cap : 1U + rng() % Cap;
-            const std::uint32_t lo = k % 7 == 0 ? r * 100000U : 0U, span = 3000U + rng() % 20000U;
+            const unsigned size = k % 5 == 0 ? Cap : 1U + static_cast<unsigned>(rng() % Cap);
+            const std::uint32_t lo = k % 7 == 0 ? r * 100000U : 0U, span = 3000U + static_cast<std::uint32_t>(rng() % 20000U);
             std::set<std::uint32_t> s;
-            while (s.size() < std::min<unsigned>(size, span)) s.insert(lo + rng() % span);
+            while (s.size() < std::min<unsigned>(size, span)) s.insert(lo + static_cast<std::uint32_t>(rng() % span));
             in[r].assign(s.begin(), s.end());
         }
         verify(in, build(in), c);

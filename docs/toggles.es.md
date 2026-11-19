@@ -24,12 +24,13 @@ Solo necesitas esta página para inspeccionar una ruta, depurar o llevar el moto
 
 | Perfil | Qué hace |
 |---|---|
-| `--profile default` | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
-| `--profile fast` | Añade solo opciones cualificadas que cambian bits. Las filas aún no cualificadas siguen apagadas (ver `--allow-pending`). |
+| `--profile exact` (alias `default`) | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
+| `--profile fast` | Añade todas las opciones cualificadas que cambian bits y las filas elegidas para fast antes de su recibo (marcadas "qualification in progress" en el recibo). Las demás siguen apagadas (ver `--allow-pending`). MiniMax: el paquete cualificado `mm-fast-pf-v2` (los mismos miembros e identidad de prefill que `STRIX_MM_FAST_PREFILL=1`; rechazado con `--baseline`). Par GLM: nada (`STRIX_GLM_PF_WMMA` no está cualificado para fast: su conjunto FAST de prefill falla la puerta de calidad a 8K; solo corre si se pone explícitamente). Par DeepSeek: el paquete FAST y sus palancas Engram / experto compartido / MoE FP16 siguen explícitos hasta su puerta de calidad. Un interruptor puesto, `0` incluido, manda. |
 | `--profile quality` | Un pack de mayor precisión donde existe (Nemotron EXL3). Si no, igual que `default`. |
+| `--profile` en `strix-cuda-ds41-prefill-service` | Servicio de prefill DS41 RTX: acepta la misma palabra (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) y `--allow-pending` que la réplica, con el mismo resolutor (`strix/profiles/ds41_rtx.hpp`). Hoy todas las filas fast están pendientes (listadas en `levers`, nunca usadas), así que `fast` se ejecuta como `exact`. |
 
-Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`.
-MiniMax no tiene perfiles de producto con nombre: `--profile NAME:PROMPT.u32:STEPS` ejecuta una sesión con tiempos.
+Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`. Todos los analizadores de la palabra, Gemma 4 y el productor GLM RTX incluidos, aceptan `exact` (= `default`) con el analizador compartido; los motores sin columna TURBO rechazan `turbo` con ese motivo.
+MiniMax acepta las mismas palabras (`--profile exact|fast|...`); `--profile NAME:PROMPT.u32:STEPS` sigue ejecutando una sesión con tiempos.
 Las CLI CUDA de Qwen denso 27B (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) aceptan la misma palabra, `--profile exact|default|fast|quality`
 (`exact` = `default`; `turbo` se rechaza: este motor aún no tiene barra TURBO). Una sola tabla, `include/strix/profiles/qwen_dense_cuda.hpp`, resuelta por
 el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el régimen donde pasó su gate; una opción explícita gana y
@@ -118,6 +119,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | `--prefill-path device` | deepseek serve | `device` | Prefill en la GPU. | - |
 | `--wide-exact N` | qwen (app decode HIP 27B) | off (ventanas de 16 filas) | Ventanas de prefill EXACT de N filas, cada fila bit a bit igual al resultado de 16 filas; solo si todas las proyecciones densas grandes son IU4 (otros formatos resuelven a 16 filas). `--wide N` (> 16) es la clase FAST ancha. [Detalles](optimizations.md#qwen27-hip-decode-step). | 64 es el mejor medido en Strix (la atención exacta cuesta más por fila en rejillas más anchas). |
 | `--prefill-rows N`, `--prefill-exact` | qwen (app spec HIP 27B) | ventanas EXACT de 64 filas (proyecciones densas IU4; 16 filas en otro caso) | `--prefill-rows 16` = ventanas de 16 filas; N > 16 = la clase FAST ancha salvo con `--prefill-exact`. [Detalles](optimizations.md#qwen27-hip-decode-step). | - |
+| `--profile exact\|fast` | qwen (apps decode y spec HIP 27B) | `exact` (= `default`) | Palabra de nivel; `exact` no cambia nada. `fast` elige ventanas de prefill FAST anchas de 64 filas cuando pase su gate compuesto; hasta entonces queda pendiente (se informa, no se aplica) salvo `--allow-pending`. `--wide N` / `--prefill-rows N` mandan sobre la palabra. | App pair: sin enlazar (su `--wide 512` ya es la clase FAST). |
 | `--vision FILE` | deepseek serve (rank 0) | desactivado | Entrada de imágenes: carga el GGUF de visión y acepta partes `image_url`. Requiere `--prefill-path device`. [Entrada de imágenes](engine/vision.es.md). | - |
 | `STRIX_VISION_RESIDENT` | deepseek serve | 1 | `1`: la torre de imagen se sube al arrancar; `0`: con la primera imagen. | `0` para dejar la memoria libre hasta que llegue una imagen. |
 | `STRIX_VISION_CACHE_MIB` | deepseek serve | 256 | Tamaño en MiB de la caché de embeddings de imagen; `0` desactiva el almacenamiento. | Mayor si las mismas imágenes se repiten. |

@@ -24,12 +24,13 @@ You only need this page to inspect a path, to debug, or to move the engine to di
 
 | Profile | What it does |
 |---|---|
-| `--profile default` | Current production path; exports no profile overrides. This is the default. |
-| `--profile fast` | Adds only qualified bit-changing options. Rows that are not qualified yet stay off (see `--allow-pending`). |
+| `--profile exact` (alias `default`) | Current production path; exports no profile overrides. This is the default. |
+| `--profile fast` | Adds every qualified bit-changing option, and the rows selected for fast ahead of their receipt (stamped "qualification in progress" in the receipt). Rows that are neither stay off (see `--allow-pending`). MiniMax: the qualified bundle `mm-fast-pf-v2` (the same members and prefill identity as `STRIX_MM_FAST_PREFILL=1`; refused with `--baseline`). GLM pair: nothing (`STRIX_GLM_PF_WMMA` is unqualified for fast: its FAST prefill set fails the 8K quality gate; it runs only when set explicitly). DeepSeek pair: the FAST bundle and its Engram / shared / MoE FP16 levers stay explicit until their quality gate. A set switch, `0` included, wins. |
 | `--profile quality` | A higher-precision pack where one exists (Nemotron EXL3). Otherwise equal to `default`. |
+| `--profile` on `strix-cuda-ds41-prefill-service` | DS41 RTX prefill service: takes the same word (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) and `--allow-pending` as the replica, through the same resolver (`strix/profiles/ds41_rtx.hpp`). Today every fast row is pending (listed in `levers`, never used), so `fast` runs as `exact`. |
 
-Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`.
-MiniMax has no named product profile: `--profile NAME:PROMPT.u32:STEPS` runs a timed session.
+Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`. Every word parser, Gemma 4 and the GLM RTX producer included, takes `exact` (= `default`) through the shared tier parser; engines without a TURBO column refuse `turbo` with that reason.
+MiniMax takes the same words (`--profile exact|fast|...`); `--profile NAME:PROMPT.u32:STEPS` still runs a timed session.
 The CUDA Qwen dense 27B CLIs (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) take the same word, `--profile exact|default|fast|quality`
 (`exact` = `default`; `turbo` is refused: no TURBO bar for this engine yet). One table, `include/strix/profiles/qwen_dense_cuda.hpp`, resolved by
 the shared resolver for both CLIs: `fast` turns on each lever only in the regime where its gate passed; an explicit option wins and
@@ -123,6 +124,7 @@ The tables below list the curated flags. The full list of environment variables 
 | `--prefill-path device` | deepseek serve | `device` | Prefill on the GPU. | - |
 | `--wide-exact N` | qwen (27B HIP decode app) | off (16-row windows) | EXACT prefill windows of N rows, every row bitwise the 16-row result; only when every large dense projection is IU4 (other formats resolve to 16 rows). `--wide N` (> 16) is the FAST wide class. [Details](optimizations.md#qwen27-hip-decode-step). | 64 measured best on Strix (exact attention costs more per row in wider grids). |
 | `--prefill-rows N`, `--prefill-exact` | qwen (27B HIP spec app) | 64-row EXACT windows (IU4 dense projections; 16 rows otherwise) | `--prefill-rows 16` = 16-row windows; N > 16 = the FAST wide class unless `--prefill-exact` is given. [Details](optimizations.md#qwen27-hip-decode-step). | - |
+| `--profile exact\|fast` | qwen (27B HIP decode and spec apps) | `exact` (= `default`) | Tier word; `exact` changes nothing. `fast` selects 64-row FAST wide prefill windows once its composite gate passes; until then it is pending (reported, not applied) unless `--allow-pending`. `--wide N` / `--prefill-rows N` win over the word. | Pair app: not bound (its `--wide 512` is already the FAST class). |
 | `--vision FILE` | deepseek serve (rank 0) | off | Image input: loads the vision GGUF and accepts `image_url` parts. Needs `--prefill-path device`. [Image input](engine/vision.md). | - |
 | `STRIX_VISION_RESIDENT` | deepseek serve | 1 | `1`: the image tower is uploaded at start; `0`: on the first image. | `0` to keep the memory free until an image arrives. |
 | `STRIX_VISION_CACHE_MIB` | deepseek serve | 256 | Size of the image embed cache in MiB; `0` disables storing. | Larger when the same images repeat. |
@@ -159,7 +161,7 @@ Pair setup: [pair-setup.md](pair-setup.md).
 
 | Flag | Engine | Default | What it does |
 |---|---|---|---|
-| `--profile default\|fast\|quality` | qwen, deepseek pair, gemma4/nemotron, glm rank | `default` | See [Profiles](#profiles-exact-vs-fast). |
+| `--profile exact\|default\|fast\|quality` | qwen, deepseek pair, gemma4/nemotron, glm rank | `exact` (= `default`) | See [Profiles](#profiles-exact-vs-fast). |
 | `--profile` (bare) | glm rank | off | Kernel timing; preserved alongside named profiles. |
 | `--profile NAME:PROMPT.u32:STEPS` | minimax rank | off | Timed session, not a product profile. |
 | `--allow-pending` | pair apps | off | Lets `fast` apply rows that are not qualified yet. |

@@ -6,11 +6,20 @@ that the reference's own chaos is not charged to the lever:
   R1 MoE engines: the lever arm replays the reference's expert routes (ids and weights); the route flip rate of the
      free-running lever arm, over the free-running null arm's, must be <= 1.5 (reported per window and pooled).
   R2 per window: KL <= max(0.02, 1.5 x the null arm's KL on that window); the pooled KL limit stays 0.02.
-     Top-1 and dNLL per window fail only when the window's own rows show the excess (one-sided, z = 2): disagreement
-     > L + z x sqrt(L (1 - L) / rows) with L = max(0.07, 1.5 x the null arm's disagreement), dNLL > 0.01 + z x se.
+     Top-1 and dNLL per window are three-state (one-sided, z = 2): PASS at disagreement <= L, FAIL above
+     L + z x sqrt(L (1 - L) / rows), UNRESOLVED between, with L = max(0.07, 1.5 x the null arm's disagreement); dNLL
+     PASS at <= 0.01, FAIL above 0.01 + z x se, UNRESOLVED between, se capped at 1.5 x the null's se on that window.
      A 63-row window has dNLL se ~0.02, twice the limit: the absolute form failed the exact one-ulp null itself on 7 of
-     16 DS41 windows. The pooled top-1 and dNLL limits stay absolute (>= 800 rows pooled, se ~0.005).
+     16 DS41 windows, and a two-state "significant only" form passed a real loss on one content class 5 times in 6.
+     An UNRESOLVED window is cleared only by its content class: the windows of a class (declared before scoring;
+     default one class, or the prompt-length band with a manifest) are pooled and judged by the same rule; a class
+     verdict is final on >= 800 rows. The pooled top-1 and dNLL limits stay absolute (>= 800 rows pooled).
   R3 dNLL on held-out ids (labels that neither arm generated), at least 800 scored rows pooled, standard error shown.
+  R4 reference check: a window where the candidate beats the exact reference by more than 3 se (and, with a null, the
+     candidate-minus-null difference is also below -3 se) is "reference suspect"; a window whose reference NLL is far
+     above the others (> max(3 x median, median + 2 nats), >= 3 windows) is "off-distribution" (control or
+     chat-template ids, a timing prompt). Either makes the verdict HOLD, never PASS.
+  Nulls are evaluation-order (one-ulp class) runs; a null equal to the reference (KL 0) is refused (no verdict).
 
   python gate_v2.py qual OUT --ref REF --cand FAST --null NULL [--cand-free FASTF --null-free NULLF] [--json F]
       option_qual runner output: OUT/logits/<case>.<arm>.bin, OUT/log/<case>.<arm>.stderr, OUT/routes/<case>.<arm>.rte
@@ -18,7 +27,9 @@ that the reference's own chaos is not charged to the lever:
       prefill quality tool head dumps OUT/<case>-<arm>.f32 (64 x V rows, labels = the manifest's prompt IDs); an engine
       without a route tap runs every arm free and reports R1 flips from its trace diag lines
   fast_logit_gate.py compare REF CAND --rule v2 --null-arm NULL ...   (sealed strix-fast-dump arms)
-Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, labels not held out, missing null).
+  qual --classes C.json: {"case": "class", ...} declares the content class of each window before scoring.
+Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, labels not held out, missing null),
+     3 = UNRESOLVED (provisional: the lever stays opt-in for the unresolved classes), 4 = HOLD (reference check).
 """
 import argparse
 import json
@@ -30,7 +41,8 @@ import sys
 import numpy as np
 
 LIMITS = {"max_kl": 0.02, "min_top1": 0.93, "max_dnll": 0.01, "null_factor": 1.5, "max_flip_ratio": 1.5, "min_rows": 800,
-          "window_z": 2.0}
+          "window_z": 2.0, "suspect_z": 3.0, "se_null_cap": 1.5, "ref_nll_factor": 3.0, "ref_nll_margin": 2.0}
+EXIT = {"PASS": 0, "FAIL": 1, "UNRESOLVED": 3, "HOLD": 4}
 ROUTE_MAGIC = b"STXROUT1"
 RECEIPT = re.compile(rb"^strix-route-file/v1 (\{.*\})\s*$", re.M)
 MIN_LABEL_ROWS = 32  # below this the held-out check cannot tell greedy ids from text
@@ -48,33 +60,75 @@ def mean_se(x):
     return float(x.mean()), se
 
 
-def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit_cand=None, limits=LIMITS, null_top1s=None):
-    """One window: R2 KL limit relative to this window's null; top-1 and dNLL fail only when significant on its rows.
+def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
+    """R2 + R4 on one window or one pooled content class: KL two-state, top-1 and dNLL three-state, reference check.
 
-    null_top1s: the null arms' top-1 agreement on this window (None: the null-relative top-1 term is absent)."""
+    null_d: per-row dNLL of the null arm on the same labels (None: no se cap, the reference check has no null term)."""
+    z = limits.get("window_z", LIMITS["window_z"])
+    kl_limit = max(limits["max_kl"], limits["null_factor"] * null_kl)
+    dnll, se = mean_se(d)
+    dis = 1.0 - float(agree.mean())
+    dis_pass = max(1.0 - limits["min_top1"], limits["null_factor"] * null_dis)
+    # one-sided binomial score test of "disagreement <= dis_pass" on these rows
+    dis_fail = min(1.0, dis_pass + z * math.sqrt(dis_pass * (1.0 - dis_pass) / max(int(agree.size), 1)))
+    j = {"kl": float(kl.mean()), "top1": 1.0 - dis, "dnll": dnll, "null_kl": null_kl, "kl_limit": kl_limit,
+         "top1_pass": 1.0 - dis_pass, "top1_limit": 1.0 - dis_fail}
+    se_used = se
+    if null_d is not None and null_d.size > 1:
+        j["null_dnll"], j["null_dnll_se"] = mean_se(null_d)
+        cap = limits.get("se_null_cap", LIMITS["se_null_cap"]) * j["null_dnll_se"]
+        if math.isfinite(cap) and 0.0 < cap < se:
+            se_used, j["dnll_se_rows"] = cap, se
+    j["dnll_se"] = se_used
+    j["dnll_limit"] = limits["max_dnll"] + (z * se_used if math.isfinite(se_used) else 0.0)
+    j["states"] = {"kl": "pass" if j["kl"] <= kl_limit else "fail",
+                   "top1": "pass" if dis <= dis_pass else ("fail" if dis > dis_fail else "unresolved"),
+                   "dnll": "pass" if dnll <= limits["max_dnll"] else ("fail" if dnll > j["dnll_limit"] else "unresolved")}
+    s = j["states"].values()
+    j["state"] = "fail" if "fail" in s else ("unresolved" if "unresolved" in s else "pass")
+    # R4: the lever beats the exact reference on the true text by more than suspect_z se, and the null does not move
+    # the same way (paired candidate-minus-null not below -suspect_z se as well)
+    sz = limits.get("suspect_z", LIMITS["suspect_z"])
+    suspect = math.isfinite(se_used) and dnll < -sz * se_used
+    if suspect and null_d is not None and null_d.size == d.size and d.size > 1:
+        j["cand_minus_null"], cn_se = mean_se(d - null_d)
+        suspect = j["cand_minus_null"] < -sz * cn_se
+    j["reference_suspect"] = bool(suspect)
+    return j
+
+
+def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit_cand=None, limits=LIMITS, null_top1s=None,
+                 null_nlls=None, cls=None):
+    """One window: R2 KL limit relative to this window's null; top-1 and dNLL PASS / UNRESOLVED / FAIL on its rows; R4.
+
+    null_top1s: the null arms' top-1 agreement on this window (None: the null-relative top-1 term is absent).
+    null_nlls: the null arms' per-row NLL on the same labels (the first is used: se cap and the paired reference check).
+    cls: the window's content class, declared before scoring (None: one class for the whole gate set)."""
     kl, agree = np.asarray(kl, np.float64), np.asarray(agree, bool)
-    d = np.asarray(nll_cand, np.float64) - np.asarray(nll_ref, np.float64)
+    nll_ref = np.asarray(nll_ref, np.float64)
+    d = np.asarray(nll_cand, np.float64) - nll_ref
     if not null_kls:
         raise GateError(f"{name}: no null arm (v2 needs the one-ulp / order-only null of every window)")
     null_kl = float(np.mean(null_kls))
-    kl_limit = max(limits["max_kl"], limits["null_factor"] * null_kl)
-    dnll, se = mean_se(d)
-    z = limits.get("window_z", LIMITS["window_z"])
     null_dis = 1.0 - float(np.mean(null_top1s)) if null_top1s else 0.0
-    dis_limit = max(1.0 - limits["min_top1"], limits["null_factor"] * null_dis)
-    # one-sided binomial score test of "disagreement <= dis_limit" on this window's rows
-    top1_limit = 1.0 - min(1.0, dis_limit + z * math.sqrt(dis_limit * (1.0 - dis_limit) / max(int(agree.size), 1)))
-    dnll_limit = limits["max_dnll"] + (z * se if math.isfinite(se) else 0.0)
-    w = {"name": name, "rows": int(kl.size), "dnll_rows": int(d.size), "kl": float(kl.mean()), "top1": float(agree.mean()),
-         "dnll": dnll, "dnll_se": se, "null_kl": null_kl, "kl_limit": kl_limit, "top1_limit": top1_limit,
-         "dnll_limit": dnll_limit}
+    null_d = None
+    if null_nlls:
+        null_d = np.asarray(null_nlls[0], np.float64) - nll_ref
+        if null_d.size != d.size:
+            raise GateError(f"{name}: the null arm scored {null_d.size} rows, the candidate {d.size}")
+    w = {"name": name, "class": cls or "all", "rows": int(kl.size), "dnll_rows": int(d.size),
+         "ref_nll": float(nll_ref.mean())}
+    w.update(_judge(kl, agree, d, null_kl, null_dis, null_d, limits))
     if null_top1s:
         w["null_top1"] = 1.0 - null_dis
     if hit_ref is not None:
         w["label_is_ref_top1"] = float(np.mean(hit_ref))
         w["label_is_cand_top1"] = float(np.mean(hit_cand))
-    w["checks"] = {"kl": w["kl"] <= kl_limit, "top1": w["top1"] >= top1_limit, "dnll": dnll <= dnll_limit}
-    w["pass"] = all(w["checks"].values())
+    w["checks"] = {k: v != "fail" for k, v in w["states"].items()}   # not failed (UNRESOLVED is not a pass)
+    w["pass"] = w["state"] == "pass"
+    w["_rows"] = {"kl": kl, "agree": agree, "dnll": d}
+    if null_d is not None:
+        w["_rows"]["null_dnll"] = null_d
     return w
 
 
@@ -172,7 +226,16 @@ def verdict(windows, flips=None, limits=LIMITS):
     if d.size < limits["min_rows"]:
         raise GateError(f"{d.size} scored dNLL rows pooled, v2 needs at least {limits['min_rows']} (se {se:.4f})")
     checks = {"kl": pooled["kl"] <= limits["max_kl"], "top1": pooled["top1"] >= limits["min_top1"],
-              "dnll": dnll <= limits["max_dnll"], "windows": all(w["pass"] for w in windows)}
+              "dnll": dnll <= limits["max_dnll"], "windows": all(w["state"] != "fail" for w in windows)}
+    pooled["classes"] = class_verdicts(windows, limits)
+    final_pass = {c["name"] for c in pooled["classes"] if c["final"] and c["state"] == "pass"}
+    for w in windows:
+        if w["state"] == "unresolved":
+            w["cleared_by_class"] = w["class"] in final_pass
+    pooled["off_distribution"] = off_distribution(windows, limits)
+    pooled["reference_suspect"] = [w["name"] for w in windows if w["reference_suspect"]]
+    pooled["unresolved"] = sorted({w["class"] for w in windows if w["state"] == "unresolved" and not w["cleared_by_class"]} |
+                                  {c["name"] for c in pooled["classes"] if c["state"] == "unresolved" or not c["final"]})
     if flips is not None:
         cand = {"slots": sum(f["cand"]["slots"] for f in flips), "ids": sum(f["cand"]["ids"] for f in flips)}
         null = {"slots": sum(f["null"]["slots"] for f in flips), "ids": sum(f["null"]["ids"] for f in flips)}
@@ -180,9 +243,50 @@ def verdict(windows, flips=None, limits=LIMITS):
             x["rate"] = x["ids"] / x["slots"] if x["slots"] else 0.0
         pooled["flips"] = {"cand": cand, "null": null, "ratio": flip_ratio(cand, null)}
         checks["flip_ratio"] = pooled["flips"]["ratio"] <= limits["max_flip_ratio"]
+    checks["classes"] = all(c["state"] != "fail" for c in pooled["classes"])
     pooled["checks"] = checks
-    pooled["pass"] = all(checks.values())
+    if not all(checks.values()):
+        pooled["state"] = "FAIL"
+    elif pooled["reference_suspect"] or pooled["off_distribution"]:
+        pooled["state"] = "HOLD"     # never PASS: the exact path is examined on those windows first
+    elif pooled["unresolved"]:
+        pooled["state"] = "UNRESOLVED"   # provisional: the lever stays opt-in for these classes
+    else:
+        pooled["state"] = "PASS"
+    pooled["pass"] = pooled["state"] == "PASS"
     return pooled
+
+
+def class_verdicts(windows, limits=LIMITS):
+    """The windows of each declared content class pooled and judged by the same rule (final on >= min_rows rows)."""
+    groups = {}
+    for w in windows:
+        groups.setdefault(w["class"], []).append(w)
+    out = []
+    for name, ws in groups.items():
+        cat = lambda k: np.concatenate([w["_rows"][k] for w in ws])  # noqa: E731
+        rows = np.array([w["dnll_rows"] for w in ws], np.float64)
+        null_kl = float(np.dot(rows, [w["null_kl"] for w in ws]) / rows.sum())
+        null_dis = (float(np.dot(rows, [1.0 - w["null_top1"] for w in ws]) / rows.sum())
+                    if all("null_top1" in w for w in ws) else 0.0)
+        null_d = cat("null_dnll") if all("null_dnll" in w["_rows"] for w in ws) else None
+        c = {"name": name, "windows": [w["name"] for w in ws], "rows": int(rows.sum())}
+        c.update(_judge(cat("kl"), cat("agree"), cat("dnll"), null_kl, null_dis, null_d, limits))
+        c["final"] = c["rows"] >= limits["min_rows"]
+        out.append(c)
+    return out
+
+
+def off_distribution(windows, limits=LIMITS):
+    """Windows whose reference NLL is far above the gate set's (control / chat-template ids, a timing prompt)."""
+    if len(windows) < 3:
+        return []
+    med = float(np.median([w["ref_nll"] for w in windows]))
+    bar = max(limits["ref_nll_factor"] * med, med + limits["ref_nll_margin"])
+    flagged = [w["name"] for w in windows if w["ref_nll"] > bar]
+    for w in windows:
+        w["off_distribution"] = w["name"] in flagged
+    return flagged
 
 
 def window_line(w, flips=None):
@@ -190,12 +294,27 @@ def window_line(w, flips=None):
     if flips:
         fl = (f"; flips free cand {flips['cand']['rate']:.3e} null {flips['null']['rate']:.3e} ratio "
               f"{flip_ratio(flips['cand'], flips['null']):.2f}")
-    bad = [k for k, ok in w["checks"].items() if not ok]
     nt = f", null {w['null_top1']:.4f}" if "null_top1" in w else ""
-    return (f"window {w['name']}: rows {w['rows']} KL {w['kl']:.5f} (limit {w['kl_limit']:.5f} = max(0.02, 1.5 x null "
-            f"{w['null_kl']:.5f})) top-1 {w['top1']:.4f} (limit {w['top1_limit']:.4f}{nt}) dNLL {w['dnll']:+.5f} se "
-            f"{w['dnll_se']:.5f} (limit {w['dnll_limit']:+.5f}){fl} -> "
-            f"{'PASS' if w['pass'] else 'FAIL ' + ','.join(bad)}")
+    nd = (f"; null dNLL {w['null_dnll']:+.5f} se {w['null_dnll_se']:.5f}" if "null_dnll" in w else "; null dNLL n/a")
+    cap = f" (rows se {w['dnll_se_rows']:.5f}, capped 1.5 x null)" if "dnll_se_rows" in w else ""
+    flags = "".join(f" [{f}]" for f in ("reference_suspect", "off_distribution") if w.get(f))
+    if w.get("cleared_by_class"):
+        flags += f" [cleared by class {w['class']}]"
+    return (f"window {w['name']} [{w['class']}]: rows {w['rows']} ref NLL {w['ref_nll']:.3f} KL {w['kl']:.5f} (limit "
+            f"{w['kl_limit']:.5f} = max(0.02, 1.5 x null {w['null_kl']:.5f})) top-1 {w['top1']:.4f} (limit "
+            f"{w['top1_limit']:.4f}{nt}; pass >= {w['top1_pass']:.4f}) dNLL {w['dnll']:+.5f} se {w['dnll_se']:.5f}{cap} "
+            f"(pass <= +0.01, fail > {w['dnll_limit']:+.5f}){nd}{fl} -> {_state_text(w)}{flags}")
+
+
+def _state_text(x):
+    st = x["state"]
+    return st.upper() + ("" if st == "pass" else " " + ",".join(k for k, v in x["states"].items() if v == st))
+
+
+def class_line(c):
+    return (f"class {c['name']}: windows {len(c['windows'])} rows {c['rows']} ({'final' if c['final'] else 'provisional'}, "
+            f">= {LIMITS['min_rows']}) KL {c['kl']:.5f} top-1 {c['top1']:.4f} (fail < {c['top1_limit']:.4f}) dNLL "
+            f"{c['dnll']:+.5f} se {c['dnll_se']:.5f} (fail > {c['dnll_limit']:+.5f}) -> {_state_text(c)}")
 
 
 def pooled_line(p):
@@ -204,9 +323,16 @@ def pooled_line(p):
         f = p["flips"]
         fl = f"; route flips free cand {f['cand']['rate']:.3e} / null {f['null']['rate']:.3e} = {f['ratio']:.2f} (<= 1.5)"
     bad = [k for k, ok in p["checks"].items() if not ok]
-    return (f"POOLED v2 rows {p['rows']} (dNLL rows {p['dnll_rows']}, >= {LIMITS['min_rows']}): KL {p['kl']:.5f} (<= 0.02) "
-            f"top-1 {p['top1']:.4f} dNLL {p['dnll']:+.5f} se {p['dnll_se']:.5f}{fl} -> "
-            f"{'PASS' if p['pass'] else 'FAIL ' + ','.join(bad)}")
+    why = {"FAIL": ",".join(bad), "UNRESOLVED": "classes " + ",".join(p.get("unresolved", [])) + " (provisional: opt-in there)",
+           "HOLD": "; ".join(x for x in (
+               ("reference suspect " + ",".join(p.get("reference_suspect", []))) if p.get("reference_suspect") else "",
+               ("off-distribution reference " + ",".join(p.get("off_distribution", []))) if p.get("off_distribution") else "")
+               if x) + " (examine the exact path on those windows, then re-run)", "PASS": ""}[p["state"]]
+    lines = [class_line(c) for c in p.get("classes", [])]
+    lines.append(f"POOLED v2 rows {p['rows']} (dNLL rows {p['dnll_rows']}, >= {LIMITS['min_rows']}): KL {p['kl']:.5f} (<= 0.02) "
+                 f"top-1 {p['top1']:.4f} dNLL {p['dnll']:+.5f} se {p['dnll_se']:.5f}{fl} -> {p['state']}"
+                 + (f" {why}" if why else ""))
+    return "\n".join(lines)
 
 
 def _option_qual_reduce():
@@ -275,6 +401,7 @@ def qual(a):
     reduce_pair = _option_qual_reduce()
     head = a.format == "head"
     manifest = read_manifest(a.manifest) if a.manifest else None
+    classes = json.loads(pathlib.Path(a.classes).read_text(encoding="utf-8")) if getattr(a, "classes", None) else None
     if head and manifest is None:
         raise GateError("--format head needs --manifest (the prompt IDs are the held-out labels)")
     pattern = a.logits or ("{case}-{arm}.f32" if head else "logits/{case}.{arm}.bin")
@@ -303,8 +430,8 @@ def qual(a):
         null_moved(case, [float(x["kl_rc"].mean()) for x in nulls])
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
-                         null_top1s=[float(x["agree"].mean()) for x in nulls])
-        w["_rows"] = {"kl": ra["kl_rc"], "agree": ra["agree"].astype(bool), "dnll": ra["nll_c"] - ra["nll_r"]}
+                         null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
+                         cls=window_class(case, classes, manifest))
         moe = route(a.ref).exists()
         f = None
         if moe:
@@ -349,7 +476,22 @@ def qual(a):
                "format": a.format, "r1": r1,
                "windows": [{k: v for k, v in w.items() if k != "_rows"} for w in windows], "pooled": p}
         pathlib.Path(a.json).write_text(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
-    return 0 if p["pass"] else 1
+    return EXIT[p["state"]]
+
+
+def window_class(case, classes, manifest):
+    """The declared content class (--classes), else the prompt-length band with a manifest, else one class."""
+    if classes:
+        if case not in classes:
+            raise GateError(f"{case}: --classes declares no class for this window (classes are declared before scoring)")
+        return str(classes[case])
+    if manifest is not None and case in manifest:
+        n = int(manifest[case].size)
+        for band in (4096, 16384, 65536):
+            if n <= band:
+                return f"prompt<={band // 1024}K"
+        return "prompt>64K"
+    return "all"
 
 
 def main(argv=None):
@@ -368,6 +510,8 @@ def main(argv=None):
     q.add_argument("--head-rows", type=int, default=64, help="rows per head dump (--format head)")
     q.add_argument("--logits", help="logit path under OUT, {case} {arm} (default logits/{case}.{arm}.bin; head {case}-{arm}.f32)")
     q.add_argument("--trace-diag", action="append", help="engine log with per-layer trace diag lines (no route tap)")
+    q.add_argument("--classes", help="JSON {case: content class} declared before scoring (default: prompt-length band "
+                   "with --manifest, else one class)")
     q.add_argument("--json")
     a = ap.parse_args(argv)
     try:

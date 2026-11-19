@@ -770,7 +770,7 @@ def compare_selection(da, a, db, b, name):
     return layers
 
 
-def compare_v2(a, names, results, null_prompt_kl, report):
+def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
     """FAST gate v2 verdict over the per-prompt rows (statistics in gate_v2.py, shared with the option_qual adapter)."""
     import gate_v2
     flips_of = {}
@@ -788,9 +788,11 @@ def compare_v2(a, names, results, null_prompt_kl, report):
     windows = []
     try:
         for name, r in zip(names, results):
+            gate_v2.null_moved(name, null_prompt_kl[name])
+            nu = (null_prompt or {}).get(name) or {}
             w = gate_v2.window_stats(name, r["kl"], r["agree"], r["nll_ref"], r["nll_cand"], null_prompt_kl[name],
-                                     r["hit_ref"], r["hit_cand"])
-            w["_rows"] = {"kl": r["kl"], "agree": r["agree"], "dnll": r["nll_cand"] - r["nll_ref"]}
+                                     r["hit_ref"], r["hit_cand"], null_top1s=nu.get("top1") or None,
+                                     null_nlls=nu.get("nll") or None)
             windows.append(w)
             print(gate_v2.window_line(w, flips_of.get(name)))
         p = gate_v2.verdict(windows, [flips_of[n] for n in names] if flips_of else None)
@@ -802,7 +804,7 @@ def compare_v2(a, names, results, null_prompt_kl, report):
     if a.json:
         pathlib.Path(a.json).write_text(json.dumps(report, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8",
                                         newline="\n")
-    return 0 if p["pass"] else 1
+    return gate_v2.EXIT[p["state"]]
 
 
 def compare(a):
@@ -892,10 +894,13 @@ def compare(a):
           f"q99 {stats['kl_q']['q99']:.2e}; true token worse {stats['worse']} better {stats['better']}; copy rows "
           f"{stats['copy_rows']} misses ref {stats['copy_miss_ref']} cand {stats['copy_miss']} (copy dNLL {stats['copy_dnll']:+.5f})")
     null_rows, null_stats, null_prompt_kl = [], [], {name: [] for name in names}
+    null_prompt = {name: {"nll": [], "top1": []} for name in names}   # per-row NLL and top-1 of each null (v2)
     for dn, mn in nulls:  # pooled exactly like the candidate: same reference, same prompts, same labels
         rs = [compare_logits(da, ma, dn, mn, name, tok_of[name]) for name in names]
         for name, r in zip(names, rs):
             null_prompt_kl[name].append(float(r["kl"].mean()))
+            null_prompt[name]["nll"].append(r["nll_cand"])
+            null_prompt[name]["top1"].append(float(r["agree"].mean()))
         st = arm_stats(rs, copy_masks)
         null_stats.append(st)
         null_rows.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],
@@ -906,7 +911,7 @@ def compare(a):
               f"worse {st['worse']} better {st['better']}; copy misses {st['copy_miss']} (ref {st['copy_miss_ref']})")
     dv = None
     if v2:
-        return compare_v2(a, names, results, null_prompt_kl, report)
+        return compare_v2(a, names, results, null_prompt_kl, report, null_prompt)
     if a.expect_identical:
         ok = identical and sel_slot_diff == 0
         rule = "identical logits and selections"

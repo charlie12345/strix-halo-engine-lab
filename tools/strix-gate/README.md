@@ -368,19 +368,24 @@ It changes what they are measured on:
 | R2 null-relative window KL | For each window, the KL limit is max(0.02, 1.5 x the null arm's KL on that same window). The null is a one-ulp perturbation, measured under the same replay as the lever. The pooled KL limit stays an absolute 0.02. Top-1 and dNLL limits stay absolute per window. |
 | R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses labels that all equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
 
-Exit 0 = PASS, 1 = FAIL, 2 = no verdict. No verdict is given in these cases:
+| R2b three states per window | Top-1 and dNLL pass at the limit (disagreement <= L = max(0.07, 1.5 x the null's disagreement); dNLL <= 0.01), fail above the limit plus 2 standard errors of the window's rows (dNLL se at most 1.5 x the null's se on that window) and are UNRESOLVED in between. An unresolved window is cleared only by its content class (`--classes C.json`, declared before scoring; default the prompt-length band with a manifest, else one class): the class rows are pooled and judged by the same rule, final on >= 800 rows. |
+| R4 reference check | A window where the lever beats the exact reference by more than 3 se, while the paired lever-minus-null difference is also below -3 se, is "reference suspect". A window whose reference NLL is above max(3 x median, median + 2 nats) of the set (>= 3 windows) is "off-distribution": control or chat-template ids, or a timing prompt used as a gate window. Either holds the verdict. |
+
+Exit 0 = PASS, 1 = FAIL, 3 = UNRESOLVED (provisional: the lever stays opt-in for the unresolved classes), 4 = HOLD
+(reference check: examine the exact path on those windows, then re-run), 2 = no verdict. No verdict is given in these cases:
 - fewer than 800 pooled rows;
 - no null arm;
 - labels that are greedy ids;
 - a replay that did not consume the whole reference record;
-- a null that moved no weight;
+- a null that moved no weight, or a null equal to the reference (KL 0: a bitwise re-run or an absorbed perturbation);
 - route files that describe different router call sequences.
 
 The receipt prints, per window:
 - rows;
 - KL with its limit and that window's null KL;
 - top-1;
-- dNLL with its standard error;
+- the content class and the reference's own NLL;
+- dNLL with its standard error (and the null's dNLL and se), the pass and fail thresholds and the window state;
 - flip rates and their ratio;
 - the replay record counts.
 

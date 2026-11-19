@@ -24,16 +24,22 @@ def write_routes(path, calls):
             f.write(np.array([layer, ids.shape[0], ids.shape[1], 0], "<u4").tobytes() + ids.tobytes() + w.tobytes())
 
 
-def window(name, n, kl, top1, dnll, null_kl, rng, hit=0.5, scale=0.05, null_top1=None):
+def rows_with_mean(n, mean, scale, rng):
+    d = np.full(n, mean) + rng.normal(scale=scale, size=n)
+    return d - (d.mean() - mean)  # exact mean
+
+
+def window(name, n, kl, top1, dnll, null_kl, rng, hit=0.5, scale=0.05, null_top1=None, null_dnll=None, null_scale=None,
+           ref_nll=1.0, cls=None):
     agree = np.arange(n) < round(top1 * n)
-    d = np.full(n, dnll) + rng.normal(scale=scale, size=n)
-    d -= d.mean() - dnll  # exact mean
-    nll_ref = np.full(n, 1.0)
+    d = rows_with_mean(n, dnll, scale, rng)
+    nll_ref = np.full(n, ref_nll)
     hits = np.arange(n) < round(hit * n)
-    w = v2.window_stats(name, np.full(n, kl), agree, nll_ref, nll_ref + d, [null_kl], hits, hits,
-                        null_top1s=None if null_top1 is None else [null_top1])
-    w["_rows"] = {"kl": np.full(n, kl), "agree": agree, "dnll": d}
-    return w
+    null_nlls = None
+    if null_dnll is not None:
+        null_nlls = [nll_ref + rows_with_mean(n, null_dnll, null_scale or scale, rng)]
+    return v2.window_stats(name, np.full(n, kl), agree, nll_ref, nll_ref + d, [null_kl], hits, hits,
+                           null_top1s=None if null_top1 is None else [null_top1], null_nlls=null_nlls, cls=cls)
 
 
 class Statistics(unittest.TestCase):
@@ -87,7 +93,8 @@ class Statistics(unittest.TestCase):
         w = window("bad", 63, 0.0304, 0.70, -0.016, 0.0293, self.rng, null_top1=0.9206)   # 30 % flips: fails
         self.assertFalse(w["checks"]["top1"])
         line = v2.window_line(window("o16384", 63, 0.0304, 0.8413, -0.016, 0.0293, self.rng, null_top1=0.9206))
-        self.assertIn("(limit 0.7993, null 0.9206)", line)
+        self.assertIn("(limit 0.7993, null 0.9206;", line)
+        self.assertIn("UNRESOLVED top1", line)
         self.assertIn("null 0.9206", line)
 
     def test_pooled_rows_se_and_absolute_kl(self):
@@ -107,6 +114,58 @@ class Statistics(unittest.TestCase):
         self.assertTrue(p["checks"]["windows"])
         self.assertFalse(p["checks"]["kl"])
         self.assertFalse(p["pass"])
+
+    def test_three_states_and_class_pooling(self):
+        # review_rule A.3: a real loss on one content class (dNLL 0.03 = 3 x limit, 63-row windows, se ~0.02) is
+        # UNRESOLVED per window, not PASS; the class pooled on >= 800 rows FAILs.
+        w = window("c0", 63, 0.005, 0.97, 0.030, 0.004, self.rng, scale=0.157, cls="code")
+        self.assertEqual((w["state"], w["states"]["dnll"], w["pass"], w["checks"]["dnll"]), ("unresolved", "unresolved", False, True))
+        prose = [window(f"p{i}", 256, 0.005, 0.97, 0.0, 0.004, self.rng, cls="prose") for i in range(4)]
+        code = [window(f"c{i}", 63, 0.005, 0.97, 0.030, 0.004, self.rng, scale=0.157, cls="code") for i in range(2)]
+        p = v2.verdict(prose + code)          # code class: 126 rows, unresolved -> provisional, not a pass
+        self.assertEqual((p["state"], p["unresolved"]), ("UNRESOLVED", ["code"]))
+        self.assertEqual(v2.EXIT[p["state"]], 3)
+        self.assertIn("UNRESOLVED classes code", v2.pooled_line(p))
+        code = [window(f"c{i}", 63, 0.005, 0.97, 0.030, 0.004, self.rng, scale=0.157, cls="code") for i in range(13)]
+        p = v2.verdict(prose + code)          # 819 rows of the class: final, FAIL
+        c = {x["name"]: x for x in p["classes"]}["code"]
+        self.assertEqual((c["final"], c["state"], p["state"]), (True, "fail", "FAIL"))
+        self.assertFalse(p["checks"]["classes"])
+        # an unresolved window inside a final passing class is cleared by it
+        ok = [window(f"q{i}", 63, 0.005, 0.97, 0.0, 0.004, self.rng, scale=0.157, cls="prose") for i in range(13)]
+        odd = window("q13", 63, 0.005, 0.97, 0.030, 0.004, self.rng, scale=0.157, cls="prose")
+        p = v2.verdict(ok + [odd])
+        self.assertTrue(odd["cleared_by_class"])
+        self.assertEqual(p["state"], "PASS")
+
+    def test_reference_check_holds(self):
+        base = [window(f"b{i}", 256, 0.005, 0.97, 0.0, 0.004, self.rng) for i in range(4)]
+        # the lever beats the exact reference by ~10 se on the true text, no null NLL: HOLD, never PASS
+        w = window("sus", 63, 0.005, 0.97, -0.19, 0.004, self.rng, scale=0.157)
+        self.assertTrue(w["reference_suspect"])
+        p = v2.verdict(base + [w])
+        self.assertEqual((p["state"], p["reference_suspect"], v2.EXIT["HOLD"]), ("HOLD", ["sus"], 4))
+        # a chaotic window: the null moves the same way (paired candidate - null not below -3 se): not suspect
+        w = window("chaos", 63, 0.005, 0.97, -0.19, 0.004, self.rng, scale=0.157, null_dnll=-0.19)
+        self.assertFalse(w["reference_suspect"])
+        self.assertIn("null dNLL -0.19000", v2.window_line(w))
+        self.assertEqual(v2.verdict(base + [w])["state"], "PASS")
+
+    def test_se_capped_by_the_null(self):
+        # row se 0.0198 but the null's se on the same window is 0.005: the dNLL limit uses 1.5 x 0.005
+        w = window("cap", 63, 0.005, 0.97, 0.030, 0.004, self.rng, scale=0.157, null_dnll=0.0, null_scale=0.0397)
+        self.assertAlmostEqual(w["dnll_se"], 1.5 * w["null_dnll_se"])
+        self.assertGreater(w["dnll_se_rows"], w["dnll_se"])
+        self.assertEqual(w["state"], "fail")
+        self.assertIn("capped 1.5 x null", v2.window_line(w))
+
+    def test_off_distribution_reference_holds(self):
+        # refx_dense: a window opening with chat-template ids had EXACT NLL 7.07 against 0.9-2.0 elsewhere
+        ws = [window(f"w{i}", 256, 0.005, 0.97, 0.0, 0.004, self.rng, ref_nll=r) for i, r in enumerate((0.9, 1.3, 2.0))]
+        ws.append(window("w2tmpl", 256, 0.005, 0.97, 0.0, 0.004, self.rng, ref_nll=7.07))
+        p = v2.verdict(ws)
+        self.assertEqual((p["state"], p["off_distribution"]), ("HOLD", ["w2tmpl"]))
+        self.assertIn("off-distribution reference w2tmpl", v2.pooled_line(p))
 
     def test_labels_must_be_held_out(self):
         ws = [window(f"w{i}", 256, 0.001, 1.0, 0.0, 0.001, self.rng, hit=1.0) for i in range(4)]
@@ -181,7 +240,7 @@ class FastLogitGateRuleV2(unittest.TestCase):
                 rc = tfg.g.main(["compare", str(a), str(near), "--ranks", "0", "1", "--tokens", f"p={self.tok}",
                                  "--rule", "v2", "--null-arm", str(null)])
             self.assertEqual(rc, 0, out.getvalue())
-            self.assertIn("window p:", out.getvalue())
+            self.assertIn("window p [all]:", out.getvalue())
             self.assertIn("POOLED v2", out.getvalue())
             far, _ = self.arm("F", "r4", self.noisy(2.0, 5), mode=3)
             self.assertEqual(self.cmp(a, far, "--rule", "v2", "--null-arm", str(null)), 1)

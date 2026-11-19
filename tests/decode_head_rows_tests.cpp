@@ -1,5 +1,5 @@
 // Head rows plan (strix/decode_head_rows.hpp): every output reads the input row of its own head, groups of `outs`
-// outputs never straddle two heads when admitted, and the named MLA absorb geometries (Hy4-flash K_b / V_b, 32 and
+// outputs never straddle two heads when admitted, and the named MLA absorb geometries (model-B K_b / V_b, 32 and
 // 64 heads) are admitted for every group width the q8_rows direct kernel uses (1, 2, 4, 8).
 #include "strix/decode_head_rows.hpp"
 
@@ -46,7 +46,7 @@ void check_groups(const strix::decode::HeadRows& h, unsigned outs) {
 int main() {
     using strix::decode::HeadRows;
     using strix::decode::head_rows_refusal;
-    // Hy4-flash MLA: K_b absorb (q_nope 192 of a 256-wide head -> latent 512), V_b (latent 512 -> v 256).
+    // model-B MLA: K_b absorb (q_nope 192 of a 256-wide head -> latent 512), V_b (latent 512 -> v 256).
     const HeadRows named[] = {
         {64U, 512U, 256U}, {32U, 512U, 256U},  // K_b: width 192, input stride 256 (q rows), 512 outputs per head
         {64U, 256U, 512U}, {32U, 256U, 512U},  // V_b: width 512, input stride 512 (latent rows), 256 outputs per head

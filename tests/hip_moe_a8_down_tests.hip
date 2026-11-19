@@ -146,7 +146,7 @@ void finite_case(unsigned type,unsigned hidden,unsigned width,unsigned slots,
     for(auto* view:{&intermediates,&reference,&w,&r,&codes,&deltas,&sums,&raw,&status,&aggregate})view->guards();
     expect(w.read<std::byte>()==weights,"weights remain read-only after failures/capture");
 }
-// K-quant down trait (Q4_K 12 / Q6_K 14) at the Hy4-flash preset (H = I = 1536, top-16) with the clamp trait (L = 10):
+// K-quant down trait (Q4_K 12 / Q6_K 14) at the model-B preset (H = I = 1536, top-16) with the clamp trait (L = 10):
 // (1) the clamped producer on raw projections == the unclamped producer on host-clamped projections (h, codes, deltas, sums,
 // rawdots bitwise); (2) codes / deltas / sums == the CPU quantizer of the produced h; (3) every rawdot == the CPU oracle
 // (evaluate_down_row, declared order) in FP32 bits. Synthetic weights; no model qualification.
@@ -217,6 +217,6 @@ int main() try {
     for(unsigned type:{7U,8U,42U,20U}) for(unsigned width:{128U,640U}) for(unsigned slots:{1U,10U})
         finite_case(type,width==128U?64U:2560U,width,slots,guard,stream.value);
     for(unsigned type:{12U,14U}) for(unsigned slots:{1U,16U}) kquant_case(type,slots,guard,stream.value);
-    std::cout<<"A8 down K-quant (Hy4 preset H=I=1536 top-16 clamp 10) Q4_K/Q6_K PASS\n";
+    std::cout<<"A8 down K-quant (model-B preset H=I=1536 top-16 clamp 10) Q4_K/Q6_K PASS\n";
     std::cout<<"A8 down component fixtures PASS; no model quality/performance qualification\n";
 } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

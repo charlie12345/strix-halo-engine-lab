@@ -1,7 +1,7 @@
 // Host tests of the shared group-pool statements (include/strix/attn/group_pool.hpp), the code the HIP block core
 // (src/attn_core/group_pool.hpp) and GLM's pool kernels run.
 // Invariants:
-//  1. HY4 GatedSoftmaxApe: the lane composition of the block core (gated_ape_channel per lane, one rms_inv chain,
+//  1. MODEL_B GatedSoftmaxApe: the lane composition of the block core (gated_ape_channel per lane, one rms_inv chain,
 //     rms_out) is bit-identical to the host oracle pool_group_gated_ape (src/attn/group_indexer_ref.cpp).
 //  2. GLM GatedSoftmax: gated_bf16_channel (decode site) and gated_pool_channel on loaded arrays (prefill / spec sites)
 //     are bit-identical to the statements GLM's private dsa_pool_channel ran before the lift (frozen copy below).
@@ -57,10 +57,10 @@ float legacy_glm_pool_channel(const std::uint16_t* key, const std::uint16_t* gat
            probability[3] * values[3];
 }
 
-void test_hy4_lanes_vs_oracle(std::mt19937& rng) {
+void test_modelb_lanes_vs_oracle(std::mt19937& rng) {
     const gi::Shape s = kGatedApe;
     constexpr unsigned R = 4, D = 128;
-    static_assert(kGatedApe.ratio == R && kGatedApe.head_dim == D, "HY4 pools 4 slots of 128");
+    static_assert(kGatedApe.ratio == R && kGatedApe.head_dim == D, "MODEL_B pools 4 slots of 128");
     std::normal_distribution<float> n01(0.0F, 1.0F);
     std::vector<float> keys(R * D), wv(D * D), wg(D * D), ape(R * D), norm(D), lane_x(D), oracle(D);
     unsigned same = 0, total = 0;
@@ -83,7 +83,7 @@ void test_hy4_lanes_vs_oracle(std::mt19937& rng) {
             CHECK(bits(out) == bits(gi::bf16_round(out)));  // bf16-valued
         }
     }
-    std::printf("hy4 lanes vs oracle: %u / %u bit-identical\n", same, total);
+    std::printf("modelb lanes vs oracle: %u / %u bit-identical\n", same, total);
     CHECK(same == total);
 }
 
@@ -144,7 +144,7 @@ void test_tie_keys(std::mt19937& rng) {
 
 int main() {
     std::mt19937 rng(20261118U);
-    test_hy4_lanes_vs_oracle(rng);
+    test_modelb_lanes_vs_oracle(rng);
     test_glm_legacy_identity(rng);
     test_tie_keys(rng);
     if (g_failures != 0) {

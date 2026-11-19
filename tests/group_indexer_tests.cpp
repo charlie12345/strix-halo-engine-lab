@@ -1,5 +1,5 @@
 // Host tests of the compressed group indexer contract (include/strix/attn/group_indexer.hpp).
-// Invariants: HY4 gated pooling vs an independent double formula; the shared gated pool channel is bit-identical to
+// Invariants: MODEL_B gated pooling vs an independent double formula; the shared gated pool channel is bit-identical to
 // GLM bf16 pool channel (shared since the pool lift) on the host; masking of the own / later / incomplete groups; declared tie rule and the set it
 // can differ from a torch.topk reference by; expansion vs the reference's clamp + causal mask; dense below 2048.
 #include "strix/attn/group_indexer.hpp"
@@ -47,7 +47,7 @@ void test_shape_rules() {
     const gi::Shape& g = gi::kGlmDsa;
     CHECK(gi::visible_groups(g, 3) == 1 && gi::pick_count(g) == 512 && gi::max_tokens(g) == 2051);
     CHECK(gi::dense(g, 2050) && !gi::dense(g, 2051));
-    CHECK(gi::tail_begin(h, 11) == 8 && gi::tail_begin(g, 11) == 12);  // own complete group: HY4 tail, GLM scored
+    CHECK(gi::tail_begin(h, 11) == 8 && gi::tail_begin(g, 11) == 12);  // own complete group: MODEL_B tail, GLM scored
     CHECK(gi::group_rope_slot(h, 5) == 20 && gi::closed_groups(h, 23) == 5 && gi::token_ring_slots(h, 16) == 19);
     CHECK(bits(gi::head_weight_scale(h)) == bits(static_cast<float>(0.25 * 0.08838834764831845)));
 }

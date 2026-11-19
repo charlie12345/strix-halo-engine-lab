@@ -1,7 +1,7 @@
 #pragma once
 
 // Engram (hashed n-gram memory), shared host contract. Vendor-free: a family adapter only builds a Spec
-// (DS41 from its admitted EngramContract, HY4 from its pack metadata); hashing, row reading and row decoding
+// (DS41 from its admitted EngramContract, other packs from their metadata); hashing, row reading and row decoding
 // are the shared code in strix/engram/{hasher,row_reader}.hpp.
 //
 // Hash of position t at Engram layer e (one definition for every family):
@@ -20,7 +20,7 @@
 namespace strix::engram {
 
 // Scale carried by a stored row. e8m0_per32: one E8M0 byte per 32 elements after the codes (DS41, 264-byte rows);
-// none: raw E4M3 codes (HY4 GGUF: the per-row amax/448 scale of the reference cancels in the per-head RMSNorm up to
+// none: raw E4M3 codes (packs storing bare codes: the per-row amax/448 scale of the reference cancels in the per-head RMSNorm up to
 // its eps term); f32_per_row: one little-endian float after the codes.
 enum class RowScale : std::uint8_t { none, e8m0_per32, f32_per_row };
 
@@ -35,7 +35,7 @@ struct RowFormat {
 // Where the table lives. Placement (byte budget per node) decides; the reader binds file_direct / file_cached.
 enum class Residency : std::uint8_t { file_direct, file_cached, host_pinned, device };
 
-// Token ids at or past `compress_valid`: reject (throw, DS41 admits only mapped ids) or read the compressed pad (HY4).
+// Token ids at or past `compress_valid`: reject (throw, DS41 admits only mapped ids) or read the compressed pad.
 enum class Unmapped : std::uint8_t { reject, pad };
 
 struct Spec {
@@ -64,7 +64,7 @@ void validate(const Spec& spec);
 [[nodiscard]] std::vector<std::uint64_t> column_offsets(const Spec& spec);
 // Rows of layer e's table (sum of its moduli).
 [[nodiscard]] std::uint64_t layer_rows(const Spec& spec, std::uint32_t e);
-// First row of layer e when all layers are one flat table in layer order (HY4 per_layer_token_embd).
+// First row of layer e when all layers are one flat table in layer order (one per-layer token-embedding tensor).
 [[nodiscard]] std::uint64_t layer_row_base(const Spec& spec, std::uint32_t e);
 
 // True when every product compressed id x multiplier fits in a signed int64 (ids of valid tokens and the pad). Then

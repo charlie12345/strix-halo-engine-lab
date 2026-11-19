@@ -1,7 +1,7 @@
 #pragma once
 // MoE activation policy: the SwiGLU clamp trait shared by every family that clamps (DS41 ds41_moe.hpp swiglu_clamped,
-// GLM-5 glm_host.hpp swiglu; HY4 routed experts). gate is clamped from above, up on both sides; NaN inputs pass through.
-// A limit of +infinity is NONE (every comparison is false), e.g. the HY4 shared expert. The silu expression and its exp
+// GLM-5 glm_host.hpp swiglu). gate is clamped from above, up on both sides; NaN inputs pass through.
+// A limit of +infinity is NONE (every comparison is false), e.g. an unclamped shared expert. The silu expression and its exp
 // stay the family's math (they differ in bits between families); only the clamp is the shared trait.
 #include <limits>
 

@@ -100,12 +100,12 @@ void ds41_bitwise(std::mt19937& g) {
 // r * sum|fn * x|, so 1e-5 is ~3.5x the worst case); pre/post |err| <= magnitude * (0.25 * |scale| * mix bound + 4e-7)
 // (sigmoid slope + declared_exp ulps); collapse/expand (given the oracle's FP32 coefficients) within one bfloat16
 // rounding of the FP64 value plus 2^-22 of the summed magnitudes (FP32 roundings under cancellation).
-void hy4_fp64(std::mt19937& g) {
+void modelb_fp64(std::mt19937& g) {
     for (const auto site : {strix::hc::Site::sublayer, strix::hc::Site::head}) {
         const auto spec = hc_fixture::identity_bf16_spec(site);
-        check(spec.valid() && spec.comb_rows() == 0U, "hy4 spec");
-        check(spec.mix_rows() == (site == strix::hc::Site::head ? 4U : 8U), "hy4 mix rows");
-        check(spec.scale_count() == (site == strix::hc::Site::head ? 1U : 2U), "hy4 scale count");
+        check(spec.valid() && spec.comb_rows() == 0U, "modelb spec");
+        check(spec.mix_rows() == (site == strix::hc::Site::head ? 4U : 8U), "modelb mix rows");
+        check(spec.scale_count() == (site == strix::hc::Site::head ? 1U : 2U), "modelb scale count");
         const std::size_t n = spec.flat(), rows = spec.mix_rows();
         const auto stream = uniform(g, n, -2.0F, 2.0F, true);
         const auto fn = uniform(g, rows * n, -0.02F, 0.02F);
@@ -128,7 +128,7 @@ void hy4_fp64(std::mt19937& g) {
             const double mref = d * r, mtol = 1e-5 * r * a + 1e-7;
             const double merr = std::fabs(double{raw[m]} - mref);
             worst_mix = std::fmax(worst_mix, merr / mtol);
-            check(merr <= mtol, "hy4 raw mix vs fp64");
+            check(merr <= mtol, "modelb raw mix vs fp64");
             const bool is_pre = m < spec.streams;
             const double s = double{scale[is_pre ? 0U : 1U]};
             const double mag = is_pre ? 1.0 : double{spec.post_magnitude};
@@ -138,9 +138,9 @@ void hy4_fp64(std::mt19937& g) {
             const double ctol = mag * (0.25 * std::fabs(s) * mtol + 4e-7);
             const double cerr = std::fabs(double{got} - cref);
             worst_coef = std::fmax(worst_coef, cerr / ctol);
-            check(cerr <= ctol, "hy4 pre/post vs fp64");
+            check(cerr <= ctol, "modelb pre/post vs fp64");
         }
-        std::printf("hy4 %s: worst raw-mix err %.2e of bound, worst coef err %.2e of bound\n",
+        std::printf("modelb %s: worst raw-mix err %.2e of bound, worst coef err %.2e of bound\n",
                     site == strix::hc::Site::head ? "head" : "sublayer", worst_mix, worst_coef);
 
         const auto bf16_close = [](float got, double ref, double magnitude) {
@@ -158,7 +158,7 @@ void hy4_fp64(std::mt19937& g) {
             }
             ok = ok && bf16_close(x[i], y, a) && x[i] == strix::ds41::round_to_bf16(x[i]);
         }
-        check(ok, "hy4 collapse vs fp64 (one bf16 rounding)");
+        check(ok, "modelb collapse vs fp64 (one bf16 rounding)");
         if (site == strix::hc::Site::head) continue;
 
         const auto sub = uniform(g, spec.hidden, -4.0F, 4.0F, true);
@@ -173,7 +173,7 @@ void hy4_fp64(std::mt19937& g) {
                 ok = ok && bf16_close(out[at], ref, std::fabs(p) + std::fabs(double{stream[at]})) &&
                      out[at] == strix::ds41::round_to_bf16(mix.post[k] * sub[i] + stream[at]);
             }
-        check(ok, "hy4 expand vs fp64 and declared order");
+        check(ok, "modelb expand vs fp64 and declared order");
     }
 }
 
@@ -217,7 +217,7 @@ void geometry_rejected() {
 int main() {
     std::mt19937 g(20261118U);
     ds41_bitwise(g);
-    hy4_fp64(g);
+    modelb_fp64(g);
     identity_is_a_skip();
     geometry_rejected();
     if (failures != 0) {

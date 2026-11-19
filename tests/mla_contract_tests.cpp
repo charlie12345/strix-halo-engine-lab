@@ -203,7 +203,7 @@ int main() {
         sink_and_gate();
         chunk_equals_rows();
         empty_list_is_zero();
-        // real geometries: HY4 DSA (list, 32 heads, 576/512), HY4 SWA (window, 64 heads), GLM-5 NoPE (8 of 64 heads)
+        // real geometries: MODEL_B DSA (list, 32 heads, 576/512), MODEL_B SWA (window, 64 heads), GLM-5 NoPE (8 of 64 heads)
         absorbed_equals_reference(list_spec(), 40U, {0U, 3U, 4U, 9U, 17U, 22U, 23U, 30U, 31U, 32U, 38U, 39U, 40U}, 101U);
         absorbed_equals_reference(window_spec(), 15U, {}, 202U);
         mla::LayerSpec glm = mla::glm5_dsa();

@@ -9,7 +9,7 @@
 // Pieces shared by the natively rendered chat templates (the Jinja semantics HF transformers applies) and the
 // key/value tool-call grammar that several templates use with their own spellings:
 //   CALL_START name KEY_START k KEY_END VALUE_START v VALUE_END ... CALL_END
-// GLM-5 writes it with <tool_call>/<arg_key>/<arg_value>, Hy4 with the ":opensource" forms inside an outer
+// GLM-5 writes it with <tool_call>/<arg_key>/<arg_value>, another dialect with the ":opensource" forms inside an outer
 // <tool_calls:opensource> block.
 namespace strix::serve::chat_kit {
 

@@ -2,7 +2,7 @@
 // Norm device presets over the shared row body (norm_device.hpp): the LDS halving reduction of
 // ReductionOrder::lane_strided_fma_lds_halving as one function, and a Traits preset for FP32 rows with the declared square
 // root. A binding with this arithmetic uses the preset instead of a private Traits copy.
-// Home: shared (HIP norm device home). Bound by: Hy4-flash RMSNorm (bf16_double).
+// Home: shared (HIP norm device home). Bound by: RMSNorm sites of the bf16_double form.
 #include "norm_device.hpp"
 #include "strix/ds41_moe.hpp"  // declared_sqrt: the declared square root of the declared-arithmetic models
 

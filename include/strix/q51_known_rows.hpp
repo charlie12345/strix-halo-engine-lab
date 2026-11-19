@@ -33,7 +33,7 @@ struct ScratchLayout {
 // Known-prompt prefill: one CSR over all T rows of a step (T a multiple of 8).
 inline constexpr std::uint32_t prefill_max_rows = known_prefill_max_rows;
 // Prefill CSR: the layout is linear in rows x top_k (the device plan is generic in top_k); 16 = the f16x K-quant envelope
-// (Hy4-flash top-16). Decode windows keep 10 (admit_csr's 8 x 10 assignment table).
+// (e.g. top-16). Decode windows keep 10 (admit_csr's 8 x 10 assignment table).
 inline constexpr std::uint32_t prefill_max_top_k = 16;
 [[nodiscard]] inline ScratchLayout scratch_layout(std::uint32_t rows,
     std::uint32_t experts, std::uint32_t top_k, bool prefill = false) {

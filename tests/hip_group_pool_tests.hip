@@ -1,10 +1,10 @@
 // GPU test of the shared group-indexer device cores against the host oracle (src/attn/group_indexer_ref.cpp), synthetic
 // fixtures only (no weights):
-//   pool   attn_core/group_pool.hpp pool_groups_kernel, HY4 GatedSoftmaxApe   == pool_group_gated_ape (bits)
-//   scan   attn_core/group_score_scan.hpp rg1 / rg2 / rk1 / rk2, HY4 view (bf16 keys, 16 heads, InHeadWeight) and a
+//   pool   attn_core/group_pool.hpp pool_groups_kernel, MODEL_B GatedSoftmaxApe   == pool_group_gated_ape (bits)
+//   scan   attn_core/group_score_scan.hpp rg1 / rg2 / rk1 / rk2, MODEL_B view (bf16 keys, 16 heads, InHeadWeight) and a
 //          GLM-shaped view (fp32 keys, 32 heads, InsideRelu), same / separate slots   == score_group -> score_key (bits)
 //          + top-byte histogram
-//   select attn_core/group_select_kernel.hpp (select_row SegmentPolicy<4>) fed by the scan's keys + hist0, HY4 view (P = t / 4, k = 511,
+//   select attn_core/group_select_kernel.hpp (select_row SegmentPolicy<4>) fed by the scan's keys + hist0, MODEL_B view (P = t / 4, k = 511,
 //          own-group tail), incl. forced ties at the cut   == select_groups + expand_tokens (token lists)
 // Argument "rate": also time the scan and the select at 2,048 and 8,192 groups (8K / 32K tokens).
 #pragma clang fp contract(off)  // declared arithmetic: the oracle's bits
@@ -69,7 +69,7 @@ template <class T> std::vector<T> host(const T* p, std::size_t n) {
 }
 
 // ------------------------------------------------------------------ pool
-struct Hy4PoolView {
+struct ModelBPoolView {
     static constexpr unsigned kRatio = 4, kDim = 128;
     const std::uint16_t* tk;  // [groups * 4][128] bf16 token keys
     gp::F32Ape w;
@@ -98,8 +98,8 @@ void test_pool(std::mt19937& rng) {
     float *dwv = dev(wv), *dwg = dev(wg), *dape = dev(ape), *dnorm = dev(norm), *dout = nullptr;
     std::uint16_t* dtk = dev(tk);
     HIPCHECK(hipMalloc(&dout, G * D * sizeof(float)));
-    const Hy4PoolView v{dtk, gp::F32Ape{gi::GatedApeWeights{dwv, dwg, dape, dnorm, 1e-5F}, D}, dout, G};
-    cp::pool_groups_kernel<Hy4PoolView><<<G, D>>>(v);
+    const ModelBPoolView v{dtk, gp::F32Ape{gi::GatedApeWeights{dwv, dwg, dape, dnorm, 1e-5F}, D}, dout, G};
+    cp::pool_groups_kernel<ModelBPoolView><<<G, D>>>(v);
     HIPCHECK(hipGetLastError());
     const std::vector<float> got = host(dout, G * D);
     const gi::GatedApeWeights hw{wv.data(), wg.data(), ape.data(), norm.data(), 1e-5F};
@@ -110,7 +110,7 @@ void test_pool(std::mt19937& rng) {
         gi::pool_group_gated_ape(kGatedApe, keys.data(), hw, exp_ds41, want.data());
         for (unsigned o = 0; o < D; ++o) same += bits(got[g * D + o]) == bits(want[o]) ? 1U : 0U;
     }
-    std::printf("pool hy4 GatedSoftmaxApe: %u / %u bit-identical to the oracle\n", same, G * D);
+    std::printf("pool modelb GatedSoftmaxApe: %u / %u bit-identical to the oracle\n", same, G * D);
     CHECK(same == G * D);
     for (void* p : {static_cast<void*>(dwv), static_cast<void*>(dwg), static_cast<void*>(dape), static_cast<void*>(dnorm),
                     static_cast<void*>(dout), static_cast<void*>(dtk)})
@@ -138,7 +138,7 @@ template <class K, unsigned H, bool Inside> struct TestScan {
     }
     __device__ static std::uint32_t key_of(float s) { return gi::score_key(s); }
 };
-using Hy4Scan = TestScan<std::uint16_t, 16, false>;
+using ModelBScan = TestScan<std::uint16_t, 16, false>;
 using GlmScanT = TestScan<float, 32, true>;
 
 template <class V> float key_value(const typename V::Key& k) {
@@ -228,11 +228,11 @@ template <class V> void test_scan(std::mt19937& rng, const char* name, bool bf16
     }
 }
 
-// ------------------------------------------------------------------ select (HY4 binding of the shared kernel)
-using Hy4SelectView = strix::attn_core::group_select::PositionView<kGatedApe, 4096>;
+// ------------------------------------------------------------------ select (MODEL_B binding of the shared kernel)
+using ModelBSelectView = strix::attn_core::group_select::PositionView<kGatedApe, 4096>;
 
 void test_select(std::mt19937& rng, bool all_tied) {
-    ScanFixture<Hy4Scan> f(rng, 2600, true);
+    ScanFixture<ModelBScan> f(rng, 2600, true);
     // Forced ties: 40 groups share one key row (equal scores); all_tied: every group equal -> the cut is all ties and
     // the declared rule must keep the 511 lowest group indices.
     for (unsigned g = all_tied ? 1U : 600U; g < (all_tied ? 2600U : 640U); ++g)
@@ -249,7 +249,7 @@ void test_select(std::mt19937& rng, bool all_tied) {
         const unsigned P = gi::visible_groups(kGatedApe, t);
         f.launch(1, f.rows(1, true, P, 0), P > 0 ? P : 1);
         HIPCHECK(hipMemcpy(dtpos, &t, sizeof(unsigned), hipMemcpyHostToDevice));
-        strix::attn_core::group_select::enqueue_select<Hy4SelectView>(strix::attn_core::group_select::PositionRows{dtpos}, 1U, f.dout,
+        strix::attn_core::group_select::enqueue_select<ModelBSelectView>(strix::attn_core::group_select::PositionRows{dtpos}, 1U, f.dout,
                                                                       P > 0 ? P : 1U, f.dhist, dtok, dn, nullptr);
         HIPCHECK(hipGetLastError());
         const unsigned n = host(dn, 1)[0];
@@ -265,7 +265,7 @@ void test_select(std::mt19937& rng, bool all_tied) {
         ++rows;
         if (!ok) std::printf("select t=%u: device %u tokens, oracle %zu tokens\n", t, n, want.size());
     }
-    std::printf("select hy4 (P = t/4, k = 511, own tail, %s): %u / %u rows equal to the oracle\n",
+    std::printf("select modelb (P = t/4, k = 511, own tail, %s): %u / %u rows equal to the oracle\n",
                 all_tied ? "all groups tied" : "40 tied groups", rows - bad_rows, rows);
     CHECK(bad_rows == 0U);
     (void)hipFree(dtok);
@@ -297,7 +297,7 @@ template <class V> void rate_scan(std::mt19937& rng, const char* name, int var, 
 }
 
 void rate_select(std::mt19937& rng, unsigned P) {
-    ScanFixture<Hy4Scan> f(rng, P, true);
+    ScanFixture<ModelBScan> f(rng, P, true);
     const std::uint32_t t = P * 4U + 1U;
     std::uint32_t *dtok = nullptr, *dn = nullptr;
     HIPCHECK(hipMalloc(&dtok, 4096 * sizeof(std::uint32_t)));
@@ -307,7 +307,7 @@ void rate_select(std::mt19937& rng, unsigned P) {
     HIPCHECK(hipMalloc(&dtpos, sizeof(unsigned)));
     HIPCHECK(hipMemcpy(dtpos, &t, sizeof(unsigned), hipMemcpyHostToDevice));
     const auto run_select = [&] {
-        strix::attn_core::group_select::enqueue_select<Hy4SelectView>(strix::attn_core::group_select::PositionRows{dtpos}, 1U, f.dout, P,
+        strix::attn_core::group_select::enqueue_select<ModelBSelectView>(strix::attn_core::group_select::PositionRows{dtpos}, 1U, f.dout, P,
                                                                       f.dhist, dtok, dn, nullptr);
     };
     hipEvent_t a, b;
@@ -321,7 +321,7 @@ void rate_select(std::mt19937& rng, unsigned P) {
     HIPCHECK(hipEventSynchronize(b));
     float ms = 0.0F;
     HIPCHECK(hipEventElapsedTime(&ms, a, b));
-    std::printf("rate select hy4 P=%u k=511: %.1f us/launch, %.2f ns/group\n", P, 1000.0 * ms / kIters, 1e6 * ms / kIters / P);
+    std::printf("rate select modelb P=%u k=511: %.1f us/launch, %.2f ns/group\n", P, 1000.0 * ms / kIters, 1e6 * ms / kIters / P);
     (void)hipEventDestroy(a);
     (void)hipEventDestroy(b);
     (void)hipFree(dtok);
@@ -333,19 +333,19 @@ void rate_select(std::mt19937& rng, unsigned P) {
 int main(int argc, char** argv) {
     std::mt19937 rng(20261118U);
     test_pool(rng);
-    test_scan<Hy4Scan>(rng, "hy4(bf16,16h,InHeadWeight)", true);
+    test_scan<ModelBScan>(rng, "modelb(bf16,16h,InHeadWeight)", true);
     test_scan<GlmScanT>(rng, "glm-shape(fp32,32h,InsideRelu)", false);
     test_select(rng, false);
     test_select(rng, true);
     if (argc > 1 && std::strcmp(argv[1], "rate") == 0) {
         for (unsigned P : {2048U, 8192U}) {
-            rate_scan<Hy4Scan>(rng, "hy4", 1, P, 1, true);
-            rate_scan<Hy4Scan>(rng, "hy4", 5, P, 1, true);
+            rate_scan<ModelBScan>(rng, "modelb", 1, P, 1, true);
+            rate_scan<ModelBScan>(rng, "modelb", 5, P, 1, true);
             rate_scan<GlmScanT>(rng, "glm-shape", 1, P, 1, true);
             rate_select(rng, P);
         }
         rate_scan<GlmScanT>(rng, "glm-shape", 1, 8192, 2, false);  // cross-check: receipt R2 rg1 32K = 62.6 us
-        rate_scan<Hy4Scan>(rng, "hy4", 3, 8192, 2, true);
+        rate_scan<ModelBScan>(rng, "modelb", 3, 8192, 2, true);
     }
     if (g_fail != 0) {
         std::printf("hip_group_pool_tests: %d FAIL\n", g_fail);

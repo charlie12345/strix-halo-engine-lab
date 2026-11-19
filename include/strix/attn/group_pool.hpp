@@ -4,7 +4,7 @@
 //
 // Lane = output channel o of the pooled key (head_dim lanes). Two traits:
 //   GatedSoftmax     (GLM DSA): logits = bf16 gate + ape, values = bf16 key, both cached per token; gated channel.
-//   GatedSoftmaxApe  (HY4):     values = Wv tk, logits = Wg tk + ape (fp32 fma chains over the input index ascending,
+//   GatedSoftmaxApe:            values = Wv tk, logits = Wg tk + ape (fp32 fma chains over the input index ascending,
 //                               from +0), gated channel, then RMSNorm (serial fma chain of x * x over the channel index
 //                               ascending, r = 1 / sqrt(ss / head_dim + eps)) and bf16(norm * (x * r)). RoPE of the
 //                               group key (group_rope_slot) is the caller's rotary stage, applied to the bf16 output.

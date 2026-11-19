@@ -1,6 +1,6 @@
 // Shared Engram row preparation contract (include/strix/engram/row_prep.hpp): host reference of both forms.
 //   decode        == engram::decode_row (spec.cpp) for every RowScale, all 256 codes;
-//   head_rms_bf16 == the Hy4-flash oracle row statements (src/hy4/ref/hy4_host_ref.cpp Impl::engram: x = bf(e4m3),
+//   head_rms_bf16 == the model-B oracle row statements (src/modelb/ref/modelb_host_ref.cpp Impl::engram: x = bf(e4m3),
 //                    rms_norm with ds41::chunked_dot, eps 2^-7), transcribed here with the non-template chunked_dot.
 #include "strix/ds41_layer.hpp"
 #include "strix/ds41_scalar_codecs.hpp"
@@ -78,7 +78,7 @@ void decode_case(strix::engram::RowScale scale, std::uint32_t elements) {
     check(same, "decode form == engram::decode_row (bitwise)");
 }
 
-// The oracle's statements (hy4_host_ref.cpp: bf, rms_norm with dot = ds41 chunked dot, eps), for one row.
+// The oracle's statements (modelb_host_ref.cpp: bf, rms_norm with dot = ds41 chunked dot, eps), for one row.
 void oracle_row(const std::uint8_t* codes, std::uint32_t n, const float* w, float eps, float* y) {
     std::vector<float> row(n);
     for (std::uint32_t j = 0; j < n; ++j) row[j] = strix::ds41::round_to_bf16(strix::ds41::codec::e4m3(codes[j]));
@@ -127,7 +127,7 @@ void validation() {
     v.fmt = RowFormat{96U, RowScale::none};
     v.heads = 16U;
     v.row_count = 32U;
-    check(row_prep_invalid(v) == nullptr, "Hy4 view (96 x 16 heads) is supported");
+    check(row_prep_invalid(v) == nullptr, "model-B view (96 x 16 heads) is supported");
     v.row_count = 33U;
     check(row_prep_invalid(v) != nullptr, "partial token rejected");
     v.row_count = 32U;
@@ -153,9 +153,9 @@ void validation() {
 int main() {
     using strix::engram::RowScale;
     decode_case(RowScale::e8m0_per32, 256U);  // DS41 rows (264 B)
-    decode_case(RowScale::none, 96U);         // Hy4 rows (96 B)
+    decode_case(RowScale::none, 96U);         // model-B rows (96 B)
     decode_case(RowScale::f32_per_row, 64U);
-    head_rms_case(96U, 16U, 9U, false);  // Hy4-flash geometry
+    head_rms_case(96U, 16U, 9U, false);  // model-B geometry
     head_rms_case(96U, 16U, 2U, true);
     head_rms_case(40U, 3U, 5U, false);   // a row width that is not a multiple of the wave
     validation();

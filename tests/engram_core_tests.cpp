@@ -1,7 +1,7 @@
 // Shared Engram component (strix/engram/*): host tests.
 // - DS41 re-bind: hash ids and gathered rows of the shared code equal golden digests captured from the DS41-private
 //   implementation before it was removed (same synthetic contract, tokens, file and requests), plus the cache sizing.
-// - HY4: hash ids from the pack's 12 multipliers and 64 moduli equal vectors computed on the host CPU by the reference
+// - MODEL_B: hash ids from the pack's 12 multipliers and 64 moduli equal vectors computed on the host CPU by the reference
 //   formula (modeling_hy_v4_flash hash_ngrams: lookup, int64 products, XOR fold, % head vocab size); padding at the
 //   document start; ids at or past the reference table size read the pad; e4m3 decode of all 256 codes; 96-byte rows.
 #include "strix/ds41_engram.hpp"
@@ -160,7 +160,7 @@ void test_ds41_rebind() {
     expect(throws([&] { strix::ds41::EngramHasher bad(c); }), "DS41 primes must sum to the table rows");
 }
 
-// ---- HY4 (the model package's Spec adapter; built when it is present) ----
+// ---- MODEL_B (the model package's Spec adapter; built when it is present) ----
 // Independent E4M3 (finite variant) value: bias 7, subnormals m * 2^-9, S.1111.111 NaN.
 float e4m3_reference(std::uint8_t c) {
     const int e = (c >> 3) & 15, m = c & 7;
@@ -191,7 +191,7 @@ void test_decode() {
     expect(throws([&] { strix::engram::decode_row({96, strix::engram::RowScale::none}, row, scaled); }), "row size checked");
 }
 
-// The shared reader on 96-byte rows (HY4 layout: rows straddle 4 KiB pages), direct + cache and plain.
+// The shared reader on 96-byte rows (MODEL_B layout: rows straddle 4 KiB pages), direct + cache and plain.
 void test_reader_96() {
     std::vector<std::uint8_t> bytes(4096U * 12U + 13U);
     Lcg g{31};

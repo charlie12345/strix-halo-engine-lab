@@ -1,7 +1,7 @@
 // Host contract of the shared RoPE and gated elementwise ops (src/ops/rope, src/ops/glu):
 //  - glu Round::none + DeclaredExp == ds41_moe.hpp swiglu_clamped (the lifted DS41 form) bit for bit;
-//  - glu Round::bf16 == the HY4 reference expressions (hy4-host-ref-v1: bf(bf(silu(g)) * u), bf(bf(x) * bf(sigmoid(g))));
-//  - native table + reference_apply Round::bf16 == the HY4 reference rotation (interleaved pairs, theta^(-2i/64) in FP32,
+//  - glu Round::bf16 == the MODEL_B reference expressions (modelb-host-ref-v1: bf(bf(silu(g)) * u), bf(bf(x) * bf(sigmoid(g))));
+//  - native table + reference_apply Round::bf16 == the MODEL_B reference rotation (interleaved pairs, theta^(-2i/64) in FP32,
 //    cos / sin from double rounded to BF16, BF16 outputs) on the trailing 64 of a 256-wide head;
 //  - positions index table rows; inverse undoes the rotation (Round::none, within rounding).
 #include "ops/glu/glu.hpp"
@@ -52,8 +52,8 @@ void glu_tests() {
                                                  x * strix::ds41::declared_sigmoid(g));
     }
     check(none_ok, "swiglu none == ds41 swiglu_clamped");
-    check(bf_ok, "swiglu bf16 == hy4 reference expression");
-    check(gate_ok, "sigmoid gate bf16 == hy4 reference expression");
+    check(bf_ok, "swiglu bf16 == modelb reference expression");
+    check(gate_ok, "sigmoid gate bf16 == modelb reference expression");
     check(gate_none_ok, "sigmoid gate none");
     // Clamp edges: gate clamped from above only, up on both sides, NaN passes through, +inf limit = none.
     check(strix::ops::glu::swiglu<DeclaredExp, Round::none>(50.0F, 1.0F, 10.0F) ==
@@ -84,8 +84,8 @@ void epilogue_tests() {
     check(same_bits(strix::ops::glu::epilogue<Round::bf16>(1.0F + 0x1.0p-9F, bias, 0), bf(1.0F + 0x1.0p-9F + 0.25F)), "single rounding");
 }
 
-// The HY4 reference rotation, written independently of the op (hy4-host-ref-v1).
-void hy4_rope(float* x, std::size_t dims, std::uint32_t pos, float theta) {
+// The MODEL_B reference rotation, written independently of the op (modelb-host-ref-v1).
+void modelb_rope(float* x, std::size_t dims, std::uint32_t pos, float theta) {
     for (std::size_t i = 0; i < dims / 2U; ++i) {
         const float inv = 1.0F / std::pow(theta, static_cast<float>(2U * i) / static_cast<float>(dims));
         const float angle = static_cast<float>(pos) * inv;
@@ -112,7 +112,7 @@ void rope_tests() {
         for (auto& v : x) v = bf(next_value(4.0F));
         auto want = x;
         for (std::uint32_t r = 0; r < rows; ++r)
-            for (std::uint32_t h = 0; h < heads; ++h) hy4_rope(want.data() + (r * heads + h) * head + nope, 2U * pairs, positions[r], theta);
+            for (std::uint32_t h = 0; h < heads; ++h) modelb_rope(want.data() + (r * heads + h) * head + nope, 2U * pairs, positions[r], theta);
         const std::uint32_t slots[rows] = {0U, 1U, 2U};
         View v;
         v.x = x.data();
@@ -126,7 +126,7 @@ void rope_tests() {
         v.sin = st.data();
         v.positions = slots;
         strix::ops::rope::reference_apply(v, Round::bf16);
-        check(std::memcmp(x.data(), want.data(), x.size() * sizeof(float)) == 0, "rope bf16 == hy4 reference rotation");
+        check(std::memcmp(x.data(), want.data(), x.size() * sizeof(float)) == 0, "rope bf16 == modelb reference rotation");
         // Inverse with FP32 tables (BF16 cos / sin are not orthonormal) restores the input within FP32 rounding.
         for (std::uint32_t r = 0; r < rows; ++r)
             strix::ops::rope::build_native_table(theta, pairs, positions[r], 1U, Round::none, ct.data() + r * pairs,

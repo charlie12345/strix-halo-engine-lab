@@ -1,6 +1,6 @@
 // Shared attention cache-row contract (strix/attn/cache_rows.hpp): RNE encoding vs an independent nearest-value
 // reference, slot rule (full cache / ring), the Window reader's ring size, ring wrap overwrite, non-finite flag, and
-// the HY4 geometries (MLA 576-wide rows in a full cache and in the SWA ring, 128-wide token keys in the indexer ring).
+// the MODEL_B geometries (MLA 576-wide rows in a full cache and in the SWA ring, 128-wide token keys in the indexer ring).
 #include "strix/attn/cache_rows.hpp"
 #include "strix/attn/group_indexer.hpp"
 

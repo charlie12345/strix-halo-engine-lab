@@ -151,8 +151,8 @@ void run_case(const char* name, const hc::Spec& ref_spec, unsigned rows, unsigne
                 ok_rows, rows, S.post_rows() != 0U ? ", expand" : "");
 }
 
-constexpr hc::Spec hy4_sub = hc_fixture::identity_bf16_spec(hc::Site::sublayer);
-constexpr hc::Spec hy4_head = hc_fixture::identity_bf16_spec(hc::Site::head);
+constexpr hc::Spec modelb_sub = hc_fixture::identity_bf16_spec(hc::Site::sublayer);
+constexpr hc::Spec modelb_head = hc_fixture::identity_bf16_spec(hc::Site::head);
 // DeepSeek V4.1 mHC as bound in src/hip_ds41_layer.hip (hc_spec), with the runtime fields the oracle reads.
 constexpr hc::Spec ds41_device{.streams = 4, .hidden = 0, .site = hc::Site::sublayer, .comb = hc::Comb::sinkhorn,
                                .sinkhorn_iters = 0, .fn = hc::FnType::f16, .store = hc::Store::f32, .post_magnitude = 2.0F};
@@ -170,9 +170,9 @@ hc::Spec ds41_ref(std::uint32_t hidden, std::uint32_t iters) {
 
 int main() {
     try {
-        run_case<hy4_sub>("hy4-sublayer", hy4_sub, 9, 0, hy4_sub.pre_eps, false, false, 1);
-        run_case<hy4_sub>("hy4-sublayer-ranksum", hy4_sub, 3, 0, hy4_sub.pre_eps, false, true, 2);
-        run_case<hy4_head>("hy4-head", hy4_head, 9, 0, hy4_head.pre_eps, false, false, 3);
+        run_case<modelb_sub>("modelb-sublayer", modelb_sub, 9, 0, modelb_sub.pre_eps, false, false, 1);
+        run_case<modelb_sub>("modelb-sublayer-ranksum", modelb_sub, 3, 0, modelb_sub.pre_eps, false, true, 2);
+        run_case<modelb_head>("modelb-head", modelb_head, 9, 0, modelb_head.pre_eps, false, false, 3);
         run_case<ds41_device>("ds41", ds41_ref(1536, 20), 9, 20, 1e-6F, false, true, 4);
         run_case<ds41_device>("ds41-copy0", ds41_ref(1536, 1), 2, 1, 1e-6F, true, false, 5);
     } catch (const std::exception& e) {

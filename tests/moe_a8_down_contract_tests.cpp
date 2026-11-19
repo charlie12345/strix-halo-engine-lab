@@ -92,7 +92,7 @@ void tests() {
     rejects([&]{static_cast<void>(quantize_down_values(std::vector<float>(128,1)));});
     expect(std::fesetround(saved)==0,"round mode restore");
 }
-// K-quant down classes (Hy4-flash preset: Q4_K / Q6_K down, I = H = 1536, top-16, clamp 10).
+// K-quant down classes (model-B preset: Q4_K / Q6_K down, I = H = 1536, top-16, clamp 10).
 std::uint32_t mix(std::uint32_t x) {x^=x>>16U;x*=0x7feb352dU;x^=x>>15U;x*=0x846ca68bU;x^=x>>16U;return x;}
 std::vector<std::byte> kquant_row(std::uint32_t type,std::uint32_t width,std::uint32_t seed) {
     std::vector<std::byte> w(static_cast<std::size_t>(down_row_bytes(type,width)));
@@ -132,7 +132,7 @@ void kquant_tests() {
             expect(evaluate_down_row(mutant,q,type)!=got,"Q6_K scale half mutant has power");
         }
     }
-    // Geometry presets: Hy4 admitted for the K-quant classes only; Qwen bounds unchanged for the incumbent classes.
+    // Geometry presets: model-B admitted for the K-quant classes only; Qwen bounds unchanged for the incumbent classes.
     DownRequest request;request.enabled=true;request.weight_type=14;request.approved_numerical_identity=q6k_a8_down_numerical_identity;
     request.shape={kLatent.hidden,kLatent.intermediate,kLatent.experts,kLatent.top_k};request.swiglu_limit=10.0F;
     const auto s=request.shape;
@@ -155,7 +155,7 @@ void kquant_tests() {
     rejects([&]{validate_down(invalid,b);});  // Q4_K rows are 864 B, the weight extent above is Q6_K
     auto q4=b;q4.weights.bytes=std::uint64_t{s.experts}*s.hidden*864U;validate_down(invalid,q4);
     q4.weights.address+=2U;rejects([&]{validate_down(invalid,q4);});  // Q4_K needs 16-byte rows
-    // Clamp trait = Hy4 oracle semantics (hy4_host_ref.cpp: g = min(g, L), u = clamp(u, -L, L)); NaN propagates.
+    // Clamp trait = model-B oracle semantics (modelb_host_ref.cpp: g = min(g, L), u = clamp(u, -L, L)); NaN propagates.
     const auto c=strix::moe::swiglu_clamp(12.5F,-11.0F,10.0F);expect(c.gate==10.0F && c.up==-10.0F,"clamp gate max / up both sides");
     const auto d=strix::moe::swiglu_clamp(-50.0F,3.0F,10.0F);expect(d.gate==-50.0F && d.up==3.0F,"gate has no lower clamp");
     const auto e=strix::moe::swiglu_clamp(std::numeric_limits<float>::quiet_NaN(),1.0F,10.0F);expect(std::isnan(e.gate),"NaN propagates");

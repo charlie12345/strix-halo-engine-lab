@@ -6,8 +6,8 @@
 // R = BF16 RNE (ds41::round_to_bf16). exp is the binder's Exp trait; DeclaredExp = the declared exp of ds41_moe.hpp (basic
 // IEEE operations only: host and device give the same bits when the binder's TU does not contract).
 // Lifted from the DS41 trellis (swiglu_f32_kernel, Round::none + DeclaredExp = its former bits). Binders: DS41 (dense
-// SwiGLU of the device / batch forward and the TP shared expert), HY4 (routed experts limit 10, dense layer and shared
-// expert limit +infinity, attention output gate; Round::bf16).
+// SwiGLU of the device / batch forward and the TP shared expert), and Round::bf16 bindings (clamped routed experts, unclamped dense
+// and shared experts, attention output gate).
 #include "strix/ds41_layer.hpp"  // round_to_bf16
 #include "strix/ds41_moe.hpp"    // declared_exp
 #include "strix/moe/activation_policy.hpp"
@@ -52,8 +52,8 @@ STRIX_OPS_GLU_HD inline float sigmoid_gate(float x, float gate) {
 }
 
 // Linear epilogue: the stored output of a Linear layer, y = R(x + bias), bias == nullptr: y = R(x); Round::none: y = x + bias
-// (unit: y = x). One rounding of (dot + bias), as a BF16 Linear module stores its output. Binders: HY4 (every Q8_0 / BF16
-// projection output, Engram kv with its bias, the embedding rows' BF16 storage).
+// (unit: y = x). One rounding of (dot + bias), as a BF16 Linear module stores its output. Binders: BF16-storing
+// models (every Q8_0 / BF16 projection output, Engram kv with its bias, the embedding rows' BF16 storage).
 template <Round R>
 STRIX_OPS_GLU_HD inline float epilogue(float x, const float* bias, std::size_t column) {
     const float v = bias ? x + bias[column] : x;

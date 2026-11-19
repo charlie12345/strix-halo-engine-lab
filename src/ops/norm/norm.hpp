@@ -13,9 +13,9 @@ namespace strix::ops::norm {
 enum class ReductionOrder { lane_strided_fma_lds_halving };
 
 // Output form, an optional trait (`static constexpr OutputForm output_form`; absent = plain):
-//   plain:       y = (x*r)*scale, unit scale y = x*r (every binder before Hy4-flash: bits unchanged);
+//   plain:       y = (x*r)*scale, unit scale y = x*r (the existing binders: bits unchanged);
 //   bf16_double: y = R(scale * R(x*r)), unit scale y = R(x*r), R = BF16 RNE: the BF16 reference module's norm
-//                (normalise in BF16, then the BF16 weight product). Binders: Hy4-flash (every RMSNorm).
+//                (normalise in BF16, then the BF16 weight product). Binders: models whose reference norm rounds through BF16.
 enum class OutputForm { plain, bf16_double };
 
 template <class Traits>

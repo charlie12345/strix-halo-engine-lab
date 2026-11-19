@@ -1,5 +1,5 @@
 // Shared HIP cache-row writer (attn_core/cache_rows.hpp) == host reference (strix/attn/cache_rows.hpp), bitwise, on
-// the HY4 geometries: MLA rows 576 (512 latent + 64 rope) in a full cache (DSA layers, explicit positions) and in the
+// the MODEL_B geometries: MLA rows 576 (512 latent + 64 rope) in a full cache (DSA layers, explicit positions) and in the
 // SWA ring of 512 (decode one row per launch past a wrap, and a prefill chunk of 64 rows in a ring of 1024), and the
 // indexer token keys (128) in the token ring of 7; a non-finite input raises the flag.
 #include "attn_core/cache_rows.hpp"
@@ -83,13 +83,13 @@ int main() {
     bool pass = true;
     // DSA layer: full cache, explicit positions (a verify window and a jump), source stride 576 (kv_a row)
     std::vector<std::uint32_t> dsa{0U, 1U, 2U, 3U, 700U, 701U, 702U, 1999U};
-    pass = run("hy4 dsa full 576", cr::Rows{576U, 0U}, 2048U, 576U, 0U, 4U, 2U, dsa, false) && pass;
+    pass = run("modelb dsa full 576", cr::Rows{576U, 0U}, 2048U, 576U, 0U, 4U, 2U, dsa, false) && pass;
     // SWA decode: one row per launch, 1300 positions through the ring of 512 (two wraps)
-    pass = run("hy4 swa ring 512 decode", cr::Rows{576U, cr::window_ring(512U, 1U)}, 512U, 576U, 0U, 1U, 1300U, {}, false) && pass;
+    pass = run("modelb swa ring 512 decode", cr::Rows{576U, cr::window_ring(512U, 1U)}, 512U, 576U, 0U, 1U, 1300U, {}, false) && pass;
     // SWA prefill chunks of 64 rows in the ring the reader needs for that chunk (1024)
-    pass = run("hy4 swa ring prefill 64", cr::Rows{576U, cr::window_ring(512U, 64U)}, 1024U, 576U, 37U, 64U, 30U, {}, false) && pass;
+    pass = run("modelb swa ring prefill 64", cr::Rows{576U, cr::window_ring(512U, 64U)}, 1024U, 576U, 37U, 64U, 30U, {}, false) && pass;
     // indexer token keys: width 128 from a wider staging row (stride 160), token ring of 7 (ratio 4, 4 verify rows)
-    pass = run("hy4 token keys ring 7", cr::Rows{128U, 7U}, 7U, 160U, 5U, 4U, 9U, {}, false) && pass;
+    pass = run("modelb token keys ring 7", cr::Rows{128U, 7U}, 7U, 160U, 5U, 4U, 9U, {}, false) && pass;
     // a NaN input flags the launch
     pass = run("non-finite flag", cr::Rows{576U, 0U}, 16U, 576U, 0U, 4U, 1U, {}, true) && pass;
     std::printf("%s cache rows\n", pass ? "PASS" : "FAIL");

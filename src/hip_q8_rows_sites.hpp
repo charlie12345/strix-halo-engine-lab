@@ -5,7 +5,7 @@
 //   dot + bias) applied in the store, the same device function on the same FP32 value as a separate epilogue launch.
 // - HeadsF32: H per-head GEMVs in ONE launch (strix/decode_head_rows.hpp head rows), out[(o / head_outputs) * out_stride
 //   + o % head_outputs]; e.g. MLA absorb of K_b / V_b.
-// Home: shared (HIP kernel sites beside the q8_rows core). Bound by: Hy4-flash projections and MLA absorb.
+// Home: shared (HIP kernel sites beside the q8_rows core). Bound by: bindings with stock Q8_0 projections and MLA absorb.
 #include "hip_q8_rows_gemv.hpp"
 #include "ops/glu/glu.hpp"
 

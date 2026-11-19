@@ -1,5 +1,5 @@
 // K-quant envelope of the shared f16x grouped MoE prefill (known_rows enqueue_prefill): Q4_K gate/up, Q4_K / Q6_K down,
-// top-16, I up to 1536, SwiGLU clamp (first binder Hy4-flash). Synthetic weights, no model.
+// top-16, I up to 1536, SwiGLU clamp (first binder model-B). Synthetic weights, no model.
 // Checks (default mode):
 // - gate/up h of sampled rows vs a host double sum over the same FP16 operands (device A image and B decode emulated), with the
 //   clamp trait applied in the reference; FP32-accumulation tolerance;
@@ -7,7 +7,7 @@
 // - clamp entry with limit 1e30 == unclamped entry, bitwise, on every h and raw dot;
 // - fail-closed admission (top_k 17, form 4, clamp with a Q8_0 down, route BF16 view).
 // Bench mode (`bench`): E512 T4096 K16 H1536 I1536, Q6_K and Q4_K down with clamp 10; prologue+CSR / gate-up / down ms per layer.
-// Real mode (`real GGUF GATE_AT UP_AT DOWN_AT DOWN_TYPE`): one Hy4-flash MoE layer's experts read from the pack at the absolute
+// Real mode (`real GGUF GATE_AT UP_AT DOWN_AT DOWN_TYPE`): one model-B MoE layer's experts read from the pack at the absolute
 // tensor offsets (synthetic BF16 rows, uniform random top-16 routes, clamp 10): windows of 16 / 512 / 2048 / 4096 rows, stage
 // times, sampled rows vs the FP16-operand reference (pass/fail) and the FAST-class drift vs an FP32-weight reference.
 #include <fstream>

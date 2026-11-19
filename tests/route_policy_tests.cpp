@@ -1,4 +1,4 @@
-// Shared MoE router policy (include/strix/moe/route_policy.hpp): HY4 top-16/512 with bias, ties, NaN / -0 keys, and the
+// Shared MoE router policy (include/strix/moe/route_policy.hpp): MODEL_B top-16/512 with bias, ties, NaN / -0 keys, and the
 // family byte-compares: the shared oracle reproduces the ids and weight bits of each family's host router on synthetic
 // logits (DS41 reference_router, GLM-5 route, MiniMax-M3 route_row), and each family's output digest is pinned so a
 // re-bind of the family call site to the shared oracle is checked to keep its bits.
@@ -111,9 +111,9 @@ std::vector<std::uint32_t> sorted_pick(const std::vector<float>& s, const std::v
     return idx;
 }
 
-void hy4_top16() {
+void modelb_top16() {
     const RoutePolicy p = kSigmoid512;
-    check(validate(p) == nullptr, "hy4 preset validates");
+    check(validate(p) == nullptr, "modelb preset validates");
     Lcg g{11};
     for (int row = 0; row < 64; ++row) {
         const auto z = logits(g, p.experts);
@@ -123,7 +123,7 @@ void hy4_top16() {
         const Row r = oracle(p, s, b);
         auto want = sorted_pick(s, b, p.top_k);
         std::sort(want.begin(), want.end());
-        check(r.ids == want, "hy4 top-16 = (score + bias desc, id asc), output ascending id");
+        check(r.ids == want, "modelb top-16 = (score + bias desc, id asc), output ascending id");
         float sum = 0.0F;
         for (const auto id : r.ids) sum = sum + s[id];
         bool w_ok = true, unbiased = true;
@@ -131,8 +131,8 @@ void hy4_top16() {
             w_ok = w_ok && bits(r.w[k]) == bits((s[r.ids[k]] / (sum + 1e-20F)) * 3.998F);
             unbiased = unbiased && s[r.ids[k]] > 0.0F;
         }
-        check(w_ok, "hy4 weights = sigmoid / (sum + 1e-20) x 3.998 (bias for selection only)");
-        check(unbiased, "hy4 weights come from the unbiased sigmoid scores");
+        check(w_ok, "modelb weights = sigmoid / (sum + 1e-20) x 3.998 (bias for selection only)");
+        check(unbiased, "modelb weights come from the unbiased sigmoid scores");
     }
 }
 
@@ -304,7 +304,7 @@ void pin(const char* name, const Digest& d, std::uint64_t expected) {
 }  // namespace
 
 int main() {
-    hy4_top16();
+    modelb_top16();
     ties_and_keys();
     clamp_trait();
     Digest ds41;

@@ -7,7 +7,7 @@
 //
 // decode (DeepSeek V4.1): out[i][j] = the decode_row value (E4M3 x scale, exact), FP32. DS41 rounds to BF16 in its
 //   own following launch (unchanged; enqueue_engram_rows_bf16).
-// head_rms_bf16 (Hy4-flash): rows are (token, head) pairs, head-minor: head = i % heads. Per row, the model's
+// head_rms_bf16: rows are (token, head) pairs, head-minor: head = i % heads. Per row, the model's
 //   torch.nn.RMSNorm(elements) with weight w[head] and eps = the dtype epsilon, in the declared arithmetic:
 //     x_j = bf(decode_j)                      (exact for unscaled E4M3: every E4M3 value is a BF16 value)
 //     ss  = chunked_dot(x, x)                 (ds41::chunked_dot_of: lane l sums j = l, l + 32, ... in order, then the

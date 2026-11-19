@@ -149,7 +149,7 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split(const CodePoints& tex
 }
 
 // GGUF pre names whose tokenizer.json carries exactly the DeepSeek V3/V4 rule below: `joyai-llm`, `deepseek-v3` and
-// Hy4 (`hy_v4`: its three Split regexes and the regex-free ByteLevel step are the same strings, no normalizer).
+// `hy_v4` (its three Split regexes and the regex-free ByteLevel step are the same strings, no normalizer).
 bool deepseek_rule(std::string_view pre) { return pre == "joyai-llm" || pre == "deepseek-v3" || pre == "hy_v4"; }
 
 // The DeepSeek V3/V4 pre-tokenizer (GGUF `joyai-llm` / `deepseek-v3` / `hy_v4`): a sequence of three isolating splits, each

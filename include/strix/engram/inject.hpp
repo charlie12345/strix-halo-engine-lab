@@ -9,7 +9,7 @@
 // folded (DeepSeek V4.1): w0 = q_norm [copies][hidden], w1 = k_norm [copies][hidden]; the norms are folded into scalars:
 //   rh = rsqrt(sum h^2 / hidden + eps), rk likewise for key, dot = (sum (h * (q * k)) * key) * (rh * rk) * inv_sqrt_hidden,
 //   gate = ds41::engram_gate_of(dot), h[i] = h[i] + gate * value[i]; gate_off: gate 0 (the update still runs).
-// normalized_bf16 (Hy4-flash): w0 = gate weight [copies][hidden] (the folded norm_key * norm_query weight),
+// normalized_bf16: w0 = gate weight [copies][hidden] (the folded norm_key * norm_query weight),
 //   w1 = [copy_scale [copies][hidden] | value_gamma [hidden]] (one contiguous block); BF16 rounding points of the model:
 //   query = bf(h * rq), key = bf(k * rk), term = bf(bf(key * w0) * query), d = bf(sum(term) * inv_sqrt_hidden),
 //   g = bf(sigmoid(sign(d) * sqrt(max(|d|, 1e-6)))) (sign(0) = 0), m = bf(gamma * bf(value * rv)),

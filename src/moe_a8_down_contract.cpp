@@ -55,7 +55,7 @@ void validate_down(const DownRequest& r,const DownBindings& b) {
     const auto s=r.shape;
     need(r.swiglu_limit==moe::kSwigluNoClamp || (std::isfinite(r.swiglu_limit) && r.swiglu_limit>0.0F),
         "A8 down SwiGLU clamp limit must be +infinity (none) or finite positive");
-    // Incumbent operand classes keep the Qwen bounds; the K-quant class takes the C1 envelope (Hy4 preset).
+    // Incumbent operand classes keep the Qwen bounds; the K-quant class takes the C1 envelope.
     const bool kq=kquant(r.weight_type);
     need(s.hidden>0 && s.hidden<=max_hidden && s.hidden%64U==0 && s.intermediate>0 &&
         s.intermediate<=(kq?c1_max_rows:max_rows) && s.intermediate%(kq?256U:128U)==0 &&

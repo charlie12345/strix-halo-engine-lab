@@ -1,8 +1,8 @@
 // Shared Engram injection contract (include/strix/engram/inject.hpp): host reference of both forms.
 //  - folded: bitwise equal to the DeepSeek V4.1 host code it replaced (transcribed below from src/ds41_layer.cpp before
 //    the lift) and to the re-bound ds41::engram_inject / engram_gates;
-//  - normalized_bf16: bitwise equal to the Hy4-flash CPU oracle's Engram update (transcribed from
-//    src/hy4/ref/hy4_host_ref.cpp, Engram block after the projection), including sign(0), masked rows and small hidden.
+//  - normalized_bf16: bitwise equal to the model-B CPU oracle's Engram update (transcribed from
+//    src/modelb/ref/modelb_host_ref.cpp, Engram block after the projection), including sign(0), masked rows and small hidden.
 #include "strix/ds41_layer.hpp"
 #include "strix/engram/inject.hpp"
 
@@ -72,7 +72,7 @@ void ds41_before(std::vector<float>& stream, const std::vector<float>& kv, const
         for (std::size_t i = 0; i < hidden; ++i) stream[c * hidden + i] = stream[c * hidden + i] + gates[c] * value[i];
 }
 
-// ---- Hy4 oracle Engram update (hy4_host_ref.cpp, after `projected`): kv blocks 0..3 keys, 4 value --------------------
+// ---- model-B oracle Engram update (modelb_host_ref.cpp, after `projected`): kv blocks 0..3 keys, 4 value --------------------
 float bf(float x) { return strix::ds41::round_to_bf16(x); }
 std::vector<float> oracle_rms(const float* x, std::size_t n, float eps) {
     const float r = 1.0F / strix::ds41::declared_sqrt(
@@ -82,7 +82,7 @@ std::vector<float> oracle_rms(const float* x, std::size_t n, float eps) {
     for (std::size_t i = 0; i < n; ++i) y[i] = bf(x[i] * r);
     return y;
 }
-void hy4_oracle(std::vector<float>& x, const std::vector<float>& kv, const std::vector<float>& gate_w, const std::vector<float>& hc_scale,
+void modelb_oracle(std::vector<float>& x, const std::vector<float>& kv, const std::vector<float>& gate_w, const std::vector<float>& hc_scale,
                 const std::vector<float>& pre_gamma, float eps, bool masked) {
     if (masked) return;
     const std::size_t h = pre_gamma.size();
@@ -131,11 +131,11 @@ void normalized_case(std::uint32_t hidden, std::uint64_t seed, bool masked, bool
     w1.insert(w1.end(), gamma.begin(), gamma.end());
     const float eps = 0.0078125F;
     auto oracle = stream, shared = stream;
-    hy4_oracle(oracle, kv, gate_w, scale, gamma, eps, masked);
+    modelb_oracle(oracle, kv, gate_w, scale, gamma, eps, masked);
     std::array<float, C> gates{};
     strix::engram::inject_row_reference(strix::engram::InjectForm::normalized_bf16, C, hidden, eps, shared.data(), kv.data(),
                                         gate_w.data(), w1.data(), masked, gates.data());
-    check(same_bits(oracle, shared), "normalized_bf16: shared reference == Hy4 oracle update");
+    check(same_bits(oracle, shared), "normalized_bf16: shared reference == model-B oracle update");
     if (masked) check(same_bits(stream, shared), "normalized_bf16: masked row unchanged");
     if (zero_query) check(gates[0] == 0.5F, "normalized_bf16: d = 0 gives sigmoid(0) (sign(0) = 0)");
 }
@@ -173,7 +173,7 @@ int main() {
         v.eps = 0.0078125F;
         strix::engram::inject_reference(v);
         check(same_bits(expect, stream), "view: rows independent, masked row skipped");
-        check(strix::engram::inject_threads(v) == 32U * 4U * 5U, "view: Hy4 hidden 3072 -> 20 waves");
+        check(strix::engram::inject_threads(v) == 32U * 4U * 5U, "view: model-B hidden 3072 -> 20 waves");
         v.hidden = 5121;
         check(!strix::engram::inject_supported(v), "view: hidden 5121 (9 chunks x 4 copies) refused");
         v.hidden = 4096;

@@ -548,7 +548,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-glm-kvshard-anomaly-tests COMMAND strix-glm-kvshard-anomaly-tests)
     set_tests_properties(strix-glm-kvshard-anomaly-tests PROPERTIES LABELS "cpu;glm;kvshard;oracle")
-    # Shared compressed group indexer contract (HY4 policy; GLM pool bit identity on the host).
+    # Shared compressed group indexer contract (gated-ape policy; GLM pool bit identity on the host).
     add_executable(strix-group-indexer-tests tests/group_indexer_tests.cpp src/attn/group_indexer_ref.cpp)
     target_include_directories(strix-group-indexer-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(strix-group-indexer-tests PRIVATE cxx_std_20)
@@ -560,7 +560,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-group-indexer-tests COMMAND strix-group-indexer-tests)
     set_tests_properties(strix-group-indexer-tests PROPERTIES LABELS "cpu;attn;oracle")
-    # Shared group pool statements (HIP block core src/attn_core/group_pool.hpp): HY4 lanes == oracle, GLM sites ==
+    # Shared group pool statements (HIP block core src/attn_core/group_pool.hpp): gated-ape lanes == oracle, GLM sites ==
     # the pre-lift statements, tie keys.
     add_executable(strix-group-pool-tests tests/group_pool_tests.cpp src/attn/group_indexer_ref.cpp)
     target_include_directories(strix-group-pool-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
@@ -573,7 +573,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-group-pool-tests COMMAND strix-group-pool-tests)
     set_tests_properties(strix-group-pool-tests PROPERTIES LABELS "cpu;attn;oracle")
-    # Shared MLA attention contract (HY4 DSA/SWA, GLM-5 NoPE): fp64 host oracle, absorbed == reference form.
+    # Shared MLA attention contract (DSA / SWA layers, GLM-5 NoPE): fp64 host oracle, absorbed == reference form.
     add_executable(strix-mla-contract-tests tests/mla_contract_tests.cpp src/attn/mla_ref.cpp)
     target_include_directories(strix-mla-contract-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
     target_compile_features(strix-mla-contract-tests PRIVATE cxx_std_20)
@@ -1080,7 +1080,7 @@ if(BUILD_TESTING)
         target_compile_options(strix-norm-reference-tests PRIVATE -fno-fast-math -ffp-contract=off)
     endif()
     add_test(NAME strix-norm-reference-tests COMMAND strix-norm-reference-tests)
-    # Shared RoPE / gated elementwise ops (src/ops/rope, src/ops/glu): host contract vs the lifted DS41 forms and HY4.
+    # Shared RoPE / gated elementwise ops (src/ops/rope, src/ops/glu): host contract vs the lifted DS41 forms and the BF16-table form.
     add_executable(strix-ops-rope-glu-host-tests tests/ops_rope_glu_host_tests.cpp)
     target_compile_features(strix-ops-rope-glu-host-tests PRIVATE cxx_std_20)
     target_include_directories(strix-ops-rope-glu-host-tests PRIVATE include src)
@@ -2987,7 +2987,7 @@ int main() { return 0; }"
             target_compile_options(strix-hip-exact-reduce-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-exact-reduce-tests)
             add_test(NAME strix-hip-exact-reduce-tests COMMAND strix-hip-exact-reduce-tests)
-            # Shared group-indexer device cores (pool, exact decode scan, HY4 select binding) vs the host oracle.
+            # Shared group-indexer device cores (pool, exact decode scan, AlwaysOwn select binding) vs the host oracle.
             add_executable(strix-hip-group-pool-tests tests/hip_group_pool_tests.hip src/attn/group_indexer_ref.cpp)
             set_target_properties(strix-hip-group-pool-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             target_include_directories(strix-hip-group-pool-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
@@ -3406,7 +3406,7 @@ int main() { return 0; }"
         strix_target_warnings(strix-hip-dense-rows-tile-tests)
         add_test(NAME strix-hip-dense-rows-tile-tests COMMAND strix-hip-dense-rows-tile-tests)
         set_tests_properties(strix-hip-dense-rows-tile-tests PROPERTIES SKIP_RETURN_CODE 77)
-        # Shared cache-row writer (attn_core/cache_rows.hpp) vs the host reference, HY4 geometries.
+        # Shared cache-row writer (attn_core/cache_rows.hpp) vs the host reference, test geometries.
         add_executable(strix-hip-cache-rows-tests tests/hip_cache_rows_tests.hip)
         set_target_properties(strix-hip-cache-rows-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_include_directories(strix-hip-cache-rows-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
@@ -6502,7 +6502,7 @@ set_property(SOURCE
 if(STRIX_CUDA_CORE)
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/CudaCore.cmake")
 endif()
-# Shared MoE router policy (include/strix/moe/route_policy.hpp, header-only): HY4 preset, ties, keys, and the family
+# Shared MoE router policy (include/strix/moe/route_policy.hpp, header-only): presets, ties, keys, and the family
 # byte-compares against the DS41 / MiniMax / GLM-5 host routers when those families are built.
 if(BUILD_TESTING)
     add_executable(strix-route-policy-tests tests/route_policy_tests.cpp)

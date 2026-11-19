@@ -1591,7 +1591,7 @@ __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_wa
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 }
-// Clamp trait entry of the same body (Hy4-flash routed experts, preset limit 10): h = silu(min(g, L)) * clamp(u, -L, L), the
+// Clamp trait entry of the same body (clamped routed experts, e.g. limit 10): h = silu(min(g, L)) * clamp(u, -L, L), the
 // non-finite check on the raw g / u. Only the K-quant envelope of enqueue_prefill launches it; the entry above is unchanged.
 template<bool Q5K,unsigned Tune>
 __global__ __launch_bounds__((F16TileX<Tune,0U>::Threads),prefill_core2_min_waves(Tune,0U)) void project_prefill_f16x_clamped(
@@ -2061,7 +2061,7 @@ unsigned prefill_effective_tune(const Request& request,unsigned count,unsigned d
     }
     return tune;
 }
-// K-quant envelope of the f16x grouped prefill (first binder Hy4-flash: Q4_K gate/up, Q4_K / Q6_K down, top-16 of 512,
+// K-quant envelope of the f16x grouped prefill (Q4_K gate/up, Q4_K / Q6_K down, top-16 of 512,
 // I 1536, SwiGLU clamp). Envelope = the C1 one (moe_q4k_a8_contract.hpp: rows <= c1_max_rows, top_k <= c1_max_top_k). It runs
 // the plain f16x schedule (prologue with the FP16 A image, shared CSR, gate/up, K-quant down; tune 82, or 80 below 96
 // assignments per expert, the rule of prefill_effective_tune). The qpf2k schedule levers (ROUTE, DA16, certificate, core2,

@@ -1,6 +1,6 @@
 #pragma once
 // MLA attention contract (shared): absorbed multi-head latent attention over a per-row key selection, for every engine
-// whose attention keeps one latent row per token (HY4 DSA + SWA layers, GLM-5 DSA). Host/vendor-free (core_audit rule
+// whose attention keeps one latent row per token (DSA + SWA layers, GLM-5 DSA). Host/vendor-free (core_audit rule
 // S2): the shape, the traits and the scalar index arithmetic that the host oracle (src/attn/mla_ref.cpp) and the device
 // policies (src/attn_core/sparse_flash_mla.hpp) both use.
 //
@@ -10,7 +10,7 @@
 //   (1) absorb   qt[h][l] = sum_{d < nope} q[h][d] W_k[h][d][l]  (l < kv_lora);  qt[h][kv_lora + i] = q[h][nope + i]
 //   (2) score    s[h][j]  = scale * qt[h] . key_row(pos_j)        (width d_qk = kv_lora + rope; scale = (nope+rope)^-1/2)
 //   (3) softmax  p = exp(s - m) / (sum_j exp(s_j - m) + [sink] exp(z_h - m)),  m = max(max_j s_j, [sink] z_h)
-//                (learned sink z_h: one logit per head in the denominator only, gpt-oss / HY4 form; no value)
+//                (learned sink z_h: one logit per head in the denominator only, gpt-oss form; no value)
 //   (4) latent   o[h][l] = sum_j p[h][j] latent(pos_j)[l]          (width d_v = kv_lora; the rope part has no value)
 //   (5) out      y[h][e] = sum_l o[h][l] W_v[h][e][l]              (e < v)
 //   (6) gate     y[h][e] *= sigmoid(g[h][e]),  g = gate_proj(x)    (elementwise; acts on the v space, i.e. AFTER (5):
@@ -19,7 +19,7 @@
 //
 // Selection (which cache positions a row at position t attends; ascending, unique, all <= t):
 //   List:   the indexer's list (include/strix/attn/group_indexer.hpp), at most `budget` positions.
-//   Window: [t + 1 - n, t] with n = min(t + 1, window)  (HY4 SWA: 511 earlier keys + self). A window IS a list whose
+//   Window: [t + 1 - n, t] with n = min(t + 1, window)  (window 512: 511 earlier keys + self). A window IS a list whose
 //           entries are computed, so both layer kinds run the same shared sparse core with a different policy.
 // Accumulation order: the host oracle sums every product in increasing index order in fp64. The device core is a
 // FAST identity (bf16 operands rounded RNE, WMMA order, online exp2 softmax): compared to the oracle by tolerance,

@@ -3,7 +3,7 @@
 //     geometries (K_b: width 192, 512 outputs / head, input stride 256; V_b: width 512, 256 outputs / head, stride 512;
 //     32 and 64 heads); plus a host-reference sanity bound.
 //  2. timing (printed, not asserted): per layer, the incumbent per-head launch_hip_dense_rows loop, the per-head q8_rows
-//     loop and the one-launch head form; and the streaming rate of launch_hip_dense_rows vs q8_rows on the large Hy4
+//     loop and the one-launch head form; and the streaming rate of launch_hip_dense_rows vs q8_rows on the large model-B
 //     Q8_0 projection shapes. Weights rotate over copies larger than the 32 MB last-level cache.
 #include "../src/hip_q8_rows_gemv.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
@@ -204,7 +204,7 @@ int main(int argc, char** argv) {
         CHECK(hipFree(yb));
     }
     if (bench) {
-        // U2: one-row streaming rate of the incumbent head-family dense rows vs the q8_rows direct form, Hy4 Q8_0 shapes.
+        // U2: one-row streaming rate of the incumbent head-family dense rows vs the q8_rows direct form, model-B Q8_0 shapes.
         struct Shape { const char* name; std::uint32_t outputs, width; };
         const Shape shapes[] = {{"attn_gate64_16384x3072", 16384U, 3072U}, {"attn_out64_3072x16384", 3072U, 16384U},
                                 {"attn_q_b64_16384x1024", 16384U, 1024U}, {"q_a+kv_a_1600x3072", 1600U, 3072U},

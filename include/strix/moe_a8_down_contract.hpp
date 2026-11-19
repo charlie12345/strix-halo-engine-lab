@@ -3,7 +3,7 @@
 #include "strix/moe_q4k_a8_contract.hpp"
 #include <array>
 namespace strix::moe_q4k_a8 {
-// K-quant down operand classes (C1 form down_rawdots_kq; Hy4-flash Q4_K / Q6_K routed down). Lane layout and reduction of
+// K-quant down operand classes (C1 form down_rawdots_kq; Q4_K / Q6_K routed down). Lane layout and reduction of
 // `project`: per 256-block, pair p of g32 groups (2p, 2p+1), c_g per group, paired = c_2p + c_2p+1, slot p accumulates
 // blocks ascending, result (p0+p1)+(p2+p3). Q4_K c_g is the gate/up term; Q6_K is g4-a8-v1's group term.
 inline constexpr std::string_view q4k_a8_down_numerical_identity =
@@ -42,7 +42,7 @@ struct DownRequest {
     std::string_view approved_numerical_identity;
     DownShape shape;
     std::uint32_t weight_type=7;
-    float swiglu_limit=moe::kSwigluNoClamp;  // finite > 0: clamped producer (Hy4 preset 10)
+    float swiglu_limit=moe::kSwigluNoClamp;  // finite > 0: clamped producer (e.g. 10)
 };
 // Exact logical extents. All views, including read-only views, are disjoint.
 // intermediates is K slots of [gate I, up I]; producer replaces ONLY gate with h.

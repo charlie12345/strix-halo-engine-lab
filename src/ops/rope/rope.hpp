@@ -8,8 +8,8 @@
 // unchanged by the lift). Round::bf16 evaluates every product and sum separately (no contraction), so the device
 // equals reference_apply bit for bit.
 // The tables are data: a binder builds them with its own policy (DS41: YaRN, inverse on the attention output) or with
-// build_native_table (no scaling, one theta per layer kind, e.g. HY4: theta 1e7 on indexed layers, 1e4 on sliding).
-// Binders: DS41 (hip_ds41_layer.hip enqueue_rope, Round::none), HY4 (Round::bf16, native tables, cos / sin BF16).
+// build_native_table (no scaling, one theta per layer kind, e.g. theta 1e7 on one layer kind, 1e4 on another).
+// Binders: DS41 (hip_ds41_layer.hip enqueue_rope, Round::none), Round::bf16 bindings (native tables, cos / sin BF16).
 #include "strix/ds41_layer.hpp"  // round_to_bf16: the declared BF16 RNE shared by the declared-arithmetic models
 
 #include <cmath>
@@ -39,7 +39,7 @@ inline void require_view(const View& v) {
 
 // Native table rows for positions first .. first + count - 1 (row i = position first + i, `pairs` entries each):
 // inv_p = 1 / powf(theta, 2p / (2 pairs)) and angle = float(position) * inv_p in FP32, cos / sin evaluated in double on
-// that FP32 angle and narrowed to FP32, then rounded by `round` (HY4: BF16, as its reference model rounds the tables
+// that FP32 angle and narrowed to FP32, then rounded by `round` (e.g. BF16, when the reference model rounds the tables
 // to the activation dtype). Host only.
 inline void build_native_table(float theta, std::uint32_t pairs, std::uint32_t first, std::uint32_t count, Round round,
                                float* cos_out, float* sin_out) {

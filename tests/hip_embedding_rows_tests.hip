@@ -1,5 +1,5 @@
 // Raw embedding row gather (launch_hip_embedding_rows / launch_hip_embedding_device_row) on a Q8_0 table with the
-// Hy4-flash row width (3072) vs the shared host dequantizer: FP32 output bitwise, BF16 output = round-to-nearest-even of
+// model-B row width (3072) vs the shared host dequantizer: FP32 output bitwise, BF16 output = round-to-nearest-even of
 // the host value, device id out of the vocabulary -> row 0, host id out of the vocabulary -> throws, nothing enqueued.
 // Exit 77 (skip) without a HIP device.
 #include "strix/ggml_dequant.hpp"

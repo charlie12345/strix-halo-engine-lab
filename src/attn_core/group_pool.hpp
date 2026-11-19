@@ -3,7 +3,7 @@
 // statements strix/attn/group_pool.hpp). One work-group of head_dim lanes pools one COMPLETE group; lane = channel.
 //   GatedSoftmax     (GLM): the engine kernels keep their slot addressing / flags and call gated_bf16_channel or
 //                           group_indexer::gated_pool_channel directly (no LDS, no barrier).
-//   GatedSoftmaxApe  (HY4): pool_gated_ape below (projections need every token-key element: LDS + two barriers).
+//   GatedSoftmaxApe: pool_gated_ape below (projections need every token-key element: LDS + two barriers).
 // A group key is pooled once when its group closes and cached; never re-pool closed groups per step.
 #include <hip/hip_runtime.h>
 

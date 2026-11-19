@@ -1,6 +1,6 @@
 // Device checks of the rows tile of launch_hip_dense_rows (strix/dense_rows_tile.hpp), synthetic data, no model:
 //  1. identity: rows form (one launch) == one single-row launch per row (row_loop = true), BITWISE, on
-//     F32 512 x 3072 fp32 input rows 2048 (Hy4 router), F32 16 x 3072 fp32 rows 37 (indexer proj, ragged rows),
+//     F32 512 x 3072 fp32 input rows 2048 (model-B router), F32 16 x 3072 fp32 rows 37 (indexer proj, ragged rows),
 //     BF16 1003 x 3000 bf16 input rows 13 with strides (ragged outputs, width not a multiple of 256),
 //     Q8_0 300 x 2048 bf16 rows 9, F16 64 x 768 fp32 rows 2; outputs outside the stored range stay untouched.
 //  2. timing (printed, not asserted): router geometry, rows 2048: per-row loop vs rows tile, median of 5.

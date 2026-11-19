@@ -1,5 +1,5 @@
 // K-quant FP16 down operands of the f16x down body (moe_core/hip_moe_f16x_down_body.inc with STRIX_F16X_DOWN_KQ, entry
-// down_prefill_f16x_kq in hip_moe_q4k_a8_known_rows.hip; first binder: Hy4-flash routed down, Q4_K 12 / Q6_K 14). Included
+// down_prefill_f16x_kq in hip_moe_q4k_a8_known_rows.hip; Q4_K 12 / Q6_K 14). Included
 // inside that file's anonymous namespace after factor, f16_load, f16_scaled_s8 and the Qwen K decoders.
 // A row is width/256 superblocks. The 64-K step s covers sub-blocks 2(s%4) and 2(s%4)+1 of superblock s/4; half h (32
 // weights, K 32h..32h+31 of the step) is sub-block 2(s%4)+h. Each FP16 weight is ONE rounding of an FP32 value:

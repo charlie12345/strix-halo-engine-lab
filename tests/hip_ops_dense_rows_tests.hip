@@ -1,10 +1,10 @@
-// Device checks of the HY4 dense-side shared pieces (synthetic data, no model):
+// Device checks of the MODEL_B dense-side shared pieces (synthetic data, no model):
 //  - launch_hip_dense_rows (head family): F32 weights 512 x 3072 (router geometry), BF16 weights 1024 x 3072 (head rows),
 //    BF16 and FP32 inputs, 2 rows with strides: FP32 out vs a double host sum, |err| <= 1e-5 * sum|w x| + 1e-6;
 //  - ops::rope Round::bf16 on 64 heads x 256 (trailing 64), theta 1e4 / 1e7 native tables: bitwise == reference_apply;
 //    Round::none (the DS41 instantiation): |err| <= 2^-20 relative (contraction only);
 //  - ops::glu swiglu (limit 10 and none) and sigmoid gate, Round::bf16 and none, DeclaredExp: bitwise == host
-//    (this TU compiles without contraction, as a HY4 binder must).
+//    (this TU compiles without contraction, as a MODEL_B binder must).
 // Exit 77 when no HIP device is present.
 #include "ops/glu/glu_device.hpp"
 #include "ops/rope/rope_device.hpp"
@@ -231,6 +231,6 @@ int main() {
         return 1;
     }
     if (failures) return 1;
-    std::printf("PASS hy4 dense ops (dense rows F32/BF16, rope, swiglu, sigmoid gate)\n");
+    std::printf("PASS modelb dense ops (dense rows F32/BF16, rope, swiglu, sigmoid gate)\n");
     return 0;
 }

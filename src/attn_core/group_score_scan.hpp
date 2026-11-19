@@ -5,7 +5,7 @@
 // the row's top-byte histogram hist0[r * 256 + key >> 24] that the radix select (select.hpp) starts from.
 // This is group_indexer::score_group, i.e. bit-identical to the host oracle; the WMMA core (index_score_wmma.hpp) is
 // the FAST prefill form. Lifted from GLM's decode family (rg1 / rg2 / rk1 / rk2); GLM binds it with fp32 keys,
-// 32 heads, InsideRelu; HY4 with bf16 keys, 16 heads, InHeadWeight.
+// 32 heads, InsideRelu; or bf16 keys, 16 heads, InHeadWeight.
 //
 // Row view V (an engine adapter, all static):
 //   using Rows;  using Key;  (float: fp32 keys | std::uint16_t: bf16 bits)   static constexpr unsigned kHeads, kDim;

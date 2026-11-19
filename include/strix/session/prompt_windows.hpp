@@ -5,7 +5,7 @@
 // that takes multiples of 8 from 16 rows, an indexer whose groups must close inside one window). The same windows run
 // on every stage of a layer pipeline: a stage window's plan from an aligned start concatenates to the one-rank plan, so
 // the pipeline's bits equal the one-rank prefill at the same rmax.
-// Home: shared (host shared). Bound by: Hy4-flash prompt and pair stage windows.
+// Home: shared (host shared). Bound by: bindings that run the prompt in windows (one node and pipeline stages).
 #include <cstdint>
 #include <stdexcept>
 #include <vector>

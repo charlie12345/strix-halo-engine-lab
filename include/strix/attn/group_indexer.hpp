@@ -4,7 +4,7 @@
 //
 // Stages (every engine binds the shared cores; this header holds the shape, the traits and the scalar arithmetic that
 // both the host oracle and the device policies use, so host and device give the same bits):
-//   (a) token key per slot (model data, e.g. HY4 RMSNorm(Wk x) [128]);
+//   (a) token key per slot (model data, e.g. RMSNorm(Wk x) [128]);
 //   (b) pooling of a COMPLETE group into one key (trait Pooling); a group key is a deterministic function of its
 //       ratio token keys, so it is computed once when the group closes and cached (decode reads G = N / ratio keys);
 //   (c) score_g = sum_h w_h relu(q_h . k_g) (trait ScoreScale: where the softmax-style scale sits);
@@ -42,7 +42,7 @@ namespace strix::attn::group_indexer {
 
 // How a complete group of `ratio` token keys becomes one key.
 enum class Pooling : std::uint8_t {
-    GatedSoftmaxApe,  // HY4: v = Wv k, g = Wg k + ape[slot] (fp32), softmax over slots per channel, RMSNorm, bf16
+    GatedSoftmaxApe,  // v = Wv k, g = Wg k + ape[slot] (fp32), softmax over slots per channel, RMSNorm, bf16
     GatedSoftmax,     // GLM DSA: per-token bf16 key + bf16 gate, + fp32 ape, softmax over slots per channel, no norm
     Mean,             // Qwen QSA: mean of the raw keys, then RMSNorm (qwen_qsa.cu:192-219)
 };
@@ -50,12 +50,12 @@ enum class Pooling : std::uint8_t {
 enum class OwnGroup : std::uint8_t {
     CompleteOnly,  // GLM, QSA: P = (t + 1) / ratio groups (the own group counts once complete); top `budget`; tail =
                    // tokens P * ratio .. t (0 .. ratio-1 tokens)
-    AlwaysOwn,     // HY4: P = t / ratio (the own group is never scored); top `budget - 1`; tail = own group up to t
+    AlwaysOwn,     // P = t / ratio (the own group is never scored); top `budget - 1`; tail = own group up to t
 };
 // Where the 1/sqrt scale of the score sits.
 enum class ScoreScale : std::uint8_t {
     InsideRelu,    // GLM: acc = fma(w_h, relu(dot * c), acc)
-    InHeadWeight,  // HY4: w_h already carries heads^-0.5 * head_dim^-0.5; acc = fma(w_h, relu(dot), acc)
+    InHeadWeight,  // w_h already carries heads^-0.5 * head_dim^-0.5; acc = fma(w_h, relu(dot), acc)
 };
 
 struct Shape {
@@ -80,11 +80,11 @@ STRIX_GI_HD constexpr unsigned pick_count(const Shape& s) {
 }
 // First token of the tail appended after the selected groups (the tail runs to t inclusive).
 STRIX_GI_HD constexpr std::uint32_t tail_begin(const Shape& s, std::uint32_t t) { return visible_groups(s, t) * s.ratio; }
-// Largest token list of one query (HY4: 511 * 4 + 4 = 2048; GLM / QSA: 512 * 4 + 3 = 2051).
+// Largest token list of one query (AlwaysOwn, budget 512, ratio 4: 511 * 4 + 4 = 2048; GLM / QSA: 512 * 4 + 3 = 2051).
 STRIX_GI_HD constexpr unsigned max_tokens(const Shape& s) {
     return s.own == OwnGroup::AlwaysOwn ? s.group_budget * s.ratio : s.group_budget * s.ratio + s.ratio - 1U;
 }
-// Every visible group is selected -> the query attends densely (causal). For HY4 this holds for t < 2048, which is the
+// Every visible group is selected -> the query attends densely (causal). At budget 512, ratio 4 this holds for t < 2048, which is the
 // reference's "kv_len <= 2048 -> dense" switch stated per query.
 STRIX_GI_HD constexpr bool dense(const Shape& s, std::uint32_t t) { return visible_groups(s, t) <= pick_count(s); }
 // Slot whose rotary phase the pooled key of group g carries.
@@ -152,10 +152,10 @@ STRIX_GI_HD inline float score_group(const Shape& s, const float* q, const float
 
 // ------------------------------------------------------------------ host oracle (src/attn/group_indexer_ref.cpp)
 
-// HY4 head-weight scale heads^-0.5 * head_dim^-0.5 as the fp32 the reference multiplies by.
+// InHeadWeight head-weight scale heads^-0.5 * head_dim^-0.5 as the fp32 the reference multiplies by.
 float head_weight_scale(const Shape& s);
 
-// HY4 pooling weights of one layer: wv, wg [head_dim][head_dim] row-major (out, in) like a torch Linear weight, ape
+// GatedSoftmaxApe pooling weights of one layer: wv, wg [head_dim][head_dim] row-major (out, in) like a torch Linear weight, ape
 // [ratio][head_dim], norm [head_dim]; all fp32.
 struct GatedApeWeights {
     const float* wv;

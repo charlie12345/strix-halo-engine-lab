@@ -180,6 +180,24 @@ void tests(std::mt19937& rng) {
                     ma::enqueue_index_proj_decode({x, w.packed, iq, ik, rows}, ring, nullptr, rpw);
                     same(rows, ("decode ring " + std::to_string(ring) + " rows/wave " + std::to_string(rpw)).c_str());
                 }
+        if (rows <= 8)  // short-context form (first_out = kProjQ): ik bit for bit, iq never written
+            for (int form = 0; form < 5; ++form) {
+                ma::IndexProjView kv{x, w.packed, iq, ik, rows};
+                kv.first_out = ma::kProjQ;
+                if (form == 4) ma::enqueue_index_proj(kv, nullptr);  // the decode route
+                else ma::enqueue_index_proj_decode(kv, form < 2 ? 16U : 32U, nullptr, (form & 1) != 0 ? 2U : 0U);
+                hip_ok(hipDeviceSynchronize(), "sync");
+                const auto c = host(ik, std::size_t(rows) * ma::kProjK), d = host(rk, std::size_t(rows) * ma::kProjK);
+                const auto q = host(iq, std::size_t(maxT) * ma::kProjQ);
+                bool untouched = true;
+                for (const float v : q) untouched = untouched && std::bit_cast<std::uint32_t>(v) == 0xFFFFFFFFU;
+                if (std::memcmp(c.data(), d.data(), c.size() * 4) != 0 || !untouched) {
+                    ++g_fail;
+                    std::fprintf(stderr, "FAIL: key-only form %d rows %u (ik %s, iq %s)\n", form, rows,
+                                 std::memcmp(c.data(), d.data(), c.size() * 4) == 0 ? "equal" : "DIFFERS", untouched ? "untouched" : "WRITTEN");
+                }
+                hip_ok(hipMemset(ik, 0xFF, std::size_t(maxT) * ma::kProjK * 4), "memset");
+            }
         if (rows >= 8) {
             ma::enqueue_index_proj_tiled({x, w.packed, iq, ik, rows}, nullptr);
             same(rows, "tiled");

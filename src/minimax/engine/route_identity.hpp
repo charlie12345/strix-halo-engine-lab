@@ -131,11 +131,6 @@ template <class Row> StepLayout step_layout(std::span<const Row> rows) {
     const auto n = static_cast<std::uint32_t>(rows.size());
     return {distinct ? n : one_slot ? 1U : 0U, distinct ? 1U : one_slot ? n : 0U};
 }
-template <class Row> bool step_dense(std::span<const Row> rows, std::uint64_t boundary) {
-    bool dense = true;
-    for (const auto& row : rows) dense &= row.pos < boundary;
-    return dense;
-}
 inline int kv_tile_config(std::size_t rows, int mode) { return mode == -2 ? (rows >= 2048 ? 1 : 7) : mode; }
 inline std::size_t unit_rows(std::size_t members, std::uint32_t max_rows, std::size_t remaining) {
     return std::min<std::size_t>(members * max_rows, remaining);

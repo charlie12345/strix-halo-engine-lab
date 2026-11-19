@@ -33,23 +33,25 @@ template<> struct F16xKQuantDown<12U> {
     }
 };
 // Q6_K (210-B blocks: ql 128, qh 64, int8 scales 16, d at 208) is 2-B aligned: words are read dword-aligned and realigned
-// with alignbit (the Q8_0 down discipline). Half h of step s, n = (s%4)/2, j = 2(s%2)+h: ql bytes 64n+32h (nibble 4(s%2)),
+// with alignbit (the Q8_0 down discipline); d is one 16-bit load inside the block. Offsets and the in-block rule:
+// moe_core/kquant_block_reads.hpp (host-tested). Half h of step s, n = (s%4)/2, j = 2(s%2)+h: ql bytes 64n+32h (nibble 4(s%2)),
 // qh bytes 128+32n (bits 2j), scales 8n+2j (l < 16) and 8n+2j+1; code byte (q << 2) ^ 0x80 = 4(q-32) as int8, times d*sc/4.
 template<> struct F16xKQuantDown<14U> {
     static constexpr unsigned block_bytes=210U;
     struct Raw { Dword4 l0,l1; unsigned l2; Dword4 h0,h1; unsigned h2,sc,d,odd; };
     __device__ __forceinline__ static Raw load(const unsigned char* row,unsigned step,unsigned half) {
         const unsigned char* blk=row+(step/4U)*block_bytes;
-        const unsigned odd=static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(blk))&2U,n=step%4U/2U,j=2U*(step%2U)+half;
+        namespace q6=::strix::moe_core::q6k_reads;
+        const unsigned odd=static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(blk))&2U;
         const unsigned char* base=blk-odd;  // dword-aligned (blocks start on even bytes)
-        const auto* ql=reinterpret_cast<const unsigned*>(base+64U*n+32U*half);
-        const auto* qh=reinterpret_cast<const unsigned*>(base+128U+32U*n);
-        const unsigned sc_at=odd+192U+8U*n+2U*j;  // from base; the two scale bytes never straddle a dword
+        const auto* ql=reinterpret_cast<const unsigned*>(base+q6::ql_from_base(step,half));
+        const auto* qh=reinterpret_cast<const unsigned*>(base+q6::qh_from_base(step));
+        const unsigned sc_at=q6::sc_at(odd,step,half);  // from base; the two scale bytes never straddle a dword
         Raw r;
         r.l0=reinterpret_cast<const Dword4*>(ql)[0];r.l1=reinterpret_cast<const Dword4*>(ql)[1];r.l2=ql[8];
         r.h0=reinterpret_cast<const Dword4*>(qh)[0];r.h1=reinterpret_cast<const Dword4*>(qh)[1];r.h2=qh[8];
-        r.sc=*reinterpret_cast<const unsigned*>(base+(sc_at&~3U))>>(8U*(sc_at&3U));
-        r.d=*reinterpret_cast<const unsigned*>(base+208U);
+        r.sc=*reinterpret_cast<const unsigned*>(base+q6::sc_word_from_base(odd,step,half))>>(8U*(sc_at&3U));
+        r.d=*reinterpret_cast<const unsigned short*>(blk+q6::d_from_block);  // in-block: the last block needs no slack
         r.odd=odd;
         return r;
     }
@@ -58,7 +60,7 @@ template<> struct F16xKQuantDown<14U> {
         const unsigned j=2U*(step%2U)+half,sh=8U*r.odd,nib=4U*(step%2U);
         const unsigned l[9]{r.l0.x,r.l0.y,r.l0.z,r.l0.w,r.l1.x,r.l1.y,r.l1.z,r.l1.w,r.l2};
         const unsigned h[9]{r.h0.x,r.h0.y,r.h0.z,r.h0.w,r.h1.x,r.h1.y,r.h1.z,r.h1.w,r.h2};
-        const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(r.d>>sh)));
+        const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(r.d)));
         const float a0=d*static_cast<float>(static_cast<signed char>(r.sc&255U))*0.25F;
         const float a1=d*static_cast<float>(static_cast<signed char>((r.sc>>8U)&255U))*0.25F;
         uint2 v[8];

@@ -7,6 +7,7 @@
 #include "moe_core/grouped_policy.hpp"
 #include "moe_core/device_plan.hpp"
 #include "moe_core/route_prune.hpp"
+#include "moe_core/kquant_block_reads.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"

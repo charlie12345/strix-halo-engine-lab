@@ -1675,7 +1675,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         nv.push("moe_route");
         hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), moe_rows, logits, stream);
         hc::route_select(logits, moe_rows, kTopK, true, tables, routes, route_w, stream);
-        strix::cuda::core::route_tap(l, moe_rows, kTopK, routes, route_w, stream);  // inactive: one cached test
+        strix::cuda::core::route_tap(l, moe_rows, kTopK, kExperts, routes, route_w, stream);  // inactive: one cached test
         nv.pop();
         if (trace_file) ck(cudaMemcpyAsync(trace_host + std::uint64_t{l} * rows * kTopK, routes, std::uint64_t{rows} * kTopK * 4,
                                            cudaMemcpyDeviceToHost, stream), "expert trace");

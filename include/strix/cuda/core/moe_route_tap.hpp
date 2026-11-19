@@ -37,7 +37,8 @@ struct CudaRouteCopier {
 };
 
 // ids / weights: device, contiguous [rows][top_k]. layer: the model layer of this router call.
-inline void route_tap(std::uint32_t layer, std::uint32_t rows, std::uint32_t top_k, std::uint32_t* ids, float* weights,
+inline void route_tap(std::uint32_t layer, std::uint32_t rows, std::uint32_t top_k, std::uint32_t experts,
+                      std::uint32_t* ids, float* weights,
                       cudaStream_t stream) {
     if (!route_tap_active()) return;
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
@@ -45,7 +46,7 @@ inline void route_tap(std::uint32_t layer, std::uint32_t rows, std::uint32_t top
     if (capture != cudaStreamCaptureStatusNone)
         throw std::runtime_error("MoE route tap needs eager execution: the router stream is being captured into a graph");
     CudaRouteCopier copier{stream};
-    (void)strix::moe::route_tap_exchange(strix::moe::RouteTap::instance(), copier, layer, rows, top_k, ids, weights);
+    (void)strix::moe::route_tap_exchange(strix::moe::RouteTap::instance(), copier, layer, rows, top_k, experts, ids, weights);
 }
 
 }  // namespace strix::cuda::core

@@ -80,6 +80,9 @@ struct Config {
     // before the chunk returns but later, as the identical single call on the engine stream (see mtp_deferred()), so
     // the first verify window does not wait for draft-only work. Same bits in every row; off = computed in the chunk.
     bool defer_prompt_mtp = false;
+    // Tensor-core GSQ experts (gsq_bf16_mma) in steps of <= 16 rows run the decode tile form (bitwise the tile form);
+    // false = the tile form at every row count (lever row expert_decode_tile).
+    bool expert_decode_tile = true;
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
@@ -100,6 +103,7 @@ struct Config {
         bool mtp_mma = false;  // MTP fused projection on FP16 tensor cores, FP32 accumulation
         bool qsa_mma = false;  // QSA prefill attention (scores and output) on FP16 tensor cores, FP32 accumulation
         bool moe_mma = false;  // routed-MoE prefill project/down: int8 IMMA block dots, ONE FP32 FMA chain per output (not the HIP four)
+        bool ple_a8 = false;   // PLE key/value projections on the shared dense A8 projection (qwen_dense, int8 tensor cores)
     } forms;
     qwen_packs::ExpertArithmetic expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
 };

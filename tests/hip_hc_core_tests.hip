@@ -18,6 +18,7 @@
 #include <cstring>
 #include <exception>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -117,6 +118,15 @@ void run_case(const char* name, const hc::Spec& ref_spec, unsigned rows, unsigne
     if constexpr (S.post_rows() != 0U) {
         const hcc::SubSum terms{d_sub.p, rank_sum ? d_low.p : nullptr, rank_sum ? d_high.p : nullptr};
         strix::hip_check(hcc::enqueue_expand<S>(terms, d_res.p, d_mix.p, rows, hidden, d_expand.p, s), "expand");
+        if (rank_sum) {
+            Dev<float> canonical(stream.size());
+            const hcc::CanonicalSubSum required{d_sub.p, d_low.p, d_high.p};
+            strix::hip_check(hcc::enqueue_expand<S>(required, d_res.p, d_mix.p, rows, hidden, canonical.p, s), "canonical expand");
+            const auto expected = d_expand.get(stream.size());
+            const auto actual = canonical.get(stream.size());
+            if (std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)) != 0)
+                throw std::runtime_error("canonical expand differs from optional rank sum");
+        }
     }
     strix::hip_check(hipDeviceSynchronize(), "sync");
     const auto mixes = d_mix.get(rows);

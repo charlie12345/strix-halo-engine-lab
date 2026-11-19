@@ -60,16 +60,21 @@ template <Spec S> struct MixRow<S, true, true> {
 
 // The sublayer input an expansion reads: p[i], or, with rank partials, the canonical rank sum (p[i] + low[i]) + high[i]
 // read in place (FP32 adds only; low and high both set or both null).
-struct SubSum {
+// A site dispatched with both terms always present can share the reduction without testing low on each load.
+template <bool TermsPresent> struct SubSumView {
     const float* __restrict__ p;
     const float* __restrict__ low;
     const float* __restrict__ high;
     __device__ __forceinline__ float operator[](std::size_t i) const {
         const float s = p[i];
+        if constexpr (TermsPresent) return (s + low[i]) + high[i];
         return low ? (s + low[i]) + high[i] : s;
     }
     __device__ __forceinline__ explicit operator bool() const { return p != nullptr; }
 };
+
+using SubSum = SubSumView<false>;
+using CanonicalSubSum = SubSumView<true>;
 
 __device__ __forceinline__ float butterfly(float v) {
     for (int d = 16; d; d >>= 1) v = v + __shfl_xor(v, d, wave);

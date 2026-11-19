@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "strix/qwen35/hip_engine.hpp"
+#include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/qwen35/hip_spec_defaults.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "../src/core/dense_linear.hpp"
@@ -60,6 +61,7 @@ std::vector<int> parse_ids(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::decode, argc, argv);  // --profile exact|fast
     using namespace strix::qwen35;
     std::string model, dump, ids_arg = "1";
     HipDenseSpecArgs spec_args;  // the family's shared speculation flags (hip_dense_spec_costs.hpp)
@@ -225,12 +227,12 @@ int main(int argc, char** argv) try {
         sp::BlockDrafter drafter(bc, chain.get());
         hip_dense_seed_verify(drafter, bc.max_block, bc.fixed_costs, costs);
         std::printf("spec config: costs %s (%s), verify ms r1 %.1f r2 %.1f r3 %.1f r4 %.1f r8 %.1f r16 %.1f (iu4 scalar_x %d), "
-                    "draft flush %.2f step %.2f ms (head %.1f %%), chain cap %u, max block %u, sources copy%s%s\n",
+                    "draft flush %.2f step %.2f ms (head %.1f %%), chain cap %u, max block %u, sources copy%s%s, context cost %s\n",
                     hip_dense_cost_mode_name(plan.costs), costs.source == HipDenseCostSource::calibrated ? "calibrated" : "table",
                     hip_dense_verify_ms(costs, 1), hip_dense_verify_ms(costs, 2), hip_dense_verify_ms(costs, 3),
                     hip_dense_verify_ms(costs, 4), hip_dense_verify_ms(costs, 8), hip_dense_verify_ms(costs, 16), int(scalar_x),
                     bc.chain_seed_flush_ms, bc.chain_seed_step_ms, 100.0 * head_fraction, bc.chain_max_k, bc.max_block,
-                    bc.chain ? ",chain" : "", bc.hybrid ? ",hybrid" : "");
+                    bc.chain ? ",chain" : "", bc.hybrid ? ",hybrid" : "", sp::context_cost_name(drafter.arbiter().config()).c_str());
         drafter.commit(uprompt);
         drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
         std::uint64_t k_hist[HipEngine::max_rows()] = {};  // drafts verified per step

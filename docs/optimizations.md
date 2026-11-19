@@ -305,6 +305,18 @@ Keep registered model pages off the reclaim LRU so host memory pressure cannot e
 - **Measured gain:** One Strix Halo node, HTTP server: cold starts locked 42/42 vs unlocked 5 hangs in 41 (GPU queues evicted, never restored); 8 x 8500-token clients 106.1 vs 106.8 s (1.55 vs 1.5 tok/s, ABBA); 16 clients complete (320/320 tokens, 187-199 s) where the unlocked server stalled during on-demand slot growth in both legs. Automatic slots reflect the real headroom (29 -> 8 on the measured node).
 - **Implementation / evidence:** [Residency](operations/model-weight-residency.md#registered-page-lock)
 
+### Registration prefault
+
+**Engine:** every HIP engine that registers a mapped model file (`qwen` GGUF, dense packs, MTP sidecar). **Control:** `STRIX_MODEL_PREFAULT`. **Default:** ON.
+
+Before the registered ranges of a mapped model are pinned, the same ranges are read into the page cache from up to 16 threads (64 MiB chunks). Without it the driver faults every page in from the registering thread, which on a cold page cache reads the file through one thread.
+
+- **Preconditions:** Linux, `--residency register` (registered file mapping).
+- **Exactness evidence:** Page residency only: the populate reads the file and writes nothing. Same registered bytes and tensor storages; Qwen MoE greedy ids equal ON vs OFF (64-token prompt, 32 tokens, cold cache).
+- **Off switch:** STRIX_MODEL_PREFAULT=0
+- **Measured gain:** One Strix Halo node, Qwen MoE UD-Q4_K_XL GGUF (82.5 GB registered), same binary ON vs OFF: cold page cache, load-only 21.9 vs 36.6 s; engine registration done at 21.4 vs 35.9 s, first token 84.9 vs 98.5 s; warm page cache 1.37 / 1.38 vs 1.99 / 2.00 s (ABAB). Peak RSS and bytes read unchanged.
+- **Implementation / evidence:** `src/hip_model_residency.cpp` (`create_impl`), `MappedModelFile::prefault_parallel`
+
 ### Serving PLE table re-warm
 
 **Engine:** `qwen`. **Control:** `STRIX_PLE_REWARM`. **Default:** ON (bounded).
@@ -706,6 +718,20 @@ The tiled MTP prompt primes the predictor cache for each finished block in batch
 - **Exactness evidence (original eight-row route only):** Same binary, 262,144-token prompt: end-of-prompt state digest (target state, predictor KV/index rows, held row), terminal FP32 logits digest, generation lineage digest, generated tokens and MTP acceptance counters equal with the switch on and off. Rows are published in order, so a failing row stops the later ones as before.
 - **Off switch:** STRIX_MTP_PRIME_ROWS=0 (restart the process)
 - **Measured gain (original eight-row route only; no wider-batch timing claim):** MTP-route prompt at 262,144 tokens (YaRN f2, T8192, one node): 210.9–213.2 → 202.8–203.8 s, −8.1 to −10.0 s in three pairs; decode unchanged.
+
+<a id="spec-context-cost"></a>
+
+### Context-aware verify pricing (speculative drafting)
+
+**Engine:** every engine whose drafting uses the shared Arbiter with a fixed or calibrated cost model: CUDA Qwen dense spec arms ending in `d`, HIP Qwen dense (`--spec-costs calibrated|table`). **Control:** `--cost-kv online|off|KV` (one parser, `spec::set_context_cost`); HIP Qwen dense also `auto`. **Default:** `online` (CUDA); HIP Qwen dense `auto` (`hip_dense_cost_kv`): `online` for the table fallback (measured +10.4 % at 32K code), `off` for calibrated seeds, which are the walls at the prompt's own context (measured 0.0 % at 8K code, 32K code / think, short code / think).
+
+Every verify row re-reads the K/V of the whole context, so a row's cost grows with the context while the seeded cost model was tabled at one context: at long context the Arbiter drafted too deep. `online` fits `V(r, L) = seed(r) + c + beta (r - 1) + kappa r L / 1024` from the engine's own verify walls (rows, context, wall of every pass; decayed ridge least squares, residuals clipped against the prediction, per-row slope kept non-negative), so the price follows this device, this kernel (a shared K/V row walk lowers `kappa` by itself) and the live context. Only the number of drafted rows changes; emitted tokens are the target's greedy tokens in every mode.
+
+- **Preconditions:** fixed or calibrated cost model (`BlockConfig::fixed_costs`). Learned costs (DS4.1 copy drafting, Gemma 4 lookup, HIP `--spec-costs learned`) already price each window from its walls at its context bin: the fit is not applied there. GLM and MiniMax use their own window controller.
+- **Automatic selection:** the context term prices a decision only where the walls identify it. At one context the walls give the per-row slope over the seeds, `beta + kappa L`; only the distance between the live context and the context the seed table stands for (its context bin; bin 0, below 2,048 positions, for a table seeded at every context) separates the K/V part from a seed-shape error, row-tile step or clock drift. The term is used while that identification's condition `(L - lo) / (L - hi)` is at most 1.5 (`ArbiterConfig::cost_fit_condition`), at the live context and at the fit's mean context: from 6,144 positions for a context-blind table. Below that the price is the seed table bit for bit, so a short context decides exactly as `off` (host replay of the short receipts: every decision identical). Regime rule: at 4-5K (condition about 1.8) the fitted `kappa` is bounded only within a factor 1.8 and the term lost on one content (code -0.75 %, one run per arm), so the limit holds the `off` plan on that whole regime and keeps the measured winning regimes (6.6K, 28K) open. An isolated stall (a wall off the prediction by more than half of it; the very first pass: by more than the prediction) is not folded into the fit, from the first folded pass on; a second one in a row is (clipped).
+- **Inspection:** the cost line / `spec config` line prints `context cost online|off|fixed KV`; `strix-spec-stats` ends with `"cost_fit":{"mode":..,"c":..,"beta":..,"kappa":..,"weight":..,"kv":"open"|"closed","ctx":..,"skipped":..}`.
+- **Off switch:** `--cost-kv off` (context-blind seeds, decisions a pure function of seeds and acceptance); `--cost-kv KV` = fixed `KV` ms per row per 1,024 positions under the same identification test (deterministic A/B).
+- **Measured gain:** RTX PRO 6000 at a 600 W cap, CUDA Qwen 27B dense NVFP4, greedy, `online` vs `off`, separate loads, token ids identical in both arms: 28K code 121.4 -> 138.5 tok/s (+14.1 %), reasoning 130.8 -> 148.6 (+13.6 %), prose 101.3 -> 110.4 (+9.0 %) (400 tokens, one run per arm); 8K code 198.8 -> 203.9 (+2.6 %) (300 tokens, one run per arm); short context, four contents x 1,200 tokens, two runs per arm: decisions identical step by step, 335.8 -> 335.9, 263.5 -> 263.4, 167.9 -> 168.4, 140.5 -> 140.9 tok/s (mean +0.13 %, run-to-run 0.15-0.71 %). These runs used the previous decode attention kernels and predate the stall test. On the row-shared decode attention walk (final form, one run per arm, ids identical between the arms): 28K code x 400 177.2 -> 187.9 tok/s (+6.0 %, k 7.43 -> 5.40); 6.6K code x 300 230.6 -> 236.3 (+2.5 %, ids equal to the serial reference); 4-5K x 1,200 (prompts below 4,096, the term opened mid-run under the earlier limit 2): reasoning 177.0 -> 178.5 (+0.8 %), code 347.3 -> 344.7 (-0.75 %), prose 236.5 -> 246.9 (+4.4 %); with the limit 1.5 these runs stay below 6,144 positions and decide exactly as `off`. The walk lowers the per-row K/V cost the term corrects (fitted `kappa` 0.026 vs 0.060-0.070 ms per row per 1K positions), so its 28K gain is smaller than on the previous kernels. On CUDA the switch acts on the spec arms ending in `d` only (the app's default arm `new` uses learned costs). HIP Qwen dense: no change at 8K / 32K with calibrated seeds: default `auto` (`off` for calibrated seeds, `online` for the table fallback, +10.4 % at 32K code, one run per arm).
 
 <a id="qwen-qsa-attend-batch"></a>
 
@@ -1115,6 +1141,39 @@ the decode app keeps 16-row windows unless `--wide-exact N`, the pair app keeps 
   the lower clock); plain decode 128 tokens 71.47 vs 70.26 ms/token (one pair per ticket).
 - **Implementation / evidence:** [engine](../src/qwen35/hip/engine.hip), [IU4 dense core](../src/core/dense_linear_iu4.hpp),
   [row-block grid](../src/core/dense_iu4_rows.hpp), [options](../include/strix/qwen35/hip_engine.hpp)
+
+<a id="qwen27-hip-decode-attn-row-share"></a>
+
+### Qwen 27B HIP: decode attention walks the K/V cache once per kv head for several rows
+
+**Engine:** `qwen` (27B dense, HIP). **Control:** `STRIX_DECODE_ATTN_ROW_SHARE` (default 1). **Home:** shared
+(`src/attn_core/dense_decode.hpp` kernels, `include/strix/attn_row_share.hpp` plan and measured tables).
+
+- One block walks the K/V prefix of a kv head once for P (row, q head) pairs and applies U positions per step; per pair
+  the arithmetic is main's, in main's order. A measured table picks (P, U) by walk length band and row count.
+- The table is keyed by device (architecture without feature suffix, the multiprocessor count the runtime reports) and
+  head shape (group, kv heads, head dim). Only gfx1151 with 20 multiprocessors (40 CUs), group 6 x 4 kv heads, Dim 256
+  has a table today; any other device or shape, rows past 16, and the off switch run the main schedule.
+- `--baseline` does not turn it off, and the Qwen HIP apps have no `--print-effective-config`; the switch is recorded
+  in the environment registry at its first read, like `STRIX_DECODE_FUSE`.
+
+- **Preconditions:** Qwen 27B dense on the HIP engine (24 q / 4 kv heads, Dim 256) on a device with a table.
+- **Fallback:** the main schedule (main's kernel, same instructions), silently: the plan is a pure schedule choice.
+- **Exactness evidence:** EXACT, bitwise. The per-position update is one copy with no contraction under
+  `#pragma clang fp contract(off)`, so the engine flag (`-ffp-contract=off`) and the HIP default compile every form to
+  the same instructions, and main's kernel to main's instructions. Device test against main's kernel as the engine
+  builds it, compiled with both flag sets: 111 cases (rows 1-17, 64; lengths 1 to 131072; two more head shapes;
+  ungated) x 6 forms, every one bitwise, one output digest for both builds. Qwen 27B IU4: decode ids identical with the
+  switch on, off and on main, plain and speculative, 8K and 32K contexts (3 pairs each).
+- **Off switch:** STRIX_DECODE_ATTN_ROW_SHARE=0.
+- **Measured gain:** One Strix Halo node, Qwen 27B IU4, EXACT decode, synthetic-filled contexts, one model load per
+  arm, 3 pairs (on / off ms per token): 8K plain 76.3 / 78.2; 8K speculative code 32.4 / 34.1, think 26.75 / 27.37;
+  32K plain 93.6 / 101.7; 32K speculative code 56.0 / 62.2, think 40.35 / 49.3 (the controller takes larger verify
+  windows when they are cheaper: E 3.00 -> 3.50 code, 4.20 -> 4.85 think). Kernel-only (cache flushed), 16-row
+  window at 32K: 21.7 -> 7.6 ms per layer.
+- **Implementation / evidence:** [kernels](../src/attn_core/dense_decode.hpp),
+  [plan and tables](../include/strix/attn_row_share.hpp), [device test](../tests/hip_dense_decode_rows_tests.hip),
+  [source-form test](../tests/dense_decode_exact_form_tests.py)
 
 <a id="qwen-decode-fuse"></a>
 
@@ -2211,6 +2270,49 @@ Every RTX item uses the replica's exact0/pressure/exact8/wforce0/spec0/exact0 an
 at least 64 compared steps, matched == compared, gate pass, canonical position/state digest equal, complete chat
 vectors equal; pressure must exercise bank/resurrection/mid-step collection. Pruning/controller/vocabulary can
 change acceptance, not committed target-greedy tokens. Compare within one load where supported (load spread ~10%).
+
+<a id="qwen27-cuda-decode-attn-row-share"></a>
+
+### Qwen 27B CUDA: decode attention walks the K/V cache once per kv head for several rows
+
+**Engine:** `qwen` (27B dense, CUDA: `strix-cuda-qwen35-spec`, `strix-cuda-qwen35-decode`). **Control:**
+`STRIX_DECODE_ATTN_ROW_SHARE` (default 1, the same switch as the HIP form). **Home:** shared (CUDA backend core
+`src/cuda_core/attention/attention.cu`, walk tables `include/strix/cuda_core/attention_row_walk.hpp`, plan
+`include/strix/attn_row_share.hpp`, the same plan and device-table registry as the HIP side).
+
+- Verify and draft rows of one kv head are grouped in walks; a walk loads each K (scores) and V (values) position once
+  for all its (row, q head) pairs. Per pair the operations and their order are the one-row form's (rounded multiply
+  then add per lane, the same butterfly and block-sum trees, the same running maxima), so scratch and output bits do
+  not depend on the walk.
+- The q heads of a kv head run as independent chains in one basic block; values keep the walk's weights transposed
+  (one 128-bit broadcast per four pairs). Shared walks run as a persistent item loop on two resident waves, so no
+  block is launched without work.
+- The walk length per active chunk count comes from the shared plan with the launch's occupancy floor, capped by the
+  device's measured table in the shared registry (`dense_decode_tables`, beside the HIP tables); one row, a short
+  prefix or the off switch run the one-row grid (one row per block, chunk fastest).
+- Devices: the automatic walk runs on measured (device, head shape) keys only: `sm_120` with 188 SMs (RTX PRO 6000
+  Blackwell), 24 q / 4 kv heads, Dim 256. Any other CUDA device or head shape keeps the one-row grid, as the HIP side
+  keeps its main schedule; a new device is enabled by adding its measured table. Every mode gives the same bits.
+- The kernel bodies (independent head chains, transposed weights, value batch 16, two blocks per SM) replace the
+  previous ones in every mode, rows 1 included; the switch selects the walk, not the previous kernels.
+
+- **Preconditions:** CUDA decode attention through `cuda_core::attention_decode` (Qwen 27B dense verify, draft and
+  plain steps) with more than one row.
+- **Fallback:** the one-row grid, silently: the walk is a pure schedule choice.
+- **Exactness evidence:** EXACT, bitwise. Device test against the frozen one-row kernels: 19 long cases (rows 1 / 2 /
+  3 / 4 / 5 / 7 / 12 / 13 / 16 at about 1K, 33K and 131K positions) x modes off / automatic / all, plus short
+  schedule cases at group widths 4 / 6 / 8: scratch (scores, chunk maxima, denominators, partials) and output equal.
+  Host test: every (chunk, kv head, walk) item exactly once for any persistent grid size.
+- **Off switch:** STRIX_DECODE_ATTN_ROW_SHARE=0 (one row per block in the current kernels).
+- **Measured gain:** kernel bench (one attention call, 24 q / 4 kv heads, Dim 256, RTX PRO 6000 Blackwell at 600 W;
+  automatic / off ms in the same binary): 1K rows 12 0.045 / 0.124; 32K rows 12 0.528 / 0.699; 131K rows 8 1.61 /
+  2.86, rows 12 2.15 / 4.31, rows 16 3.33 / 5.75; rows 1 equal. Model (Qwen 27B dense NVFP4, spec arm sub15d, one
+  run per arm): short code x 300, automatic 271.99 tok/s, ids equal to the serial reference; 28K code x 400, off
+  173.09 -> automatic 176.96 tok/s (verify 19.78 -> 19.26 ms per step); these two measure the switch only. Against the
+  previous kernels (the bench's frozen copy of them, same binary): every cell with 2-16 rows at 1K / 8K / 32K / 131K
+  takes at most 0.442 of their time (automatic / off at most 0.934). Model against a build of the previous kernels,
+  28K x 400 tokens, one run per arm, token ids equal: code 121.54 -> 176.56 tok/s (verify 28.84 -> 19.30 ms per step),
+  reasoning 130.54 -> 194.64, prose 101.29 -> 135.84.
 
 <a id="rtx-kernels"></a>
 
@@ -4456,7 +4558,7 @@ their checks.
 
 ### FAST WMMA prefill linear cores (glm-pf-wmma-x)
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (`strix-glm5-rank --profile fast` enables; opt-in FAST identity).
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (explicit `STRIX_GLM_PF_WMMA=1` only; unqualified for `--profile fast`, see the quality line; opt-in FAST identity).
 
 The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
 2048+ rows (X3 route) and the MoE gate/up/down of the V11/V14 route. Per (row, output) each stage of four 16-wide
@@ -4465,9 +4567,9 @@ tiles per wave (remainders on 64-row storage); the H128/svh epilogue, plan, tran
 exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits.
 
 - **Preconditions:** dense calls of 2048+ rows (`STRIX_GLM_PF_EXACT_X` auto / 4); MoE calls on V11 or V14 (auto from 128 rows). Other calls stay exact.
-- **Automatic selection:** `strix-glm5-rank --profile fast` sets `STRIX_GLM_PF_WMMA=1` before device work; an explicit environment value wins. `default` exports nothing, `quality` uses default with a notice, and baseline vetoes the profile addition. The bare `--profile` keeps its timing meaning.
+- **Automatic selection:** none today: `--profile fast` does not select it (the FAST prefill set fails the 8K quality gate, KL 0.0587 and 0.492 on two windows, no single member carrying it; it returns to the fast column when fixed). An explicit environment value runs it. `default` exports nothing, `quality` uses default with a notice, and baseline vetoes the profile addition. The bare `--profile` keeps its timing meaning.
 - **Fallback notice:** None; each rank prints `prefill identity glm-pf-wmma-x FAST (... wmma calls dense D moe M)` only when WMMA calls ran, else `prefill identity exact` (`prefill identity prefill-wmma route` under `--prefill wmma`). Two ranks: the switch is part of the startup agreement (a mismatch stops both ranks); modes without that handshake refuse `STRIX_GLM_PF_WMMA=1`.
-- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
+- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K; the later per-window FAST gate of the whole FAST prefill set fails at 8K (above), so the lever is unqualified for the profile. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
 - **Off switch:** STRIX_GLM_PF_WMMA=0 (also overrides `--profile fast`); without a named fast profile, unset keeps it off
 - **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
@@ -4925,6 +5027,24 @@ values outside the band, so byte comparisons of that buffer need `STRIX_IDX_WMMA
 
 ## Qwen RTX PRO standalone
 
+<a id="qwen-rtx-ple-a8"></a>
+
+### PLE projections on the shared dense A8 projection (FAST form `ple_a8`)
+
+**Engine:** `qwen-rtx`. **Control:** `--ple-a8 on|off`, `STRIX_QRTX_PLE_A8` (lever row `ple_a8`, identity `qwen-cuda-ple-a8-v1`). **Default:** off (opt-in under `--profile fast`; not a FAST bundle member until its gate passes).
+
+In a prefill block the PLE key projection (2560 -> 10240) and value projection (2560 -> 2560) read the same gathered rows.
+Under `ple_a8` they are two segments of one shared dense A8 projection (one activation quantize, one int8 tensor-core
+launch, the `dense-a8-v1` projection contract) instead of two FP32 lane-chain launches. Verify and decode windows keep the
+exact projections.
+
+- **Preconditions:** CUDA Qwen MoE prefill blocks under `--profile fast` with `--ple-a8 on` (the row is runnable under `fast` only).
+- **Automatic selection:** none.
+- **Exactness evidence:** FAST class (changes the PLE keys and values). FAST gate: not run yet. The arithmetic contract and the prefix identity name the form when it is on; off, the same launches run as before.
+- **Off switch:** `--ple-a8 off`; `STRIX_QRTX_PLE_A8=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [call site](../src/cuda/models/qwen/qwen_prefill_driver.cu), [lever row](../include/strix/profiles/qwen_cuda.hpp), [no-model bench](../tests/cuda/qwen_ple_a8_bench.cu)
+
 <a id="qwen-rtx-prefix-cache"></a>
 
 ### Prompt prefix cache
@@ -4941,6 +5061,23 @@ the longest cached prefix of its token ids and prefills only the rest.
 - **Off switch:** `--prefix-cache off`; `STRIX_QRTX_PREFIX_CACHE=0`
 - **Measured gain:** No throughput figure published yet. Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
 - **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
+
+<a id="qwen-rtx-expert-decode-tile"></a>
+
+### Tensor-core expert decode tile form
+
+**Engine:** `qwen-rtx`. **Control:** `--expert-decode-tile`, `STRIX_QRTX_EXPERT_DECODE_TILE` (lever row `expert_decode_tile`). **Default:** ON.
+
+A row routes to an expert at most once, so a step of at most 16 rows gives every expert tile at most one m16 block.
+Those launches of the tensor-core GSQ expert kernels bind one accumulator block instead of four. The freed registers
+hold a three-group ring of weight fields in flight, where the tile form keeps a one-group lookahead.
+
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
+- **Automatic selection:** On in every profile (an absent lever row = on); the launch picks the form from the step's row count. A wider tile under the decode form fails closed.
+- **Exactness evidence:** Same MMAs and scale FMAs in the same order for every output (bitwise the tile form). The tile form compiles to the previous instructions for every type except the IQ2_S project kernel (schedule only, same floating-point opcode multiset). Greedy ids equal on prose, edit and json; teacher-forced FAST logits of the decode form identical to the tile form (`--expert-decode-tile off`) on 645 rows of five contents (prose, edit, json, code, an 8K prompt). Contract and bundle id unchanged; `qwen_cuda_profile_host_test` checks the switch, serve == CLI and the unchanged id.
+- **Off switch:** `--expert-decode-tile off`; `STRIX_QRTX_EXPERT_DECODE_TILE=0`
+- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).
+- **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form constants](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp)
 
 <a id="qwen-dense-cuda-profile"></a>
 
@@ -4959,6 +5096,29 @@ One word selects every FAST lever qualified for the run's regime (weights source
 - **Measured gain:** none of its own (selection only): the levers' figures apply, e.g. FAST4 + chunk16 at 8K 13,437-13,714 tok/s; split-K FAST on the spec CLI below.
 - **Implementation / evidence:** [profile table](../include/strix/profiles/qwen_dense_cuda.hpp), [toggles](toggles.md#profiles-exact-vs-fast)
 
+<a id="qwen-dense-cuda-decode-attn8"></a>
+
+### Qwen dense 27B CUDA decode attention on an e4m3 K/V shadow (FAST `decode_attn8`, opt-in)
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--decode-attn8 on|off` on `strix-cuda-qwen35-decode` and `strix-cuda-qwen35-spec`. **Default:** off; `--profile fast` does not turn it on until its quality gate passes. **Class:** FAST (bit-changing, quality-gated).
+
+Decode and verify attention read an e4m3 shadow of the K/V cache instead of the BF16 rows: persistent CTAs over (2,048-key
+chunk, kv head, block of 128 (row, q-head) pairs), each K/V tile read once per kv head per step, S and P*V on e4m3 tensor
+cores (`mma m16n8k32`) with FP32 accumulation and FP32 online softmax, then a per-row combine over the chunks. The shadow
+rows of a step are written from device positions (graph-safe); the BF16 cache stays the source of truth. A trait of the
+shared per-layer entry `attention_decode_kv` (null shadow = the exact BF16 row-shared walk) in the CUDA e4m3 attention family
+(`src/cuda_core/attention/attention_flash8.cu`), no separate family. Slot batches and the MTP block keep the BF16 form.
+
+- **Preconditions:** CUDA Qwen dense 27B, main session; on the spec CLI it also covers the prefill windows.
+- **Automatic selection:** none (no `qualified` regime in `include/strix/profiles/qwen_dense_cuda.hpp`).
+- **Exactness evidence:** identity suffix `-d8`. Inside the FAST class a verify of R rows gives the same bits as R one-row
+  decode steps (absolute chunks, per-row skip / scale / combine; device test). Without the lever the engine calls the exact
+  `attention_decode` as before: the exact attention kernels and the e4m3 prefill kernels are machine-code identical to the
+  code without this trait. Quality gate (8K / 28K / 64K): not run yet.
+- **Off switch:** `--decode-attn8 off` (the default), or `--profile exact`.
+- **Measured gain:** not yet measured.
+- **Implementation / evidence:** [e4m3 attention family](../src/cuda_core/attention/attention_flash8.cu), [entry](../include/strix/cuda_core/attention.hpp), [device test](../tests/cuda_core/cuda_core_test.cu), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
+
 <a id="qwen-dense-cuda-splitk-fast"></a>
 
 ### Qwen dense 27B CUDA NVFP4 GEMV split-K FAST (`nvfp4-splitk-fast-v1`)
@@ -4976,6 +5136,24 @@ A device without a row runs the EXACT targets.
 - **Off switch:** `--split-k exact` (also under `--profile fast`), or `--profile exact`.
 - **Measured gain:** RTX PRO 6000 at 600 W, converted NVFP4 pack, greedy spec decode (sub15d), 1,200 tokens, two strict A/B pairs of 3 runs each: think 262.02 / 261.66 -> 263.83 / 263.90 tok/s (+0.7 / +0.9 %), verify 14.07 / 14.08 -> 13.99 / 13.98 ms per step (-0.5 / -0.7 %); FAST also changes the accepted drafts on think (263 -> 262 steps, E 4.56 -> 4.58), so its tok/s is not a pure per-step figure: per step 17.399 -> 17.346 ms (-0.3 %); code 334.32 / 333.94 -> 335.53 / 336.18 tok/s (+0.4 / +0.7 %, within 3x the run spread), verify 14.94 / 14.94 -> 14.85 / 14.81 ms per step. GPU clocks 2,550-2,750 MHz across the four runs.
 - **Implementation / evidence:** [policy](../include/strix/split_k_policy.hpp), [GEMV](../src/cuda_core/dense/nvfp4.cu), [policy test](../tests/split_k_policy_host_tests.cpp), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
+
+<a id="qwen-dense-cuda-verify-prelaunch"></a>
+
+### Qwen dense 27B CUDA spec: verify pre-launch behind the device-fed MTP draft
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--prelaunch 0|1` on `strix-cuda-qwen35-spec`. **Default:** off (`0`) until its timing receipt.
+
+The verify of a speculative block reads the drafted ids from the device feed slots instead of from the host: the MTP
+chain queues the copy of its ids to the host, the verify graph is launched behind the draft on the same stream (a
+32-thread gather kernel writes the ids into the verify inputs, then the same trunk graph runs), and only then does the
+host wait for the ids. The host no longer stands between the last draft kernel and the first verify kernel.
+
+- **Preconditions:** CUDA Qwen dense spec CLI with the MTP chain drafter (chain-only and hybrid blocks); other drafters and engines decline the pre-launch and run the serial form.
+- **Automatic selection:** none yet; the CLI prints `prelaunch[TAG]: on|off, pre-launched steps N of M`.
+- **Exactness evidence:** Scheduling only: the verify runs the same graph on the same position and id contents in the same stream order; emitted ids equal the serial greedy ids in every block (host tests: same MTP calls and proposals, feed slots resolve to the drafted ids, identical emitted ids and block traces with the controller on and off).
+- **Off switch:** `--prelaunch 0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [contract](../include/strix/spec/block_drafter.hpp), [MTP chain](../include/strix/spec/mtp_chain.hpp), [CUDA binding](../src/qwen35/cuda/engine.cu)
 
 ## Platform (kernel)
 

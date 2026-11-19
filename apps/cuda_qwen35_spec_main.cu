@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "strix/device/cuda_enumerator.hpp"
+#include "strix/cuda_core/attention_row_walk.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/qwen35/cuda_spec.hpp"
@@ -106,6 +107,7 @@ int main(int argc, char** argv) {
         double oracle = -1.0;
         std::uint32_t trace_n = 0, pairs = 1;
         std::string ids_out;
+        std::string spec_trace;  // --spec-trace DIR: round trace per spec run (diagnostic, no effect on ids; scripts/bench/spec)
         // Controller / draft-head arms per spec run, interleaved --pairs times (A B A B ...) on the same loaded engine:
         //   N (number) = the cc_decode form: frontier probe every N passes (0 = before it), flat prior, unpriced probe, full head;
         //   new = the ArbiterConfig defaults (continuation prior, probe charged its cost), full head;
@@ -114,13 +116,18 @@ int main(int argc, char** argv) {
         //   A trailing "d" (newd, subd, new15d, sub15d) = deterministic controller: BlockConfig::fixed_costs with the work
         //   model --cost-model V1,VROW,DA,DB: verify V(r) = V1 + VROW (r - 1) ms, draft DA + DB f ms per position with
         //   f = draft head rows / vocab (1 = full head). Defaults = PRO 6000 receipts of this identity (cc_decode3-STATE.md).
+        //   --cost-kv online|off|KV = the context cost of those arms (spec::set_context_cost, shared with every binder):
+        //   online (default) fits it from this device's verify walls (ArbiterConfig::cost_fit), off = context-blind seeds
+        //   (the previous form), KV = fixed ms per verify row per 1,024 context positions (deterministic A/B).
         double cm_v1 = 13.30, cm_vrow = 0.113, cm_da = 0.370, cm_db = 0.454;
+        std::string cost_kv = "online";
         std::vector<std::string> arms{"new"};
         std::uint32_t draft_core = sp::DraftRowsConfig{}.core_groups, draft_fallback = sp::DraftRowsConfig{}.fallback_groups;
         std::string draft_pack;
         std::unique_ptr<sp::DraftRows> draft_rows;
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
+        bool prelaunch = false;  // verify pre-launch: bits unchanged; default off until its timing receipt (DEFAULT ON WHEN PROVEN)
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -144,14 +151,21 @@ int main(int argc, char** argv) {
             else if (a == "--check") check = next() != "0";
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--pdl") pdl = next() != "0";  // EngineOptions::pdl, as the decode CLI
+            else if (a == "--prelaunch") prelaunch = next() != "0";  // verify pre-launch (BlockSpeculator::set_prelaunch)
             else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
             else if (a == "--split-k") lever_cli.emplace_back("split_k", next());  // exact|fast: overrides the profile
+            else if (a == "--decode-attn8") lever_cli.emplace_back("decode_attn8", next());  // on|off: e4m3 decode/verify attention (FAST, identity -d8)
             else if (a == "--seed-costs") seed_costs = next() != "0";
             else if (a == "--cost-model") {
                 const std::string v = next();
                 if (std::sscanf(v.c_str(), "%lf,%lf,%lf,%lf", &cm_v1, &cm_vrow, &cm_da, &cm_db) != 4 || !(cm_v1 > 0.0) ||
                     !(cm_vrow >= 0.0) || !(cm_da > 0.0) || !(cm_db >= 0.0))
                     throw std::runtime_error("--cost-model V1,VROW,DA,DB (ms; V1 > 0, DA > 0)");
+            }
+            else if (a == "--cost-kv") {
+                cost_kv = next();
+                sp::ArbiterConfig probe;
+                sp::set_context_cost(probe, cost_kv);  // validates now: online|off|KV
             }
             else if (a == "--chain-hidden") chain_hidden = next();
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
@@ -174,6 +188,7 @@ int main(int argc, char** argv) {
             else if (a == "--idle-ms") idle_ms = strix::core::parse_u32(next());
             else if (a == "--pairs") { pairs = strix::core::parse_u32(next()); if (pairs == 0) throw std::runtime_error("--pairs >= 1"); }
             else if (a == "--ids-out") ids_out = next();
+            else if (a == "--spec-trace") spec_trace = next();
             else if (a == "--turbo-weights") {
                 const std::string v = next();
                 if (v != "off" && v != "native" && v != "onfly" && v != "converted") throw std::runtime_error("--turbo-weights expects off|native|onfly|converted");
@@ -193,7 +208,7 @@ int main(int argc, char** argv) {
         if (model.empty() == synth.empty())
             throw std::runtime_error("usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) [--prompt-ids a,b | --prompt-file F | --prompt-len N] "
                                      "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32] "
-                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
+                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR] [--spec-trace DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
         // (label, ids) per prompt; --prompt-file takes a comma list (label = file stem), each prompt runs serial + spec arms.
         std::vector<std::pair<std::string, std::vector<std::uint32_t>>> prompts;
         if (!ids_arg.empty()) prompts.emplace_back(label, parse_ids(ids_arg));
@@ -239,6 +254,11 @@ int main(int argc, char** argv) {
         std::printf("identity: %s\n", E->identity().c_str());
         // the split policy the device really runs (also for --split-k fast without a tier word)
         if (opt.turbo_weights != q::TurboWeights::off) q::print_split_policy(E->options(), stderr);
+        // effective decode attention schedule (same bits in every mode; STRIX_DECODE_ATTN_ROW_SHARE=0 = one row per block)
+        const auto rsm = strix::cuda_core::decode_row_share();
+        std::printf("decode attention row share: %s\n", rsm == strix::cuda_core::DecodeRowShare::off         ? "off"
+                                                         : rsm == strix::cuda_core::DecodeRowShare::automatic ? "automatic"
+                                                                                                               : "all");
         if (prompt.empty()) {
             std::uint64_t s = 99;
             for (std::uint32_t i = 0; i < prompt_len; ++i) prompt.push_back(std::uint32_t(mix(s + i) % cfg.vocab));
@@ -400,12 +420,16 @@ int main(int argc, char** argv) {
                     fixed_draft_ms = cm_da + cm_db * f;
                     bc.fixed_costs = true;
                     bc.chain_seed_flush_ms = bc.chain_seed_step_ms = fixed_draft_ms;
+                    sp::set_context_cost(bc.arbiter, cost_kv);  // seeded model only (fixed_costs -> learn_costs = false)
                 }
                 sp::BlockDrafter drafter(bc, chain);
                 if (arm.fixed) {
                     for (std::uint32_t r = 1; r <= bc.max_block; ++r) drafter.seed_verify_ms(r, cm_v1 + cm_vrow * double(r - 1));
-                    std::printf("costs[%s]: fixed model V(r) = %.3f + %.4f (r-1) ms, draft %.3f ms per position\n", tag.c_str(),
+                    std::printf("costs[%s]: fixed model V(r) = %.3f + %.4f (r-1) ms, draft %.3f ms per position", tag.c_str(),
                                 cm_v1, cm_vrow, fixed_draft_ms);
+                    const auto& ac = drafter.arbiter().config();
+                    if (ac.row_kv_ms_per_kpos > 0.0) std::printf(", + %.4f r ms per 1K context positions", ac.row_kv_ms_per_kpos);
+                    std::printf(", context cost %s\n", sp::context_cost_name(ac).c_str());
                 } else if (seed_costs) {  // engine's measured verify wall per window shape (commit full), 3 reps each
                     std::vector<std::uint32_t> t(32, anchor);
                     for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) {
@@ -424,6 +448,14 @@ int main(int argc, char** argv) {
                 std::vector<std::uint32_t> out{anchor};
                 drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
                 sp::BlockSpeculator spec(drafter, S);
+                std::unique_ptr<sp::RoundTraceWriter> round_trace;
+                if (!spec_trace.empty()) {
+                    std::string file = tag;
+                    std::replace(file.begin(), file.end(), '/', '_');
+                    round_trace = std::make_unique<sp::RoundTraceWriter>(spec_trace + "/" + file + ".srt", label);
+                    spec.set_round_sink(round_trace.get());
+                }
+                spec.set_prelaunch(prelaunch);
                 spec.start(anchor);
                 std::vector<double> tick_ms{0.0};  // wall at each step end (relative), tokens cumulative in cum
                 std::vector<std::uint32_t> cum{1};
@@ -483,6 +515,8 @@ int main(int argc, char** argv) {
                             (unsigned long long)drafter.hybrid_blocks, (unsigned long long)drafter.hybrid_ext_accepted,
                             (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)(S.chain_calls() - calls0),
                             (unsigned long long)(S.chain_rows() - rows0));
+                std::printf("prelaunch[%s]: %s, pre-launched steps %llu of %zu\n", tag.c_str(), prelaunch ? "on" : "off",
+                            (unsigned long long)spec.prelaunched_steps(), per_step.size());
                 const double steps_n = double(std::max<std::size_t>(per_step.size(), 1));
                 std::string hist;
                 for (std::size_t k = 1; k < k_hist.size(); ++k)
@@ -499,6 +533,9 @@ int main(int argc, char** argv) {
                                 std::min(out.size(), ref.size()), bad);
                     if (serial_ms > 0) std::printf("speedup vs serial: %.2fx\n", serial_ms / double(n_gen - 1) / (wall / double(out.size() - 1)));
                 }
+                if (round_trace)
+                    std::printf("spec-trace: content=%s rounds=%zu records=%llu ids_equal=%d\n", tag.c_str(), per_step.size(),
+                                static_cast<unsigned long long>(round_trace->records()), ref.empty() ? -1 : int(bad == 0));
                 bad_total += bad;
             }  // arms x pairs
         }  // prompts

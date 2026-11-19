@@ -45,7 +45,7 @@ want exact || want fast || want compare || { echo "--arms: no step selected" >&2
 mkdir -p "$out"
 # Profile arms must not inherit numerical overrides or profile-export provenance.
 for key in STRIX_QRTX_HC_MMA STRIX_QRTX_MTP_MMA STRIX_QRTX_QSA_MMA STRIX_QRTX_MOE_MMA \
-           STRIX_QRTX_EXPERT_FAST STRIX_QRTX_EXPERT_TURBO STRIX_QRTX_MTP_DEFER_PROMPT STRIX_QRTX_QSA_FUSED \
+           STRIX_QRTX_EXPERT_FAST STRIX_QRTX_EXPERT_TURBO STRIX_QRTX_EXPERT_DECODE_TILE STRIX_QRTX_MTP_DEFER_PROMPT STRIX_QRTX_QSA_FUSED \
            STRIX_QPF2K_MOE_ROUTE_BF16 STRIX_QPF2K_QSA_BUDGET STRIX_QPF2K_GDN_FP16_CHUNK \
            STRIX_QWEN_PROFILE_ALLOW_PENDING ${!STRIX_QWEN_PROFILE_OWNED_@}; do
     unset "$key"
@@ -70,12 +70,12 @@ import json, sys
 with open(sys.argv[1], encoding='utf-8') as f:
     c = json.load(f)
 forms = c['forms']
-names = ['hc_mma', 'mtp_mma', 'qsa_mma', 'moe_mma']
+names = ['hc_mma', 'mtp_mma', 'qsa_mma', 'moe_mma', 'ple_a8']
 if set(forms) != set(names + ['moe_route_bf16']) or any(type(v) is not bool for v in forms.values()):
     raise SystemExit('invalid resolved forms')
 expert = c['expert_arithmetic']  # 'incumbent' or the expert contract (e.g. the FAST bundle's gsq-iq-bf16mma-cuda-v1)
 ids = ['qwen-cuda-hc-f16mma-v2', 'qwen-cuda-mtp-f16mma-v1',
-       'qwen-cuda-qsa-bf16mma-v2', 'qwen-cuda-moe-i8fma-v1']
+       'qwen-cuda-qsa-bf16mma-v2', 'qwen-cuda-moe-i8fma-v1', 'qwen-cuda-ple-a8-v1']
 form_ids = ','.join(i for n, i in zip(names, ids) if forms[n])
 contract = 'qwen-cuda;prefill=exact'
 if any(forms.values()):
@@ -93,7 +93,7 @@ sys.stderr.write(f"arm {sys.argv[2]}: contract {contract} | fast_bundle {bundle}
 executions = c.get('executions')
 if not isinstance(executions, list) or not executions:
     raise SystemExit('missing completed execution receipts')
-targets = ['hc_mma', 'qsa_mma', 'moe_mma', 'moe_route_bf16']
+targets = ['hc_mma', 'qsa_mma', 'moe_mma', 'moe_route_bf16', 'ple_a8']
 for execution in executions:
     active = execution['forms']
     if (set(active) != set(forms) or any(type(v) is not bool for v in active.values())

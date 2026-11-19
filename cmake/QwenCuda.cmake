@@ -102,6 +102,9 @@ target_compile_options(nvfp4_a8_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=f
 add_test(NAME nvfp4_a8 COMMAND nvfp4_a8_test)
 add_executable(nvfp4_a8_bench tests/cuda/nvfp4_a8_bench.cu)
 target_link_libraries(nvfp4_a8_bench PRIVATE strix_qwen_cuda)
+# FAST ple_a8: PLE key/value projections, exact lane chain vs the shared dense A8 site (bound + timing, GPU index 0, no model).
+add_executable(qwen_ple_a8_bench tests/cuda/qwen_ple_a8_bench.cu)
+target_link_libraries(qwen_ple_a8_bench PRIVATE strix_qwen_cuda)
 add_executable(qwen_turbo_resolver_test tests/cuda/qwen_turbo_resolver_test.cu)
 target_link_libraries(qwen_turbo_resolver_test PRIVATE strix_qwen_cuda strix_qwen_prefix)
 add_test(NAME qwen_turbo_resolver COMMAND qwen_turbo_resolver_test)
@@ -183,6 +186,7 @@ add_test(NAME qwen_qsa_fused_order COMMAND qwen_qsa_fused_order_test)
 # Shared row-group attention core: union-list invariant on the host (no GPU) and the device fixture
 # qwen_qsa_rowgroup_test <tables dir> [--no-timing] (FAST qsa_mma v2 vs the exact path, union byte-compare, timing).
 add_executable(rowgroup_union_host_test tests/cuda/rowgroup_union_host_test.cpp)
+target_include_directories(rowgroup_union_host_test PRIVATE include)
 add_test(NAME rowgroup_union_host COMMAND rowgroup_union_host_test)
 add_executable(qwen_qsa_rowgroup_test tests/cuda/qwen_qsa_rowgroup_test.cu)
 target_link_libraries(qwen_qsa_rowgroup_test PRIVATE strix_qwen_cuda)

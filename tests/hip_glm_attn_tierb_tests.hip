@@ -744,7 +744,7 @@ int run_bench(const std::vector<unsigned>& rows_list) {
         for (unsigned i = 0; i < 6; ++i) f[i] = dalloc<float>(static_cast<std::size_t>(T::kMaxRows) * w6[i]);
         for (unsigned rows : rows_list) {
             const T::Knobs ka = selected[2][rows], kb = selected[3][rows];
-            auto arm = [&](bool fa, bool fbz) {
+            auto arm = [&](bool fa, bool fbz, bool short_ctx = false) {  // short_ctx: fused b without wq_b (qI not needed)
                 return tm.run(c.s, fsets, [&](unsigned k) {
                     if (fa) {
                         T::dsa_a(fw[k][0].raw, fw[k][1].raw, x, 4096, rows, f[0], 1536, f[3], 512, c.ws, c.s, ka);
@@ -758,7 +758,7 @@ int run_bench(const std::vector<unsigned>& rows_list) {
                         D::rmsnorm(f[3], nw + 1536, D::WType::BF16, 512, kEps, f[4], rows, c.s);
                     }
                     if (fbz) {
-                        T::dsa_b(fw[k][2].raw, fw[k][3].raw, f[1], 1536, rows, f[2], 8192, f[5], 4096, c.ws, c.s, kb);
+                        T::dsa_b(fw[k][2].raw, fw[k][3].raw, f[1], 1536, rows, f[2], 8192, short_ctx ? nullptr : f[5], 4096, c.ws, c.s, kb);
                     } else {
                         if (fa) c.lib.gemv(fw[k][2], f[1], f[2], rows, c.s);
                         c.lib.gemv(fw[k][3], f[1], f[5], rows, c.s);
@@ -778,6 +778,16 @@ int run_bench(const std::vector<unsigned>& rows_list) {
                         rows, knob_name(ka).c_str(), knob_name(kb).c_str(), median3(a[0], a[1], a[2]), median3(b[0], b[1], b[2]),
                         median3(ha[0], ha[1], ha[2]), median3(hb[0], hb[1], hb[2]), d(b, 0), d(b, 1), d(b, 2), d(ha, 0), d(ha, 1), d(ha, 2),
                         d(hb, 0), d(hb, 1), d(hb, 2));
+            // Short-context front end (fused a + q_b-only b) against B, strict B S B S B S B (S = no wq_b member).
+            double bs[4], sq[3];
+            for (unsigned rep = 0; rep < 3; ++rep) {
+                bs[rep] = arm(true, true);
+                sq[rep] = arm(true, true, true);
+            }
+            bs[3] = arm(true, true);
+            std::printf("SHORT dsa R=%u: B=%.2f S(no wq_b)=%.2f us, d(S)=%+.2f/%+.2f/%+.2f us per DSA layer; x11 layers = %.3f ms per token\n", rows,
+                        median3(bs[0], bs[1], bs[2]), median3(sq[0], sq[1], sq[2]), sq[0] - 0.5 * (bs[0] + bs[1]), sq[1] - 0.5 * (bs[1] + bs[2]),
+                        sq[2] - 0.5 * (bs[2] + bs[3]), 11.0 * (median3(sq[0], sq[1], sq[2]) - median3(bs[0], bs[1], bs[2])) / 1000.0);
             std::fflush(stdout);
         }
         for (auto& ws1 : fw)

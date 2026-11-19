@@ -597,6 +597,58 @@ void bench(std::mt19937& rng, bool slab_only) {
     (void)hipFree(ik);
 }
 
+// STRIX_MMATTN_BENCH=keyonly: the decode route (enqueue_index_proj) with every output (A) vs the index key only
+// (B, first_out = kProjQ: the short-context form), strict ABAB x4 per row count, 60 layers' weights rotated (cold).
+void bench_keyonly(std::mt19937& rng) {
+    const unsigned L = 60;
+    std::vector<Weights> ws;
+    for (unsigned l = 0; l < L; ++l) ws.push_back(make_weights(rng, false));
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> xh(std::size_t(8) * kHidden);
+    for (auto& v : xh) v = n(rng);
+    float* x = dev(xh);
+    float *iq = dev(std::vector<float>(std::size_t(8) * ma::kProjQ)), *ik = dev(std::vector<float>(std::size_t(8) * ma::kProjK));
+    hipStream_t st;
+    hip_ok(hipStreamCreateWithFlags(&st, hipStreamNonBlocking), "stream");
+    hipEvent_t e0, e1;
+    hip_ok(hipEventCreate(&e0), "event");
+    hip_ok(hipEventCreate(&e1), "event");
+    auto run = [&](unsigned rows, bool key_only) {
+        auto one = [&](unsigned l) {
+            ma::IndexProjView v{x, ws[l].packed, iq, ik, rows};
+            v.first_out = key_only ? ma::kProjQ : 0U;
+            ma::enqueue_index_proj(v, st);
+        };
+        one(0);
+        hip_ok(hipEventRecord(e0, st), "rec");
+        for (int r = 0; r < 10; ++r)
+            for (unsigned l = 0; l < L; ++l) one(l);
+        hip_ok(hipEventRecord(e1, st), "rec");
+        hip_ok(hipEventSynchronize(e1), "sync");
+        float ms = 0;
+        hip_ok(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+        return 1000.0 * ms / (10.0 * L);
+    };
+    for (unsigned rows : {1U, 2U, 4U, 8U}) {
+        std::vector<double> ta, tb;
+        std::string runs;
+        for (int round = 0; round < 4; ++round) {
+            const double a = run(rows, false), bb = run(rows, true);
+            ta.push_back(a);
+            tb.push_back(bb);
+            char s[48];
+            std::snprintf(s, sizeof s, " [%.1f %.1f]", a, bb);
+            runs += s;
+        }
+        const double ma_ = median(ta), mb = median(tb);
+        std::printf("KEYONLY rows %u us/layer: all %.1f key-only %.1f (B/A %.3f) saved %.1f us/layer = %.3f ms per 60-layer token  ABAB:%s\n",
+                    rows, ma_, mb, mb / ma_, ma_ - mb, 60.0 * (ma_ - mb) / 1000.0, runs.c_str());
+    }
+    for (void* p : {static_cast<void*>(x), static_cast<void*>(iq), static_cast<void*>(ik)}) (void)hipFree(p);
+    for (auto& w : ws) free_weights(w);
+    (void)hipStreamDestroy(st);
+}
+
 }  // namespace
 
 int main() {
@@ -613,5 +665,7 @@ int main() {
         bench(rng, std::strcmp(b, "slab") == 0);
     else if (b != nullptr && std::strcmp(b, "wmma") == 0)
         bench_wmma(rng);
+    else if (b != nullptr && std::strcmp(b, "keyonly") == 0)
+        bench_keyonly(rng);
     return g_fail == 0 ? 0 : 1;
 }

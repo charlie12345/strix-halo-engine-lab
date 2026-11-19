@@ -565,9 +565,12 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
 
-### Solo depuración (2)
+### Solo depuración (5)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
 | `STRIX_DS41_OB_READY_EPILOGUE` | deepseek | auto | [ds-ready](optimizations.md#ds-ready) |
 | `STRIX_SERVE_BACKEND_PROBE` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
+| `STRIX_MOE_ROUTES_OUT` | qwen-rtx (tap de rutas MoE compartido) | off | Gate FAST: graba los ids y pesos de expertos de cada llamada al router en FILE; [tap de rutas](../include/strix/moe/route_file.hpp) |
+| `STRIX_MOE_ROUTES_IN` | qwen-rtx (tap de rutas MoE compartido) | off | Gate FAST: reproduce los ids y pesos grabados llamada a llamada (capa, filas y top-k deben coincidir); [tap de rutas](../include/strix/moe/route_file.hpp) |
+| `STRIX_MOE_ROUTE_NULL` | qwen-rtx (tap de rutas MoE compartido) | off | Control nulo del gate FAST `CAPA[:SEMILLA]`: los pesos seleccionados de la capa se mueven un ulp FP32; [tap de rutas](../include/strix/moe/route_file.hpp) |

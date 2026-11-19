@@ -10,6 +10,9 @@
 #include <stdexcept>
 #include <vector>
 using namespace strix::moe_q4k_a8;
+// Latent MoE geometry at the C1 envelope edge (1536 in and out, top-16 of 512).
+constexpr Geometry kLatent{1536, 1536, 512, 16};
+static_assert(fits_c1(kLatent));
 namespace {
 void expect(bool ok,const char* why) {if(!ok) throw std::runtime_error(why);}
 template<class F> void rejects(F&& f) {bool caught=false;try{f();}catch(const std::invalid_argument&){caught=true;}expect(caught,"expected contract rejection");}
@@ -110,7 +113,7 @@ void kquant_tests() {
         "per-expert bytes match pack-tensors.tsv (990,904,320 / 679,477,248 over 512 experts)");
     // Oracle == exact dot of the shared llama.cpp-bitwise dequantizer and the dequantised A8 codes (only FP32 rounding of
     // the declared order differs): proves the Q6_K element / scale / pair mapping and the reuse of the Q4_K term.
-    constexpr std::uint32_t width=hy4_geometry.intermediate;
+    constexpr std::uint32_t width=kLatent.intermediate;
     for(const std::uint32_t type:{12U,14U}) for(std::uint32_t seed=1;seed<=24;++seed) {
         const auto w=kquant_row(type,width,seed);
         std::vector<float> h(width);
@@ -131,7 +134,7 @@ void kquant_tests() {
     }
     // Geometry presets: Hy4 admitted for the K-quant classes only; Qwen bounds unchanged for the incumbent classes.
     DownRequest request;request.enabled=true;request.weight_type=14;request.approved_numerical_identity=q6k_a8_down_numerical_identity;
-    request.shape={hy4_geometry.hidden,hy4_geometry.intermediate,hy4_geometry.experts,hy4_geometry.top_k};request.swiglu_limit=10.0F;
+    request.shape={kLatent.hidden,kLatent.intermediate,kLatent.experts,kLatent.top_k};request.swiglu_limit=10.0F;
     const auto s=request.shape;
     DownBindings b;std::uintptr_t at=0x100000;
     auto next=[&](std::uint64_t bytes){DeviceBytes v{at,bytes};at+=static_cast<std::uintptr_t>((bytes+255U)&~255ULL);return v;};

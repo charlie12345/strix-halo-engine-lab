@@ -67,8 +67,6 @@ struct Shape {
     OwnGroup own;
     ScoreScale scale;
 };
-// HY4-Flash compressed indexer (config compressed_indexer_*: ratio 4, 16 heads x 128, group_topk 512, pooling gated).
-inline constexpr Shape kHy4{4U, 16U, 128U, 512U, Pooling::GatedSoftmaxApe, OwnGroup::AlwaysOwn, ScoreScale::InHeadWeight};
 // GLM DSA indexer as it runs today (glm_dims.hpp:8, glm_attn_fast.hip:771-781). GLM's decode select binds it through
 // src/attn_core/group_select_kernel.hpp (GlmSelectView); the other GLM stages are descriptive here.
 inline constexpr Shape kGlmDsa{4U, 32U, 128U, 512U, Pooling::GatedSoftmax, OwnGroup::CompleteOnly, ScoreScale::InsideRelu};

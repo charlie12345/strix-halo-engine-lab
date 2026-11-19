@@ -20,9 +20,13 @@ bool Model::in(Layers set, std::uint32_t layer) const noexcept {
     return (layer_class[layer] >> static_cast<std::uint32_t>(set) & 1U) != 0;
 }
 
+// Families with a naming table (src/weight/adapters/<family>.cpp), one accessor each.
+using FamilyAccessor = const FamilyMap& (*)();
+constexpr std::array<FamilyAccessor, 0> kFamilies{};
+
 const FamilyMap* find_family(std::string_view architecture) {
-    for (const auto* family : {&hy4_flash_map()})
-        if (family->architecture == architecture) return family;
+    for (const auto accessor : kFamilies)
+        if (const auto& family = accessor(); family.architecture == architecture) return &family;
     return nullptr;
 }
 

@@ -12,6 +12,9 @@
 #include <cstdlib>
 #include <vector>
 using namespace strix::moe_q4k_a8;
+// Latent MoE geometry at the C1 envelope edge (1536 in and out, top-16 of 512).
+constexpr Geometry kLatent{1536, 1536, 512, 16};
+static_assert(fits_c1(kLatent));
 namespace {
 void expect(bool ok,const char* why){if(!ok) throw std::runtime_error(why);}
 void check(hipError_t e){if(e!=hipSuccess) throw std::runtime_error(hipGetErrorString(e));}
@@ -148,7 +151,7 @@ void finite_case(unsigned type,unsigned hidden,unsigned width,unsigned slots,
 // rawdots bitwise); (2) codes / deltas / sums == the CPU quantizer of the produced h; (3) every rawdot == the CPU oracle
 // (evaluate_down_row, declared order) in FP32 bits. Synthetic weights; no model qualification.
 void kquant_case(unsigned type,unsigned slots,const strix::HipSetupQuiescenceGuard& guard,hipStream_t stream) {
-    constexpr unsigned experts=3,hidden=hy4_geometry.hidden,width=hy4_geometry.intermediate;
+    constexpr unsigned experts=3,hidden=kLatent.hidden,width=kLatent.intermediate;
     constexpr float limit=10.0F;
     const auto row_bytes=static_cast<std::size_t>(down_row_bytes(type,width));
     const std::size_t block_bytes=type==12U?144U:210U;

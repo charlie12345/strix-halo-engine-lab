@@ -5,10 +5,10 @@
 // (include/strix/moe/route_policy.hpp: selection order or ascending id), and an optional base[r][width]. Declared order
 // per element d (k ascending, every bit of every binding):
 //   fma_f32 (GLM-5):      acc = +0; acc = fma(w_k, eo_k[d], acc); y[d] = acc + base[d]            (base required)
-//   bf16_steps (Hy4-flash, PY:199-200 index_add_ in ascending id with bf16 rounding of every add):
+//   bf16_steps (a reference that accumulates experts with a BF16 index-add in ascending id, rounding every add):
 //                         acc = +0; acc = bf(acc + bf(eo_k[d] * w_k)); y[d] = base ? bf(acc + base[d]) : acc
 //                         w == nullptr: unit weights, term = eo_k[d] (no product): with top_k = 1 and BF16-valued eo
-//                         this is the BF16 add y = bf(eo + base) (Hy4: routed_up output + shared expert output).
+//                         this is the BF16 add y = bf(eo + base) (e.g. routed output + shared expert output).
 #include <cmath>
 #include <cstddef>
 #include <cstdint>

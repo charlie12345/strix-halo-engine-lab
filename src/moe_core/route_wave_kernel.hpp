@@ -9,8 +9,8 @@
 // key = route_ordered_key(s + bias); the k-pass selection is moe_core::route_wave_topk (XOR tree on the key bits, ties ->
 // lower id), so the picks equal route_select_ref with RouteKey::ordered_bits. Lane 0 orders the picks (ascending id when
 // the policy says so), sums the scores in output order from +0, adds renorm_eps and writes w = (s / den) * scale.
-// Lifted from GLM-5 (src/glm/kernels/glm_tier_a.hip route_kernel / moe_combine_kernel, moved here unchanged); Hy4-flash
-// binds preset::hy4.
+// Lifted from GLM-5 (src/glm/kernels/glm_tier_a.hip route_kernel / moe_combine_kernel, moved here unchanged); any
+// RoutePolicy with sigmoid scores, ordered keys and ascending-id output binds it.
 #include "moe_core/route.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe/combine.hpp"

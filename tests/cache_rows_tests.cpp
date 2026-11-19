@@ -99,7 +99,11 @@ void slots_and_rings() {
         CHECK(rr >= 512U - 1U + c);
     }
     // indexer token-key ring (not a power of two): slot = position % ring
-    static_assert(strix::attn::group_indexer::token_ring_slots(strix::attn::group_indexer::kHy4, 4U) == 7U);
+    static_assert(strix::attn::group_indexer::token_ring_slots(
+        strix::attn::group_indexer::Shape{4U, 16U, 128U, 512U, strix::attn::group_indexer::Pooling::GatedSoftmaxApe,
+                                          strix::attn::group_indexer::OwnGroup::AlwaysOwn,
+                                          strix::attn::group_indexer::ScoreScale::InHeadWeight},
+        4U) == 7U);
     cr::Rows keys{128U, 7U};
     CHECK(cr::slot(keys, 20U) == 6U && cr::row_offset(keys, 21U) == 0U);
 }

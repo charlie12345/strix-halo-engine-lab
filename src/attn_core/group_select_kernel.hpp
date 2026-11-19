@@ -4,8 +4,8 @@
 // this stage for decode rows; contract: include/strix/attn/group_indexer.hpp (Shape, OwnGroup, visible_groups,
 // pick_count, max_tokens). The selection is attn_core::select::select_row (Segmented schedule: the top byte comes from
 // the score scan's histogram hist0, src/attn_core/group_score_scan.hpp, then 3 byte passes; ties -> lower group index).
-// Lifted from GLM-5 (src/glm/attn/glm_attn_fast.hip idx_select_kernel, moved here unchanged); Hy4-flash binds kHy4
-// (AlwaysOwn: P = t / 4 visible groups, top 511, tail = own group up to t).
+// Lifted from GLM-5 (src/glm/attn/glm_attn_fast.hip idx_select_kernel, moved here unchanged); the AlwaysOwn
+// trait binds it with P = t / ratio visible groups, top budget - 1, tail = own group up to t.
 //
 // View V (compile-time):
 //   using Rows;                                        // the binder's row descriptor, passed by value

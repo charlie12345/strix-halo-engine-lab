@@ -14,7 +14,7 @@
 //   head       output head: divided by vocabulary over tensor-parallel ranks, read whole per token on one rank
 // Blocks at or above `layers` (next-token / draft blocks) are kept apart as `beyond`: not trunk layers, resident where
 // drafting runs.
-// Home: shared (host shared). Bound by: qwen35 pair plan (block_of), hy4 placement (tensor naming map components).
+// Home: shared (host shared). Bound by: qwen35 pair plan (block_of); a family placement reads the tensor naming map components.
 #include <array>
 #include <cmath>
 #include <cstddef>

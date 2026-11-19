@@ -15,11 +15,12 @@ inline constexpr std::uint32_t max_hidden = 2560, max_rows = 640, max_experts = 
 // size LDS by max_hidden (gate/up) or c1_max_rows (K-quant down), so their envelope is the geometry presets below.
 struct Geometry { std::uint32_t hidden, intermediate, experts, top_k; };
 inline constexpr Geometry qwen_geometry{2560, 640, 512, 10};  // Qwen MoE canonical H/I/E/K
-inline constexpr Geometry hy4_geometry{1536, 1536, 512, 16};  // Hy4-flash LatentMoE: latent 1536 in and out, top-16
 inline constexpr std::uint32_t c1_max_rows = 1536, c1_max_top_k = 16;
 static_assert(qwen_geometry.intermediate <= max_rows && qwen_geometry.top_k <= max_top_k);
-static_assert(hy4_geometry.hidden <= max_hidden && hy4_geometry.intermediate <= c1_max_rows &&
-              hy4_geometry.top_k <= c1_max_top_k && hy4_geometry.experts <= max_experts);
+// A geometry fits the C1 envelope when this holds (a model package static-asserts its own geometry with it).
+[[nodiscard]] constexpr bool fits_c1(const Geometry& g) {
+    return g.hidden <= max_hidden && g.intermediate <= c1_max_rows && g.top_k <= c1_max_top_k && g.experts <= max_experts;
+}
 inline constexpr std::string_view numerical_identity =
     "strix-moe-q4k-a8g32-probe-v2:f32-div-rne:g32-sym127-zero1-finite-noflush:"
     "dot-s8xu8-i32:combine-separate-f32:pair-ascending-sb-tree4:writer-c0:wave32:proj-nonfinite=propagate-unqualified";

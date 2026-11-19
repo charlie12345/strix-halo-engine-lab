@@ -14,8 +14,8 @@
 //                                              xor butterfly 16..1; one chunk for elements <= 640)
 //     r   = 1 / declared_sqrt(ss / elements + eps)
 //     out[i][j] = bf(w[head][j] * bf(x_j * r))
-//   This is src/hy4/ref/hy4_host_ref.cpp Impl::engram's row loop (the CPU oracle) statement for statement. Token t's
-//   concatenated heads out[t * heads .. + heads) are the 16 x 96 = 1536-wide projection input of Hy4-flash.
+//   A binding's CPU oracle runs these statements in the same order. Token t's concatenated heads out[t * heads .. + heads)
+//   are the heads * width projection input.
 // Rows are independent; NaN codes propagate.
 #include "strix/ds41_layer.hpp"  // declared arithmetic shared by every engine: chunked_dot_of, declared_sqrt, round_to_bf16
 #include "strix/ds41_scalar_codecs.hpp"

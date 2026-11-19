@@ -14,7 +14,7 @@
 // The arithmetic is the contract's declared order (chunked lane dots of 640, butterflies 16..1, scale after the dot,
 // ascending sums from 0). Callers compile with -ffp-contract=off -fno-fast-math -fhip-fp32-correctly-rounded-divide-sqrt.
 // Bindings: DeepSeek V4.1 (src/hip_ds41_layer.hip: F16 fn, sinkhorn, FP32 store; its fused decode site schedules call the
-// bodies below), Hy-V4 Flash (hc::hy4_flash_spec: F32 fn, identity, bf16 store; tests/hip_hc_core_tests.hip).
+// bodies below), a Spec with F32 fn, identity comb and bf16 store (tests/hip_hc_core_tests.hip).
 // Mix rows are written to a row type M with arrays pre[N] (+ post[N], + comb[N * N] when the Spec has them), e.g.
 // MixRow<S> below or a layout-equal model type (::strix::ds41::HcMix).
 

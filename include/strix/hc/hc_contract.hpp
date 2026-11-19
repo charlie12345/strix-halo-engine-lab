@@ -26,7 +26,7 @@
 //             s = 0 + comb[0][k] * residual[0][i] + ... ascending j (sinkhorn);
 //   store(v) = v (Store::f32) or the nearest bfloat16, ties to even (Store::bf16).
 //
-// Traits not covered by this oracle (declared differences, see wave4/next1112/hy4_hc-STATE.md section 2): the GLM
+// Traits not covered by this oracle (declared differences): the GLM
 // order (normalise before the dot, serial FMA chains) is a different identity; its binding adds a trait together with
 // its own fixture, never a silent unification.
 //
@@ -79,23 +79,6 @@ struct Spec {
                (comb_rows() == 0U || sinkhorn_iters >= 1U);
     }
 };
-
-// Hy-V4 Flash iHC (config.json: hc_mult 4, hidden_size 3072, hc_eps 1e-6, hc_magnitude 2.0, rms_norm_eps 1e-5;
-// fn F32 in the pack; streams stored in bfloat16 by the reference, which also rounds the collapse output).
-[[nodiscard]] constexpr Spec hy4_flash_spec(Site site) {
-    Spec s;
-    s.streams = 4;
-    s.hidden = 3072;
-    s.site = site;
-    s.comb = Comb::identity;
-    s.fn = FnType::f32;
-    s.store = Store::bf16;
-    s.post_magnitude = 2.0F;
-    s.pre_eps = 1e-6F;
-    s.post_eps = 1e-6F;
-    s.norm_eps = 1e-5F;
-    return s;
-}
 
 // ---- per-value pieces shared by the oracle and the device bodies ----------------------------------------
 STRIX_HC_HD inline float store_value(float v, Store store) {

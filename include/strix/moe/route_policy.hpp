@@ -15,7 +15,8 @@
 //     renormalize == false: w_k = s[id_k] * scale. top_k == 1 && !renorm_single: w_0 = s[id_0] * scale.
 //   groups: n_group = topk_group = 1 only (no bound family uses group-limited routing; anything else is rejected).
 //
-// Bound families (presets below, each the bits of the source named): DS41, GLM-5, MiniMax-M3, HY4.
+// Bound families (presets below, each the bits of the source named): DS41, GLM-5, MiniMax-M3. A family whose binding
+// lives in its model package keeps its preset there as data (a RoutePolicy value checked by route_policy_error).
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -67,12 +68,6 @@ constexpr RoutePolicy ds41(std::uint32_t experts, std::uint32_t top_k, float sca
 inline constexpr RoutePolicy glm5{RouteScore::sigmoid, true, RouteKey::ordered_bits, RouteOrder::ascending_id, 288U, 8U, 1U, 1U, true, true, 1e-20F, 2.5F};
 // src/minimax_moe.cpp route_row; HIP hip_minimax_moe.hip route_topk. 128 experts, top-4, x 2.0.
 inline constexpr RoutePolicy minimax_m3{RouteScore::sigmoid, true, RouteKey::float_serial, RouteOrder::selection, 128U, 4U, 1U, 1U, true, true, 1e-20F, 2.0F};
-// Hy4-flash config.json: sigmoid, e_score_correction_bias for selection, top-16 of 512, n_group 1, renorm (+1e-20), x 3.998.
-// Output order ascending id: the reference accumulates the experts with index_add_ in ascending id (PY:200) and the CPU
-// oracle sorts the ids (src/hy4/ref/hy4_host_ref.cpp route), so the denominator and the BF16 merge run in id order. Key
-// ordered_bits: the oracle's stable sort on score + bias (lower id on ties, -0 == +0) for every non-NaN key; the HIP
-// binding is moe_core::route_wave_kernel (src/moe_core/route_wave_kernel.hpp), the GLM-5 kernel on this preset.
-inline constexpr RoutePolicy hy4{RouteScore::sigmoid, true, RouteKey::ordered_bits, RouteOrder::ascending_id, 512U, 16U, 1U, 1U, true, true, 1e-20F, 3.998F};
 }  // namespace preset
 
 // Score transforms of one logit. Math supplies exp / log1p / sqrt with the family's bits.

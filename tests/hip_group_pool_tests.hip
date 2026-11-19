@@ -25,6 +25,10 @@
 #include <vector>
 
 namespace gi = strix::attn::group_indexer;
+// Gated-pool AlwaysOwn indexer shape exercised here (ratio 4, 16 heads x 128, 512 groups); a model binding keeps its
+// own Shape in its model package.
+constexpr gi::Shape kGatedApe{4U, 16U, 128U, 512U, gi::Pooling::GatedSoftmaxApe, gi::OwnGroup::AlwaysOwn,
+                              gi::ScoreScale::InHeadWeight};
 namespace gp = strix::attn::group_pool;
 namespace cp = strix::attn_core::group_pool;
 namespace gs = strix::attn_core::group_scan;
@@ -103,7 +107,7 @@ void test_pool(std::mt19937& rng) {
     std::vector<float> keys(R * D), want(D);
     for (unsigned g = 0; g < G; ++g) {
         for (unsigned e = 0; e < R * D; ++e) keys[e] = gp::bf16_value(tk[g * R * D + e]);
-        gi::pool_group_gated_ape(gi::kHy4, keys.data(), hw, exp_ds41, want.data());
+        gi::pool_group_gated_ape(kGatedApe, keys.data(), hw, exp_ds41, want.data());
         for (unsigned o = 0; o < D; ++o) same += bits(got[g * D + o]) == bits(want[o]) ? 1U : 0U;
     }
     std::printf("pool hy4 GatedSoftmaxApe: %u / %u bit-identical to the oracle\n", same, G * D);
@@ -189,7 +193,7 @@ template <class V> struct ScanFixture {
     }
     // Host oracle: score_group with the contract shape of the view.
     std::uint32_t want(unsigned r, unsigned slot, unsigned p) const {
-        const gi::Shape s = V::kHeads == 16 ? gi::kHy4 : gi::kGlmDsa;
+        const gi::Shape s = V::kHeads == 16 ? kGatedApe : gi::kGlmDsa;
         float k[128], w[32];
         for (unsigned i = 0; i < V::kDim; ++i) k[i] = key_value<V>(keys[slot][static_cast<std::size_t>(p) * V::kDim + i]);
         for (unsigned h = 0; h < V::kHeads; ++h) w[h] = wraw[r * V::kHeads + h] * V::weight_scale();
@@ -225,7 +229,7 @@ template <class V> void test_scan(std::mt19937& rng, const char* name, bool bf16
 }
 
 // ------------------------------------------------------------------ select (HY4 binding of the shared kernel)
-using Hy4SelectView = strix::attn_core::group_select::PositionView<gi::kHy4, 4096>;
+using Hy4SelectView = strix::attn_core::group_select::PositionView<kGatedApe, 4096>;
 
 void test_select(std::mt19937& rng, bool all_tied) {
     ScanFixture<Hy4Scan> f(rng, 2600, true);
@@ -242,7 +246,7 @@ void test_select(std::mt19937& rng, bool all_tied) {
     HIPCHECK(hipMalloc(&dtpos, sizeof(unsigned)));
     unsigned bad_rows = 0, rows = 0;
     for (std::uint32_t t : {0U, 5U, 2043U, 2047U, 2048U, 2049U, 2052U, 3001U, 6000U, 10399U, 10400U}) {
-        const unsigned P = gi::visible_groups(gi::kHy4, t);
+        const unsigned P = gi::visible_groups(kGatedApe, t);
         f.launch(1, f.rows(1, true, P, 0), P > 0 ? P : 1);
         HIPCHECK(hipMemcpy(dtpos, &t, sizeof(unsigned), hipMemcpyHostToDevice));
         strix::attn_core::group_select::enqueue_select<Hy4SelectView>(strix::attn_core::group_select::PositionRows{dtpos}, 1U, f.dout,
@@ -255,7 +259,7 @@ void test_select(std::mt19937& rng, bool all_tied) {
             const std::uint32_t key = f.want(0, 0, p);
             scores[p] = __builtin_bit_cast(float, (key & 0x80000000U) != 0U ? (key & 0x7FFFFFFFU) : ~key);
         }
-        const std::vector<std::uint32_t> want = gi::expand_tokens(gi::kHy4, gi::select_groups(gi::kHy4, scores.data(), P), t);
+        const std::vector<std::uint32_t> want = gi::expand_tokens(kGatedApe, gi::select_groups(kGatedApe, scores.data(), P), t);
         const bool ok = got == want;
         bad_rows += ok ? 0U : 1U;
         ++rows;

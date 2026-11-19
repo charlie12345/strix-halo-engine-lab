@@ -1,11 +1,12 @@
 // Shared HIP hyper-connection core (src/core/hc_core.hpp) against the host oracle (include/strix/hc/hc_ref.hpp),
 // bit for bit, on synthetic data (no weights):
-//   Hy-V4 Flash sublayer (hc::hy4_flash_spec: 4 streams, identity comb, F32 fn, bf16 store, post eps) and head
+//   identity bf16 sublayer (hc_fixture::identity_bf16_spec: 4 streams, identity comb, F32 fn, bf16 store, post eps) and head
 //   (pre-only mixes + collapse), hidden 3072 (19.2 chunks of 640: a partial last chunk), 9 rows (two mix tiles),
 //   expansion from a canonical rank sum (SubSum low/high, the TP2 form);
 //   DeepSeek V4.1 (Sinkhorn comb 20 iterations, F16 fn, FP32 store), hidden 1536, with the null-mixes collapse (copy 0).
 // Every mix, collapse and expand value is compared with memcmp; the first mismatch is printed.
 
+#include "hc_spec_fixture.hpp"
 #include "core/hc_core.hpp"
 #include "strix/hc/hc_ref.hpp"
 #include "strix/hip_check.hpp"
@@ -150,8 +151,8 @@ void run_case(const char* name, const hc::Spec& ref_spec, unsigned rows, unsigne
                 ok_rows, rows, S.post_rows() != 0U ? ", expand" : "");
 }
 
-constexpr hc::Spec hy4_sub = hc::hy4_flash_spec(hc::Site::sublayer);
-constexpr hc::Spec hy4_head = hc::hy4_flash_spec(hc::Site::head);
+constexpr hc::Spec hy4_sub = hc_fixture::identity_bf16_spec(hc::Site::sublayer);
+constexpr hc::Spec hy4_head = hc_fixture::identity_bf16_spec(hc::Site::head);
 // DeepSeek V4.1 mHC as bound in src/hip_ds41_layer.hip (hc_spec), with the runtime fields the oracle reads.
 constexpr hc::Spec ds41_device{.streams = 4, .hidden = 0, .site = hc::Site::sublayer, .comb = hc::Comb::sinkhorn,
                                .sinkhorn_iters = 0, .fn = hc::FnType::f16, .store = hc::Store::f32, .post_magnitude = 2.0F};

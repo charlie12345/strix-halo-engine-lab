@@ -68,9 +68,8 @@ struct LayerSpec {
 STRIX_MLA_HD constexpr unsigned window_count(unsigned t, unsigned window) { return t + 1U < window ? t + 1U : window; }
 STRIX_MLA_HD constexpr unsigned window_key(unsigned t, unsigned n, unsigned j) { return t + 1U - n + j; }
 
-// Presets (config: hy4/web/config.json; GLM: include/strix/glm/engine.hpp DsaLayerWeights, glm_math.hpp kMlaScale).
-constexpr LayerSpec hy4_dsa() { return {{32U, 512U, 64U, 192U, 256U}, {Select::List, 2048U}, Sink::Learned, Gate::SigmoidElementwise, 1.0e7}; }
-constexpr LayerSpec hy4_swa() { return {{64U, 512U, 64U, 192U, 256U}, {Select::Window, 512U}, Sink::Learned, Gate::SigmoidElementwise, 1.0e4}; }
+// Presets (GLM: include/strix/glm/engine.hpp DsaLayerWeights, glm_math.hpp kMlaScale). A family bound from its model
+// package keeps its LayerSpec there as data.
 // GLM-5 DSA in this engine: NoPE MLA (key = latent only), k_nope 256, v 256, 64 heads, top-k list; no sink, no gate.
 constexpr LayerSpec glm5_dsa() { return {{64U, 512U, 0U, 256U, 256U}, {Select::List, 2048U}, Sink::None, Gate::None, 0.0}; }
 

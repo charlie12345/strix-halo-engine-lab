@@ -19,6 +19,10 @@
 #include <vector>
 
 namespace gi = strix::attn::group_indexer;
+// Gated-pool AlwaysOwn indexer shape exercised here (ratio 4, 16 heads x 128, 512 groups); a model binding keeps its
+// own Shape in its model package.
+constexpr gi::Shape kGatedApe{4U, 16U, 128U, 512U, gi::Pooling::GatedSoftmaxApe, gi::OwnGroup::AlwaysOwn,
+                              gi::ScoreScale::InHeadWeight};
 namespace gp = strix::attn::group_pool;
 
 namespace {
@@ -54,9 +58,9 @@ float legacy_glm_pool_channel(const std::uint16_t* key, const std::uint16_t* gat
 }
 
 void test_hy4_lanes_vs_oracle(std::mt19937& rng) {
-    const gi::Shape s = gi::kHy4;
+    const gi::Shape s = kGatedApe;
     constexpr unsigned R = 4, D = 128;
-    static_assert(gi::kHy4.ratio == R && gi::kHy4.head_dim == D, "HY4 pools 4 slots of 128");
+    static_assert(kGatedApe.ratio == R && kGatedApe.head_dim == D, "HY4 pools 4 slots of 128");
     std::normal_distribution<float> n01(0.0F, 1.0F);
     std::vector<float> keys(R * D), wv(D * D), wg(D * D), ape(R * D), norm(D), lane_x(D), oracle(D);
     unsigned same = 0, total = 0;

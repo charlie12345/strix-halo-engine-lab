@@ -2,6 +2,7 @@
 // (ds41_layer.hpp) bit for bit; the Hy-V4 Flash identity-comb trait matches a direct FP64 evaluation within the
 // stated bounds; the identity trait is a skipped stage, not an identity matrix.
 
+#include "hc_spec_fixture.hpp"
 #include "strix/ds41_layer.hpp"
 #include "strix/hc/hc_ref.hpp"
 
@@ -101,7 +102,7 @@ void ds41_bitwise(std::mt19937& g) {
 // rounding of the FP64 value plus 2^-22 of the summed magnitudes (FP32 roundings under cancellation).
 void hy4_fp64(std::mt19937& g) {
     for (const auto site : {strix::hc::Site::sublayer, strix::hc::Site::head}) {
-        const auto spec = strix::hc::hy4_flash_spec(site);
+        const auto spec = hc_fixture::identity_bf16_spec(site);
         check(spec.valid() && spec.comb_rows() == 0U, "hy4 spec");
         check(spec.mix_rows() == (site == strix::hc::Site::head ? 4U : 8U), "hy4 mix rows");
         check(spec.scale_count() == (site == strix::hc::Site::head ? 1U : 2U), "hy4 scale count");
@@ -179,7 +180,7 @@ void hy4_fp64(std::mt19937& g) {
 // The identity trait skips the comb: an infinite residual copy stays infinite in its own stream, while an identity
 // comb matrix would give 0 * inf = NaN in every other stream (why identity is a trait, not a matrix).
 void identity_is_a_skip() {
-    auto spec = strix::hc::hy4_flash_spec(strix::hc::Site::sublayer);
+    auto spec = hc_fixture::identity_bf16_spec(strix::hc::Site::sublayer);
     spec.hidden = 2;
     spec.store = strix::hc::Store::f32;
     strix::hc::Mix mix;
@@ -198,7 +199,7 @@ void identity_is_a_skip() {
 }
 
 void geometry_rejected() {
-    auto spec = strix::hc::hy4_flash_spec(strix::hc::Site::sublayer);
+    auto spec = hc_fixture::identity_bf16_spec(strix::hc::Site::sublayer);
     bool threw = false;
     try {
         const std::vector<float> stream(10);

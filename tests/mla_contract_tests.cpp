@@ -10,6 +10,14 @@
 #include <vector>
 
 namespace mla = strix::attn::mla;
+// List (DSA) and window (SWA) layers with learned sink and sigmoid gate; a model binding keeps its own LayerSpec values
+// in its model package.
+constexpr mla::LayerSpec list_spec() {
+    return {{32U, 512U, 64U, 192U, 256U}, {mla::Select::List, 2048U}, mla::Sink::Learned, mla::Gate::SigmoidElementwise, 1.0e7};
+}
+constexpr mla::LayerSpec window_spec() {
+    return {{64U, 512U, 64U, 192U, 256U}, {mla::Select::Window, 512U}, mla::Sink::Learned, mla::Gate::SigmoidElementwise, 1.0e4};
+}
 
 namespace {
 
@@ -82,7 +90,7 @@ void absorbed_equals_reference(const mla::LayerSpec& s, unsigned t, std::vector<
 }
 
 void presets() {
-    const mla::LayerSpec dsa = mla::hy4_dsa(), swa = mla::hy4_swa(), glm = mla::glm5_dsa();
+    const mla::LayerSpec dsa = list_spec(), swa = window_spec(), glm = mla::glm5_dsa();
     CHECK(dsa.g.d_qk() == 576U && dsa.g.d_v() == 512U && dsa.g.head_qk() == 256U && dsa.g.heads == 32U);
     CHECK(swa.g.d_qk() == 576U && swa.g.heads == 64U && swa.sel.kind == mla::Select::Window && swa.sel.budget == 512U);
     CHECK(glm.g.d_qk() == 512U && glm.g.rope == 0U && glm.g.nope == 256U);
@@ -92,7 +100,7 @@ void presets() {
 }
 
 void window_selection() {
-    const mla::LayerSpec s = mla::hy4_swa();
+    const mla::LayerSpec s = window_spec();
     std::vector<std::uint32_t> out(512);
     CHECK(mla::ref::select(s, 0U, nullptr, 0U, out.data()) == 1U && out[0] == 0U);
     CHECK(mla::ref::select(s, 510U, nullptr, 0U, out.data()) == 511U && out[510] == 510U);
@@ -103,7 +111,7 @@ void window_selection() {
 }
 
 void list_validation() {
-    const mla::LayerSpec s = mla::hy4_dsa();
+    const mla::LayerSpec s = list_spec();
     std::vector<std::uint32_t> out(2048);
     const std::uint32_t bad_order[] = {3U, 2U}, after[] = {1U, 9U}, ok[] = {0U, 4U, 7U};
     int thrown = 0;
@@ -196,8 +204,8 @@ int main() {
         chunk_equals_rows();
         empty_list_is_zero();
         // real geometries: HY4 DSA (list, 32 heads, 576/512), HY4 SWA (window, 64 heads), GLM-5 NoPE (8 of 64 heads)
-        absorbed_equals_reference(mla::hy4_dsa(), 40U, {0U, 3U, 4U, 9U, 17U, 22U, 23U, 30U, 31U, 32U, 38U, 39U, 40U}, 101U);
-        absorbed_equals_reference(mla::hy4_swa(), 15U, {}, 202U);
+        absorbed_equals_reference(list_spec(), 40U, {0U, 3U, 4U, 9U, 17U, 22U, 23U, 30U, 31U, 32U, 38U, 39U, 40U}, 101U);
+        absorbed_equals_reference(window_spec(), 15U, {}, 202U);
         mla::LayerSpec glm = mla::glm5_dsa();
         glm.g.heads = 8U;
         absorbed_equals_reference(glm, 25U, {1U, 2U, 8U, 16U, 24U, 25U}, 303U);

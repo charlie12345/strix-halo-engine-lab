@@ -22,13 +22,14 @@
 #include <numeric>
 #include <stdexcept>
 #include <vector>
-#if defined(STRIX_RP_HY4)
-#include "hy4/ref/hy4_host_ref.hpp"
-#endif
 
 namespace {
 
 using namespace strix::moe;
+// Sigmoid router with ordered keys and ascending-id output, top-16 of 512, x 3.998 (a model binding keeps its own
+// RoutePolicy in its model package).
+constexpr RoutePolicy kSigmoid512{RouteScore::sigmoid, true, RouteKey::ordered_bits, RouteOrder::ascending_id, 512U, 16U, 1U, 1U,
+                                  true, true, 1e-20F, 3.998F};
 
 int g_failures = 0;
 void check(bool ok, const char* what) {
@@ -111,7 +112,7 @@ std::vector<std::uint32_t> sorted_pick(const std::vector<float>& s, const std::v
 }
 
 void hy4_top16() {
-    const RoutePolicy p = preset::hy4;
+    const RoutePolicy p = kSigmoid512;
     check(validate(p) == nullptr, "hy4 preset validates");
     Lcg g{11};
     for (int row = 0; row < 64; ++row) {
@@ -137,7 +138,7 @@ void hy4_top16() {
 
 void ties_and_keys() {
     // All choices equal: the lowest ids win, in ascending order.
-    RoutePolicy p = preset::hy4;
+    RoutePolicy p = kSigmoid512;
     std::vector<float> s(p.experts, 0.25F), b(p.experts, 0.0F);
     Row r = oracle(p, s, b);
     bool lowest = true;
@@ -168,7 +169,7 @@ void ties_and_keys() {
     const RoutePolicy one = preset::ds41(4U, 1U, 2.0F);
     r = oracle(one, desc, std::vector<float>(4, 0.0F));
     check(r.ids[0] == 1U && bits(r.w[0]) == bits(6.0F), "ds41 top-1: raw score x scale");
-    RoutePolicy grouped = preset::hy4;
+    RoutePolicy grouped = kSigmoid512;
     grouped.n_group = 8U;
     check(validate(grouped) != nullptr, "group-limited routing is rejected");
     bool threw = false;
@@ -291,30 +292,6 @@ void glm_compare(Digest& d) {
 }
 #endif
 
-#if defined(STRIX_RP_HY4)
-// preset::hy4 through the shared oracle == the Hy4-flash CPU oracle's router (src/hy4/ref route: stable sort on
-// score + bias, ids ascending, ascending sum): ids and weight bits, including rows with many tied keys.
-void hy4_oracle_compare() {
-    const RoutePolicy p = preset::hy4;
-    Lcg g{17};
-    bool ok = true;
-    for (int row = 0; row < 64; ++row) {
-        auto z = logits(g, p.experts);
-        auto b = biases(g, p.experts);
-        if (row % 4 == 0)
-            for (std::size_t e = 0; e < z.size(); ++e) {  // coarse logits, no bias: ties at the cut
-                z[e] = static_cast<float>(static_cast<int>(z[e] * 2.0F)) * 0.5F;
-                b[e] = 0.0F;
-            }
-        std::vector<float> s(p.experts);
-        route_scores_ref<Ds41Math>(p.score, z, s);
-        const Row r = oracle(p, s, b);
-        const auto ref = strix::hy4::route(z, b, p.top_k, p.scale);
-        ok = ok && ref.ids.size() == p.top_k && same(r, ref.ids.data(), ref.weights.data());
-    }
-    check(ok, "hy4: shared oracle (preset::hy4) = Hy4 CPU oracle route ids and weight bits");
-}
-#endif
 
 // Family output digests on the synthetic set, recorded on 015a043ab + 347072d22 BEFORE the call-site re-binds (WSL GCC 13,
 // -ffp-contract=off): the re-bound family routers must keep them.
@@ -328,9 +305,6 @@ void pin(const char* name, const Digest& d, std::uint64_t expected) {
 
 int main() {
     hy4_top16();
-#if defined(STRIX_RP_HY4)
-    hy4_oracle_compare();
-#endif
     ties_and_keys();
     clamp_trait();
     Digest ds41;

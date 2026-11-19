@@ -20,6 +20,10 @@
 #include <vector>
 
 namespace gi = strix::attn::group_indexer;
+// Gated-pool AlwaysOwn indexer shape exercised here (ratio 4, 16 heads x 128, 512 groups); a model binding keeps its
+// own Shape in its model package.
+constexpr gi::Shape kGatedApe{4U, 16U, 128U, 512U, gi::Pooling::GatedSoftmaxApe, gi::OwnGroup::AlwaysOwn,
+                              gi::ScoreScale::InHeadWeight};
 
 namespace {
 int g_failures = 0;
@@ -36,7 +40,7 @@ std::uint16_t bf16_bits(float x) { return static_cast<std::uint16_t>(bits(gi::bf
 float exp_glm(float x) { return strix::glm::declared_exp(x); }
 
 void test_shape_rules() {
-    const gi::Shape& h = gi::kHy4;
+    const gi::Shape& h = kGatedApe;
     CHECK(gi::visible_groups(h, 0) == 0 && gi::visible_groups(h, 3) == 0 && gi::visible_groups(h, 4) == 1);
     CHECK(gi::pick_count(h) == 511 && gi::max_tokens(h) == 2048);
     CHECK(gi::dense(h, 2047) && !gi::dense(h, 2048));  // the reference's kv_len <= 2048 switch, per query
@@ -49,7 +53,7 @@ void test_shape_rules() {
 }
 
 void test_pool_gated_ape(std::mt19937& rng) {
-    const gi::Shape& s = gi::kHy4;
+    const gi::Shape& s = kGatedApe;
     const unsigned d = s.head_dim, r = s.ratio;
     std::normal_distribution<float> n01(0.0F, 1.0F);
     std::vector<float> keys(r * d), wv(d * d), wg(d * d), ape(r * d), norm(d), out(d);
@@ -118,7 +122,7 @@ void test_glm_pool_identity(std::mt19937& rng) {
 }
 
 void test_score(std::mt19937& rng) {
-    const gi::Shape& s = gi::kHy4;
+    const gi::Shape& s = kGatedApe;
     std::normal_distribution<float> n01(0.0F, 1.0F);
     std::vector<float> q(s.heads * s.head_dim), k(s.head_dim), w(s.heads);
     for (float& x : q) x = gi::bf16_round(n01(rng));
@@ -164,7 +168,7 @@ std::vector<std::uint32_t> reference_tokens(const std::vector<float>& all_scores
 }
 
 std::vector<std::uint32_t> ours(const std::vector<float>& all_scores, std::uint32_t t) {
-    const gi::Shape& s = gi::kHy4;
+    const gi::Shape& s = kGatedApe;
     const unsigned visible = gi::visible_groups(s, t);
     return gi::expand_tokens(s, gi::select_groups(s, all_scores.data(), visible), t);
 }
@@ -179,12 +183,12 @@ void test_selection_vs_reference(std::mt19937& rng) {
         const auto a = ours(all, t), b = reference_tokens(all, n, t);
         CHECK(a == b);
         CHECK(std::is_sorted(a.begin(), a.end()) && std::adjacent_find(a.begin(), a.end()) == a.end());
-        CHECK(!a.empty() && a.back() == t && a.size() <= gi::max_tokens(gi::kHy4));
-        if (gi::dense(gi::kHy4, t)) CHECK(a.size() == t + 1U);
-        if (!gi::dense(gi::kHy4, t) && t % 4U == 3U) CHECK(a.size() == 2048U);
+        CHECK(!a.empty() && a.back() == t && a.size() <= gi::max_tokens(kGatedApe));
+        if (gi::dense(kGatedApe, t)) CHECK(a.size() == t + 1U);
+        if (!gi::dense(kGatedApe, t) && t % 4U == 3U) CHECK(a.size() == 2048U);
     }
     // Scores from the shared score arithmetic for one query (later groups carry garbage that must be masked).
-    const gi::Shape& s = gi::kHy4;
+    const gi::Shape& s = kGatedApe;
     std::normal_distribution<float> n01(0.0F, 1.0F);
     std::vector<float> q(s.heads * s.head_dim), w(s.heads), keys((n / 4U) * s.head_dim);
     for (float& x : q) x = gi::bf16_round(n01(rng));
@@ -207,7 +211,7 @@ void test_ties(std::mt19937& rng) {
     std::vector<std::uint32_t> tied(perm.begin() + 500, perm.begin() + 530);
     for (const std::uint32_t g : tied) all[g] = 5.0F;
     std::sort(tied.begin(), tied.end());
-    const auto groups = gi::select_groups(gi::kHy4, all.data(), 1023);
+    const auto groups = gi::select_groups(kGatedApe, all.data(), 1023);
     CHECK(groups.size() == 511U);
     for (std::size_t i = 0; i < tied.size(); ++i)  // declared rule: the lowest 11 tied indices
         CHECK(std::binary_search(groups.begin(), groups.end(), tied[i]) == (i < 11U));

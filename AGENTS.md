@@ -98,7 +98,7 @@ Support for a new model is a binding, not a new engine:
   limits are absolute.
 - The null of a window is the distance between two exact runs that differ only in evaluation order
   (one-ulp class), measured on that same window. A re-run that reproduces the same bits is not a
-  null; an engine without a null arm is judged with the absolute limits.
+  null; an engine without a null arm gets no verdict (the tool refuses it) until it binds a null hook.
 - Per window, with n scored rows:
   - KL passes up to `max(0.02, 1.5 x the null's KL)`.
   - top-1: with `L = max(0.07, 1.5 x the null's disagreement)`, the window passes at a disagreement

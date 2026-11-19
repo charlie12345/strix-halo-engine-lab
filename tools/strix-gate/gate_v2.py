@@ -68,7 +68,7 @@ def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
     kl_limit = max(limits["max_kl"], limits["null_factor"] * null_kl)
     dnll, se = mean_se(d)
     dis = 1.0 - float(agree.mean())
-    dis_pass = max(1.0 - limits["min_top1"], limits["null_factor"] * null_dis)
+    dis_pass = min(1.0, max(1.0 - limits["min_top1"], limits["null_factor"] * null_dis))
     # one-sided binomial score test of "disagreement <= dis_pass" on these rows
     dis_fail = min(1.0, dis_pass + z * math.sqrt(dis_pass * (1.0 - dis_pass) / max(int(agree.size), 1)))
     j = {"kl": float(kl.mean()), "top1": 1.0 - dis, "dnll": dnll, "null_kl": null_kl, "kl_limit": kl_limit,
@@ -106,16 +106,24 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
     cls: the window's content class, declared before scoring (None: one class for the whole gate set)."""
     kl, agree = np.asarray(kl, np.float64), np.asarray(agree, bool)
     nll_ref = np.asarray(nll_ref, np.float64)
-    d = np.asarray(nll_cand, np.float64) - nll_ref
+    nll_cand = np.asarray(nll_cand, np.float64)
+    if nll_ref.ndim != 1 or nll_cand.shape != nll_ref.shape or kl.ndim != 1 or agree.shape != kl.shape or not kl.size:
+        raise GateError(f"{name}: unpaired or empty score rows")
+    if not all(np.isfinite(v).all() for v in (kl, nll_ref, nll_cand, null_kls)):
+        raise GateError(f"{name}: non-finite score or null evidence")
+    d = nll_cand - nll_ref
     if not null_kls:
         raise GateError(f"{name}: no null arm (v2 needs the one-ulp / order-only null of every window)")
     null_kl = float(np.mean(null_kls))
+    if null_top1s and not all(0.0 <= x <= 1.0 for x in null_top1s):
+        raise GateError(f"{name}: null top-1 agreement is outside [0, 1]")
     null_dis = 1.0 - float(np.mean(null_top1s)) if null_top1s else 0.0
     null_d = None
     if null_nlls:
-        null_d = np.asarray(null_nlls[0], np.float64) - nll_ref
-        if null_d.size != d.size:
-            raise GateError(f"{name}: the null arm scored {null_d.size} rows, the candidate {d.size}")
+        null_nll = np.asarray(null_nlls[0], np.float64)
+        if null_nll.shape != nll_ref.shape or not np.isfinite(null_nll).all():
+            raise GateError(f"{name}: invalid or unpaired null NLL rows")
+        null_d = null_nll - nll_ref
     w = {"name": name, "class": cls or "all", "rows": int(kl.size), "dnll_rows": int(d.size),
          "ref_nll": float(nll_ref.mean())}
     w.update(_judge(kl, agree, d, null_kl, null_dis, null_d, limits))
@@ -216,6 +224,8 @@ def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
 
 def verdict(windows, flips=None, limits=LIMITS):
     """Pooled + per-window verdict. windows: window_stats dicts with their per-row arrays under '_rows'."""
+    if len({w["name"] for w in windows}) != len(windows):
+        raise GateError("duplicate window in pooled evidence")
     held = check_held_out(windows)
     kl = np.concatenate([w["_rows"]["kl"] for w in windows])
     agree = np.concatenate([w["_rows"]["agree"] for w in windows])

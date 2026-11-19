@@ -46,6 +46,21 @@ class Statistics(unittest.TestCase):
     def setUp(self):
         self.rng = np.random.default_rng(3)
 
+    def test_repeated_window_cannot_meet_the_row_minimum(self):
+        w = window("one", 400, 0.001, 0.99, 0.0, 0.004, self.rng)
+        with self.assertRaisesRegex(v2.GateError, "duplicate window"):
+            v2.verdict([w, w])
+
+    def test_window_refuses_invalid_or_unpaired_evidence(self):
+        for cand, null in [([1.0], 0.004), ([1.0, np.nan], 0.004), ([1.0, 1.0], np.inf)]:
+            with self.subTest(cand=cand, null=null), self.assertRaises(v2.GateError):
+                v2.window_stats("bad", [0.01, 0.01], [True, True], [1.0, 1.0], cand, [null])
+
+    def test_noisy_null_disagreement_is_bounded_by_one(self):
+        w = window("noisy", 16, 0.001, 0.0, 0.0, 0.004, self.rng, null_top1=0.0)
+        self.assertEqual(w["top1_pass"], 0.0)
+        self.assertEqual(w["states"]["top1"], "pass")
+
     def test_null_equal_to_reference_is_refused(self):
         # GLM b8 (refx_moe): a one-f32-ulp residual flip under FP16 input staging left the null bitwise equal to the
         # reference; its KL 0 would floor the limit at 0.02 while the FP16-ulp null of the same window has KL 0.49.

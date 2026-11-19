@@ -226,15 +226,28 @@ private:
     }
 
     static std::uint64_t count_records(const std::string& path) {
-        std::ifstream f(path, std::ios::binary);
-        f.seekg(16);
+        // seekg() may succeed beyond EOF: use the actual file length to reject truncated bodies and partial headers
+        // before a replay starts. Otherwise the receipt can claim a route file is complete when it is corrupt.
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f) throw std::runtime_error("route tap: cannot inspect " + path);
+        const auto end = f.tellg();
+        if (end < static_cast<std::streamoff>(16)) throw std::runtime_error("route tap: short header in " + path);
+        f.seekg(16, std::ios::beg);
         std::uint64_t n = 0;
         RouteRecordHeader h{};
-        while (f.read(reinterpret_cast<char*>(&h), sizeof(h))) {
-            if (h.top_k == 0 || h.top_k > kRouteMaxTopK) throw std::runtime_error("route tap: corrupt record in " + path);
-            const auto body = static_cast<std::streamoff>(std::uint64_t{h.rows} * h.top_k * 8U);
-            f.seekg(body, std::ios::cur);
-            if (!f) throw std::runtime_error("route tap: truncated record in " + path);
+        while (f.tellg() < end) {
+            const auto left = end - f.tellg();
+            if (left < static_cast<std::streamoff>(sizeof(h)))
+                throw std::runtime_error("route tap: partial record header in " + path);
+            f.read(reinterpret_cast<char*>(&h), sizeof(h));
+            if (!f || h.rows == 0 || h.top_k == 0 || h.top_k > kRouteMaxTopK || h.flags != 0)
+                throw std::runtime_error("route tap: corrupt record in " + path);
+            const auto body = std::uint64_t{h.rows} * h.top_k * 8U;
+            const auto remaining = end - f.tellg();
+            if (remaining < 0 || body > static_cast<std::uint64_t>(remaining))
+                throw std::runtime_error("route tap: truncated record body in " + path);
+            f.seekg(static_cast<std::streamoff>(body), std::ios::cur);
+            if (!f) throw std::runtime_error("route tap: corrupt record offset in " + path);
             ++n;
         }
         return n;

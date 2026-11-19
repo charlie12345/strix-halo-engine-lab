@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -120,6 +121,23 @@ int main() {
         std::vector<float> v = {1, 1};
         check(!tap.on_call(0, 1, 2, a.data(), v.data()), "inactive tap is a no-op");
     }
+    // Replaying a malformed route file must fail at open, not only when a later router call reads its body.
+    // In particular, seekg() past EOF is permitted by iostreams, so a truncated payload needs a size check.
+    const auto corrupt = temp_file("truncated.rte");
+    std::filesystem::copy_file(path, corrupt, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::resize_file(corrupt, std::filesystem::file_size(corrupt) - 1);
+    check(throws([&] { RouteTapConfig c; c.in_path = corrupt; RouteTap tap(c); }),
+          "truncated final route payload refused at open");
+    std::filesystem::remove(corrupt);
+    const auto trailing = temp_file("partial-header.rte");
+    std::filesystem::copy_file(path, trailing, std::filesystem::copy_options::overwrite_existing);
+    {
+        std::ofstream f(trailing, std::ios::binary | std::ios::app);
+        f.put('X');
+    }
+    check(throws([&] { RouteTapConfig c; c.in_path = trailing; RouteTap tap(c); }),
+          "partial trailing route header refused at open");
+    std::filesystem::remove(trailing);
     std::filesystem::remove(path);
     if (failures) return 1;
     std::printf("moe_route_file_tests: all passed\n");

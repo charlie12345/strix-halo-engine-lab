@@ -153,5 +153,106 @@ class FastLogitGateRuleV2(unittest.TestCase):
             self.assertEqual(self.cmp(a, far, "--rule", "v2", "--null-arm", str(null)), 1)
 
 
+class HeadFormat(unittest.TestCase):
+    """Prefill quality head dumps (rows x V FP32, labels = the prompt IDs) and trace-diag flips (no route tap)."""
+    V, N, R = 32, 80, 64
+
+    def setUp(self):
+        self.rng = np.random.default_rng(11)
+
+    def test_read_head_labels_positions_and_last_row(self):
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+        from tools.qualification.option_qual.records import read_head
+        ids = np.arange(10) * 3
+        z = self.rng.normal(size=(4, self.V)).astype("<f4")
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "c-exact.f32"
+            p.write_bytes(z.tobytes())
+            rows = list(read_head(p, ids=ids, rows=4))
+            self.assertEqual([r.position for r in rows], [6, 7, 8])         # the last row (position 9) has no label
+            self.assertEqual([r.label for r in rows], [21, 24, 27])         # ids[n - rows + j + 1]
+            for j, r in enumerate(rows):
+                np.testing.assert_array_equal(r.logits, z[j])
+            p.write_bytes(z.tobytes() + b"\0\0\0\0")
+            with self.assertRaises(ValueError):
+                list(read_head(p, ids=ids, rows=4))                         # not rows x V
+            p.write_bytes(z.tobytes())
+            with self.assertRaises(ValueError):
+                list(read_head(p, ids=np.arange(10) * 9, rows=4))           # ID 81 outside V = 32
+
+    def kit(self, d, cases, null_ids=20, cand_ids=30, layers=4, skip_diag=()):
+        d = pathlib.Path(d)
+        man, log = [], []
+        for c in cases:
+            ids = self.rng.integers(0, self.V, self.N)
+            (d / f"{c}.ids").write_text(" ".join(map(str, ids)), encoding="utf-8")
+            man.append(f"{c}\t{self.N}\t{c}.ids\texact,fast,n0")
+            ref = 3.0 * self.rng.normal(size=(self.R, self.V))
+            for arm, s in (("exact", 0.0), ("fast", 0.02), ("n0", 0.03)):
+                (d / f"{c}-{arm}.f32").write_bytes((ref + s * self.rng.normal(size=ref.shape)).astype("<f4").tobytes())
+            for arm, n in (("fast", cand_ids), ("n0", null_ids)):
+                if (c, arm) in skip_diag:
+                    continue
+                lay = ",".join(f'{{"l":{i},"router_rows":{n},"router_tail":0,"router_ids":{n // layers}}}' for i in range(layers))
+                log.append(f'{{"diag":1,"case":"{c}","arm":"{arm}","mean_kl":0.001,"top1":64,"kl":[0.001],"layers":[{lay}]}}')
+        (d / "m.tsv").write_text("\n".join(man) + "\n", encoding="utf-8")
+        (d / "r0.log").write_text("loaded rank=0\n" + "\n".join(log) + "\n", encoding="utf-8")
+        return d
+
+    def gate(self, d, *extra):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = v2.main(["qual", str(d), "--format", "head", "--manifest", str(d / "m.tsv"), "--ref", "exact",
+                          "--cand", "fast", "--null", "n0", "--trace-diag", str(d / "r0.log"), "--json", str(d / "g.json"), *extra])
+        return rc, out.getvalue()
+
+    def test_head_gate_pass_rows_and_free_running_flips(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=28)
+            rc, out = self.gate(d)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("POOLED v2 rows 819 (dNLL rows 819, >= 800)", out)  # 13 windows x 63 labelled rows
+            self.assertIn("R1: no route tap", out)
+            self.assertIn("ratio 1.40", out)                                 # 28 / 20, same slots
+            doc = json.loads((d / "g.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["r1"], "free-running, trace flips on 13 of 13 windows")
+            self.assertEqual(doc["windows"][0]["flips"]["cand"]["slots"], self.N * 4)
+            self.assertTrue(0.0 < doc["pooled"]["held_out"]["label_is_ref_top1"] < 1.0)
+
+    def test_head_gate_flip_ratio_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(13)], null_ids=20, cand_ids=32))
+            self.assertEqual(rc, 1, out)
+            self.assertIn("FAIL flip_ratio", out)
+
+    def test_head_gate_no_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(12)]))   # 756 rows < 800
+            self.assertEqual(rc, 2, out)
+            self.assertIn("NO VERDICT: 756 scored dNLL rows", out)
+        with tempfile.TemporaryDirectory() as d:
+            rc, out = self.gate(self.kit(d, [f"w{i:02d}" for i in range(13)], skip_diag={("w03", "n0")}))
+            self.assertEqual(rc, 2, out)
+            self.assertIn("w03: trace of only one", out)
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = v2.main(["qual", str(d), "--format", "head", "--ref", "exact", "--cand", "fast", "--null", "n0"])
+            self.assertEqual(rc, 2)
+            self.assertIn("needs --manifest", out.getvalue())
+            (d / "w05-n0.f32").unlink()                                       # a lost dump: no verdict, not FAIL
+            rc, out = self.gate(d)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("NO VERDICT: FileNotFoundError", out)
+
+    def test_untraced_windows_pool_without_flips(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = self.kit(d, [f"w{i:02d}" for i in range(13)], skip_diag={("w12", "fast"), ("w12", "n0")})
+            rc, out = self.gate(d)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("engine trace on 12 of 13 windows", out)
+
+
 if __name__ == "__main__":
     unittest.main()

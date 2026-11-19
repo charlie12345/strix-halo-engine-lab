@@ -10,6 +10,9 @@ that the reference's own chaos is not charged to the lever:
 
   python gate_v2.py qual OUT --ref REF --cand FAST --null NULL [--cand-free FASTF --null-free NULLF] [--json F]
       option_qual runner output: OUT/logits/<case>.<arm>.bin, OUT/log/<case>.<arm>.stderr, OUT/routes/<case>.<arm>.rte
+  python gate_v2.py qual OUT --format head --manifest M --ref exact --cand FAST --null NULL [--trace-diag LOG ...]
+      prefill quality tool head dumps OUT/<case>-<arm>.f32 (64 x V rows, labels = the manifest's prompt IDs); an engine
+      without a route tap runs every arm free and reports R1 flips from its trace diag lines
   fast_logit_gate.py compare REF CAND --rule v2 --null-arm NULL ...   (sealed strix-fast-dump arms)
 Exit 0 = PASS, 1 = FAIL, 2 = no verdict (bookkeeping defect, too few rows, labels not held out, missing null).
 """
@@ -196,20 +199,80 @@ def _option_qual_reduce():
     return reduce_pair
 
 
+def read_manifest(path):
+    """Prompt manifest rows NAME TOKENS IDS_PATH [ARMS] -> {name: ids}; the IDs file is whitespace-separated (a relative
+    path is next to the manifest)."""
+    path, rows = pathlib.Path(path), {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        f = line.split()
+        if not f or f[0].startswith("#"):
+            continue
+        if len(f) < 3:
+            raise GateError(f"{path}: manifest row {line!r} needs NAME TOKENS IDS_PATH")
+        if f[0] in rows:
+            raise GateError(f"{path}: case {f[0]} twice")
+        ids_path = pathlib.Path(f[2]) if pathlib.Path(f[2]).is_absolute() else path.parent / f[2]
+        ids = np.array(ids_path.read_text(encoding="utf-8").split(), dtype=np.int64)
+        if ids.size != int(f[1]):
+            raise GateError(f"{path}: {f[0]} has {ids.size} IDs, the manifest says {f[1]}")
+        rows[f[0]] = ids
+    return rows
+
+
+TRACE_DIAG = re.compile(r'^\{"diag":1,"case":"([^"]+)","arm":"([^"]+)"')
+
+
+def read_trace_diag(paths):
+    """Free-running route flips from an engine's per-layer trace, for engines without a route tap: lines
+    {"diag":1,"case":C,"arm":A,...,"layers":[{"l":0,...,"router_ids":I,...},...]} where router_ids counts the
+    reference's selected experts missing from the arm's selection on that layer (order-free, over the traced rows).
+    Returns {(case, arm): (ids, layers)}; a diag line without layers (trace off) is skipped."""
+    out = {}
+    for p in paths or []:
+        for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
+            m = TRACE_DIAG.match(line)
+            if not m:
+                continue
+            ids = [int(x) for x in re.findall(r'"router_ids":(\d+)', line)]
+            if not ids:
+                continue
+            if m.groups() in out:
+                raise GateError(f"{p}: a second trace of {m.group(1)}.{m.group(2)}")
+            out[m.groups()] = (sum(ids), len(ids))
+    return out
+
+
 def qual(a):
     """option_qual adapter: reduce every case's REF vs CAND / NULL logits, check replay receipts, count free flips."""
     out = pathlib.Path(a.out)
     reduce_pair = _option_qual_reduce()
-    cases = a.cases or sorted(p.name[:-len(f".{a.ref}.bin")] for p in (out / "logits").glob(f"*.{a.ref}.bin"))
+    head = a.format == "head"
+    manifest = read_manifest(a.manifest) if a.manifest else None
+    if head and manifest is None:
+        raise GateError("--format head needs --manifest (the prompt IDs are the held-out labels)")
+    pattern = a.logits or ("{case}-{arm}.f32" if head else "logits/{case}.{arm}.bin")
+    path_of = lambda case, arm: out / pattern.format(case=case, arm=arm)  # noqa: E731
+    if a.cases:
+        cases = a.cases
+    elif manifest is not None:
+        cases = [c for c in manifest if path_of(c, a.ref).exists()]
+    else:
+        cases = sorted(p.name[:-len(f".{a.ref}.bin")] for p in (out / "logits").glob(f"*.{a.ref}.bin"))
     if not cases:
-        raise GateError(f"{out}/logits holds no {a.ref} logits")
-    windows, flips, replay = [], [], {}
+        raise GateError(f"{out} holds no {a.ref} logits")
+    diag = read_trace_diag(a.trace_diag)
+    if diag and manifest is None:
+        raise GateError("--trace-diag needs --manifest (flip slots = prompt rows x traced layers)")
+    windows, flips, replay, traced = [], [], {}, 0
     for case in cases:
-        logit = lambda arm: out / "logits" / f"{case}.{arm}.bin"  # noqa: E731
+        if manifest is not None and case not in manifest:
+            raise GateError(f"{case}: not in the manifest")
+        kw = {"ids": manifest[case], "rows": a.head_rows} if head else {}
+        logit = lambda arm: path_of(case, arm)  # noqa: E731
         route = lambda arm: out / "routes" / f"{case}.{arm}.rte"  # noqa: E731
         err = lambda arm: (out / "log" / f"{case}.{arm}.stderr").read_bytes()  # noqa: E731
-        ra, _ = reduce_pair(logit(a.ref), logit(a.cand), a.format)
-        nulls = [reduce_pair(logit(a.ref), logit(n), a.format)[0]["kl_rc"].mean() for n in a.null]
+        ra, _ = reduce_pair(logit(a.ref), logit(a.cand), a.format, **kw)
+        nulls = [reduce_pair(logit(a.ref), logit(n), a.format, **kw)[0]["kl_rc"].mean() for n in a.null]
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"], [float(x) for x in nulls],
                          ra["top1_r_is_label"], ra["top1_c_is_label"])
         w["_rows"] = {"kl": ra["kl_rc"], "agree": ra["agree"].astype(bool), "dnll": ra["nll_c"] - ra["nll_r"]}
@@ -226,6 +289,19 @@ def qual(a):
             f = {"cand": route_flips(route(a.ref), route(a.cand_free)), "null": route_flips(route(a.ref), route(a.null_free))}
             flips.append(f)
             w["flips"] = {k: {x: v[x] for x in ("slots", "ids", "rate")} for k, v in f.items()}
+        elif diag:
+            # no route tap: every arm ran free, so the flips come from the engine trace of the candidate and the null
+            fc, fn = diag.get((case, a.cand_free or a.cand)), diag.get((case, a.null_free or a.null[0]))
+            if (fc is None) != (fn is None):
+                raise GateError(f"{case}: trace of only one of the free-running candidate / null arms (R1 needs both)")
+            if fc is not None:
+                if fc[1] != fn[1]:
+                    raise GateError(f"{case}: candidate trace has {fc[1]} layers, the null's {fn[1]}")
+                slots = int(manifest[case].size) * fc[1]
+                f = {k: {"slots": slots, "ids": v[0], "rate": v[0] / slots} for k, v in (("cand", fc), ("null", fn))}
+                flips.append(f)
+                w["flips"] = f
+                traced += 1
         windows.append(w)
         print(window_line(w, f))
         for c in ([replay[case]["cand"]] + replay[case]["null"]) if moe else []:
@@ -233,10 +309,15 @@ def qual(a):
             print(f"  replay {case}: {c['records']} router calls, {c['rows']} rows replayed; local flips "
                   f"{lf.get('ids', 0)}/{lf.get('slots', 0)}" + (f"; null layer {c['null']['layer']} seed {c['null']['seed']} "
                                                                  f"nudged {c['null']['nudged']}" if c["null"] else ""))
+    r1 = "replay" if replay else (f"free-running, trace flips on {traced} of {len(windows)} windows" if traced else "none")
+    if traced and not replay:
+        print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
+              f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
     p = verdict(windows, flips if flips else None)
     print(pooled_line(p))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": LIMITS, "ref": a.ref, "cand": a.cand, "null": a.null,
+               "format": a.format, "r1": r1,
                "windows": [{k: v for k, v in w.items() if k != "_rows"} for w in windows], "pooled": p}
         pathlib.Path(a.json).write_text(json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8")
     return 0 if p["pass"] else 1
@@ -253,13 +334,20 @@ def main(argv=None):
     q.add_argument("--cand-free")
     q.add_argument("--null-free")
     q.add_argument("--cases", nargs="*")
-    q.add_argument("--format", default="steps")
+    q.add_argument("--format", default="steps", choices=["steps", "spool", "head"])
+    q.add_argument("--manifest", help="NAME TOKENS IDS_PATH [ARMS] rows (needed by --format head and --trace-diag)")
+    q.add_argument("--head-rows", type=int, default=64, help="rows per head dump (--format head)")
+    q.add_argument("--logits", help="logit path under OUT, {case} {arm} (default logits/{case}.{arm}.bin; head {case}-{arm}.f32)")
+    q.add_argument("--trace-diag", action="append", help="engine log with per-layer trace diag lines (no route tap)")
     q.add_argument("--json")
     a = ap.parse_args(argv)
     try:
         return qual(a)
     except GateError as e:
         print(f"NO VERDICT: {e}")
+        return 2
+    except (OSError, ValueError) as e:  # a missing / malformed arm file is a defect of the evidence, never a FAIL (exit 1)
+        print(f"NO VERDICT: {type(e).__name__}: {e}")
         return 2
 
 

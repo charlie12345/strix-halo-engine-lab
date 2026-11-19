@@ -410,6 +410,24 @@ python tools/strix-gate/fast_logit_gate.py compare REF CAND --ranks 0 --tokens p
 Qwen HIP kit: `scripts/bench/qwen/fast-gate-v2.sh` (one model load per GPU ticket, resumable; arms in
 `fast-gate-v2-arms.json`: REF, NULL, FAST, the free-running FASTF / NULLF, and the single levers Q / G / R).
 
+**Prefill head dumps and engines without a route tap.** A prefill quality tool that writes the logits of a prompt's
+last rows (`<case>-<arm>.f32`, rows x vocabulary FP32, no header) is read with `--format head`. The manifest
+(`NAME TOKENS IDS_PATH` per row) gives the prompt IDs. Row `j` of a dump is scored against the prompt ID that follows it,
+so the labels are held-out text; the last row has no label and is not scored, which leaves 63 scored rows per window of
+64. An engine that has not bound the route tap runs every arm free. KL, top-1 and dNLL then include the route flips,
+which is a harder test than replay. The R1 flip ratio comes from the engine's per-layer trace lines
+(`{"diag":1,"case":...,"arm":...,"layers":[{"router_ids":N,...}]}`, `--trace-diag LOG`). `router_ids` counts the
+reference's experts missing from the arm's selection. The slots are prompt rows x traced layers, the same for the
+candidate and the null, so the ratio is unit-free. A window with no trace line for either arm adds no flips. A trace
+line for only one of the two arms is no verdict.
+
+```sh
+python tools/strix-gate/gate_v2.py qual DUMPS --format head --manifest windows.tsv \
+    --ref exact --cand m16_sh_eng_fast3 --null n_l0_s1 --trace-diag rank0.log --json gate.json
+```
+
+A missing or malformed arm file is a defect of the evidence (exit 2, no verdict), never a FAIL.
+
 A lever that passes v2 and has a measured speed gain is qualified per prompt-length regime (the profile table's
 `fast_regimes` rows) and runs under `--profile fast`.
 

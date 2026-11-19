@@ -1897,9 +1897,15 @@ int main(int argc, char** argv) {
                 guarded_install("gemv");
                 const Run ex = guarded_run(toks, true, "null study exact");
                 digest("exact", ex, toks.size());
-                guarded_install("wmma");
-                const Run cand = guarded_run(toks, true, "null study wmma");
-                dev("wmma", cand, ex);
+                // The wmma candidate is informational: when its route cannot run here (library without the pinned GEMM,
+                // or its install fails on both ranks alike) the study reports it and still measures the nulls.
+                try {
+                    guarded_install("wmma");
+                    const Run cand = guarded_run(toks, true, "null study wmma");
+                    dev("wmma", cand, ex);
+                } catch (const std::exception& e) {
+                    std::printf("rank %u DEV wmma: not measured (%s)\n", opt.rank, e.what());
+                }
                 guarded_install("gemv");
                 std::size_t a = 0;
                 while (!pf_nulls.empty() && a <= pf_nulls.size()) {

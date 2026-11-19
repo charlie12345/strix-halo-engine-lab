@@ -16,7 +16,7 @@
 //   groups: n_group = topk_group = 1 only (no bound family uses group-limited routing; anything else is rejected).
 //
 // Bound families (presets below, each the bits of the source named): DS41, GLM-5, MiniMax-M3. A family whose binding
-// lives in its model package keeps its preset there as data (a RoutePolicy value checked by route_policy_error).
+// lives in its model package keeps its preset there as data (a RoutePolicy value checked by validate).
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>

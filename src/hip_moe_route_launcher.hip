@@ -1658,7 +1658,7 @@ void launch_moe_route(const ExecutionDispatchContext& context, void* user_data) 
     launch_moe_route_kernels(prepared, context);
     auto* ids = reinterpret_cast<std::uint32_t*>(prepared.indices.address);
     auto* weights = reinterpret_cast<float*>(prepared.route_weights.address);
-    tap_routes(static_cast<std::uint32_t>(context.layer), prepared.config->top_k, &ids, &weights, 1U, 1U, 0U, 0U);
+    tap_routes(context.layer.value_or(0xFFFFFFFFU), prepared.config->top_k, &ids, &weights, 1U, 1U, 0U, 0U);
 }
 void launch_moe_route_kernels(const PreparedRouterLaunch& prepared, const ExecutionDispatchContext& context) {
     const auto& config = *prepared.config;
@@ -1949,7 +1949,7 @@ void moe_route_known_window_rows_launch(std::span<const ExecutionDispatchContext
     const auto prepared = prepare_router_rows(rows, config);
     if (config.activation == HipActivationStorage::bf16) launch_router_rows_by_weight<std::uint16_t>(prepared, config);
     else launch_router_rows_by_weight<float>(prepared, config);
-    tap_routes(static_cast<std::uint32_t>(rows.front().layer), config.top_k, prepared.args.indices, prepared.args.weights,
+    tap_routes(rows.front().layer.value_or(0xFFFFFFFFU), config.top_k, prepared.args.indices, prepared.args.weights,
                prepared.rows, 1U, 0U, 0U);
 }
 void moe_route_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
@@ -1978,7 +1978,7 @@ void moe_route_known_window_cohort_launch(std::span<const std::span<const Execut
     hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave,RouterCohortRowsArgs>),
         dim3(args.count),dim3(kThreads),0,hip_execution_stream(),args,config.expert_count,config.top_k,config.normalize_selected);
     check_hip(hipGetLastError(),"wide router cohort select launch");
-    tap_routes(static_cast<std::uint32_t>(segments[0].front().layer),config.top_k,args.indices,args.weights,args.count,1U,0U,0U);
+    tap_routes(segments[0].front().layer.value_or(0xFFFFFFFFU),config.top_k,args.indices,args.weights,args.count,1U,0U,0U);
 }
 
 namespace {
@@ -2184,7 +2184,7 @@ void moe_route_known_prefill_rows_launch(std::span<const ExecutionDispatchContex
     const auto stride = [](const auto* a, const auto* b) {
         return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(b) - reinterpret_cast<std::uintptr_t>(a));
     };
-    tap_routes(static_cast<std::uint32_t>(rows.front().layer), config.top_k, first.args.indices, first.args.weights, 8U,
+    tap_routes(rows.front().layer.value_or(0xFFFFFFFFU), config.top_k, first.args.indices, first.args.weights, 8U,
                static_cast<std::uint32_t>(rows.size() / 8U), stride(first.args.indices[0], second.args.indices[0]),
                stride(first.args.weights[0], second.args.weights[0]));
 }

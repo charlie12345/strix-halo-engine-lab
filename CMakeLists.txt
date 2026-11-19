@@ -6380,6 +6380,13 @@ if(BUILD_TESTING)
     target_compile_features(strix-qwen35-pair-plan-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-qwen35-pair-plan-tests)
     add_test(NAME strix-qwen35-pair-plan-tests COMMAND strix-qwen35-pair-plan-tests)
+    # Shared prompt windows (strix/session/prompt_windows.hpp) and the two-stage window picker.
+    add_executable(strix-prompt-windows-tests tests/prompt_windows_tests.cpp)
+    target_include_directories(strix-prompt-windows-tests PRIVATE include)
+    target_compile_features(strix-prompt-windows-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-prompt-windows-tests PRIVATE Threads::Threads)
+    strix_target_warnings(strix-prompt-windows-tests)
+    add_test(NAME strix-prompt-windows-tests COMMAND strix-prompt-windows-tests)
     # N-rank layer pipeline (strix/pair/layer_pipeline.hpp): composed prefill + decode == one rank, bytes, N = 1..4.
     add_executable(strix-pair-layer-pipeline-tests tests/pair_layer_pipeline_tests.cpp)
     target_include_directories(strix-pair-layer-pipeline-tests PRIVATE include)

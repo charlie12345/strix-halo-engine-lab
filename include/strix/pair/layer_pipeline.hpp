@@ -67,6 +67,26 @@ inline std::vector<Window> windows(std::size_t prompt, std::uint32_t width) {
     return out;
 }
 
+// Window width of a two-stage pipe from a calibration of the half-window time per width (stage time of one window).
+// The width changes no bit when the binding is window-invariant; only the flow shop changes: wall = (windows + 1) x
+// half-window time, so a narrower window that costs a little more per row can win by filling the pipe sooner. Costs are
+// an input measured on the deployment, never compiled in; no usable cost -> 0 (the caller keeps its width). Ties keep
+// the first entry.
+struct WindowCost {
+    std::uint32_t rows = 0;
+    double half_ms = 0;
+};
+[[nodiscard]] inline std::uint32_t two_stage_window_rows(std::size_t prompt, std::span<const WindowCost> costs) {
+    std::uint32_t best = 0;
+    double best_ms = 0;
+    for (const auto& w : costs) {
+        if (w.rows == 0U || !(w.half_ms > 0)) continue;
+        const double ms = static_cast<double>((prompt + w.rows - 1U) / w.rows + 1U) * w.half_ms;
+        if (best_ms == 0 || ms < best_ms) best = w.rows, best_ms = ms;
+    }
+    return best;
+}
+
 // Consumer-side header check (PipeOptions::validate) of one link: returns the payload bytes.
 inline std::function<std::size_t(const PipeHeader&, std::uint64_t)> validator(
     std::uint64_t identity, std::uint64_t count, std::uint32_t cut, std::uint32_t max_rows, std::size_t row_bytes) {

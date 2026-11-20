@@ -414,6 +414,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-exact-reduce-contract-tests)
     add_test(NAME strix-exact-reduce-contract-tests COMMAND strix-exact-reduce-contract-tests)
 
+    add_executable(strix-sparse-select-policy-tests tests/sparse_select_policy_tests.cpp)
+    target_include_directories(strix-sparse-select-policy-tests PRIVATE include)
+    target_compile_features(strix-sparse-select-policy-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-sparse-select-policy-tests)
+    add_test(NAME strix-sparse-select-policy-tests COMMAND strix-sparse-select-policy-tests)
+
     add_executable(strix-head-argmax-tests tests/head_argmax_tests.cpp)
     target_include_directories(strix-head-argmax-tests PRIVATE include)
     target_compile_features(strix-head-argmax-tests PRIVATE cxx_std_20)

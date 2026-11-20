@@ -206,7 +206,7 @@ public:
     // STRIX_G4_PREFILL_CHUNK (64..512, a multiple of 64; default 512): prompt rows per prefill chunk. Linears are
     // row-independent and canonical attention reads committed keys exactly as the overlay, so chunk ends do not
     // change bytes (checked by state/logits digests); shorter chunks fill the two-node pipeline sooner.
-    // CHUNK1024 (lever, default on; STRIX_G4_PREFILL_CHUNK1024=0 off): WMMA linears take max_chunk_rows (1024) per pass:
+    // CHUNK1024 (lever, opt-in; STRIX_G4_PREFILL_CHUNK1024=1): WMMA linears take max_chunk_rows (1024) per pass:
     // the many small under-filled GEMM grids (narrow/direct tiles) and the per-pass dispatches halve, while attention
     // runs in chunk_rows pieces aligned to absolute positions with the 512-row calls' arguments (target.hip), so the
     // committed bytes equal the 512-row chunks. Exact / a8 / EXL3 linears keep 512 (the exact route measured slower at

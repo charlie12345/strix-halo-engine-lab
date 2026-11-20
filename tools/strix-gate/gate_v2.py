@@ -561,7 +561,7 @@ def qual(a):
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
-    p = verdict(windows, flips if flips else None, allow_null_floor=a.allow_null_floor)
+    p = verdict(windows, flips if flips else None, allow_null_floor=getattr(a, 'allow_null_floor', False))
     print(pooled_line(p))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": LIMITS, "ref": a.ref, "cand": a.cand, "null": a.null,

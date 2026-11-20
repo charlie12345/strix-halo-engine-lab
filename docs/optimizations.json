@@ -589,6 +589,17 @@
   },
   {
     "engine": "qwen",
+    "name": "MTP priming input projection: four output rows per wave",
+    "flag_or_env": "STRIX_MTP_PRIME_PROJ_ROWS",
+    "default": "4 (1 restores one output row per wave; restart)",
+    "exact": "Each row keeps its FMA chain, reduction tree and rounding: the device test compares prime-rows fusion with one-token fusion bit for bit (run with 4 and 1); same binary, T2048, 4,096-token prompt: state, terminal logits and lineage digests and tokens equal with 4 and 1.",
+    "gain": "Same binary, one node, 32,768-token MTP prompt (T16384), ABBA: final-block priming 618-667 vs 934-947 ms, prompt mean -0.78 s (about -3.6 %, two pairs); 16,384 tokens: final-block priming 313-321 vs 455 ms. Decode unchanged.",
+    "preconditions": "Same admission as STRIX_MTP_PRIME_ROWS; priming batches of two or more rows (the last row keeps the one-row path).",
+    "off_switch": "STRIX_MTP_PRIME_PROJ_ROWS=1 (restart)",
+    "doc_anchor": "docs/optimizations.md#qwen-mtp-prime-rows"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA attend batching",
     "flag_or_env": "STRIX_QSA_ATTEND_BATCH",
     "default": "1",

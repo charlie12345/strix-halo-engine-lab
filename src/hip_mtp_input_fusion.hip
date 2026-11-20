@@ -1,6 +1,7 @@
 #include "strix/hip_mtp_prime_rows.hpp"
 #include <type_traits>
 #include "strix/hip_check.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
@@ -491,9 +492,9 @@ template<class Rows> void launch_mtp_input_fusion_rows(std::span<const HipMtpInp
     static const unsigned group=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_PROJ_GROUP");
         const unsigned g=v?static_cast<unsigned>(std::atoi(v)):2U;return g==1U||g==4U?g:2U;}();
     // Prompt priming: four output rows per wave on two-token groups (mtp_input_projections_batch R: 80 input and
-    // 40 accumulator registers per lane). STRIX_MTP_PRIME_PROJ_ROWS=1 keeps one row per wave (read once, restart).
+    // 40 accumulator registers per lane). STRIX_MTP_PRIME_PROJ_ROWS=1 keeps one row per wave (cached, restart).
     if constexpr(std::is_same_v<Rows,HipMtpInputFusionPrimeRows>) {
-        static const bool four=[]{const char* v=std::getenv("STRIX_MTP_PRIME_PROJ_ROWS");return !(v && v[0]=='1' && !v[1]);}();
+        static const bool four=strix::envcfg::integer("STRIX_MTP_PRIME_PROJ_ROWS",4)!=1;
         if(four && n>1U) {
             constexpr unsigned rows_per_wave=4U,tokens=2U;
             const dim3 grid4((r.hidden_size+8U*rows_per_wave-1U)/(8U*rows_per_wave),(n+tokens-1U)/tokens);

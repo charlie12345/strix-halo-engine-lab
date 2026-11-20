@@ -5090,6 +5090,25 @@ the longest cached prefix of its token ids and prefills only the rest.
 - **Measured gain:** No throughput figure published yet. Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
 - **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
 
+<a id="qwen-rtx-expert-wide-tile"></a>
+
+### Tensor-core expert wide tile form (128 rows)
+
+**Engine:** `qwen-rtx`. **Control:** `--expert-wide-tile on|off|N`, `STRIX_QRTX_EXPERT_WIDE_TILE` (lever row `expert_wide_tile`). **Default:** off (opt-in until its timing receipt).
+
+A prefill launch whose experts receive at least N rows each on average cuts 128-row CSR tiles and runs them in
+512-thread blocks: each warp keeps one column block and one weight row per lane (32 accumulators per thread, as the
+64-row tile form), so a 128-row run of an expert decodes its weight codes once instead of twice. MMA count, activation
+bytes per row and warps per SM do not change. N is a planner parameter per device: the no-model tile bench prints it
+(`TILEWIDE min_rows=N`); `on` uses the builtin value (128, provisional).
+
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic) on prefill launches above 16 rows; decode steps keep the decode form.
+- **Automatic selection:** none yet; when on, the launch picks the wide form from its average rows per expert.
+- **Exactness evidence:** Exact schedule trait: a wide tile is exactly two consecutive 64-row tiles; every row keeps its m16 position and order and each output's MMA and scale-FMA sequence is unchanged, so outputs are bitwise the tile form (host test on edge counts and 200 random 512-expert routings; the bench compares both forms' device hashes). Contract and bundle id do not change.
+- **Off switch:** `--expert-wide-tile off`; `STRIX_QRTX_EXPERT_WIDE_TILE=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form contract and launch rule](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp), [bench](../tests/cuda/qwen_moe_tile_bench.cu)
+
 <a id="qwen-rtx-expert-decode-tile"></a>
 
 ### Tensor-core expert decode tile form

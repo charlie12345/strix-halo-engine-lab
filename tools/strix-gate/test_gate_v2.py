@@ -139,7 +139,7 @@ class Statistics(unittest.TestCase):
         def gate(top1, kl=0.13, dnll=0.005):
             ws = [window(f"w{i}", 255, kl, top1, dnll, 0.141, self.rng, null_top1=0.9304, null_dnll=0.052,
                          null_kl_rows=np.full(255, 0.141), scale=0.01) for i in range(4)]
-            return v2.verdict(ws)
+            return v2.verdict(ws, allow_null_floor=True)
         p = gate(0.926)
         f = p["null_floor"]
         self.assertEqual(f["applied"], ["kl", "top1", "dnll"])
@@ -158,6 +158,25 @@ class Statistics(unittest.TestCase):
         self.assertFalse(gate(0.898)["checks"]["top1"])
         self.assertFalse(gate(0.926, kl=0.165)["checks"]["kl"])
         self.assertFalse(gate(0.926, dnll=0.07)["checks"]["dnll"])
+
+    def test_null_floor_is_advisory_by_default(self):
+        ws = [window(f"w{i}", 255, 0.13, 0.926, 0.005, 0.141, self.rng,
+                     null_top1=0.9304, null_dnll=0.052, null_kl_rows=np.full(255, 0.141),
+                     scale=0.01) for i in range(4)]
+        strict = v2.verdict(ws)
+        self.assertEqual(strict["state"], "FAIL")
+        self.assertFalse(strict["null_floor"]["enabled"])
+        self.assertFalse(strict["checks"]["kl"])
+        self.assertFalse(strict["checks"]["top1"])
+        self.assertTrue(strict["null_floor"]["kl"]["pass"])
+        self.assertIn("ADVISORY ONLY", v2.pooled_line(strict))
+        self.assertIn("<= 0.02", v2.pooled_line(strict))
+        allowed = v2.verdict(ws, allow_null_floor=True)
+        self.assertTrue(allowed["null_floor"]["enabled"])
+        self.assertEqual(allowed["state"], "PASS")
+        self.assertTrue(allowed["checks"]["kl"])
+        self.assertTrue(allowed["checks"]["top1"])
+        self.assertIn("enabled by explicit opt-in", v2.pooled_line(allowed))
 
     def test_null_floor_is_relax_only_and_off_for_a_clean_null(self):
         # engaged (null 0.9405 within 2 se of 0.93) but null - 0.01 = 0.9305 is above the bar: the bar stays 0.93
@@ -208,7 +227,7 @@ class Statistics(unittest.TestCase):
                      null_kl_rows=np.full(255, 0.141)) for i in range(3)]
         ws.append(window("bad", 255, 0.25, 0.93, 0.0, 0.141, self.rng, null_top1=0.9304, null_dnll=0.05,
                          null_kl_rows=np.full(255, 0.141)))   # 0.25 > 1.5 x 0.141 on its own window
-        p = v2.verdict(ws)
+        p = v2.verdict(ws, allow_null_floor=True)
         self.assertTrue(p["checks"]["kl"])                  # pooled 0.1525 <= 0.161 under the floor ...
         self.assertFalse(p["checks"]["windows"])            # ... the window still fails
         self.assertEqual(p["state"], "FAIL")

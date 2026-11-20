@@ -33,8 +33,9 @@ struct Chunk {
                                       std::uint32_t admitted_context = max_positions);
 // Host/runtime levers of the exact prefill chunk. Each one leaves every output
 // byte unchanged; a set bit in ChunkResult::levers says the lever ran for that
-// chunk (receipt engagement counter). Each is default on; STRIX_G4_PREFILL_<NAME>=0
-// turns it off. The switches are read per chunk so one process can A/B them.
+// chunk (receipt engagement counter). Existing levers are default on; STRIX_G4_PREFILL_<NAME>=0
+// turns them off. CHUNK1024 is opt-in (STRIX_G4_PREFILL_CHUNK1024=1), preserving 512-row default.
+// The switches are read per chunk so one process can A/B them.
 enum Lever : std::uint32_t {
     lever_pinned_taps = 1U << 0U, // PINNED_TAPS: taps/hidden through pinned asynchronous copies, only when consumed
     lever_device_finite = 1U << 1U, // DEVICE_FINITE: taps checked finite on the device, inside the failure fence
@@ -86,6 +87,7 @@ template <class F> void for_each_attention_piece(std::uint64_t start, unsigned r
     for (const auto& l : lever_names)
         if (l.bit == bit) {
             const auto* p = std::getenv(l.toggle);
+            if (bit == lever_chunk_1024) return p && *p && std::string_view(p) != "0";
             return !p || std::string_view(p) != "0";
         }
     return false;

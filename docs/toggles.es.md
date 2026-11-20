@@ -115,6 +115,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | Flag | Motor | Por defecto | Qué hace | Cuándo lo quiere otro hardware |
 |---|---|---|---|---|
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Orden de bloques en los kernels grandes. | `default` en GPUs con otro número de CUs. |
+| `--prefill-tile-feed bulk\|lsu` | qwen-rtx (CLI de decode del denso 27B, prefill FAST4) | `lsu` | Alimentación de etapas de las GEMM tile FAST4: `bulk` = warpgroup productor con copias bulk (optativo), `lsu` = copias por hilo y barrera de CTA de la ruta anterior. Bits idénticos en el fixture del operador. [Detalles](optimizations.md#qwen-dense-cuda-fast4-tile-bulk-feed) | Mantener `lsu` hasta validar el prefill completo. |
 | `--prefill auto` | glm | `auto` | Elige la ruta de prefill. | - |
 | `--prefill-chunk N` | glm | 512 | Tamaño de chunk de prefill en filas. | Mayor con más cómputo; menor con menos memoria. |
 | `--prefill-route windows\|large`, `--prefill-chunk N` | qwen-rtx (CLI spec 27B) | `windows` | `large`: el prompt pasa por el prefill grande del CLI de decode (`--prefill-chunk N` filas por chunk; 0 = valor del motor) y sus filas alimentan la cadena MTP. Opcional, aún sin medir frente a `windows`. | - |

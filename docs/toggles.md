@@ -120,6 +120,7 @@ The tables below list the curated flags. The full list of environment variables 
 | Flag | Engine | Default | What it does | When other hardware wants it |
 |---|---|---|---|---|
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Order of blocks in the large kernels. | `default` on GPUs with a different CU count. |
+| `--prefill-tile-feed bulk\|lsu` | qwen-rtx (dense 27B decode CLI, FAST4 prefill) | `lsu` | Stage feed of the FAST4 tile GEMMs: `bulk` = a producer warpgroup with bulk copies (opt-in), `lsu` = incumbent per-thread copies + one CTA barrier per stage. Same bits in the operator fixture. [Details](optimizations.md#qwen-dense-cuda-fast4-tile-bulk-feed) | Keep `lsu` until end-to-end prefill qualification. |
 | `--prefill auto` | glm | `auto` | Picks the prefill path. | - |
 | `--prefill-chunk N` | glm | 512 | Prefill chunk size in rows. | Larger with more compute; smaller with less memory. |
 | `--prefill-route windows\|large`, `--prefill-chunk N` | qwen-rtx (27B spec CLI) | `windows` | `large`: the prompt goes through the decode CLI's large prefill (`--prefill-chunk N` rows per chunk; 0 = engine default) and its rows feed the MTP chain. Opt-in, not yet measured against `windows`. | - |

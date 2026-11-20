@@ -1163,6 +1163,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-core-window-state-buffers-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-core-window-state-buffers-tests)
     add_test(NAME strix-core-window-state-buffers-tests COMMAND strix-core-window-state-buffers-tests)
+    add_executable(strix-core-null-perturb-tests tests/core_null_perturb_tests.cpp)
+    target_include_directories(strix-core-null-perturb-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(strix-core-null-perturb-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-core-null-perturb-tests)
+    add_test(NAME strix-core-null-perturb-tests COMMAND strix-core-null-perturb-tests)
     add_executable(strix-core-iu4-x-pairs-tests tests/core_iu4_x_pairs_tests.cpp)
     target_include_directories(strix-core-iu4-x-pairs-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_features(strix-core-iu4-x-pairs-tests PRIVATE cxx_std_20)
@@ -2835,6 +2840,10 @@ if(BUILD_TESTING)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
         set_tests_properties(strix-option-qual-core-tests strix-option-qual-end-to-end-tests PROPERTIES
             TIMEOUT 3600 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+        # FAST gate v2 statistics (per-window null-relative KL, held-out dNLL + se, route replay bookkeeping).
+        add_test(NAME strix-fast-gate-v2-tests
+            COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s tools/strix-gate -p test_gate_v2.py
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endif()
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-dual-transport-runner-tests

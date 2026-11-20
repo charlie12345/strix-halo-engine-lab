@@ -719,6 +719,12 @@ The tiled MTP prompt primes the predictor cache for each finished block in batch
 - **Off switch:** STRIX_MTP_PRIME_ROWS=0 (restart the process)
 - **Measured gain (original eight-row route only; no wider-batch timing claim):** MTP-route prompt at 262,144 tokens (YaRN f2, T8192, one node): 210.9–213.2 → 202.8–203.8 s, −8.1 to −10.0 s in three pairs; decode unchanged.
 
+**Four output rows per wave in the priming input projection.** `STRIX_MTP_PRIME_PROJ_ROWS` (default `4`; `1` restores one output row per wave; cached, restart). The fused input projection of a priming batch (embedding plus the four hyper streams, Q4 copy) was bound by L1 input loads: with one wave per output row every row reloads the token inputs of each column group, one load per FMA (about 39 µs of the ~55 µs per primed row). With four rows per wave the inputs of a two-token group are loaded once per column group and each row runs its unchanged FMA chain, reduction tree and rounding, so the outputs are bitwise those of one row per wave. The draft (decode) path is unchanged.
+
+- **Exactness evidence:** device test `strix-hip-mtp-draft-batch-tests` compares the prime-rows fusion with the one-token fusion bit for bit (2 to 64 rows, both roundings, run with `4` and with `1`); same binary, T2048, 4,096-token prompt: end-of-prompt state digest, terminal logits digest, lineage digest and tokens equal with `4` and `1`.
+- **Measured gain:** same binary, one node, 32,768-token MTP prompt (T16384), ABBA: final-block priming 618–667 ms vs 934–947 ms with `1`, prompt 20.87–21.08 s vs 21.60–21.91 s (mean −0.78 s, about −3.6 %, two pairs); 16,384 tokens: final-block priming 313–321 ms vs 455 ms (prompt difference within noise). Tokens identical; decode unchanged.
+- **Off switch:** `STRIX_MTP_PRIME_PROJ_ROWS=1` (restart)
+
 <a id="spec-context-cost"></a>
 
 ### Context-aware verify pricing (speculative drafting)

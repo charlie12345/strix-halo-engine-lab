@@ -2031,6 +2031,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-moe-route-file-tests)
     add_test(NAME strix-moe-route-file-tests COMMAND strix-moe-route-file-tests)
     set_tests_properties(strix-moe-route-file-tests PROPERTIES LABELS "cpu;gate" TIMEOUT 60)
+    # Device state image codec (long teacher-forced references carried across processes).
+    add_executable(strix-session-state-image-tests tests/session_state_image_tests.cpp)
+    target_link_libraries(strix-session-state-image-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-state-image-tests)
+    add_test(NAME strix-session-state-image-tests COMMAND strix-session-state-image-tests)
+    set_tests_properties(strix-session-state-image-tests PROPERTIES LABELS "cpu;gate" TIMEOUT 60)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-turbo-kit-tests COMMAND ${Python3_EXECUTABLE} -B
@@ -4167,6 +4173,17 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-q8-rows-heads-tests PRIVATE strix_hip_runtime strix_core)
         strix_target_warnings(strix-hip-q8-rows-heads-tests)
         add_test(NAME strix-hip-q8-rows-heads-tests COMMAND strix-hip-q8-rows-heads-tests)
+        # Decode FFN fusions: GLU projection group (q8_rows paired store) and combine with rounded expert outputs ==
+        # the separate launches, bitwise, at the Hy4 shapes; --bench times them.
+        add_executable(strix-hip-glu-pair-combine-tests tests/hip_glu_pair_combine_tests.hip)
+        set_target_properties(strix-hip-glu-pair-combine-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-glu-pair-combine-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+        target_compile_options(strix-hip-glu-pair-combine-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+            -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-glu-pair-combine-tests PRIVATE strix_hip_runtime strix_core)
+        strix_target_warnings(strix-hip-glu-pair-combine-tests)
+        add_test(NAME strix-hip-glu-pair-combine-tests COMMAND strix-hip-glu-pair-combine-tests)
         add_executable(strix-hip-gsq-dense-a8-tests tests/hip_gsq_dense_a8_tests.hip)
         set_target_properties(strix-hip-gsq-dense-a8-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -7026,6 +7043,7 @@ if(STRIX_FAMILY_HY4)
     target_compile_options(strix_hy4_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
+    target_link_libraries(strix_hy4_hip PRIVATE strix_state_cache strix_tiled_core)  # state image files; head Q8_0 transcode
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
     target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec)  # pair: shared layer pipeline + link; copy proposer

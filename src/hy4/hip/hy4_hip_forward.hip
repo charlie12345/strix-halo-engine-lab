@@ -15,11 +15,14 @@
 #include "attn_core/sparse_flash_mla.hpp"
 #include "core/f16_dense_q8a8.hpp"
 #include "core/hc_core.hpp"
+#include "core/wmma_tiled.hpp"
 #include "core/hip_range_weight_loader.hpp"
 #include "engram/hip/inject_kernel.hpp"
 #include "engram/hip/row_kernel.hpp"
 #include "moe_core/route_wave_kernel.hpp"
+#include "moe_core/route_tap_hip.hpp"
 #include "ops/glu/glu_device.hpp"
+#include "ops/glu/q8_rows_glu_pair.hpp"
 #include "ops/norm/norm_presets.hpp"
 #include "ops/rope/rope_device.hpp"
 #include "strix/a8_row_pitch.hpp"
@@ -37,6 +40,8 @@
 #include "strix/hip_mtp_draft_head.hpp"
 #include "../../hip_q8_rows_sites.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/session/checkpoint_io.hpp"
+#include "strix/session/state_image.hpp"
 #include "strix/hip_moe_a8_down.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/q51_known_rows.hpp"
@@ -73,6 +78,11 @@ constexpr hcs::Spec kHead = preset::hc_spec(hcs::Site::head);
 // RMSNorm of this model: the BF16 module's double rounding (ops/norm OutputForm::bf16_double), F32 weights, the declared
 // square root: the shared preset.
 using NormTraits = strix::ops::norm::DeclaredF32Traits<strix::ops::norm::OutputForm::bf16_double>;
+
+// Decode FFN input group (STRIX_DECODE_FUSE, default on; 0 = the separate launches): the Q8_0 Linears that read xn in ONE
+// q8_rows launch, the shared GLU projection group (ops/glu/q8_rows_glu_pair.hpp): MoE layers latent down -> z plus the
+// shared expert gate / up -> act = swiglu; the dense layer gate / up -> act. Bits unchanged (bf16 Linear store, DeclaredExp,
+// no clamp: the separate stores and swiglu launch it replaces), 3 (dense layer: 2) launches fewer.
 
 // Sparse MLA flash policies (strix/hy4/presets.hpp dsa / swa): 32 heads per group.
 struct DsaSpec {
@@ -209,6 +219,9 @@ struct Forward::Impl {
     LoadReport report;
     StepTimes times;
     bool timing = false;
+    // STRIX_DECODE_FUSE (same switch name and default as the Qwen HIP decode): FFN input group + combine with the rounded
+    // expert outputs (bits unchanged); 0 = the separate launches.
+    bool decode_fuse = strix::envcfg::flag("STRIX_DECODE_FUSE", true);
 
     std::vector<DevMem> mem;  // every allocation (weights, caches, workspace)
     std::map<std::string, Tensor> w;
@@ -238,6 +251,15 @@ struct Forward::Impl {
     float *ik = nullptr, *pooled = nullptr, *iq = nullptr, *hwraw = nullptr;
     std::uint32_t *skeys = nullptr, *hist0 = nullptr, *ilist = nullptr;
     std::uint32_t group_cap = 0;            // group-key rows per layer (context / 4, rounded up)
+    // Cross-position device state of the target (state image regions, in allocation order): every cache row a step
+    // reads, nothing else carries from one position to the next (rope tables are static, Engram reads `tokens`).
+    struct StateRegion {
+        std::string name;
+        void* p;
+        std::size_t bytes;
+    };
+    std::vector<StateRegion> state_regions;
+    std::uint32_t state_launch_rows = 0;
     std::array<std::uint32_t, 4> hpos{};    // uploaded to dpos: {position, rope slot 4g, closing group g, 0}
 
     // workspace
@@ -263,6 +285,8 @@ struct Forward::Impl {
 
     // batched prompt (prompt_rows > 0): [rows][...] workspaces of one window; attn_k_b re-laid 256 wide per layer
     std::uint32_t rmax = 0;
+    bool head_q8_on = false;                // options.head_q8 (FAST row head_q8 of strix/profiles/hy4.hpp)
+    const std::uint8_t* head_q8 = nullptr;  // Q8_0 copy of output.weight read by linear("output.weight") (decode / drafter)
     float* seam = nullptr;  // [rmax][4][hidden] X rows of a layer-pipeline window (stage of a layer split only)
     struct PromptRows {
         float *x0 = nullptr, *x1 = nullptr, *u = nullptr, *xn = nullptr, *f = nullptr, *partial = nullptr;
@@ -430,6 +454,7 @@ struct Forward::Impl {
         store_epilogue = strix::envcfg::flag("STRIX_HY4_Q8_STORE_EPILOGUE", true);
         pf_store_epilogue = strix::envcfg::flag("STRIX_HY4_PF_STORE_EPILOGUE", true);
         const std::uint32_t launch_rows = rows::cache_rows(rmax, vr.max);  // rows a launch / verify pass may write (ring sizes)
+        state_launch_rows = launch_rows;
         std::vector<std::uint32_t> seq(context + 1U);
         std::iota(seq.begin(), seq.end(), 0U);
         check(hipMemcpy(iota, seq.data(), seq.size() * 4U, hipMemcpyHostToDevice), "iota upload");
@@ -441,6 +466,7 @@ struct Forward::Impl {
             const auto k = layer_caches(c, l, context, launch_rows);
             latent_rows[l] = k.latent;
             latent[l] = alloc<std::uint16_t>(k.latent_rows * k.latent.width);
+            state_regions.push_back({"latent." + std::to_string(l), latent[l], std::size_t{k.latent_rows} * k.latent.width * 2U});
         }
         // indexer caches (token ring + group keys) and the shared scratch of the select stages
         tkeys.assign(c.layers, nullptr);
@@ -457,6 +483,8 @@ struct Forward::Impl {
             tk_rows[l] = k.token_keys;
             tkeys[l] = alloc<std::uint16_t>(k.token_rows * k.token_keys.width);
             gkeys[l] = alloc<std::uint16_t>(std::size_t{group_cap} * kIdxDim);
+            state_regions.push_back({"tkeys." + std::to_string(l), tkeys[l], std::size_t{k.token_rows} * k.token_keys.width * 2U});
+            state_regions.push_back({"gkeys." + std::to_string(l), gkeys[l], std::size_t{group_cap} * kIdxDim * 2U});
             any_indexed = true;
         }
         if (any_indexed) {
@@ -577,9 +605,30 @@ struct Forward::Impl {
         if (round) glu::launch_epilogue<glu::Round::bf16>(y, bias, outputs, outputs, y, s);
         check(hipGetLastError(), "linear epilogue launch");
     }
+    // FAST hy4-head-bf16-q8_0-v1: the BF16 output head gets a Q8_0 copy at load (shared transcode core::convert_bf16_q8_0,
+    // ggml quantize_row_q8_0_ref rule, host reference core/iu4_onfly.hpp) that linear("output.weight") reads through the
+    // q8 rows form: the decode head and the drafter head. The prompt windows and the verify rows keep the BF16 bytes.
+    void build_head_q8() {
+        if (!head_q8_on || w.find("output.weight") == w.end()) return;
+        const auto& tw = t("output.weight");
+        if (tw.type != 30U || tw.dims.size() != 2U || tw.dims[0] % 32U) throw std::runtime_error("hy4 head q8: BF16 [K % 32] head");
+        const auto K = static_cast<std::uint32_t>(tw.dims[0]), N = static_cast<std::uint32_t>(tw.dims[1]);
+        const std::size_t bytes = row_bytes(8U, K) * N;
+        auto* d = alloc<std::uint8_t>(bytes);
+        check(strix::core::convert_bf16_q8_0(reinterpret_cast<const std::uint16_t*>(tw.p), static_cast<int>(K), static_cast<int>(N), d, s),
+              "head q8 convert");
+        check(hipStreamSynchronize(s), "head q8 convert sync");
+        head_q8 = d;
+        report.queue_line += "decode head hy4-head-bf16-q8_0-v1 source_GiB=" + std::to_string(static_cast<double>(tw.bytes) / 1073741824.0) +
+                             " copy_GiB=" + std::to_string(static_cast<double>(bytes) / 1073741824.0) + "\n";
+    }
     void linear(const std::string& name, const float* x, std::uint32_t width, std::uint32_t outputs, float* y, bool round = true,
                 const float* bias = nullptr) {
         const auto& tw = t(name);
+        if (head_q8 != nullptr && name == "output.weight") {
+            if (tw.dims.at(0) != width) throw std::runtime_error("hy4 hip forward: shape of " + name);
+            return linear(head_q8, 8U, x, width, outputs, y, round, bias);
+        }
         if (tw.dims.at(0) != width || tw.bytes != row_bytes(tw.type, width) * outputs)
             throw std::runtime_error("hy4 hip forward: shape of " + name);
         linear(tw.p, tw.type, x, width, outputs, y, round, bias);
@@ -792,17 +841,45 @@ struct Forward::Impl {
         check(hipGetLastError(), "BF16 experts launch");
     }
 
+    // FFN input group of layer l (glu::Q8RowsGluPair, see above): [plain member ->] plain_out, gate / up -> act = swiglu (one launch). Falls back to
+    // one linear() per member + the swiglu launch when STRIX_DECODE_FUSE=0 or a member is not a plain Q8_0 Linear (a FAST class
+    // that replaces a member's weights takes this fallback too).
+    void ffn_input_group(std::uint32_t l, const char* plain, std::uint32_t plain_outputs, float* plain_out, const char* gate_name,
+                         const char* up_name, std::uint32_t ff) {
+        const std::uint32_t h = c.hidden;
+        const std::string pn = plain ? blk(l, plain) : std::string(), gn = blk(l, gate_name), un = blk(l, up_name);
+        const auto plain_ok = [&](const std::string& name, std::uint32_t outputs) {
+            const auto& tw = t(name);
+            if (tw.dims.at(0) != h || tw.bytes != row_bytes(tw.type, h) * outputs) throw std::runtime_error("hy4 hip forward: shape of " + name);
+            return tw.type == 8U;
+        };
+        bool grouped = decode_fuse && store_epilogue && h % 32U == 0U && (plain_outputs % 2U) == 0U;
+        if (plain) grouped = plain_ok(pn, plain_outputs) && grouped;
+        grouped = plain_ok(gn, ff) && plain_ok(un, ff) && grouped;
+        if (!grouped) {
+            if (plain) linear(pn, xn, h, plain_outputs, plain_out);
+            linear(gn, xn, h, ff, g);
+            linear(un, xn, h, ff, up);
+            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, ff, glu::no_clamp, act, s);
+            return;
+        }
+        const auto site = glu::q8_rows_glu_pair<glu::DeclaredExp, glu::Round::bf16>(xn, h, plain ? t(pn).p : nullptr, plain_outputs, plain_out,
+                                                                              t(gn).p, t(un).p, ff, act, glu::no_clamp);
+        strix::q8_rows::launch(site, false, s);
+        check(hipGetLastError(), "ffn input group launch");
+    }
+
     void ffn(std::uint32_t l) {  // xn -> f
         const std::uint32_t h = c.hidden;
         if (dense_of(l)) {
-            linear(blk(l, "ffn_gate.weight"), xn, h, c.dense_ff, g);
-            linear(blk(l, "ffn_up.weight"), xn, h, c.dense_ff, up);
-            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, c.dense_ff, glu::no_clamp, act, s);
+            ffn_input_group(l, nullptr, 0U, nullptr, "ffn_gate.weight", "ffn_up.weight", c.dense_ff);  // one node: gate / up -> act in one launch
             linear(blk(l, "ffn_down.weight"), act, c.dense_ff, h, f);
         } else {
             linear(blk(l, "ffn_gate_inp.weight"), xn, h, c.experts, rlog, false);
             strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(rlog, t(blk(l, "exp_probs_b.bias")).f(), ids, rw, 1U, s);
-            linear(blk(l, "ffn_routed_down.weight"), xn, h, c.latent, z);
+            strix::moe_core::route_tap(l, 1U, c.top_k, c.experts, ids, rw, s);  // FAST gate v2 tap (inactive: no copy)
+            // latent down -> z and the shared expert's gate / up -> act, one launch (the shared swiglu moves here)
+            ffn_input_group(l, "ffn_routed_down.weight", c.latent, z, "ffn_gate_shexp.weight", "ffn_up_shexp.weight", c.shared_ff);
             const auto& wg = t(blk(l, "ffn_gate_exps.weight"));
             const auto& wu = t(blk(l, "ffn_up_exps.weight"));
             const auto& wd = t(blk(l, "ffn_down_exps.weight"));
@@ -837,12 +914,14 @@ struct Forward::Impl {
                 a8::enqueue_down_rawdots(dq, db, s);
             }
             const std::uint64_t K = c.top_k, L = c.latent;
-            glu::launch_epilogue<glu::Round::bf16>(rawdots, nullptr, L, K * L, rawdots, s);  // each expert's down Linear output
-            strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(rw, rawdots, nullptr, acc, 1U, s);
+            // each expert's down Linear output is its bf16 rounding: read so by the combine (decode_fuse, one launch fewer) or
+            // stored here
+            if (!decode_fuse) glu::launch_epilogue<glu::Round::bf16>(rawdots, nullptr, L, K * L, rawdots, s);
+            if (decode_fuse)
+                strix::moe_core::enqueue_combine_rounded_eo<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(rw, rawdots, nullptr, acc, 1U, s);
+            else
+                strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(rw, rawdots, nullptr, acc, 1U, s);
             linear(blk(l, "ffn_routed_up.weight"), acc, c.latent, h, routed);
-            linear(blk(l, "ffn_gate_shexp.weight"), xn, h, c.shared_ff, g);
-            linear(blk(l, "ffn_up_shexp.weight"), xn, h, c.shared_ff, up);
-            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, c.shared_ff, glu::no_clamp, act, s);
             linear(blk(l, "ffn_down_shexp.weight"), act, c.shared_ff, h, shared);
             strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 1U, 3072U>(nullptr, routed, shared, f, 1U, s);
         }
@@ -1192,6 +1271,7 @@ struct Forward::Impl {
             const std::uint64_t K = c.top_k, L = c.latent;
             linear_rows(blk(l, "ffn_gate_inp.weight"), pr.xn, h, c.experts, R, pr.rlog, false);
             strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(pr.rlog, t(blk(l, "exp_probs_b.bias")).f(), pr.ids, pr.rw, R, s);
+            strix::moe_core::route_tap(l, R, c.top_k, c.experts, pr.ids, pr.rw, s);
             linear_rows(blk(l, "ffn_routed_down.weight"), pr.xn, h, c.latent, R, pr.z);
             check(dcr::store_rows({pr.z, L, nullptr, 0U, R, {c.latent, 0U}, pr.zb, flag}, s), "expert input rows (bf16)");
             experts_rows(l, R);
@@ -1468,9 +1548,9 @@ struct Forward::Impl {
         void* sp = nullptr;
         check(hipHostMalloc(&sp, kNextnRows * sizeof(Staging), hipHostMallocDefault), "next-token row staging");
         nx.stages = static_cast<Staging*>(sp);
-        void* tp = nullptr;
-        check(hipHostMalloc(&tp, kNextnRows * sizeof(std::uint32_t), hipHostMallocDefault), "next-token ids");
-        nx.top = static_cast<std::uint32_t*>(tp);
+        void* top_host = nullptr;
+        check(hipHostMalloc(&top_host, kNextnRows * sizeof(std::uint32_t), hipHostMallocDefault), "next-token ids");
+        nx.top = static_cast<std::uint32_t*>(top_host);
         std::fill(nx.top, nx.top + kNextnRows, 0U);
         if (vr.max >= 2U) {  // the rows form runs through the verify workspace (allocate_verify before this)
             nx.xr = alloc<float>(std::size_t{vr.max} * h);
@@ -1687,6 +1767,7 @@ Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
         throw std::invalid_argument("hy4 hip forward: prompt rows must be a multiple of 8, at least 16");
     if (o.verify_rows > rows::kMaxVerifyRows) throw std::invalid_argument("hy4 hip forward: verify rows outside 0..8");
     impl_->vr.max = o.verify_rows;
+    impl_->head_q8_on = o.head_q8;
     impl_->nx.on = o.nextn;  // before load(): wanted() admits the next-token block
     impl_->nx.head = o.nextn_head;
     if (o.nextn && (impl_->first != 0U || impl_->last != impl_->c.layers || impl_->c.nextn != 1U))
@@ -1694,6 +1775,7 @@ Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
     check(hipStreamCreateWithFlags(&impl_->s, hipStreamNonBlocking), "stream");
     impl_->load(o.parts);
     impl_->allocate();
+    impl_->build_head_q8();
     if (impl_->rmax) impl_->allocate_prompt();
     if (impl_->vr.max) impl_->allocate_verify();
     if (impl_->nx.on) impl_->allocate_nextn();
@@ -1788,6 +1870,58 @@ void Forward::reset() noexcept {
     impl_->pos = 0;
     impl_->tokens.clear();
     impl_->times = {};
+}
+const std::vector<std::uint32_t>& Forward::token_history() const noexcept { return impl_->tokens; }
+std::string Forward::state_layout() const {
+    const auto& m = *impl_;
+    std::string key = "hy4-hip-state v1 layers=" + std::to_string(m.c.layers) + " first=" + std::to_string(m.first) +
+                      " last=" + std::to_string(m.last) + " context=" + std::to_string(m.context) +
+                      " launch_rows=" + std::to_string(m.state_launch_rows) + " regions=" + std::to_string(m.state_regions.size());
+    for (const auto& r : m.state_regions) key += " " + r.name + ":" + std::to_string(r.bytes);
+    return key;
+}
+void Forward::save_state(const std::filesystem::path& file) const {
+    auto& m = *impl_;
+    if (m.nx.on) throw std::logic_error("hy4 state image: the next-token block's caches are not in the image (nextn off)");
+    if (m.vr.rows != 0U) throw std::logic_error("hy4 state image: save between a verify pass and its commit_rows");
+    namespace si = strix::session::state_image;
+    si::Image im;
+    im.layout = state_layout();
+    im.position = m.pos;
+    im.tokens = m.tokens;
+    check(hipStreamSynchronize(m.s), "state image sync");
+    for (const auto& r : m.state_regions) {
+        si::Region reg{r.name, std::vector<std::byte>(r.bytes)};
+        check(hipMemcpy(reg.bytes.data(), r.p, r.bytes, hipMemcpyDeviceToHost), "state image read");
+        im.regions.push_back(std::move(reg));
+    }
+    const auto bytes = si::encode(im);
+    strix::session::checkpoint_io::atomic_write(file, bytes);
+}
+void Forward::load_state(const std::filesystem::path& file) {
+    auto& m = *impl_;
+    if (m.nx.on) throw std::logic_error("hy4 state image: the next-token block's caches are not in the image (nextn off)");
+    if (m.vr.rows != 0U) throw std::logic_error("hy4 state image: load between a verify pass and its commit_rows");
+    namespace si = strix::session::state_image;
+    std::vector<std::uint8_t> raw;
+    strix::session::checkpoint_io::read(file, raw, strix::session::checkpoint_io::DirectIo::buffered, false);
+    auto im = si::decode(std::as_bytes(std::span<const std::uint8_t>(raw)), state_layout());
+    raw = {};
+    if (im.tokens.size() != im.position || im.position > m.context)
+        throw std::runtime_error("hy4 state image: position " + std::to_string(im.position) + " with " + std::to_string(im.tokens.size()) +
+                                 " tokens (context " + std::to_string(m.context) + ")");
+    if (im.regions.size() != m.state_regions.size()) throw std::runtime_error("hy4 state image: region count");
+    for (std::size_t i = 0; i < im.regions.size(); ++i) {
+        const auto& r = m.state_regions[i];
+        if (im.regions[i].name != r.name || im.regions[i].bytes.size() != r.bytes)
+            throw std::runtime_error("hy4 state image: region " + im.regions[i].name + " is not " + r.name);
+        check(hipMemcpy(r.p, im.regions[i].bytes.data(), r.bytes, hipMemcpyHostToDevice), "state image write");
+    }
+    for (const auto t : im.tokens)
+        if (t >= m.c.vocab) throw std::runtime_error("hy4 state image: token outside the vocabulary");
+    m.pos = static_cast<std::uint32_t>(im.position);
+    m.tokens.assign(im.tokens.begin(), im.tokens.end());
+    m.times = {};
 }
 void Forward::set_timing(bool on) noexcept { impl_->timing = on; }
 const StepTimes& Forward::times() const noexcept { return impl_->times; }

@@ -273,7 +273,10 @@ void campaign_defaults_contract(){
         "batch route: STRIX_BATCH_NGRAM=ctx builds the default context drafter over the extension mode");
     for(const auto& [flag,ctx]:{std::pair<const char*,bool>{"--mtp-ngram-draft=copy",true},{"--mtp-ngram-draft=ctx",true},
                                 {"--mtp-ngram-draft=on",false}}) {
-        auto served=request();served.push_back(flag);
+        auto served=request();served.insert(served.end(),{"--mtp-draft-chain","--mtp-target-window-rows","8","--mtp-window-prefix",
+            "--mtp-window-capture-bytes","8192","--mtp-window-checkpoint-bytes","8192",
+            "--mtp-window-total-bytes","32768","--mtp-window-arena-bytes","8192","--mtp-window-history-intervals","32",flag});
+        set(served,"--mtp-candidate-depth","7");
         const auto lookup=mtp_batch_lookup(parse(served).mtp,nullptr);
         require(lookup.on && !lookup.default_context && parse(served).mtp.ngram_context==ctx,"batch route honours the parsed mode");
     }

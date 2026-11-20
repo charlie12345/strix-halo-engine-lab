@@ -181,11 +181,11 @@ void tests(std::mt19937& rng) {
                     same(rows, ("decode ring " + std::to_string(ring) + " rows/wave " + std::to_string(rpw)).c_str());
                 }
         if (rows <= 8)  // short-context form (first_out = kProjQ): ik bit for bit, iq never written
-            for (int form = 0; form < 5; ++form) {
+            for (int form = 0; form < 6; ++form) {
                 ma::IndexProjView kv{x, w.packed, iq, ik, rows};
                 kv.first_out = ma::kProjQ;
                 if (form == 4) ma::enqueue_index_proj(kv, nullptr);  // the decode route
-                else ma::enqueue_index_proj_decode(kv, form < 2 ? 16U : 32U, nullptr, (form & 1) != 0 ? 2U : 0U);
+                else ma::enqueue_index_proj_decode(kv, form == 5 ? 48U : form < 2 ? 16U : 32U, nullptr, (form & 1) != 0 ? 2U : 0U);
                 hip_ok(hipDeviceSynchronize(), "sync");
                 const auto c = host(ik, std::size_t(rows) * ma::kProjK), d = host(rk, std::size_t(rows) * ma::kProjK);
                 const auto q = host(iq, std::size_t(maxT) * ma::kProjQ);
@@ -613,11 +613,14 @@ void bench_keyonly(std::mt19937& rng) {
     hipEvent_t e0, e1;
     hip_ok(hipEventCreate(&e0), "event");
     hip_ok(hipEventCreate(&e1), "event");
-    auto run = [&](unsigned rows, bool key_only) {
+    // ring 0 = the decode route; ring 48 = the deepest register ring (4 waves carry the key-only launch: loads in flight
+    // per wave, not bandwidth, bound it), same row split as the route.
+    auto run = [&](unsigned rows, bool key_only, unsigned ring = 0) {
         auto one = [&](unsigned l) {
             ma::IndexProjView v{x, ws[l].packed, iq, ik, rows};
             v.first_out = key_only ? ma::kProjQ : 0U;
-            ma::enqueue_index_proj(v, st);
+            if (ring == 0) ma::enqueue_index_proj(v, st);
+            else ma::enqueue_index_proj_decode(v, ring, st, rows > 2 ? 2U : 0U);
         };
         one(0);
         hip_ok(hipEventRecord(e0, st), "rec");
@@ -630,19 +633,21 @@ void bench_keyonly(std::mt19937& rng) {
         return 1000.0 * ms / (10.0 * L);
     };
     for (unsigned rows : {1U, 2U, 4U, 8U}) {
-        std::vector<double> ta, tb;
+        std::vector<double> ta, tb, tc;
         std::string runs;
         for (int round = 0; round < 4; ++round) {
-            const double a = run(rows, false), bb = run(rows, true);
+            const double a = run(rows, false), bb = run(rows, true), cc = run(rows, true, 48U);
             ta.push_back(a);
             tb.push_back(bb);
-            char s[48];
-            std::snprintf(s, sizeof s, " [%.1f %.1f]", a, bb);
+            tc.push_back(cc);
+            char s[64];
+            std::snprintf(s, sizeof s, " [%.1f %.1f %.1f]", a, bb, cc);
             runs += s;
         }
-        const double ma_ = median(ta), mb = median(tb);
-        std::printf("KEYONLY rows %u us/layer: all %.1f key-only %.1f (B/A %.3f) saved %.1f us/layer = %.3f ms per 60-layer token  ABAB:%s\n",
-                    rows, ma_, mb, mb / ma_, ma_ - mb, 60.0 * (ma_ - mb) / 1000.0, runs.c_str());
+        const double ma_ = median(ta), mb = median(tb), mc = median(tc);
+        std::printf("KEYONLY rows %u us/layer: all %.1f key-only %.1f (B/A %.3f) key-only ring48 %.1f (C/A %.3f); saved B %.3f C %.3f ms per"
+                    " 60-layer token  ABC:%s\n",
+                    rows, ma_, mb, mb / ma_, mc, mc / ma_, 60.0 * (ma_ - mb) / 1000.0, 60.0 * (ma_ - mc) / 1000.0, runs.c_str());
     }
     for (void* p : {static_cast<void*>(x), static_cast<void*>(iq), static_cast<void*>(ik)}) (void)hipFree(p);
     for (auto& w : ws) free_weights(w);

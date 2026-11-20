@@ -505,7 +505,7 @@ void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {
     const unsigned ring = ring_override();
     const unsigned lds = v.rows >= 2 && v.rows <= 8 ? lds_default() : 0U;
     const unsigned split = v.rows <= 8 && v.rows > 2 && lds == 0 ? split_default() : 0U;
-    const auto choice = route::index_route(v.rows, ring, split, lds);
+    const auto choice = route::index_route(v.rows, ring, split, lds, v.first_out != 0);
     if (choice.lds) enqueue_index_proj_decode_lds(v, stream);
     else if (!choice.tiled) enqueue_index_proj_decode(v, choice.ring, stream, choice.rows_per_wave);
     else enqueue_index_proj_slab(v, stream);  // same bits as enqueue_index_proj_tiled

@@ -375,7 +375,11 @@ It changes what they are measured on:
 
 On some engines the exact null itself fails a pooled bar: on GLM-5.3 (4 windows x 255 rows) the one-ulp null scores
 pooled KL 0.141 and dNLL +0.052 against the exact reference, and top-1 0.9304 (se 0.008), so no arm, the exact null
-included, could pass KL <= 0.02. A pooled bar is then judged against the pooled null of the same windows:
+included, could pass KL <= 0.02. **By default, these calculations are advisory only:** the gate still judges
+PASS/FAIL with the original absolute pooled bars. `qual --allow-null-floor` explicitly opts into using the relaxed
+null-relative bars to decide PASS/FAIL; the JSON records `pooled.null_floor.enabled`. Without the opt-in, a candidate
+failing any absolute pooled bar remains FAIL, regardless of the advisory null-floor result.
+When explicitly enabled, a pooled bar is judged against the pooled null of the same windows:
 
 | bar | engaged when the pooled null ... | limit when engaged (relax-only) |
 |---|---|---|

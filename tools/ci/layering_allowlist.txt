@@ -452,3 +452,4 @@ tu-include src/cuda/models/minimax/mm_fp32_identity_tests.cu 1
 tu-include src/glm/xfer/glm_xfer.hip 1
 tu-include src/hip_deepseek41_prefill_xport.hip 1
 tu-include src/minimax/xfer/minimax_xfer.hip 1
+tu-include src/xport/tp_gather.hip 1

@@ -580,7 +580,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
 
-### Debug only (3)
+### Debug only (7)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -588,3 +588,6 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_ROUTE_RECEIPT` | platform | ON | [platform-route-receipt](optimizations.md#platform-route-receipt) |
 | `STRIX_DS41_OB_READY_EPILOGUE` | deepseek | auto | [ds-ready](optimizations.md#ds-ready) |
 | `STRIX_SERVE_BACKEND_PROBE` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
+| `STRIX_MOE_ROUTES_OUT` | qwen-rtx (shared MoE route tap) | off | FAST gate: record every router call's expert ids and weights to FILE; [route tap](../include/strix/moe/route_file.hpp) |
+| `STRIX_MOE_ROUTES_IN` | qwen-rtx (shared MoE route tap) | off | FAST gate: replay recorded ids and weights call by call (layer, rows, top-k must match); [route tap](../include/strix/moe/route_file.hpp) |
+| `STRIX_MOE_ROUTE_NULL` | qwen-rtx (shared MoE route tap) | off | FAST gate null control `LAYER[:SEED]`: layer's selected weights move by one FP32 ulp; [route tap](../include/strix/moe/route_file.hpp) |

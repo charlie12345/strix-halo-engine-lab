@@ -409,6 +409,11 @@ target_include_directories(strix_ds41_http_session_owner PUBLIC src)
 target_link_libraries(strix_ds41_http_session_owner PUBLIC strix_session_owner)
 strix_target_warnings(strix_ds41_http_session_owner)
 if(BUILD_TESTING)
+    # CPU-only checks against the real HIP find_library command (toolkit priority and legacy fallback).
+    add_test(NAME strix-hip-toolkit-lookup-tests
+        COMMAND "${CMAKE_COMMAND}" "-DSTRIX_REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                -P "${CMAKE_SOURCE_DIR}/tests/cmake/hip_toolkit_paths_tests.cmake")
+    set_tests_properties(strix-hip-toolkit-lookup-tests PROPERTIES LABELS "cpu;build")
     add_executable(strix-exact-reduce-contract-tests tests/exact_reduce_contract_tests.cpp)
     target_compile_features(strix-exact-reduce-contract-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-exact-reduce-contract-tests)
@@ -3169,18 +3174,19 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     # CMake's HIP language drives device compilation directly. ROCm 7.x
     # development images do not necessarily ship the legacy hipConfig.cmake /
     # hip::host package target, so locate the runtime header/library from the
-    # toolkit instead of requiring that package surface.
+    # toolkit instead of requiring that package surface. The compiler's own ROCm root comes before
+    # /opt/rocm so a toolkit selected only by CMAKE_HIP_COMPILER gets its own headers and runtime.
     find_path(
         STRIX_HIP_INCLUDE_DIR
         NAMES hip/hip_runtime.h
-        HINTS "$ENV{ROCM_PATH}" /opt/rocm
+        HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" /opt/rocm
         PATH_SUFFIXES include
         REQUIRED
     )
     find_library(
         STRIX_HIP_RUNTIME_LIBRARY
         NAMES amdhip64
-        HINTS "$ENV{ROCM_PATH}" /opt/rocm
+        HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" /opt/rocm
         PATH_SUFFIXES lib lib64
         REQUIRED
     )
@@ -5206,7 +5212,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     option(STRIX_DS41_PREFILL_FP16_LT "Build optional FP16 dense prefill backend" OFF)
     if(STRIX_DS41_PREFILL_FP16_LT)
-        find_library(STRIX_HIPBLASLT_LIBRARY NAMES hipblaslt PATHS /opt/rocm/lib /opt/rocm/core-10.1/lib REQUIRED)
+        # Same toolkit as the HIP compiler: ROCM_PATH, then the compiler's ROCm root, then the system default.
+        find_library(STRIX_HIPBLASLT_LIBRARY NAMES hipblaslt
+            HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" PATH_SUFFIXES lib lib64
+            PATHS /opt/rocm /opt/rocm/core-10.1 REQUIRED)
         target_sources(strix_ds41_layer_hip PRIVATE src/hip_ds41_dense_fp16.hip)
         target_link_libraries(strix_ds41_layer_hip PUBLIC "${STRIX_HIPBLASLT_LIBRARY}")
         get_filename_component(strix_hipblaslt_real "${STRIX_HIPBLASLT_LIBRARY}" REALPATH)

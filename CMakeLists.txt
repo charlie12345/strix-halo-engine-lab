@@ -1336,6 +1336,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-core-dense-iu4-rows-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-core-dense-iu4-rows-tests)
     add_test(NAME strix-core-dense-iu4-rows-tests COMMAND strix-core-dense-iu4-rows-tests)
+    add_executable(strix-q8-0-rule-tests tests/q8_0_rule_tests.cpp)
+    target_include_directories(strix-q8-0-rule-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(strix-q8-0-rule-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-q8-0-rule-tests)
+    add_test(NAME strix-q8-0-rule-tests COMMAND strix-q8-0-rule-tests)
     add_executable(strix-spec-mtp-chain-tests tests/spec_mtp_chain_tests.cpp)
     target_link_libraries(strix-spec-mtp-chain-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-mtp-chain-tests)
@@ -3740,7 +3745,7 @@ int main() { return 0; }"
         strix_target_warnings(strix-hip-dense-rows-wave-tests)
         add_test(NAME strix-hip-dense-rows-wave-tests COMMAND strix-hip-dense-rows-wave-tests)
         set_tests_properties(strix-hip-dense-rows-wave-tests PROPERTIES SKIP_RETURN_CODE 77)
-        # Rows tile of launch_hip_dense_rows == one single-row launch per row (bitwise); router timing printed.
+        # Rows tile and grouped rows of launch_hip_dense_rows == one single-row launch per row / group (bitwise); timing printed.
         add_executable(strix-hip-dense-rows-tile-tests tests/hip_dense_rows_tile_tests.hip)
         set_target_properties(strix-hip-dense-rows-tile-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")

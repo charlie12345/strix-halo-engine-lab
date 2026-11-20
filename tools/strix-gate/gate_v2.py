@@ -236,7 +236,7 @@ def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
             "null": arm_receipt.get("null")}
 
 
-def verdict(windows, flips=None, limits=LIMITS):
+def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
     """Pooled + per-window verdict. windows: window_stats dicts with their per-row arrays under '_rows'."""
     if len({w["name"] for w in windows}) != len(windows):
         raise GateError("duplicate window in pooled evidence")
@@ -251,7 +251,8 @@ def verdict(windows, flips=None, limits=LIMITS):
         raise GateError(f"{d.size} scored dNLL rows pooled, v2 needs at least {limits['min_rows']} (se {se:.4f})")
     floor = null_floor(windows, pooled, limits)
     pooled["null_floor"] = floor
-    checks = {b: floor[b]["pass"] for b in FLOOR_BARS}
+    floor["enabled"] = bool(allow_null_floor)
+    checks = {b: floor[b]["pass"] if allow_null_floor else floor[b]["absolute_pass"] for b in FLOOR_BARS}
     checks["windows"] = all(w["state"] != "fail" for w in windows)
     pooled["classes"] = class_verdicts(windows, limits)
     final_pass = {c["name"] for c in pooled["classes"] if c["final"] and c["state"] == "pass"}
@@ -341,7 +342,8 @@ def floor_line(p):
     tail = ("not applied (every pooled null measurably inside its bar)" if not f["applied"] else
             f"applied to {','.join(f['applied'])}" + (f"; these pooled bars pass ONLY under the floor: {','.join(f['decisive'])}"
                                                       if f["decisive"] else ""))
-    return f"NULL-FLOOR (pooled null of the same windows, z {f['z']:g}): " + "; ".join(parts) + f" -> {tail}"
+    policy = "enabled by explicit opt-in" if f["enabled"] else "ADVISORY ONLY; absolute pooled limits govern PASS/FAIL"
+    return f"NULL-FLOOR ({policy}; pooled null of the same windows, z {f['z']:g}): " + "; ".join(parts) + f" -> {tail}"
 
 
 def class_verdicts(windows, limits=LIMITS):
@@ -417,7 +419,7 @@ def pooled_line(p):
                if x) + " (examine the exact path on those windows, then re-run)", "PASS": ""}[p["state"]]
     lines = [class_line(c) for c in p.get("classes", [])]
     lines.append(floor_line(p))
-    lim = {b: p["null_floor"][b]["limit"] for b in FLOOR_BARS}
+    lim = {b: p["null_floor"][b]["limit" if p["null_floor"]["enabled"] else "absolute"] for b in FLOOR_BARS}
     lines.append(f"POOLED v2 rows {p['rows']} (dNLL rows {p['dnll_rows']}, >= {LIMITS['min_rows']}): KL {p['kl']:.5f} "
                  f"(<= {lim['kl']:.5g}) top-1 {p['top1']:.4f} (>= {lim['top1']:.5g}) dNLL {p['dnll']:+.5f} (<= "
                  f"{lim['dnll']:+.5g}) se {p['dnll_se']:.5f}{fl} -> {p['state']}"
@@ -559,7 +561,7 @@ def qual(a):
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
-    p = verdict(windows, flips if flips else None)
+    p = verdict(windows, flips if flips else None, allow_null_floor=a.allow_null_floor)
     print(pooled_line(p))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": LIMITS, "ref": a.ref, "cand": a.cand, "null": a.null,
@@ -603,6 +605,7 @@ def main(argv=None):
     q.add_argument("--classes", help="JSON {case: content class} declared before scoring (default: prompt-length band "
                    "with --manifest, else one class)")
     q.add_argument("--json")
+    q.add_argument("--allow-null-floor", action="store_true", help="explicitly opt in to relaxed pooled acceptance bars; default keeps absolute FAST limits")
     a = ap.parse_args(argv)
     try:
         return qual(a)

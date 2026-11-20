@@ -3172,6 +3172,10 @@ int main() { return 0; }"
             add_test(NAME strix-hip-mtp-${mtp_fixture}-tests COMMAND strix-hip-mtp-${mtp_fixture}-tests)
             set_tests_properties(strix-hip-mtp-${mtp_fixture}-tests PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
+        # Prompt priming with one output row per wave (STRIX_MTP_PRIME_PROJ_ROWS=1) against the same one-token reference.
+        add_test(NAME strix-hip-mtp-draft-batch-one-row-prime-tests COMMAND strix-hip-mtp-draft-batch-tests)
+        set_tests_properties(strix-hip-mtp-draft-batch-one-row-prime-tests PROPERTIES SKIP_RETURN_CODE 77
+            ENVIRONMENT "STRIX_MTP_PRIME_PROJ_ROWS=1")
         # Callable fixture requires actual independently supplied component goldens.
         # Building this source library does not execute or qualify the components.
         add_library(strix_mtp_projection_component_fixtures STATIC tests/hip_mtp_projection_components.hip tests/hip_mtp_shared_expert_components.hip tests/hip_mtp_target_window_components.hip tests/hip_mtp_greedy_cycle_components.hip)

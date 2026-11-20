@@ -483,6 +483,13 @@ if(BUILD_TESTING)
     target_compile_features(strix-attention-row-walk-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-attention-row-walk-host-tests)
     add_test(NAME strix-attention-row-walk-host-tests COMMAND strix-attention-row-walk-host-tests)
+    # Transposed butterfly halving of the CUDA decode attention scores: bits == the contract's per-dot xor butterfly.
+    add_executable(strix-attention-score-reduce-host-tests tests/attention_score_reduce_host_tests.cpp)
+    target_include_directories(strix-attention-score-reduce-host-tests PRIVATE include)
+    target_compile_features(strix-attention-score-reduce-host-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-attention-score-reduce-host-tests)
+    target_link_libraries(strix-attention-score-reduce-host-tests PRIVATE Threads::Threads)
+    add_test(NAME strix-attention-score-reduce-host-tests COMMAND strix-attention-score-reduce-host-tests)
     # K/V cache storage classes (strix/kv_storage.hpp): bytes, role / tier policy, quantiser layouts, draft-cache ids == serial.
     add_executable(strix-kv-storage-tests tests/kv_storage_tests.cpp)
     target_include_directories(strix-kv-storage-tests PRIVATE include)

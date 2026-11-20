@@ -72,7 +72,20 @@ int main() {
         threw = true;
     }
     check(threw, "switch: other values fail closed");
+    const auto recorded = strix::envcfg::registered();
+    const auto entry = std::find_if(recorded.begin(), recorded.end(), [](const auto& e) {
+        return e.name == "STRIX_SELECT_SHORT_SKIP";
+    });
+    check(entry != recorded.end() && entry->set && entry->value == "yes",
+          "switch: invalid user setting is recorded for diagnosis");
     set_env(nullptr);
+    check(ss::query_skip_enabled(), "switch: unset restores default");
+    const auto defaults = strix::envcfg::registered();
+    const auto unconfigured = std::find_if(defaults.begin(), defaults.end(), [](const auto& e) {
+        return e.name == "STRIX_SELECT_SHORT_SKIP";
+    });
+    check(unconfigured != defaults.end() && !unconfigured->set && unconfigured->value.empty(),
+          "switch: default is recorded as unset");
 
     std::printf("sparse_select_policy: %s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

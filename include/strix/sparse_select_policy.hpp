@@ -13,6 +13,8 @@
 //   topk_units           units the selector keeps;
 //   partial_unit_scored  true: the newest unfinished unit is scored too (units = ceil((pos + 1) / unit)); false: only
 //                        completed units are scored and the unfinished tail is always attended (floor).
+#include "strix/env_flags.hpp"
+
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -46,7 +48,7 @@ template <class Row, class PosOf> bool step_selection_is_identity(const Geometry
 // STRIX_SELECT_SHORT_SKIP: unset / empty / "1" = on (skip the dead indexer query work), "0" = off (compute it anyway,
 // the previous form); other values fail closed. Engines read it once at startup (not per layer call).
 inline bool query_skip_enabled() {
-    const char* e = std::getenv("STRIX_SELECT_SHORT_SKIP");
+    const char* e = strix::envcfg::text("STRIX_SELECT_SHORT_SKIP");
     if (e == nullptr || *e == '\0' || std::strcmp(e, "1") == 0) return true;
     if (std::strcmp(e, "0") == 0) return false;
     throw std::invalid_argument("STRIX_SELECT_SHORT_SKIP must be 0 or 1");

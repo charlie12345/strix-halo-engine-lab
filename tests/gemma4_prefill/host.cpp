@@ -2,6 +2,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -36,7 +37,23 @@ int main() try {
     {
         bool named = false;
         for (const auto& l : pf::lever_names) named = named || (l.bit == pf::lever_chunk_1024 && std::string_view(l.toggle) == "STRIX_G4_PREFILL_CHUNK1024");
-        require(named, "chunk_1024 lever off switch");
+        require(named, "chunk_1024 opt-in switch");
+        // Preserve the legacy 512-row scheduling until a deployment explicitly enables CHUNK1024.
+        const auto set_chunk = [](const char* v) {
+#if defined(_WIN32)
+            return _putenv_s("STRIX_G4_PREFILL_CHUNK1024", v ? v : "") == 0;
+#else
+            return v ? setenv("STRIX_G4_PREFILL_CHUNK1024", v, 1) == 0
+                     : unsetenv("STRIX_G4_PREFILL_CHUNK1024") == 0;
+#endif
+        };
+        require(set_chunk(nullptr), "reset chunk switch");
+        require(!pf::lever_enabled(pf::lever_chunk_1024), "chunk_1024 stays off by default");
+        require(pf::lever_enabled(pf::lever_pinned_taps), "existing levers remain on by default");
+        require(set_chunk("1") && pf::lever_enabled(pf::lever_chunk_1024), "chunk_1024 explicitly enabled");
+        require(set_chunk("0") && !pf::lever_enabled(pf::lever_chunk_1024), "chunk_1024 explicitly disabled");
+        require(set_chunk(nullptr) && !pf::lever_enabled(pf::lever_chunk_1024), "chunk_1024 unset restores legacy");
+
         const auto chunks = [](std::uint64_t position, std::uint64_t end, std::uint64_t chunk) {
             std::vector<std::pair<std::uint64_t, unsigned>> out;
             while (position < end) {

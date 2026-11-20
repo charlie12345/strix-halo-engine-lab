@@ -1145,7 +1145,7 @@ struct MtpBatchRequest {
     std::vector<std::uint32_t> stop_tokens;
     std::shared_ptr<TokenSampler> sampler; // null: first-max selection
     // Request field "ngram_draft": true/false forces this request's context draft source on/off (greedy only);
-    // absent: the engine's batch setting (STRIX_BATCH_NGRAM, off by default).
+    // absent: the engine's --mtp-ngram-draft mode as on the single route (mtp_batch_lookup; STRIX_BATCH_NGRAM overrides).
     std::optional<bool> ngram_draft;
     std::uint32_t draft_depth_max = 0; // request field "draft_depth_max": predictor drafts per cycle at most (0: engine)
     std::optional<bool> tool_draft;    // request field "tool_draft": strict tool-call frames (unset: STRIX_BATCH_TOOL_DRAFT)
@@ -2958,15 +2958,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 runner.slots_capacity=parents->batch_capacity?parents->batch_capacity:runner.slots();
                 runner.growth_memory_ok=parents->batch_memory_ok;
                 if(parents->grow_batch_slot) runner.grow_factory=[&] {return prepare_slot(parents->grow_batch_slot(), runner.slots());};
-                // Prompt lookup in batched decoding (opt-in, off by default): STRIX_BATCH_NGRAM=1 the n-gram extension
-                // (the single request's default source), =ctx the context drafter (--mtp-ngram-draft=ctx); a request's
-                // "ngram_draft" field forces it on/off. Solo cycles use it as a single request does; cohort cycles keep
-                // only context rows at the chain gate (STRIX_BATCH_NGRAM_GATE, default 0.9). Greedy requests only.
+                // Prompt lookup in batched decoding: the engine's --mtp-ngram-draft mode, resolved and built as for the
+                // single request (mtp_batch_lookup + enable_ngram: auto where admissible, =on/ctx/copy/wide required,
+                // =off none); STRIX_BATCH_NGRAM overrides it (0 = off switch). A request's "ngram_draft" field forces it
+                // on/off. Solo cycles use it as a single request does; cohort cycles keep only context rows at the chain
+                // gate (STRIX_BATCH_NGRAM_GATE, default 0.9). Greedy requests only.
                 {
-                    const char* mode_env=std::getenv("STRIX_BATCH_NGRAM");
-                    const std::string mode=mode_env?mode_env:"";
-                    const bool engine_on=mode=="1" || mode=="on" || mode=="ctx";
-                    const bool use_context=mode=="ctx" || m.ngram_context;
+                    const auto lookup=mtp_batch_lookup(m,std::getenv("STRIX_BATCH_NGRAM"));
                     runner.wide_rows=wide_rows;
                     if(!runner.wide_rows.empty()) {
                         // Startup check of the owners the wide cycle needs (same lookup the cycle builds from), so a
@@ -2982,13 +2980,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         }
                         runner.enable_wide=[&enable_ngram](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt){enable_ngram(greedy,prompt);};
                     }
-                    runner.enable_context=[engine_on,use_context,ngram_config,&m](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt,
+                    runner.enable_context=[lookup,&enable_ngram,&m](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt,
                         const std::shared_ptr<TokenSampler>& request_sampler,std::optional<bool> request) {
-                        if(!(request?*request:engine_on) || request_sampler || !greedy.window_verifier() ||
+                        if(!(request?*request:lookup.on) || request_sampler || !greedy.window_verifier() ||
                            greedy.window_verifier()->survival_controller() || !m.draft_chain) return;
-                        if(!use_context) {greedy.enable_ngram_draft(prompt,ngram_config());return;}
-                        MtpContextDraftConfig context;context.copy_edit=m.ngram_copy_edit;
-                        greedy.enable_context_draft(prompt,context,false);
+                        if(!lookup.default_context) {enable_ngram(greedy,prompt);return;}
+                        greedy.enable_context_draft(prompt,MtpContextDraftConfig{},false);
                     };
                 }
                 runner.calibration={calibration_rows,calibration_ms,replay.observation.maximum_hidden_abs_error,

@@ -223,6 +223,22 @@ inline bool mtp_ngram_draft_admissible(const MtpCliOptions& m) noexcept {
 inline bool mtp_ngram_draft_requested(const MtpCliOptions& m) noexcept {
     return m.ngram_draft || (!m.ngram_off && mtp_ngram_draft_admissible(m));
 }
+// Prompt lookup on the batched HTTP route: the engine's --mtp-ngram-draft mode resolved exactly as for the single
+// request and the CLI (one resolver; =copy / =ctx / =wide configure the drafter through the same builder).
+// STRIX_BATCH_NGRAM overrides it when set: 0 / off none, 1 / on the engine's source, ctx the context drafter with its
+// default configuration when the engine mode is not a context mode. A request's "ngram_draft" field still forces it.
+struct MtpBatchLookup {
+    bool on = false;
+    bool default_context = false; // build the default context drafter instead of the engine mode's source
+};
+inline MtpBatchLookup mtp_batch_lookup(const MtpCliOptions& m, const char* env) noexcept {
+    if(env && *env) {
+        const std::string_view v(env);
+        const bool context = v == "ctx";
+        return {v == "1" || v == "on" || context, context && !m.ngram_context};
+    }
+    return {mtp_ngram_draft_requested(m), false};
+}
 // Fill the sidecar pins of --mtp-draft-profile that were not given; a given pin must agree.
 inline void apply_mtp_draft_profile(MtpCliOptions& m) {
     if(m.draft_profile.empty()) return;

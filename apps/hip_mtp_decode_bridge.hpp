@@ -629,8 +629,10 @@ public:
         // STRIX_RTX_EXPORT_STATE keeps every block synchronous: its export (after_unit) must see this block's predictor
         // rows and held row, which the async path below completes only at the next unit's drain.
         // A registry without a store (STRIX_PROMPT_STATE_DIGEST / --rtx-state-import) captures nothing: those blocks stay async.
+        // The unit ending at the prompt's row-class point stays synchronous too: its capture follows the held row.
+        const bool row_class_end=tiled_.cache && !legacy_cache() && tiled_.cache->row_class_point()==pos_+rows;
         if(pipe_mtp() && !block.final && !(legacy_cache() && (block.capture || tiled_.cache_tails)) &&
-            !rtx_state_export_request()) {
+            !rtx_state_export_request() && !row_class_end) {
             // Same rows, kernels and order as below; the wait moves to the next unit of the prompt.
             std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
             if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
@@ -703,6 +705,17 @@ public:
                 }
             }
         }
+        // Row-class checkpoint (the next turn resumes here, off the T grid): after this unit's predictor rows and
+        // held row, before the final row's adoption.
+        if(row_class_end) {
+            // Synchronous capture: finish this unit's deferred owner checks and predictor rows first (no arithmetic change).
+            if(!complete && block.owner->completion_pending()) block.owner->finish_pending_completion();
+            if(!complete && runtime_.prime_hidden_rows_pending()) runtime_.prime_hidden_rows_complete();
+            const bool ready=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
+                runtime_.next_source_position()+1U==pos_;
+            row_class_note_=ready?tiled_.cache->capture_row_class(session_,tokens_):
+                block.owner->completion_pending()?"owner-pending":runtime_.prime_hidden_rows_pending()?"priming-pending":"predictor-frontier";
+        }
         if(tiled_.cache) tiled_.cache->after_unit(session_,tokens_,pos_);
         if(block.capture)++blocks_;else ++tail_blocks_;
         if(grouped)++grouped_blocks_;
@@ -764,6 +777,7 @@ public:
         out<<"\"rows\":"<<tiled_.rows<<",\"tail_rows\":[";
         for(std::size_t t=0;t<tiled_.tails.size();++t)out<<(t?",":"")<<tiled_.tails[t].rows;
         out<<"],\"restored_position\":"<<restored_
+           <<",\"row_class_point\":"<<(tiled_.cache?tiled_.cache->row_class_point():0U)<<",\"row_class\":\""<<row_class_note_<<'"'
            <<",\"blocks\":"<<blocks_<<",\"tail_blocks\":"<<tail_blocks_<<",\"serial_rows\":"<<serial_rows_<<",\"tiled_start\":"<<(adopted_?"true":"false")
            <<",\"prompt_ms\":"<<prompt_ms<<",\"grouped_blocks\":"<<grouped_blocks_
            <<",\"block_ms\":"<<block_ms_<<",\"tail_ms\":"<<tail_ms_<<",\"serial_ms\":"<<serial_ms_;
@@ -1064,6 +1078,7 @@ private:
     std::byte* hidden_allocation_=nullptr;
     Phase phase_=Phase::blocks;
     bool adopted_=false,window_refused_=false,priming_=false;
+    const char* row_class_note_="";   // the row-class capture at this prompt's class point: "captured" or why not
     int balanced_=-1;
     HipPrefixStateCacheSession::Capture capture_;
     std::future<bool> submitter_;

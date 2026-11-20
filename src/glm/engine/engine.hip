@@ -21,6 +21,7 @@
 
 #include "glm/engine/glm_fast_attn.hpp"
 #include "glm/engine/glm_fast_moe.hpp"
+#include "glm/engine/glm_fast_i4_defaults.hpp"
 #include "glm/engine/glm_fast_i4_pack.hpp"
 #include "core/host_free_memory.hpp"
 #include "core/iu4.hpp"
@@ -714,16 +715,17 @@ struct Engine::Impl {
     }();
     // Layer / scope policy (src/moe_core/int4_layer_policy.hpp; the engine only names the options and the defaults).
     // STRIX_GLM_FAST_I4_EXL3_LAYERS = none | comma list of trunk MoE ordinals / ranges a-b (0 = the first MoE layer) that
-    // keep the EXL3 routed experts in prefill and decode. Default 0-14: an early INT4 layer costs a saturating KL step
-    // (about 0.007 alone), late layers about 0.0003 each; INT4 on ordinals >= 15 passes the quality gate, all layers do not.
+    // keep the EXL3 routed experts in prefill and decode. Default 0-24 (glm_fast_i4_defaults.hpp): an early INT4 layer
+    // costs a saturating KL step (about 0.007 alone), late layers about 0.0005 each; under FAST gate v2 ordinals >= 15
+    // fail two windows, ordinals >= 25 pass every window FAST alone passes.
     // STRIX_GLM_FAST_I4_SCOPE = gate_up (default: the routed down stays EXL3, the largest error source) | all.
     // STRIX_GLM_FAST_I4_SCALE = fast_full (default: core/iu4.hpp fast full-range rule) | legacy (max|w| / 7).
     const strix::moe_core::Int4LayerPolicy i4_policy = [] {
         strix::moe_core::Int4LayerPolicy policy;
         const char* layers_env = std::getenv("STRIX_GLM_FAST_I4_EXL3_LAYERS");
-        policy.source_mask = strix::moe_core::parse_int4_source_layers(layers_env == nullptr || *layers_env == '\0' ? "0-14" : layers_env, "STRIX_GLM_FAST_I4_EXL3_LAYERS");
+        policy.source_mask = strix::moe_core::parse_int4_source_layers(layers_env == nullptr || *layers_env == '\0' ? fast_i4::kExl3LayersDefault : layers_env, "STRIX_GLM_FAST_I4_EXL3_LAYERS");
         const char* scope_env = std::getenv("STRIX_GLM_FAST_I4_SCOPE");
-        policy.matrices = strix::moe_core::parse_int4_scope(scope_env == nullptr || *scope_env == '\0' ? "gate_up" : scope_env, "STRIX_GLM_FAST_I4_SCOPE");
+        policy.matrices = strix::moe_core::parse_int4_scope(scope_env == nullptr || *scope_env == '\0' ? fast_i4::kScopeDefault : scope_env, "STRIX_GLM_FAST_I4_SCOPE");
         return policy;
     }();
     const unsigned i4_matrices = i4_policy.matrices;

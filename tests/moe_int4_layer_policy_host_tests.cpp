@@ -1,5 +1,6 @@
 // Host checks: the stored INT4 layer / scope policy and the fast full-range IU4 scale rule.
 #include "core/iu4.hpp"
+#include "glm/engine/glm_fast_i4_defaults.hpp"
 #include "moe_core/int4_layer_policy.hpp"
 
 #include <algorithm>
@@ -91,6 +92,15 @@ int main() {
     mc::Int4LayerPolicy r = p;
     r.source_mask = mc::parse_int4_source_layers("0-13", "L");
     CHECK(r.tag(2001) != p.tag(2001) && p.tag(2001) == mc::Int4LayerPolicy{p}.tag(2001));
+
+    // GLM adapter defaults (the engine resolves an unset STRIX_GLM_FAST_I4_EXL3_LAYERS / _SCOPE to these): INT4 only
+    // on the 17 late MoE ordinals 25-41 of GLM-5.3's 42, gate/up only (the set that passes every FAST gate v2 window).
+    namespace gf = strix::glm::engine::fast_i4;
+    mc::Int4LayerPolicy g;
+    g.source_mask = mc::parse_int4_source_layers(gf::kExl3LayersDefault, "L");
+    g.matrices = mc::parse_int4_scope(gf::kScopeDefault, "S");
+    CHECK(g.source_mask == 0x1ffffffULL && !g.int4(24) && g.int4(25) && g.int4(41) && g.count(42) == 17U);
+    CHECK(!g.down_int4() && g.tag(2001) != p.tag(2001));
 
     // Fast full-range rule: the scale, the clamp and round-to-nearest-even.
     CHECK(iu4_fast_full_scale(0.0f, 0.0f) == 1.0f);

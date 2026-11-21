@@ -196,6 +196,34 @@ void test_admission_bytes() {
     check(res.size() == 6, "bytes: all answered");
 }
 
+void test_zero_output_refusal() {
+    // Zero output must be rejected before draft headroom arithmetic or any backend work.
+    FakeBackend be(2, 8, 23);
+    CohortConfig cfg;
+    CohortDecoder dec(be, cfg);
+    CohortRequest zero;
+    zero.id = 42;
+    zero.prompt = {1, 2, 3};
+    zero.max_tokens = 0;
+    dec.submit(zero);
+    check(dec.idle(), "zero output: refused before lane admission");
+    const auto rejected = dec.take_finished();
+    check(rejected.size() == 1 && rejected[0].id == zero.id && !rejected[0].error.empty() &&
+              rejected[0].ids.empty(), "zero output: explicit refusal, no emitted tokens");
+    check(be.forwards == 0 && be.prefills == 0 && be.releases == 0,
+          "zero output: no backend work or lane allocation");
+
+    CohortRequest one = zero;
+    one.id = 43;
+    one.max_tokens = 1;
+    dec.submit(one);
+    dec.run();
+    const auto answered = dec.take_finished();
+    check(answered.size() == 1 && answered[0].error.empty() && answered[0].ids == solo(one, 23),
+          "one output: exact identity with solo preserved");
+    check(be.forwards == 1 && be.releases == 1, "one output: one decode and one release");
+}
+
 void test_short_first() {
     const std::uint32_t vocab = 23;
     FakeBackend be(4, 16, vocab);
@@ -329,6 +357,7 @@ int main() {
     run_identity(true, 16, 8, "draft lanes capped by rows");
     run_identity(true, 1, 16, "draft 1 lane (solo path)");
     test_admission_bytes();
+    test_zero_output_refusal();
     test_short_first();
     if (failures) {
         std::cerr << failures << " failure(s)\n";

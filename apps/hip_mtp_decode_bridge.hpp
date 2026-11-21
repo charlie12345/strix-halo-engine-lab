@@ -89,6 +89,7 @@ struct MtpServeRequest {
     serve::CacheRetention cache_retention = serve::CacheRetention::server_policy;
     std::string session_id, session_operation, session_durability;
     std::span<const std::uint32_t> prompt;
+    std::uint32_t stable_prefix = 0; // GenerationJob::stable_prefix: the prompt's root mark (prefix_root_capture)
     std::uint64_t max_tokens = 0;
     std::span<const std::uint32_t> stop_tokens;
     // Context n-gram draft extension for this request: forced on/off, or unset = the engine's default.
@@ -337,7 +338,8 @@ public:
         MtpDecodeTargetParents::TiledPrompt& tiled,SerialSessionContext& session,HipMtpTargetHidden& target,HipMtpRuntime& runtime,
         const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,const ExecutionRuntimeResources& resources,
         DirectLaunchDispatcher& dispatcher,std::byte* held,std::shared_ptr<TokenSampler> final_sampler={},
-        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false, BatchCertContext batch_cert={}, bool defer_cache_lookup=false)
+        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false, BatchCertContext batch_cert={}, bool defer_cache_lookup=false,
+        std::uint32_t stable_prefix=0)
         :tokens_(tokens.begin(),tokens.end()),tiled_(tiled),session_(session),target_(target),runtime_(runtime),qualified_(qualified),
          activated_(activated),resources_(resources),dispatcher_(dispatcher),held_(held),final_sampler_(std::move(final_sampler)),final_selector_(std::move(final_selector)),progress_(std::move(progress)) {
         producer_rotary_=model.rotary_identity();
@@ -405,11 +407,15 @@ public:
         if(tiled_.cache) tiled_.cache->set_policy_selection(!!final_selector_);
         deferred_lookup_=defer_cache_lookup && tiled_.cache && tiled_.cache->joining_allowed() && !session_resume;
         start_=std::chrono::steady_clock::now();
+        stable_prefix_=stable_prefix;
         if(session_resume) {
             restored_=session_.next_position;
             if(!restored_ || restored_>=n_ || runtime_.next_source_position()+1U!=restored_)
                 throw std::invalid_argument("MTP session suffix frontier differs");
-        } else if(tiled_.cache && !deferred_lookup_) restored_=tiled_.cache->begin_request(session_,tokens_);
+        } else if(tiled_.cache && !deferred_lookup_) {
+            restored_=tiled_.cache->begin_request(session_,tokens_);
+            request_root_capture();
+        }
         pos_=restored_;
         if(restored_ && !session_resume && !tiled_.rtx_import && !legacy_cache()) {
             const auto& cursor=tiled_.cache->continuation();
@@ -451,6 +457,7 @@ public:
             throw std::logic_error("prefix join retry requires an untouched certified prompt");
         deferred_lookup_=false;
         restored_=tiled_.cache->begin_request(session_,tokens_);
+        request_root_capture();
         pos_=restored_;
         if(restored_) {
             const auto& cursor=tiled_.cache->continuation();
@@ -641,9 +648,11 @@ public:
                 next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
             const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
             const auto* last=block_hidden_+static_cast<std::size_t>(rows-1U)*width_;
-            if((block.capture || tiled_.cache_tails) && tiled_.cache && !legacy_cache())
+            if((block.capture || tiled_.cache_tails) && tiled_.cache && !legacy_cache()) {
+                const auto order=capture_order(block,grouped,stream);
                 capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),
-                    !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
+                    !block.owner->completion_pending(),order,n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),capture_tag(order));
+            }
             int device=0;strix::hip_check(hipGetDevice(&device),"get priming device");
             const auto submit=[this,device,stream,last,capture=capture_,views=std::move(views),next=std::move(next)] {
                 try {
@@ -674,9 +683,10 @@ public:
         const bool split_capture=(block.capture || tiled_.cache_tails) && tiled_.cache && tiled_.cache->pooled_capture();
         if(split_capture) {
             const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
+            const auto order=capture_order(block,grouped,stream);
             capture_=tiled_.cache->try_prepare_target_capture(session_,tokens_,block.owner->producer_stream(),
-                !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,
-                block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
+                !block.owner->completion_pending(),order,n_-1U,
+                block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),capture_tag(order));
         }
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
         strix::hip_check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
@@ -696,8 +706,9 @@ public:
                 }
             } else if(complete) {
                 const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
-                capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),true,capture_order(block,grouped,stream),n_-1U,
-                    block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
+                const auto order=capture_order(block,grouped,stream);
+                capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),true,order,n_-1U,
+                    block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),capture_tag(order));
                 if(capture_) {
                     capture_->submit_predictor(stream);
                     capture_->commit(true);
@@ -853,12 +864,23 @@ public:
     }
 private:
     using Phase=QwenPlanPhase;
+    // Captures tagged with this prompt get the writer tripwire (batch) or the writer fence (cross-owner).
+    const void* capture_tag(const PrefixCaptureOrder& order) const {return batch_ || order.next_other_owner?this:nullptr;}
     PrefixCaptureOrder capture_order(const Block& block,bool grouped,hipStream_t snapshot_predictor) const {
         if(grouped || small_ || (batch_ && forced_ladder_) || adopted_ || !certified_request_) return {};
         QwenPlanCursor cursor{phase_,tail_,balanced_};
         const auto next=qwen_prompt_next(plan_config_,cursor,session_.next_position,n_,false,small_,adopted_);
-        if(!next || !next->t_owner ||
-            block.owner!=tiled_.block_owner.get() || next->owner!=plan_config_.block) return {};
+        if(!next || block.owner!=tiled_.block_owner.get()) return {};
+        const auto mtp=static_cast<hipStream_t>(runtime_.resources().stream());
+        if(!next->t_owner || next->owner!=plan_config_.block) {
+            // Another owner writes next: only a requested boundary (root mark) is captured, fenced by the cache
+            // (the tail owner's stream waits on the snapshot; window / serial rows: a host wait). Not in batch mode.
+            if(batch_ || !tiled_.cache->capture_requested(session_.next_position)) return {};
+            PrefixCaptureOrder order{std::nullopt,snapshot_predictor,mtp,true};
+            if(next->kind==QwenPlanKind::tail_owner && !next->t_owner && next->tail<tiled_.tails.size() &&
+               tiled_.tails[next->tail].owner) order.next_target=tiled_.tails[next->tail].owner->producer_stream();
+            return order;
+        }
         if(batch_) {
             const auto p=session_.next_position;
             const bool nest=qwen_batch_nest_possible(batch_cert_.nesting_possible,batch_cert_.config.nest_rows,tiled_.rows,n_-p);
@@ -866,16 +888,23 @@ private:
                 trace_.back(),tiled_.rows,qwen_producer_trace_ok(plan_config_,n_,p,trace_),
                 next->t_owner,static_cast<std::uint32_t>(next->end-next->begin),nest)) return {};
         }
-        const auto mtp=static_cast<hipStream_t>(runtime_.resources().stream());
         // The next target writes on this actual owner stream. Predictor rows and held_ are
         // next written on mtp. The next target uses the spare tap buffer; drain_priming
         // joins the worker and completes mtp (including its snapshot) before tap reuse or
         // any synchronous/default-stream held copy. No dependency is added for capture.
         return {tiled_.block_owner->producer_stream(),snapshot_predictor,mtp};
     }
+    // The root mark (system + tools prefix) is kept as a checkpoint even off the capture cadence, so a sibling
+    // conversation restores there. begin_request clears the request's capture set, so this follows each lookup.
+    void request_root_capture() {
+        if(!tiled_.cache || !certified_request_) return;
+        if(const auto root=prefix_root_capture(stable_prefix_,n_,plan_config_.rows); root>restored_)
+            tiled_.cache->request_capture(root);
+    }
     QwenTiledPlanConfig plan_config_;
     bool certified_request_=false,batch_=false;
     bool deferred_lookup_=false;
+    std::uint32_t stable_prefix_=0;
     BatchCertContext batch_cert_;
     std::vector<QwenUnitExec> trace_;
     std::uint64_t request_order_=0;
@@ -911,7 +940,8 @@ public:
     std::function<void(HipKnownPrefixWindow&,const std::function<void()>&)> execute_native;
     void drain_for_handoff(){drain_priming();}
     void set_request_order(std::uint64_t value) {request_order_=value;}
-    void before_writer(hipStream_t stream) const {if(batch_cert_.enabled) PrefixAsyncCapture::before_writer(this,stream);}
+    // A no-op unless the pending capture carries this tag (batch certification, or a fenced cross-owner capture).
+    void before_writer(hipStream_t stream) const {PrefixAsyncCapture::before_writer(this,stream);}
 private:
     std::vector<float> pair_logits_;
     void run_block(const Block& block) {
@@ -1136,9 +1166,9 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(std::span<const std::uint32
     HipMtpTargetHidden& target,HipMtpRuntime& runtime,const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,
     const ExecutionRuntimeResources& resources,DirectLaunchDispatcher& dispatcher,std::byte* held,std::string& receipt,
     std::shared_ptr<TokenSampler> final_sampler={},HipMtpHostRowSelector final_selector={},
-    std::function<void(serve::GenerationProgress)> progress={}) {
+    std::function<void(serve::GenerationProgress)> progress={},std::uint32_t stable_prefix=0) {
     TiledMtpPrompt prompt(tokens,model,compiled,tiled,session,target,runtime,qualified,activated,resources,dispatcher,held,
-        std::move(final_sampler),std::move(final_selector),std::move(progress));
+        std::move(final_sampler),std::move(final_selector),std::move(progress),false,true,false,{},false,stable_prefix);
     while(!prompt.done()) prompt.step();
     return prompt.finish(receipt);
 }
@@ -1157,6 +1187,7 @@ struct MtpBatchRequest {
     std::shared_ptr<MtpConstraintRow> constraint;
     serve::CacheRetention cache_retention = serve::CacheRetention::server_policy;
     std::vector<std::uint32_t> prompt;
+    std::uint32_t stable_prefix = 0; // GenerationJob::stable_prefix: the prompt's root mark (prefix_root_capture)
     std::uint64_t max_tokens = 0;
     std::vector<std::uint32_t> stop_tokens;
     std::shared_ptr<TokenSampler> sampler; // null: first-max selection
@@ -1474,7 +1505,7 @@ private:
             *s.runtime, qualified_, activated_, s.parents->resources, *s.dispatcher, s.held, s.request.sampler,
             s.request.constraint?HipMtpHostRowSelector{[state=s.request.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},
             s.request.on_progress,false,true,true,batch_cert_context(s),
-            options_.prefix_cache_inflight && interleave_ && !service_mode_);
+            options_.prefix_cache_inflight && interleave_ && !service_mode_,s.request.stable_prefix);
         static_cast<void>(m);
         ++stats_.admitted;
         s.order = stats_.admitted;
@@ -2845,7 +2876,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         std::string request_receipt;
                         pending=run_tiled_mtp_prompt(q.prompt,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
                             r,dispatcher,tiled_held,request_receipt,{},
-                            q.constraint?HipMtpHostRowSelector{[state=q.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},q.on_progress);
+                            q.constraint?HipMtpHostRowSelector{[state=q.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},q.on_progress,
+                            q.stable_prefix);
                         static const bool state_digest=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST", false);
                         if(state_digest && parents->tiled.cache)
                             out.prompt_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));

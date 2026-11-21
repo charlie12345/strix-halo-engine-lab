@@ -26,6 +26,24 @@ struct StoreArgs {
 };
 
 template <unsigned kBlock>
+__device__ __forceinline__ void store_row(const StoreArgs& a) {
+    const unsigned k = blockIdx.x;
+    const std::uint64_t p = a.positions != nullptr ? a.positions[k] : std::uint64_t{a.first_position} + k;
+    std::uint16_t* dst = a.cache + cr::row_offset(a.layout, p);
+    const float* src = a.src + static_cast<std::size_t>(k) * a.src_stride;
+    bool ok = true;
+    for (unsigned i = threadIdx.x; i < a.layout.width; i += kBlock) {
+        const float x = src[i];
+        const std::uint16_t b = cr::encode(x);
+        ok = ok && cr::finite(x) && cr::finite(b);
+        dst[i] = b;
+    }
+    if (!ok && a.flag != nullptr) atomicOr(a.flag, 1U);
+}
+
+// store_rows_kernel keeps its own body (the same steps as store_row) so existing callers compile to the same
+// machine code as before the paired entry existed.
+template <unsigned kBlock>
 __global__ __launch_bounds__(kBlock) void store_rows_kernel(StoreArgs a) {
     const unsigned k = blockIdx.x;
     const std::uint64_t p = a.positions != nullptr ? a.positions[k] : std::uint64_t{a.first_position} + k;
@@ -41,6 +59,11 @@ __global__ __launch_bounds__(kBlock) void store_rows_kernel(StoreArgs a) {
     if (!ok && a.flag != nullptr) atomicOr(a.flag, 1U);
 }
 
+template <unsigned kBlock>
+__global__ __launch_bounds__(kBlock) void store_pair_kernel(StoreArgs first, StoreArgs second) {
+    store_row<kBlock>(blockIdx.y == 0U ? first : second);
+}
+
 // The writer as a producer's store epilogue (policy E of core/f16_dense_q8a8.hpp StoreImage): the producer's FP32 output
 // x is stored as tile::to_bf16(x) == encode(x) for every non-NaN x (a NaN raises the flag on both paths), and the flag
 // is raised under the same rule as store_rows (encodes_finite). The image rows are the producer's rows (ring 0, rows
@@ -54,11 +77,30 @@ struct ImageEpilogue {
 };
 
 // rows == 0 is a no-op. Errors: width 0, a null cache / source.
+inline bool valid_store(const StoreArgs& a) {
+    return a.layout.width != 0U && a.cache != nullptr && a.src != nullptr && a.src_stride >= a.layout.width;
+}
+
 inline hipError_t store_rows(const StoreArgs& a, hipStream_t stream) {
     if (a.rows == 0U) return hipSuccess;
-    if (a.layout.width == 0U || a.cache == nullptr || a.src == nullptr || a.src_stride < a.layout.width) return hipErrorInvalidValue;
+    if (!valid_store(a)) return hipErrorInvalidValue;
     constexpr unsigned kBlock = 128U;
     STRIX_HIP_LAUNCH(Rdna3Layout, store_rows_kernel<kBlock><<<dim3(a.rows), dim3(kBlock), 0, stream>>>(a));
+    return hipGetLastError();
+}
+
+// Two disjoint destinations with the same number of rows, in one launch.
+// The caller guarantees distinct slots for device-supplied positions.
+inline hipError_t store_pair(const StoreArgs& first, const StoreArgs& second, hipStream_t stream) {
+    if (first.rows != second.rows) return hipErrorInvalidValue;
+    if (first.rows == 0U) return hipSuccess;
+    const auto distinct_slots = [](const StoreArgs& a) {
+        return a.positions != nullptr || a.layout.ring == 0U || a.rows <= a.layout.ring;
+    };
+    if (first.cache == second.cache || !valid_store(first) || !valid_store(second) ||
+        !distinct_slots(first) || !distinct_slots(second)) return hipErrorInvalidValue;
+    constexpr unsigned kBlock = 128U;
+    store_pair_kernel<kBlock><<<dim3(first.rows, 2U), dim3(kBlock), 0, stream>>>(first, second);
     return hipGetLastError();
 }
 

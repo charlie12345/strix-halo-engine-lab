@@ -37,6 +37,14 @@ enum class RouteScore : std::uint8_t { softmax, sigmoid, sqrt_softplus };
 enum class RouteKey : std::uint8_t { float_serial, ordered_bits };
 enum class RouteOrder : std::uint8_t { selection, ascending_id };
 
+// Device execution traits. Checked rows write status and use sentinel IDs on failure.
+// Explicit round-to-nearest keeps the arithmetic of bindings that require it.
+template <bool CheckedStatus = false, bool RoundNearest = false>
+struct RouteWaveTraits {
+    static constexpr bool checked_status = CheckedStatus;
+    static constexpr bool round_nearest = RoundNearest;
+};
+
 struct RoutePolicy {
     RouteScore score = RouteScore::sigmoid;
     bool selection_bias = false;
@@ -152,6 +160,26 @@ void route_scores_ref(RouteScore score, std::span<const float> logits, std::span
         for (std::size_t e = 0; e < logits.size(); ++e) scores[e] = sqrt_softplus_score<Math>(logits[e]);
     } else {
         throw std::invalid_argument("route policy: Math has no log1p / sqrt for sqrt_softplus");
+    }
+}
+
+// Reuse one score buffer over token-major rows. Weights retain the order and
+// normalization of the route policy, independent of any later grouping.
+template <class Math>
+void route_rows_ref(const RoutePolicy& policy, std::span<const float> logits, std::span<const float> bias,
+                    std::span<std::uint32_t> ids, std::span<float> weights) {
+    if (const char* why = validate(policy)) throw std::invalid_argument(why);
+    const auto rows = logits.size() / policy.experts;
+    if (logits.size() % policy.experts != 0 || (policy.selection_bias && bias.size() != policy.experts) ||
+        ids.size() % policy.top_k != 0 || ids.size() / policy.top_k != rows || weights.size() != ids.size()) {
+        throw std::invalid_argument("route policy: invalid token-major geometry");
+    }
+    if (rows == 0) return;
+    std::vector<float> scores(policy.experts);
+    for (std::size_t row = 0; row < rows; ++row) {
+        const auto first = row * policy.top_k;
+        route_scores_ref<Math>(policy.score, logits.subspan(row * policy.experts, policy.experts), scores);
+        route_select_ref(policy, scores, bias, ids.subspan(first, policy.top_k), weights.subspan(first, policy.top_k));
     }
 }
 

@@ -1,7 +1,15 @@
 #pragma once
 #include "types.hpp"
+#include <bit>
 #include <istream>
 namespace strix::weight {
+// Decode one little-endian F32 from four source bytes, at any byte alignment.
+inline float decode_f32_le(const Byte* bytes) {
+    std::uint32_t bits = 0;
+    for (unsigned i = 0; i < 4; ++i) bits |= std::to_integer<std::uint32_t>(bytes[i]) << (8U * i);
+    return std::bit_cast<float>(bits);
+}
+
 struct Source {
   virtual ~Source() = default;
   virtual Status read(ByteRange, std::span<Byte>) const = 0;
@@ -22,4 +30,14 @@ TensorId tensor_id(const Source&, std::string_view, const Digest256& header = {}
 Status digest_slice(const Slice&, Digest256&);
 std::shared_ptr<const Source> namespace_source(std::shared_ptr<const Source>, std::string shard);
 Status read_slice(const Slice&, std::span<Byte>);
+// Create a positioned view relative to a slice without reading its contents.
+inline Status subslice(const Slice& parent, ByteRange range, Slice& out) {
+    if (!parent.source) return {Error::stale_source, "missing source ownership"};
+    if (parent.range.offset > parent.source->size() ||
+        parent.range.bytes > parent.source->size() - parent.range.offset ||
+        range.offset > parent.range.bytes || range.bytes > parent.range.bytes - range.offset)
+        return {Error::malformed, "subslice outside its source range"};
+    out = {parent.source, {parent.range.offset + range.offset, range.bytes}};
+    return {Error::ok, {}};
+}
 }

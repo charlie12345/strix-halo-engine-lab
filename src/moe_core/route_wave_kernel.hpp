@@ -1,5 +1,5 @@
 #pragma once
-// MoE router (one wave per row) and expert-output combine: the HIP kernels of the shared route / combine family.
+// MoE router (one wave per row) and expert-output combine.
 // Contracts and host oracles: include/strix/moe/route_policy.hpp (RoutePolicy, presets, route_select_ref) and
 // include/strix/moe/combine.hpp (CombineForm, combine_ref). A family binds a preset (the policy is a template argument
 // referring to the constexpr preset object, so every constant is an immediate) and its Math trait (exp with the family's
@@ -9,20 +9,30 @@
 // key = route_ordered_key(s + bias); the k-pass selection is moe_core::route_wave_topk (XOR tree on the key bits, ties ->
 // lower id), so the picks equal route_select_ref with RouteKey::ordered_bits. Lane 0 orders the picks (ascending id when
 // the policy says so), sums the scores in output order from +0, adds renorm_eps and writes w = (s / den) * scale.
-// Lifted from GLM-5 (src/glm/kernels/glm_tier_a.hip route_kernel / moe_combine_kernel, moved here unchanged); any
-// RoutePolicy with sigmoid scores, ordered keys and ascending-id output binds it.
+// Lifted from GLM-5 (src/glm/kernels/glm_tier_a.hip route_kernel / moe_combine_kernel). Checked finite rows may
+// also bind float_serial: the ordered keys give the same picks for finite choices, including ties at signed zero.
 #include "moe_core/route.hpp"
-#include "strix/hip_qwen_dpp_reduce.hpp"
-#include "strix/moe/combine.hpp"
 #include "strix/moe/route_policy.hpp"
 
+#if defined(__HIPCC__)
+#include "strix/hip_qwen_dpp_reduce.hpp"
+#include "strix/moe/combine.hpp"
 #include <hip/hip_runtime.h>
+#else
+#include <cuda_runtime.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 
 namespace strix::moe_core {
+
+#if defined(__HIPCC__)
+inline constexpr unsigned kCheckedRouteRowsPerBlock = 1U;
+#else
+inline constexpr unsigned kCheckedRouteRowsPerBlock = 4U;
+#endif
 
 template <const moe::RoutePolicy& P>
 struct RouteWavePolicy {
@@ -31,8 +41,17 @@ struct RouteWavePolicy {
     std::uint32_t lane;
     std::uint32_t* pick;
     template <class T>
-    __device__ static T xor32(T value, int mask) { return strix::qwen_dpp::xor32(value, static_cast<unsigned>(mask)); }
+    __device__ static T xor32(T value, int mask) {
+#if defined(__HIPCC__)
+        return strix::qwen_dpp::xor32(value, static_cast<unsigned>(mask));
+#else
+        return __shfl_xor_sync(0xffffffffU, value, mask, 32);
+#endif
+    }
     __device__ static bool better(float a, std::uint32_t ai, float b, std::uint32_t bi) {
+#if !defined(__HIPCC__)
+        if constexpr (P.key == moe::RouteKey::float_serial) return a > b || (a == b && ai < bi);
+#endif
         const std::uint32_t ka = __builtin_bit_cast(std::uint32_t, a), kb = __builtin_bit_cast(std::uint32_t, b);
         return ka > kb || (ka == kb && ai < bi);
     }
@@ -41,7 +60,104 @@ struct RouteWavePolicy {
     }
 };
 
-// logits / bias: [rows][experts] / [experts]; ids / w: [rows][top_k]. Grid: rows blocks of 32 threads.
+// logits / bias: [rows][experts] / [experts]; ids / w: [rows][top_k].
+template <const moe::RoutePolicy& P, class Math, class Traits>
+__device__ __forceinline__ void route_wave_body(const float* logits, const float* bias, std::uint32_t* ids,
+                                               float* w, unsigned* status, unsigned rows) {
+    // moe::validate(P) is checked by the host launchers (constexpr host function).
+    static_assert(P.score == moe::RouteScore::sigmoid && P.selection_bias &&
+                      (P.key == moe::RouteKey::ordered_bits || Traits::checked_status) &&
+                      P.renormalize && (P.top_k > 1U || P.renorm_single),
+                  "route_wave_kernel: sigmoid + selection bias, renormalised weights");
+    using Pol = RouteWavePolicy<P>;
+    constexpr std::uint32_t experts = P.experts, top_k = P.top_k;
+    constexpr std::uint32_t all = Pol::candidates == 32U ? ~0U : (1U << Pol::candidates) - 1U;
+    __shared__ float score_rows[kCheckedRouteRowsPerBlock][experts];
+    __shared__ std::uint32_t picked_rows[kCheckedRouteRowsPerBlock][top_k];
+    const unsigned wave = threadIdx.x / Pol::wave;
+    const unsigned lane = threadIdx.x % Pol::wave;
+    const unsigned r = blockIdx.x * kCheckedRouteRowsPerBlock + wave;
+    if (r >= rows) return;
+    auto* sg = score_rows[wave];
+    auto* pick_s = picked_rows[wave];
+    const float* lg = logits + static_cast<std::size_t>(r) * experts;
+    float key[Pol::candidates];
+    [[maybe_unused]] bool bad = false;
+#pragma unroll
+    for (unsigned i = 0; i < Pol::candidates; ++i) {
+        const unsigned e = lane + 32 * i;
+        const float v = moe::sigmoid_score<Math>(lg[e]);
+        const float choice = v + bias[e];
+        sg[e] = v;
+#if defined(__HIPCC__)
+        if constexpr (Traits::checked_status) bad |= !isfinite(lg[e]) || !isfinite(bias[e]);
+        key[i] = __builtin_bit_cast(float, moe::route_ordered_key(choice));
+#else
+        if constexpr (Traits::checked_status) bad |= !isfinite(lg[e]) || !isfinite(bias[e]) || !isfinite(choice);
+        if constexpr (P.key == moe::RouteKey::float_serial) key[i] = choice;
+        else key[i] = __builtin_bit_cast(float, moe::route_ordered_key(choice));
+#endif
+    }
+    if constexpr (Traits::checked_status) {
+#if defined(__HIPCC__)
+        if (__ballot(bad) != 0U) {
+#else
+        if (__any_sync(0xffffffffU, bad)) {
+#endif
+            for (unsigned k = lane; k < top_k; k += Pol::wave) {
+                ids[static_cast<std::size_t>(r) * top_k + k] = experts;
+                w[static_cast<std::size_t>(r) * top_k + k] = 0.0F;
+            }
+            if (lane == 0U) status[r] = 1U;
+            return;
+        }
+    }
+    route_wave_topk(key, all, experts, top_k, lane, Pol{lane, pick_s});
+#if defined(__HIPCC__)
+    __syncthreads();
+#else
+    __syncwarp();
+#endif
+    if (lane != 0) return;
+    std::uint32_t pick[top_k];
+    for (unsigned k = 0; k < top_k; ++k) pick[k] = pick_s[k];
+    if constexpr (P.order == moe::RouteOrder::ascending_id) {
+        for (unsigned a = 1; a < top_k; ++a)  // ascending id
+            for (unsigned b = a; b > 0 && pick[b - 1] > pick[b]; --b) {
+                const std::uint32_t t = pick[b];
+                pick[b] = pick[b - 1];
+                pick[b - 1] = t;
+            }
+    }
+    float den = 0.0F;
+    for (unsigned k = 0; k < top_k; ++k) {
+        if constexpr (Traits::round_nearest) den = __fadd_rn(den, sg[pick[k]]);
+        else den = den + sg[pick[k]];
+    }
+    if constexpr (Traits::round_nearest) den = __fadd_rn(den, P.renorm_eps);
+    else den = den + P.renorm_eps;
+    for (unsigned k = 0; k < top_k; ++k) {
+        ids[static_cast<std::size_t>(r) * top_k + k] = pick[k];
+        if constexpr (Traits::round_nearest) {
+            w[static_cast<std::size_t>(r) * top_k + k] = __fmul_rn(__fdiv_rn(sg[pick[k]], den), P.scale);
+        } else {
+            w[static_cast<std::size_t>(r) * top_k + k] = (sg[pick[k]] / den) * P.scale;
+        }
+    }
+    if constexpr (Traits::checked_status) status[r] = 0U;
+}
+
+template <const moe::RoutePolicy& P, class Math, class Traits>
+__global__ __launch_bounds__(kCheckedRouteRowsPerBlock * 32U) void route_wave_status_entry(
+    const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned* status, unsigned rows) {
+    static_assert(Traits::checked_status);
+    route_wave_body<P, Math, Traits>(logits, bias, ids, w, status, rows);
+}
+
+#if defined(__HIPCC__)
+// The established four-argument entry keeps its own body so the GLM and HY4 instantiations compile to the same
+// machine code as before the checked entry existed; route_wave_body above is the checked trait form of the same
+// algorithm (same score, key, top-k, ordering and renormalisation steps).
 template <const moe::RoutePolicy& P, class Math>
 __global__ void route_wave_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
     static_assert(moe::validate(P) == nullptr, "route_wave_kernel: invalid policy");
@@ -132,6 +248,15 @@ void enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* i
     if (rows == 0U) return;
     hipLaunchKernelGGL((route_wave_kernel<P, Math>), dim3(rows), dim3(32), 0, stream, logits, bias, ids, w);
 }
+template <const moe::RoutePolicy& P, class Math, class Traits>
+hipError_t enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w,
+                              unsigned* status, unsigned rows, hipStream_t stream) {
+    static_assert(moe::validate(P) == nullptr, "route_wave_kernel: invalid policy");
+    if (rows == 0U || !logits || !bias || !ids || !w || !status) return hipErrorInvalidValue;
+    hipLaunchKernelGGL((route_wave_status_entry<P, Math, Traits>), dim3(rows), dim3(32U), 0, stream, logits, bias,
+                       ids, w, status, rows);
+    return hipGetLastError();
+}
 template <moe::CombineForm Form, unsigned TopK, unsigned Width>
 void enqueue_combine(const float* w, const float* eo, const float* shared, float* y, unsigned rows, hipStream_t stream) {
     if (Form == moe::CombineForm::fma_f32 && (w == nullptr || shared == nullptr)) throw std::invalid_argument("moe combine: fma_f32 needs w and shared");
@@ -147,5 +272,36 @@ void enqueue_combine_rounded_eo(const float* w, const float* eo, const float* sh
     hipLaunchKernelGGL((combine_rounded_eo_kernel<Form, TopK, Width>), dim3((Width + 255U) / 256U, rows), dim3(256), 0, stream, w, eo,
                        shared, y);
 }
+
+// Policy-type entry: Policy::value names the route policy. The HIP form forwards to the reference entry above
+// (same kernel instantiation). CUDA kernels take the policy as a type because nvcc's host stub cannot name an
+// inline variable used as a reference template argument of a __global__ function under MSVC.
+template <class Policy, class Math, class Traits>
+hipError_t enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w,
+                              unsigned* status, unsigned rows, hipStream_t stream) {
+    return enqueue_route_wave<Policy::value, Math, Traits>(logits, bias, ids, w, status, rows, stream);
+}
+
+#else
+template <class Policy, class Math, class Traits>
+__global__ __launch_bounds__(kCheckedRouteRowsPerBlock * 32U) void route_wave_policy_entry(
+    const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned* status, unsigned rows) {
+    static_assert(Traits::checked_status);
+    route_wave_body<Policy::value, Math, Traits>(logits, bias, ids, w, status, rows);
+}
+
+template <class Policy, class Math, class Traits>
+cudaError_t enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w,
+                               unsigned* status, unsigned rows, cudaStream_t stream) {
+    static_assert(moe::validate(Policy::value) == nullptr, "route_wave_kernel: invalid policy");
+    if (rows == 0U) return cudaSuccess;
+    if (!logits || !bias || !ids || !w || !status || rows > 0x7fffffffU) return cudaErrorInvalidValue;
+    constexpr unsigned waves = kCheckedRouteRowsPerBlock;
+    const unsigned blocks = (rows - 1U) / waves + 1U;
+    route_wave_policy_entry<Policy, Math, Traits><<<blocks, waves * 32U, 0, stream>>>(logits, bias, ids, w, status,
+                                                                                      rows);
+    return cudaGetLastError();
+}
+#endif
 
 }  // namespace strix::moe_core

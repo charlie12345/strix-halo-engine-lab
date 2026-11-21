@@ -14,6 +14,14 @@ CPU allocation, copy and completion are immediate. Native runtime adapters provi
 
 ## Consumers
 
+## Load-time matrix storage
+
+A family can tag BF16 matrix roles in its tensor schema and declare a versioned `WeightLoadPolicy`. The load plan applies to the complete tagged set. Changing the set, transcode rule or numerical bundle requires a new policy revision. The backend supplies the intersection of storage formats supported by all routes admitted for those roles, including the head and any prefill route or fallback that can execute with the image.
+
+`resolve_weight_load` takes the resolved profile tier. EXACT uses BF16. FAST and TURBO select the target when the backend declares support and the decision table holds a gate v2 PASS and a measured workload gain for the same policy revision, backend, device, compiler, build, checkpoint and workload regime. Both receipts apply to the complete tagged set. The caller verifies the identities of the running code and the loaded checkpoint. An explicit qualification-arm request can select a runnable plan before receipts exist, with status `unqualified`.
+
+The loader sizes each compact image using `matrix_load_geometry`. `load_bf16_matrix` reads the little-endian checkpoint slice into the planned image. Q8_0 stores 34 bytes per 32 consecutive weights, with a binary16 scale and signed 8-bit codes. The loader uses the shared block encoder and bounded staging. It rejects nonfinite inputs and FP16 scale overflow. Block scales that fall below the FP32 normal range round to zero in FP16 and use an all-zero block. The caller publishes storage and selects the matching backend weight view only after the complete load succeeds.
+
 The `strix-hip-decode-token` loader and the Qwen Flash-Next CUDA `Prefill` loader resolve native Q8_0 indexed-attention output projections (`blk.N.attn_output.weight`) after tensor admission. The family adapter supplies the incumbent for the active backend and HIP decode profile. The common resolver returns the native packed rows and the incumbent launch ID. HIP binds that ID in the serial indexed-attention launcher and checks the resolved extent against device-visible storage. CUDA uses the resolved file range for upload and binds the existing dense A8 projection to the loaded layer. Both execution receipts include `qsa_output_weight_plans` with each tensor's storage, image, arithmetic, kernel ID and packed bytes.
 
 The migration covers native Q8_0 trunk weights on those routes. Other source formats, alternate weight images and HIP prompt/window launchers use their existing routes. The native plan API refuses a request for another format with a reason. It has no conversion candidate. Device compilation and comparison of token IDs and uploaded bytes are pending.

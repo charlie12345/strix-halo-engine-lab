@@ -99,8 +99,10 @@ function(strix_session_add_runtime)
     target_include_directories(strix_qwen_http_session_owner PUBLIC "${_strix_session_root}/src")
     target_link_libraries(strix_qwen_http_session_owner PUBLIC strix_session_owner)
     strix_session_warnings(strix_qwen_http_session_owner)
-    add_library(strix_session_runtime INTERFACE)
-    target_link_libraries(strix_session_runtime INTERFACE strix_session_owner strix_serve strix_model_registry)
+    # Service adapters use the registry and lifecycle without the CLI shell.
+    add_library(strix_session_runtime STATIC "${_strix_session_root}/src/serve/serve_session.cpp")
+    target_link_libraries(strix_session_runtime PUBLIC strix_session_owner strix_serve strix_model_registry)
+    strix_session_warnings(strix_session_runtime)
     add_library(strix_session_shell STATIC "${_strix_session_root}/src/serve/run.cpp")
     target_link_libraries(strix_session_shell PUBLIC strix_session_runtime)
     strix_session_warnings(strix_session_shell)
@@ -204,10 +206,12 @@ function(strix_session_link_services)
     # A device-backed service makes HIP the link language of every shell
     # consumer; these targets were declared before the HIP target list.
     if(STRIX_ENABLE_HIP_RUNTIME AND DEFINED STRIX_HIP_ARCHS
-       AND (TARGET strix_gemma4_session_service OR TARGET strix_minimax_session_service))
+       AND (TARGET strix_gemma4_session_service OR TARGET strix_minimax_session_service
+            OR TARGET strix-hip-decode-token))
         foreach(_t strix_session_shell strix-serve strix-skeleton-serve skeleton_engine_tests
                 session_runtime_tests session_http_replay_tests session_registry_tests session_turn_cache_tests
-                minimax_service_tests minimax_service_compat minimax-native-paired-state)
+                minimax_service_tests minimax_service_compat minimax-native-paired-state
+                hy4_serve_tests strix-qwen-serve-factory-tests)
             if(TARGET ${_t})
                 set_target_properties(${_t} PROPERTIES HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
             endif()

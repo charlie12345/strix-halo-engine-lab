@@ -92,6 +92,29 @@ public:
     const std::vector<float>& prefill_window(std::span<const std::uint32_t> tokens, std::uint32_t start, bool head);
     [[nodiscard]] void* seam_rows() const noexcept;        // device [prompt_rows][4][hidden] FP32 (BF16 values); null on a whole-model rank
     [[nodiscard]] std::size_t seam_row_bytes() const noexcept;  // 4 x hidden x 4 B: one seam row = one decode state
+    // ---- pair prime on a whole-model rank: the stages of a StageMap as layer ranges of THIS forward, then the state
+    // re-laid out for the TP decode (strix/pair/relayout.hpp), KV in place. Prompt from position 0 after reset():
+    //   window_rows(P): rows the one-node prompt plan runs as windows (the stage pipeline runs exactly these windows;
+    //     the P - window_rows(P) tail positions run as steps through prompt_tail, TP steps after enable_tp);
+    //   range_window(ids, start, a, b, head): one window of layers [a, b) (prefill_window's work with this forward's
+    //     caches; input / output rows through range_seam() unless a == 0 / b == layers; b == layers feeds the
+    //     prompt-hidden sink with the window's rows); one-node like prefill() (no gather);
+    //   cache_bytes / export_cache / import_cache(layer, P): the layer's state for P positions (latent rows or ring slots,
+    //     indexer token-key ring and group keys), synchronous host copies;
+    //   seat(P): position P after every window ran here or was imported; feed_prompt_hidden(rows, p0, n): the sink with
+    //     rows produced on the peer (device rows); prompt_tail(ids): steps with the prompt-hidden feed, last logits.
+    // Bits: every cache row is the stage owner's = the one-node prefill's at the same prompt rows (StageMap invariant);
+    // the tail steps are TP steps = the one-node steps (TP invariant): decode ids equal the one-node-primed run.
+    [[nodiscard]] std::uint32_t window_rows(std::uint32_t prompt) const;
+    [[nodiscard]] void* range_seam();
+    const std::vector<float>& range_window(std::span<const std::uint32_t> tokens, std::uint32_t start, std::uint32_t first_layer,
+                                           std::uint32_t last_layer, bool head);
+    [[nodiscard]] std::uint64_t cache_bytes(std::uint32_t layer, std::uint32_t positions) const;
+    void export_cache(std::uint32_t layer, std::uint32_t positions, std::span<std::byte> out);
+    void import_cache(std::uint32_t layer, std::uint32_t positions, std::span<const std::byte> in);
+    void seat(std::uint32_t positions);
+    void feed_prompt_hidden(const float* rows, std::uint32_t p0, std::uint32_t n);
+    const std::vector<float>& prompt_tail(std::span<const std::uint32_t> tokens);
     [[nodiscard]] void* stream_handle() const noexcept;    // the hipStream_t every device operation of this forward runs on
     void sync();
     // step_greedy on a head stage of any range: `state` = X from the previous stage (ignored with the embedding).
@@ -150,6 +173,10 @@ public:
     void set_nextn_row_loop(bool on) noexcept;
     // The drafts' head from the next nextn_rows call on (the device check compares the forms on the same rows).
     void set_nextn_head(NextnHead head);
+    // After enable_tp: nextn_rows runs tensor-parallel (this rank's heads, BF16 expert slots 8 + 8 and shared rows, joined;
+    // the drafts' head on both ranks) instead of the one-node form. Both ranks must then make every nextn_rows call in the
+    // same order (strix/spec/pair_round.hpp draft rounds). Bitwise the one-node block: the same joins as the trunk's.
+    void set_nextn_tp(bool on);
     // outputs = trailing rows whose top / hidden the caller reads (default all). Rows [0, rows - outputs) only write the
     // block's caches (bitwise the full form's: the latent row and the indexer keys depend only on the row's input); their
     // pre / post rows are unspecified and their top is 0. want_top needs outputs >= 1. The row loop computes every row.
@@ -171,6 +198,28 @@ public:
 
     void set_timing(bool on) noexcept;  // per-stage device sync for StepTimes (a first-receipt aid, not a tuned path)
     [[nodiscard]] const StepTimes& times() const noexcept;
+
+    // ---- exact tensor parallelism over two whole-model ranks (decode steps; strix/pair/gather_link.hpp) ----
+    // After enable_tp every step() computes this rank's share and joins it with the peer's through `gather` (the shared
+    // GatherLink::fn binding): attention by heads (gate, q_b, rope, K_b, query image, flash, V_b, gate) then o joined,
+    // o_proj by output rows then joined; layer-0 FFN gate/up by rows (act joined), down by rows (joined); MoE routed
+    // slots 8 + 8 (A8 probe / down at ids + 8 rank) and shared gate/up by rows, one join of [slot rows | shared act];
+    // head by vocabulary rows (logits joined). Router, latent down/up, shared down, HC sites, norms, Engram, indexer
+    // and the greedy pick stay replicated. Every split output is a whole per-head / per-row / per-slot result of the
+    // same kernel and the joins are concatenations (the combine runs over all 16 slot rows in slot order): bitwise the
+    // one-node step. Both ranks must run the same step sequence (each gather is a symmetric swap). forward_rows (verify
+    // rows) splits the same way over its R rows (heads, o_proj / FFN / shared rows, routed slots 8 + 8 per row; the head
+    // stays replicated): bitwise the one-node pass; both ranks run the same passes (strix/spec/pair_round.hpp). prefill()
+    // and the next-token block (nextn_rows / nextn_logits, the drafter) run the one-node form on each rank that calls them
+    // (no gather), unless set_nextn_tp(true) (nextn_rows then splits like a step on both ranks). Whole-model rank only.
+    struct TpGather {
+        void* ctx = nullptr;
+        void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;
+    };
+    void enable_tp(std::uint32_t rank, TpGather gather);
+    [[nodiscard]] std::uint32_t tp_gathers_per_step() const noexcept;  // 0 before enable_tp
+    [[nodiscard]] std::string tp_receipt() const;                      // one line: rank, shares, gathers and bytes per step
+    [[nodiscard]] std::uint64_t tensor_bytes(const std::string& name) const noexcept;  // loaded tensor bytes (0: absent)
 
 private:
     struct Impl;

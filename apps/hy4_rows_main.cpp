@@ -16,11 +16,29 @@
 // strix-hy4-rows PART.gguf... --ids-file F [--context N] [--prompt-rows N] [--reps K] [--spec N] [--max-rows R]
 //   [--verify-ms a,b,...] [--gbps G] [--mtp [--mtp-head full|q8|q4] [--mtp-copy 0|1] [--chain-ms S,F] [--survival c,...] [--mtp-taps DIR
 //   [--taps-gen N] [--depth D]]]; --content LABEL=PATH (repeatable) instead of --ids-file: one spec run per content
+//   [--tp-rank 0|1 [--tp-transport usb4auto|tcp-listen:PORT|tcp-connect:HOST:PORT]]: the same run on a tensor-parallel
+//     pair (each rank loads the whole pack): bench rows / plain steps on both ranks with their shares; --spec: rank 0
+//     drafts and decides, rank 1 replays its verify passes (FOLLOW line), ids compared with plain greedy on rank 0.
+//     [--prefill-route auto|stages|one]: how the pair primes a prompt. stages: the layer-stage pipeline of the shared
+//     StageMap (default_stage_map) over the pair link on each rank's whole-model forward, the caches re-laid out for the
+//     TP decode (strix/pair/relayout.hpp), the drafter's teacher rows replayed, the tail as TP steps (one process, KV in
+//     place; bits = the one-node prime). one: every rank primes the whole prompt one-node (the previous form). auto
+//     (default): stages when relayout::stage_prime_wins (>= 2 full windows of >= 256 rows), else one. STAGES line: the split of the prime.
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_rows.hpp"
 #include "strix/spec/block_parallel.hpp"
+#include "strix/dist/open_transport.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/spec/pair_round.hpp"
+#include "strix/pair/layer_pipeline.hpp"
+#include "strix/pair/link_mux.hpp"
+#include "strix/pair/relayout.hpp"
+#include "strix/pair/stage_map.hpp"
+#include "xport/hip_pipe_staging.hpp"
+#include "xport/tp_gather_hip.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -86,10 +104,157 @@ double median(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     return v.empty() ? 0.0 : v[v.size() / 2U];
 }
+// --prefill-route on a TP pair: the gather's transport, this rank, the pack identity and the prompt rows.
+struct StagePrime {
+    strix::xport::tp_gather::HipPairGather* gather = nullptr;
+    unsigned rank = 0;
+    std::string route = "auto";  // auto | stages | one
+    std::string pack;            // pack identity in the request digest (file size)
+    std::uint32_t rows = 0;      // --prompt-rows (the windows)
+};
+
+void swap_words(strix::dist::Transport& t, unsigned rank, std::span<const std::byte> mine, std::span<std::byte> peer) {
+    if (rank == 0U) {
+        t.send(mine);
+        t.receive(peer);
+    } else {
+        t.receive(peer);
+        t.send(mine);
+    }
+}
+
+// The pair prime as layer stages on this rank's whole-model forward (both ranks, same point, same prompt): the windows
+// of the one-node prompt plan through the shared stage pipeline (StageMap default_stage_map, StagePipes over a LinkMux on
+// the gather's transport), every layer's caches re-laid out to both ranks (strix/pair/relayout.hpp), the head rank's
+// teacher rows to a drafting peer and replayed into the drafter (the same block calls in the same order as prefill()),
+// the anchor logits from the last window's head (no tail) or the tail as TP steps. Bits = the one-node prime.
+std::uint32_t prime_stages(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::MtpSource<hb::Forward>* mtp,
+                           const StagePrime& sp) {
+    namespace layers = strix::pair::layers;
+    namespace relayout = strix::pair::relayout;
+    const double t0 = now_ms();
+    auto& t = sp.gather->host_transport();
+    const unsigned rank = sp.rank;
+    f.reset();
+    const auto P = static_cast<std::uint32_t>(prompt.size());
+    const std::uint32_t Pw = f.window_rows(P), W = sp.rows;
+    if (Pw == 0U) throw std::invalid_argument("--prefill-route stages: the prompt has no full window");
+    const std::size_t h = f.config().hidden;
+    const auto chunks = layers::windows(Pw, W);
+    const auto map = strix::pair::default_stage_map(f.config().layers, chunks.size());
+    layers::check_stage_map(map, rank, true);
+    const std::uint64_t identity = layers::fnv(
+        layers::fnv(14695981039346656037ULL, "hy4-prime|" + sp.pack + "|" + map.text() + "|" + std::to_string(W)),
+        std::span<const std::uint32_t>(prompt));
+    // which ranks draft (their teacher pass needs the head rank's rows); doubles as the start barrier of the pipes
+    std::array<std::uint64_t, 2> mine{identity, mtp ? 1ULL : 0ULL}, peer{};
+    swap_words(t, rank, std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)));
+    if (peer[0] != identity) throw std::runtime_error("--prefill-route stages: the ranks prime different requests");
+    const bool head_rank = rank == map.owner(map.stages() - 1U), no_tail = Pw == P;
+    std::vector<float> hidden;
+    const auto stream = static_cast<hipStream_t>(f.stream_handle());
+    if (head_rank && (mtp || peer[1] != 0U)) {
+        hidden.resize(std::size_t{Pw} * h);
+        f.set_prompt_hidden([&hidden, h, stream](const float* rows, std::uint32_t p0, std::uint32_t n) {
+            if (hipMemcpyAsync(hidden.data() + std::size_t{p0} * h, rows, std::size_t{n} * h * sizeof(float), hipMemcpyDeviceToHost, stream) !=
+                    hipSuccess ||
+                hipStreamSynchronize(stream) != hipSuccess)
+                throw std::runtime_error("--prefill-route stages: teacher rows read");
+        });
+    }
+    std::vector<float> logits;
+    layers::StageOps ops;
+    const std::size_t row_bytes = f.seam_row_bytes();
+    ops.row_bytes = row_bytes;
+    ops.range = [&](std::span<const std::uint32_t> tok, const layers::Window& w, std::uint32_t a, std::uint32_t b, bool head) {
+        const auto& l = f.range_window(tok, w.start, a, b, head && no_tail);
+        if (head && no_tail) logits = l;
+    };
+    ops.seam = [&f](strix::pair::PipeFrame& fr, bool save, std::size_t bytes) { fr.staging->copy(save, 0, f.range_seam(), bytes); };
+    ops.fence = [&f] { f.sync(); };
+    {
+        strix::pair::LinkMux mux([&t](std::span<const std::byte> d) { t.send(d); }, [&t](std::span<std::byte> d) { t.receive(d); },
+                                 [&t](const std::string& why) { t.abort(why); }, 2U, std::size_t{16} << 20U);
+        const auto channel = [&mux](std::uint32_t ch) {
+            return strix::pair::PipeLink{[&mux, ch](std::span<const std::byte> d) { mux.send(ch, d); },
+                                         [&mux, ch](std::span<std::byte> d) { mux.receive(ch, d); },
+                                         [&mux] { mux.abort("hy4 stage prime pipe stopped"); }};
+        };
+        strix::pair::PipeOptions po;
+        po.validate = layers::stage_validator(identity, map, W, row_bytes);
+        po.profile_label = "hy4-stage-prime";
+        auto pipes = std::make_unique<strix::pair::StagePipes>(
+            rank, map, chunks.size(), channel(0U), channel(1U), std::move(po), [stream, W, row_bytes] {
+                return strix::pair::make_hip_pipe_staging(std::size_t{W} * row_bytes, [stream] { return stream; });
+            });
+        (void)layers::prefill(map, rank, std::span<const std::uint32_t>(prompt.data(), Pw), W, identity, *pipes, ops);
+        f.sync();
+        pipes.reset();
+        mux.close();
+    }
+    f.set_prompt_hidden({});
+    const double t_stages = now_ms();
+    const auto plan = relayout::plan(map, rank, [&f, Pw](std::uint32_t l) { return f.cache_bytes(l, Pw); });
+    relayout::Link lk{[&t](std::span<const std::byte> b) { t.send(b); }, [&t](std::span<std::byte> b) { t.receive(b); },
+                      [&t](const std::string& why) { t.abort(why); }};
+    relayout::Io io{[&f, Pw](std::uint32_t l, std::span<std::byte> out) { f.export_cache(l, Pw, out); },
+                    [&f, Pw](std::uint32_t l, std::span<const std::byte> in) { f.import_cache(l, Pw, in); }};
+    const auto rs = relayout::exchange(map, rank, identity, plan, lk, io);
+    const double t_relayout = now_ms();
+    // the head rank's teacher rows to a drafting peer, its anchor logits (no tail) to the peer
+    if (head_rank && peer[1] != 0U) t.send(std::as_bytes(std::span(hidden)));
+    if (!head_rank && mtp) {
+        hidden.resize(std::size_t{Pw} * h);
+        t.receive(std::as_writable_bytes(std::span(hidden)));
+    }
+    if (no_tail) {
+        if (head_rank) t.send(std::as_bytes(std::span(logits)));
+        else {
+            logits.resize(f.config().vocab);
+            t.receive(std::as_writable_bytes(std::span(logits)));
+        }
+    }
+    const double t_hidden = now_ms();
+    if (mtp) mtp->install(prompt);  // position 0: the teacher rows' first position
+    f.seat(Pw);
+    if (mtp) {  // the block's teacher pass: the windows' rows in prompt order, as prefill() feeds them
+        float* dev = f.alloc_f32(std::size_t{W} * h);
+        try {
+            for (const auto& w : chunks) {
+                if (hipMemcpyAsync(dev, hidden.data() + std::size_t{w.start} * h, std::size_t{w.rows} * h * sizeof(float), hipMemcpyHostToDevice,
+                                   stream) != hipSuccess)
+                    throw std::runtime_error("--prefill-route stages: teacher rows upload");
+                f.feed_prompt_hidden(dev, w.start, w.rows);
+            }
+            f.sync();
+        } catch (...) {
+            f.free_f32(dev);
+            throw;
+        }
+        f.free_f32(dev);
+    }
+    const double t_block = now_ms();
+    if (!no_tail) logits = f.prompt_tail(std::span<const std::uint32_t>(prompt).subspan(Pw));
+    const auto anchor = argmax(logits.data(), logits.size());
+    if (mtp) mtp->finish_prompt(anchor);
+    const double t_end = now_ms();
+    std::printf("STAGES rank %u map %s windows %zu rows %u tail %u: stages %.1f relayout %.1f (sent %.1f MB, received %.1f MB) "
+                "teacher+logits %.1f block %.1f tail %.1f total %.1f ms\n",
+                rank, map.text().c_str(), chunks.size(), W, P - Pw, t_stages - t0, t_relayout - t_stages, static_cast<double>(rs.sent) / 1e6,
+                static_cast<double>(rs.received) / 1e6, t_hidden - t_relayout, t_block - t_hidden, t_end - t_block, t_end - t0);
+    return anchor;
+}
+
 // The prompt into a fresh forward: position by position (class BASE) or the batched prompt windows (--prompt-rows).
-// Returns the anchor = greedy id after the last prompt token.
+// Returns the anchor = greedy id after the last prompt token. sp (TP pair): --prefill-route (prime_stages).
 std::uint32_t prime(hb::Forward& f, const std::vector<std::uint32_t>& prompt, bool batched,
-                    hb::rows::MtpSource<hb::Forward>* mtp = nullptr) {
+                    hb::rows::MtpSource<hb::Forward>* mtp = nullptr, const StagePrime* sp = nullptr) {
+    if (batched && sp && sp->route != "one") {
+        std::uint64_t full = 0;
+        for (const auto& w : strix::pair::layers::windows(f.window_rows(static_cast<std::uint32_t>(prompt.size())), sp->rows))
+            full += w.rows == sp->rows ? 1U : 0U;
+        if (sp->route == "stages" || strix::pair::relayout::stage_prime_wins(full, sp->rows)) return prime_stages(f, prompt, mtp, *sp);
+    }
     f.reset();
     if (batched) {
         if (mtp) mtp->install(prompt);  // the prompt rows' hidden feed the next-token block's teacher pass
@@ -309,6 +474,11 @@ int main(int argc, char** argv) {
         std::vector<double> chain_ms, survival;
         std::string taps_dir;
         std::uint32_t taps_gen = 128, depth = 6;
+        // tensor-parallel pair (Forward::enable_tp on both ranks, each holding the whole pack): rank 0 drafts and decides,
+        // both ranks run every verify pass with their shares (strix/spec/pair_round.hpp); bench mode runs on both ranks
+        int tp_rank = -1;
+        std::string tp_spec = "usb4auto";
+        std::string prefill_route = "auto";
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             const bool more = i + 1 < argc;
@@ -328,6 +498,13 @@ int main(int argc, char** argv) {
             else if (a == "--gbps" && more) gbps = std::stod(argv[++i]);
             else if (a == "--union-ab") union_ab = true;
             else if (a == "--mtp") mtp = true;
+            else if (a == "--tp-rank" && more) tp_rank = static_cast<int>(std::stoul(argv[++i]));
+            else if (a == "--tp-transport" && more) tp_spec = argv[++i];
+            else if (a == "--prefill-route" && more) {
+                prefill_route = argv[++i];
+                if (prefill_route != "auto" && prefill_route != "stages" && prefill_route != "one")
+                    throw std::invalid_argument("--prefill-route auto|stages|one");
+            }
             else if (a == "--mtp-head" && more) {
                 const std::string v = argv[++i];
                 if (v == "full") o.nextn_head = hb::NextnHead::full;
@@ -356,9 +533,52 @@ int main(int argc, char** argv) {
         std::printf("load %.1f s, %u verify rows, prompt %zu ids (%s), context %u, draft head %s\n", (now_ms() - t_load) / 1000.0,
                     o.verify_rows, prompt.size(), o.prompt_rows ? "batched" : "position by position", o.context, head_name(o.nextn_head));
         const auto vocab = static_cast<std::size_t>(f.config().vocab);
+        std::unique_ptr<strix::xport::tp_gather::HipPairGather> tpg;
+        strix::spec::pair_round::Exchange pair_ex;
+        if (tp_rank >= 0) {
+            if (tp_rank > 1 || !taps_dir.empty()) throw std::invalid_argument("--tp-rank 0|1 (bench or --spec; not with --mtp-taps)");
+            const auto rank = static_cast<std::uint32_t>(tp_rank);
+            auto opened = strix::dist::open_pair(tp_spec, rank);
+            if (!opened.receipt.empty()) std::printf("tp transport: %s\n", opened.receipt.c_str());
+            // largest gather: a verify pass's MoE join at 8 rows (8 x (8 slot rows x 1536 + shared / 2) FP32) < 2 MiB
+            const auto stream = static_cast<hipStream_t>(f.stream_handle());
+            tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), rank, std::size_t{2} << 20, stream,
+                                                                           strix::envcfg::flag("STRIX_TP_CHANNEL", true));
+            f.enable_tp(rank, {&tpg->link(), &strix::xport::tp_gather::HipPairGather::Link::fn});
+            std::printf("%s\n", f.tp_receipt().c_str());
+            // the round message rides the same gather: [2][kSlot] bytes on the device, stream-ordered after the last pass
+            constexpr std::size_t kSlot = 128;
+            static_assert(strix::spec::pair_round::kMessageBytes <= kSlot);
+            auto* slots = reinterpret_cast<std::uint8_t*>(f.alloc_f32(2U * kSlot / 4U));
+            auto* glink = &tpg->link();
+            pair_ex = [stream, slots, glink, rank](const std::uint8_t* mine, std::uint8_t* peer) {
+                constexpr std::size_t B = strix::spec::pair_round::kMessageBytes;
+                const auto ok = [](hipError_t e, const char* what) {
+                    if (e != hipSuccess) throw std::runtime_error(std::string("spec pair round: ") + what + ": " + hipGetErrorString(e));
+                };
+                ok(hipMemcpyAsync(slots + std::size_t{rank} * kSlot, mine, B, hipMemcpyHostToDevice, stream), "message upload");
+                strix::xport::tp_gather::HipPairGather::Link::fn(glink, stream, slots, kSlot, kSlot);
+                ok(hipMemcpyAsync(peer, slots + std::size_t{1U - rank} * kSlot, B, hipMemcpyDeviceToHost, stream), "message read");
+                ok(hipStreamSynchronize(stream), "message sync");
+            };
+        }
+        const bool follower = tp_rank == 1;
         const bool batched = o.prompt_rows != 0U;
+        StagePrime stage_prime;  // TP pair only: the prompt as layer stages + state re-layout (--prefill-route)
+        const StagePrime* sp = nullptr;
+        if (tpg) {
+            stage_prime.gather = tpg.get();
+            stage_prime.rank = static_cast<unsigned>(tp_rank);
+            stage_prime.route = prefill_route;
+            stage_prime.pack = std::to_string(std::filesystem::file_size(o.parts.front()));
+            stage_prime.rows = o.prompt_rows;
+            sp = &stage_prime;
+            std::printf("prefill route %s (pair: layer stages + state re-layout when chosen)\n", prefill_route.c_str());
+        }
         if (!taps_dir.empty()) return mtp_taps(f, prompt, taps_dir, taps_gen, depth, o.nextn_head);
-        const std::uint32_t anchor = prime(f, prompt, batched);
+        const double prime_b0 = now_ms();
+        const std::uint32_t anchor = prime(f, prompt, batched, nullptr, sp);
+        std::printf("PRIME first prompt %zu ids %.1f ms anchor %u\n", prompt.size(), now_ms() - prime_b0, anchor);
         if (spec_n == 0U) {
             // ---- bench: plain digests at G positions, rows of the same tokens
             constexpr std::uint32_t G = hb::rows::kMaxVerifyRows;
@@ -370,6 +590,13 @@ int main(int argc, char** argv) {
                 const auto& logits = f.step(t[i], state);
                 plain_fnv.push_back(fnv(logits.data(), logits.size()));
                 t.push_back(argmax(logits.data(), logits.size()));
+            }
+            {  // the plain steps after the prime: compared across prime routes (bits of the primed state)
+                std::uint64_t all = 1469598103934665603ULL;
+                for (const auto v : plain_fnv) all = (all ^ v) * 1099511628211ULL;
+                std::printf("PLAIN_STEPS fnv %016llx ids", static_cast<unsigned long long>(all));
+                for (std::uint32_t i = 1; i <= G; ++i) std::printf(" %u", t[i]);
+                std::printf("\n");
             }
             for (std::uint32_t i = 0; i < G; ++i) f.rewind();
             std::uint32_t equal = 0, total = 0;
@@ -432,7 +659,7 @@ int main(int argc, char** argv) {
         int rc = 0;
         for (std::size_t ci = 0; ci < contents.size(); ++ci) {
             const auto& [label, ids] = contents[ci];
-            const std::uint32_t first_id = ci == 0U ? anchor : prime(f, ids, batched);
+            const std::uint32_t first_id = ci == 0U ? anchor : prime(f, ids, batched, nullptr, sp);
             std::vector<std::uint32_t> plain{first_id};
             const double p0 = now_ms();
             while (plain.size() < spec_n) plain.push_back(f.step_greedy(plain.back()));
@@ -442,6 +669,29 @@ int main(int argc, char** argv) {
             so.max_rows = max_rows;
             so.verify_ms = verify_ms.empty() ? strix::spec::moe_verify_seed_ms(strix::spec::hy4_verify_bytes(), step_ms, gbps, max_rows) : verify_ms;
             std::unique_ptr<hb::rows::MtpSource<hb::Forward>> source;
+            std::uint64_t plain_fnv = 1469598103934665603ULL;  // the plain ids (compared across one node / pair runs)
+            for (const auto id : plain) plain_fnv = (plain_fnv ^ id) * 1099511628211ULL;
+            // tensor-parallel drafter (both ranks; STRIX_HY4_TP_DRAFT=0: rank 0 alone, one-node block): both ranks must agree
+            so.draft_tp = tp_rank >= 0 && mtp && strix::envcfg::flag("STRIX_HY4_TP_DRAFT", true);
+            if (follower) {  // rank 1: the same prompt pass (with the block when the drafter runs on both), then rank 0's rounds
+                std::unique_ptr<hb::rows::MtpSource<hb::Forward>> fsrc;
+                if (so.draft_tp) fsrc = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
+                const double prime_t1 = now_ms();
+                if (prime(f, ids, batched, fsrc.get(), sp) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
+                std::printf("PRIME %s prompt %zu ids %.1f ms (tp rank 1%s)\n", label.c_str(), ids.size(), now_ms() - prime_t1,
+                            fsrc ? ", with the block" : "");
+                const double t1 = now_ms();
+                const auto fr = fsrc ? hb::rows::spec_follow(f, pair_ex, *fsrc) : hb::rows::spec_follow(f, pair_ex);
+                const double wall = now_ms() - t1;
+                std::printf("FOLLOW %s rounds %llu passes %llu rows %llu committed %llu drafts %llu wall %.1f ms (position checked%s)\n",
+                            label.c_str(), static_cast<unsigned long long>(fr.rounds), static_cast<unsigned long long>(fr.passes),
+                            static_cast<unsigned long long>(fr.rows), static_cast<unsigned long long>(fr.committed),
+                            static_cast<unsigned long long>(fr.drafts), wall, fsrc ? ", draft ids cross-checked" : "");
+                std::printf("PLAIN %s tp rank 1 %.2f tok/s (%.2f ms/token) ids_fnv %016llx\n", label.c_str(), 1000.0 / step_ms, step_ms,
+                            static_cast<unsigned long long>(plain_fnv));
+                std::fflush(stdout);
+                continue;
+            }
             if (mtp) {
                 source = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
                 so.copy = mtp_copy;
@@ -453,10 +703,13 @@ int main(int argc, char** argv) {
                 so.chain_survival = survival.empty() ? std::vector<double>{0.714, 0.633, 0.436, 0.675, 0.256, 0.5} : survival;
             }
             const double prime_t0 = now_ms();  // the spec path's prompt pass (with the block: its teacher flushes when the ring fills)
-            if (prime(f, ids, batched, source.get()) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
+            if (prime(f, ids, batched, source.get(), sp) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
             std::printf("PRIME %s prompt %zu ids %.1f ms%s\n", label.c_str(), ids.size(), now_ms() - prime_t0, source ? " (with the block)" : "");
-            const auto res = source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source)
-                                    : hb::rows::spec_decode(f, ids, first_id, spec_n, so);
+            const auto* pex = tp_rank == 0 ? &pair_ex : nullptr;
+            const auto res = source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source, pex)
+                                    : hb::rows::spec_decode(f, ids, first_id, spec_n, so, pex);
+            std::printf("PLAIN %s %s %.2f tok/s (%.2f ms/token) ids_fnv %016llx\n", label.c_str(), tp_rank == 0 ? "tp rank 0" : "one node",
+                        1000.0 / step_ms, step_ms, static_cast<unsigned long long>(plain_fnv));
             std::size_t first_bad = std::min(res.ids.size(), plain.size());
             for (std::size_t i = 0; i < first_bad; ++i)
                 if (res.ids[i] != plain[i]) {
@@ -474,11 +727,17 @@ int main(int argc, char** argv) {
                         res.steps.empty() ? 0.0 : gen / static_cast<double>(res.steps.size()), static_cast<unsigned long long>(res.proposed),
                         static_cast<unsigned long long>(res.accepted));
             if (mtp)
-                std::printf("MTP %s block calls %llu rows %llu drafts %llu id reads %llu draft wall %.1f ms (%.2f ms/draft) chain %s seeds step %.1f flush %.1f\n",
+                std::printf("MTP %s block calls %llu rows %llu drafts %llu id reads %llu draft wall %.1f ms (%.2f ms/draft) chain %s seeds step %.1f flush %.1f%s\n",
                             label.c_str(), static_cast<unsigned long long>(res.chain_calls), static_cast<unsigned long long>(res.chain_rows),
                             static_cast<unsigned long long>(res.chain_drafts), static_cast<unsigned long long>(res.chain_reads), res.chain_ms,
                             res.chain_drafts ? res.chain_ms / static_cast<double>(res.chain_drafts) : 0.0, so.copy ? "+copy+hybrid" : "only",
-                            so.chain_step_ms, so.chain_flush_ms);
+                            so.chain_step_ms, so.chain_flush_ms, so.draft_tp ? " block tp" : (tp_rank == 0 ? " block rank 0" : ""));
+            if (mtp)  // where a pass's wall goes: verify passes, drafter (flush + chain), the rest (round message, host)
+                std::printf("WALL %s total %.1f ms verify %.1f draft %.1f other %.1f (per pass %.2f / %.2f / %.2f)\n", label.c_str(), res.wall_ms,
+                            res.verify_ms, res.chain_ms, res.wall_ms - res.verify_ms - res.chain_ms,
+                            res.verify_ms / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)),
+                            res.chain_ms / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)),
+                            (res.wall_ms - res.verify_ms - res.chain_ms) / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)));
             std::fflush(stdout);
             if (!equal) rc = 3;
         }

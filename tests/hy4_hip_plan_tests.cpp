@@ -158,6 +158,14 @@ void check_stage_windows() {
     CHECK(hb::pair_window_rows(4096U, {}) == 0U);  // no calibration: the caller keeps its width
     const hb::PairWindowCost unusable[] = {{0U, 5.0}, {1024U, 0.0}};
     CHECK(hb::pair_window_rows(4096U, unusable) == 0U);
+    // The interleaved pair plan over the measured cost (shared planner): narrower windows on short prompts, more stages
+    // per rank and wider windows on long ones; an explicit width keeps it; one window keeps the two-stage cut.
+    CHECK(hb::pair_stage_plan(2048U, 42U).choice.chunk == 1024U);
+    CHECK(hb::pair_stage_plan(4096U, 42U).choice.chunk == 1024U && hb::pair_stage_plan(4096U, 42U).map.virtual_stages() >= 3U);
+    CHECK(hb::pair_stage_plan(8192U, 42U).choice.chunk == 2048U && hb::pair_stage_plan(8192U, 42U).map.virtual_stages() == 5U);
+    CHECK(hb::pair_stage_plan(32768U, 42U).choice.chunk == 4096U && hb::pair_stage_plan(32768U, 42U).map.virtual_stages() == 5U);
+    CHECK(hb::pair_stage_plan(8192U, 42U, 1024U).choice.chunk == 1024U);
+    CHECK(hb::pair_stage_plan(1000U, 42U).choice.chunk == 0U && hb::pair_stage_plan(1000U, 42U).map.text() == "0,21,42");
 }
 
 // The tier word through the shared resolver: default leaves the plain invocation (prompt position by position); the
@@ -229,12 +237,23 @@ void check_profile_regime() {
     CHECK(run(g, one, 16384, {"--profile", "fast"}, &st) == "4096" && st == "profile / qualified");
     CHECK(run(g, one, gated + 1U, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
     CHECK(run(hp::Device::unknown, one, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
-    CHECK(run(g, hp::Topology::pair, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
+    // the pair inherits each width's one-node gate by identity (same bits at the same width), over the same prompt range
+    const auto pair = hp::Topology::pair;
+    CHECK(run(g, pair, 17, {"--profile", "fast"}, &st) == "4096" && st == "profile / qualified");
+    CHECK(run(g, pair, gated, {"--profile", "fast"}, &st) == "4096" && st == "profile / qualified");
+    CHECK(run(g, pair, gated + 1U, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
+    CHECK(run(hp::Device::unknown, pair, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
+    for (const char* w : {"1024", "2048", "4096"}) {
+        CHECK(run(g, pair, 8192, {"--prompt-rows", w}, &st) == w && st == "explicit-cli / qualified");
+        CHECK(run(g, one, 8192, {"--prompt-rows", w}, &st) == w && st == "explicit-cli / qualified");
+        CHECK(run(g, pair, gated + 1U, {"--prompt-rows", w}, &st) == w && st == "explicit-cli / unqualified: prompt_rows");
+    }
+    CHECK(run(g, pair, 8192, {"--prompt-rows", "512"}, &st) == "512" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(run(g, one, 17, {}, &st) == "0" && st == "builtin / qualified");
     CHECK(run(g, one, 17, {"--prompt-rows", "4096"}, &st) == "4096" && st == "explicit-cli / qualified");
     CHECK(run(g, one, 32568, {"--prompt-rows", "4096"}, &st) == "4096" && st == "explicit-cli / qualified");
-    // the shared resolver qualifies only the table value: 2048 (same bits) runs stamped unqualified
-    CHECK(run(g, one, 17, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / unqualified: prompt_rows");
+    // 2048 is in the table value's same_bits class: qualified wherever 4096 is, unqualified past the gated range
+    CHECK(run(g, one, 17, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / qualified");
     CHECK(run(g, one, gated + 1U, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(run(g, one, 17, {"--prompt-rows", "512"}, &st) == "512" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(hp::device_of("gfx1151:sramecc+:xnack-") == g && hp::device_of("gfx1100") == hp::Device::unknown);
@@ -255,6 +274,49 @@ void check_profile_regime() {
     CHECK(head(g, one, 1U << 20) == "1/profile");
     CHECK(head(g, hp::Topology::pair, 32768) == "1/profile");
     CHECK(head(hp::Device::unknown, one, 17) == "0/pending");
+}
+
+// pf_mha (environment lever STRIX_HY4_PF_MHA): fast sets it, and strix::profile::apply exports it, exactly where a
+// `qualified` row covers the regime; elsewhere it stays pending and nothing is exported; an explicit value wins.
+void check_profile_pf_mha() {
+    namespace sp = strix::profile;
+    namespace hp = strix::hy4::profile;
+    const auto run = [](hp::Device d, hp::Topology t, std::uint64_t tokens, const char* env, std::string* exported) {
+        sp::Inputs in;
+        in.env = [env](const char* k) -> const char* { return std::strcmp(k, "STRIX_HY4_PF_MHA") == 0 ? env : nullptr; };
+        std::vector<std::string> args{"--profile", "fast"};
+        sp::take_options(hp::engine(), args, in);
+        hp::Regime r;
+        r.device = d;
+        r.topology = t;
+        r.prompt_tokens = tokens;
+        const auto res = hp::resolve(r, in);
+        exported->clear();
+        sp::apply(res->resolution, [exported](const char* k, const char* v) {
+            if (std::strcmp(k, "STRIX_HY4_PF_MHA") == 0) *exported = v;
+            return true;
+        });
+        const auto* e = res->find("pf_mha");
+        return e == nullptr ? std::string("missing") : e->value + "/" + sp::status_name(e->status);
+    };
+    const auto g = hp::Device::gfx1151;
+    const auto one = hp::Topology::one_node;
+    const auto pair = hp::Topology::pair;
+    for (const auto t : {one, pair})
+        for (const std::uint64_t tokens : {std::uint64_t{17}, std::uint64_t{8192}, std::uint64_t{32568}, std::uint64_t{1} << 20}) {
+            hp::Regime r;
+            r.device = g;
+            r.topology = t;
+            r.prompt_tokens = tokens;
+            const bool gated = hp::qualification("pf_mha", "1", r, hp::qualified) != nullptr;
+            std::string ex;
+            const auto got = run(g, t, tokens, nullptr, &ex);
+            CHECK(gated ? (got == "1/profile" && ex == "1") : (got == "0/pending" && ex.empty()));
+            CHECK(run(g, t, tokens, "0", &ex) == "0/off" && ex.empty());
+            CHECK(run(g, t, tokens, "1", &ex) == "1/explicit-env" && ex.empty());
+        }
+    std::string ex;
+    CHECK(run(hp::Device::unknown, one, 17, nullptr, &ex) == "0/pending" && ex.empty());
 }
 
 void check_indexer_binding() {
@@ -303,6 +365,7 @@ int main(int argc, char** argv) {
         check_stage_windows();
         check_profile();
         check_profile_regime();
+        check_profile_pf_mha();
         if (argc > 1 && std::filesystem::exists(argv[1])) {
             const auto real = strix::hy4::Config::from_gguf(argv[1]);
             check_config(real, "pack");

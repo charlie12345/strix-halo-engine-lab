@@ -13,6 +13,12 @@ if(MSVC)
     target_compile_definitions(strix_gemma4_engine PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 target_link_libraries(strix_gemma4_engine PUBLIC strix_gemma4_serve strix_session_runtime)
+if(TARGET strix_intel_core)
+    # Link only: the engine includes SDK-free headers and must not inherit -fsycl (its exact-rounding host flags are
+    # not supported in device compilation).
+    target_link_libraries(strix_gemma4_engine PRIVATE $<LINK_ONLY:strix_intel_core>)
+    target_compile_definitions(strix_gemma4_engine PRIVATE STRIX_GEMMA4_INTEL_BACKEND=1)
+endif()
 add_library(strix_gemma4_session_service STATIC src/gemma4/engine/session_service.cpp)
 target_link_libraries(strix_gemma4_session_service PUBLIC strix_gemma4_engine strix_gemma4_description)
 strix_target_warnings(strix_gemma4_session_service)

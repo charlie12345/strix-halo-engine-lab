@@ -989,12 +989,14 @@ cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const
     return glu4(gate, up, a, nullptr, y_bf16, s, ctx);
 }
 
+enum class Bf16Tile { regular, compact, fixture };
+
 static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, float* y, const float* aux,
-                                      BigEpi epi, cudaStream_t s, BigCtx* ctx, bool compact);
+                                      BigEpi epi, cudaStream_t s, BigCtx* ctx, Bf16Tile tile);
 
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux,
                            BigEpi epi, cudaStream_t s, BigCtx* ctx) {
-    return dense_big_gemm_impl(w, a, y, aux, epi, s, ctx, false);
+    return dense_big_gemm_impl(w, a, y, aux, epi, s, ctx, Bf16Tile::regular);
 }
 
 cudaError_t dense_big_bf16_compact(const DenseWeight& w, const BigAct& a, float* y,
@@ -1002,11 +1004,22 @@ cudaError_t dense_big_bf16_compact(const DenseWeight& w, const BigAct& a, float*
     if (w.format != WeightFormat::bf16 || w.out == 0 || w.out > kCompactBf16Outputs ||
         a.terms != 3 || a.f4 || a.f8 || (epi != BigEpi::none && epi != BigEpi::round_bf16))
         return cudaErrorInvalidValue;
-    return dense_big_gemm_impl(w, a, y, nullptr, epi, s, ctx, true);
+    return dense_big_gemm_impl(w, a, y, nullptr, epi, s, ctx, Bf16Tile::compact);
 }
 
+#if defined(STRIX_B4_CUDA_FIXTURE)
+cudaError_t dense_big_bf16_fixture(const DenseWeight& w, const BigAct& a, float* y, cudaStream_t s, BigCtx* ctx) {
+    using Plan = strix::core::tall::Bf16ExactPlan;
+    const auto padded_rows = (std::uint64_t{a.rows} + Plan::rows - 1) / Plan::rows * Plan::rows;
+    if (w.format != WeightFormat::bf16 || w.out == 0 || w.in == 0 || a.rows == 0 || a.rows_pad < padded_rows ||
+        a.planes == nullptr || y == nullptr || a.f4 || a.f8 || a.terms != Plan::planes)
+        return cudaErrorInvalidValue;
+    return dense_big_gemm_impl(w, a, y, nullptr, BigEpi::none, s, ctx, Bf16Tile::fixture);
+}
+#endif
+
 static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, float* y, const float* aux,
-                                      BigEpi epi, cudaStream_t s, BigCtx* ctx, bool compact) {
+                                      BigEpi epi, cudaStream_t s, BigCtx* ctx, Bf16Tile tile) {
     if (a.f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (!dense_big_supported(w) || a.in != w.in || a.f16 != (w.format == WeightFormat::nvfp4)) return cudaErrorInvalidValue;
     const bool round_bf16 = epi == BigEpi::round_bf16;
@@ -1099,7 +1112,18 @@ static cudaError_t dense_big_gemm_impl(const DenseWeight& w, const BigAct& a, fl
     }
     if (a.terms == 1) return bkb == 2 ? launch<false, 1, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 1, 4, kChain, 1>(ba, w.out, a.rows, s);
     if (a.terms == 2) return bkb == 2 ? launch<false, 2, 4, kChain, 2>(ba, w.out, a.rows, s) : launch<false, 2, 4, kChain, 1>(ba, w.out, a.rows, s);
-    if (compact) {
+#if defined(STRIX_B4_CUDA_FIXTURE)
+    if (tile == Bf16Tile::fixture) {
+        using Plan = strix::core::tall::Bf16ExactPlan;
+        constexpr int row_fragments = Plan::rows / (4 * 8);
+        constexpr int output_fragments = Plan::outputs / (2 * 16);
+        using Shape = Tall16<false, Plan::planes, row_fragments, kChain, 1, false, output_fragments, 2>;
+        static_assert(Shape::tile.rows == Plan::rows && Shape::tile.outputs == Plan::outputs &&
+                      Shape::tile.k == Plan::block_k);
+        return launch<false, Plan::planes, row_fragments, kChain, 1, false, output_fragments, 2>(ba, w.out, a.rows, s);
+    }
+#endif
+    if (tile == Bf16Tile::compact) {
         // 32 outputs x 32 rows. The CTA reads the same K table and each
         // accumulator sees the same two K16 steps and lo/mid/hi MMA sequence.
         if (round_bf16) return launch<false, 3, 1, kChain, 1, true, 2, 1>(ba, w.out, a.rows, s);

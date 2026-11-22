@@ -214,8 +214,7 @@ __device__ void block_score(const ScoreRow& row, ScoreSpec spec) {
 }
 
 template <ScoreForm Form>
-__global__ void score_kernel(const ScoreRow* rows, ScoreSpec spec) {
-    const auto row = rows[blockIdx.y];
+__device__ __forceinline__ void score_row(const ScoreRow& row, ScoreSpec spec) {
     if constexpr (Form == ScoreForm::block_max || Form == ScoreForm::block_max_tiled) {
         block_score<Form == ScoreForm::block_max ? 32U : 8U>(row, spec);
     } else if constexpr (Form == ScoreForm::weighted_fp8) {
@@ -248,6 +247,12 @@ __global__ void score_kernel(const ScoreRow* rows, ScoreSpec spec) {
         }
         store_score(row, i, sum);
     }
+}
+
+template <ScoreForm Form>
+__global__ void score_kernel(const ScoreRow* rows, ScoreSpec spec) {
+    const auto row = rows[blockIdx.y];
+    score_row<Form>(row, spec);
 }
 
 inline constexpr unsigned vectors_per_score_row = strided_score_width / 4U;

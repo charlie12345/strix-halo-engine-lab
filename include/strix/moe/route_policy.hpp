@@ -192,6 +192,68 @@ STRIX_MOE_ROUTE_HD inline bool route_better(RouteKey key, float a, std::uint32_t
     return ka > kb || (ka == kb && ai < bi);
 }
 
+// F3 selection trait for a precomputed score/choice pair. Keep the serial
+// comparison even for nonfinite choices: the first eligible NaN sticks,
+// while any NaN encountered after the first eligible expert cannot win.
+template <class Policy>
+struct RouteSerialScorePlanes {
+    static_assert(validate(Policy::value) == nullptr);
+    static_assert(Policy::value.math == RouteMath::native && Policy::value.selection_bias &&
+                  Policy::value.key == RouteKey::float_serial && Policy::value.order == RouteOrder::selection &&
+                  Policy::value.renormalize && (Policy::value.top_k > 1U || Policy::value.renorm_single));
+    static constexpr auto experts = Policy::value.experts;
+    static constexpr auto top_k = Policy::value.top_k;
+
+    template <unsigned Stride>
+    STRIX_MOE_ROUTE_HD static inline void select_row(RouteScorePlanes<Stride> planes, std::size_t row,
+                                                     std::uint32_t* ids, float* weights) {
+        const auto input = row * experts * Stride;
+        const float* const scores = planes.unbiased + input;
+        const float* const choices = planes.biased + input;
+        std::uint32_t picked[top_k];
+        for (std::uint32_t slot = 0U; slot < top_k; ++slot) {
+            std::uint32_t best = experts;
+            for (std::uint32_t expert = 0U; expert < experts; ++expert) {
+                bool taken = false;
+                for (std::uint32_t prior = 0U; prior < slot; ++prior) taken |= picked[prior] == expert;
+                if (taken) continue;
+                if (best == experts ||
+                    route_better(Policy::value.key, choices[std::size_t{expert} * Stride], expert,
+                                 choices[std::size_t{best} * Stride], best)) {
+                    best = expert;
+                }
+            }
+            picked[slot] = best;
+        }
+        float sum = 0.0F;
+        for (const auto expert : picked) sum = sum + scores[std::size_t{expert} * Stride];
+        const float denominator = sum + Policy::value.renorm_eps;
+        for (std::uint32_t slot = 0U; slot < top_k; ++slot) {
+            ids[slot] = picked[slot];
+            weights[slot] = (scores[std::size_t{picked[slot]} * Stride] / denominator) * Policy::value.scale;
+        }
+    }
+};
+
+// CPU oracle. The input view must address rows * experts elements per plane
+// at the declared stride, as it does for the projection writer.
+template <class Policy, unsigned Stride>
+void route_score_planes_ref(RouteScorePlanes<Stride> planes, std::span<std::uint32_t> ids,
+                            std::span<float> weights) {
+    using Selection = RouteSerialScorePlanes<Policy>;
+    if (ids.size() != weights.size() || ids.size() % Selection::top_k != 0U)
+        throw std::invalid_argument("route policy: invalid score plane output geometry");
+    const auto rows = ids.size() / Selection::top_k;
+    if (rows == 0U) return;
+    if (!planes.unbiased || !planes.biased || planes.unbiased == planes.biased ||
+        rows > std::numeric_limits<std::size_t>::max() / Stride / Selection::experts)
+        throw std::invalid_argument("route policy: invalid score plane input view");
+    for (std::size_t row = 0; row < rows; ++row) {
+        const auto output = row * Selection::top_k;
+        Selection::select_row(planes, row, ids.data() + output, weights.data() + output);
+    }
+}
+
 inline void validate_route_row(const RoutePolicy& p, std::size_t scores, std::size_t bias,
                                std::size_t ids, std::size_t weights) {
     if (const char* why = validate(p)) throw std::invalid_argument(why);

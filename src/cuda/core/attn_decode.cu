@@ -509,7 +509,7 @@ cudaError_t decode(const DecodePlan& plan, const DecodeInput& in, float* out,
 
     const cuda_core::AttentionDims dims{spec.heads, spec.kv_heads, spec.head_dim, spec.scale, spec.cache_slots};
     const detail::PlanPosition position{in.device_position, in.first_position, spec.max_context - spec.rows};
-    if (uses_native_split(spec)) {
+    if (uses_native_split(spec, kNativeSplitHeadDim)) {
         const bool interleaved = spec.gate == OutputGate::sigmoid_interleaved;
         const auto stride = spec.head_dim * (interleaved ? 2U : 1U);
         const cuda_core::GroupedView packed{spec.rows, spec.heads, spec.head_dim};
@@ -533,7 +533,8 @@ cudaError_t decode(const DecodePlan& plan, const DecodeInput& in, float* out,
         return detail::decode_split(dims, in.q, q_view, gate, gate_view, in.k, in.v, position, spec.rows,
                                     out, scratch, stream, in.row_map);
     }
-    if (mapped || strided || in.shadow) return cudaErrorInvalidValue;
+    if (mapped || strided || in.shadow || spec.order == DecodeOrder::online_e4m3 ||
+        spec.gate == OutputGate::sigmoid_strided) return cudaErrorInvalidValue;
     if (spec.order == DecodeOrder::online_bf16 && spec.head_dim == 128) {
         const cuda_core::PreparedBf16Flash prepared{
             in.relative_bias, spec.sinks ? in.sinks : nullptr, spec.relative_extent, spec.window,

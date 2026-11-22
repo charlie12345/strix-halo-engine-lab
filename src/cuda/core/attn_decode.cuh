@@ -1,12 +1,14 @@
 #pragma once
 
-#include "attn_plan.hpp"
+#include "attn_core/decode_plan.hpp"
 #include "strix/cuda_core/attention.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace strix::cuda::core::attn {
+
+inline constexpr std::uint32_t kNativeSplitHeadDim = 256;
 
 struct DecodeInput {
     // Q is [row][head][dim], or [row][head][Q | gate] for sigmoid_interleaved.
@@ -32,7 +34,7 @@ struct DecodeInput {
     const cuda_core::KvShadowE4m3* shadow = nullptr;
 };
 
-// Enqueue a plan returned by make_decode_plan. Output is contiguous
+// Enqueue a plan made with kNativeSplitHeadDim. Output is contiguous
 // [row][head][dim]. The caller owns scratch and keeps all buffers alive until
 // the stream completes. Prepared MMA requires 16-byte aligned K/V planes.
 cudaError_t decode(const DecodePlan& plan, const DecodeInput& input, float* output,

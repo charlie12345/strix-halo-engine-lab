@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include "strix/numeric/math_gfx1151.hpp"
 
 namespace strix::cpu::expert {
 

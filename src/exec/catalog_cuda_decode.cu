@@ -4,12 +4,15 @@
 #include "cuda/core/head_argmax.cuh"
 #include "cuda/core/dense/bf16_rows.hpp"
 #include "cuda/core/mix_cuda.cuh"
+#include "cuda/core/mma_tile.cuh"
+#include "cuda/core/dense/rows_bf16_epilogue.cuh"
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/norms.hpp"
 #include "strix/device/runtime.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -23,6 +26,8 @@ namespace transforms = core::row_transforms;
 namespace cuda = cuda_core;
 namespace packed = moe_core::microscaled_r1;
 namespace argmax = ::strix::cuda::core::head_argmax;
+namespace grouped_mma = ::strix::cuda::core::mma::microscaled;
+namespace grouped_rows = moe_core::grouped_rows;
 using weight::microscaled::MatrixFormat;
 
 cudaError_t enqueue(const Embedding& a, cudaStream_t stream) {
@@ -150,6 +155,50 @@ cudaError_t enqueue(const Bf16DenseGroup& a, cudaStream_t stream) {
     return cuda::dense_rows_multi(weights, output, n, a.input, 1, nullptr, stream, arithmetic);
 }
 
+cudaError_t enqueue(const AppendKvHostBf16& a, cudaStream_t stream) { return enqueue(a.args, stream); }
+cudaError_t enqueue(const PreparedFlashHostBf16& a, cudaStream_t stream) { return enqueue(a.args, stream); }
+
+cudaError_t enqueue(const grouped_rows::GatherArgs& a, cudaStream_t stream) { return grouped_rows::gather(a, stream); }
+cudaError_t enqueue(const grouped_rows::CombineArgs& a, cudaStream_t stream) { return grouped_rows::combine(a, stream); }
+
+cudaError_t enqueue(const GroupedProjection& a, cudaStream_t stream) {
+    if (a.format == MatrixFormat::nvfp4) return grouped_mma::launch<MatrixFormat::nvfp4>(a.args, stream);
+    if (a.format == MatrixFormat::mxfp8) return grouped_mma::launch<MatrixFormat::mxfp8>(a.args, stream);
+    return cudaErrorInvalidValue;
+}
+
+cudaError_t enqueue(const GroupedActivation& a, cudaStream_t stream) {
+    return moe_core::expert_activation::launch(a.args, a.gate_cap, a.up_cap, stream);
+}
+
+bool valid(const Bf16Fp32Epilogue& a) {
+    const auto& d = a.dense;
+    return d.count == 1 && d.mode == Bf16DenseMode::fp32 &&
+        d.projections[0].outputs <= std::numeric_limits<std::uint32_t>::max() - 7U &&
+        cuda::detail::valid_bf16_dense_row_group({d.input, d.input_width, std::span(d.projections).first(1)},
+                                                1, cuda::DenseArith::fp32) &&
+        (a.form == graph::Form::store_bf16 ||
+         (a.form == graph::Form::softcap && a.cap > 0.0F && std::isfinite(a.cap)));
+}
+
+cudaError_t enqueue(const Bf16Fp32Epilogue& a, cudaStream_t stream) {
+    if (!valid(a)) return cudaErrorInvalidValue;
+    const auto& d = a.dense;
+    const auto& p = d.projections[0];
+    const auto store = a.form == graph::Form::softcap ? cuda::Bf16Fp32Store::softcap : cuda::Bf16Fp32Store::round;
+    return cuda::dense_bf16_fp32_r1_epilogue(p.weights, d.input, p.output, d.input_width, p.outputs, store, a.cap, stream);
+}
+
+cudaError_t enqueue(const RoundedCausalConvolution& a, cudaStream_t stream) {
+    if (!a.convolution.round_bf16) return cudaErrorInvalidValue;
+    return enqueue(a.convolution, stream);
+}
+
+bool valid(const RoundedCausalConvolution& a) {
+    return a.convolution.round_bf16 &&
+        core::causal_conv::valid(a.convolution.plan, convolution_args(a.convolution));
+}
+
 template <class Args>
 void thunk(std::span<const std::byte> bytes, const Grid&, void* stream) {
     static_assert(std::is_trivially_copyable_v<Args>);
@@ -205,6 +254,18 @@ constexpr LauncherRef gate_up{"strix::moe_core::microscaled_r1::launch_gate_up",
 constexpr LauncherRef down_combine{"strix::moe_core::microscaled_r1::launch_down_combine", "src/moe_core/microscaled_r1.hpp", "r1.k8", 1};
 constexpr LauncherRef pick_part{"strix::cuda::core::head_argmax::pick_partial", "src/cuda/core/head_argmax.cuh", "plain", 1};
 constexpr LauncherRef pick_final{"strix::cuda::core::head_argmax::pick_final", "src/cuda/core/head_argmax.cuh", "plain.index_or_none", 1};
+constexpr LauncherRef append_kv_host{append_kv.symbol, append_kv.source, "host.r1", 1};
+constexpr LauncherRef prepared_flash_host{prepared_flash.symbol, prepared_flash.source, "host.r1.pad2", 1};
+constexpr LauncherRef grouped_gather{"strix::moe_core::grouped_rows::gather", "src/moe_core/grouped_rows.hpp", "r1", 1};
+constexpr LauncherRef grouped_project{"strix::cuda::core::mma::microscaled::launch", "src/cuda/core/mma_tile.cuh", "r1", 1};
+constexpr LauncherRef grouped_activate{"strix::moe_core::expert_activation::launch", "src/moe_core/expert_activation.hpp", "r1", 1};
+constexpr LauncherRef grouped_combine{"strix::moe_core::grouped_rows::combine", "src/moe_core/grouped_rows.hpp", "r1", 1};
+constexpr LauncherRef dense_fp32_round{"strix::cuda_core::dense_bf16_fp32_r1_epilogue",
+    "src/cuda/core/dense/dense.cu", "fp32_round", 1};
+constexpr LauncherRef dense_fp32_softcap{"strix::cuda_core::dense_bf16_fp32_r1_epilogue",
+    "src/cuda/core/dense/dense.cu", "fp32_softcap", 1};
+constexpr LauncherRef convolution_round{"strix::core::causal_conv::launch_with_store",
+    "src/core/short_convolution.hpp", "r1.round_bf16", 1};
 
 template <class Args, OperandClass Act = OperandClass::f32_fma, Bf16DenseMode... Modes>
 constexpr KernelEntry entry(graph::Op op, FormId form, weight::FormatId format,
@@ -229,9 +290,38 @@ constexpr KernelEntry packed_entry(graph::Op op, FormId form, std::string_view i
     return instance;
 }
 
+template <graph::Form Form>
+EntryLaunch bind_fp32_epilogue_site(const LaunchSite& site, EntryBinder& binder) {
+    const auto* args = static_cast<const Bf16Fp32Epilogue*>(site.backend_args);
+    if (!args || args->form != Form || !valid(*args)) return {};
+    return bind_site<Bf16Fp32Epilogue>(site, binder);
+}
+
+template <graph::Form Form>
+constexpr KernelEntry fp32_epilogue_entry(FormId key, std::string_view identity, const LauncherRef& launcher) {
+    auto instance = entry<Bf16Fp32Epilogue>(graph::Op::linear, key, {"plain.bf16", 1}, identity, launcher);
+    instance.bind = bind_fp32_epilogue_site<Form>;
+    return instance;
+}
+
+EntryLaunch bind_rounded_conv_site(const LaunchSite& site, EntryBinder& binder) {
+    const auto* args = static_cast<const RoundedCausalConvolution*>(site.backend_args);
+    if (!args || !valid(*args)) return {};
+    return bind_site<RoundedCausalConvolution>(site, binder);
+}
+
+constexpr KernelEntry rounded_conv_entry() {
+    auto instance = entry<RoundedCausalConvolution>(graph::Op::elementwise, "causal_convolution.decode_round", {},
+        "cuda-sm120-causal-convolution-round-r1-v1", convolution_round);
+    instance.bind = bind_rounded_conv_site;
+    return instance;
+}
+
 enum Leaf { embed, rms_bf16, kv_store, flash, finite_check, conv, head_clip, bank_norm, bank_mix,
             row_add, blend, round, gate, head_softcap, relative_d16, linear_fp32, linear_mma3, linear_mma3_round,
-            controller_pair, gate_up_nvfp4, gate_up_mxfp8, down_nvfp4, down_mxfp8, greedy_part, greedy_final };
+            controller_pair, gate_up_nvfp4, gate_up_mxfp8, down_nvfp4, down_mxfp8, greedy_part, greedy_final,
+            kv_store_host, flash_host, group_gather, group_nvfp4, group_mxfp8, group_activation, group_combine,
+            linear_fp32_round, linear_fp32_softcap, conv_round };
 constexpr KernelEntry catalogue[] = {
     entry<Embedding>(graph::Op::gather, "embedding.bf16_to_f32", {"plain.bf16", 1}, "cuda-sm120-embedding-bf16-r1-v1", embedding),
     entry<RmsBf16>(graph::Op::norm, "rms.bf16_gain.f32_image", {"plain.bf16", 1}, "cuda-sm120-rms-bf16-image-r1-v1", rms),
@@ -267,6 +357,23 @@ constexpr KernelEntry catalogue[] = {
         "cuda-sm120-packed-mxfp8-down-combine-r1-k8-v1", down_combine),
     entry<GreedyPartial>(graph::Op::argmax, "greedy.partial", {}, "cuda-sm120-greedy-partial-r1-v1", pick_part),
     entry<GreedyFinal>(graph::Op::argmax, "greedy.final", {}, "cuda-sm120-greedy-final-r1-v1", pick_final),
+    entry<AppendKvHostBf16>(graph::Op::store, "prepared.kv.bf16.host_position", {},
+        "cuda-sm120-prepared-bf16-kv-host-r1-v1", append_kv_host),
+    entry<PreparedFlashHostBf16>(graph::Op::attend, "prepared.flash.pad2.d128.host_position", {},
+        "cuda-sm120-prepared-flash-pad2-d128-host-r1-v1", prepared_flash_host),
+    entry<grouped_rows::GatherArgs>(graph::Op::gather, "microscaled.grouped.gather", {},
+        "cuda-sm120-grouped-gather-r1-v1", grouped_gather),
+    packed_entry<GroupedProjection, MatrixFormat::nvfp4>(graph::Op::linear, "microscaled.grouped.projection",
+        "cuda-sm120-grouped-nvfp4-projection-r1-v1", grouped_project),
+    packed_entry<GroupedProjection, MatrixFormat::mxfp8>(graph::Op::linear, "microscaled.grouped.projection",
+        "cuda-sm120-grouped-mxfp8-projection-r1-v1", grouped_project),
+    entry<GroupedActivation>(graph::Op::elementwise, "microscaled.grouped.swiglu_bf16", {},
+        "cuda-sm120-grouped-swiglu-r1-v1", grouped_activate),
+    entry<grouped_rows::CombineArgs>(graph::Op::combine, "microscaled.grouped.combine", {},
+        "cuda-sm120-grouped-combine-r1-v1", grouped_combine),
+    fp32_epilogue_entry<graph::Form::store_bf16>("r1.bf16_image.fp32_round", "cuda-sm120-bf16-r1-fp32-round-v1", dense_fp32_round),
+    fp32_epilogue_entry<graph::Form::softcap>("r1.bf16_image.fp32_softcap", "cuda-sm120-bf16-r1-fp32-softcap-v1", dense_fp32_softcap),
+    rounded_conv_entry(),
 };
 
 template <class Args>
@@ -396,6 +503,21 @@ KernelBinding bind(const Bf16DenseGroup& a) {
     return bind_leaf(linear_fp32, {{(outputs + 7U) / 8U, 1, 1}, {256, 1, 1}, 0}, a);
 }
 
+KernelBinding bind(const Bf16Fp32Epilogue& a) {
+    if (!valid(a)) throw std::invalid_argument("invalid CUDA R1 FP32 dense epilogue");
+    const auto outputs = a.dense.projections[0].outputs;
+    const auto leaf = a.form == graph::Form::softcap ? linear_fp32_softcap : linear_fp32_round;
+    return bind_leaf(leaf, {{(outputs - 1U) / 8U + 1U, 1, 1}, {256, 1, 1}, 0}, a);
+}
+
+KernelBinding bind(const RoundedCausalConvolution& a) {
+    const auto& conv = a.convolution;
+    if (!valid(a))
+        throw std::invalid_argument("invalid CUDA R1 rounded convolution");
+    const auto grid = core::causal_conv::launch_plan(conv.plan, convolution_args(conv));
+    return bind_leaf(conv_round, {{grid.channel_blocks, grid.row_blocks, 1}, {grid.threads, 1, 1}, 0}, a);
+}
+
 KernelBinding bind(const residual::NormalizePairArgs& a) {
     if (a.first.rows != 1U || a.second.rows != 1U || !residual::fits(a.first) || !residual::fits(a.second))
         throw std::invalid_argument("invalid CUDA R1 controller pair norm");
@@ -443,6 +565,46 @@ KernelBinding bind(const GreedyFinal& a) {
     (void)greedy_chunks(a.reduction);
     if (!a.output) throw std::invalid_argument("missing CUDA R1 greedy output");
     return bind_leaf(greedy_final, {{1, 1, 1}, {argmax::detail::kThreads, 1, 1}, 0}, a);
+}
+
+KernelBinding bind(const AppendKvHostBf16& a) {
+    if (a.args.position) throw std::invalid_argument("host-position KV append has a device position");
+    return bind_leaf(kv_store_host, {{a.args.kv_heads, 1, 1}, {std::min(a.args.width, 256U), 1, 1}, 0}, a);
+}
+
+KernelBinding bind(const PreparedFlashHostBf16& a) {
+    if (a.args.position) throw std::invalid_argument("host-position prepared flash has a device position");
+    constexpr auto shared = 2U * 32U * (4U * prepared_head_width + 32U + 16U);
+    return bind_leaf(flash_host, {{a.args.heads, 1, 1}, {256, 1, 1}, shared}, a);
+}
+
+KernelBinding bind(const grouped_rows::GatherArgs& a) {
+    if (a.width == 0 || a.assignments == 0) throw std::invalid_argument("empty CUDA grouped gather");
+    const auto grid = grouped_rows::detail::grid(a.width, a.assignments);
+    return bind_leaf(group_gather, {{grid.x, grid.y, 1}, {grouped_rows::detail::kThreads, 1, 1}, 0}, a);
+}
+
+KernelBinding bind(const GroupedProjection& a) {
+    if (!grouped_mma::fits(a.args) || a.args.max_tile_rows != 1U ||
+        (a.format != MatrixFormat::nvfp4 && a.format != MatrixFormat::mxfp8))
+        throw std::invalid_argument("invalid CUDA R1 grouped projection");
+    using Shape = grouped_mma::TileShape< ::strix::cuda::core::native_mma::kDecodeMBlocks, grouped_mma::kDecodeOutputs>;
+    const auto leaf = a.format == MatrixFormat::nvfp4 ? group_nvfp4 : group_mxfp8;
+    return bind_leaf(leaf, {{a.args.outputs / grouped_mma::kDecodeOutputs, 1, a.args.count},
+                            {Shape::kThreads, 1, 1}, 0}, a);
+}
+
+KernelBinding bind(const GroupedActivation& a) {
+    if (a.args.rows == 0 || !moe_core::expert_activation::fits(a.args, a.gate_cap, a.up_cap))
+        throw std::invalid_argument("invalid CUDA grouped activation");
+    return bind_leaf(group_activation, {{static_cast<unsigned>((a.args.width - 1U) / 128U + 1U),
+        static_cast<unsigned>(a.args.rows), 1}, {128, 1, 1}, 0}, a);
+}
+
+KernelBinding bind(const grouped_rows::CombineArgs& a) {
+    if (a.width == 0 || a.rows != 1U) throw std::invalid_argument("invalid CUDA R1 grouped combine");
+    const auto grid = grouped_rows::detail::grid(a.width, a.rows);
+    return bind_leaf(group_combine, {{grid.x, grid.y, 1}, {grouped_rows::detail::kThreads, 1, 1}, 0}, a);
 }
 
 }  // namespace strix::exec::cuda_decode

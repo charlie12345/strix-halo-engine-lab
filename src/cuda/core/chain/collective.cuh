@@ -29,7 +29,8 @@ __device__ __forceinline__ unsigned column(unsigned reg) { return threadIdx.x + 
 
 // Each lane accumulates its strided BF16 dot in feature order. The tree
 // then combines the upper lane with the lower lane at every level.
-__device__ __forceinline__ float folded_sigmoid(const Gfx1151FoldedGate& gate, const TileCtx& ctx) {
+template <bool SideOutputOnly = false>
+__device__ __forceinline__ auto folded_sigmoid(const Gfx1151FoldedGate& gate, const TileCtx& ctx) {
     const auto* input = gate.input + std::size_t{ctx.row} * gate.input_stride;
     const unsigned lane = threadIdx.x;
     float sum = 0.0F;
@@ -37,19 +38,30 @@ __device__ __forceinline__ float folded_sigmoid(const Gfx1151FoldedGate& gate, c
         sum = __fmaf_rn(gate.weights[i], cache::decode(input[i]), sum);
     ctx.scratch[lane] = sum;
     __syncthreads();
-    for (unsigned stride = kThreads / 2U; stride > 0U; stride >>= 1U) {
+    constexpr unsigned stop = SideOutputOnly ? 1U : 0U;
+    for (unsigned stride = kThreads / 2U; stride > stop; stride >>= 1U) {
         if (lane < stride) ctx.scratch[lane] = __fadd_rn(ctx.scratch[lane + stride], ctx.scratch[lane]);
         __syncthreads();
     }
-    if (lane == 0U) {
-        const float sigmoid = gate_sigmoid<Math::gfx1151_v1>(ctx.scratch[0], &gate.tables);
-        ctx.scratch[0] = sigmoid;
-        if (gate.sigmoid_out) gate.sigmoid_out[ctx.row] = sigmoid;
+    if constexpr (SideOutputOnly) {
+        // Lane zero computes the final level and publishes before its barrier,
+        // so the next step can immediately reuse scratch.
+        if (lane == 0U && gate.sigmoid_out) {
+            const float folded = __fadd_rn(ctx.scratch[1], ctx.scratch[0]);
+            gate.sigmoid_out[ctx.row] = gate_sigmoid<Math::gfx1151_v1>(folded, &gate.tables);
+        }
+        __syncthreads();
+    } else {
+        if (lane == 0U) {
+            const float sigmoid = gate_sigmoid<Math::gfx1151_v1>(ctx.scratch[0], &gate.tables);
+            ctx.scratch[0] = sigmoid;
+            if (gate.sigmoid_out) gate.sigmoid_out[ctx.row] = sigmoid;
+        }
+        __syncthreads();
+        const float result = ctx.scratch[0];
+        __syncthreads();
+        return result;
     }
-    __syncthreads();
-    const float result = ctx.scratch[0];
-    __syncthreads();
-    return result;
 }
 
 template <unsigned R>
@@ -341,7 +353,9 @@ __device__ __forceinline__ void apply_step(Step<F, Slot> step, RegisterRow<R>& r
 template <Form F, std::uint8_t Slot, Fold O, unsigned R>
 __device__ __forceinline__ void apply_step(ActivationVariant<F, Slot, Math::gfx1151_v1, O> step,
                                            RegisterRow<R>& row, const ChainArgs& args, const TileCtx& ctx) {
-    if constexpr (O == Fold::descending_upper_first) {
+    if constexpr (O == Fold::descending_upper_first_side_output) {
+        folded_sigmoid<true>(descriptor<Gfx1151FoldedGate>(args, Slot), ctx);
+    } else if constexpr (O == Fold::descending_upper_first) {
         const float sigmoid = folded_sigmoid(descriptor<Gfx1151FoldedGate>(args, Slot), ctx);
 #pragma unroll
         for (unsigned r = 0; r < R; ++r)

@@ -12,7 +12,7 @@ using graph::Form;
 enum class Scope : std::uint8_t { element, warp, row, unsupported };
 enum class Arg : std::uint8_t { none, scalar, aux, state };
 enum class Math : std::uint8_t { native, gfx1151_v1 };
-enum class Fold : std::uint8_t { none, descending_upper_first };
+enum class Fold : std::uint8_t { none, descending_upper_first, descending_upper_first_side_output };
 
 struct FormInfo {
     Scope scope;
@@ -41,7 +41,8 @@ template <Form F, std::uint8_t Slot, Math M, Fold O>
 struct ActivationVariant : Step<F, Slot> {
     static_assert(F == Form::act_silu_mul || F == Form::gate_sigmoid_mul);
     static_assert(M == Math::gfx1151_v1);
-    static_assert(O == Fold::none || (F == Form::gate_sigmoid_mul && O == Fold::descending_upper_first));
+    static_assert(O == Fold::none || (F == Form::gate_sigmoid_mul &&
+        (O == Fold::descending_upper_first || O == Fold::descending_upper_first_side_output)));
     static constexpr Math math = M;
     static constexpr Fold fold = O;
 };

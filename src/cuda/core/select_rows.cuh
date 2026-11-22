@@ -2,6 +2,7 @@
 
 #include "cuda/core/select_rows.hpp"
 #include "cuda/core/select_score.cuh"
+#include "cuda/core/select_relu_schedules.cuh"
 
 #include <concepts>
 
@@ -17,7 +18,7 @@ __global__ void score_rows_kernel(Rows rows, ScoreSpec spec) {
     if (rows.load(blockIdx.y, input)) score_row<ScoreForm::relu_tree>(input.score(spec.block_width), spec);
 }
 
-template <IndexedRows Rows>
+template <class Rows>
 __global__ __launch_bounds__(pick_threads) void pick_rows_kernel(Rows rows, PickSpec spec) {
     __shared__ PickScratch scratch;
     VisibleRow input;
@@ -60,6 +61,25 @@ cudaError_t enqueue_pick(Rows rows, unsigned row_count, PickSpec spec, cudaStrea
             return cudaErrorInvalidValue;
     } else {
         if (!rows.step || !rows.slots || row_count > exec::kStepMaxRows) return cudaErrorInvalidValue;
+    }
+    detail::pick_rows_kernel<<<row_count, detail::pick_threads, 0, stream>>>(rows, spec);
+    return cudaGetLastError();
+}
+
+// Segment descriptors are packed before the eager launch or each replay.
+// Inactive capture rows are skipped by the same producer used for scoring.
+// Use the packed shape's row bound and the scorer's ratio and top_k.
+template <class Map>
+cudaError_t enqueue_pick(SegmentRows<Map> rows, unsigned row_count, PickSpec spec, cudaStream_t stream) {
+    if (row_count == 0) return cudaSuccess;
+    if (row_count > 2147483647U || spec.order != KeyOrder::eligible_float || spec.force_newest ||
+        spec.top_k == 0 || spec.expansion == 0 || !rows.base.selected) return cudaErrorInvalidValue;
+    if constexpr (rows.replay) {
+        if (!rows.map || !rows.base.scores) return cudaErrorInvalidValue;
+    } else {
+        if (rows.map.count > rows.capacity) return cudaErrorInvalidValue;
+        if (rows.map.count == 0) return cudaSuccess;
+        if (!rows.base.scores && rows.map.segments[rows.map.count - 1U].wave_end != 0) return cudaErrorInvalidValue;
     }
     detail::pick_rows_kernel<<<row_count, detail::pick_threads, 0, stream>>>(rows, spec);
     return cudaGetLastError();

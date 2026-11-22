@@ -1,6 +1,5 @@
-// Compile with nvcc --cubin for the before/after K5c disassembly comparison.
-// Instantiate each materialized-row kernel and both strided block-max kernels.
-#include "cuda/core/select_score.cuh"
+// Compile with nvcc --cubin for the before/after K5c and K5A disassembly comparison.
+#include "cuda/core/select_rows.cuh"
 
 namespace strix::cuda::core::select::detail {
 template __global__ void score_kernel<ScoreForm::relu_tree>(const ScoreRow*, ScoreSpec);
@@ -17,4 +16,8 @@ template __global__ void pick_kernel<KeyOrder::ordered>(const PickRow*, PickSpec
 template __global__ void pick_kernel<KeyOrder::canonical_float>(const PickRow*, PickSpec);
 template __global__ void pick_kernel<KeyOrder::raw_float>(const PickRow*, PickSpec);
 template __global__ void pick_kernel<KeyOrder::eligible_float>(const PickRow*, PickSpec);
+template __global__ void score_rows_kernel<AffineRows>(AffineRows, ScoreSpec);
+template __global__ void score_rows_kernel<SlotRows>(SlotRows, ScoreSpec);
+template __global__ void pick_rows_kernel<AffineRows>(AffineRows, PickSpec);
+template __global__ void pick_rows_kernel<SlotRows>(SlotRows, PickSpec);
 } // namespace strix::cuda::core::select::detail

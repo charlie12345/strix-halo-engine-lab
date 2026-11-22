@@ -289,4 +289,43 @@ __global__ __launch_bounds__(kSelectThreads) void select_kernel(float* __restric
 
 #undef kInf
 
+// Score fields of the private cohort descriptor and the two score wrappers,
+// frozen from src/cuda/models/qwen/qwen_qsa.cu at 5b220d036.
+inline constexpr unsigned kMaxSegments = 8;
+struct SegmentMap {
+    unsigned n = 0;
+    unsigned first_row[kMaxSegments + 1] = {};
+    std::uint64_t position[kMaxSegments] = {};
+    const float* pooled[kMaxSegments] = {};
+    unsigned scored[kMaxSegments] = {}, score_begin[kMaxSegments + 1] = {};
+};
+
+__device__ __forceinline__ const SegmentMap& map_of(const SegmentMap& m) { return m; }
+__device__ __forceinline__ const SegmentMap& map_of(const SegmentMap* m) { return *m; }
+
+template <class MapArg>
+__global__ __launch_bounds__(256) void block_score_multi_kernel(const float* __restrict__ index_query, MapArg mapa,
+    float* __restrict__ block_scores, std::uint32_t max_blocks) {
+    const SegmentMap& map = map_of(mapa);
+    const unsigned total = map.score_begin[map.n];
+    for (unsigned wave = blockIdx.x * 8U + threadIdx.x / 32U; wave < total; wave += gridDim.x * 8U) {
+        unsigned seg = 0;
+        while (seg + 1U < map.n && wave >= map.score_begin[seg + 1U]) ++seg;
+        const auto row = map.first_row[seg];
+        block_score_body(index_query + static_cast<std::uint64_t>(row) * kIndexQWidth, map.first_row[seg + 1U] - row, map.position[seg],
+            map.pooled[seg], map.scored[seg], block_scores + static_cast<std::uint64_t>(row) * max_blocks, max_blocks,
+            wave - map.score_begin[seg]);
+    }
+}
+
+template <class MapArg>
+__global__ __launch_bounds__(256, 1) void block_score_tree_multi_kernel(const float* __restrict__ index_query, MapArg mapa,
+    float* __restrict__ block_scores, std::uint32_t max_blocks) {
+    const SegmentMap& map = map_of(mapa);
+    const unsigned seg = blockIdx.z;
+    const auto row = map.first_row[seg];
+    block_score_tree_body(index_query + static_cast<std::uint64_t>(row) * kIndexQWidth, map.first_row[seg + 1U] - row, map.position[seg],
+        map.pooled[seg], map.scored[seg], block_scores + static_cast<std::uint64_t>(row) * max_blocks, max_blocks, blockIdx.x, blockIdx.y);
+}
+
 } // namespace select_qwen_baseline

@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -66,12 +67,35 @@ void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 
-template <class T> auto allocate() {
+template <class T> auto allocate_device() {
     T* storage = nullptr;
-    check(cudaMallocManaged(&storage, sizeof(T)));
+    check(cudaMalloc(&storage, sizeof(T)));
     const auto release = [](T* p) { (void)cudaFree(p); };
     return std::unique_ptr<T, decltype(release)>(storage, release);
 }
+
+// On WDDM, only the CPU mirror is host-accessible. Launch pointers and
+// addresses embedded in descriptors always refer to the device allocation.
+template <class T> class Mirrored {
+    static_assert(std::is_trivially_copyable_v<T>);
+
+public:
+    T& host() const { return *host_; }
+    T* device() const { return device_.get(); }
+
+    void upload(std::size_t bytes = sizeof(T)) const {
+        check(cudaMemcpy(device(), &host(), bytes, cudaMemcpyHostToDevice));
+    }
+
+    // The caller synchronizes the producing work before reading device state.
+    void download(std::size_t bytes = sizeof(T)) const {
+        check(cudaMemcpy(&host(), device(), bytes, cudaMemcpyDeviceToHost));
+    }
+
+private:
+    std::unique_ptr<T> host_ = std::make_unique<T>();
+    decltype(allocate_device<T>()) device_ = allocate_device<T>();
+};
 
 template <class T>
 void compare(const char* label, const T* actual, const T* expected, std::size_t count) {
@@ -129,16 +153,16 @@ void initialize(Input<T>& input) {
 }
 
 template <class T>
-void describe(Input<T>& input, unsigned width, bool chain) {
+void describe(Input<T>& input, const Input<T>* device, unsigned width, bool chain) {
     auto& step = input.step;
     step = {};
     step.h.rows = width;
     step.h.valid_mask = (1U << width) - 1U;
     constexpr unsigned start[kSlots] = {37U, 541U};
     for (unsigned slot = 0; slot < kSlots; ++slot) {
-        input.directory[slot] = {reinterpret_cast<std::uintptr_t>(input.image[slot].history),
+        input.directory[slot] = {reinterpret_cast<std::uintptr_t>(device->image[slot].history),
                                  start[slot], width, start[slot] + width, 1};
-        input.directory[kSlots + slot] = {reinterpret_cast<std::uintptr_t>(input.image[slot].matrix),
+        input.directory[kSlots + slot] = {reinterpret_cast<std::uintptr_t>(device->image[slot].matrix),
                                           start[slot], width, start[slot] + width, 1};
     }
     // Interleaved slots, siblings (3 and 4), a hole in each validity channel.
@@ -156,29 +180,36 @@ void describe(Input<T>& input, unsigned width, bool chain) {
 }
 
 template <RecurrentStateType Type, class T>
-void serial(const Input<T>& input, Pending<T>& work, const rec::DecodeWeights& w, const am::Tables& tables, bool alias) {
-    for (unsigned r = 0; r < input.step.h.rows; ++r) {
-        if (!exec::step_row_valid(input.step, r)) continue;
-        const auto& desc = input.step.row[r];
-        const auto& image = input.image[desc.slot];
+void serial(const exec::StepBlock& step, const Input<T>* device_input, Pending<T>* device_work,
+            const rec::DecodeWeights& w, const am::Tables& tables, bool alias) {
+    for (unsigned r = 0; r < step.h.rows; ++r) {
+        if (!exec::step_row_valid(step, r)) continue;
+        const auto& desc = step.row[r];
+        const auto& image = device_input->image[desc.slot];
         const bool root = desc.parent == exec::kStepNoParent;
-        check(cudaMemcpyAsync(work.history[r], root ? image.history : work.history[desc.parent],
-                              sizeof(work.history[r]), cudaMemcpyDeviceToDevice, nullptr));
-        const rec::DecodeRow row{input.hidden[r], work.qkv[r], input.z[r],
-            alias ? work.qkv[r] : work.prepared[r], work.beta[r], work.gate[r], work.out[r], work.raw[r]};
-        const rec::DecodeState state{work.history[r], root ? image.matrix : work.matrix[desc.parent], work.matrix[r], Type};
-        check(rec::enqueue_decode({}, w, row, state, tables, {work.codes[r], work.deltas + r}, nullptr));
+        check(cudaMemcpyAsync(device_work->history[r], root ? image.history : device_work->history[desc.parent],
+                              sizeof(device_work->history[r]), cudaMemcpyDeviceToDevice, nullptr));
+        const rec::DecodeRow row{device_input->hidden[r], device_work->qkv[r], device_input->z[r],
+            alias ? device_work->qkv[r] : device_work->prepared[r], device_work->beta[r], device_work->gate[r],
+            device_work->out[r], device_work->raw[r]};
+        const rec::DecodeState state{device_work->history[r], root ? image.matrix : device_work->matrix[desc.parent],
+                                     device_work->matrix[r], Type};
+        check(rec::enqueue_decode({}, w, row, state, tables, {device_work->codes[r], device_work->deltas + r}, nullptr));
     }
 }
 
 template <unsigned R, RecurrentStateType Type, class T>
-void donor_prefix(const Input<T>& input, Donor<T>& donor, const Pending<T>& work, unsigned target,
+void donor_prefix(const Mirrored<Input<T>>& inputs, const Mirrored<Donor<T>>& donors,
+                  const Pending<T>& work, unsigned target,
                   const am::Tables& tables, bool alias) {
+    const auto& input = inputs.host();
+    auto& donor = donors.host();
     std::array<unsigned, R> path{};
     unsigned count = 0U;
     for (unsigned r = target; r != exec::kStepNoParent; r = input.step.row[r].parent) path[count++] = r;
     std::reverse(path.begin(), path.begin() + count);
-    const auto& published = input.image[input.step.row[target].slot];
+    const unsigned slot = input.step.row[target].slot;
+    const auto& published = input.image[slot];
     std::memcpy(donor.image.history, published.history, sizeof(published.history));
     for (unsigned i = 0; i < R; ++i) {
         const unsigned r = i < count ? path[i] : target; // Extra donor rows cannot affect the prefix.
@@ -186,33 +217,39 @@ void donor_prefix(const Input<T>& input, Donor<T>& donor, const Pending<T>& work
         std::copy_n(input.qkv[r], L::channels, donor.qkv[i]);
         std::copy_n(input.z[r], L::value_width, donor.z[i]);
     }
-    const frozen::Rows rows{donor.qkv[0], donor.z[0], donor.beta[0], donor.gate[0], donor.out[0], kStride};
+    donors.upload();
+    const auto* device_input = inputs.device();
+    auto* device_donor = donors.device();
+    const auto& device_published = device_input->image[slot];
+    const frozen::Rows rows{device_donor->qkv[0], device_donor->z[0], device_donor->beta[0],
+                            device_donor->gate[0], device_donor->out[0], kStride};
     frozen::decode_front_kernel<R><<<frozen::kDecConvBlocks + frozen::kDecGateBlocks, 256>>>(
-        donor.input[0], kStrides.input, rows, input.beta, input.alpha, input.dt, input.a,
-        input.conv, 1e-6F, tables, {donor.image.history}, donor.raw[0]);
+        device_donor->input[0], kStrides.input, rows, device_input->beta, device_input->alpha, device_input->dt,
+        device_input->a, device_input->conv, 1e-6F, tables, {device_donor->image.history}, device_donor->raw[0]);
     check(cudaGetLastError());
 
     // Frozen donor accept replay: recompute the matrix and roll taps back to
     // count, independently of the full-width destructive front above.
     constexpr unsigned rollback_blocks = (L::channels + kRecThreads - 1U) / kRecThreads;
-    const frozen::DevRef<float> in{reinterpret_cast<float*>(const_cast<T*>(published.matrix))};
-    const frozen::DevRef<float> out{reinterpret_cast<float*>(donor.image.matrix)};
+    const frozen::DevRef<float> in{reinterpret_cast<float*>(const_cast<T*>(device_published.matrix))};
+    const frozen::DevRef<float> out{reinterpret_cast<float*>(device_donor->image.matrix)};
     if constexpr (Type == RecurrentStateType::f32) {
         frozen::recurrence_dec_kernel<4><<<kRecBlocks + rollback_blocks, kRecThreads>>>(
-            rows, count, in, out, tables, donor.raw[0], published.history, donor.image.history);
+            rows, count, in, out, tables, device_donor->raw[0], device_published.history, device_donor->image.history);
     } else {
-        frozen::decay_kernel<<<(count * L::value_heads + 255U) / 256U, 256>>>(rows, count, donor.decay, tables);
+        frozen::decay_kernel<<<(count * L::value_heads + 255U) / 256U, 256>>>(rows, count, device_donor->decay, tables);
         check(cudaGetLastError());
-        frozen::recurrence_kernel<4, Type, true><<<kRecBlocks, kRecThreads>>>(rows, count, in, out, donor.decay);
+        frozen::recurrence_kernel<4, Type, true><<<kRecBlocks, kRecThreads>>>(rows, count, in, out, device_donor->decay);
         check(cudaGetLastError());
         frozen::conv_rollback_kernel<><<<(L::channels + 255U) / 256U, 256>>>(
-            donor.raw[0], count, published.history, donor.image.history);
+            device_donor->raw[0], count, device_published.history, device_donor->image.history);
     }
     check(cudaGetLastError());
     frozen::norm_kernel<true><<<count * L::value_heads / 8U, 256>>>(
-        rows, count, input.gain, 1e-6F, tables, donor.codes[0], donor.deltas);
+        rows, count, device_input->gain, 1e-6F, tables, device_donor->codes[0], device_donor->deltas);
     check(cudaGetLastError());
     check(cudaDeviceSynchronize());
+    donors.download();
 
     for (unsigned i = 0; i < count; ++i) {
         const unsigned r = path[i];
@@ -230,70 +267,101 @@ void donor_prefix(const Input<T>& input, Donor<T>& donor, const Pending<T>& work
 }
 
 template <RecurrentStateType Type, class T>
-void resume(Input<T>& input, Pending<T>& work, Pending<T>& seq, rec::DecodeStep args,
+void resume(const Mirrored<Input<T>>& inputs, const Mirrored<Pending<T>>& pending,
+            const Mirrored<Pending<T>>& reference, rec::DecodeStep args,
             const rec::DecodeWeights& w, const am::Tables& tables) {
+    auto& input = inputs.host();
+    auto* device_input = inputs.device();
+    auto* device_work = pending.device();
+    auto* device_seq = reference.device();
     constexpr unsigned accepted = 4U, next = kRows - 1U;
     const unsigned position = input.step.row[accepted].position + 1U;
-    input.directory[0].base = reinterpret_cast<std::uintptr_t>(work.history[accepted]);
+    input.directory[0].base = reinterpret_cast<std::uintptr_t>(device_work->history[accepted]);
     input.directory[0].frontier = position;
-    input.directory[kSlots].base = reinterpret_cast<std::uintptr_t>(work.matrix[accepted]);
+    input.directory[kSlots].base = reinterpret_cast<std::uintptr_t>(device_work->matrix[accepted]);
     input.directory[kSlots].frontier = position;
     input.step.h.rows = 1U;
     input.step.h.valid_mask = 1U;
     input.step.row[0] = {0, position, 0, exec::kStepNoParent, 1, exec::step_valid, 0, 0};
+    inputs.upload();
 
     // Reuse the last rejected row's buffers for a new token after acceptance.
-    std::copy_n(input.qkv[next], L::channels, work.qkv[next]);
-    std::copy_n(input.qkv[next], L::channels, seq.qkv[next]);
+    check(cudaMemcpy(device_work->qkv[next], input.qkv[next], sizeof(input.qkv[next]), cudaMemcpyHostToDevice));
+    check(cudaMemcpy(device_seq->qkv[next], input.qkv[next], sizeof(input.qkv[next]), cudaMemcpyHostToDevice));
     args.rows = rec::decode_row(args, next);
-    args.pending_history = work.history[next];
-    args.pending_matrix = work.matrix[next];
-    args.a8 = {work.codes[next], work.deltas + next};
+    args.pending_history = device_work->history[next];
+    args.pending_matrix = device_work->matrix[next];
+    args.a8 = {device_work->codes[next], device_work->deltas + next};
     check(rec::enqueue_decode_step(1U, w, args, tables, nullptr));
 
-    check(cudaMemcpyAsync(seq.history[next], seq.history[accepted], sizeof(seq.history[next]),
+    check(cudaMemcpyAsync(device_seq->history[next], device_seq->history[accepted], sizeof(device_seq->history[next]),
                           cudaMemcpyDeviceToDevice, nullptr));
-    const rec::DecodeRow row{input.hidden[next], seq.qkv[next], input.z[next],
-        seq.qkv[next], seq.beta[next], seq.gate[next], seq.out[next], seq.raw[next]};
-    const rec::DecodeState state{seq.history[next], seq.matrix[accepted], seq.matrix[next], Type};
-    check(rec::enqueue_decode({}, w, row, state, tables, {seq.codes[next], seq.deltas + next}, nullptr));
+    const rec::DecodeRow row{device_input->hidden[next], device_seq->qkv[next], device_input->z[next],
+        device_seq->qkv[next], device_seq->beta[next], device_seq->gate[next], device_seq->out[next], device_seq->raw[next]};
+    const rec::DecodeState state{device_seq->history[next], device_seq->matrix[accepted], device_seq->matrix[next], Type};
+    check(rec::enqueue_decode({}, w, row, state, tables, {device_seq->codes[next], device_seq->deltas + next}, nullptr));
     check(cudaDeviceSynchronize());
-    compare("resumed after partial acceptance", reinterpret_cast<const unsigned char*>(&work),
-            reinterpret_cast<const unsigned char*>(&seq), sizeof(work));
+    pending.download();
+    reference.download();
+    inputs.download();
+    compare("resumed after partial acceptance", reinterpret_cast<const unsigned char*>(&pending.host()),
+            reinterpret_cast<const unsigned char*>(&reference.host()), sizeof(Pending<T>));
 }
 
 template <unsigned R, RecurrentStateType Type, class T>
-void run(Input<T>& input, Pending<T>& work, Pending<T>& seq, Donor<T>& donor, const am::Tables& tables, bool chain) {
-    describe(input, R, chain);
+void run(const Mirrored<Input<T>>& inputs, const Mirrored<Pending<T>>& pending,
+         const Mirrored<Pending<T>>& reference, const Mirrored<Donor<T>>& donors,
+         const am::Tables& tables, bool chain) {
+    std::fprintf(stderr, "K9G X3 decode %s R=%u case=%s\n", strix::recurrent_state_type_name(Type), R,
+                 chain ? "verify" : "cohort");
+    std::fflush(stderr);
+    auto& input = inputs.host();
+    auto& work = pending.host();
+    auto& seq = reference.host();
+    auto* device_input = inputs.device();
+    auto* device_work = pending.device();
+    describe(input, device_input, R, chain);
     std::memset(&work, 0xa5, sizeof(work));
     for (unsigned r = 0; r < R; ++r) std::copy_n(input.qkv[r], L::channels, work.qkv[r]);
     std::memcpy(&seq, &work, sizeof(work));
     const auto published = std::make_unique<std::array<Image<T>, kSlots>>();
     std::memcpy(published->data(), input.image, sizeof(input.image));
     const auto directory = std::to_array(input.directory);
-    const strix::state::StateTable table{input.directory, 2, kSlots};
-    const rec::DecodeWeights w{input.beta, input.alpha, input.dt, input.a, input.conv, input.gain};
+    const strix::state::StateTable table{device_input->directory, 2, kSlots};
+    const rec::DecodeWeights w{device_input->beta, device_input->alpha, device_input->dt, device_input->a,
+                               device_input->conv, device_input->gain};
     const bool alias = chain;
     auto strides = kStrides;
     if (alias) strides.prepared = strides.qkv;
-    const rec::DecodeStep args{&input.step,
-        {input.hidden[0], work.qkv[0], input.z[0], alias ? work.qkv[0] : work.prepared[0],
-         work.beta[0], work.gate[0], work.out[0], work.raw[0]},
-        strides, {table, 0}, {table, 1}, work.history[0], work.matrix[0], Type, {work.codes[0], work.deltas}};
+    const rec::DecodeStep args{&device_input->step,
+        {device_input->hidden[0], device_work->qkv[0], device_input->z[0],
+         alias ? device_work->qkv[0] : device_work->prepared[0],
+         device_work->beta[0], device_work->gate[0], device_work->out[0], device_work->raw[0]},
+        strides, {table, 0}, {table, 1}, device_work->history[0], device_work->matrix[0], Type,
+        {device_work->codes[0], device_work->deltas}};
+    pending.upload();
+    reference.upload();
 
     // Zero acceptance keeps the published images, including for a fully
     // padded launch. For a nonempty accepted path select its last row image.
     if constexpr (R == 1U) {
         input.step.h.valid_mask = 0U;
+        inputs.upload();
         check(rec::enqueue_decode_step(R, w, args, tables, nullptr));
         check(cudaDeviceSynchronize());
+        pending.download();
+        inputs.download();
         compare("fully padded", reinterpret_cast<const unsigned char*>(&work),
                 reinterpret_cast<const unsigned char*>(&seq), sizeof(work));
         input.step.h.valid_mask = 1U;
     }
-    serial<Type>(input, seq, w, tables, alias);
+    inputs.upload();
+    serial<Type>(input.step, device_input, reference.device(), w, tables, alias);
     check(rec::enqueue_decode_step(R, w, args, tables, nullptr));
     check(cudaDeviceSynchronize());
+    pending.download();
+    reference.download();
+    inputs.download();
     compare("sequential K9G (including all padding)", reinterpret_cast<const unsigned char*>(&work),
             reinterpret_cast<const unsigned char*>(&seq), sizeof(work));
     compare("published directory", input.directory, directory.data(), directory.size());
@@ -304,28 +372,27 @@ void run(Input<T>& input, Pending<T>& work, Pending<T>& seq, Donor<T>& donor, co
     for (unsigned r = 0; r < R; ++r)
         if (exec::step_row_valid(input.step, r)) {
             try {
-                donor_prefix<R, Type>(input, donor, work, r, tables, alias);
+                donor_prefix<R, Type>(inputs, donors, work, r, tables, alias);
             } catch (...) {
                 std::fprintf(stderr, "R=%u row=%u %s\n", R, r, chain ? "verify" : "cohort");
                 throw;
             }
         }
     if constexpr (R == kRows) {
-        if (chain) resume<Type>(input, work, seq, args, w, tables);
+        if (chain) resume<Type>(inputs, pending, reference, args, w, tables);
     }
 }
 
 template <RecurrentStateType Type>
 void test(const am::Tables& tables) {
     using T = std::conditional_t<Type == RecurrentStateType::f32, float, std::uint16_t>;
-    auto input = allocate<Input<T>>();
-    auto work = allocate<Pending<T>>();
-    auto seq = allocate<Pending<T>>();
-    auto donor = allocate<Donor<T>>();
-    initialize<Type>(*input);
+    const Mirrored<Input<T>> input;
+    const Mirrored<Pending<T>> work, seq;
+    const Mirrored<Donor<T>> donor;
+    initialize<Type>(input.host());
     const auto width = [&]<unsigned R>() {
-        run<R, Type>(*input, *work, *seq, *donor, tables, true);
-        run<R, Type>(*input, *work, *seq, *donor, tables, false);
+        run<R, Type>(input, work, seq, donor, tables, true);
+        run<R, Type>(input, work, seq, donor, tables, false);
     };
     width.template operator()<1>();
     width.template operator()<2>();
@@ -334,6 +401,7 @@ void test(const am::Tables& tables) {
     width.template operator()<16>();
     std::printf("K9G X3 decode %s EXACT (R=1,2,4,8,16, verify/cohort, partial accept, padding)\n",
                 strix::recurrent_state_type_name(Type));
+    std::fflush(stdout);
 }
 
 template <class T>
@@ -361,12 +429,20 @@ struct ReplayGraph {
 };
 
 template <unsigned R, RecurrentStateType Type, class T, std::size_t Count>
-void run_replay(Input<T>& input, Pending<T>& work, Pending<T>& seq, Donor<T>& donor,
+void run_replay(const Mirrored<Input<T>>& inputs, const Mirrored<Pending<T>>& pending,
+                const Mirrored<Pending<T>>& reference, const Mirrored<Donor<T>>& donors,
                 const am::Tables& tables, const std::array<unsigned, Count>& counts) {
-    auto banks = allocate<ReplayBanks<T>>();
-    auto words = allocate<ReplayWords>();
+    auto& input = inputs.host();
+    auto& work = pending.host();
+    auto& seq = reference.host();
+    auto* device_input = inputs.device();
+    auto* device_work = pending.device();
+    const Mirrored<ReplayBanks<T>> replay_banks;
+    auto* banks = &replay_banks.host();
+    auto* device_banks = replay_banks.device();
+    const Mirrored<ReplayWords> words;
     auto expected = std::make_unique_for_overwrite<ReplayBanks<T>>();
-    std::memset(banks.get(), 0xa5, sizeof(*banks));
+    std::memset(banks, 0xa5, sizeof(*banks));
     for (unsigned slot = 0U; slot < kSlots; ++slot) {
         std::memcpy(banks->before[slot][1], input.image[slot].history, sizeof(input.image[slot].history));
         for (auto& parity : banks->matrix[slot])
@@ -375,66 +451,85 @@ void run_replay(Input<T>& input, Pending<T>& work, Pending<T>& seq, Donor<T>& do
 
     constexpr auto tap_offset = sizeof(banks->taps[0][0]);
     constexpr auto matrix_offset = sizeof(banks->matrix[0][0][0]);
-    const strix::state::StateTable table{input.directory, 2, kSlots};
-    const rec::DecodeWeights w{input.beta, input.alpha, input.dt, input.a, input.conv, input.gain};
+    const strix::state::StateTable table{device_input->directory, 2, kSlots};
+    const rec::DecodeWeights w{device_input->beta, device_input->alpha, device_input->dt, device_input->a,
+                               device_input->conv, device_input->gain};
     auto strides = kStrides;
     strides.prepared = strides.qkv;
-    const rec::DecodeReplayStep args{&input.step,
-        {input.hidden[0], work.qkv[0], input.z[0], work.qkv[0], work.beta[0], work.gate[0], work.out[0], work.raw[0]},
-        strides, {table, 0}, {table, 1}, {nullptr, &words->taps, tap_offset}, {nullptr, &words->matrix, matrix_offset},
-        Type, {work.codes[0], work.deltas}, tap_offset, matrix_offset};
+    const rec::DecodeReplayStep args{&device_input->step,
+        {device_input->hidden[0], device_work->qkv[0], device_input->z[0], device_work->qkv[0], device_work->beta[0],
+         device_work->gate[0], device_work->out[0], device_work->raw[0]},
+        strides, {table, 0}, {table, 1}, {nullptr, &words.device()->taps, tap_offset},
+        {nullptr, &words.device()->matrix, matrix_offset}, Type, {device_work->codes[0], device_work->deltas},
+        tap_offset, matrix_offset};
 
     ReplayGraph graph;
-    check(cudaStreamCreateWithFlags(&graph.stream, cudaStreamNonBlocking));
-    check(cudaStreamBeginCapture(graph.stream, cudaStreamCaptureModeThreadLocal));
-    check(rec::enqueue_decode_replay_step(R, w, args, tables, graph.stream));
-    check(cudaStreamEndCapture(graph.stream, &graph.graph));
-    check(cudaGraphInstantiate(&graph.executable, graph.graph, 0));
-
     for (std::size_t replay = 0; replay < counts.size(); ++replay) {
         const auto count = counts[replay];
         const unsigned slot = R == 1U && replay == 1U ? 1U : 0U;
         const unsigned parity = R == 1U && replay != 0U ? 1U : 0U;
+        std::fprintf(stderr, "K9G X3 replay %s R=%u case=%zu count=%u slot=%u parity=%u\n",
+                     strix::recurrent_state_type_name(Type), R, replay, count, slot, parity);
+        std::fflush(stderr);
         auto& before = banks->before[slot];
         auto& taps = banks->taps[slot];
         auto& matrix_in = banks->matrix[slot][parity];
-        auto& matrix_out = banks->matrix[slot][parity ^ 1U];
-        if (R == 1U && replay == 2U)
+        if (R == 1U && replay == 2U) {
             std::memcpy(before[1], taps[1], tap_offset); // Continue session 0 from replay 0.
+            check(cudaMemcpy(device_banks->before[slot][1], before[1], tap_offset, cudaMemcpyHostToDevice));
+        }
         std::memcpy(input.image[slot].history, before[1], tap_offset);
         std::memcpy(input.image[slot].matrix, matrix_in[1], matrix_offset);
-        describe(input, R, true);
+        describe(input, device_input, R, true);
         input.step.h.valid_mask = (1U << count) - 1U;
         for (unsigned r = 0; r < R; ++r) {
             input.step.row[r].slot = slot;
             input.step.row[r].position = input.directory[slot].frontier + r;
         }
-        input.directory[slot].base = reinterpret_cast<std::uintptr_t>(before[0]);
-        input.directory[kSlots + slot].base = reinterpret_cast<std::uintptr_t>(matrix_in[0]);
-        words->taps = taps[0];
-        words->matrix = reinterpret_cast<float*>(matrix_out[0]);
+        input.directory[slot].base = reinterpret_cast<std::uintptr_t>(device_banks->before[slot][0]);
+        input.directory[kSlots + slot].base = reinterpret_cast<std::uintptr_t>(device_banks->matrix[slot][parity][0]);
+        words.host() = {device_banks->taps[slot][0], reinterpret_cast<float*>(device_banks->matrix[slot][parity ^ 1U][0])};
 
         constexpr auto row_bytes = offsetof(Pending<T>, history);
         std::memset(&work, 0xa5, row_bytes);
         for (unsigned r = 0; r < R; ++r) std::copy_n(input.qkv[r], L::channels, work.qkv[r]);
         std::memcpy(&seq, &work, row_bytes);
-        std::memcpy(expected.get(), banks.get(), sizeof(*banks));
+        std::memcpy(expected.get(), banks, sizeof(*banks));
         const auto directory = std::to_array(input.directory);
-        check(cudaGraphLaunch(graph.executable, graph.stream));
-        check(cudaStreamSynchronize(graph.stream));
-
-        serial<Type>(input, seq, w, tables, true);
+        inputs.upload();
+        pending.upload(row_bytes);
+        reference.upload(row_bytes);
+        words.upload();
+        if (replay == 0U) replay_banks.upload();
+        // The nonblocking graph stream does not wait for default-stream uploads.
         check(cudaDeviceSynchronize());
+        if (replay == 0U) {
+            check(cudaStreamCreateWithFlags(&graph.stream, cudaStreamNonBlocking));
+            check(cudaStreamBeginCapture(graph.stream, cudaStreamCaptureModeThreadLocal));
+            check(rec::enqueue_decode_replay_step(R, w, args, tables, graph.stream));
+            check(cudaStreamEndCapture(graph.stream, &graph.graph));
+            check(cudaGraphInstantiate(&graph.executable, graph.graph, 0));
+        }
+        check(cudaGraphLaunch(graph.executable, graph.stream));
+        check(cudaDeviceSynchronize());
+        inputs.download();
+
+        serial<Type>(input.step, device_input, reference.device(), w, tables, true);
+        check(cudaDeviceSynchronize());
+        pending.download(row_bytes);
+        reference.download();
         compare("captured replay rows and padding vs direct", reinterpret_cast<const unsigned char*>(&work),
                 reinterpret_cast<const unsigned char*>(&seq), row_bytes);
         if (count != 0U) {
             const unsigned last = count - 1U;
-            donor_prefix<R, Type>(input, donor, seq, last, tables, true);
+            donor_prefix<R, Type>(inputs, donors, seq, last, tables, true);
             std::memcpy(expected->taps[slot][1], seq.history[last], tap_offset);
             std::memcpy(expected->matrix[slot][parity ^ 1U][1], seq.matrix[last], matrix_offset);
         }
+        replay_banks.download();
+        inputs.download();
         compare("captured replay images and inactive banks vs direct",
-                reinterpret_cast<const unsigned char*>(banks.get()),
+                reinterpret_cast<const unsigned char*>(banks),
                 reinterpret_cast<const unsigned char*>(expected.get()), sizeof(*banks));
         compare("captured replay published directory", input.directory, directory.data(), directory.size());
     }
@@ -443,20 +538,21 @@ void run_replay(Input<T>& input, Pending<T>& work, Pending<T>& seq, Donor<T>& do
 template <RecurrentStateType Type>
 void test_replay(const am::Tables& tables) {
     using T = std::conditional_t<Type == RecurrentStateType::f32, float, std::uint16_t>;
-    auto input = allocate<Input<T>>();
-    auto work = allocate<Pending<T>>();
-    auto seq = allocate<Pending<T>>();
-    auto donor = allocate<Donor<T>>();
-    initialize<Type>(*input);
-    run_replay<1, Type>(*input, *work, *seq, *donor, tables, std::array{1U, 1U, 1U});
+    const Mirrored<Input<T>> input;
+    const Mirrored<Pending<T>> work, seq;
+    const Mirrored<Donor<T>> donor;
+    initialize<Type>(input.host());
+    run_replay<1, Type>(input, work, seq, donor, tables, std::array{1U, 1U, 1U});
     std::printf("K9G X3 replay %s R=1 EXACT (3 graph launches, 2 slots, parity, layer offsets)\n",
                 strix::recurrent_state_type_name(Type));
-    run_replay<2, Type>(*input, *work, *seq, *donor, tables, std::array{2U, 1U, 0U});
-    run_replay<4, Type>(*input, *work, *seq, *donor, tables, std::array{4U, 3U, 1U});
-    run_replay<8, Type>(*input, *work, *seq, *donor, tables, std::array{8U, 7U, 6U, 5U, 2U});
-    run_replay<16, Type>(*input, *work, *seq, *donor, tables, std::array{16U, 9U, 4U, 0U});
+    std::fflush(stdout);
+    run_replay<2, Type>(input, work, seq, donor, tables, std::array{2U, 1U, 0U});
+    run_replay<4, Type>(input, work, seq, donor, tables, std::array{4U, 3U, 1U});
+    run_replay<8, Type>(input, work, seq, donor, tables, std::array{8U, 7U, 6U, 5U, 2U});
+    run_replay<16, Type>(input, work, seq, donor, tables, std::array{16U, 9U, 4U, 0U});
     std::printf("K9G X3 replay %s R=2,4,8,16 EXACT (one spare, prefix replay, padding, zero accept)\n",
                 strix::recurrent_state_type_name(Type));
+    std::fflush(stdout);
 }
 
 #if defined(STRIX_K9G_REPLAY_FIXTURE)

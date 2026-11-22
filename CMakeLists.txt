@@ -7271,3 +7271,6 @@ if(STRIX_FAMILY_HY4)
     target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec strix_dist strix_tp_xport)  # --tp-rank: pair gather + round messages
     strix_target_warnings(strix-hy4-rows)
 endif()
+
+# --- core packages (CORE-SPEC 17.4) ---
+include(cmake/packages/K1.cmake)

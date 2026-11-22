@@ -1,10 +1,26 @@
-#include "cuda/core/dense/rows_f32_input_major_plan.hpp"
+#include "core/dense_f32_input_major_plan.hpp"
 
 #include <cstddef>
 #include <iostream>
 #include <limits>
 
 namespace {
+
+using strix::core::plan_f32_input_major_rows;
+
+struct FixtureTile {
+    static constexpr unsigned rows = 16, outputs = 128, k = 64;
+};
+
+struct AlternativeTile {
+    static constexpr unsigned rows = 2, outputs = 3, k = 4;
+};
+
+constexpr auto alternative_grid = plan_f32_input_major_rows<AlternativeTile>(3, 4, 7, 8, 2, 3);
+static_assert(alternative_grid.valid() && alternative_grid.row_tiles == 2 && alternative_grid.output_tiles == 3);
+static_assert(!plan_f32_input_major_rows<AlternativeTile>(3, 4, 7, 8, 1, 3).valid());
+static_assert(!plan_f32_input_major_rows<AlternativeTile>(3, 4, 7, 8, 2, 2).valid());
+static_assert(!plan_f32_input_major_rows<AlternativeTile>(3, 6, 7, 8, 2, 3).valid());
 
 struct Case {
     std::size_t rows;
@@ -37,7 +53,8 @@ constexpr Case cases[] = {
 
 int main() {
     for (const auto& c : cases) {
-        const auto grid = strix::cuda_core::plan_f32_input_major_rows(c.rows, c.in, c.out, c.stride);
+        const auto grid = plan_f32_input_major_rows<FixtureTile>(
+            c.rows, c.in, c.out, c.stride, 0x7fffffffU, 65535U);
         if (grid.row_tiles != c.row_tiles || grid.output_tiles != c.output_tiles ||
             grid.valid() != (c.output_tiles != 0)) {
             std::cerr << "MMIDX plan FAIL for rows=" << c.rows << " in=" << c.in << " out=" << c.out

@@ -1,10 +1,20 @@
 #pragma once
 
-#include "rows_f32_input_major_plan.hpp"
+#include "core/dense_f32_input_major_plan.hpp"
 
 #include <cuda_runtime.h>
 
 namespace strix::cuda_core {
+
+struct F32InputMajorRows {
+    static constexpr unsigned rows = 16, outputs = 128, k = 64;
+};
+
+[[nodiscard]] constexpr core::F32InputMajorGrid plan_f32_input_major_rows(
+    std::size_t rows, unsigned in, unsigned out, unsigned out_stride) noexcept {
+    return core::plan_f32_input_major_rows<F32InputMajorRows>(
+        rows, in, out, out_stride, 0x7fffffffU, 65535U);
+}
 
 // An explicitly selected dense rows form. x is [rows][in], w is [in][out],
 // and y starts at the first live column of a [rows][out_stride] image.

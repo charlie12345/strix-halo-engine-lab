@@ -15,11 +15,8 @@ endif()
 option(STRIX_QSA_CUDA_FIXTURE "Compile the QSA launch identity fixture for sm_120a" OFF)
 if(STRIX_QSA_CUDA_FIXTURE)
     enable_language(CUDA)
-    add_executable(strix-qsa-launch-fixture
-        tests/cuda_core/attn_rowgroup_fixture.cu
-        src/cuda/models/qwen/qwen_qsa.cu)
+    add_executable(strix-qsa-launch-fixture tests/cuda_core/attn_rowgroup_fixture.cu)
     target_include_directories(strix-qsa-launch-fixture PRIVATE include src)
-    target_compile_definitions(strix-qsa-launch-fixture PRIVATE _CRT_SECURE_NO_WARNINGS)
     set_target_properties(strix-qsa-launch-fixture PROPERTIES
         CUDA_ARCHITECTURES 120a-real CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     target_compile_options(strix-qsa-launch-fixture PRIVATE

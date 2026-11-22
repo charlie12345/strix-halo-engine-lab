@@ -1,5 +1,5 @@
+#include "attn_rowgroup_baseline.cuh"
 #include "cuda/core/attn_rowgroup_launch.cuh"
-#include "strix/cuda/qwen_qsa.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -11,47 +11,11 @@
 #include <vector>
 
 namespace rg = strix::cuda::core::rowgroup;
-namespace qsa = strix::cuda::qwen_qsa;
+namespace baseline = attn_rowgroup_baseline;
 
 namespace {
 
-__device__ __forceinline__ float round_bf16(float v) {
-    const auto b = __float_as_uint(v);
-    const auto rounded = static_cast<std::uint16_t>((b + 0x7fffU + ((b >> 16U) & 1U)) >> 16U);
-    return __uint_as_float(static_cast<std::uint32_t>(rounded) << 16U);
-}
-
-// Test-only twin of QsaRowgroup in qwen_qsa.cu, including its argument ABI.
-struct QwenRowgroup {
-    static constexpr unsigned D = qsa::kHeadDim, Heads = qsa::kHeads / qsa::kKvHeads, Rows = 4, Cap = qsa::kMaxSelected;
-    static constexpr float kScaleLog2 = 0.0625F * 1.44269504088896341F;
-    const float* q_gate;
-    std::uint64_t first_position;
-    const std::uint32_t* selected;
-    const std::uint16_t* kv;
-    float* output;
-    std::uint32_t rows;
-
-    __device__ unsigned count(unsigned row) const { return qsa::selected_count(first_position + row); }
-    __device__ std::uint32_t key(unsigned row, unsigned j) const { return selected[static_cast<std::uint64_t>(row) * Cap + j]; }
-    __device__ const std::uint16_t* key_row(std::uint32_t token, unsigned kvh) const {
-        return kv + static_cast<std::uint64_t>(token) * (qsa::kKvWidth * 2ULL) + static_cast<std::uint64_t>(kvh) * D;
-    }
-    __device__ const std::uint16_t* value_row(std::uint32_t token, unsigned kvh) const { return key_row(token, kvh) + qsa::kKvWidth; }
-    __device__ float query(unsigned row, unsigned kvh, unsigned h, unsigned d) const {
-        return q_gate[static_cast<std::uint64_t>(row) * qsa::kQGateWidth + static_cast<std::uint64_t>(kvh * Heads + h) * D * 2ULL + d];
-    }
-    __device__ void store2(unsigned row, unsigned kvh, unsigned h, unsigned d, float a0, float a1) const {
-        const auto head = kvh * Heads + h;
-        const float* g = q_gate + static_cast<std::uint64_t>(row) * qsa::kQGateWidth + static_cast<std::uint64_t>(head) * D * 2ULL + D + d;
-        const float g0 = round_bf16(1.0F / (1.0F + __expf(-g[0]))), g1 = round_bf16(1.0F / (1.0F + __expf(-g[1])));
-        *reinterpret_cast<float2*>(output + static_cast<std::uint64_t>(row) * qsa::kAttnWidth + static_cast<std::uint64_t>(head) * D + d) =
-            make_float2(round_bf16(round_bf16(a0) * g0), round_bf16(round_bf16(a1) * g1));
-    }
-};
-
-using Shape = rg::Shape<QwenRowgroup>;
-static_assert(Shape::Threads == 128 && Shape::UnionSmem == 49232 && Shape::FlashSmem == 33792);
+using Layout = baseline::FrozenRowgroup;
 
 void check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
@@ -76,43 +40,44 @@ template <class T> struct Buffer {
 
 int compare(cudaStream_t stream) {
     constexpr unsigned rows = 7, first = 15;
-    constexpr auto plan = *rg::make_launch_plan<QwenRowgroup>(rows, qsa::kKvHeads);
-    constexpr auto scratch_bytes = rg::workspace_bytes<QwenRowgroup>(plan.tiles);
+    constexpr auto plan = *rg::make_launch_plan<Layout>(rows, baseline::kKvHeads);
+    constexpr auto scratch_bytes = rg::workspace_bytes<Layout>(plan.tiles);
     static_assert(scratch_bytes == 82048);
-    std::vector<std::uint32_t> selected(std::size_t{rows} * qsa::kMaxSelected);
+    std::vector<std::uint32_t> selected(std::size_t{rows} * baseline::kMaxSelected);
     for (unsigned row = 0; row < rows; ++row) {
-        auto* list = selected.data() + std::size_t{row} * qsa::kMaxSelected;
-        for (unsigned j = 0; j < qsa::selected_count(first + row); ++j) list[j] = j;
+        auto* list = selected.data() + std::size_t{row} * baseline::kMaxSelected;
+        for (unsigned j = 0; j < baseline::selected_count(first + row); ++j) list[j] = j;
         if (row == 5) list[3] = 1;  // The second tile uses concatenation and retains a duplicate.
     }
-    std::vector<float> q_gate(std::size_t{rows} * qsa::kQGateWidth);
+    std::vector<float> q_gate(std::size_t{rows} * baseline::kQGateWidth);
     for (std::size_t i = 0; i < q_gate.size(); ++i)
         q_gate[i] = static_cast<float>(static_cast<int>((i * 7U) % 29U) - 14) / 16.0F;
     constexpr std::uint16_t values[] = {0x3d80, 0x3e00, 0x3e80, 0xbe80, 0x3f00, 0xbf00, 0x3f80};
-    std::vector<std::uint16_t> kv(std::size_t{first + rows} * 2U * qsa::kKvWidth);
+    std::vector<std::uint16_t> kv(std::size_t{first + rows} * 2U * baseline::kKvWidth);
     for (std::size_t i = 0; i < kv.size(); ++i) kv[i] = values[i % 7U];
 
     const Buffer<float> queries(q_gate);
     const Buffer<std::uint32_t> lists(selected);
     const Buffer<std::uint16_t> cache(kv);
-    const Buffer<std::uint8_t> private_scratch(scratch_bytes), shared_scratch(scratch_bytes);
-    const Buffer<float> private_out(rows * qsa::kAttnWidth), shared_out(rows * qsa::kAttnWidth);
-    check(cudaMemsetAsync(private_scratch.ptr, 0xa5, private_scratch.bytes, stream));
+    const Buffer<std::uint8_t> frozen_scratch(scratch_bytes), shared_scratch(scratch_bytes);
+    const Buffer<float> frozen_out(rows * baseline::kAttnWidth), shared_out(rows * baseline::kAttnWidth);
+    check(cudaMemsetAsync(frozen_scratch.ptr, 0xa5, frozen_scratch.bytes, stream));
     check(cudaMemsetAsync(shared_scratch.ptr, 0xa5, shared_scratch.bytes, stream));
-    check(cudaMemsetAsync(private_out.ptr, 0xff, private_out.bytes, stream));
+    check(cudaMemsetAsync(frozen_out.ptr, 0xff, frozen_out.bytes, stream));
     check(cudaMemsetAsync(shared_out.ptr, 0x7f, shared_out.bytes, stream));
 
-    qsa::attention_mma(queries.ptr, rows, first, lists.ptr, cache.ptr, private_scratch.ptr, private_out.ptr, stream);
-    rg::enqueue_rowgroup(QwenRowgroup{queries.ptr, first, lists.ptr, cache.ptr, shared_out.ptr, rows},
-                         qsa::kKvHeads, shared_scratch.ptr, shared_scratch.bytes, stream);
+    baseline::launch(Layout{queries.ptr, first, lists.ptr, cache.ptr, frozen_out.ptr, rows},
+                     frozen_scratch.ptr, stream);
+    rg::enqueue_rowgroup(Layout{queries.ptr, first, lists.ptr, cache.ptr, shared_out.ptr, rows},
+                         baseline::kKvHeads, shared_scratch.ptr, shared_scratch.bytes, stream);
     check(cudaStreamSynchronize(stream));
 
-    const auto private_union = private_scratch.read();
+    const auto frozen_union = frozen_scratch.read();
     auto shared_union = shared_scratch.read();
     std::uint32_t counts[2]{};
-    std::memcpy(counts, rg::carve<QwenRowgroup>(shared_union.data(), plan.tiles).count, sizeof(counts));
-    const bool union_ok = private_union == shared_union && counts[0] == 19U && counts[1] == 63U;
-    const auto expected = private_out.read(), actual = shared_out.read();
+    std::memcpy(counts, rg::carve<Layout>(shared_union.data(), plan.tiles).count, sizeof(counts));
+    const bool union_ok = frozen_union == shared_union && counts[0] == 19U && counts[1] == 63U;
+    const auto expected = frozen_out.read(), actual = shared_out.read();
     const bool output_ok = std::memcmp(expected.data(), actual.data(), shared_out.bytes) == 0 &&
         std::all_of(actual.begin(), actual.end(), [](float x) { return std::isfinite(x); });
     std::printf("QSA union %s: 2 tiles, counts 19 and 63\n", union_ok ? "PASS" : "FAIL");
@@ -124,7 +89,7 @@ int compare(cudaStream_t stream) {
 int main() {
     cudaStream_t stream = nullptr;
     try {
-        rg::prepare_rowgroup<QwenRowgroup>();
+        rg::prepare_rowgroup<Layout>();
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         const int result = compare(stream);
         check(cudaStreamDestroy(stream));

@@ -1,4 +1,4 @@
-#include "cuda/core/recur_decode_step.hpp"
+#include "ops/recur/recur_decode_step.hpp"
 
 #include <array>
 #include <cstdio>
@@ -7,9 +7,10 @@
 
 namespace {
 
-namespace rec = strix::cuda::recur;
+namespace rec = strix::ops::recur;
 namespace exec = strix::exec;
-using L = rec::Gfx1151Decode;
+constexpr auto kShape = rec::shape::gdn_2560_16x48x128;
+using L = rec::GdnDecodeLayout<kShape>;
 
 void require(bool condition, const char* message) {
     if (condition) return;
@@ -83,9 +84,19 @@ void test_layout() {
         strix::RecurrentStateType::bf16, {codes.data(), deltas.data()}};
 
     for (unsigned width : {1U, 2U, 4U, 8U, 16U})
-        require(rec::valid_decode_step(width, step), "rejected a supported width");
+        require(rec::valid_decode_step(kShape, width, step), "rejected a supported width");
     for (unsigned width : {0U, 3U, 17U, 32U})
-        require(!rec::valid_decode_step(width, step), "admitted an unsupported width");
+        require(!rec::valid_decode_step(kShape, width, step), "admitted an unsupported width");
+
+    constexpr rec::GdnDecodeShape smaller{512, 2, 8, 64, 3, 2};
+    auto smaller_step = step;
+    smaller_step.strides = rec::packed_decode_strides(smaller);
+    require(rec::valid_decode_step(smaller, 2U, smaller_step), "rejected smaller packed rows");
+    require(!rec::valid_decode_step(kShape, 2U, smaller_step), "admitted packed rows for a different shape");
+    require(!rec::valid_decode_step(smaller, 4U, smaller_step), "admitted more columns than the A8 pitch");
+    smaller_step.a8 = {};
+    require(rec::valid_decode_step(smaller, 4U, smaller_step), "applied A8 pitch limits to an FP32 output");
+
     const auto row = rec::decode_row(step, 1);
     require(row.input == input.data() + strides.input && row.qkv == qkv.data() + strides.qkv &&
             row.z == z.data() + strides.z && row.prepared == prepared.data() + strides.prepared &&
@@ -95,17 +106,17 @@ void test_layout() {
     step.rows.raw_capture = nullptr;
     require(!rec::decode_row(step, 1).raw_capture, "shifted a null raw capture");
     step.a8.codes = nullptr;
-    require(!rec::valid_decode_step(2, step), "admitted half of the A8 view");
+    require(!rec::valid_decode_step(kShape, 2, step), "admitted half of the A8 view");
     step.a8.deltas = nullptr;
     step.strides.prepared += 1;
-    require(!rec::valid_decode_step(2, step), "admitted a misaligned prepared stride");
+    require(!rec::valid_decode_step(kShape, 2, step), "admitted a misaligned prepared stride");
     step.strides.prepared = strides.prepared;
     step.rows.qkv = step.rows.prepared;
-    require(!rec::valid_decode_step(2, step), "admitted mismatched QKV alias strides");
+    require(!rec::valid_decode_step(kShape, 2, step), "admitted mismatched QKV alias strides");
     step.strides.qkv = strides.prepared;
-    require(rec::valid_decode_step(2, step), "rejected an exact QKV alias");
+    require(rec::valid_decode_step(kShape, 2, step), "rejected an exact QKV alias");
     step.strides.input = std::numeric_limits<std::size_t>::max();
-    require(!rec::valid_decode_step(16, step), "admitted overflowing row offsets");
+    require(!rec::valid_decode_step(kShape, 16, step), "admitted overflowing row offsets");
 }
 
 }  // namespace

@@ -7,19 +7,24 @@
 #include <cstdint>
 #include <limits>
 
-namespace strix::cuda::recur {
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define STRIX_RECUR_DECODE_HD __host__ __device__
+#else
+#define STRIX_RECUR_DECODE_HD
+#endif
+
+namespace strix::ops::recur {
 
 struct DecodeRowStrides {
     // Element strides, with beta and log_decay using the same stride.
-    std::size_t input = Gfx1151Decode::hidden;
-    std::size_t qkv = Gfx1151Decode::channels;
-    std::size_t z = Gfx1151Decode::value_width;
-    std::size_t prepared = Gfx1151Decode::channels;
-    std::size_t gate = Gfx1151Decode::value_heads;
-    std::size_t out = Gfx1151Decode::value_width;
-    std::size_t raw_capture = Gfx1151Decode::channels;
-    std::size_t a8_codes = Gfx1151Decode::value_width;
+    std::size_t input, qkv, z, prepared, gate, out, raw_capture, a8_codes;
 };
+
+// Default to dense rows for the supplied, validated geometry.
+[[nodiscard]] constexpr DecodeRowStrides packed_decode_strides(GdnDecodeShape shape) noexcept {
+    return {shape.hidden, shape.channels(), shape.value_width(), shape.channels(),
+            shape.value_heads, shape.value_width(), shape.channels(), shape.value_width()};
+}
 
 struct DecodeStep {
     const exec::StepBlock* descriptor;
@@ -58,9 +63,8 @@ struct DecodeReplayStep {
 };
 
 template <class Binding>
-[[nodiscard]] inline bool valid_decode_step_rows(unsigned width, const Binding& step) noexcept {
-    using L = Gfx1151Decode;
-    if (width > 16U || !session::is_step_replay_width(width) ||
+[[nodiscard]] inline bool valid_decode_step_rows(GdnDecodeShape shape, unsigned width, const Binding& step) noexcept {
+    if (!shape.valid() || width > 16U || !session::is_step_replay_width(width) ||
         !step.descriptor || !step.history.valid() || !step.matrix.valid() ||
         (step.type != RecurrentStateType::f32 && step.type != RecurrentStateType::f16 &&
          step.type != RecurrentStateType::bf16))
@@ -68,23 +72,23 @@ template <class Binding>
 
     const auto fits = [width](std::size_t stride, std::size_t extent, std::size_t element) {
         const auto limit = std::numeric_limits<std::size_t>::max() / element;
-        return stride >= extent && (width == 1U || stride <= (limit - extent) / (width - 1U));
+        return extent <= limit && stride >= extent && (width == 1U || stride <= (limit - extent) / (width - 1U));
     };
     const auto& r = step.rows;
     const auto& s = step.strides;
     return r.input && r.qkv && r.z && r.prepared && r.beta && r.log_decay && r.out &&
         reinterpret_cast<std::uintptr_t>(r.prepared) % 16U == 0U && s.prepared % 4U == 0U &&
         (r.qkv != r.prepared || s.qkv == s.prepared) &&
-        fits(s.input, L::hidden, sizeof(std::uint16_t)) && fits(s.qkv, L::channels, sizeof(float)) &&
-        fits(s.z, L::value_width, sizeof(float)) && fits(s.prepared, L::channels, sizeof(float)) &&
-        fits(s.gate, L::value_heads, sizeof(float)) && fits(s.out, L::value_width, sizeof(float)) &&
-        (!r.raw_capture || fits(s.raw_capture, L::channels, sizeof(float))) &&
+        fits(s.input, shape.hidden, sizeof(std::uint16_t)) && fits(s.qkv, shape.channels(), sizeof(float)) &&
+        fits(s.z, shape.value_width(), sizeof(float)) && fits(s.prepared, shape.channels(), sizeof(float)) &&
+        fits(s.gate, shape.value_heads, sizeof(float)) && fits(s.out, shape.value_width(), sizeof(float)) &&
+        (!r.raw_capture || fits(s.raw_capture, shape.channels(), sizeof(float))) &&
         bool(step.a8.codes) == bool(step.a8.deltas) &&
-        (!step.a8.codes || fits(s.a8_codes, L::value_width, sizeof(std::int8_t)));
+        (!step.a8.codes || (width <= shape.a8_pitch && fits(s.a8_codes, shape.value_width(), sizeof(std::int8_t))));
 }
 
-[[nodiscard]] inline bool valid_decode_step(unsigned width, const DecodeStep& step) noexcept {
-    return step.pending_history && step.pending_matrix && valid_decode_step_rows(width, step);
+[[nodiscard]] inline bool valid_decode_step(GdnDecodeShape shape, unsigned width, const DecodeStep& step) noexcept {
+    return step.pending_history && step.pending_matrix && valid_decode_step_rows(shape, width, step);
 }
 
 struct DecodeSource {
@@ -94,10 +98,7 @@ struct DecodeSource {
 };
 
 template <class Binding>
-#if defined(__CUDACC__)
-__host__ __device__
-#endif
-[[nodiscard]] inline DecodeSource decode_step_source(const Binding& args, unsigned r) noexcept {
+[[nodiscard]] STRIX_RECUR_DECODE_HD inline DecodeSource decode_step_source(const Binding& args, unsigned r) noexcept {
     using namespace ::strix::core::decode_state;
     const auto& step = *args.descriptor;
     if (!exec::step_row_valid(step, r)) return {};
@@ -118,18 +119,12 @@ __host__ __device__
     return {history, matrix, parent};
 }
 
-#if defined(__CUDACC__)
-__host__ __device__
-#endif
-[[nodiscard]] inline DecodeSource decode_source(const DecodeStep& args, unsigned r) noexcept {
+[[nodiscard]] STRIX_RECUR_DECODE_HD inline DecodeSource decode_source(const DecodeStep& args, unsigned r) noexcept {
     return decode_step_source(args, r);
 }
 
 template <class Binding>
-#if defined(__CUDACC__)
-__host__ __device__
-#endif
-[[nodiscard]] inline DecodeRow decode_row(const Binding& step, std::size_t r) noexcept {
+[[nodiscard]] STRIX_RECUR_DECODE_HD inline DecodeRow decode_row(const Binding& step, std::size_t r) noexcept {
     const auto& b = step.rows;
     const auto& s = step.strides;
     return {b.input + r * s.input, b.qkv + r * s.qkv, b.z + r * s.z,
@@ -140,18 +135,12 @@ __host__ __device__
 struct DecodeImageRange {
     std::uint64_t begin, end;
 
-#if defined(__CUDACC__)
-    __host__ __device__
-#endif
-    [[nodiscard]] constexpr bool disjoint(DecodeImageRange other) const noexcept {
+    [[nodiscard]] STRIX_RECUR_DECODE_HD constexpr bool disjoint(DecodeImageRange other) const noexcept {
         return end <= other.begin || other.end <= begin;
     }
 };
 
-#if defined(__CUDACC__)
-__host__ __device__
-#endif
-[[nodiscard]] inline DecodeImageRange decode_image_range(std::uint64_t base, std::uint64_t offset,
+[[nodiscard]] STRIX_RECUR_DECODE_HD inline DecodeImageRange decode_image_range(std::uint64_t base, std::uint64_t offset,
     std::uint64_t bytes, std::uint64_t alignment) noexcept {
     constexpr auto limit = UINTPTR_MAX;
     if (!base || base > limit || offset > limit - base) return {};
@@ -167,19 +156,17 @@ template <class T>
     return decode_image_range(reinterpret_cast<std::uintptr_t>(ref.direct), ref.byte_offset, bytes, alignof(T)).begin != 0U;
 }
 
-[[nodiscard]] inline bool valid_decode_replay_step(unsigned width, const DecodeReplayStep& step) noexcept {
-    using L = Gfx1151Decode;
-    return valid_decode_step_rows(width, step) &&
+[[nodiscard]] inline bool valid_decode_replay_step(GdnDecodeShape shape, unsigned width,
+                                                   const DecodeReplayStep& step) noexcept {
+    return valid_decode_step_rows(shape, width, step) &&
         step.history_byte_offset % alignof(std::uint16_t) == 0U && step.matrix_byte_offset % alignof(float) == 0U &&
-        valid_decode_output(step.pending_history, L::history_elements * sizeof(std::uint16_t)) &&
-        valid_decode_output(step.pending_matrix, L::matrix_bytes(step.type));
+        valid_decode_output(step.pending_history, std::uint64_t{shape.history_elements()} * sizeof(std::uint16_t)) &&
+        valid_decode_output(step.pending_matrix, shape.matrix_bytes(step.type));
 }
 
 template <class T>
-#if defined(__CUDACC__)
-__host__ __device__
-#endif
-[[nodiscard]] inline DecodeImageRange decode_output_range(DecodeOutputRef<T> ref, std::uint64_t bytes) noexcept {
+[[nodiscard]] STRIX_RECUR_DECODE_HD inline DecodeImageRange decode_output_range(DecodeOutputRef<T> ref,
+                                                                               std::uint64_t bytes) noexcept {
     return decode_image_range(reinterpret_cast<std::uintptr_t>(ref.slot ? *ref.slot : ref.direct),
                               ref.byte_offset, bytes, alignof(T));
 }
@@ -192,17 +179,12 @@ struct DecodeReplayImages {
     unsigned rows;
 };
 
-inline constexpr auto kDecodeF32MatrixBytes = Gfx1151Decode::matrix_bytes(RecurrentStateType::f32);
-inline constexpr auto kDecodeNarrowMatrixBytes = Gfx1151Decode::matrix_bytes(RecurrentStateType::f16);
-static_assert(kDecodeNarrowMatrixBytes == Gfx1151Decode::matrix_bytes(RecurrentStateType::bf16));
-
 // Resolve and check before any writes, in every stage. A malformed replay
 // masks off the entire prefix, including the row outputs.
-#if defined(__CUDACC__)
-__host__ __device__
-#endif
-[[nodiscard]] inline DecodeReplayImages decode_replay_images(unsigned width, const DecodeReplayStep& args) noexcept {
-    using L = Gfx1151Decode;
+template <GdnDecodeShape Shape>
+[[nodiscard]] STRIX_RECUR_DECODE_HD inline DecodeReplayImages decode_replay_images(unsigned width,
+                                                                                  const DecodeReplayStep& args) noexcept {
+    using L = GdnDecodeLayout<Shape>;
     using ::strix::core::decode_state::parent_row;
     const auto& step = *args.descriptor;
     if (step.h.rows > width || step.row[0].parent != exec::kStepNoParent) return {};
@@ -219,8 +201,11 @@ __host__ __device__
         ++rows;
     }
 
-    constexpr auto history_bytes = L::history_elements * sizeof(std::uint16_t);
-    const auto matrix_bytes = args.type == RecurrentStateType::f32 ? kDecodeF32MatrixBytes : kDecodeNarrowMatrixBytes;
+    constexpr auto history_bytes = std::uint64_t{L::history_elements} * sizeof(std::uint16_t);
+    constexpr auto f32_bytes = L::template matrix_bytes<RecurrentStateType::f32>;
+    constexpr auto narrow_bytes = L::template matrix_bytes<RecurrentStateType::f16>;
+    static_assert(narrow_bytes == L::template matrix_bytes<RecurrentStateType::bf16>);
+    const auto matrix_bytes = args.type == RecurrentStateType::f32 ? f32_bytes : narrow_bytes;
     const auto history = decode_image_range(src.history->base, args.history_byte_offset, history_bytes, alignof(std::uint16_t));
     const auto matrix = decode_image_range(src.matrix->base, args.matrix_byte_offset, matrix_bytes, alignof(float));
     const auto pending_history = decode_output_range(args.pending_history, history_bytes);
@@ -233,4 +218,6 @@ __host__ __device__
             reinterpret_cast<std::uint16_t*>(pending_history.begin), reinterpret_cast<float*>(pending_matrix.begin), rows};
 }
 
-}  // namespace strix::cuda::recur
+}  // namespace strix::ops::recur
+
+#undef STRIX_RECUR_DECODE_HD

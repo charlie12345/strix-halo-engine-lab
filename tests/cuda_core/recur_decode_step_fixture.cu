@@ -20,12 +20,13 @@ namespace exec = strix::exec;
 namespace frozen = rec::test::frozen;
 namespace am = strix::cuda::amdmath;
 using strix::RecurrentStateType;
-using L = rec::Gfx1151Decode;
+constexpr auto kShape = strix::ops::recur::shape::gdn_2560_16x48x128;
+using L = strix::ops::recur::GdnDecodeLayout<kShape>;
 
 constexpr unsigned kRows = 16, kSlots = 2, kStride = L::channels + 16;
 constexpr unsigned kRecBlocks = L::value_heads * L::head_dim / 32U;
 constexpr unsigned kRecThreads = frozen::RecShape<4>::Threads;
-constexpr rec::DecodeRowStrides kStrides{L::hidden + 3, L::channels + 4, L::value_width + 2,
+constexpr strix::ops::recur::DecodeRowStrides kStrides{L::hidden + 3, L::channels + 4, L::value_width + 2,
     L::channels + 8, L::value_heads + 3, L::value_width + 5, L::channels + 6, L::value_width + 7};
 static_assert(L::channels == frozen::kConvWidth && L::value_width == frozen::kValueWidth &&
               L::matrix_elements == frozen::kMatrixFloats && L::history_elements == frozen::kConvStateHalfs);
@@ -194,7 +195,7 @@ void serial(const exec::StepBlock& step, const Input<T>* device_input, Pending<T
             device_work->out[r], device_work->raw[r]};
         const rec::DecodeState state{device_work->history[r], root ? image.matrix : device_work->matrix[desc.parent],
                                      device_work->matrix[r], Type};
-        check(rec::enqueue_decode({}, w, row, state, tables, {device_work->codes[r], device_work->deltas + r}, nullptr));
+        check(rec::enqueue_decode(kShape, w, row, state, tables, {device_work->codes[r], device_work->deltas + r}, nullptr));
     }
 }
 
@@ -288,18 +289,18 @@ void resume(const Mirrored<Input<T>>& inputs, const Mirrored<Pending<T>>& pendin
     // Reuse the last rejected row's buffers for a new token after acceptance.
     check(cudaMemcpy(device_work->qkv[next], input.qkv[next], sizeof(input.qkv[next]), cudaMemcpyHostToDevice));
     check(cudaMemcpy(device_seq->qkv[next], input.qkv[next], sizeof(input.qkv[next]), cudaMemcpyHostToDevice));
-    args.rows = rec::decode_row(args, next);
+    args.rows = strix::ops::recur::decode_row(args, next);
     args.pending_history = device_work->history[next];
     args.pending_matrix = device_work->matrix[next];
     args.a8 = {device_work->codes[next], device_work->deltas + next};
-    check(rec::enqueue_decode_step(1U, w, args, tables, nullptr));
+    check(rec::enqueue_decode_step(kShape, 1U, w, args, tables, nullptr));
 
     check(cudaMemcpyAsync(device_seq->history[next], device_seq->history[accepted], sizeof(device_seq->history[next]),
                           cudaMemcpyDeviceToDevice, nullptr));
     const rec::DecodeRow row{device_input->hidden[next], device_seq->qkv[next], device_input->z[next],
         device_seq->qkv[next], device_seq->beta[next], device_seq->gate[next], device_seq->out[next], device_seq->raw[next]};
     const rec::DecodeState state{device_seq->history[next], device_seq->matrix[accepted], device_seq->matrix[next], Type};
-    check(rec::enqueue_decode({}, w, row, state, tables, {device_seq->codes[next], device_seq->deltas + next}, nullptr));
+    check(rec::enqueue_decode(kShape, w, row, state, tables, {device_seq->codes[next], device_seq->deltas + next}, nullptr));
     check(cudaDeviceSynchronize());
     pending.download();
     reference.download();
@@ -347,7 +348,7 @@ void run(const Mirrored<Input<T>>& inputs, const Mirrored<Pending<T>>& pending,
     if constexpr (R == 1U) {
         input.step.h.valid_mask = 0U;
         inputs.upload();
-        check(rec::enqueue_decode_step(R, w, args, tables, nullptr));
+        check(rec::enqueue_decode_step(kShape, R, w, args, tables, nullptr));
         check(cudaDeviceSynchronize());
         pending.download();
         inputs.download();
@@ -357,7 +358,7 @@ void run(const Mirrored<Input<T>>& inputs, const Mirrored<Pending<T>>& pending,
     }
     inputs.upload();
     serial<Type>(input.step, device_input, reference.device(), w, tables, alias);
-    check(rec::enqueue_decode_step(R, w, args, tables, nullptr));
+    check(rec::enqueue_decode_step(kShape, R, w, args, tables, nullptr));
     check(cudaDeviceSynchronize());
     pending.download();
     reference.download();
@@ -506,7 +507,7 @@ void run_replay(const Mirrored<Input<T>>& inputs, const Mirrored<Pending<T>>& pe
         if (replay == 0U) {
             check(cudaStreamCreateWithFlags(&graph.stream, cudaStreamNonBlocking));
             check(cudaStreamBeginCapture(graph.stream, cudaStreamCaptureModeThreadLocal));
-            check(rec::enqueue_decode_replay_step(R, w, args, tables, graph.stream));
+            check(rec::enqueue_decode_replay_step(kShape, R, w, args, tables, graph.stream));
             check(cudaStreamEndCapture(graph.stream, &graph.graph));
             check(cudaGraphInstantiate(&graph.executable, graph.graph, 0));
         }

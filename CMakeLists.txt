@@ -193,8 +193,10 @@ target_include_directories(strix_lookup PUBLIC include)
 target_compile_features(strix_lookup PUBLIC cxx_std_20)
 strix_target_warnings(strix_lookup)
 # Shared drafting layer: context proposer (copy cursor, long proposals), lookup/drafter/serial arbiter, stats line.
-add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp src/spec/draft_rows.cpp src/spec/block_parallel.cpp)
-target_link_libraries(strix_spec PUBLIC strix_lookup)
+include(cmake/StrixTokenSampling.cmake)
+add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp src/spec/draft_rows.cpp
+    src/spec/block_parallel.cpp src/spec/row_rule.cpp)
+target_link_libraries(strix_spec PUBLIC strix_lookup strix_token_sampling)
 strix_target_warnings(strix_spec)
 
 if(STRIX_CUDA_DS41_ONLY)
@@ -370,11 +372,10 @@ add_library(strix_core STATIC
     src/speculation.cpp
     src/speculation_controller.cpp
     src/speculation_measurement.cpp
-    src/speculation_rng.cpp
+    src/speculation_multi_draft.cpp
     src/speculation_sampling.cpp
     src/speculation_sampling_cycle.cpp
     src/speculation_sampling_executor.cpp
-    src/token_sampling.cpp
     src/speculation_cycle.cpp
     src/speculation_executor.cpp
     src/speculative_verify_plan.cpp
@@ -395,7 +396,7 @@ target_link_libraries(strix_core PRIVATE strix_session)
 endif()
 target_include_directories(strix_core PUBLIC include src)
 target_compile_features(strix_core PUBLIC cxx_std_20)
-target_link_libraries(strix_core PUBLIC Threads::Threads strix_state_cache)
+target_link_libraries(strix_core PUBLIC Threads::Threads strix_state_cache strix_token_sampling)
 if(NOT STRIX_CUDA_DS41_ONLY)
     target_link_libraries(strix_core PRIVATE strix_spec)
 endif()
@@ -1379,6 +1380,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-spec-block-drafter-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-block-drafter-tests)
     add_test(NAME strix-spec-block-drafter-tests COMMAND strix-spec-block-drafter-tests)
+
+    add_executable(strix-spec-sampled-rows-tests tests/spec_sampled_rows_tests.cpp)
+    target_link_libraries(strix-spec-sampled-rows-tests PRIVATE strix_spec)
+    strix_target_warnings(strix-spec-sampled-rows-tests)
+    add_test(NAME strix-spec-sampled-rows-tests COMMAND strix-spec-sampled-rows-tests)
     add_executable(strix-spec-round-sink-tests tests/spec_round_sink_tests.cpp)
     target_link_libraries(strix-spec-round-sink-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-round-sink-tests)
@@ -2924,6 +2930,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-speculation-sampling-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-sampling-tests)
     add_test(NAME strix-speculation-sampling-tests COMMAND strix-speculation-sampling-tests)
+
+    add_executable(strix-speculation-multi-draft-tests tests/speculation_multi_draft_tests.cpp)
+    target_link_libraries(strix-speculation-multi-draft-tests PRIVATE strix_core)
+    strix_target_warnings(strix-speculation-multi-draft-tests)
+    add_test(NAME strix-speculation-multi-draft-tests COMMAND strix-speculation-multi-draft-tests)
 
     add_executable(strix-speculation-sampling-distribution-tests tests/speculation_sampling_distribution_tests.cpp)
     target_link_libraries(strix-speculation-sampling-distribution-tests PRIVATE strix_core)

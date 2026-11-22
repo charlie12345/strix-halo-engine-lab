@@ -1,8 +1,9 @@
 // Included by f16_tile_gemm.hpp for each operand policy. Keep the FP16 and
 // packed BF16 staging and instruction sequences intact.
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
-template <Layout L, class Store, bool kA16, class Weights>
-__device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store, const Weights& weights) {
+template <Layout L, class Store, bool kA16, class Weights, class Pair = UnpairedColumns>
+__device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& store, const Weights& weights,
+                                     const Pair& pair = {}) {
     static_assert(kA16 && L == Layout::NK);
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
 template <bool kHalfTail, unsigned Capacity, bool kGated = false>
@@ -44,6 +45,11 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     // W stager. NK: column n0 + tid / 2, k half (tid % 2) * 16. KN: k = lane, columns n0 + 16 * wave .. + 15.
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
     typename Weights::Tile16 packed_rb;
+    // Paired columns (placement only): local columns 0..63 are logical columns 64 x .. 64 x + 63, local 64..127 the
+    // same columns + pair.half (the up half of a [gate | up] matrix), x = blockIdx.x.
+    const unsigned wl = tid >> 1U;
+    const unsigned wcol = Pair::kPaired ? (wl < 64U ? 64U * blockIdx.x + wl : pair.half + 64U * blockIdx.x + (wl - 64U))
+                                        : n0 + wl;
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
     // Inactive columns stage a valid weight row. Only live columns store.
     const unsigned wc = (tid >> 1U) % kBf16Panel;
@@ -81,7 +87,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
             for (unsigned i = 0; i < 4U; ++i) ra[i] = *reinterpret_cast<const Float4*>(ap + k0 + 4U * i);
         }
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
-        packed_rb = weights.template load_tile16<true>(n0 + (tid >> 1U), k0 + ak);
+        packed_rb = weights.template load_tile16<true>(wcol, k0 + ak);
 #else
         const std::uint16_t* q = wp + (L == Layout::NK ? std::size_t{k0} : std::size_t{k0} * p.w_ld);
         rb[0] = *reinterpret_cast<const U4*>(q);
@@ -173,6 +179,33 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
         }
     }
     // acc[m][t][j] -> row 32 wm + 16 m + 2 j + lane / 16, column 64 wn + 16 t + lane % 16.
+#if defined(STRIX_F16_TILE_PACKED_OPERANDS)
+    if constexpr (Pair::kPaired) {
+        // Waves wn = 0 hold the gate sums and waves wn = 1 the up sums of the same rows and columns (same accumulator
+        // map). Four passes of 8 rows per wave: both halves go to LDS (2 x 8 KB), then all 256 threads call pair.put
+        // for 8 elements each, so the epilogue math is spread over every wave.
+        float* exchange = reinterpret_cast<float*>(&lds);
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) {
+            const unsigned m = q / 2U, h = q % 2U;
+            __syncthreads();  // the K loop's (or the previous pass's) LDS reads are done
+#pragma unroll
+            for (unsigned jj = 0; jj < 4U; ++jj)
+#pragma unroll
+                for (unsigned t = 0; t < 4U; ++t)
+                    exchange[wn * 2048U + (8U * wm + 2U * jj + (lane >> 4U)) * 64U + 16U * t + c] = acc[m][t][4U * h + jj];
+            __syncthreads();
+#pragma unroll
+            for (unsigned i = 0; i < 8U; ++i) {
+                const unsigned e = tid + 256U * i, local = e / 64U, column = e % 64U;
+                const unsigned r = r0 + 32U * (local / 8U) + 16U * m + 8U * h + (local % 8U);
+                const unsigned col = 64U * blockIdx.x + column;
+                if (r < p.rows && col < pair.half) pair.put(r, col, exchange[e], exchange[2048U + e]);
+            }
+        }
+        return;
+    }
+#endif
 #if defined(STRIX_F16_TILE_PLAIN_BF16)
     if constexpr (kGated) {
         // Group [forget, gain] of equal width: waves wn = 1 hold the gain sums of the same rows and columns (same

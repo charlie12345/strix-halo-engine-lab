@@ -7401,6 +7401,7 @@ if(STRIX_FAMILY_HY4)
 endif()
 
 # --- core packages (CORE-SPEC 17.4) ---
+include(cmake/packages/B2.cmake)
 include(cmake/packages/K1.cmake)
 include(cmake/packages/K1c.cmake)
 include(cmake/packages/MMIDX.cmake)

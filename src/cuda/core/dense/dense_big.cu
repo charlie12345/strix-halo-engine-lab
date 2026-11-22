@@ -8,7 +8,7 @@
 // Shared memory rows are 32 bf16/f16 (64 B); the 8-byte unit u of a row is stored at u ^ ((row >> 1) & 1) so the LDS.64 fragment
 // reads (4 rows x 4 quad lanes per half warp) are conflict free.
 #include "strix/cuda_core/dense_big.hpp"
-#include "row_plan.hpp"
+#include "strix/cuda_core/dense.hpp"
 #include "strix/attn/group_indexer.hpp"
 
 #include <algorithm>
@@ -22,7 +22,7 @@
 #include "strix/cuda/core/nvfp4_tile_cuda.hpp"
 namespace ftile = ::strix::cuda::core::nvfp4::tile;  // FAST4 operand layouts and kernels (shared CUDA core)
 #include "../common.cuh"
-#include "../tall_k_plan.hpp"
+#include "core/tall_k_plan.hpp"
 
 namespace strix::cuda_core {
 struct Table {
@@ -625,7 +625,7 @@ const Table* get_table(BigCtx& ctx, Mode mode, std::uint32_t out, std::uint32_t 
     const auto key = std::make_tuple(static_cast<int>(mode), in, mode == kSplit ? key2 : 0u, static_cast<std::uint32_t>(bkb));
     auto it = ctx.tables.find(key);
     if (it != ctx.tables.end()) return it->second.get();
-    const auto [kbs, ends] = tall::k_plan(reduction(mode), in, key2, bkb);
+    const auto [kbs, ends] = core::tall::k_plan(reduction(mode), in, key2, bkb);
     auto t = std::make_unique<Table>();
     t->nkb = static_cast<std::uint32_t>(kbs.size());
     t->nseg = static_cast<std::uint32_t>(ends.size());

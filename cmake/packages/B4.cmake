@@ -23,6 +23,8 @@ if(STRIX_B4_CUDA_FIXTURE)
         execute_process(COMMAND "${GIT_EXECUTABLE}" show "6224587f7:src/cuda/core/${path}"
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
             OUTPUT_VARIABLE body COMMAND_ERROR_IS_FATAL ANY)
+        string(REPLACE "#include \"row_plan.hpp\"" "#include \"strix/cuda_core/dense.hpp\"" body "${body}")
+        string(REPLACE "#include \"tall_family.cuh\"" "#include \"core/tall_family.hpp\"" body "${body}")
         file(CONFIGURE OUTPUT "${b4_baseline}/${path}" CONTENT "${body}" @ONLY)
     endforeach()
 

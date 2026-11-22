@@ -48,7 +48,7 @@ cuda_attn::DecodePlan plan_for(const Case& c, unsigned rows, unsigned context) {
     cuda_attn::DecodeSpec spec{c.dim, c.heads, c.kv_heads, rows, context, c.slots, c.window};
     spec.layout = c.layout == Layout::head ? cuda_attn::KvLayout::head_major :
         c.layout == Layout::slot ? cuda_attn::KvLayout::slot_major : cuda_attn::KvLayout::ring;
-    const auto plan = cuda_attn::make_decode_plan(spec);
+    const auto plan = cuda_attn::make_decode_plan(spec, cuda_attn::kNativeSplitHeadDim);
     require(plan.has_value(), "decode plan");
     return *plan;
 }

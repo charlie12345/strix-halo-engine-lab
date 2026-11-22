@@ -1,12 +1,14 @@
 #pragma once
 
-#include "tall_family.cuh"
-#include "core/tall_bf16_plan.hpp"
+#include "tall_bf16_plan.hpp"
+#include "tall_family.hpp"
 
 #include <cstddef>
 #include <vector>
 
-namespace strix::cuda::core::tall {
+namespace strix::core::tall {
+
+using ::strix::cuda::core::tall::Reduction;
 
 struct KPlan {
     std::vector<int> blocks;
@@ -45,4 +47,4 @@ inline KPlan k_plan(Reduction reduction, std::uint32_t in, std::uint32_t splits,
     return plan;
 }
 
-}  // namespace strix::cuda::core::tall
+}  // namespace strix::core::tall

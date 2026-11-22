@@ -26,6 +26,9 @@ cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint
 
 // BF16 or FP32 weights with the same FP32 dot order as dense_rows. For long
 // windows, assign an independent row window to each grid Y coordinate.
+inline constexpr unsigned kFp32GridRows = 8;
+inline constexpr unsigned kFp32GridMaxRows = 65535U * kFp32GridRows;
+inline constexpr unsigned kCompactBf16Outputs = 32;
 cudaError_t dense_fp32_rows_grid(const DenseWeight& w, const float* x, float* y, std::uint32_t rows,
                                 cudaStream_t stream);
 

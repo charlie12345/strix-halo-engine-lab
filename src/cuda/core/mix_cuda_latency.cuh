@@ -1,10 +1,14 @@
 #pragma once
 
 #include "mix_cuda.cuh"
-#include "mix_cuda_latency_plan.hpp"
+#include "core/mix_latency_plan.hpp"
 #include "common.cuh"
 
 namespace strix::cuda::mix {
+inline constexpr unsigned kLatencyTile = 512U;
+inline constexpr unsigned kLatencyBankThreads = 128U;
+inline constexpr unsigned kLatencyMaxWidth = 4096U;
+
 namespace detail {
 
 // Each physical bank lane has already combined virtual lanes x and x+128.
@@ -118,7 +122,7 @@ bank_softmax_tiled(const __grid_constant__ MixArgs args) {
 } // namespace detail
 
 [[nodiscard]] inline cudaError_t enqueue_tiled(const ::strix::core::residual_mix::MixArgs& args, cudaStream_t stream) {
-    const auto grid = latency_grid(args);
+    const auto grid = ::strix::core::residual_mix::latency_grid(args, kLatencyTile, kLatencyMaxWidth);
     if (grid.tiles == 0U) return cudaErrorInvalidValue;
     const auto kernel = args.normalized ? detail::bank_softmax_tiled<true> : detail::bank_softmax_tiled<false>;
     return cuda_core::launch_pdl(kernel, dim3(grid.tiles, grid.queries), dim3(kLatencyBankThreads, grid.banks), stream, args);

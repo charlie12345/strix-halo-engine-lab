@@ -6,7 +6,6 @@
 #include "../common.cuh"
 #include "../step_rows.cuh"
 #include "dense_mma.hpp"
-#include "row_plan.hpp"
 #include "rows_bf16_epilogue.cuh"
 #include "rows_f32_input_major.cuh"
 

@@ -336,26 +336,159 @@ void test(const am::Tables& tables) {
                 strix::recurrent_state_type_name(Type));
 }
 
+template <class T>
+struct ReplayBanks {
+    // Layer 0 guards the nonzero layer offset on every selected state.
+    std::uint16_t before[kSlots][2][L::history_elements], taps[kSlots][2][L::history_elements];
+    alignas(float) T matrix[kSlots][2][2][L::matrix_elements]; // slot, parity, layer, element
+};
+
+struct ReplayWords {
+    std::uint16_t* taps;
+    float* matrix;
+};
+
+struct ReplayGraph {
+    cudaStream_t stream{};
+    cudaGraph_t graph{};
+    cudaGraphExec_t executable{};
+
+    ~ReplayGraph() {
+        if (executable) (void)cudaGraphExecDestroy(executable);
+        if (graph) (void)cudaGraphDestroy(graph);
+        if (stream) (void)cudaStreamDestroy(stream);
+    }
+};
+
+template <unsigned R, RecurrentStateType Type, class T, std::size_t Count>
+void run_replay(Input<T>& input, Pending<T>& work, Pending<T>& seq, Donor<T>& donor,
+                const am::Tables& tables, const std::array<unsigned, Count>& counts) {
+    auto banks = allocate<ReplayBanks<T>>();
+    auto words = allocate<ReplayWords>();
+    auto expected = std::make_unique_for_overwrite<ReplayBanks<T>>();
+    std::memset(banks.get(), 0xa5, sizeof(*banks));
+    for (unsigned slot = 0U; slot < kSlots; ++slot) {
+        std::memcpy(banks->before[slot][1], input.image[slot].history, sizeof(input.image[slot].history));
+        for (auto& parity : banks->matrix[slot])
+            std::memcpy(parity[1], input.image[slot].matrix, sizeof(input.image[slot].matrix));
+    }
+
+    constexpr auto tap_offset = sizeof(banks->taps[0][0]);
+    constexpr auto matrix_offset = sizeof(banks->matrix[0][0][0]);
+    const strix::state::StateTable table{input.directory, 2, kSlots};
+    const rec::DecodeWeights w{input.beta, input.alpha, input.dt, input.a, input.conv, input.gain};
+    auto strides = kStrides;
+    strides.prepared = strides.qkv;
+    const rec::DecodeReplayStep args{&input.step,
+        {input.hidden[0], work.qkv[0], input.z[0], work.qkv[0], work.beta[0], work.gate[0], work.out[0], work.raw[0]},
+        strides, {table, 0}, {table, 1}, {nullptr, &words->taps, tap_offset}, {nullptr, &words->matrix, matrix_offset},
+        Type, {work.codes[0], work.deltas}, tap_offset, matrix_offset};
+
+    ReplayGraph graph;
+    check(cudaStreamCreateWithFlags(&graph.stream, cudaStreamNonBlocking));
+    check(cudaStreamBeginCapture(graph.stream, cudaStreamCaptureModeThreadLocal));
+    check(rec::enqueue_decode_replay_step(R, w, args, tables, graph.stream));
+    check(cudaStreamEndCapture(graph.stream, &graph.graph));
+    check(cudaGraphInstantiate(&graph.executable, graph.graph, 0));
+
+    for (std::size_t replay = 0; replay < counts.size(); ++replay) {
+        const auto count = counts[replay];
+        const unsigned slot = R == 1U && replay == 1U ? 1U : 0U;
+        const unsigned parity = R == 1U && replay != 0U ? 1U : 0U;
+        auto& before = banks->before[slot];
+        auto& taps = banks->taps[slot];
+        auto& matrix_in = banks->matrix[slot][parity];
+        auto& matrix_out = banks->matrix[slot][parity ^ 1U];
+        if (R == 1U && replay == 2U)
+            std::memcpy(before[1], taps[1], tap_offset); // Continue session 0 from replay 0.
+        std::memcpy(input.image[slot].history, before[1], tap_offset);
+        std::memcpy(input.image[slot].matrix, matrix_in[1], matrix_offset);
+        describe(input, R, true);
+        input.step.h.valid_mask = (1U << count) - 1U;
+        for (unsigned r = 0; r < R; ++r) {
+            input.step.row[r].slot = slot;
+            input.step.row[r].position = input.directory[slot].frontier + r;
+        }
+        input.directory[slot].base = reinterpret_cast<std::uintptr_t>(before[0]);
+        input.directory[kSlots + slot].base = reinterpret_cast<std::uintptr_t>(matrix_in[0]);
+        words->taps = taps[0];
+        words->matrix = reinterpret_cast<float*>(matrix_out[0]);
+
+        constexpr auto row_bytes = offsetof(Pending<T>, history);
+        std::memset(&work, 0xa5, row_bytes);
+        for (unsigned r = 0; r < R; ++r) std::copy_n(input.qkv[r], L::channels, work.qkv[r]);
+        std::memcpy(&seq, &work, row_bytes);
+        std::memcpy(expected.get(), banks.get(), sizeof(*banks));
+        const auto directory = std::to_array(input.directory);
+        check(cudaGraphLaunch(graph.executable, graph.stream));
+        check(cudaStreamSynchronize(graph.stream));
+
+        serial<Type>(input, seq, w, tables, true);
+        check(cudaDeviceSynchronize());
+        compare("captured replay rows and padding vs direct", reinterpret_cast<const unsigned char*>(&work),
+                reinterpret_cast<const unsigned char*>(&seq), row_bytes);
+        if (count != 0U) {
+            const unsigned last = count - 1U;
+            donor_prefix<R, Type>(input, donor, seq, last, tables, true);
+            std::memcpy(expected->taps[slot][1], seq.history[last], tap_offset);
+            std::memcpy(expected->matrix[slot][parity ^ 1U][1], seq.matrix[last], matrix_offset);
+        }
+        compare("captured replay images and inactive banks vs direct",
+                reinterpret_cast<const unsigned char*>(banks.get()),
+                reinterpret_cast<const unsigned char*>(expected.get()), sizeof(*banks));
+        compare("captured replay published directory", input.directory, directory.data(), directory.size());
+    }
+}
+
+template <RecurrentStateType Type>
+void test_replay(const am::Tables& tables) {
+    using T = std::conditional_t<Type == RecurrentStateType::f32, float, std::uint16_t>;
+    auto input = allocate<Input<T>>();
+    auto work = allocate<Pending<T>>();
+    auto seq = allocate<Pending<T>>();
+    auto donor = allocate<Donor<T>>();
+    initialize<Type>(*input);
+    run_replay<1, Type>(*input, *work, *seq, *donor, tables, std::array{1U, 1U, 1U});
+    std::printf("K9G X3 replay %s R=1 EXACT (3 graph launches, 2 slots, parity, layer offsets)\n",
+                strix::recurrent_state_type_name(Type));
+    run_replay<2, Type>(*input, *work, *seq, *donor, tables, std::array{2U, 1U, 0U});
+    run_replay<4, Type>(*input, *work, *seq, *donor, tables, std::array{4U, 3U, 1U});
+    run_replay<8, Type>(*input, *work, *seq, *donor, tables, std::array{8U, 7U, 6U, 5U, 2U});
+    run_replay<16, Type>(*input, *work, *seq, *donor, tables, std::array{16U, 9U, 4U, 0U});
+    std::printf("K9G X3 replay %s R=2,4,8,16 EXACT (one spare, prefix replay, padding, zero accept)\n",
+                strix::recurrent_state_type_name(Type));
+}
+
+#if defined(STRIX_K9G_REPLAY_FIXTURE)
+constexpr auto kFixture = "strix-k9g-decode-replay-fixture";
+template <RecurrentStateType Type>
+void run_fixture(const am::Tables& tables) { test_replay<Type>(tables); }
+#else
+constexpr auto kFixture = "strix-k9g-decode-step-fixture";
+template <RecurrentStateType Type>
+void run_fixture(const am::Tables& tables) { test<Type>(tables); }
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::fprintf(stderr, "usage: strix-k9g-decode-step-fixture TABLES_DIR\n");
+        std::fprintf(stderr, "usage: %s TABLES_DIR\n", kFixture);
         return 2;
     }
     try {
         auto tables = am::load_tables(argv[1]);
         try {
-            test<RecurrentStateType::f32>(tables);
-            test<RecurrentStateType::f16>(tables);
-            test<RecurrentStateType::bf16>(tables);
+            run_fixture<RecurrentStateType::f32>(tables);
+            run_fixture<RecurrentStateType::f16>(tables);
+            run_fixture<RecurrentStateType::bf16>(tables);
         } catch (...) {
             am::free_tables(tables);
             throw;
         }
         am::free_tables(tables);
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "K9G X3 decode FAIL: %s\n", error.what());
+        std::fprintf(stderr, "%s FAIL: %s\n", kFixture, error.what());
         return 1;
     }
 }

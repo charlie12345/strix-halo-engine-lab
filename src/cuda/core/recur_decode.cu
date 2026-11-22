@@ -163,13 +163,17 @@ template <class Arithmetic, bool A8, class Binding = DecodeRow>
 __global__ __launch_bounds__(256) void decode_norm(DecodeWeights w, Binding binding, am::Tables t, DecodeA8 a8) {
     if constexpr (std::is_same_v<Binding, DecodeStep>) {
         if (!decode_source(binding, blockIdx.y).history) return;
+    } else if constexpr (std::is_same_v<Binding, DecodeReplayStep>) {
+        if (blockIdx.y >= decode_replay_images(gridDim.y, binding).rows) return;
+    }
+    if constexpr (!std::is_same_v<Binding, DecodeRow>) {
         if constexpr (A8) {
             a8.codes += blockIdx.y * binding.strides.a8_codes;
             a8.deltas += blockIdx.y;
         }
     }
     const DecodeRow row = [&]() {
-        if constexpr (std::is_same_v<Binding, DecodeStep>) return decode_row(binding, blockIdx.y);
+        if constexpr (!std::is_same_v<Binding, DecodeRow>) return decode_row(binding, blockIdx.y);
         else return binding;
     }();
     const unsigned lane = threadIdx.x % 32U, head = blockIdx.x * 8U + threadIdx.x / 32U;
@@ -198,13 +202,25 @@ constexpr unsigned kDeltaBlocks = Layout::value_heads * (Layout::head_dim / 32U)
 template <RecurrentStateType Type>
 inline constexpr auto kMatrixBytes = Layout::matrix_bytes(Type);
 
-template <unsigned R>
-__global__ __launch_bounds__(256) void decode_step_front(DecodeWeights w, DecodeStep step, am::Tables t) {
+template <unsigned R, class Binding>
+__device__ __forceinline__ DecodeReplayImages replay_images(const Binding& step) {
+    if constexpr (std::is_same_v<Binding, DecodeReplayStep>) return decode_replay_images(R, step);
+    else return {};
+}
+
+template <unsigned R, class Binding>
+__device__ __forceinline__ void decode_step_front_body(DecodeWeights w, const Binding& step, am::Tables t) {
+    constexpr bool replay = std::is_same_v<Binding, DecodeReplayStep>;
+    const auto images = replay_images<R>(step);
     const unsigned block = blockIdx.x;
     if (block >= kConvBlocks) {
         const unsigned gate_block = block - kConvBlocks;
         const unsigned r = gate_block / kGateBlocks;
-        if (decode_source(step, r).history)
+        const bool valid = [&]() {
+            if constexpr (replay) return r < images.rows;
+            else return decode_source(step, r).history != nullptr;
+        }();
+        if (valid)
             project_gate<DecodeArithmetic>(w, decode_row(step, r), t, gate_block % kGateBlocks);
         return;
     }
@@ -212,35 +228,72 @@ __global__ __launch_bounds__(256) void decode_step_front(DecodeWeights w, Decode
     // The first warp owns the same channels in every row. It consumes only
     // the pending taps it wrote for the parent, even when QKV is overwritten.
     if (threadIdx.x >= 32U) return;
-    for (unsigned r = 0U; r < R; ++r) {
-        const auto src = decode_source(step, r);
-        if (!src.history) continue;
-        const auto* history = src.parent == exec::kStepNoParent
-            ? reinterpret_cast<const std::uint16_t*>(src.history->base)
-            : step.pending_history + src.parent * Layout::history_elements;
-        convolve_decode<DecodeArithmetic>(w, decode_row(step, r), history,
-                                          step.pending_history + r * Layout::history_elements, t);
+    for (unsigned r = 0U; r < (replay ? images.rows : R); ++r) {
+        const std::uint16_t* history;
+        std::uint16_t* next;
+        if constexpr (replay) {
+            next = images.pending_history;
+            history = r == 0U ? images.history : next;
+        } else {
+            const auto src = decode_source(step, r);
+            if (!src.history) continue;
+            next = step.pending_history + r * Layout::history_elements;
+            history = src.parent == exec::kStepNoParent
+                ? reinterpret_cast<const std::uint16_t*>(src.history->base)
+                : step.pending_history + src.parent * Layout::history_elements;
+        }
+        convolve_decode<DecodeArithmetic>(w, decode_row(step, r), history, next, t);
     }
 }
 
-template <unsigned R, RecurrentStateType Type>
-__global__ __launch_bounds__(lanes::RecShape<kLanes>::Threads) void decode_step_delta(DecodeStep step, am::Tables t) {
-    auto* pending = static_cast<std::byte*>(step.pending_matrix);
+template <unsigned R>
+__global__ __launch_bounds__(256) void decode_step_front(DecodeWeights w, DecodeStep step, am::Tables t) {
+    decode_step_front_body<R>(w, step, t);
+}
+
+template <unsigned R>
+__global__ __launch_bounds__(256) void decode_step_front(DecodeWeights w, DecodeReplayStep step, am::Tables t) {
+    decode_step_front_body<R>(w, step, t);
+}
+
+template <unsigned R, RecurrentStateType Type, class Binding>
+__device__ __forceinline__ void decode_step_delta_body(const Binding& step, am::Tables t) {
+    constexpr bool replay = std::is_same_v<Binding, DecodeReplayStep>;
+    const auto images = replay_images<R>(step);
     constexpr auto bytes = kMatrixBytes<Type>;
-    for (unsigned r = 0U; r < R; ++r) {
-        const auto src = decode_source(step, r);
-        if (!src.matrix) continue;
-        const auto* matrix = src.parent == exec::kStepNoParent
-            ? reinterpret_cast<const float*>(src.matrix->base)
-            : reinterpret_cast<const float*>(pending + bytes * src.parent);
+    for (unsigned r = 0U; r < (replay ? images.rows : R); ++r) {
+        const float* matrix;
+        float* next;
+        if constexpr (replay) {
+            next = images.pending_matrix;
+            matrix = r == 0U ? images.matrix : next;
+        } else {
+            const auto src = decode_source(step, r);
+            if (!src.matrix) continue;
+            auto* pending = static_cast<std::byte*>(step.pending_matrix);
+            next = reinterpret_cast<float*>(pending + bytes * r);
+            matrix = src.parent == exec::kStepNoParent
+                ? reinterpret_cast<const float*>(src.matrix->base)
+                : reinterpret_cast<const float*>(pending + bytes * src.parent);
+        }
         const auto row = decode_row(step, r);
         const LanesRow prepared{row.prepared, row.beta, row.log_decay, row.out, Layout::channels};
         // The shared body dots in FP32, then stores through the typed codec.
         // Each block reads back only the same cells it owned for the parent.
         lanes::recurrence_body<kLanes, Type, false, true>(
-            prepared, 1U, matrix, reinterpret_cast<float*>(pending + bytes * r), nullptr, &t);
+            prepared, 1U, matrix, next, nullptr, &t);
         __syncthreads();
     }
+}
+
+template <unsigned R, RecurrentStateType Type>
+__global__ __launch_bounds__(lanes::RecShape<kLanes>::Threads) void decode_step_delta(DecodeStep step, am::Tables t) {
+    decode_step_delta_body<R, Type>(step, t);
+}
+
+template <unsigned R, RecurrentStateType Type>
+__global__ __launch_bounds__(lanes::RecShape<kLanes>::Threads) void decode_step_delta(DecodeReplayStep step, am::Tables t) {
+    decode_step_delta_body<R, Type>(step, t);
 }
 
 }  // namespace
@@ -278,9 +331,12 @@ cudaError_t enqueue_decode(Gfx1151Decode, const DecodeWeights& w, DecodeRow row,
     return cudaGetLastError();
 }
 
-cudaError_t enqueue_decode_step(unsigned width, const DecodeWeights& w, const DecodeStep& step,
-                                const am::Tables& t, cudaStream_t stream) {
-    if (!valid_decode_step(width, step) || !w.beta || !w.alpha || !w.dt || !w.a || !w.conv || !w.gain ||
+namespace {
+
+template <class Binding>
+cudaError_t enqueue_step(unsigned width, const DecodeWeights& w, const Binding& step,
+                         const am::Tables& t, cudaStream_t stream) {
+    if (!w.beta || !w.alpha || !w.dt || !w.a || !w.conv || !w.gain ||
         !t.exp_bits || !t.rsq_bits || !t.rcp_bits)
         return cudaErrorInvalidValue;
     return ::strix::cuda::core::dispatch_step_rows(width, [&]<unsigned R>() {
@@ -302,6 +358,20 @@ cudaError_t enqueue_decode_step(unsigned width, const DecodeWeights& w, const De
         else decode_norm<DecodeArithmetic, false><<<grid, 256, 0, stream>>>(w, step, t, step.a8);
         return cudaGetLastError();
     });
+}
+
+}  // namespace
+
+cudaError_t enqueue_decode_step(unsigned width, const DecodeWeights& w, const DecodeStep& step,
+                                const am::Tables& t, cudaStream_t stream) {
+    if (!valid_decode_step(width, step)) return cudaErrorInvalidValue;
+    return enqueue_step(width, w, step, t, stream);
+}
+
+cudaError_t enqueue_decode_replay_step(unsigned width, const DecodeWeights& w, const DecodeReplayStep& step,
+                                       const am::Tables& t, cudaStream_t stream) {
+    if (!valid_decode_replay_step(width, step)) return cudaErrorInvalidValue;
+    return enqueue_step(width, w, step, t, stream);
 }
 
 }  // namespace strix::cuda::recur

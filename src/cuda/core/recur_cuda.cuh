@@ -51,4 +51,13 @@ cudaError_t enqueue_decode(Gfx1151Decode, const DecodeWeights&, DecodeRow, Decod
 cudaError_t enqueue_decode_step(unsigned width, const DecodeWeights&, const DecodeStep&,
                                 const numeric::gfx1151::Tables&, cudaStream_t);
 
+// X3 replay policy for one contiguous chain. The final row leaves its images
+// in the selected spare. Rerun a shorter prefix from the same published inputs
+// to replace those images after partial acceptance. Zero acceptance leaves
+// the published images alone. The caller owns publication and synchronization.
+// Invalid device bindings/rows mask the whole step. Row-buffer rules match
+// enqueue_decode_step. Keep QKV (or restore it from raw_capture) for replay.
+cudaError_t enqueue_decode_replay_step(unsigned width, const DecodeWeights&, const DecodeReplayStep&,
+                                       const numeric::gfx1151::Tables&, cudaStream_t);
+
 }  // namespace strix::cuda::recur

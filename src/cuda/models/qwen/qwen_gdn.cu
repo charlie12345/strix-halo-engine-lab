@@ -24,7 +24,7 @@
 #include "strix/gdn_prefill_overlap.hpp"
 #include <cuda_fp16.h>
 #include "../../../attn_core/recurrent_state.hpp"
-#include "../../../cuda_core/gdn/gdn_lanes.cuh"
+#include "../../core/recur_lanes.cuh"
 
 #include "strix/env_flags.hpp"
 
@@ -37,7 +37,7 @@ namespace {
 namespace am = strix::cuda::amdmath;
 namespace rstate = strix::attn_core::rstate;
 constexpr unsigned kFull = 0xffffffffU;
-// The lanes recurrence (staging shape + per-row body) is the shared CUDA core's (src/cuda_core/gdn/gdn_lanes.cuh).
+// The lanes recurrence (staging shape + per-row body) is the shared CUDA core's (src/cuda/core/recur_lanes.cuh).
 using strix::cuda_core::gdn_lanes::RecShape;
 using strix::cuda_core::gdn_lanes::RecStage;
 using strix::cuda_core::gdn_lanes::recurrence_body;

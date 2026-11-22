@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <math.h>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -109,6 +110,73 @@ STRIX_MOE_ROUTE_HD inline float sigmoid_score(float z) {
 template <class Math>
 STRIX_MOE_ROUTE_HD inline float sqrt_softplus_score(float z) {
     return Math::sqrt(z > 20.0F ? z : Math::log1p(Math::exp(z)));
+}
+
+// Declared prefill exp from minimax_msa.hpp. Nearest-even Cody-Waite range
+// reduction and degree-eight Horner polynomial, with the donor's cutoffs.
+struct RouteCodyWaiteExpV1 {
+    STRIX_MOE_ROUTE_HD static float exp(float x) {
+        if (!(x >= -87.0F)) return x < -87.0F ? 0.0F : x;
+        if (x > 88.0F) return __builtin_bit_cast(float, std::uint32_t{0x7f800000U});
+        const float n = ::rintf(x * 1.44269504088896341F);
+        float r = ::fmaf(n, -0.693145751953125F, x);
+        r = ::fmaf(n, -1.42860676533018e-06F, r);
+        float p = 2.48015873e-05F;
+        p = ::fmaf(p, r, 1.98412698e-04F);
+        p = ::fmaf(p, r, 1.38888889e-03F);
+        p = ::fmaf(p, r, 8.33333333e-03F);
+        p = ::fmaf(p, r, 4.16666667e-02F);
+        p = ::fmaf(p, r, 1.66666667e-01F);
+        p = ::fmaf(p, r, 0.5F);
+        p = ::fmaf(p, r, 1.0F);
+        p = ::fmaf(p, r, 1.0F);
+        const auto bits = static_cast<std::uint32_t>(static_cast<int>(n) + 127) << 23U;
+        return p * __builtin_bit_cast(float, bits);
+    }
+};
+
+struct RouteScorePair {
+    float unbiased;
+    float biased;
+};
+
+// Token-major row/expert views. Separate arrays use stride 1. An interleaved
+// buffer uses stride 2 with bases at element 0 and element 1.
+template <unsigned Stride>
+struct RouteScorePlanes {
+    static_assert(Stride > 0U);
+    float* unbiased;
+    float* biased;
+};
+
+template <class Math>
+STRIX_MOE_ROUTE_HD inline RouteScorePair route_sigmoid_score_pair(float logit, float bias) {
+    const float score = sigmoid_score<Math>(logit);
+    return {score, score + bias};
+}
+
+// Lane l folds dimensions l, l+32, ... by FP32 FMA. The reduction uses XOR
+// masks 16, 8, 4, 2, 1; the host computes the operands that reach lane zero.
+struct RouteStridedFmaXor32 {
+    static constexpr unsigned lanes = 32U;
+
+    static float dot_ref(std::span<const float> hidden, std::span<const float> weight) {
+        if (hidden.empty() || hidden.size() != weight.size())
+            throw std::invalid_argument("route projection: expected equal nonempty input and weight spans");
+        std::array<float, lanes> partial{};
+        for (unsigned lane = 0; lane < lanes; ++lane)
+            for (std::size_t j = lane; j < hidden.size(); j += lanes)
+                partial[lane] = std::fma(hidden[j], weight[j], partial[lane]);
+        for (unsigned mask = lanes / 2U; mask > 0U; mask >>= 1U)
+            for (unsigned lane = 0; lane < mask; ++lane)
+                partial[lane] = partial[lane] + partial[lane ^ mask];
+        return partial[0];
+    }
+};
+
+template <class Dot, class Math>
+RouteScorePair route_project_sigmoid_ref(std::span<const float> hidden, std::span<const float> weight, float bias) {
+    return route_sigmoid_score_pair<Math>(Dot::dot_ref(hidden, weight), bias);
 }
 
 // Selection key: -0 is +0; negatives below positives; a total order on the remaining bits.

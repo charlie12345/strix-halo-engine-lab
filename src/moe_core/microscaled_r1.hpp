@@ -4,6 +4,7 @@
 #include "moe_core/device_grouped_plan.hpp"
 #include "moe_core/expert_activation.hpp"
 #include "moe_core/grouped_rows.hpp"
+#include "moe_core/microscaled_r1_geometry.hpp"
 #include "strix/exec/descriptor.hpp"
 
 #include <cmath>
@@ -19,13 +20,6 @@
 // body below as their reference.
 #include "cuda/core/moe_microscaled_r1.cuh"
 #define STRIX_MOE_R1_CUDA_PACKED_DOT 1
-#endif
-
-// Geometry helpers run on the host (launch grids) and in the kernels (column and row maps).
-#if defined(__HIPCC__) || defined(__CUDACC__)
-#define STRIX_R1_HD __host__ __device__
-#else
-#define STRIX_R1_HD
 #endif
 
 namespace strix::moe_core::microscaled_r1 {
@@ -73,36 +67,11 @@ inline bool fits(const Args& a) {
            std::isfinite(a.gate_cap) && a.gate_cap > 0.0F && std::isfinite(a.up_cap) && a.up_cap > 0.0F;
 }
 
-// Launch geometry. A wave owns `columns` consecutive outputs and streams their rows together (gate_up: the gate and
-// up rows of each column; down_combine: one row per column per routed expert). Each row keeps its own accumulator,
-// lane->K mapping and butterfly, so the column count changes no output bit. It sets how many rows share one wave's
-// dependent load chain (ids -> matrices -> codes -> scales): on gfx1151 one row per wave left that chain carrying
-// 1.3 KB (gate) / 0.65 KB (down) and the kernels at 61 % / 53 % of the byte roof.
-struct Geometry {
-    unsigned gate_columns, down_columns;
-};
-inline constexpr unsigned kWavesPerBlock = 8;
-inline constexpr Geometry kHipGeometry{2U, 4U};
-inline constexpr Geometry kCudaGeometry{1U, 1U};
 #if defined(__HIPCC__)
 inline constexpr Geometry kGeometry = kHipGeometry;
 #else
 inline constexpr Geometry kGeometry = kCudaGeometry;
 #endif
-
-STRIX_R1_HD constexpr unsigned gate_blocks(unsigned intermediate, unsigned columns) {
-    return (intermediate - 1U) / (kWavesPerBlock * columns) + 1U;
-}
-STRIX_R1_HD constexpr unsigned gate_first_column(unsigned block, unsigned wave, unsigned columns) {
-    return (block * kWavesPerBlock + wave) * columns;
-}
-STRIX_R1_HD constexpr unsigned down_blocks(unsigned hidden, unsigned columns) { return (hidden - 1U) / columns + 1U; }
-// Weight row read by output slot i of a wave whose first column is col; `live` columns remain in the matrix.
-// Slots past the live columns re-read the first valid row (their results are never stored).
-STRIX_R1_HD constexpr unsigned slot_row(unsigned col, unsigned i, unsigned columns, unsigned stride, unsigned live) {
-    const unsigned offset = i % columns < live ? i % columns : 0U;
-    return col + offset + (i / columns) * stride;
-}
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace detail {
@@ -347,25 +316,9 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 __global__ __launch_bounds__(kThreads)
 #endif
 void gate_up(Args args) {
-    if (args.failure && *args.failure != 0U) return;
-    const unsigned slot = blockIdx.y;
-    const unsigned expert = args.ids[slot];
-    const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, kGateColumns);
-    if (expert >= args.experts || col >= args.intermediate) return;
-    const unsigned lane = threadIdx.x % kWarp;
-    const unsigned live = args.intermediate - col;
-    float pair[2U * kGateColumns];
-    dot_rows<Format, kGateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live,
-                                   args.input, args.hidden, lane, pair);
-    if (lane == 0U) {
-        const moe::SoftcappedSwiglu<activation::DeviceMath> swiglu{args.gate_cap, args.up_cap};
-#pragma unroll
-        for (unsigned i = 0; i < kGateColumns; ++i) {
-            if (i >= live) break;
-            args.activation[std::size_t{slot} * args.intermediate + col + i] =
-                activation::activate_bf16(swiglu, pair[i], pair[kGateColumns + i]);
-        }
-    }
+#define STRIX_R1_GATE_COLUMNS kGateColumns
+#include "microscaled_r1_gate_up.inc"
+#undef STRIX_R1_GATE_COLUMNS
 }
 
 // One CTA owns kDownColumns hidden output columns. Each warp projects down one or more
@@ -378,46 +331,9 @@ __global__ __launch_bounds__(kThreads, kMinWavesPerEu)
 __global__ __launch_bounds__(kThreads)
 #endif
 void down_combine(Args args) {
-    if (args.failure && *args.failure != 0U) return;
-    __shared__ float terms[kDownColumns][TopK];
-    const unsigned col = blockIdx.x * kDownColumns;
-    const unsigned live = args.hidden - col;
-    const unsigned lane = threadIdx.x % kWarp;
-    for (unsigned slot = threadIdx.x / kWarp; slot < TopK; slot += kWarps) {
-        const unsigned expert = args.ids[slot];
-        if (expert >= args.experts) continue;
-        const auto* input = args.activation + std::size_t{slot} * args.intermediate;
-        float projected[kDownColumns];
-        dot_rows<Format, kDownColumns>(args.matrices[expert].down, col, 0U, live,
-                                       input, args.intermediate, lane, projected);
-        if (lane == 0U) {
-            unsigned rank = 0;
-#pragma unroll
-            for (unsigned i = 0; i < TopK; ++i) {
-                const auto other = args.ids[i];
-                rank += other < expert || (other == expert && i < slot);
-            }
-#pragma unroll
-            for (unsigned i = 0; i < kDownColumns; ++i) {
-                terms[i][rank] = combine::weighted_bf16<false>(args.weights[slot], projected[i]);
-            }
-        }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0U) {
-#pragma unroll
-        for (unsigned slot = 0; slot < TopK; ++slot) {
-            if (args.ids[slot] >= args.experts) return;
-        }
-#pragma unroll
-        for (unsigned i = 0; i < kDownColumns; ++i) {
-            if (i >= live) break;
-            float result = 0.0F;
-#pragma unroll
-            for (unsigned slot = 0; slot < TopK; ++slot) result = __fadd_rn(result, terms[i][slot]);
-            args.output[col + i] = combine::rounded_bf16<false>(result);
-        }
-    }
+#define STRIX_R1_DOWN_COLUMNS kDownColumns
+#include "microscaled_r1_down.inc"
+#undef STRIX_R1_DOWN_COLUMNS
 }
 
 } // namespace detail

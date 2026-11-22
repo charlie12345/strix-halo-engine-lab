@@ -3,13 +3,16 @@
 #include "chain/key.hpp"
 #include "common.cuh"
 #include "recur_lanes.cuh"
+#include "step_rows.cuh"
+
+#include <type_traits>
 
 namespace strix::cuda::recur {
 namespace {
 
 namespace lanes = cuda_core::gdn_lanes;
 namespace am = numeric::gfx1151;
-namespace chain = core::chain;
+namespace chain = ::strix::cuda::core::chain;
 using Layout = Gfx1151Decode;
 using chain::Math;
 
@@ -85,7 +88,8 @@ __device__ __forceinline__ void project_gate(const DecodeWeights& w, const Decod
 
 template <class Arithmetic>
 __device__ __forceinline__ void convolve_decode(const DecodeWeights& w, const DecodeRow& row,
-                                                std::uint16_t* history, const am::Tables& t) {
+                                                const std::uint16_t* history, std::uint16_t* next,
+                                                const am::Tables& t) {
     const unsigned lane = threadIdx.x;
     if (lane >= 32U) return;
     const unsigned base = blockIdx.x * Layout::head_dim;
@@ -95,13 +99,13 @@ __device__ __forceinline__ void convolve_decode(const DecodeWeights& w, const De
         const unsigned c = base + part * 32U + lane;
         const float raw = row.qkv[c];
         if (row.raw_capture) row.raw_capture[c] = raw;
-        auto* tap = history + c * Layout::taps;
+        const auto* tap = history + c * Layout::taps;
         const std::uint16_t samples[]{tap[1], tap[2], tap[3], narrow(raw)};
         float sum = 0.0F;
 #pragma unroll
         for (unsigned i = 0U; i < Layout::taps; ++i) {
             sum = __fmaf_rn(cuda_core::bf16_lo(samples[i]), w.conv[c * Layout::taps + i], sum);
-            tap[i] = samples[i];
+            next[c * Layout::taps + i] = samples[i];
         }
         const float den = Arithmetic::sigmoid_denominator(sum, t);
         value[part] = round_bf16(__fdiv_rn(sum, den));
@@ -122,7 +126,7 @@ __device__ __forceinline__ void convolve_decode(const DecodeWeights& w, const De
 template <class Arithmetic>
 __global__ __launch_bounds__(256) void decode_front(DecodeWeights w, DecodeRow row, std::uint16_t* history, am::Tables t) {
     constexpr unsigned conv_blocks = 2U * Layout::key_heads + Layout::value_heads;
-    if (blockIdx.x < conv_blocks) convolve_decode<Arithmetic>(w, row, history, t);
+    if (blockIdx.x < conv_blocks) convolve_decode<Arithmetic>(w, row, history, history, t);
     else project_gate<Arithmetic>(w, row, t, blockIdx.x - conv_blocks);
 }
 
@@ -155,8 +159,19 @@ __device__ __forceinline__ void store_a8(float x, DecodeA8 a8, unsigned feature,
     if (lane == 0U) a8.deltas[feature / 32U * Layout::a8_pitch] = delta;
 }
 
-template <class Arithmetic, bool A8>
-__global__ __launch_bounds__(256) void decode_norm(DecodeWeights w, DecodeRow row, am::Tables t, DecodeA8 a8) {
+template <class Arithmetic, bool A8, class Binding = DecodeRow>
+__global__ __launch_bounds__(256) void decode_norm(DecodeWeights w, Binding binding, am::Tables t, DecodeA8 a8) {
+    if constexpr (std::is_same_v<Binding, DecodeStep>) {
+        if (!decode_source(binding, blockIdx.y).history) return;
+        if constexpr (A8) {
+            a8.codes += blockIdx.y * binding.strides.a8_codes;
+            a8.deltas += blockIdx.y;
+        }
+    }
+    const DecodeRow row = [&]() {
+        if constexpr (std::is_same_v<Binding, DecodeStep>) return decode_row(binding, blockIdx.y);
+        else return binding;
+    }();
     const unsigned lane = threadIdx.x % 32U, head = blockIdx.x * 8U + threadIdx.x / 32U;
     const unsigned base = head * Layout::head_dim;
     float value[4], square[4];
@@ -174,6 +189,57 @@ __global__ __launch_bounds__(256) void decode_norm(DecodeWeights w, DecodeRow ro
         const float result = __fmul_rn(__fmul_rn(__fmul_rn(value[part], inverse), w.gain[c]), gate);
         row.out[feature] = result;
         if constexpr (A8) store_a8(result, a8, feature, lane);
+    }
+}
+
+constexpr unsigned kConvBlocks = 2U * Layout::key_heads + Layout::value_heads;
+constexpr unsigned kGateBlocks = 2U * Layout::value_heads;
+constexpr unsigned kDeltaBlocks = Layout::value_heads * (Layout::head_dim / 32U);
+template <RecurrentStateType Type>
+inline constexpr auto kMatrixBytes = Layout::matrix_bytes(Type);
+
+template <unsigned R>
+__global__ __launch_bounds__(256) void decode_step_front(DecodeWeights w, DecodeStep step, am::Tables t) {
+    const unsigned block = blockIdx.x;
+    if (block >= kConvBlocks) {
+        const unsigned gate_block = block - kConvBlocks;
+        const unsigned r = gate_block / kGateBlocks;
+        if (decode_source(step, r).history)
+            project_gate<DecodeArithmetic>(w, decode_row(step, r), t, gate_block % kGateBlocks);
+        return;
+    }
+
+    // The first warp owns the same channels in every row. It consumes only
+    // the pending taps it wrote for the parent, even when QKV is overwritten.
+    if (threadIdx.x >= 32U) return;
+    for (unsigned r = 0U; r < R; ++r) {
+        const auto src = decode_source(step, r);
+        if (!src.history) continue;
+        const auto* history = src.parent == exec::kStepNoParent
+            ? reinterpret_cast<const std::uint16_t*>(src.history->base)
+            : step.pending_history + src.parent * Layout::history_elements;
+        convolve_decode<DecodeArithmetic>(w, decode_row(step, r), history,
+                                          step.pending_history + r * Layout::history_elements, t);
+    }
+}
+
+template <unsigned R, RecurrentStateType Type>
+__global__ __launch_bounds__(lanes::RecShape<kLanes>::Threads) void decode_step_delta(DecodeStep step, am::Tables t) {
+    auto* pending = static_cast<std::byte*>(step.pending_matrix);
+    constexpr auto bytes = kMatrixBytes<Type>;
+    for (unsigned r = 0U; r < R; ++r) {
+        const auto src = decode_source(step, r);
+        if (!src.matrix) continue;
+        const auto* matrix = src.parent == exec::kStepNoParent
+            ? reinterpret_cast<const float*>(src.matrix->base)
+            : reinterpret_cast<const float*>(pending + bytes * src.parent);
+        const auto row = decode_row(step, r);
+        const LanesRow prepared{row.prepared, row.beta, row.log_decay, row.out, Layout::channels};
+        // The shared body dots in FP32, then stores through the typed codec.
+        // Each block reads back only the same cells it owned for the parent.
+        lanes::recurrence_body<kLanes, Type, false, true>(
+            prepared, 1U, matrix, reinterpret_cast<float*>(pending + bytes * r), nullptr, &t);
+        __syncthreads();
     }
 }
 
@@ -210,6 +276,32 @@ cudaError_t enqueue_decode(Gfx1151Decode, const DecodeWeights& w, DecodeRow row,
     if (a8.codes) decode_norm<DecodeArithmetic, true><<<Layout::value_heads / 8U, 256, 0, stream>>>(w, row, t, a8);
     else decode_norm<DecodeArithmetic, false><<<Layout::value_heads / 8U, 256, 0, stream>>>(w, row, t, a8);
     return cudaGetLastError();
+}
+
+cudaError_t enqueue_decode_step(unsigned width, const DecodeWeights& w, const DecodeStep& step,
+                                const am::Tables& t, cudaStream_t stream) {
+    if (!valid_decode_step(width, step) || !w.beta || !w.alpha || !w.dt || !w.a || !w.conv || !w.gain ||
+        !t.exp_bits || !t.rsq_bits || !t.rcp_bits)
+        return cudaErrorInvalidValue;
+    return ::strix::cuda::core::dispatch_step_rows(width, [&]<unsigned R>() {
+        decode_step_front<R><<<kConvBlocks + R * kGateBlocks, 256, 0, stream>>>(w, step, t);
+        if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+
+        const auto launch = [&]<RecurrentStateType Type>() {
+            decode_step_delta<R, Type><<<kDeltaBlocks, lanes::RecShape<kLanes>::Threads, 0, stream>>>(step, t);
+        };
+        switch (step.type) {
+        case RecurrentStateType::f32: launch.template operator()<RecurrentStateType::f32>(); break;
+        case RecurrentStateType::f16: launch.template operator()<RecurrentStateType::f16>(); break;
+        case RecurrentStateType::bf16: launch.template operator()<RecurrentStateType::bf16>(); break;
+        }
+        if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+
+        const dim3 grid(Layout::value_heads / 8U, R);
+        if (step.a8.codes) decode_norm<DecodeArithmetic, true><<<grid, 256, 0, stream>>>(w, step, t, step.a8);
+        else decode_norm<DecodeArithmetic, false><<<grid, 256, 0, stream>>>(w, step, t, step.a8);
+        return cudaGetLastError();
+    });
 }
 
 }  // namespace strix::cuda::recur

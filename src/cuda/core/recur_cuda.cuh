@@ -1,6 +1,6 @@
 #pragma once
 
-#include "recur_decode_plan.hpp"
+#include "recur_decode_step.hpp"
 #include "recur_plan.hpp"
 #include "strix/numeric/math_gfx1151.hpp"
 
@@ -44,5 +44,11 @@ cudaError_t enqueue_replay(const Plan&, const Weights&, StateView matrix, StateV
 // to the caller. A8 is enabled by supplying both buffers.
 cudaError_t enqueue_decode(Gfx1151Decode, const DecodeWeights&, DecodeRow, DecodeState,
                            const numeric::gfx1151::Tables&, DecodeA8, cudaStream_t);
+
+// X3 verify or cohort step. Each valid row writes its own state images and
+// optional pre-convolution FP32 capture. The slot directory remains read-only.
+// The only allowed row-buffer alias is prepared == qkv with equal strides.
+cudaError_t enqueue_decode_step(unsigned width, const DecodeWeights&, const DecodeStep&,
+                                const numeric::gfx1151::Tables&, cudaStream_t);
 
 }  // namespace strix::cuda::recur

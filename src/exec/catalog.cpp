@@ -175,6 +175,8 @@ constexpr LauncherRef cuda_decode_dense_fp32{"strix::cuda_core::dense_rows_multi
     "src/cuda/core/dense/dense.cu", "fp32", 1U};
 constexpr LauncherRef cuda_decode_dense_mma3{"strix::cuda_core::dense_rows_multi",
     "src/cuda/core/dense/dense.cu", "mma3", 1U};
+constexpr LauncherRef cuda_decode_independent{"strix::cuda_core::dense_bf16_mma3_r1",
+    "src/cuda/core/dense/dense_mma.cu", "mma3_independent", 1U};
 constexpr LauncherRef cuda_decode_dense_round{"strix::cuda_core::dense_bf16_mma3_rows_round",
     "src/cuda/core/dense/dense_mma.cu", "mma3_round", 1U};
 constexpr LauncherRef cuda_decode_pair_norm{"strix::core::residual_mix::launch_normalize_pair",
@@ -465,6 +467,8 @@ constexpr KernelEntry cuda_entries[] = {
         graph::Op::linear, "r1.bf16_image.group", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-fp32-group-v1", true),
     instance<OperandClass::bf16_mma, RowsClass::r1, cuda_decode_dense_mma3, unpriced_single_launch, workspace>(
         graph::Op::linear, "r1.bf16_image.group", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-group-v1", true),
+    instance<OperandClass::bf16_mma, RowsClass::r1, cuda_decode_independent, unpriced_single_launch, workspace>(
+        graph::Op::linear, "r1.bf16_image.independent", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-independent-v1", true),
     instance<OperandClass::bf16_mma, RowsClass::r1, cuda_decode_dense_round, unpriced_single_launch, workspace>(
         graph::Op::linear, "r1.bf16_image.group_round", {"plain.bf16", 1U}, device::ArchMask::sm120, "cuda-sm120-bf16-r1-mma3-group-round-v1", true),
     instance<OperandClass::f32_fma, RowsClass::r1, cuda_decode_pair_norm, unpriced_single_launch, workspace>(

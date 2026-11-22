@@ -79,6 +79,7 @@ NATIVE_HEADERS = {
     "src/core/pointwise.hpp",
     "src/core/q8_f16_staging.hpp",
     "src/core/residual_mix.hpp",
+    "src/core/resident_greedy.hpp",  # Native HIP/CUDA buffers, pinned replies and selector binding.
     "src/core/short_convolution.hpp",
     "src/core/tp_join.hpp",
     "src/core/trellis_codec.hpp",

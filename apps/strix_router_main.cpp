@@ -35,7 +35,7 @@ void usage() {
         "  --max-connections N       concurrent client connections (default 256)\n"
         "  --status-target PATH      replica status route (default /api/status)\n"
         "  --description PATH        model TOML: admit the replicas only if its [multi_device] resolves the\n"
-        "                            replica form for this many endpoints (same resolver as strix run/serve --devices N)\n"
+        "                            replica form for this many endpoints (same resolver as strix run/serve --device-count N)\n"
         "  --profile exact|fast|turbo  tier of that admission (default: the model's presets.default)\n"
         "Placement: named session, then longest shared prompt prefix (unless that replica is more than one\n"
         "slot busier), then least busy. Router routes: GET /router/status, GET /health.\n";

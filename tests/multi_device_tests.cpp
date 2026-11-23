@@ -218,7 +218,6 @@ void legacy_environment() {
     for (const auto& o : found) {
         cut |= o.env == "STRIX_QWEN_PF_PIPE_CUT" && o.value == "20" && o.key == "multi_device.forms.layers.cut";
         draft |= o.env == "STRIX_HY4_TP_DRAFT" && o.key == "multi_device.forms.tensor.draft_placement";
-        require(md::deprecation_line(o).find("deprecated: " + o.env) != std::string::npos, "deprecation line names the env");
     }
     require(cut && draft, "legacy switches map to their [multi_device] keys");
     // Reports never change the decision: engines still read their switches.
@@ -226,6 +225,30 @@ void legacy_environment() {
     require(d.form == md::Form::single && d.legacy.size() == 2, "legacy reports ride on the decision");
     const auto json = d.json(policy("name = 'x'\n"), query(Name::standard, 1)).dump();
     require(json.find("\"legacy_env\":[{") != std::string::npos, "effective JSON lists legacy switches");
+    // No resolver reads the planned keys yet: the report names the env and its reader, never a key or a deprecation.
+    require(json.find("\"read_by\":\"engine\"") != std::string::npos && json.find("deprecated") == std::string::npos &&
+            json.find("multi_device.forms") == std::string::npos, "legacy report names no unread key");
+}
+
+// A launch applies single and replica only; any other resolved form is refused with its reason, never printed.
+void launch_applies_single_and_replica() {
+    const auto description = strix::model_description::parse(
+        "name = 'x'\n[multi_device]\nversion = 1\ndefault = 'replica'\n[multi_device.forms.replica]\nranks = 2\n"
+        "[multi_device.forms.tensor]\nranks = 2\n");
+    md::Query q;
+    q.devices = 2;
+    const auto replica = strix::profile::resolve_model_preset(description, Name::fast, "hip", q);
+    require(replica.placement.form == md::Form::replica, "replica launches");
+    require(strix::profile::resolve_replica_router(description, {}, 2).placement.form == md::Form::replica,
+            "the replica router admits the model");
+    q.placement = md::Form::tensor;
+    require(md::select(md::parse_policy(description), [&] { auto f = q; f.tier = Name::fast; return f; }()).form ==
+                md::Form::tensor, "the resolver itself still decides tensor");
+    refuses([&] { (void)strix::profile::resolve_model_preset(description, Name::fast, "hip", q); },
+            "'tensor' (explicit: --placement) is not applied by any engine yet");
+    q.placement = md::Form::single;
+    require(strix::profile::resolve_model_preset(description, Name::fast, "hip", q).placement.form == md::Form::single,
+            "explicit single launches");
 }
 
 void registered_models(const std::filesystem::path& root) {
@@ -270,6 +293,7 @@ int main(int argc, char** argv) {
     wire_tiers();
     validation();
     legacy_environment();
+    launch_applies_single_and_replica();
     registered_models(argv[1]);
     if (failures) {
         std::cerr << failures << " failure(s)\n";

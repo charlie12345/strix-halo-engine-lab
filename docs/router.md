@@ -18,7 +18,7 @@ strix-router --listen 0.0.0.0:8090 \
 Clients use `http://ROUTER:8090` with the same routes, bodies and credentials as before (headers pass through).
 
 With `--description models/<name>.toml` the router first resolves the model's `[multi_device]` section with the
-same resolver as `strix run|serve --devices N`: it starts only if the model admits the `replica` form for that many
+same resolver as `strix run|serve --device-count N`: it starts only if the model admits the `replica` form for that many
 endpoints, and prints `effective-multi-device {...}` (form, ranks, wire, rule, reason). A model without the section,
 or with one endpoint, is refused with the reason. `--profile exact|fast|turbo` sets the tier of that check.
 

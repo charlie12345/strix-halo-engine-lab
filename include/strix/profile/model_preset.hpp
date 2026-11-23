@@ -23,7 +23,7 @@ struct ModelPreset {
 
 [[nodiscard]] std::string_view tier_word(Name);
 [[nodiscard]] Name parse_tier(std::string_view);
-// `placement` carries --devices / --placement (its tier is replaced by the resolved tier). Every launcher (CLI, server,
+// `placement` carries --device-count / --placement (its tier is replaced by the resolved tier). Every launcher (CLI, server,
 // replica router) passes the same query so the effective "multi_device" member is identical for the same request.
 [[nodiscard]] ModelPreset resolve_model_preset(const model_description::ModelDescription&,
                                                std::optional<Name>, std::string_view backend,
@@ -31,7 +31,7 @@ struct ModelPreset {
 [[nodiscard]] serve::Json description_json(const model_description::Value&);
 // The replica router's admission through the same resolver: `replicas` whole-model endpoints must resolve the
 // model's replica form (else std::invalid_argument with the rule and reason). The result's
-// config["multi_device"] is what CLI / serve print for --devices N with the same tier.
+// config["multi_device"] is what CLI / serve print for --device-count N with the same tier.
 [[nodiscard]] ModelPreset resolve_replica_router(const model_description::ModelDescription&, std::optional<Name>,
                                                  std::uint32_t replicas);
 

@@ -1,7 +1,6 @@
 #include "strix/profile/model_preset.hpp"
 
 #include <algorithm>
-#include <iostream>
 #include <type_traits>
 
 namespace strix::profile {
@@ -109,8 +108,8 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
     query.tier = requested;
     const auto policy = multi_device::parse_policy(description);
     auto decision = multi_device::select(policy, query);
+    multi_device::require_launchable(decision);
     decision.legacy = multi_device::legacy_overrides();
-    for (const auto& legacy : decision.legacy) std::cerr << multi_device::deprecation_line(legacy) << std::endl;
     config.set("multi_device", decision.json(policy, query));
     return {requested, column, std::move(kv), std::move(config), std::move(decision)};
 }

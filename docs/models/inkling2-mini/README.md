@@ -95,7 +95,7 @@ strix-router --description models/inkling2-mini.toml \
 
 The router prints `effective-multi-device {...}` and refuses to start if
 the model data does not admit replicas for that many endpoints.
-`strix run|serve inkling2-mini --devices 2 --print-effective-config` prints
+`strix run|serve inkling2-mini --device-count 2 --print-effective-config` prints
 the same placement. To roll back, start the router without
 `--description`, or serve from one node.
 

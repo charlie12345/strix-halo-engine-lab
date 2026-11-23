@@ -46,7 +46,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             {"model", "--model", Kind::value}, {"registry_root", "--registry-root", Kind::path}, {"registry", "--registry", Kind::path},
             {"description", "--description", Kind::value}, {"bind", "--bind", Kind::value}, {"port", "--port", Kind::value},
             {"profile", "--profile", Kind::value}, {"backend", "--backend", Kind::value}, {"asset", "--asset", Kind::path},
-            {"devices", "--devices", Kind::value}, {"placement", "--placement", Kind::value}};
+            {"device_count", "--device-count", Kind::value}, {"placement", "--placement", Kind::value}};
         auto file = config_file::expand(argc, argv, shell_options);
         if (file.print) { out << file.effective; return 0; }
         std::vector<char*> expanded;
@@ -68,7 +68,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             if (arg == "--help" || arg == "-h") {
                 out << "strix-serve --model FAMILY|ID|NAME [--profile exact|fast|turbo] [--asset PATH]\n"
                     "  --backend hip|cuda --print-effective-config [-- ENGINE_ARGS]\n"
-                    "  --devices N --placement single|replica|layers|tensor|speculation\n"
+                    "  --device-count N --placement single|replica|layers|tensor|speculation\n"
                     "  --registry-root DIR --registry PATH --description PATH\n"
                     "  --list-models --inspect --family-inspect --bind ADDRESS --port N\n"
                     "Use -- before family arguments that overlap shell options.\n"
@@ -88,12 +88,12 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
                 if (request.backend != "hip" && request.backend != "cuda")
                     throw std::invalid_argument("--backend requires hip or cuda");
             }
-            else if (arg == "--devices") {
+            else if (arg == "--device-count") {
                 const auto number = value(i);
                 unsigned devices = 0;
                 const auto parsed = std::from_chars(number.data(), number.data() + number.size(), devices);
                 if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() || devices < 1 || devices > 64)
-                    throw std::invalid_argument("--devices requires an integer in 1..64");
+                    throw std::invalid_argument("--device-count requires an integer in 1..64");
                 request.placement.devices = devices;
             } else if (arg == "--placement") {
                 const auto form = value(i);

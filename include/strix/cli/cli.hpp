@@ -26,7 +26,7 @@ struct Request {
     bool print_effective_config = false;
     std::string backend;
     std::string asset;
-    // run/serve: whole-model devices available (--devices N) and an explicit multi-device form (--placement).
+    // run/serve: whole-model devices available (--device-count N; --devices stays the device-file option of strix plan and of engines) and an explicit multi-device form (--placement).
     std::uint32_t device_count = 0;
     std::string placement;
 };

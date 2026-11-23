@@ -101,15 +101,20 @@ struct Decision {
 // > single. An explicit placement that cannot run throws std::invalid_argument with the reason.
 [[nodiscard]] Decision select(const Policy&, const Query&);
 
-// Legacy switches the resolver replaces. They still act inside the engines that read them (no kit breaks); the
-// resolver reports each one that is set, with the [multi_device] key it maps to, and logs one deprecation line.
+// Legacy switches with the [multi_device] key planned to replace each. They still act inside the engines that read
+// them (no kit breaks) and no resolver reads the planned keys yet, so the resolver only lists the set ones in the
+// effective JSON (env, value, read by the engine); it prints nothing and names no key until the key is read.
 struct LegacySwitch {
     const char* env;
     const char* key;
 };
 [[nodiscard]] const std::vector<LegacySwitch>& legacy_switches();
 [[nodiscard]] std::vector<LegacyOverride> legacy_overrides(const Lookup& env = {});
-[[nodiscard]] std::string deprecation_line(const LegacyOverride&);
+
+// Forms a launch applies today: `single` (one engine) and `replica` (whole-model engines behind strix-router).
+// Any other decision throws std::invalid_argument with its rule and reason: it is refused, never printed as
+// effective, until an engine consumes it.
+void require_launchable(const Decision&);
 
 // One call for every launcher: parse + select + legacy report.
 [[nodiscard]] Decision resolve(const model_description::ModelDescription&, const Query&, const Lookup& env = {});

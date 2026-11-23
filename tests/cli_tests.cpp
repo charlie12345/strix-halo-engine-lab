@@ -258,11 +258,11 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     require(command.args == std::vector<std::string>{"--model", "model.gguf", "--n-gen", "32", "--profile",
         "fast", "--kv", "fp8", "--print-effective-config"}, "TURBO and native config arguments");
     {
-        // --devices / --placement are resolver inputs: the engine arguments do not change, and the effective config
+        // --device-count / --placement are resolver inputs: the engine arguments do not change, and the effective config
         // is the shared resolver's for the same query (strix-serve builds the same query from the same options).
         auto placed = parse({"run", "--model", "qwen3.8-27b", "--backend", "cuda", "--asset", "model.gguf",
-                             "--devices", "2", "--placement", "single", "--print-effective-config", "--", "--n-gen", "32"});
-        require(placed.device_count == 2 && placed.placement == "single", "run parses --devices and --placement");
+                             "--device-count", "2", "--placement", "single", "--print-effective-config", "--", "--n-gen", "32"});
+        require(placed.device_count == 2 && placed.placement == "single", "run parses --device-count and --placement");
         const auto placed_command = resolve(placed, entries, matrix, probes, "bin", exists, &dense);
         require(placed_command.args == std::vector<std::string>{"--model", "model.gguf", "--n-gen", "32", "--profile",
             "fast", "--kv", "native", "--print-effective-config"}, "placement options never reach the engine");
@@ -277,7 +277,7 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         placed.placement = "replica";
         refuses([&] { (void)resolve(placed, entries, matrix, probes, "bin", exists, &dense); }, "replica is not declared");
         refuses([] { (void)parse({"run", "qwen3.8-27b", "--placement", "mirror"}); }, "--placement requires");
-        refuses([] { (void)parse({"run", "qwen3.8-27b", "--devices", "0"}); }, "--devices");
+        refuses([] { (void)parse({"run", "qwen3.8-27b", "--device-count", "0"}); }, "--device-count");
     }
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};

@@ -30,8 +30,11 @@ contra qué, cambia según la familia; véase la lista de alcance más abajo.
 de colocación que el modelo admite en varios dispositivos (`replica`, `layers`, `tensor`, `speculation`, con sus datos
 de corte, filas, cable y drafter) y `regimes` ordenados que eligen forma por fase, filas del prompt, peticiones listas y
 tier. Un modelo sin la sección resuelve `single` con cualquier número de dispositivos. El cable `reference` conserva
-cada unión exacta; un cable más estrecho nunca se resuelve en EXACT. `strix run|serve --devices N --placement FORMA
---print-effective-config` imprime la decisión.
+cada unión exacta; un cable más estrecho nunca se resuelve en EXACT. `strix run|serve --device-count N --placement FORMA
+--print-effective-config` imprime la decisión; un lanzamiento solo aplica `single` y `replica` (réplicas tras
+`strix-router`) y rechaza cualquier otra forma resuelta con su motivo hasta que un motor la consuma. Los interruptores
+locales de los motores (`STRIX_*_PF_PIPE_CUT`, ...) siguen actuando dentro del motor; la config efectiva lista los que
+están puestos en `multi_device.legacy_env`.
 
 El lector (`src/model_description.cpp`) acepta un subconjunto de TOML: claves simples y con puntos, tablas, tablas en
 línea, arrays, cadenas de una línea, enteros y decimales, booleanos. Cualquier otra cosa es un error con línea y

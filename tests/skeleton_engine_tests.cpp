@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -124,7 +125,7 @@ void shell_config_tests() {
     fs::remove_all(dir);
 }
 
-// strix-serve --devices N --print-effective-config prints the shared resolver's config for the same query, and its
+// strix-serve --device-count N --print-effective-config prints the shared resolver's config for the same query, and its
 // multi_device member is what the replica router admits (one resolver for CLI, server and router).
 void multi_device_parity() {
     namespace fs = std::filesystem;
@@ -138,7 +139,7 @@ void multi_device_parity() {
     std::ofstream(dir / "models/m.toml") << text;
     const auto description = strix::model_description::parse(text);
     for (std::uint32_t devices : {1U, 2U}) {
-        std::vector<std::string> args{"serve", "--registry-root", dir.string(), "--model", "fixture", "--devices",
+        std::vector<std::string> args{"serve", "--registry-root", dir.string(), "--model", "fixture", "--device-count",
                                       std::to_string(devices), "--print-effective-config"};
         std::vector<char*> pointers;
         for (auto& a : args) pointers.push_back(a.data());
@@ -162,6 +163,27 @@ void multi_device_parity() {
             catch (const std::invalid_argument&) { refused = true; }
             CHECK(refused);
         }
+    }
+    // The shell's count is --device-count: `--devices FILE` (an engine's device file, e.g. Inkling's) still reaches
+    // the family arguments unchanged, as before the multi-device options existed.
+    {
+        std::vector<std::string> seen;
+        sv::ServiceFactories family;
+        sv::ServiceFactory fixture;
+        fixture.validate = [&](const sv::ServiceSelection& selection) { seen = selection.arguments; };
+        fixture.inspect = [](const sv::ServiceSelection&, std::ostream&) {};
+        fixture.create = [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> { return nullptr; };
+        fixture.early_exit = [](const sv::ServiceSelection&, std::ostream&) -> std::optional<int> { return 0; };
+        family.install("fixture", std::move(fixture));
+        std::vector<std::string> args{"serve", "--registry-root", dir.string(), "--model", "fixture", "--devices",
+                                      "devices.toml"};
+        std::vector<char*> pointers;
+        for (auto& a : args) pointers.push_back(a.data());
+        std::ostringstream out, error;
+        const int result = sv::run(static_cast<int>(pointers.size()), pointers.data(), family, out, error);
+        if (result) std::cerr << error.str();
+        CHECK(result == 0);
+        CHECK((seen == std::vector<std::string>{"--devices", "devices.toml"}));
     }
     fs::remove_all(dir);
 }

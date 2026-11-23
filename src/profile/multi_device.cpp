@@ -301,7 +301,7 @@ Policy parse_policy(const model_description::ModelDescription& description) {
 }
 
 Decision select(const Policy& policy, const Query& q) {
-    if (q.devices == 0) refuse("--devices must be at least 1");
+    if (q.devices == 0) refuse("--device-count must be at least 1");
     if (q.placement) {
         const auto wire = form_wire(policy, *q.placement);
         if (auto why = blocked(policy, *q.placement, q, wire); !why.empty()) refuse("--placement " + why);
@@ -361,9 +361,10 @@ std::vector<LegacyOverride> legacy_overrides(const Lookup& env) {
     return out;
 }
 
-std::string deprecation_line(const LegacyOverride& o) {
-    return "strix: deprecated: " + o.env + "=" + o.value + " still overrides " + o.key +
-           " inside the engine; declare it in the model TOML [multi_device] or pass --placement";
+void require_launchable(const Decision& d) {
+    if (d.form == Form::single || d.form == Form::replica) return;
+    throw std::invalid_argument("multi_device form '" + std::string(form_name(d.form)) + "' (" + d.rule + ": " + d.reason +
+                                ") is not applied by any engine yet; run / serve launch only single or replica");
 }
 
 Decision resolve(const model_description::ModelDescription& description, const Query& q, const Lookup& env) {
@@ -385,7 +386,7 @@ serve::Json Decision::json(const Policy& policy, const Query& q) const {
     }
     Json legacy_json = Json::array();
     for (const auto& o : legacy)
-        legacy_json.push(Json::Object{{"env", o.env}, {"value", o.value}, {"key", o.key}, {"deprecated", true}});
+        legacy_json.push(Json::Object{{"env", o.env}, {"value", o.value}, {"read_by", "engine"}});
     out.set("legacy_env", std::move(legacy_json));
     return out;
 }

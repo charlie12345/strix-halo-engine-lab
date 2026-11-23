@@ -16,7 +16,7 @@ constexpr std::string_view usage =
     "       strix models list [--json] | inspect MODEL [--json]\n"
     "       strix plan MODEL --context N [--devices FILE] --json\n"
     "       strix run|serve [--model] MODEL [--profile exact|fast|turbo] [--backend hip|cuda]\n"
-    "             [--asset PATH] [--devices N] [--placement single|replica|layers|tensor|speculation]\n"
+    "             [--asset PATH] [--device-count N] [--placement single|replica|layers|tensor|speculation]\n"
     "             [--print-effective-config] [--dry-run] [-- ENGINE_ARGS]\n"
     "             (serve also takes --host H and --port P)\n"
     "       strix update | rollback\n";
@@ -60,7 +60,7 @@ constexpr Route routes[] = {
 
 bool value_token(std::string_view value) { return !value.empty() && value.front() != '-'; }
 
-// --devices / --placement as the shared multi-device query (CLI and server build the same one).
+// --device-count / --placement as the shared multi-device query (CLI and server build the same one).
 profile::multi_device::Query placement_query(const Request& req) {
     profile::multi_device::Query query;
     if (req.device_count) query.devices = req.device_count;
@@ -202,8 +202,8 @@ Request parse(const std::vector<std::string>& args) {
         else if (r.verb == Verb::serve && arg == "--port" && r.port.empty()) {
             r.port = value();
             (void)number(r.port, "--port", 1, 65535);
-        } else if (launch && arg == "--devices" && !r.device_count)
-            r.device_count = number(value(), "--devices", 1, 64);
+        } else if (launch && arg == "--device-count" && !r.device_count)
+            r.device_count = number(value(), "--device-count", 1, 64);
         else if (launch && arg == "--placement" && r.placement.empty()) {
             r.placement = value();
             if (!profile::multi_device::parse_form(r.placement))

@@ -74,8 +74,10 @@ void linear_ref(const Tensor& w, const Tensor& bias, const float* x, std::size_t
     });
 }
 
-void norm_ref(const EncoderConfig& c, const Tensor& w, const Tensor& b, const float* x, std::size_t rows, float* y) {
-    const std::size_t n = c.width;
+// Rows of n values (default: the tower width); y may be x.
+void norm_ref(const EncoderConfig& c, const Tensor& w, const Tensor& b, const float* x, std::size_t rows, float* y,
+              std::size_t n = 0) {
+    if (n == 0) n = c.width;
     std::vector<float> wv(n), bv(n, 0.0F);
     for (std::size_t i = 0; i < n; ++i) wv[i] = w.at(i);
     if (b)
@@ -191,6 +193,12 @@ void validate(const EncoderConfig& c, const EncoderWeights& w) {
         check(b.norm1_b, width, 1, "norm1_b", ln);
         check(b.qkv_w, 3U * width, width, "qkv_w");
         check(b.qkv_b, 3U * width, 1, "qkv_b", c.qkv_bias);
+        if (c.qk_norm) {
+            check(b.q_norm_w, c.head_dim(), 1, "q_norm_w");
+            check(b.q_norm_b, c.head_dim(), 1, "q_norm_b", ln);
+            check(b.k_norm_w, c.head_dim(), 1, "k_norm_w");
+            check(b.k_norm_b, c.head_dim(), 1, "k_norm_b", ln);
+        }
         check(b.out_w, width, width, "out_w");
         check(b.out_b, width, 1, "out_b", c.out_bias);
         check(b.norm2_w, width, 1, "norm2_w");
@@ -269,6 +277,7 @@ bool hip_supported(const EncoderConfig& c, std::string* why) {
     }
     if (!layout::head_pad(c.head_dim())) return no("head dimension must be 64, 72 or 80");
     if (c.heads > 64U) return no("more than 64 heads");
+    if (c.qk_norm) return no("per-head q/k norm runs on the host reference only");
     return true;
 }
 
@@ -349,6 +358,11 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
         const auto& b = w.blocks[l];
         norm_ref(c, b.norm1_w, b.norm1_b, x.data(), N, n.data());
         lin(b.qkv_w, b.qkv_b, n.data(), N, qkv.data());
+        if (c.qk_norm)  // every head's q and k, in place: a row of the norm is one head vector
+            for (std::size_t r = 0; r < N; ++r) {
+                norm_ref(c, b.q_norm_w, b.q_norm_b, &qkv[r * 3U * W], H, &qkv[r * 3U * W], D);
+                norm_ref(c, b.k_norm_w, b.k_norm_b, &qkv[r * 3U * W + W], H, &qkv[r * 3U * W + W], D);
+            }
         if (c.has_rope())
             for (std::size_t r = 0; r < N; ++r)
                 for (std::size_t h = 0; h < H; ++h) {

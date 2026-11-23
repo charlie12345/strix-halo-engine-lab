@@ -289,6 +289,87 @@ void test_embed_norm() {
     }
 }
 
+// qk_norm: one block without rotary positions against a direct FP64 computation (each head's q and k normed over
+// head_dim before the scores), for both norm kinds. The device plans refuse the option.
+void test_qk_norm() {
+    for (const auto norm : {EncoderConfig::Norm::layernorm, EncoderConfig::Norm::rmsnorm}) {
+        EncoderConfig c = base_config();
+        c.layers = 1;
+        c.norm = norm;
+        c.qk_norm = true;
+        Tower t = make_tower(c, 91);
+        const PatchGrid g = make_grid(t.cfg, 2, 3, 92);
+        const PositionInputs p = default_positions(t.cfg, t.w, g);
+        const EncoderOutput got = reference_encode(t.cfg, t.w, g, p);
+
+        const std::size_t N = g.rows, W = c.width, H = c.heads, D = c.head_dim(), M = c.mlp_width;
+        const auto& b = t.w.blocks[0];
+        std::vector<std::vector<double>> x(N), q(N), k(N), v(N);
+        for (std::size_t r = 0; r < N; ++r) {
+            const std::vector<double> patch(g.data.begin() + static_cast<std::ptrdiff_t>(r * g.patch_dim),
+                                            g.data.begin() + static_cast<std::ptrdiff_t>((r + 1U) * g.patch_dim));
+            x[r] = matvec(t.w.patch_w, t.w.patch_b, patch, 0, W);
+            for (std::size_t i = 0; i < W; ++i) x[r][i] += static_cast<double>(p.addend[r * W + i]);
+            const auto n = norm1(c, b.norm1_w, b.norm1_b, x[r]);
+            q[r] = matvec(b.qkv_w, b.qkv_b, n, 0, W);
+            k[r] = matvec(b.qkv_w, b.qkv_b, n, W, W);
+            v[r] = matvec(b.qkv_w, b.qkv_b, n, 2U * W, W);
+            for (std::size_t h = 0; h < H; ++h) {
+                const auto first = static_cast<std::ptrdiff_t>(h * D), last = static_cast<std::ptrdiff_t>((h + 1U) * D);
+                const auto qn = norm1(c, b.q_norm_w, b.q_norm_b, std::vector<double>(q[r].begin() + first, q[r].begin() + last));
+                const auto kn = norm1(c, b.k_norm_w, b.k_norm_b, std::vector<double>(k[r].begin() + first, k[r].begin() + last));
+                std::copy(qn.begin(), qn.end(), q[r].begin() + first);
+                std::copy(kn.begin(), kn.end(), k[r].begin() + first);
+            }
+        }
+        std::vector<float> want(N * W);
+        for (std::size_t r = 0; r < N; ++r) {
+            std::vector<double> att(W, 0.0);
+            for (std::size_t h = 0; h < H; ++h) {
+                std::vector<double> e(N);
+                double sum = 0.0;
+                for (std::size_t j = 0; j < N; ++j) {
+                    double dot = 0.0;
+                    for (std::size_t d = 0; d < D; ++d) dot += q[r][h * D + d] * k[j][h * D + d];
+                    e[j] = std::exp(dot / std::sqrt(static_cast<double>(D)));
+                    sum += e[j];
+                }
+                for (std::size_t j = 0; j < N; ++j)
+                    for (std::size_t d = 0; d < D; ++d) att[h * D + d] += e[j] / sum * v[j][h * D + d];
+            }
+            std::vector<double> y = x[r];
+            const auto o = matvec(b.out_w, b.out_b, att, 0, W);
+            for (std::size_t i = 0; i < W; ++i) y[i] += o[i];
+            const auto m = matvec(b.mlp1_w, b.mlp1_b, norm1(c, b.norm2_w, b.norm2_b, y), 0, M);
+            std::vector<double> a(M);
+            for (std::size_t j = 0; j < M; ++j) a[j] = 0.5 * m[j] * (1.0 + std::erf(m[j] / std::sqrt(2.0)));
+            const auto o2 = matvec(b.mlp2_w, b.mlp2_b, a, 0, W);
+            for (std::size_t i = 0; i < W; ++i) want[r * W + i] = static_cast<float>(y[i] + o2[i]);
+        }
+        CHECK(max_diff(got.hidden, want) < 2e-5);
+
+        // The norm takes part: the same tower without it gives other rows.
+        EncoderConfig plain = c;
+        plain.qk_norm = false;
+        CHECK(max_diff(got.hidden, reference_encode(plain, t.w, g, p).hidden) > 1e-3);
+
+        EncoderWeights missing = t.w;
+        missing.blocks[0].k_norm_w = Tensor{};
+        CHECK(throws([&] { validate(t.cfg, missing); }));
+        EncoderWeights narrow = t.w;
+        narrow.blocks[0].q_norm_w.rows = D - 1U;
+        CHECK(throws([&] { validate(t.cfg, narrow); }));
+    }
+    EncoderConfig c = rms_config();
+    c.width = 128;
+    c.heads = 2;  // head dimension 64: a shape the device plan takes
+    std::string why;
+    CHECK(hip_supported(c, &why));
+    c.qk_norm = true;
+    CHECK(!hip_supported(c, &why) && why.find("q/k norm") != std::string::npos);
+    CHECK(throws([&] { (void)plan(c, 16, 1); }));
+}
+
 void test_single_row() {
     std::vector<EncoderConfig> configs{base_config(), rms_config()};
     EncoderConfig c = base_config();
@@ -1064,6 +1145,7 @@ int main(int argc, char** argv) {
         test_positions();
         test_single_row();
         test_embed_norm();
+        test_qk_norm();
         test_mean_attention();
         test_permutation();
         test_rope_translation();

@@ -253,7 +253,7 @@ for the model identity, fallback policy, measurement scope and remaining gates.
 ## Inkling 2 Mini Q8_0 attention and head on gfx1151
 
 **observed** (2026-11-23). Policy `weights.attention_head.q8_0@1` (attention projections and output head stored as
-Q8_0, converted from BF16 at load), HIP 7.16 on gfx1151, checkpoint SHA-256 `65e60f51…39d1`, gate v2 against the
+Q8_0, converted from BF16 at load), HIP (device compiler clang 24.0.0git, commit d6f6cb691863) on gfx1151, checkpoint SHA-256 `65e60f51…39d1`, gate v2 against the
 EXACT reference with a null arm, 39 held-out windows of three content classes (prose, code, structured) at 8K, 32K
 and 64K context.
 

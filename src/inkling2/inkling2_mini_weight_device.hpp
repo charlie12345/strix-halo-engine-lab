@@ -8,7 +8,6 @@
 
 #if defined(__HIPCC__)
 #include "strix/device/hip_enumerator.hpp"
-#include <hip/hip_version.h>
 #else
 #include "strix/device/cuda_enumerator.hpp"
 #endif
@@ -49,7 +48,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 #if defined(__HIPCC__)
     if (hipGetDevice(&ordinal) != hipSuccess) return out;
     const auto visible = device::HipEnumerator{}.enumerate();
-    out.compiler_id = "hip-" + std::to_string(HIP_VERSION_MAJOR) + "." + std::to_string(HIP_VERSION_MINOR);
+    out.compiler_id = weight::hip_clang_compiler_id(__clang_version__);  // one id for CLI and server
     const auto identity = weight::implementation_identity(core::kResidentQ8ArithmeticHip);
 #else
     if (cudaGetDevice(&ordinal) != cudaSuccess) return out;

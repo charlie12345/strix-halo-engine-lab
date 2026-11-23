@@ -207,6 +207,8 @@ void test_committed_rows() {
         require(!(row.gate_v2_pass == weight::Digest256{}) && !row.evidence.receipt.empty() &&
                     row.evidence.receipt.starts_with("docs/") && row.evidence.date.size() == 10U && row.evidence.rows > 0U,
                 "decision row without its gate receipt id, date and rows");
+        require(row.scope.backend != weight::Backend::hip || row.scope.compiler_id.starts_with("hip-clang-"),
+                "HIP row toolkit must be the device-compiler id (weight::hip_clang_compiler_id)");
         const auto context = row.evidence.max_context ? row.evidence.max_context : 8192U;
         bool every_regime = true, gain = false;
         for (const auto regime : mini::kMiniWeightLoadRegimes) {

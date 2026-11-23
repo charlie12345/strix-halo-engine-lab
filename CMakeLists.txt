@@ -861,6 +861,19 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME strix-eager-selected-tests COMMAND strix-eager-selected-tests)
     set_tests_properties(strix-eager-selected-tests PROPERTIES LABELS "cpu;attn;oracle")
+    # Shared Radix3 select schedule (HIP body src/attn_core/select_radix3.hpp): three-pass radix, ordered compaction, zero fill
+    # and the candidate-group form == the serial first-k-blocks rule; frozen zero-folding order key.
+    add_executable(strix-select-radix3-tests tests/select_radix3_tests.cpp)
+    target_include_directories(strix-select-radix3-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(strix-select-radix3-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-select-radix3-tests)
+    if(MSVC)
+        target_compile_options(strix-select-radix3-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-select-radix3-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
+    add_test(NAME strix-select-radix3-tests COMMAND strix-select-radix3-tests)
+    set_tests_properties(strix-select-radix3-tests PROPERTIES LABELS "cpu;attn;oracle")
     # Shared MLA attention contract (DSA / SWA layers, GLM-5 NoPE): fp64 host oracle, absorbed == reference form.
     add_executable(strix-mla-contract-tests tests/mla_contract_tests.cpp src/attn/mla_ref.cpp)
     target_include_directories(strix-mla-contract-tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -3727,6 +3740,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-resident-q8-tile-tests PRIVATE strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
         strix_target_warnings(strix-hip-resident-q8-tile-tests)
         add_test(NAME strix-hip-resident-q8-tile-tests COMMAND strix-hip-resident-q8-tile-tests)
+        # Shared Radix3 select device entry point (src/attn_core/select_radix3.hpp) vs the host rule, eager + graph forms,
+        # blocks <= k and k == 0 boundaries with guarded outputs. Needs a gfx1151 device (exit 77 = no device).
+        add_executable(strix-hip-select-radix3-tests tests/hip_select_radix3_tests.hip)
+        set_target_properties(strix-hip-select-radix3-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-select-radix3-tests PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-select-radix3-tests PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-select-radix3-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-select-radix3-tests)
+        add_test(NAME strix-hip-select-radix3-tests COMMAND strix-hip-select-radix3-tests)
+        set_tests_properties(strix-hip-select-radix3-tests PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;attn;exactness")
         # Shared EXACT chunk-partial combine device entry point (src/attn_core/chunk_exact_combine.hpp) vs the host rule, output
         # bits, plus the empty-row canary. Needs a gfx1151 device (exit 77 = no device).
         add_executable(strix-hip-chunk-exact-combine-tests tests/hip_chunk_exact_combine_tests.hip)

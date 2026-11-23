@@ -50,13 +50,14 @@ of an image to an embed rows file, and both ranks read that file, so they splice
 and plain decode (`--mtp 0`; with MTP speculation resolved on, `--embed-rows` is refused).
 
 Status: the adapter and the tool are tested on the host against synthetic projector files
-([gate status](vision-adapters.md#gate-status-1)). The device half (`Engine::set_embed_rows`, `--embed-rows`) was
+([gate status](vision-adapters.md#gate-status)). The device half (`Engine::set_embed_rows`, `--embed-rows`) was
 written without a HIP toolchain and is not compiled or run; the real projector file is not run; no answer of the
 language model on an image has been checked.
 
 Cost of the CPU tower: the host reference accumulates in FP64 and is slow by design. On a synthetic tower of width
-1024 with 4 blocks (MLP 4096) and a projector of width 4096, on a 4-thread x86 host: 20.9 s for 1,024 patches (a 448 x 448 image, 256 rows) and 116.7 s for 4,096 patches (896 x 896, 1,024 rows), host reference FP32, one run each. Time grows
-linearly with the block count and, in attention, with the square of the patch count.
+1024 with 4 blocks (MLP 4096) and a projector of width 4096, on a 4-thread x86 host: 20.9 s for 1,024 patches (a
+448 x 448 image, 256 rows) and 116.7 s for 4,096 patches (896 x 896, 1,024 rows), host reference FP32, one run
+each. Time grows linearly with the block count and, in attention, with the square of the patch count.
 
 ## Data path
 

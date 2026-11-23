@@ -45,7 +45,8 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
         static constexpr config_file::Option shell_options[] = {
             {"model", "--model", Kind::value}, {"registry_root", "--registry-root", Kind::path}, {"registry", "--registry", Kind::path},
             {"description", "--description", Kind::value}, {"bind", "--bind", Kind::value}, {"port", "--port", Kind::value},
-            {"profile", "--profile", Kind::value}, {"backend", "--backend", Kind::value}, {"asset", "--asset", Kind::path}};
+            {"profile", "--profile", Kind::value}, {"backend", "--backend", Kind::value}, {"asset", "--asset", Kind::path},
+            {"devices", "--devices", Kind::value}, {"placement", "--placement", Kind::value}};
         auto file = config_file::expand(argc, argv, shell_options);
         if (file.print) { out << file.effective; return 0; }
         std::vector<char*> expanded;
@@ -67,6 +68,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             if (arg == "--help" || arg == "-h") {
                 out << "strix-serve --model FAMILY|ID|NAME [--profile exact|fast|turbo] [--asset PATH]\n"
                     "  --backend hip|cuda --print-effective-config [-- ENGINE_ARGS]\n"
+                    "  --devices N --placement single|replica|layers|tensor|speculation\n"
                     "  --registry-root DIR --registry PATH --description PATH\n"
                     "  --list-models --inspect --family-inspect --bind ADDRESS --port N\n"
                     "Use -- before family arguments that overlap shell options.\n"
@@ -85,6 +87,19 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
                 request.backend = value(i);
                 if (request.backend != "hip" && request.backend != "cuda")
                     throw std::invalid_argument("--backend requires hip or cuda");
+            }
+            else if (arg == "--devices") {
+                const auto number = value(i);
+                unsigned devices = 0;
+                const auto parsed = std::from_chars(number.data(), number.data() + number.size(), devices);
+                if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() || devices < 1 || devices > 64)
+                    throw std::invalid_argument("--devices requires an integer in 1..64");
+                request.placement.devices = devices;
+            } else if (arg == "--placement") {
+                const auto form = value(i);
+                request.placement.placement = profile::multi_device::parse_form(form);
+                if (!request.placement.placement)
+                    throw std::invalid_argument("--placement requires single, replica, layers, tensor or speculation");
             }
             else if (arg == "--print-effective-config") request.print = true;
             else if (arg == "--list-models") list = true;
@@ -149,10 +164,11 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             selection.arguments = std::move(local.args);
             if (request.backend.empty()) request.backend = std::move(local.backend);
         }
-        const bool preset_requested = request.tier || request.print || !request.asset.empty() || !request.backend.empty();
+        const bool preset_requested = request.tier || request.print || !request.asset.empty() || !request.backend.empty() ||
+            request.placement.placement || request.placement.devices != 1;
         const std::string_view backend = request.backend.empty() ? "hip" : std::string_view(request.backend);
         if (request.print && request.asset.empty() && selection.arguments.empty()) {
-            out << profile::resolve_model_preset(selection.description, request.tier, backend).config.dump() << '\n';
+            out << profile::resolve_model_preset(selection.description, request.tier, backend, request.placement).config.dump() << '\n';
             return 0;
         }
         const bool external_cuda = backend == "cuda" && !(factory && factory->serves_cuda);
@@ -170,7 +186,7 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
                 if (!factory->asset_option.empty())
                     selection.arguments.emplace(selection.arguments.begin(), factory->asset_option);
             }
-            const auto preset = profile::resolve_model_preset(selection.description, request.tier, backend);
+            const auto preset = profile::resolve_model_preset(selection.description, request.tier, backend, request.placement);
             preset.append_options(selection.arguments);
             if (request.print) {
                 out << preset.config.dump() << '\n' << std::flush;

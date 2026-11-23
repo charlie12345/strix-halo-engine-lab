@@ -6,7 +6,8 @@ strix_servespec_serve_sources(
 
 if(TARGET strix_serve)
     add_executable(strix-router "${CMAKE_SOURCE_DIR}/apps/strix_router_main.cpp")
-    target_link_libraries(strix-router PRIVATE strix_serve)
+    include("${CMAKE_SOURCE_DIR}/cmake/StrixModelPreset.cmake")
+    target_link_libraries(strix-router PRIVATE strix_serve strix_model_preset)
     if(WIN32)
         target_link_libraries(strix-router PRIVATE ws2_32)
     endif()

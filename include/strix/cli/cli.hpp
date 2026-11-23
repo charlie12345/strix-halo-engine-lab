@@ -26,6 +26,9 @@ struct Request {
     bool print_effective_config = false;
     std::string backend;
     std::string asset;
+    // run/serve: whole-model devices available (--devices N) and an explicit multi-device form (--placement).
+    std::uint32_t device_count = 0;
+    std::string placement;
 };
 
 enum class Platform { linux_host, windows_host, macos_host, other };

@@ -16,7 +16,8 @@ constexpr std::string_view usage =
     "       strix models list [--json] | inspect MODEL [--json]\n"
     "       strix plan MODEL --context N [--devices FILE] --json\n"
     "       strix run|serve [--model] MODEL [--profile exact|fast|turbo] [--backend hip|cuda]\n"
-    "             [--asset PATH] [--print-effective-config] [--dry-run] [-- ENGINE_ARGS]\n"
+    "             [--asset PATH] [--devices N] [--placement single|replica|layers|tensor|speculation]\n"
+    "             [--print-effective-config] [--dry-run] [-- ENGINE_ARGS]\n"
     "             (serve also takes --host H and --port P)\n"
     "       strix update | rollback\n";
 
@@ -58,6 +59,14 @@ constexpr Route routes[] = {
 [[noreturn]] void invalid(std::string reason) { throw std::invalid_argument(std::move(reason)); }
 
 bool value_token(std::string_view value) { return !value.empty() && value.front() != '-'; }
+
+// --devices / --placement as the shared multi-device query (CLI and server build the same one).
+profile::multi_device::Query placement_query(const Request& req) {
+    profile::multi_device::Query query;
+    if (req.device_count) query.devices = req.device_count;
+    if (!req.placement.empty()) query.placement = profile::multi_device::parse_form(req.placement);
+    return query;
+}
 
 std::uint32_t number(std::string_view value, std::string_view name, std::uint32_t lo, std::uint32_t hi) {
     std::uint32_t result = 0;
@@ -193,6 +202,12 @@ Request parse(const std::vector<std::string>& args) {
         else if (r.verb == Verb::serve && arg == "--port" && r.port.empty()) {
             r.port = value();
             (void)number(r.port, "--port", 1, 65535);
+        } else if (launch && arg == "--devices" && !r.device_count)
+            r.device_count = number(value(), "--devices", 1, 64);
+        else if (launch && arg == "--placement" && r.placement.empty()) {
+            r.placement = value();
+            if (!profile::multi_device::parse_form(r.placement))
+                invalid("--placement requires single, replica, layers, tensor or speculation");
         } else if (r.verb == Verb::plan && arg == "--devices" && r.devices.empty())
             r.devices = value();
         else if (r.verb == Verb::plan && arg == "--context" && !r.context)
@@ -273,7 +288,7 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
         }
         cmd.args.insert(cmd.args.end(), rest.begin(), rest.end());
         if (description) {
-            cmd.preset = profile::resolve_model_preset(*description, req.profile, route.backend);
+            cmd.preset = profile::resolve_model_preset(*description, req.profile, route.backend, placement_query(req));
             cmd.preset->append_options(cmd.args);
         }
         if (req.print_effective_config) cmd.args.emplace_back("--print-effective-config");
@@ -298,7 +313,8 @@ int launch(const Request& request, const std::vector<model_registry::Entry>& ent
     }
     if (req.print_effective_config && !req.dry_run && description && req.asset.empty() &&
         req.args.empty() && alias(entry, req.model)) {
-        out << profile::resolve_model_preset(*description, req.profile, req.backend.empty() ? "hip" : req.backend).config.dump() << '\n';
+        out << profile::resolve_model_preset(*description, req.profile, req.backend.empty() ? "hip" : req.backend,
+                                             placement_query(req)).config.dump() << '\n';
         return 0;
     }
     const auto command = resolve(req, entries, support::load(data / "support/matrix.toml"), probes, bin, exists, description);

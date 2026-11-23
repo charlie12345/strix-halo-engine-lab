@@ -26,6 +26,13 @@ attention, MoE, formats) are read by the family adapter, which is the only code 
 descriptive: it selects no kernel, schedule or switch and prints no identity. What is checked, and against what, differs
 per family; see the scope list below.
 
+Optional `[multi_device]` (read by the shared profile resolver, `include/strix/profile/multi_device.hpp`): the
+placement forms the model admits on several devices (`replica`, `layers`, `tensor`, `speculation`, with their cut,
+rows, wire and drafter data) and ordered `regimes` that pick a form by phase, prompt rows, ready requests and tier.
+A model without it resolves `single` on any number of devices. The wire `reference` keeps every exact join; a
+narrower wire never resolves under EXACT. `strix run|serve --devices N --placement FORM --print-effective-config`
+prints the decision.
+
 The reader (`src/model_description.cpp`) accepts a TOML subset: bare and dotted keys, tables, inline tables, arrays,
 single-line strings, decimal integers and floats, booleans. Anything else is an error with line and column.
 

@@ -1,6 +1,7 @@
 #include "strix/profile/model_preset.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <type_traits>
 
 namespace strix::profile {
@@ -53,7 +54,7 @@ Name parse_tier(std::string_view tier) {
 }
 
 ModelPreset resolve_model_preset(const model_description::ModelDescription& description, std::optional<Name> request,
-                                 std::string_view backend) {
+                                 std::string_view backend, const multi_device::Query& placement) {
     const auto* presets = description.find("presets");
     auto requested = request.value_or(Name::standard);
     if (presets) {
@@ -104,7 +105,26 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
     for (const auto* field : {"weights", "drafter", "fusion", "schedule"}) {
         if (const auto* value = description.find(field)) config.set(field, description_json(*value));
     }
-    return {requested, column, std::move(kv), std::move(config)};
+    auto query = placement;
+    query.tier = requested;
+    const auto policy = multi_device::parse_policy(description);
+    auto decision = multi_device::select(policy, query);
+    decision.legacy = multi_device::legacy_overrides();
+    for (const auto& legacy : decision.legacy) std::cerr << multi_device::deprecation_line(legacy) << std::endl;
+    config.set("multi_device", decision.json(policy, query));
+    return {requested, column, std::move(kv), std::move(config), std::move(decision)};
+}
+
+ModelPreset resolve_replica_router(const model_description::ModelDescription& description, std::optional<Name> tier,
+                                   std::uint32_t replicas) {
+    multi_device::Query query;
+    query.devices = replicas;
+    auto preset = resolve_model_preset(description, tier, {}, query);
+    if (preset.placement.form != multi_device::Form::replica)
+        throw std::invalid_argument("model does not resolve the replica form for " + std::to_string(replicas) +
+                                    " replicas (" + std::string(multi_device::form_name(preset.placement.form)) + ", " +
+                                    preset.placement.rule + ": " + preset.placement.reason + ")");
+    return preset;
 }
 
 ModelLaunch load_model_launch(const std::filesystem::path& directory, std::string_view model, std::string_view verb) {

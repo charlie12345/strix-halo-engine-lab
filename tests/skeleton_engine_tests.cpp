@@ -1,6 +1,7 @@
 // The example family of docs/adding-an-engine.md serves a completion and a chat
 // request through the shared serve shell with the CPU reference backend.
 #include "../examples/skeleton_engine/skeleton_engine.hpp"
+#include "strix/profile/model_preset.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -123,9 +124,52 @@ void shell_config_tests() {
     fs::remove_all(dir);
 }
 
+// strix-serve --devices N --print-effective-config prints the shared resolver's config for the same query, and its
+// multi_device member is what the replica router admits (one resolver for CLI, server and router).
+void multi_device_parity() {
+    namespace fs = std::filesystem;
+    namespace md = strix::profile::multi_device;
+    const auto dir = fs::current_path() / "serve-multi-device-fixture";
+    fs::create_directories(dir / "models");
+    std::ofstream(dir / "models/registry.toml") << "schema = \"strix-registry/v1\"\n[models.fixture]\n"
+        "name = \"fixture\"\nfamily = \"fixture\"\ndescription = \"models/m.toml\"\n";
+    const std::string text = "schema = \"strix-model/v1\"\nname = \"fixture\"\n[multi_device]\nversion = 1\n"
+        "default = \"replica\"\n[multi_device.forms.replica]\nranks = 2\n";
+    std::ofstream(dir / "models/m.toml") << text;
+    const auto description = strix::model_description::parse(text);
+    for (std::uint32_t devices : {1U, 2U}) {
+        std::vector<std::string> args{"serve", "--registry-root", dir.string(), "--model", "fixture", "--devices",
+                                      std::to_string(devices), "--print-effective-config"};
+        std::vector<char*> pointers;
+        for (auto& a : args) pointers.push_back(a.data());
+        std::ostringstream out, error;
+        const sv::ServiceFactories factories;
+        const int result = sv::run(static_cast<int>(pointers.size()), pointers.data(), factories, out, error);
+        if (result) std::cerr << error.str();
+        CHECK(result == 0);
+        md::Query query;
+        query.devices = devices;
+        const auto expected = strix::profile::resolve_model_preset(description, {}, "hip", query).config.dump();
+        CHECK(out.str() == expected + "\n");
+        const auto form = std::string("\"form\":\"") + (devices == 1 ? "single" : "replica") + "\"";
+        CHECK(out.str().find(form) != std::string::npos);
+        if (devices == 2) {
+            const auto router = strix::profile::resolve_replica_router(description, {}, 2);
+            CHECK(out.str().find(router.config.find("multi_device")->dump()) != std::string::npos);
+        } else {
+            bool refused = false;
+            try { (void)strix::profile::resolve_replica_router(description, {}, 1); }
+            catch (const std::invalid_argument&) { refused = true; }
+            CHECK(refused);
+        }
+    }
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     shell_config_tests();
+    multi_device_parity();
     embed_rows();
     sv::ServiceFactories factories;
     skeleton::install_session_service(factories);

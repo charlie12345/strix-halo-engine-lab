@@ -26,6 +26,13 @@ Campos comunes a todos los ficheros: `schema = "strix-model/v1"` y un `name` ún
 fichero es descriptivo: no elige kernel, calendario ni interruptor y no imprime ninguna identidad. Qué se comprueba, y
 contra qué, cambia según la familia; véase la lista de alcance más abajo.
 
+`[multi_device]` opcional (lo lee el resolver de perfiles común, `include/strix/profile/multi_device.hpp`): las formas
+de colocación que el modelo admite en varios dispositivos (`replica`, `layers`, `tensor`, `speculation`, con sus datos
+de corte, filas, cable y drafter) y `regimes` ordenados que eligen forma por fase, filas del prompt, peticiones listas y
+tier. Un modelo sin la sección resuelve `single` con cualquier número de dispositivos. El cable `reference` conserva
+cada unión exacta; un cable más estrecho nunca se resuelve en EXACT. `strix run|serve --devices N --placement FORMA
+--print-effective-config` imprime la decisión.
+
 El lector (`src/model_description.cpp`) acepta un subconjunto de TOML: claves simples y con puntos, tablas, tablas en
 línea, arrays, cadenas de una línea, enteros y decimales, booleanos. Cualquier otra cosa es un error con línea y
 columna.

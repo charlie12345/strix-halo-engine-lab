@@ -257,6 +257,28 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     require(command.executable.stem() == "strix-cuda-qwen35-decode", "launches the qualified backend route");
     require(command.args == std::vector<std::string>{"--model", "model.gguf", "--n-gen", "32", "--profile",
         "fast", "--kv", "fp8", "--print-effective-config"}, "TURBO and native config arguments");
+    {
+        // --devices / --placement are resolver inputs: the engine arguments do not change, and the effective config
+        // is the shared resolver's for the same query (strix-serve builds the same query from the same options).
+        auto placed = parse({"run", "--model", "qwen3.8-27b", "--backend", "cuda", "--asset", "model.gguf",
+                             "--devices", "2", "--placement", "single", "--print-effective-config", "--", "--n-gen", "32"});
+        require(placed.device_count == 2 && placed.placement == "single", "run parses --devices and --placement");
+        const auto placed_command = resolve(placed, entries, matrix, probes, "bin", exists, &dense);
+        require(placed_command.args == std::vector<std::string>{"--model", "model.gguf", "--n-gen", "32", "--profile",
+            "fast", "--kv", "native", "--print-effective-config"}, "placement options never reach the engine");
+        strix::profile::multi_device::Query query;
+        query.devices = 2;
+        query.placement = strix::profile::multi_device::Form::single;
+        require(placed_command.preset->config.dump() ==
+                profile::resolve_model_preset(dense, {}, "cuda", query).config.dump(),
+                "CLI effective config is the shared resolver's");
+        require(placed_command.preset->config.find("multi_device")->find("rule")->as_string() == "explicit",
+                "explicit placement is reported");
+        placed.placement = "replica";
+        refuses([&] { (void)resolve(placed, entries, matrix, probes, "bin", exists, &dense); }, "replica is not declared");
+        refuses([] { (void)parse({"run", "qwen3.8-27b", "--placement", "mirror"}); }, "--placement requires");
+        refuses([] { (void)parse({"run", "qwen3.8-27b", "--devices", "0"}); }, "--devices");
+    }
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};
     refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "requires the turbo preset");

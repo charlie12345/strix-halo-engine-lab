@@ -188,15 +188,17 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
-            // Without a device the plan is exact unless a full row (gate + gain) of this backend could match there.
+            // Without a device the plan is exact unless a full row (gate + gain) of this backend could select for this
+            // instance's extent there (the same extent make_mini_device_cohort resolves with).
             const auto of_backend = [backend](const weight::WeightLoadDecision& row) { return row.scope.backend == backend; };
+            const weight::WeightLoadExtent extent{opt.context, opt.slots};
             const bool device_dependent = opt.tier != profile::Name::standard && !opt.weight_options.disable_q8 &&
                 std::ranges::any_of(kMiniWeightLoadDecisions, [&](const weight::WeightLoadDecision& row) {
-                    return of_backend(row) && !(row.measured_gain == weight::Digest256{});
+                    return of_backend(row) && weight::weight_load_gain_selects(row, extent);
                 });
             if (!device_dependent) {
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
-                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope, opt.context);
+                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope, extent);
                 out << " weight_storage " << plan.storage.name << '@' << plan.storage.revision
                     << " weight_status " << profile::status_name(plan.status);
             } else {

@@ -307,7 +307,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
         const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope,
-                                                                       options.context);
+                                                                       {options.context, options.slots});
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};
@@ -345,9 +345,18 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
         // The route line names the committed rows per regime (why the image stays BF16 on this backend).
         const bool hip = std::string_view(backend) == "hip";
-        require(hip ? out.str().find(" weight_rows prefill=gate-only@gfx1151,decode=none") != std::string::npos
+        require(hip ? out.str().find(" weight_rows prefill=gate-only@gfx1151,decode=full@gfx1151/lanes<=1") !=
+                          std::string::npos
                     : out.str().find("weight_rows") == std::string::npos,
                 "inspection does not name the committed per-regime rows");
+        if (!hip || qualify_q8) return;
+        // A one-slot server is inside the decode row's lane band: its plan depends on the device (as the CLI's).
+        std::ostringstream one, one_error;
+        strings.insert(strings.end(), {"--slots", "1", "--family-inspect"});
+        const auto one_rc = run({}, one, one_error);
+        strings.resize(strings.size() - 3U);
+        require(one_rc == 0 && !created && one.str().find(" weight_status pending-device") != std::string::npos,
+                "a one-slot server inspection must defer the weight plan to the device");
     };
     inspect();
 

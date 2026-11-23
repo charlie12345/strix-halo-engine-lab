@@ -17,8 +17,10 @@ namespace strix::inkling2 {
 // The scope a load-time weight decision row is matched against: the current device's architecture, the toolkit
 // this binary was built with, the resident Q8_0 consumers' implementation identity and the raw checkpoint SHA-256
 // (shared persistent stat-keyed cache: only the first FAST run of a checkpoint reads it whole). The resolver sets
-// the regime of each lookup (kMiniWeightLoadRegimes). Hash only for explicit qualification or when a committed row
-// of this backend, device, toolkit and consumer identity exists.
+// the regime of each lookup (kMiniWeightLoadRegimes). Hash only for explicit qualification or when a committed FULL
+// row of this backend, device, toolkit and consumer identity could select for `extent` (its context band holds the
+// instance's context and its gain's lane band its lanes): a gate-only row, or a gain outside its band, never selects,
+// so it never costs a whole-checkpoint read (which also evicts the page cache of running servers on a node).
 // Owns the strings; view() builds the scope on use, so copies and moves never leave a view dangling.
 struct MiniWeightScope {
     weight::Backend backend{};
@@ -37,7 +39,7 @@ inline constexpr auto kMiniWeightBackend = weight::Backend::cuda;
 #endif
 
 inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name tier,
-                                         const MiniWeightOptions& options) {
+                                         const MiniWeightOptions& options, weight::WeightLoadExtent extent) {
     const bool compact_tier = tier == profile::Name::fast || tier == profile::Name::turbo;
     const bool needed = compact_tier && !options.disable_q8 && (options.qualify_q8 ||
         std::ranges::any_of(kMiniWeightLoadDecisions, [](const auto& row) { return row.scope.backend == kMiniWeightBackend; }));
@@ -59,9 +61,10 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     for (const auto& device : visible)
         if (device.ordinal == ordinal) out.device_class = device.arch;
     out.build = identity;
-    const auto row_matches = [&out](const weight::WeightLoadDecision& row) {
+    const auto row_matches = [&out, extent](const weight::WeightLoadDecision& row) {
         return row.scope.backend == out.backend && row.scope.device_class == out.device_class &&
-               row.scope.compiler_id == out.compiler_id && row.scope.build == out.build;
+               row.scope.compiler_id == out.compiler_id && row.scope.build == out.build &&
+               weight::weight_load_gain_selects(row, extent);
     };
     if (!options.qualify_q8 && std::ranges::none_of(kMiniWeightLoadDecisions, row_matches)) return out;
     out.checkpoint = weight::Digest256{sha256_file_content(model).bytes};

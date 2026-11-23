@@ -261,8 +261,18 @@ and 64K context.
   and window inside its limits. Prompt timing on the same device: 4K 2,544 -> 2,541 ms, 8K 4,684 -> 4,673 ms,
   32K 20,650 -> 20,732 ms (no gain: the prompt projections are bound by the WMMA rate, not by weight bytes). The
   decision row is therefore gate-only (`kMiniWeightLoadRows`, regime `prefill`, band <= 65,536).
-- Decode regime: HOLD by the reference-window rule (one window above the bar after a median shift); no row.
+- Decode regime: PASS with the reference-window bar frozen from the original 39 windows (median 0.975, bar 2.975),
+  three protocol substitutions recorded beside the set (two off-distribution reference windows replaced by reserve
+  windows, one 63-row run by its 255-row rerun): 2,649 pooled rows, KL 0.00042, top-1 0.9966, dNLL +0.00041 ±
+  0.00057, free-flip ratio 1.09; every class and band inside its limits. The arm ran the Q8_0 image in both phases.
+  Served decode on the same device (4K prompt, 256 tokens, two repeats each): one lane 27.22 -> 30.53 tok/s; eight
+  lanes 68.95 -> 63.81 tok/s (the cohort step read the Q8_0 head once per lane). The row's gain is banded to one
+  decode lane (`max_lanes` 1).
 - Selection rule: one resident image serves both regimes, so the Q8_0 image is taken only when every regime has a
-  gate v2 PASS row and one of them a measured gain; FAST keeps the BF16 image on this device today.
+  gate v2 PASS row and one of them a measured gain covering the instance (context <= 65,536, decode lanes inside the
+  gain's band). FAST on this device: the serial CLI (one lane, prompt + generated positions) and one-slot servers run
+  prefill and decode on the Q8_0 image; wider servers, servers whose slot count is left to the memory budget and
+  contexts above 65,536 keep the BF16 image. Q8_0 prefill followed by BF16 decode never runs (it would need a second
+  resident image).
 
 Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.

@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 
 namespace strix::inkling2::cli {
 
@@ -273,8 +274,22 @@ int main(int argc, char** argv) {
 #else
         auto options = cli::parse(argc, argv, family);
 #endif
-        const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
-        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), kMaxContext);
+        // One rule for the CLI and the server (resolve_mini_weight_load): the serial CLI holds one sequence, so one
+        // decode lane, of prompt + generated positions, known at load (SerialGenerationLoad::positions); it resolves
+        // its image there. The gate and the CUDA step route resolve before any prompt with the model limit, outside
+        // every context band (explicit --qualify-q8 arms only).
+        struct ResolvedWeights {
+            MiniWeightScope scope;
+            strix::weight::WeightLoadPlan plan;
+        };
+        const auto resolve_weights = [&options, model = std::string(argv[1])](strix::weight::WeightLoadExtent extent) {
+            auto scope = mini_weight_scope(model, options.tier.profile, options.weights, extent);
+            const auto plan = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), extent);
+            return ResolvedWeights{std::move(scope), plan};
+        };
+        const auto early = resolve_weights({kMaxContext, 1U});
+        std::optional<ResolvedWeights> loaded;
+        const auto& weights = early.plan;
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
@@ -290,21 +305,25 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
+        family.load = [&loaded, &resolve_weights, step_graphs, dspark = options.dspark,
                        moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4);
+            loaded = resolve_weights({load.positions, 1U});
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.storage, dspark, moe_w4a4);
         };
         const auto write_profile = [&] {
+            const auto& resolved = loaded ? *loaded : early;
+            const auto& plan = resolved.plan;
+            const auto& scope = resolved.scope;
             cli::write_profile(options.tier, std::cerr, true);
-            cli::write_weight_load_plan(std::cerr, weights);
-            std::cerr << strix::weight::weight_load_regime_receipt(weights) << '\n';
+            cli::write_weight_load_plan(std::cerr, plan);
+            std::cerr << strix::weight::weight_load_regime_receipt(plan) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("
                           << route.speculation_reason << ")\n";
 #endif
-            std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(weights.status) << " ("
-                      << weights.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
+            std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(plan.status) << " ("
+                      << plan.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
                       << " compiler " << (scope.compiler_id.empty() ? "-" : scope.compiler_id) << " checkpoint ";
             if (scope.checkpoint == strix::weight::Digest256{}) std::cerr << '-';
             for (std::size_t i = 0; i < 8 && !(scope.checkpoint == strix::weight::Digest256{}); ++i)

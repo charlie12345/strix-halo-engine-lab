@@ -22,8 +22,11 @@ inline MiniServeCohort make_mini_device_cohort(
     const MiniServeOptions& opt, const device::MemoryBudget& budget, std::string_view backend,
     unsigned row_limit = std::numeric_limits<unsigned>::max()) {
     const auto rows = std::min(opt.slots ? opt.slots : opt.prefill_rows, row_limit);
-    const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
-    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), opt.context);
+    // The instance's extent for the weight rows: its configured context and its slot cap (0 = left to the memory
+    // budget: lane-banded gains do not select).
+    const weight::WeightLoadExtent extent{opt.context, opt.slots};
+    const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options, extent);
+    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), extent);
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
     decoder->set_moe_w4a4(opt.moe_w4a4);

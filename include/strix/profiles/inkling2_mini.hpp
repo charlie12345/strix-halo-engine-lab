@@ -22,7 +22,12 @@ inline constexpr std::array<std::string_view, 2> kMiniWeightLoadRegimes{weight::
 // the repository). PREFILL, gfx1151, HIP device compiler clang 24.0.0git d6f6cb691863: PASS, 39 windows (prose,
 // code, structured at 8K, 32K and 64K), 2,457 pooled rows; no measured gain in this regime (prompt projections are
 // WMMA-bound: 8K 4,684 -> 4,673 ms, 32K 20,650 -> 20,732 ms), so the row is gate-only and admits prefill onto a
-// Q8_0 image a decode row selects. DECODE: no row (gate v2 HOLD on one reference window by rule R4).
+// Q8_0 image a decode row selects. DECODE, same scope: PASS, the same 39 windows with three protocol substitutions
+// recorded beside the set (two off-distribution reference windows replaced by reserve windows, one 63-row run by its
+// 255-row rerun), the R4 reference-window bar frozen from the original set, 2,649 pooled rows; the decode arm ran the
+// Q8_0 image in both phases, which is what FAST runs when this row selects it. Measured served decode gain (4K prompt,
+// 256 tokens): one lane 27.22 -> 30.53 tok/s; eight lanes lost (68.95 -> 63.81, the Q8_0 head was read once per lane),
+// so the gain is banded to one decode lane: CLI and one-slot servers take the Q8_0 image, wider servers keep BF16.
 inline constexpr weight::WeightLoadDecision kMiniWeightLoadRows[] = {
     {kMiniWeightLoadPolicy.id,
      {weight::Backend::hip, "gfx1151", "hip-clang-24.0.0git-d6f6cb691863", weight::kPrefillRegime,
@@ -31,17 +36,27 @@ inline constexpr weight::WeightLoadDecision kMiniWeightLoadRows[] = {
      weight::digest_from_hex("d64b562553020001310a9ad9831d4197fb17ae47ae8cc49fa3fec80fdc51518c"), {},
      {"docs/decisions/evidence-register.md#inkling-2-mini-q8_0-attention-and-head-on-gfx1151", "2026-11-23", 2457,
       65536}},
+    {kMiniWeightLoadPolicy.id,
+     {weight::Backend::hip, "gfx1151", "hip-clang-24.0.0git-d6f6cb691863", weight::kDecodeRegime,
+      weight::digest_from_hex("06b924b4f4116787df43a3668795417070ca22669e6314fd3bb8250eb29bd9c6"),
+      weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1")},
+     weight::digest_from_hex("7ec63bd6db841811f160e1e056c4e857de1b49f7aeb0e7f2883e319a34607309"),
+     weight::digest_from_hex("dbf6bcd5c1bccb956d7315a5dfb54cc661cee8410a2165cff3923a2537c49e51"),
+     {"docs/decisions/evidence-register.md#inkling-2-mini-q8_0-attention-and-head-on-gfx1151", "2026-11-23", 2649,
+      65536, 1}},
 };
 inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{kMiniWeightLoadRows};
 
-// `context`: the largest context the instance admits (served: its configured context; serial CLI: the model limit,
-// fixed before the prompt is read). A banded row applies only inside its band.
+// `extent`: what the instance holds, the same rule for the CLI and the server: context = the resident positions
+// (serial CLI: prompt + generated tokens of its one sequence; server: its configured context), lanes = concurrent
+// decode lanes (serial CLI: 1; server: its slot cap, 0 when the slot count is left to the memory budget). A banded
+// row applies only inside its bands.
 inline weight::WeightLoadPlan resolve_mini_weight_load(
     profile::Name tier, const weight::WeightLoadScope& scope,
     std::span<const weight::FormatId> consumer_formats, bool enabled, bool qualify,
-    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions, std::uint32_t context = 0) {
+    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions, weight::WeightLoadExtent extent = {}) {
     return weight::resolve_weight_load(weight::builtin_registry(), kMiniWeightLoadPolicy,
-        {tier, scope, consumer_formats, enabled, qualify, kMiniWeightLoadRegimes, context}, decisions);
+        {tier, scope, consumer_formats, enabled, qualify, kMiniWeightLoadRegimes, extent}, decisions);
 }
 
 // FAST lever: W4A4 experts. Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4

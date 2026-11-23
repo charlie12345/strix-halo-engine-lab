@@ -1,0 +1,142 @@
+// Host test of the NVFP4 encoder and the MXFP8 -> NVFP4 transcode (strix/weight/formats/microscaled_encode.hpp):
+// (1) NVFP4-representable rows round-trip bitwise in value; (2) the mse@2 block scale is never worse than the amax rule
+// alone; (3) Gaussian rows stay within the 4-bit error band; (4) a random MXFP8 matrix transcodes with a bounded relative
+// error and the reported error matches a recomputation; (5) malformed inputs throw.
+#include "strix/weight/formats/microscaled_encode.hpp"
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <random>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+
+namespace ms = strix::weight::microscaled;
+namespace sf = strix::weight::scalar_float;
+
+int failures = 0;
+void expect(bool ok, const char* what) {
+    if (!ok) {
+        std::printf("FAIL %s\n", what);
+        ++failures;
+    }
+}
+
+float decoded(const std::vector<std::uint8_t>& codes, const std::vector<std::uint8_t>& scales, float outer, std::size_t c) {
+    const auto byte = codes[c / 2U];
+    const auto code = static_cast<std::uint8_t>(c % 2U == 0U ? byte & 0x0FU : byte >> 4U);
+    return ms::nvfp4_value(code, sf::e4m3(scales[c / 16U]), outer);
+}
+
+void representable(std::mt19937& rng) {
+    constexpr std::size_t n = 256;
+    std::uniform_int_distribution<int> code(0, 15), scale(0x10, 0x60);
+    std::vector<float> x(n);
+    for (std::size_t b = 0; b < n / 16U; ++b) {
+        const auto s = static_cast<std::uint8_t>(scale(rng));
+        for (std::size_t i = 0; i < 16U; ++i) {
+            // One element per block at |code| 6 makes amax / 6 the block scale exactly.
+            const auto c = i == 3U ? std::uint8_t{7} : static_cast<std::uint8_t>(code(rng));
+            x[b * 16U + i] = sf::e2m1(c) * sf::e4m3(s);
+        }
+    }
+    std::vector<std::uint8_t> codes(n / 2U), scales(n / 16U);
+    ms::encode_nvfp4_row(x, 1.0F, codes, scales);
+    bool same = true;
+    for (std::size_t c = 0; c < n; ++c) same = same && decoded(codes, scales, 1.0F, c) == x[c];
+    expect(same, "representable row round-trips");
+}
+
+void mse_rule(std::mt19937& rng) {
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    double mse_total = 0.0, amax_total = 0.0;
+    const float outer = 0.01F;
+    for (int trial = 0; trial < 2000; ++trial) {
+        float block[16];
+        float amax = 0.0F;
+        for (float& v : block) {
+            v = nd(rng) * (trial % 7 == 0 ? 0.01F : 1.0F);
+            amax = std::fmax(amax, std::fabs(v));
+        }
+        std::uint8_t codes[8], scale[1];
+        ms::encode_nvfp4_row(std::span<const float>(block, 16), outer, codes, scale);
+        const double mse = ms::nvfp4_block_error(block, outer, scale[0], nullptr);
+        const auto rule = static_cast<std::uint8_t>(sf::e4m3_encode(amax / (6.0F * outer)) & 0x7F);
+        const double amax_error = ms::nvfp4_block_error(block, outer, rule, nullptr);
+        expect(mse <= amax_error, "mse@2 never worse than the amax rule");
+        mse_total += mse;
+        amax_total += amax_error;
+    }
+    std::printf("block SSE mse@2 %.4f amax rule %.4f (ratio %.3f)\n", mse_total, amax_total, mse_total / amax_total);
+}
+
+void transcode(std::mt19937& rng) {
+    constexpr std::size_t rows = 64, cols = 1152;
+    std::vector<std::uint8_t> codes(rows * cols), scales(rows * cols / 32U);
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::uniform_int_distribution<int> e(118, 124);
+    for (auto& s : scales) s = static_cast<std::uint8_t>(e(rng));
+    for (auto& c : codes) c = sf::e4m3_encode(nd(rng) * 64.0F);
+    const auto out = ms::transcode_mxfp8_to_nvfp4(codes, scales, rows, cols);
+    // Recompute the error from the packed bytes.
+    double sse = 0.0, energy = 0.0;
+    for (std::size_t r = 0; r < rows; ++r)
+        for (std::size_t c = 0; c < cols; ++c) {
+            const double src = double{sf::e4m3(codes[r * cols + c])} * double{sf::e8m0(scales[r * (cols / 32U) + c / 32U])};
+            const auto byte = out.codes[(r * cols + c) / 2U];
+            const auto code = static_cast<std::uint8_t>(c % 2U == 0U ? byte & 0x0FU : byte >> 4U);
+            const double d = double{ms::nvfp4_value(code, sf::e4m3(out.scales[r * (cols / 16U) + c / 16U]), out.outer)} - src;
+            sse += d * d;
+            energy += src * src;
+        }
+    const double rel = std::sqrt(sse / energy);
+    std::printf("MXFP8 -> NVFP4 relative RMS error %.4f (reported %.4f), outer %g\n", rel, out.error.relative(),
+                double{out.outer});
+    expect(std::fabs(rel - out.error.relative()) < 1e-9, "reported error matches");
+    expect(rel > 0.0 && rel < 0.15, "4-bit error band");
+}
+
+void malformed() {
+    bool threw = false;
+    try {
+        std::vector<float> x(15, 1.0F);
+        std::vector<std::uint8_t> c(7), s(1);
+        ms::encode_nvfp4_row(x, 1.0F, c, s);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "short row throws");
+    threw = false;
+    try {
+        std::vector<float> x(16, 1.0F);
+        x[5] = INFINITY;
+        std::vector<std::uint8_t> c(8), s(1);
+        ms::encode_nvfp4_row(x, 1.0F, c, s);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "non-finite value throws");
+    threw = false;
+    try {
+        std::vector<std::uint8_t> c(64), s(2);
+        c[0] = 0x7F;  // E4M3 NaN
+        (void)ms::transcode_mxfp8_to_nvfp4(c, s, 1, 64);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "inconsistent or NaN MXFP8 throws");
+}
+
+}  // namespace
+
+int main() {
+    std::mt19937 rng(1123U);
+    representable(rng);
+    mse_rule(rng);
+    transcode(rng);
+    malformed();
+    std::printf("%s\n", failures == 0 ? "PASS" : "FAIL");
+    return failures == 0 ? 0 : 1;
+}

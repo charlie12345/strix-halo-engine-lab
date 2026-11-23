@@ -203,6 +203,23 @@ void validation() {
                               "min_prompt_rows = 9\nmax_prompt_rows = 8\n"); }, "min_prompt_rows > max_prompt_rows");
     refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.forms.tensor]\nexpert_shares = [0.7, 0.7]\n"); },
             "sum to 1");
+    // A regime names only declared forms, enabled or parked: enabling it can never resolve a missing form to single.
+    refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.regimes.a]\nprefer = ['layers', 'single']\n"); },
+            "prefer names 'layers', which the model does not declare");
+    refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.regimes.a]\nprefer = ['layers']\n"
+                              "enabled = false\n"); }, "does not declare");
+    // A regime wire binds to forms that carry one; with prefer = ['single'] it would be reported as reference.
+    refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.regimes.a]\nprefer = ['single']\n"
+                              "wire = 'fp16'\nmin_tier = 'fast'\n"); }, "cannot apply to 'single'");
+    refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.forms.tensor]\nranks = 2\n"
+                              "[multi_device.regimes.a]\nprefer = ['tensor', 'single']\nwire = 'fp16'\n"
+                              "min_tier = 'fast'\n"); }, "cannot apply to 'single'");
+    // A preferred form whose own wire changes bits needs a FAST / TURBO regime.
+    refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.forms.tensor]\nranks = 2\nwire = 'fp16'\n"
+                              "[multi_device.regimes.a]\nprefer = ['tensor']\n"); }, "whose wire 'fp16' changes bits");
+    const auto bound = policy("[multi_device]\nversion = 1\n[multi_device.forms.tensor]\nranks = 2\n"
+                              "[multi_device.regimes.a]\nprefer = ['tensor']\nwire = 'fp16'\nmin_tier = 'fast'\n");
+    require(bound.regimes.size() == 1 && bound.regimes[0].wire == "fp16", "a wire bound to a tensor regime parses");
 }
 
 void legacy_environment() {
@@ -237,18 +254,29 @@ void launch_applies_single_and_replica() {
         "[multi_device.forms.tensor]\nranks = 2\n");
     md::Query q;
     q.devices = 2;
+    // Inspection reports the replica decision and who executes it ...
     const auto replica = strix::profile::resolve_model_preset(description, Name::fast, "hip", q);
-    require(replica.placement.form == md::Form::replica, "replica launches");
+    require(replica.placement.form == md::Form::replica, "replica is reported");
+    require(replica.config.dump().find("\"executed_by\":\"router\"") != std::string::npos, "the report names the router");
+    // ... a standalone engine launch refuses it (it would start one worker), the router admits it.
+    refuses([&] { md::admit(replica.placement, md::Executor::engine); }, "runs behind strix-router");
     require(strix::profile::resolve_replica_router(description, {}, 2).placement.form == md::Form::replica,
             "the replica router admits the model");
+    md::Query one;
+    refuses([&] { md::admit(strix::profile::resolve_model_preset(description, {}, "hip", one).placement,
+                            md::Executor::router); }, "strix-router executes only replica");
+    // A form no engine executes is reported, refused by both executors.
     q.placement = md::Form::tensor;
-    require(md::select(md::parse_policy(description), [&] { auto f = q; f.tier = Name::fast; return f; }()).form ==
-                md::Form::tensor, "the resolver itself still decides tensor");
-    refuses([&] { (void)strix::profile::resolve_model_preset(description, Name::fast, "hip", q); },
-            "'tensor' (explicit: --placement) is not applied by any engine yet");
+    const auto tensor = strix::profile::resolve_model_preset(description, Name::fast, "hip", q);
+    require(tensor.placement.form == md::Form::tensor &&
+            tensor.config.dump().find("\"executed_by\":\"none\"") != std::string::npos, "tensor is reported, not executed");
+    refuses([&] { md::admit(tensor.placement, md::Executor::engine); },
+            "'tensor' (explicit: --placement) is not executed by any engine yet");
+    refuses([&] { md::admit(tensor.placement, md::Executor::router); }, "executes only replica");
     q.placement = md::Form::single;
-    require(strix::profile::resolve_model_preset(description, Name::fast, "hip", q).placement.form == md::Form::single,
-            "explicit single launches");
+    const auto single = strix::profile::resolve_model_preset(description, Name::fast, "hip", q);
+    require(single.placement.form == md::Form::single, "explicit single resolves");
+    md::admit(single.placement, md::Executor::engine);
 }
 
 void registered_models(const std::filesystem::path& root) {

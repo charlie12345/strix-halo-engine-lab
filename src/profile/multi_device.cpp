@@ -200,6 +200,26 @@ Regime parse_regime(const std::string& name, const Value& v, const std::string& 
     return r;
 }
 
+// A regime may name only forms the model declares, and its wire must bind to forms that carry one: a disabled
+// regime is data awaiting a receipt, so it obeys the same rules (enabling it changes nothing else).
+void validate_regime(const Policy& policy, const Regime& r, const std::string& path) {
+    for (auto form : r.prefer) {
+        if (!policy.forms.contains(form))
+            refuse(path + ".prefer names '" + std::string(form_name(form)) +
+                   "', which the model does not declare under multi_device.forms");
+        const bool carries_wire = form != Form::single && form != Form::replica;
+        if (!r.wire.empty() && !carries_wire)
+            refuse(path + ".wire '" + r.wire + "' cannot apply to '" + std::string(form_name(form)) +
+                   "' (it runs the reference wire): list only layers / tensor / speculation forms, or drop the wire");
+        if (r.wire.empty() && carries_wire) {
+            const auto& wire = policy.forms.at(form).wire;
+            if (!exact_wire(wire) && r.min_tier == Name::standard)
+                refuse(path + " prefers '" + std::string(form_name(form)) + "' whose wire '" + wire +
+                       "' changes bits: the regime needs min_tier = \"fast\" or \"turbo\"");
+        }
+    }
+}
+
 bool rows_match(const std::optional<std::uint64_t>& value, const std::optional<std::uint64_t>& lo,
                 const std::optional<std::uint64_t>& hi) {
     if (!lo && !hi) return true;
@@ -295,7 +315,9 @@ Policy parse_policy(const model_description::ModelDescription& description) {
     for (const auto& name : order) {
         const auto it = regimes->find(name);
         if (it == regimes->end()) refuse("multi_device.order names an unknown regime '" + name + "'");
-        policy.regimes.push_back(parse_regime(name, it->second, "multi_device.regimes." + name));
+        auto regime = parse_regime(name, it->second, "multi_device.regimes." + name);
+        validate_regime(policy, regime, "multi_device.regimes." + name);
+        policy.regimes.push_back(std::move(regime));
     }
     return policy;
 }
@@ -361,10 +383,22 @@ std::vector<LegacyOverride> legacy_overrides(const Lookup& env) {
     return out;
 }
 
-void require_launchable(const Decision& d) {
-    if (d.form == Form::single || d.form == Form::replica) return;
-    throw std::invalid_argument("multi_device form '" + std::string(form_name(d.form)) + "' (" + d.rule + ": " + d.reason +
-                                ") is not applied by any engine yet; run / serve launch only single or replica");
+std::string_view executed_by(Form form) noexcept {
+    return form == Form::single ? "engine" : form == Form::replica ? "router" : "none";
+}
+
+void admit(const Decision& d, Executor executor) {
+    const auto what = "multi_device form '" + std::string(form_name(d.form)) + "' (" + d.rule + ": " + d.reason + ")";
+    if (executor == Executor::engine) {
+        if (d.form == Form::single) return;
+        if (d.form == Form::replica)
+            throw std::invalid_argument(what + " runs behind strix-router, which holds the endpoints; this launch runs "
+                                        "one engine: start each worker with --device-count 1 and strix-router with the "
+                                        "worker endpoints");
+        throw std::invalid_argument(what + " is not executed by any engine yet; a run / serve launch executes single");
+    }
+    if (d.form == Form::replica) return;
+    throw std::invalid_argument(what + " is not a replica placement; strix-router executes only replica");
 }
 
 Decision resolve(const model_description::ModelDescription& description, const Query& q, const Lookup& env) {
@@ -378,7 +412,8 @@ serve::Json Decision::json(const Policy& policy, const Query& q) const {
     for (const auto& entry : policy.forms) declared.push(form_name(entry.first));
     Json out = Json::Object{{"version", policy.version}, {"form", form_name(form)},
         {"ranks", static_cast<std::int64_t>(ranks)}, {"devices", static_cast<std::int64_t>(q.devices)},
-        {"phase", phase_name(q.phase)}, {"wire", wire}, {"rule", rule}, {"reason", reason}, {"declared", declared}};
+        {"phase", phase_name(q.phase)}, {"wire", wire}, {"rule", rule}, {"reason", reason}, {"declared", declared},
+        {"executed_by", executed_by(form)}};
     if (const auto it = policy.forms.find(form); it != policy.forms.end() && !it->second.fields.empty()) {
         Json fields = Json::object();
         for (const auto& [key, value] : it->second.fields) fields.set(key, value);

@@ -108,7 +108,6 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
     query.tier = requested;
     const auto policy = multi_device::parse_policy(description);
     auto decision = multi_device::select(policy, query);
-    multi_device::require_launchable(decision);
     decision.legacy = multi_device::legacy_overrides();
     config.set("multi_device", decision.json(policy, query));
     return {requested, column, std::move(kv), std::move(config), std::move(decision)};
@@ -123,6 +122,7 @@ ModelPreset resolve_replica_router(const model_description::ModelDescription& de
         throw std::invalid_argument("model does not resolve the replica form for " + std::to_string(replicas) +
                                     " replicas (" + std::string(multi_device::form_name(preset.placement.form)) + ", " +
                                     preset.placement.rule + ": " + preset.placement.reason + ")");
+    multi_device::admit(preset.placement, multi_device::Executor::router);
     return preset;
 }
 

@@ -31,8 +31,12 @@ de colocación que el modelo admite en varios dispositivos (`replica`, `layers`,
 de corte, filas, cable y drafter) y `regimes` ordenados que eligen forma por fase, filas del prompt, peticiones listas y
 tier. Un modelo sin la sección resuelve `single` con cualquier número de dispositivos. El cable `reference` conserva
 cada unión exacta; un cable más estrecho nunca se resuelve en EXACT. `strix run|serve --device-count N --placement FORMA
---print-effective-config` imprime la decisión; un lanzamiento solo aplica `single` y `replica` (réplicas tras
-`strix-router`) y rechaza cualquier otra forma resuelta con su motivo hasta que un motor la consuma. Los interruptores
+--print-effective-config` imprime la decisión y quién la ejecuta (`executed_by`). Inspeccionar y ejecutar son cosas
+distintas: un lanzamiento `run` / `serve` ejecuta un solo motor, así que solo se admite cuando la decisión es `single`;
+`replica` solo la ejecuta `strix-router`, que tiene los endpoints (cada worker se arranca con `--device-count 1` y
+después el router con las direcciones de los workers); cualquier otra forma se rechaza con su motivo hasta que un
+motor la consuma. Un régimen solo puede nombrar formas declaradas, y su `wire` solo formas que lo llevan (`layers`,
+`tensor`, `speculation`). Los interruptores
 locales de los motores (`STRIX_*_PF_PIPE_CUT`, ...) siguen actuando dentro del motor; la config efectiva lista los que
 están puestos en `multi_device.legacy_env`.
 

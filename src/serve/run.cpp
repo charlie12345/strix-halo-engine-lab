@@ -172,8 +172,15 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             return 0;
         }
         const bool external_cuda = backend == "cuda" && !(factory && factory->serves_cuda);
-        if (preset_requested && (!factory || external_cuda) && shell.launch)
+        if (preset_requested && (!factory || external_cuda) && shell.launch) {
+            // The native handoff carries the whole query (device count, placement) to the backend launcher, which
+            // resolves it again; refuse here first so no launch starts for a form one engine does not execute.
+            if (!request.print)
+                profile::multi_device::admit(
+                    profile::resolve_model_preset(selection.description, request.tier, backend, request.placement).placement,
+                    profile::multi_device::Executor::engine);
             return shell.launch(selection, request, out);
+        }
         if (!factory) {
             error << "known family '" << selection.model.family << "' has no built shared serve adapter; legacy entry points remain separate\n";
             return 3;
@@ -187,6 +194,8 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
                     selection.arguments.emplace(selection.arguments.begin(), factory->asset_option);
             }
             const auto preset = profile::resolve_model_preset(selection.description, request.tier, backend, request.placement);
+            // This process serves one worker: only `single` executes here (replicas run behind strix-router).
+            if (!request.print) profile::multi_device::admit(preset.placement, profile::multi_device::Executor::engine);
             preset.append_options(selection.arguments);
             if (request.print) {
                 out << preset.config.dump() << '\n' << std::flush;

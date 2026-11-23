@@ -129,7 +129,7 @@ int main() {
         const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0};
         const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536};
         const auto& q8 = weight::kAttentionHeadQ8Policy;
-        weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, 32768};
+        weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, {32768, 0}};
         const auto resolve = [&](std::span<const weight::WeightLoadDecision> table) {
             return weight::resolve_weight_load(weight::builtin_registry(), q8, r, table);
         };
@@ -153,15 +153,51 @@ int main() {
         ok &= check(p.storage == weight::kQ8WeightStorage && p.status == strix::profile::Status::set &&
                         p.measured_gain == gain && p.regimes[1].qualification == weight::RegimeQualification::full,
                     "gate rows in every regime plus one full row select the image");
-        r.context = 131072;
+        r.extent.context = 131072;
         p = resolve(both);
         ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == nullptr &&
                         p.regimes[1].outside_band == &both[1], "a context outside the gate band is refused");
         ok &= check(weight::weight_load_regime_receipt(p).ends_with("decode=none:outside-band<=65536"),
                     "outside-band receipt");
-        r.context = 0;
+        r.extent.context = 0;
         ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "unknown context never meets a banded row");
-        r.context = 32768;
+        r.extent.context = 32768;
+        // A decode gain banded by lanes: inside the band (and only with known lanes) the row is full; outside it
+        // keeps its gate v2 PASS (admits decode) but never selects; the receipt says why.
+        const weight::WeightLoadEvidence one_lane{"receipts/decode", "2026-11-24", 2649, 65536, 1};
+        const std::array lane_banded{weight::WeightLoadDecision{q8.id, prefill, gate, {}, pf_receipt},
+                                     weight::WeightLoadDecision{q8.id, decode, gate, gain, one_lane}};
+        p = resolve(lane_banded);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == &lane_banded[1] &&
+                        p.regimes[1].qualification == weight::RegimeQualification::gate_only &&
+                        p.regimes[1].gain_outside_lanes, "unknown lanes never meet a lane-banded gain");
+        r.extent.lanes = 1;
+        p = resolve(lane_banded);
+        ok &= check(p.storage == weight::kQ8WeightStorage && p.measured_gain == gain &&
+                        p.regimes[1].qualification == weight::RegimeQualification::full && !p.regimes[1].gain_outside_lanes,
+                    "one lane inside the lane band selects the image");
+        ok &= check(weight::weight_load_regime_receipt(p) == "strix-weight-load-regimes/v1 weights.attention_head.q8_0@1 "
+                        "gguf.q8_0@1 profile prefill=gate-only:receipts/prefill decode=full:receipts/decode",
+                    "lane band receipt inside the band");
+        r.extent.lanes = 8;
+        p = resolve(lane_banded);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.status == strix::profile::Status::pending &&
+                        p.regimes[1].qualification == weight::RegimeQualification::gate_only,
+                    "eight lanes outside the lane band keep BF16");
+        ok &= check(weight::weight_load_regime_receipt(p).ends_with("decode=gate-only:receipts/decode:gain-lanes<=1"),
+                    "lane band receipt outside the band");
+        ok &= check(weight::find_weight_load_gate(q8, decode, lane_banded, {32768, 8}) == &lane_banded[1] &&
+                        weight::find_weight_load_gate(q8, decode, lane_banded, {131072, 1}) == nullptr,
+                    "the gate lookup keeps a lane-banded PASS row and still applies the context band");
+        ok &= check(weight::registered_regime_rows(q8, weight::Backend::hip, regimes, lane_banded) ==
+                        "prefill=gate-only@" + std::string(scope.device_class) + ",decode=full@" +
+                        std::string(scope.device_class) + "/lanes<=1", "committed rows show the lane band");
+        ok &= check(weight::weight_load_gain_selects(lane_banded[1], {32768, 1}) &&
+                        !weight::weight_load_gain_selects(lane_banded[1], {32768, 2}) &&
+                        !weight::weight_load_gain_selects(lane_banded[1], {131072, 1}) &&
+                        !weight::weight_load_gain_selects(lane_banded[0], {32768, 1}),
+                    "a gain selects only inside both bands; a gate-only row never");
+        r.extent.lanes = 0;
         r.tier = strix::profile::Name::standard;
         ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "EXACT never takes a regime row");
         r.tier = strix::profile::Name::fast;

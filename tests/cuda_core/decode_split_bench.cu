@@ -4,12 +4,15 @@
 // launches (also proves the ticket reset), then microseconds per launch (cudaEvent, `--iters`). Prints RESULT PASS|FAIL.
 // bits / flash_bits / rows: output digests of the split, the one-row flash and host-position flash blocks of 16 / 17 / 128 /
 // 129 rows (both sides of the 16-row warp slice and of the 128-row query tile), for comparing two builds case by case.
-// Every launch is checked (a failed launch exits rc 2); outputs start as a sentinel and every live element must be written;
+// Every launch is checked (a failed launch exits rc 2); outputs start as a sentinel (again before the second split
+// launch) and every live element must be written and finite;
 // the blocks are checked against the double reference on sampled rows. --inject-unwritten skips the 17-row launch (negative
 // control: the run must FAIL).
 // The one-row flash also runs with the swz3 pipe (three stages, prefetch distance 2): its digest must equal the pad2 one
 // (layouts change addresses, never arithmetic) and TIME reports both pipes with GB/s of the unique K/V bytes walked.
-// Usage: cuda_core_decode_split_bench [--iters N] [--check-only] [--inject-unwritten]
+// --inject-stale skips the second split launch and --inject-nonfinite stores the same infinity in every one-row output:
+// both are negative controls of the overwrite and finite checks (the run must FAIL).
+// Usage: cuda_core_decode_split_bench [--iters N] [--check-only] [--inject-unwritten] [--inject-stale] [--inject-nonfinite]
 #include "strix/cuda_core/attention.hpp"
 #include "strix/attention_split_plan.hpp"
 
@@ -33,10 +36,24 @@ constexpr unsigned kHeads = 24, kKv = 8, kDim = 128, kExtent = 1024;
 constexpr float kScale = 0.08838834764831845f;
 bool g_fail = false;
 bool g_inject_unwritten = false;
+bool g_inject_stale = false;     // negative control: the second split launch is skipped
+bool g_inject_nonfinite = false;  // negative control: the same infinity in every one-row output
 constexpr std::uint32_t kSentinel = 0xffffffffU;  // a NaN no kernel stores
 
 // NaN-aware running maximum (std::max keeps its left side against a NaN).
 void raise_max(double& m, double v) { m = (v != v || m != m) ? v + m : std::max(m, v); }
+
+// Written elements that are not finite (the sentinel is counted by unwritten): an infinity or NaN in both builds
+// would otherwise pass byte equality and an infinite tolerance.
+std::size_t nonfinite(const std::vector<float>& v, std::size_t live) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < live; ++i) {
+        std::uint32_t u = 0;
+        std::memcpy(&u, &v[i], sizeof u);
+        n += u != kSentinel && !std::isfinite(v[i]) ? 1U : 0U;
+    }
+    return n;
+}
 
 std::size_t unwritten(const std::vector<float>& v, std::size_t live) {
     std::size_t n = 0;
@@ -140,14 +157,17 @@ void run_case(const Case& c, int iters, bool check_only) {
     check(flash_swz(), "flash swz3");
     check(split(), "split 1");
     check(cudaDeviceSynchronize(), "sync");
-    const auto first = out_split.get();
-    check(split(), "split 2");
+    auto first = out_split.get();
+    out_split.poison();  // the second launch must overwrite every element, not inherit the first launch's output
+    if (!g_inject_stale) check(split(), "split 2");
     check(cudaDeviceSynchronize(), "sync");
-    const auto second = out_split.get();
+    auto second = out_split.get();
     const bool det = std::memcmp(first.data(), second.data(), first.size() * sizeof(float)) == 0;
-    const auto fl = out_flash.get();
-    const auto fz = out_swz.get();
+    auto fl = out_flash.get();
+    auto fz = out_swz.get();
     const bool pipes_equal = std::memcmp(fl.data(), fz.data(), fl.size() * sizeof(float)) == 0;
+    if (g_inject_nonfinite)
+        for (auto* v : {&first, &second, &fl, &fz}) (*v)[0] = HUGE_VALF;
 
     // double reference
     const unsigned lo = c.window && c.position >= c.window ? c.position - c.window + 1U : 0U;
@@ -184,8 +204,11 @@ void run_case(const Case& c, int iters, bool check_only) {
     }
     // FP32 split: bound 1e-4 of the output scale; it must not be worse than the BF16-operand flash.
     const double bound = 1e-4 * std::max(scale_ref, 1e-3);
-    const std::size_t miss1 = unwritten(fl, fl.size()) + unwritten(first, first.size());
-    bool ok = det && pipes_equal && unwritten(fz, fz.size()) == 0 && miss1 == 0 && err_flash == err_flash && err_split <= bound && err_split <= std::max(err_flash, bound);
+    const std::size_t miss1 = unwritten(fl, fl.size()) + unwritten(first, first.size()) + unwritten(second, second.size());
+    std::size_t bad = nonfinite(fl, fl.size()) + nonfinite(fz, fz.size()) + nonfinite(first, first.size()) +
+                      nonfinite(second, second.size());
+    bool ok = det && pipes_equal && unwritten(fz, fz.size()) == 0 && miss1 == 0 && bad == 0 && std::isfinite(err_flash) &&
+              std::isfinite(err_split) && err_split <= bound && err_split <= std::max(err_flash, bound);
     const auto plan = strix::attn_split::decode_split_plan(c.position, c.window);
     // FNV-1a of output bits: compares two builds of the kernels case by case (schedule changes must keep them)
     const auto fnv = [](const std::vector<float>& v) {
@@ -229,6 +252,7 @@ void run_case(const Case& c, int iters, bool check_only) {
             check(cudaDeviceSynchronize(), "sync rows");
             const auto out = outr.get();
             miss_rows += unwritten(out, live);
+            bad += nonfinite(out, live);
             rows_bits = fnv(out);
             // double reference on the rows next to each boundary and on the last row (this case's own position)
             const unsigned sample[] = {15U, 16U, 127U, 128U, rows - 1U};
@@ -277,12 +301,12 @@ void run_case(const Case& c, int iters, bool check_only) {
     }
     // BF16 Q and P operands: a few 1e-3 of the output scale; 2e-2 (or 8x the one-row flash error) only rejects wrong rows.
     const double bound_rows = std::max(2e-2 * std::max(scale_rows, 1e-3), 8.0 * err_flash);
-    ok = ok && miss_rows == 0 && err_rows == err_rows && err_rows <= bound_rows;
+    ok = ok && miss_rows == 0 && bad == 0 && std::isfinite(err_rows) && err_rows <= bound_rows;
     if (!ok) g_fail = true;
     std::printf("SPLIT %s pos=%u window=%u wrapped=%d splits=%u chunk=%u err_split=%.3e err_flash=%.3e ref_scale=%.3e det=%s "
-                "bits=%016llx flash_bits=%016llx swz3=%s err_rows=%.3e unwritten=%zu rows=%s %s\n",
+                "bits=%016llx flash_bits=%016llx swz3=%s err_rows=%.3e unwritten=%zu nonfinite=%zu rows=%s %s\n",
                 c.name, c.position, c.window, c.wrapped ? 1 : 0, plan.splits, plan.chunk, err_split, err_flash, scale_ref,
-                det ? "EQUAL" : "DIFF", fnv(first), fnv(fl), pipes_equal ? "EQUAL" : "DIFF", err_rows, miss1 + miss_rows, rows_text, ok ? "PASS" : "FAIL");
+                det ? "EQUAL" : "DIFF", fnv(first), fnv(fl), pipes_equal ? "EQUAL" : "DIFF", err_rows, miss1 + miss_rows, bad, rows_text, ok ? "PASS" : "FAIL");
     if (check_only) return;
 
     cudaEvent_t a, b;
@@ -321,6 +345,8 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--check-only")) check_only = true;
         else if (!std::strcmp(argv[i], "--inject-unwritten")) g_inject_unwritten = true;
+        else if (!std::strcmp(argv[i], "--inject-stale")) g_inject_stale = true;
+        else if (!std::strcmp(argv[i], "--inject-nonfinite")) g_inject_nonfinite = true;
         else {
             std::printf("unknown option %s\n", argv[i]);
             return 2;

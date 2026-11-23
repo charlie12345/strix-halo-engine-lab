@@ -174,5 +174,9 @@ int main() {
         r.scope = prefill;
         ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
     }
+    ok &= check(weight::hip_clang_compiler_id("24.0.0git (https://github.com/ROCm/llvm-project.git "
+                                              "d6f6cb691863e9258034ab48c1dfce21689d5606)") ==
+                    "hip-clang-24.0.0git-d6f6cb691863", "HIP toolkit id from the device compiler text");
+    ok &= check(weight::hip_clang_compiler_id("20.0.0") == "hip-clang-20.0.0", "HIP toolkit id without a commit");
     return ok ? 0 : 1;
 }

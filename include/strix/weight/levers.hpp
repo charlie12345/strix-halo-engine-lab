@@ -213,6 +213,18 @@ WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
 // a row's context band misses the engine's context. Says which regime rows are active and why the others are not.
 [[nodiscard]] std::string weight_load_regime_receipt(const WeightLoadPlan& plan);
 
+// The HIP toolkit id of a decision row: the device-code compiler, 'hip-clang-<version>-<12 hex of its commit>', from
+// the compiler's __clang_version__ text. Every HIP translation unit of one build shares it, while the hip_version.h a
+// target includes and the runtime it loads can differ between targets of one build (system and ROCm packages side by
+// side), so an id taken from those would split the CLI and the server of the same build.
+[[nodiscard]] inline std::string hip_clang_compiler_id(std::string_view clang_version) {
+    std::string id = "hip-clang-" + std::string(clang_version.substr(0, clang_version.find(' ')));
+    const auto close = clang_version.rfind(')');
+    const auto space = close == std::string_view::npos ? close : clang_version.rfind(' ', close);
+    if (space != std::string_view::npos && close > space + 12U) id += "-" + std::string(clang_version.substr(space + 1U, 12U));
+    return id;
+}
+
 // Before a device is known (a route description): the committed rows of `policy` for `backend`, per regime,
 // '<regime>=<full|gate-only|none>[@<device>]' joined by ','. Says what a device could match, not what it matched.
 [[nodiscard]] inline std::string registered_regime_rows(const WeightLoadPolicy& policy, Backend backend,

@@ -93,6 +93,25 @@ same `MODEL_DIR/tokenizer.json` the server loads) on the command line. `--identi
 
 Prefill MLA switches: `STRIX_GLM_PF_SCORES=6` and `STRIX_GLM_PF_OBAR=7` (o-bar v7; `=5` v5) restore earlier stages; default o-bar v10 stages 2 k per batch with the same chains (pair logits bitwise equal to v7 at 8K and 32K; o-bar time 7-9 % lower, TTFT 8K -0.7 %, 32K -0.3 %). `STRIX_GLM_PF_MLA_GEMM=2` restores GEMM v2 (`=1` legacy); default v3 keeps the ascending-k FMA chains (pair logits and state bitwise equal to v2 at 8K and 32K; MLA GEMM time 41-43 % lower, TTFT 8K -1.9 %, 32K -2.3 %).
 
+<a id="glm-image"></a>
+
+## Image input: the pair (draft)
+
+A prompt can carry images through the model's projector file (a separate GGUF, `clip.projector_type = glm5v`). The
+tower runs on the CPU ahead of the run and the ranks splice its rows into the prompt prefill:
+
+```sh
+./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
+./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --mtp 0 \
+    --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
+```
+
+Draft: the host half is tested on synthetic projector files; the device half is written but not compiled or run,
+and no answer on an image has been checked. Commands, status and limits: [image input](../../engine/vision.md#glm-53-flash);
+the adapter and its gate: [vision adapters](../../engine/vision-adapters.md#glm-53-flash). The server takes no
+image parts.
+
 <a id="glm-serve"></a>
 
 ## Serve: the pair

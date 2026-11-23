@@ -1,13 +1,16 @@
 # Image input
 
-Image input lets a chat request carry pictures. Today one model takes them: DeepSeek V4.1 on the two-node pair.
+Image input lets a chat request carry pictures. DeepSeek V4.1 takes them on the two-node pair server. GLM-5.3 Flash
+has an image tower adapter and a command-line path that is written but not yet run on the device (see
+[GLM-5.3 Flash](#glm-53-flash) below).
 [One shared vision runtime](shared-cores.md#the-components) serves every family; a model only supplies an adapter
 ([vision-adapters.md](vision-adapters.md) describes the adapter interface).
 
 | Model | Image input |
 |---|---|
 | DeepSeek V4.1 | yes, on the pair, behind `--vision` |
-| Qwen, GLM, MiniMax, Gemma | not yet |
+| GLM-5.3 Flash | command line only, behind `--embed-rows`: tower on the CPU, device path not yet run; no HTTP image input |
+| Qwen, MiniMax, Gemma | not yet |
 
 ## Use
 
@@ -24,6 +27,36 @@ curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/jso
     {"type": "text", "text": "Describe this image."},
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}'
 ```
+
+## GLM-5.3 Flash
+
+The image tower is a separate GGUF projector file (`clip.projector_type = glm5v`, FP32 / FP16 / BF16 storage). It
+runs on the CPU, on the shared FP32 host reference, ahead of the run: `strix-glm5-vision` writes the projected rows
+of an image to an embed rows file, and both ranks read that file, so they splice the same bytes.
+
+```sh
+# 1. one image -> its rows (host only, no GPU; prints the number of rows)
+./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
+# 2. the tokenized prompt (32-bit ids, as --prompt takes them) with one <|image|> token (154854) where each image
+#    goes -> the prompt with every image span in place
+./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows
+# 3. once per node, R = 0 or 1, the same two files on both
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --mtp 0 \
+    --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
+```
+
+`expand` turns the n-th `<|image|>` into `<|begin_of_image|>`, one `<|image|>` per row of the n-th rows file and
+`<|end_of_image|>`; several images take a comma-separated list in prompt order. The run uses the chunked prefill
+and plain decode (`--mtp 0`; with MTP speculation resolved on, `--embed-rows` is refused).
+
+Status: the adapter and the tool are tested on the host against synthetic projector files
+([gate status](vision-adapters.md#gate-status-1)). The device half (`Engine::set_embed_rows`, `--embed-rows`) was
+written without a HIP toolchain and is not compiled or run; the real projector file is not run; no answer of the
+language model on an image has been checked.
+
+Cost of the CPU tower: the host reference accumulates in FP64 and is slow by design. On a synthetic tower of width
+1024 with 4 blocks (MLP 4096) and a projector of width 4096, on a 4-thread x86 host: 20.9 s for 1,024 patches (a 448 x 448 image, 256 rows) and 116.7 s for 4,096 patches (896 x 896, 1,024 rows), host reference FP32, one run each. Time grows
+linearly with the block count and, in attention, with the square of the patch count.
 
 ## Data path
 
@@ -72,7 +105,9 @@ See [toggles](../toggles.md).
 - Images over the row budget are refused.
 - Image requests with `session_id` are refused.
 - Video is refused.
-- One image adapter so far (DeepSeek V4.1); other models do not take images yet.
+- One served image adapter so far (DeepSeek V4.1). GLM-5.3 Flash: command line only, rows encoded ahead of the run on
+  the CPU, no embed cache, no pair frame, no HTTP image parts (`strix-glm5-serve` renders the model's reminder for
+  an image part, as before).
 - Needs the device prefill path.
 - Encoding is serialized with media preprocessing; peer/split scheduling and overlap with text-prefix prefill remain future work.
 - Image positions have zero Engram gates. Synthetic gate tests do not qualify complete served-image fidelity;

@@ -98,6 +98,25 @@ las [familias de modelos](../model-families.md) y la [cualificación/rendimiento
 
 Interruptores MLA del prefill: `STRIX_GLM_PF_SCORES=6` y `STRIX_GLM_PF_OBAR=7` (o-bar v7; `=5` v5) restauran etapas anteriores; la o-bar v10, predeterminada, prepara 2 k por lote con las mismas cadenas (logits del par idénticos bit a bit a la v7 con 8K y 32K; tiempo de o-bar un 7-9 % menor, TTFT con 8K −0.7 % y con 32K −0.3 %). `STRIX_GLM_PF_MLA_GEMM=2` restaura la GEMM v2 (`=1`, la heredada); la v3, predeterminada, conserva las cadenas FMA con k ascendente (logits y estado del par idénticos bit a bit a la v2 con 8K y 32K; tiempo de la GEMM MLA un 41-43 % menor, TTFT con 8K −1.9 % y con 32K −2.3 %).
 
+<a id="glm-image"></a>
+
+## Entrada de imágenes: el par (borrador)
+
+Un prompt puede llevar imágenes mediante el fichero de proyector del modelo (un GGUF aparte,
+`clip.projector_type = glm5v`). La torre se ejecuta en CPU antes de la ejecución y los ranks insertan sus filas en
+el prefill del prompt:
+
+```sh
+./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
+./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --mtp 0 \
+    --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
+```
+
+Borrador: la mitad de host está probada con ficheros de proyector sintéticos; la mitad de dispositivo está escrita
+pero no compilada ni ejecutada, y no se ha comprobado ninguna respuesta sobre una imagen. Órdenes, estado y límites:
+[entrada de imágenes](../../engine/vision.es.md#glm-53-flash). El servidor no admite partes de imagen.
+
 <a id="glm-serve"></a>
 
 ## Servicio: el par

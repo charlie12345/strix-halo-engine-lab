@@ -278,6 +278,21 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         refuses([&] { (void)resolve(placed, entries, matrix, probes, "bin", exists, &dense); }, "replica is not declared");
         refuses([] { (void)parse({"run", "qwen3.8-27b", "--placement", "mirror"}); }, "--placement requires");
         refuses([] { (void)parse({"run", "qwen3.8-27b", "--device-count", "0"}); }, "--device-count");
+        // Inspection vs execution: with a model whose two-device default is replica, --dry-run reports the command,
+        // while a real launch is refused before anything executes (one engine process cannot run replicas).
+        std::stringstream text;
+        text << std::ifstream(data / "models/qwen3.8-27b.toml").rdbuf()
+             << "\n[multi_device]\nversion = 1\ndefault = \"replica\"\n[multi_device.forms.replica]\nranks = 2\n";
+        const auto replicated = strix::model_description::parse(text.str());
+        auto replica_run = parse({"run", "--model", "qwen3.8-27b", "--backend", "cuda", "--asset", "model.gguf",
+                                  "--device-count", "2", "--dry-run"});
+        std::ostringstream shown;
+        require(strix::cli::launch(replica_run, entries, &replicated, "bin", data, probes, exists, shown) == 0 &&
+                shown.str().find("strix-cuda-qwen35-decode") != std::string::npos, "--dry-run reports a replica launch");
+        replica_run.dry_run = false;
+        refuses([&] { std::ostringstream sink;
+                      (void)strix::cli::launch(replica_run, entries, &replicated, "bin", data, probes, exists, sink); },
+                "runs behind strix-router");
     }
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};

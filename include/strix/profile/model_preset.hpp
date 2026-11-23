@@ -25,6 +25,7 @@ struct ModelPreset {
 [[nodiscard]] Name parse_tier(std::string_view);
 // `placement` carries --device-count / --placement (its tier is replaced by the resolved tier). Every launcher (CLI, server,
 // replica router) passes the same query so the effective "multi_device" member is identical for the same request.
+// The preset is inspection: a launcher that executes it first calls multi_device::admit(preset.placement, its executor).
 [[nodiscard]] ModelPreset resolve_model_preset(const model_description::ModelDescription&,
                                                std::optional<Name>, std::string_view backend,
                                                const multi_device::Query& placement = {});

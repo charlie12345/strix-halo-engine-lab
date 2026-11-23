@@ -31,8 +31,11 @@ placement forms the model admits on several devices (`replica`, `layers`, `tenso
 rows, wire and drafter data) and ordered `regimes` that pick a form by phase, prompt rows, ready requests and tier.
 A model without it resolves `single` on any number of devices. The wire `reference` keeps every exact join; a
 narrower wire never resolves under EXACT. `strix run|serve --device-count N --placement FORM --print-effective-config`
-prints the decision; a launch applies only `single` and `replica` (replicas behind `strix-router`) and refuses any
-other resolved form with its reason until an engine consumes it. Engine-local switches (`STRIX_*_PF_PIPE_CUT`, ...)
+prints the decision and who executes it (`executed_by`). Inspection and execution are distinct: a `run` / `serve`
+launch executes one engine, so it is admitted only when the decision is `single`; `replica` is executed only by
+`strix-router`, which holds the endpoints (start each worker with `--device-count 1`, then the router with the
+worker addresses); any other form is refused with its reason until an engine consumes it. A regime may name only
+declared forms, and its `wire` only forms that carry one (`layers`, `tensor`, `speculation`). Engine-local switches (`STRIX_*_PF_PIPE_CUT`, ...)
 still act inside the engine; the effective config lists the ones that are set under `multi_device.legacy_env`.
 
 The reader (`src/model_description.cpp`) accepts a TOML subset: bare and dotted keys, tables, inline tables, arrays,

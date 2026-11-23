@@ -2,6 +2,7 @@
 // request through the shared serve shell with the CPU reference backend.
 #include "../examples/skeleton_engine/skeleton_engine.hpp"
 #include "strix/profile/model_preset.hpp"
+#include "strix/serve/native_handoff.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -184,7 +185,66 @@ void multi_device_parity() {
         if (result) std::cerr << error.str();
         CHECK(result == 0);
         CHECK((seen == std::vector<std::string>{"--devices", "devices.toml"}));
+        // This process serves one worker: --device-count 2 resolves the model's replica default, which only
+        // strix-router executes, so the launch is refused before the family sees it (inspection above reports it).
+        seen.clear();
+        std::vector<std::string> two{"serve", "--registry-root", dir.string(), "--model", "fixture", "--device-count", "2"};
+        std::vector<char*> two_pointers;
+        for (auto& a : two) two_pointers.push_back(a.data());
+        std::ostringstream two_out, two_error;
+        CHECK(sv::run(static_cast<int>(two_pointers.size()), two_pointers.data(), family, two_out, two_error) == 2);
+        CHECK(two_error.str().find("runs behind strix-router") != std::string::npos);
+        CHECK(seen.empty());
     }
+    fs::remove_all(dir);
+}
+
+// strix-serve's native handoff (no in-process adapter, or an external CUDA launcher) forwards the whole multi-device
+// query, and a launch is admitted before delegation only for the form one engine executes. Backend arguments are
+// given so the print-only inspection path cannot return before the handoff.
+void native_handoff() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::current_path() / "serve-native-handoff-fixture";
+    fs::create_directories(dir / "models");
+    std::ofstream(dir / "models/registry.toml") << "schema = \"strix-registry/v1\"\n[models.fixture]\n"
+        "name = \"fixture\"\nfamily = \"fixture\"\ndescription = \"models/m.toml\"\n";
+    std::ofstream(dir / "models/m.toml") << "schema = \"strix-model/v1\"\nname = \"fixture\"\n[multi_device]\nversion = 1\n"
+        "[multi_device.forms.replica]\nranks = 2\n[multi_device.forms.layers]\nranks = 2\n";
+    const auto invoke = [&](std::vector<std::string> extra, std::optional<strix::cli::Request>& handed, std::string& error) {
+        std::vector<std::string> args{"serve", "--registry-root", dir.string(), "--model", "fixture", "--asset", "w.gguf"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        std::vector<char*> pointers;
+        for (auto& a : args) pointers.push_back(a.data());
+        handed.reset();
+        sv::ServeShell shell;
+        shell.launch = [&](const sv::ServiceSelection& selection, const sv::ServeShell::NativeRequest& request,
+                           std::ostream&) {
+            handed = sv::native_serve_request(selection, request);
+            return 0;
+        };
+        std::ostringstream out, err;
+        const sv::ServiceFactories none;   // no in-process adapter: every preset launch is a native handoff
+        const int result = sv::run(static_cast<int>(pointers.size()), pointers.data(), none, out, err, shell);
+        error = err.str();
+        return result;
+    };
+    std::optional<strix::cli::Request> handed;
+    std::string error;
+    // Explicit single on two devices reaches the backend launcher with both inputs.
+    CHECK(invoke({"--device-count", "2", "--placement", "single", "--bind", "127.0.0.2"}, handed, error) == 0);
+    CHECK(handed && handed->verb == strix::cli::Verb::serve && handed->model == "fixture" && handed->asset == "w.gguf");
+    CHECK(handed->device_count == 2 && handed->placement == "single" && handed->host == "127.0.0.2");
+    // A count alone (the model's default is single) is forwarded too, with no placement.
+    CHECK(invoke({"--device-count", "2"}, handed, error) == 0);
+    CHECK(handed && handed->device_count == 2 && handed->placement.empty());
+    // A declared but unexecuted form and a standalone replica are refused before delegation.
+    CHECK(invoke({"--device-count", "2", "--placement", "layers"}, handed, error) == 2);
+    CHECK(!handed && error.find("'layers' (explicit: --placement) is not executed") != std::string::npos);
+    CHECK(invoke({"--device-count", "2", "--placement", "replica"}, handed, error) == 2);
+    CHECK(!handed && error.find("runs behind strix-router") != std::string::npos);
+    // Inspection is forwarded as inspection: the backend launcher prints the same decision and executes nothing.
+    CHECK(invoke({"--device-count", "2", "--placement", "layers", "--print-effective-config"}, handed, error) == 0);
+    CHECK(handed && handed->print_effective_config && handed->placement == "layers" && handed->device_count == 2);
     fs::remove_all(dir);
 }
 
@@ -192,6 +252,7 @@ int main(int argc, char** argv) {
     CHECK(argc == 2);
     shell_config_tests();
     multi_device_parity();
+    native_handoff();
     embed_rows();
     sv::ServiceFactories factories;
     skeleton::install_session_service(factories);

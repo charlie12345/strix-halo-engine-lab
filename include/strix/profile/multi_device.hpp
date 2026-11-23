@@ -111,10 +111,15 @@ struct LegacySwitch {
 [[nodiscard]] const std::vector<LegacySwitch>& legacy_switches();
 [[nodiscard]] std::vector<LegacyOverride> legacy_overrides(const Lookup& env = {});
 
-// Forms a launch applies today: `single` (one engine) and `replica` (whole-model engines behind strix-router).
-// Any other decision throws std::invalid_argument with its rule and reason: it is refused, never printed as
-// effective, until an engine consumes it.
-void require_launchable(const Decision&);
+// Inspection and execution are distinct. Inspection (--print-effective-config, --dry-run) reports any selected form
+// (Decision::json names who executes it). A launch is admitted only for the form its entry point executes:
+//   engine  one engine process (strix run / serve, strix-serve, a native backend launcher) executes `single`;
+//   router  strix-router, which holds the whole-model endpoints, executes `replica`.
+// Anything else throws std::invalid_argument with the rule and reason (a replica launch outside the router is told
+// to start one worker per endpoint and the router). No executed form carries a bit-changing wire.
+enum class Executor { engine, router };
+[[nodiscard]] std::string_view executed_by(Form) noexcept;   // "engine" | "router" | "none"
+void admit(const Decision&, Executor);
 
 // One call for every launcher: parse + select + legacy report.
 [[nodiscard]] Decision resolve(const model_description::ModelDescription&, const Query&, const Lookup& env = {});

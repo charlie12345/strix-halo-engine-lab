@@ -324,6 +324,10 @@ int launch(const Request& request, const std::vector<model_registry::Entry>& ent
         out << command_line(command) << '\n';
         return 0;
     }
+    // Inspection (--print-effective-config: the engine prints and exits, --dry-run) reports any placement; a launch
+    // executes one engine, so it is admitted only for the form one engine executes.
+    if (command.preset && !req.print_effective_config)
+        profile::multi_device::admit(command.preset->placement, profile::multi_device::Executor::engine);
     std::optional<profile::PresetScope> scope;
     if (command.preset) scope.emplace();
     return execute(command);

@@ -77,6 +77,33 @@ grouped GEMM. Use `--packed-decode` or `--grouped-decode` to select the
 route explicitly. The packed route uses one kernel for gate/up with BF16
 activation and one for down with ordered expert combine.
 
+## Two nodes: replicas
+
+The model fits one node, so two nodes serve independent requests as
+replicas: one full `strix-serve` per node and `strix-router` in front. Each
+request runs on one node with the single-node identity. The
+`[multi_device]` section of `models/inkling2-mini.toml` declares this form;
+with one device the same resolver selects `single`, as before.
+
+```sh
+# on each node
+strix-serve --model inkling2-mini --checkpoint MODEL.safetensors --port 18196
+# on the node that takes the API traffic
+strix-router --description models/inkling2-mini.toml \
+  --replica http://NODE_A:18196 --replica http://NODE_B:18196 --listen 0.0.0.0:8090
+```
+
+The router prints `effective-multi-device {...}` and refuses to start if
+the model data does not admit replicas for that many endpoints.
+`strix run|serve inkling2-mini --devices 2 --print-effective-config` prints
+the same placement. To roll back, start the router without
+`--description`, or serve from one node.
+
+Dos nodos: cada nodo ejecuta un `strix-serve` completo y `strix-router`
+reparte las peticiones; cada petición se resuelve en un solo nodo con la
+identidad de un nodo. Para volver atrás, arranca el router sin
+`--description` o sirve desde un nodo.
+
 ## Execution and reuse
 
 | Stage | Shared component | Mini binding |

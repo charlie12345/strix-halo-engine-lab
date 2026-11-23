@@ -244,6 +244,18 @@ void registered_models(const std::filesystem::path& root) {
         const auto* member = preset.config.find("multi_device");
         require(member && member->find("form") && member->find("form")->as_string() == "single",
                 entry.name + ": effective config states multi_device.form = single on one device");
+        if (entry.name == "inkling2-mini") {
+            // Two whole-model devices: replicas for every tier and phase (the long-prefill regime is parked).
+            for (Name tier : {Name::standard, Name::fast, Name::turbo})
+                for (auto phase : {md::Phase::request, md::Phase::prefill, md::Phase::decode}) {
+                    const auto d = md::select(p, query(tier, 2, phase, 32768, 1));
+                    require(d.form == md::Form::replica && d.ranks == 2 && d.wire == "reference",
+                            "inkling2-mini: two devices resolve replicas");
+                }
+            const auto router = strix::profile::resolve_replica_router(description, {}, 2);
+            require(router.placement.form == md::Form::replica && router.requested == Name::standard,
+                    "inkling2-mini: the router admits two replicas under the EXACT default");
+        }
     }
 }
 } // namespace

@@ -61,3 +61,22 @@ levers = "fast"
 # Use the admitted FAST levers until this model has a qualified TURBO set.
 [presets.turbo]
 levers = "fast"
+
+# Multi-device placement, resolved by the shared profile resolver (strix run/serve --devices N, strix-router
+# --description). Two whole-model nodes serve independent requests as replicas behind strix-router: each request
+# runs on one node with the single-node identity. One device resolves single, exactly as before. Staged prefill
+# and tensor forms are not bound for this model; the long-prefill regime waits for its receipt.
+[multi_device]
+version = 1
+default = "replica"
+fallback = "single"
+
+[multi_device.forms.replica]
+ranks = 2
+objective = "throughput"
+
+[multi_device.regimes.long_prefill]
+phase = "prefill"
+min_prompt_rows = 4096
+prefer = ["layers", "single"]
+enabled = false

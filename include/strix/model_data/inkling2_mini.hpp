@@ -42,6 +42,25 @@ inline constexpr std::int64_t mxfp8_first = 20;
 inline constexpr double route_scale = 0x1p+3 /* 8 */;
 inline constexpr double up_softcap = 0x1.9p+4 /* 25 */;
 } // namespace moe
+namespace multi_device {
+inline constexpr std::string_view default_ = "replica";
+inline constexpr std::string_view fallback = "single";
+namespace forms {
+namespace replica {
+inline constexpr std::string_view objective = "throughput";
+inline constexpr std::int64_t ranks = 2;
+} // namespace replica
+} // namespace forms
+namespace regimes {
+namespace long_prefill {
+inline constexpr bool enabled = false;
+inline constexpr std::int64_t min_prompt_rows = 4096;
+inline constexpr std::string_view phase = "prefill";
+inline constexpr std::string_view prefer[] = {"layers", "single"};
+} // namespace long_prefill
+} // namespace regimes
+inline constexpr std::int64_t version = 1;
+} // namespace multi_device
 inline constexpr std::string_view name = "inkling2-mini";
 namespace presets {
 inline constexpr std::string_view default_ = "exact";

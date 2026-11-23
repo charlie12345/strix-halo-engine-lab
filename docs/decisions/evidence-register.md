@@ -249,3 +249,20 @@ this observation does not assert deployment of a remote user binary. Detailed
 receipts and original comparative inputs remain outside Git. See the
 [profile adoption record](../engine/decode/optimization-profile.md#qualified-adoption-2026-10-15)
 for the model identity, fallback policy, measurement scope and remaining gates.
+
+## Inkling 2 Mini Q8_0 attention and head on gfx1151
+
+**observed** (2026-11-23). Policy `weights.attention_head.q8_0@1` (attention projections and output head stored as
+Q8_0, converted from BF16 at load), HIP 7.16 on gfx1151, checkpoint SHA-256 `65e60f51…39d1`, gate v2 against the
+EXACT reference with a null arm, 39 held-out windows of three content classes (prose, code, structured) at 8K, 32K
+and 64K context.
+
+- Prefill regime: PASS, 2,457 pooled rows (KL 0.00044, top-1 0.9963, dNLL -0.00066 ± 0.00053), every class, band
+  and window inside its limits. Prompt timing on the same device: 4K 2,544 -> 2,541 ms, 8K 4,684 -> 4,673 ms,
+  32K 20,650 -> 20,732 ms (no gain: the prompt projections are bound by the WMMA rate, not by weight bytes). The
+  decision row is therefore gate-only (`kMiniWeightLoadRows`, regime `prefill`, band <= 65,536).
+- Decode regime: HOLD by the reference-window rule (one window above the bar after a median shift); no row.
+- Selection rule: one resident image serves both regimes, so the Q8_0 image is taken only when every regime has a
+  gate v2 PASS row and one of them a measured gain; FAST keeps the BF16 image on this device today.
+
+Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.

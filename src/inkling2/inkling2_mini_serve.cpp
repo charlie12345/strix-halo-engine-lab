@@ -185,14 +185,16 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
+            const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
             if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
-                const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
-                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope);
+                const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope, opt.context);
                 out << " weight_storage " << plan.storage.name << '@' << plan.storage.revision
                     << " weight_status " << profile::status_name(plan.status);
             } else {
-                out << " weight_status pending-device";
+                out << " weight_status pending-device weight_rows "
+                    << weight::registered_regime_rows(kMiniWeightLoadPolicy, backend, kMiniWeightLoadRegimes,
+                                                      kMiniWeightLoadDecisions);
             }
             out << '\n';
         },

@@ -23,7 +23,7 @@ inline MiniServeCohort make_mini_device_cohort(
     unsigned row_limit = std::numeric_limits<unsigned>::max()) {
     const auto rows = std::min(opt.slots ? opt.slots : opt.prefill_rows, row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
-    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
+    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), opt.context);
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
     decoder->set_moe_w4a4(opt.moe_w4a4);
@@ -45,7 +45,8 @@ inline MiniServeCohort make_mini_device_cohort(
               << " cohort_programs " << (programs.enabled ? "on" : "off")
               << " widths " << exec::cohort_widths_name(programs.widths)
 #endif
-              << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n";
+              << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n"
+              << weight::weight_load_regime_receipt(weights) << '\n';
     return {std::move(cohort), weights};
 }
 

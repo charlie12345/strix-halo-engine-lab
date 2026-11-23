@@ -147,7 +147,11 @@ void test_selection() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto backend : {weight::Backend::hip, weight::Backend::cuda}) {
         const weight::WeightLoadScope scope{backend, "test-device", "test-compiler", "decode", digest(1), digest(2)};
-        const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4)}};
+        // One image serves prefill and decode: a full decode row selects it once prefill has its gate row.
+        auto prefill = scope;
+        prefill.regime = weight::kPrefillRegime;
+        const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4)},
+                                  weight::WeightLoadDecision{policy.id, prefill, digest(6), {}}};
         weight::WeightLoadRequest request{profile::Name::standard, scope, formats, true, true};
         const auto resolve = [&] {
             return mini::resolve_mini_weight_load(request.tier, request.scope, request.consumer_formats,
@@ -170,6 +174,8 @@ void test_selection() {
         no_speed.front().measured_gain = {};
         require(mini::resolve_mini_weight_load(request.tier, scope, formats, true, false, no_speed).storage ==
                     weight::kBf16WeightStorage, "missing measured gain");
+        require(mini::resolve_mini_weight_load(request.tier, scope, formats, true, false, std::span(receipts).first(1))
+                    .storage == weight::kBf16WeightStorage, "a regime without a gate row needs a second image");
         request.scope.checkpoint = digest(5);
         require(resolve().status == profile::Status::pending && resolve().storage == weight::kBf16WeightStorage,
                 "unqualified checkpoint used FAST storage");
@@ -183,7 +189,9 @@ void test_selection() {
 }
 
 // Every committed decision row names the current consumer arithmetic: bumping a resident Q8_0 route's revision
-// retires the row, and this test then says so instead of FAST silently falling back to BF16.
+// retires the row, and this test then says so instead of FAST silently falling back to BF16. The committed table
+// resolves, on its own device scope, to exactly what its rows qualify: a regime with no gate row (or only gate-only
+// rows) keeps the image BF16 and the receipt line names every regime's row.
 void test_committed_rows() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto& row : mini::kMiniWeightLoadDecisions) {
@@ -194,28 +202,64 @@ void test_committed_rows() {
                 "decision row is stale: resident Q8_0 arithmetic revision changed, re-qualify or remove the row");
         require(row.policy.name == mini::kMiniWeightLoadPolicy.id.name &&
                     row.policy.revision == mini::kMiniWeightLoadPolicy.id.revision &&
-                    row.scope.regime == mini::kMiniResidentRegime, "decision row policy/regime");
-        auto plan = mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, true, false);
-        require(plan.status == profile::Status::set && plan.storage == weight::kQ8WeightStorage &&
-                    plan.gate_v2_pass == row.gate_v2_pass, "FAST default did not select the qualified Q8_0 row");
-        require(mini::resolve_mini_weight_load(profile::Name::standard, row.scope, formats, true, false).storage ==
-                    weight::kBf16WeightStorage, "EXACT changed by a FAST row");
-        require(mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, false, false).storage ==
-                    weight::kBf16WeightStorage, "--no-weight-q8 ignored");
+                    std::ranges::find(mini::kMiniWeightLoadRegimes, row.scope.regime) != mini::kMiniWeightLoadRegimes.end(),
+                "decision row policy/regime");
+        require(!(row.gate_v2_pass == weight::Digest256{}) && !row.evidence.receipt.empty() &&
+                    row.evidence.receipt.starts_with("docs/") && row.evidence.date.size() == 10U && row.evidence.rows > 0U,
+                "decision row without its gate receipt id, date and rows");
+        const auto context = row.evidence.max_context ? row.evidence.max_context : 8192U;
+        bool every_regime = true, gain = false;
+        for (const auto regime : mini::kMiniWeightLoadRegimes) {
+            auto scope = row.scope;
+            scope.regime = regime;
+            const auto* gate = weight::find_weight_load_gate(mini::kMiniWeightLoadPolicy, scope,
+                                                             mini::kMiniWeightLoadDecisions, context);
+            every_regime = every_regime && gate;
+            gain = gain || (gate && !(gate->measured_gain == weight::Digest256{}));
+        }
+        const bool selects = every_regime && gain;
+        auto plan = mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, true, false,
+                                                   mini::kMiniWeightLoadDecisions, context);
+        require(plan.storage == (selects ? weight::kQ8WeightStorage : weight::kBf16WeightStorage) &&
+                    plan.status == (selects ? profile::Status::set : profile::Status::pending),
+                "FAST storage differs from what the committed rows qualify");
+        require(plan.regime_count == mini::kMiniWeightLoadRegimes.size(), "every regime reported");
+        for (const auto& entry : plan.regime_rows())
+            if (entry.regime == row.scope.regime)
+                require(entry.row == &row, "the committed row is the one its regime reports");
+        require(weight::weight_load_regime_receipt(plan).find(row.evidence.receipt) != std::string::npos,
+                "receipt line names the row's receipt");
+        require(mini::resolve_mini_weight_load(profile::Name::standard, row.scope, formats, true, false,
+                    mini::kMiniWeightLoadDecisions, context).storage == weight::kBf16WeightStorage,
+                "EXACT changed by a FAST row");
+        require(mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, false, false,
+                    mini::kMiniWeightLoadDecisions, context).status == profile::Status::off, "--no-weight-q8 ignored");
+        if (row.evidence.max_context) {
+            plan = mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, true, false,
+                                                  mini::kMiniWeightLoadDecisions, row.evidence.max_context + 1U);
+            for (const auto& entry : plan.regime_rows())
+                if (entry.regime == row.scope.regime)
+                    require(!entry.row && entry.outside_band == &row, "a context outside the band is reported");
+        }
         auto other = row.scope;
         other.device_class = "gfx1100";
-        plan = mini::resolve_mini_weight_load(profile::Name::fast, other, formats, true, false);
-        require(plan.status == profile::Status::pending && plan.storage == weight::kBf16WeightStorage,
-                "row admitted on another device");
+        plan = mini::resolve_mini_weight_load(profile::Name::fast, other, formats, true, false,
+                                              mini::kMiniWeightLoadDecisions, context);
+        require(plan.storage == weight::kBf16WeightStorage && plan.regimes[0].row == nullptr &&
+                    plan.regimes[1].row == nullptr, "row admitted on another device");
         other = row.scope;
         other.checkpoint.bytes[0] = static_cast<std::uint8_t>(other.checkpoint.bytes[0] ^ 1U);
-        require(mini::resolve_mini_weight_load(profile::Name::fast, other, formats, true, false).storage ==
-                    weight::kBf16WeightStorage, "row admitted on another checkpoint");
+        require(weight::find_weight_load_gate(mini::kMiniWeightLoadPolicy, other, mini::kMiniWeightLoadDecisions,
+                                              context) == nullptr, "row admitted on another checkpoint");
         other = row.scope;
         other.checkpoint = {};
-        require(mini::resolve_mini_weight_load(profile::Name::fast, other, formats, true, false).storage ==
-                    weight::kBf16WeightStorage, "empty scope admitted");
+        require(weight::find_weight_load_gate(mini::kMiniWeightLoadPolicy, other, mini::kMiniWeightLoadDecisions,
+                                              context) == nullptr, "empty scope admitted");
     }
+    // Today: prefill gate-only (no measured gain in prefill), decode no row -> FAST keeps the BF16 image on gfx1151.
+    require(weight::registered_regime_rows(mini::kMiniWeightLoadPolicy, weight::Backend::hip, mini::kMiniWeightLoadRegimes,
+                                           mini::kMiniWeightLoadDecisions) == "prefill=gate-only@gfx1151,decode=none",
+            "registered rows of the route line");
 }
 
 void test_token_bytes() {

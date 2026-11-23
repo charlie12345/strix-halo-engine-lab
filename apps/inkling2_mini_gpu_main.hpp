@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
         auto options = cli::parse(argc, argv, family);
 #endif
         const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
-        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
+        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), kMaxContext);
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
@@ -279,6 +279,7 @@ int main(int argc, char** argv) {
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);
             cli::write_weight_load_plan(std::cerr, weights);
+            std::cerr << strix::weight::weight_load_regime_receipt(weights) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("

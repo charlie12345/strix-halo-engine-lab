@@ -49,10 +49,14 @@ inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }
 
+// The one resolver of the CLI and the server: `context` is the largest context the instance admits (see
+// resolve_mini_weight_load); the receipt line weight::weight_load_regime_receipt says which regime rows are active.
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
-                                                              const weight::WeightLoadScope& scope) {
+                                                              const weight::WeightLoadScope& scope,
+                                                              std::uint32_t context) {
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
-    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8);
+    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8,
+                                               kMiniWeightLoadDecisions, context);
     if (options.qualify_q8 && plan.storage != weight::kQ8WeightStorage)
         throw std::invalid_argument("native Q8_0 weights were not admitted");
     return plan;

@@ -290,7 +290,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
         const strix::weight::WeightLoadScope scope{kind, {}, {}, {}, {}, {}};
-        const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope);
+        const auto weights = mini::resolve_mini_resident_weight_load(options.tier, options.weight_options, scope,
+                                                                       options.context);
         created = true;
         return mini::MiniServeCohort{
             std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(sample_capable), 32U, 3U, 2U), weights};

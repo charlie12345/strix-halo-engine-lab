@@ -212,6 +212,22 @@ void check_lowbit_policies() {
           "a legacy binding keeps the head format");
     check(wei::find_weight_load_policy("weights.attention_q4_g64.head_q6_g64@1") == &wei::kAttentionQ4HeadQ6Policy,
           "mix key finds its shared row");
+    // Head-only rows: every other tagged role stays BF16, the head takes the low-bit storage; EXACT stays BF16.
+    for (const auto* policy : {&wei::kHeadQ6Policy, &wei::kHeadQ4Policy}) {
+        const auto head = resolve(*policy, strix::profile::Name::fast, all);
+        check(head.storage == wei::kBf16WeightStorage && head.head_storage == policy->head_target() &&
+                  head.storage_for(wei::Role::head) == policy->head_target() &&
+                  head.storage_for(std::nullopt) == wei::kBf16WeightStorage,
+              "head-only row: low-bit head, BF16 elsewhere");
+        const auto off = resolve(*policy, strix::profile::Name::fast, no_q6);
+        check(policy == &wei::kHeadQ4Policy || off.head_storage == wei::kBf16WeightStorage,
+              "head-only q6 row needs a q6 consumer");
+        const auto standard = resolve(*policy, strix::profile::Name::standard, all);
+        check(standard.head_storage == wei::kBf16WeightStorage, "head-only row: EXACT stays BF16");
+    }
+    check(wei::find_weight_load_policy("weights.head.q4_g64@1") == &wei::kHeadQ4Policy &&
+              wei::find_weight_load_policy("weights.head.q6_g64@1") == &wei::kHeadQ6Policy,
+          "head-only keys find their shared rows");
 }
 
 

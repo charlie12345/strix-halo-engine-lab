@@ -2,9 +2,12 @@
 // position) on the Inkling 2 Mini decode shape (24 query heads, 8 KV heads, d128, relative bias extent 1024, sinks).
 // Per case: both outputs vs a double reference of the same contract (FP32 Q, unrounded P), split determinism over two
 // launches (also proves the ticket reset), then microseconds per launch (cudaEvent, `--iters`). Prints RESULT PASS|FAIL.
-// bits / flash_bits / rows17_bits: output digests of the split, the one-row flash and a 17-row host-position flash block,
-// for comparing two builds of the kernels case by case.
-// Usage: cuda_core_decode_split_bench [--iters N] [--check-only]
+// bits / flash_bits / rows: output digests of the split, the one-row flash and host-position flash blocks of 16 / 17 / 128 /
+// 129 rows (both sides of the 16-row warp slice and of the 128-row query tile), for comparing two builds case by case.
+// Every launch is checked (a failed launch exits rc 2); outputs start as a sentinel and every live element must be written;
+// the blocks are checked against the double reference on sampled rows. --inject-unwritten skips the 17-row launch (negative
+// control: the run must FAIL).
+// Usage: cuda_core_decode_split_bench [--iters N] [--check-only] [--inject-unwritten]
 #include "strix/cuda_core/attention.hpp"
 #include "strix/attention_split_plan.hpp"
 
@@ -27,6 +30,21 @@ namespace {
 constexpr unsigned kHeads = 24, kKv = 8, kDim = 128, kExtent = 1024;
 constexpr float kScale = 0.08838834764831845f;
 bool g_fail = false;
+bool g_inject_unwritten = false;
+constexpr std::uint32_t kSentinel = 0xffffffffU;  // a NaN no kernel stores
+
+// NaN-aware running maximum (std::max keeps its left side against a NaN).
+void raise_max(double& m, double v) { m = (v != v || m != m) ? v + m : std::max(m, v); }
+
+std::size_t unwritten(const std::vector<float>& v, std::size_t live) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < live; ++i) {
+        std::uint32_t u = 0;
+        std::memcpy(&u, &v[i], sizeof u);
+        n += u == kSentinel ? 1U : 0U;
+    }
+    return n;
+}
 
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -43,6 +61,7 @@ struct Dev {
     ~Dev() { cudaFree(p); }
     Dev(const Dev&) = delete;
     Dev& operator=(const Dev&) = delete;
+    void poison() { check(cudaMemset(p, 0xff, n * sizeof(T)), "sentinel"); }
     void put(const std::vector<T>& h) { check(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "h2d"); }
     std::vector<T> get() const {
         std::vector<T> h(n);
@@ -99,6 +118,8 @@ void run_case(const Case& c, int iters, bool check_only) {
     check(cc::decode_split_workspace_init(ws.p, dims, c.window, nullptr), "ws init");
     const auto* kb = reinterpret_cast<const __nv_bfloat16*>(dk.p);
     const auto* vb = reinterpret_cast<const __nv_bfloat16*>(dv.p);
+    out_flash.poison();
+    out_split.poison();
     const auto flash = [&] {
         return cc::attention_prefill_prepared_bf16(dims, prepared, dq.p, kb, vb, c.position, 1, out_flash.p, nullptr,
                                                    cc::FlashPipe::pad2, dpos.p);
@@ -146,14 +167,14 @@ void run_case(const Case& c, int iters, bool check_only) {
         for (unsigned i = 0; i < kDim; ++i) {
             const double ref = o[i] / den;
             scale_ref = std::max(scale_ref, std::fabs(ref));
-            err_split = std::max(err_split, std::fabs(first[h * kDim + i] - ref));
-            err_flash = std::max(err_flash, std::fabs(fl[h * kDim + i] - ref));
+            raise_max(err_split, std::fabs(first[h * kDim + i] - ref));
+            raise_max(err_flash, std::fabs(fl[h * kDim + i] - ref));
         }
     }
     // FP32 split: bound 1e-4 of the output scale; it must not be worse than the BF16-operand flash.
     const double bound = 1e-4 * std::max(scale_ref, 1e-3);
-    const bool ok = det && err_split <= bound && err_split <= std::max(err_flash, bound);
-    if (!ok) g_fail = true;
+    const std::size_t miss1 = unwritten(fl, fl.size()) + unwritten(first, first.size());
+    bool ok = det && miss1 == 0 && err_flash == err_flash && err_split <= bound && err_split <= std::max(err_flash, bound);
     const auto plan = strix::attn_split::decode_split_plan(c.position, c.window);
     // FNV-1a of output bits: compares two builds of the kernels case by case (schedule changes must keep them)
     const auto fnv = [](const std::vector<float>& v) {
@@ -165,34 +186,92 @@ void run_case(const Case& c, int iters, bool check_only) {
         }
         return bits;
     };
-    // The same flash at a host position over a 17-row block ending at this case's row (a prompt's partial query tile):
-    // per-row relative bias and sinks, one 128-row tile with two of its eight 16-row slices live.
-    constexpr unsigned kRows = 17U;
-    unsigned long long rows_bits = 0ULL;
-    {
-        std::vector<float> hq17(static_cast<std::size_t>(kRows) * kHeads * kDim), hb17(static_cast<std::size_t>(kRows) * kHeads * kExtent),
-            hs17(static_cast<std::size_t>(kRows) * kHeads);
-        for (auto& x : hq17) x = uni(rng) * 2.0f;
-        for (auto& x : hb17) x = uni(rng);
-        for (auto& x : hs17) x = uni(rng) * 2.0f;
-        Dev<float> dq17(hq17.size()), db17(hb17.size()), ds17(hs17.size()), out17(hq17.size());
-        dq17.put(hq17);
-        db17.put(hb17);
-        ds17.put(hs17);
-        const cc::PreparedBf16Flash prepared17{db17.p, ds17.p, kExtent, c.window, c.wrapped, false};
-        const auto e = cc::attention_prefill_prepared_bf16(dims, prepared17, dq17.p, kb, vb, c.position + 1U - kRows, kRows,
-                                                           out17.p, nullptr, cc::FlashPipe::pad2, nullptr);
-        if (e == cudaSuccess) {
+    // The same flash at host positions over blocks of 16 / 17 / 128 / 129 rows ending at this case's row (a prompt's tiles):
+    // per-row relative bias and sinks; 16 | 17 straddle the first 16-row warp slice, 128 | 129 the 128-row query tile.
+    // A block the cache cannot hold (wrapped ring shorter than window + rows - 1) is skipped in both builds alike.
+    constexpr unsigned kBlockRows[] = {16U, 17U, 128U, 129U};
+    char rows_text[200] = {0};
+    std::size_t rows_text_len = 0;
+    double err_rows = 0, scale_rows = 0;
+    std::size_t miss_rows = 0;
+    for (const unsigned rows : kBlockRows) {
+        unsigned long long rows_bits = 0ULL;
+        const bool fits = !c.wrapped || c.window + rows - 1U <= c.capacity;
+        if (fits) {
+            const unsigned pos0 = c.position + 1U >= rows ? c.position + 1U - rows : 0U;
+            const std::size_t live = static_cast<std::size_t>(rows) * kHeads * kDim;
+            std::vector<float> hqr(live), hbr(static_cast<std::size_t>(rows) * kHeads * kExtent),
+                hsr(static_cast<std::size_t>(rows) * kHeads);
+            for (auto& x : hqr) x = uni(rng) * 2.0f;
+            for (auto& x : hbr) x = uni(rng);
+            for (auto& x : hsr) x = uni(rng) * 2.0f;
+            Dev<float> dqr(hqr.size()), dbr(hbr.size()), dsr(hsr.size()), outr(live);
+            dqr.put(hqr);
+            dbr.put(hbr);
+            dsr.put(hsr);
+            outr.poison();
+            const cc::PreparedBf16Flash prepared_rows{dbr.p, dsr.p, kExtent, c.window, c.wrapped, false};
+            if (!(g_inject_unwritten && rows == 17U))
+                check(cc::attention_prefill_prepared_bf16(dims, prepared_rows, dqr.p, kb, vb, pos0, rows, outr.p, nullptr,
+                                                          cc::FlashPipe::pad2, nullptr),
+                      "flash rows");
             check(cudaDeviceSynchronize(), "sync rows");
-            rows_bits = fnv(out17.get());
-        } else {
-            (void)cudaGetLastError();
+            const auto out = outr.get();
+            miss_rows += unwritten(out, live);
+            rows_bits = fnv(out);
+            // double reference on the rows next to each boundary and on the last row (this case's own position)
+            const unsigned sample[] = {15U, 16U, 127U, 128U, rows - 1U};
+            for (unsigned si = 0; si < 5U; ++si) {
+                const unsigned r = sample[si];
+                if (r >= rows || (si == 4U && (r == 15U || r == 16U || r == 127U || r == 128U))) continue;
+                const unsigned p = pos0 + r;
+                const unsigned rlo = c.window && p >= c.window ? p - c.window + 1U : 0U;
+                for (unsigned h = 0; h < kHeads; ++h) {
+                    const unsigned kvh = h / (kHeads / kKv);
+                    const float* qr = hqr.data() + (static_cast<std::size_t>(r) * kHeads + h) * kDim;
+                    const float* br = hbr.data() + (static_cast<std::size_t>(r) * kHeads + h) * kExtent;
+                    const double sink = hsr[static_cast<std::size_t>(r) * kHeads + h];
+                    std::vector<double> sc(p - rlo + 1U);
+                    double mx = sink;
+                    for (unsigned key = rlo; key <= p; ++key) {
+                        const unsigned slot = c.wrapped ? key % c.capacity : key;
+                        const std::uint16_t* kr = hk.data() + (static_cast<std::size_t>(slot) * kKv + kvh) * kDim;
+                        double dot = 0;
+                        for (unsigned i = 0; i < kDim; ++i) dot += static_cast<double>(qr[i]) * bf2f(kr[i]);
+                        const unsigned dist = p - key;
+                        sc[key - rlo] = dot * kScale + (dist < kExtent ? br[dist] : 0.0);
+                        mx = std::max(mx, sc[key - rlo]);
+                    }
+                    double den = std::exp(sink - mx);
+                    std::vector<double> o(kDim, 0.0);
+                    for (unsigned key = rlo; key <= p; ++key) {
+                        const unsigned slot = c.wrapped ? key % c.capacity : key;
+                        const std::uint16_t* vr = hv.data() + (static_cast<std::size_t>(slot) * kKv + kvh) * kDim;
+                        const double pk = std::exp(sc[key - rlo] - mx);
+                        den += pk;
+                        for (unsigned i = 0; i < kDim; ++i) o[i] += pk * bf2f(vr[i]);
+                    }
+                    const float* got = out.data() + (static_cast<std::size_t>(r) * kHeads + h) * kDim;
+                    for (unsigned i = 0; i < kDim; ++i) {
+                        const double ref = o[i] / den;
+                        scale_rows = std::max(scale_rows, std::fabs(ref));
+                        raise_max(err_rows, std::fabs(got[i] - ref));
+                    }
+                }
+            }
         }
+        const int w = std::snprintf(rows_text + rows_text_len, sizeof rows_text - rows_text_len, "%s%u:%016llx%s",
+                                    rows_text_len ? "," : "", rows, rows_bits, fits ? "" : "-skip");
+        if (w > 0) rows_text_len = std::min(sizeof rows_text - 1U, rows_text_len + static_cast<std::size_t>(w));
     }
+    // BF16 Q and P operands: a few 1e-3 of the output scale; 2e-2 (or 8x the one-row flash error) only rejects wrong rows.
+    const double bound_rows = std::max(2e-2 * std::max(scale_rows, 1e-3), 8.0 * err_flash);
+    ok = ok && miss_rows == 0 && err_rows == err_rows && err_rows <= bound_rows;
+    if (!ok) g_fail = true;
     std::printf("SPLIT %s pos=%u window=%u wrapped=%d splits=%u chunk=%u err_split=%.3e err_flash=%.3e ref_scale=%.3e det=%s "
-                "bits=%016llx flash_bits=%016llx rows17_bits=%016llx %s\n",
+                "bits=%016llx flash_bits=%016llx err_rows=%.3e unwritten=%zu rows=%s %s\n",
                 c.name, c.position, c.window, c.wrapped ? 1 : 0, plan.splits, plan.chunk, err_split, err_flash, scale_ref,
-                det ? "EQUAL" : "DIFF", fnv(first), fnv(fl), rows_bits, ok ? "PASS" : "FAIL");
+                det ? "EQUAL" : "DIFF", fnv(first), fnv(fl), err_rows, miss1 + miss_rows, rows_text, ok ? "PASS" : "FAIL");
     if (check_only) return;
 
     cudaEvent_t a, b;
@@ -223,6 +302,11 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--check-only")) check_only = true;
+        else if (!std::strcmp(argv[i], "--inject-unwritten")) g_inject_unwritten = true;
+        else {
+            std::printf("unknown option %s\n", argv[i]);
+            return 2;
+        }
     }
     // sliding visits (window 1024, wrapped ring) and full visits (prefix, unwrapped) at 0.1K / 1K / 2.5K / 8K / 16K
     const Case cases[] = {

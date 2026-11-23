@@ -74,6 +74,9 @@ cudaError_t attention_decode_row_phase(const AttentionDims& d, const float* q, c
 // T mod S tiles form a partial wave that bills a whole CTA time. split: those tiles run as jobs of w active warps (w = 1/2/4, the
 // smallest with (T mod S) * 8 / w <= S, or tail_warps if non-zero), so the partial wave spreads over the idle SMs. Every warp keeps its
 // 16 rows, its head and the tile count of its 128-row block, so each output row runs the same instructions on the same tiles.
+// Live slices of the prepared / planned forms (scheduling only, SAME bits): a warp whose 16 rows all lie at or past `rows`
+// (one-row step, verify-row, lane and planned calls; a prompt's last tile) only copies K/V and meets the barriers, so a one-row
+// call does 1/8 of the tile's mma work.
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
                                     float* out, cudaStream_t stream, FlashPipe pipe = FlashPipe::pad2, FlashTail tail = FlashTail::off,

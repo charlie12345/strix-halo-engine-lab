@@ -2,6 +2,8 @@
 // position) on the Inkling 2 Mini decode shape (24 query heads, 8 KV heads, d128, relative bias extent 1024, sinks).
 // Per case: both outputs vs a double reference of the same contract (FP32 Q, unrounded P), split determinism over two
 // launches (also proves the ticket reset), then microseconds per launch (cudaEvent, `--iters`). Prints RESULT PASS|FAIL.
+// bits / flash_bits / rows17_bits: output digests of the split, the one-row flash and a 17-row host-position flash block,
+// for comparing two builds of the kernels case by case.
 // Usage: cuda_core_decode_split_bench [--iters N] [--check-only]
 #include "strix/cuda_core/attention.hpp"
 #include "strix/attention_split_plan.hpp"
@@ -153,17 +155,44 @@ void run_case(const Case& c, int iters, bool check_only) {
     const bool ok = det && err_split <= bound && err_split <= std::max(err_flash, bound);
     if (!ok) g_fail = true;
     const auto plan = strix::attn_split::decode_split_plan(c.position, c.window);
-    // FNV-1a of the split output bits: compares two builds of the kernel case by case (schedule changes must keep them)
-    unsigned long long bits = 1469598103934665603ULL;
-    for (const float f : first) {
-        std::uint32_t u = 0;
-        std::memcpy(&u, &f, sizeof u);
-        for (unsigned b = 0; b < 4U; ++b) bits = (bits ^ ((u >> (8U * b)) & 0xffU)) * 1099511628211ULL;
+    // FNV-1a of output bits: compares two builds of the kernels case by case (schedule changes must keep them)
+    const auto fnv = [](const std::vector<float>& v) {
+        unsigned long long bits = 1469598103934665603ULL;
+        for (const float f : v) {
+            std::uint32_t u = 0;
+            std::memcpy(&u, &f, sizeof u);
+            for (unsigned b = 0; b < 4U; ++b) bits = (bits ^ ((u >> (8U * b)) & 0xffU)) * 1099511628211ULL;
+        }
+        return bits;
+    };
+    // The same flash at a host position over a 17-row block ending at this case's row (a prompt's partial query tile):
+    // per-row relative bias and sinks, one 128-row tile with two of its eight 16-row slices live.
+    constexpr unsigned kRows = 17U;
+    unsigned long long rows_bits = 0ULL;
+    {
+        std::vector<float> hq17(static_cast<std::size_t>(kRows) * kHeads * kDim), hb17(static_cast<std::size_t>(kRows) * kHeads * kExtent),
+            hs17(static_cast<std::size_t>(kRows) * kHeads);
+        for (auto& x : hq17) x = uni(rng) * 2.0f;
+        for (auto& x : hb17) x = uni(rng);
+        for (auto& x : hs17) x = uni(rng) * 2.0f;
+        Dev<float> dq17(hq17.size()), db17(hb17.size()), ds17(hs17.size()), out17(hq17.size());
+        dq17.put(hq17);
+        db17.put(hb17);
+        ds17.put(hs17);
+        const cc::PreparedBf16Flash prepared17{db17.p, ds17.p, kExtent, c.window, c.wrapped, false};
+        const auto e = cc::attention_prefill_prepared_bf16(dims, prepared17, dq17.p, kb, vb, c.position + 1U - kRows, kRows,
+                                                           out17.p, nullptr, cc::FlashPipe::pad2, nullptr);
+        if (e == cudaSuccess) {
+            check(cudaDeviceSynchronize(), "sync rows");
+            rows_bits = fnv(out17.get());
+        } else {
+            (void)cudaGetLastError();
+        }
     }
     std::printf("SPLIT %s pos=%u window=%u wrapped=%d splits=%u chunk=%u err_split=%.3e err_flash=%.3e ref_scale=%.3e det=%s "
-                "bits=%016llx %s\n",
+                "bits=%016llx flash_bits=%016llx rows17_bits=%016llx %s\n",
                 c.name, c.position, c.window, c.wrapped ? 1 : 0, plan.splits, plan.chunk, err_split, err_flash, scale_ref,
-                det ? "EQUAL" : "DIFF", bits, ok ? "PASS" : "FAIL");
+                det ? "EQUAL" : "DIFF", fnv(first), fnv(fl), rows_bits, ok ? "PASS" : "FAIL");
     if (check_only) return;
 
     cudaEvent_t a, b;

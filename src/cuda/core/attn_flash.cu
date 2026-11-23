@@ -144,8 +144,12 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
     const std::uint32_t qb = nqb - 1 - tile % nqb;  // heavy (late) blocks first
     const std::uint32_t head = tile / nqb, G = d.heads / d.kv_heads, kvh = head / G;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q4 = lane & 3;
-    const bool act = static_cast<std::uint32_t>(warp) - wlo < wn;  // warp-uniform
     const std::uint32_t row_base = qb * QB, wrow0 = row_base + warp * 16;
+    // Prepared forms: a warp whose 16 rows all lie at or past `rows` (the one-row step, verify-row and lane forms, planned
+    // calls, a prompt's last tile) has every score masked and stores nothing, and no other warp reads its registers: it only
+    // copies K/V and meets the barriers, so each stored row runs the same instructions on the same tiles while the tile's
+    // mma work shrinks (one row: 1/8). The plain prompt flash keeps every warp (its code is unchanged).
+    const bool act = static_cast<std::uint32_t>(warp) - wlo < wn && (!Prepared || wrow0 < rows);  // warp-uniform
     const auto fixed = attn_core::mask::block_range(pos0, rows, prepared.window);
     const std::uint32_t nkeys = Bidirectional ? fixed.end : pos0 + min(rows, row_base + QB);
     const std::uint32_t first_key = Bidirectional ? fixed.begin :

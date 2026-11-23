@@ -453,8 +453,8 @@ __global__ void iota_kernel(std::uint32_t* p, std::uint32_t n, std::uint32_t bas
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
                                     float* out, cudaStream_t stream, FlashPipe pipe, FlashTail tail, std::uint32_t tail_warps) {
-    if (d.head_dim != PadLayout::D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8 || pos0 + rows > d.max_positions)
-        return cudaErrorInvalidValue;
+    static_assert(PadLayout::D == static_cast<int>(kPrefillFlashHeadDim) && SwzLayout::D == static_cast<int>(kPrefillFlashHeadDim));
+    if (!can_launch_prefill_flash(d, pos0, rows)) return cudaErrorInvalidValue;
     static int sms = 0;
     if (sms == 0 && tail != FlashTail::off) {
         int dev = 0;

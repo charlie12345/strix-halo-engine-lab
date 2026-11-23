@@ -270,6 +270,8 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda")
     endforeach()
     add_test(NAME cuda_core_flash_bench COMMAND cuda_core_flash_bench --check-only)  # flash pipes bitwise identical, flash8 finite
+    # host only (no CUDA call): every launch of the decode split bench is admitted by the engine's launch predicates
+    add_test(NAME cuda_core_decode_split_bench_args COMMAND cuda_core_decode_split_bench --check-args)
     set_tests_properties(cuda_core_flash_bench PROPERTIES LABELS "gpu;cuda")
 endif()
 

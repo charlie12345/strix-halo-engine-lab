@@ -12,7 +12,11 @@
 // (layouts change addresses, never arithmetic) and TIME reports both pipes with GB/s of the unique K/V bytes walked.
 // --inject-stale skips the second split launch and --inject-nonfinite stores the same infinity in every one-row output:
 // both are negative controls of the overwrite and finite checks (the run must FAIL).
-// Usage: cuda_core_decode_split_bench [--iters N] [--check-only] [--inject-unwritten] [--inject-stale] [--inject-nonfinite]
+// Before any CUDA call every launch of the run is checked against the engine's host admission predicates (ARGS line; a
+// refused launch exits rc 3 with no device work). --check-args stops after that check: a kit dry run proves the arguments
+// without touching the GPU.
+// Usage: cuda_core_decode_split_bench [--iters N] [--check-only] [--check-args] [--inject-unwritten] [--inject-stale]
+//        [--inject-nonfinite]
 #include "strix/cuda_core/attention.hpp"
 #include "strix/attention_split_plan.hpp"
 
@@ -108,6 +112,65 @@ struct Case {
     unsigned capacity, window, position;
     bool wrapped;
 };
+
+// sliding visits (window 1024, wrapped ring) and full visits (prefix, unwrapped) at 0.1K / 1K / 2.5K / 8K / 16K
+constexpr Case kCases[] = {
+    {"sliding", 1280, 1024, 37, true},   {"sliding", 1280, 1024, 1023, true}, {"sliding", 1280, 1024, 2520, true},
+    {"sliding", 1280, 1024, 8191, true}, {"full", 16384, 0, 37, false},      {"full", 16384, 0, 100, false},
+    {"full", 16384, 0, 255, false},      {"full", 16384, 0, 256, false},     {"full", 16384, 0, 511, false},
+    {"full", 16384, 0, 1023, false},     {"full", 16384, 0, 2520, false},    {"full", 16384, 0, 8191, false},
+    {"full", 16384, 0, 16383, false},
+    // position-canonical plan: aligned sliding row (4 chunks), short window straddling a unit (one pass from first),
+    // past 16K keys (512-key aligned chunks)
+    {"sliding", 1280, 1024, 2559, true}, {"short", 256, 200, 3000, true}, {"full", 20480, 0, 20000, false},
+};
+// host-position flash blocks: both sides of the 16-row warp slice and of the 128-row query tile
+constexpr unsigned kBlockRows[] = {16U, 17U, 128U, 129U};
+bool block_fits(const Case& c, unsigned rows) { return !c.wrapped || c.window + rows - 1U <= c.capacity; }
+unsigned block_pos0(const Case& c, unsigned rows) { return c.position + 1U >= rows ? c.position + 1U - rows : 0U; }
+
+// Plain prompt flash (Qwen's prefill form) serves head_dim cc::kPrefillFlashHeadDim only: its own geometry, 24 q / 8 kv heads.
+constexpr unsigned kPlainCapacity = 2048U, kPlainMaxRows = 1000U;
+constexpr float kPlainScale = 0.0625f;  // 1 / sqrt(256)
+struct Plain { unsigned pos0, rows; };
+constexpr Plain kPlainCases[] = {{0U, 17U}, {0U, 129U}, {700U, 1000U}, {1023U, 300U}};
+cc::AttentionDims plain_dims() { return {kHeads, kKv, cc::kPrefillFlashHeadDim, kPlainScale, kPlainCapacity}; }
+
+// Every launch of the run against the engine's host admission predicates, with aligned distinct host stand-ins for the device
+// pointers (the predicates read only alignment, nullness and aliasing). No CUDA call. Returns the refused launch count.
+unsigned check_args(unsigned& launches) {
+    alignas(16) static float q[4], out[4], bias[4], sinks[4];
+    alignas(16) static std::uint16_t kc[8], vc[8];
+    alignas(16) static std::uint32_t pos[4];
+    alignas(16) static unsigned char ws[16];
+    const auto* k = reinterpret_cast<const __nv_bfloat16*>(kc);
+    const auto* v = reinterpret_cast<const __nv_bfloat16*>(vc);
+    unsigned refused = 0;
+    const auto admit = [&](bool ok, const char* what, unsigned a, unsigned b) {
+        ++launches;
+        if (!ok) {
+            ++refused;
+            std::printf("ARGS FAIL %s %u %u\n", what, a, b);
+        }
+    };
+    for (const auto& c : kCases) {
+        const cc::AttentionDims dims{kHeads, kKv, kDim, kScale, c.capacity};
+        const cc::PreparedBf16Flash prepared{bias, sinks, kExtent, c.window, c.wrapped, false};
+        for (const auto pipe : {cc::FlashPipe::pad2, cc::FlashPipe::swz3})
+            admit(cc::can_launch_prepared_bf16_flash(dims, prepared, q, k, v, c.position, 1U, out, pipe), "flash", c.position, 1U);
+        const std::size_t ws_bytes = cc::decode_split_workspace_bytes(dims, c.window);
+        admit(cc::can_launch_prepared_decode_split(dims, prepared, q, k, v, pos, out, ws, ws_bytes), "split", c.position, c.window);
+        for (const unsigned rows : kBlockRows)
+            if (block_fits(c, rows))
+                admit(cc::can_launch_prepared_bf16_flash(dims, prepared, q, k, v, block_pos0(c, rows), rows, out,
+                                                         cc::FlashPipe::pad2), "flash rows", c.position, rows);
+    }
+    for (const auto& p : kPlainCases)
+        for (int tail = 0; tail < 2; ++tail) admit(cc::can_launch_prefill_flash(plain_dims(), p.pos0, p.rows), "plain", p.pos0, p.rows);
+    // control: the predicate refuses the prepared forms' head_dim on the plain flash (the argument t3 passed)
+    admit(!cc::can_launch_prefill_flash({kHeads, kKv, kDim, kScale, kPlainCapacity}, 0U, 17U), "plain control d128", 0U, 17U);
+    return refused;
+}
 
 void run_case(const Case& c, int iters, bool check_only) {
     std::mt19937 rng(1234U + c.position);
@@ -224,16 +287,15 @@ void run_case(const Case& c, int iters, bool check_only) {
     // The same flash at host positions over blocks of 16 / 17 / 128 / 129 rows ending at this case's row (a prompt's tiles):
     // per-row relative bias and sinks; 16 | 17 straddle the first 16-row warp slice, 128 | 129 the 128-row query tile.
     // A block the cache cannot hold (wrapped ring shorter than window + rows - 1) is skipped in both builds alike.
-    constexpr unsigned kBlockRows[] = {16U, 17U, 128U, 129U};
     char rows_text[200] = {0};
     std::size_t rows_text_len = 0;
     double err_rows = 0, scale_rows = 0;
     std::size_t miss_rows = 0;
     for (const unsigned rows : kBlockRows) {
         unsigned long long rows_bits = 0ULL;
-        const bool fits = !c.wrapped || c.window + rows - 1U <= c.capacity;
+        const bool fits = block_fits(c, rows);
         if (fits) {
-            const unsigned pos0 = c.position + 1U >= rows ? c.position + 1U - rows : 0U;
+            const unsigned pos0 = block_pos0(c, rows);
             const std::size_t live = static_cast<std::size_t>(rows) * kHeads * kDim;
             std::vector<float> hqr(live), hbr(static_cast<std::size_t>(rows) * kHeads * kExtent),
                 hsr(static_cast<std::size_t>(rows) * kHeads);
@@ -343,35 +405,32 @@ void run_case(const Case& c, int iters, bool check_only) {
 // tail warps are the inactive-warp path of the body. Output digests compare two builds case by case; every element
 // must be written and finite.
 void run_plain() {
-    constexpr unsigned kCapacity = 2048U;
+    constexpr unsigned kD = cc::kPrefillFlashHeadDim;
     std::mt19937 rng(777U);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-    const std::size_t cache_elems = std::size_t{kCapacity} * kKv * kDim;
+    const std::size_t cache_elems = std::size_t{kPlainCapacity} * kKv * kD;
     std::vector<std::uint16_t> hk(cache_elems), hv(cache_elems);
     for (auto& x : hk) x = f2bf(uni(rng) * 2.0f);
     for (auto& x : hv) x = f2bf(uni(rng));
-    constexpr unsigned kMaxRowsPlain = 1000U;
-    std::vector<float> hq(std::size_t{kMaxRowsPlain} * kHeads * kDim);
+    std::vector<float> hq(std::size_t{kPlainMaxRows} * kHeads * kD);
     for (auto& x : hq) x = uni(rng) * 2.0f;
     Dev<std::uint16_t> dk(cache_elems), dv(cache_elems);
     Dev<float> dq(hq.size()), out(hq.size());
     dk.put(hk);
     dv.put(hv);
     dq.put(hq);
-    const cc::AttentionDims dims{kHeads, kKv, kDim, kScale, kCapacity};
+    const cc::AttentionDims dims = plain_dims();
     const auto* kb = reinterpret_cast<const __nv_bfloat16*>(dk.p);
     const auto* vb = reinterpret_cast<const __nv_bfloat16*>(dv.p);
-    struct Plain { unsigned pos0, rows; };
-    const Plain cases[] = {{0U, 17U}, {0U, 129U}, {700U, 1000U}, {1023U, 300U}};
-    for (const auto& c : cases) {
+    for (const auto& c : kPlainCases) {
         for (const auto tail : {cc::FlashTail::off, cc::FlashTail::split}) {
             out.poison();
-            const cc::GroupedView qv{c.rows, kHeads, kDim};
+            const cc::GroupedView qv{c.rows, kHeads, kD};
             check(cc::attention_prefill_flash(dims, dq.p, qv, nullptr, {}, kb, vb, c.pos0, c.rows, out.p, nullptr,
                                               cc::FlashPipe::pad2, tail), "plain flash");
             check(cudaDeviceSynchronize(), "sync plain");
             const auto o = out.get();
-            const std::size_t live = std::size_t{c.rows} * kHeads * kDim, miss = unwritten(o, live), bad = nonfinite(o, live);
+            const std::size_t live = std::size_t{c.rows} * kHeads * kD, miss = unwritten(o, live), bad = nonfinite(o, live);
             unsigned long long bits = 1469598103934665603ULL;
             for (std::size_t i = 0; i < live; ++i) {
                 std::uint32_t u = 0;
@@ -388,10 +447,11 @@ void run_plain() {
 
 int main(int argc, char** argv) {
     int iters = 200;
-    bool check_only = false;
+    bool check_only = false, args_only = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--check-only")) check_only = true;
+        else if (!std::strcmp(argv[i], "--check-args")) args_only = true;
         else if (!std::strcmp(argv[i], "--inject-unwritten")) g_inject_unwritten = true;
         else if (!std::strcmp(argv[i], "--inject-stale")) g_inject_stale = true;
         else if (!std::strcmp(argv[i], "--inject-nonfinite")) g_inject_nonfinite = true;
@@ -400,18 +460,12 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    // sliding visits (window 1024, wrapped ring) and full visits (prefix, unwrapped) at 0.1K / 1K / 2.5K / 8K / 16K
-    const Case cases[] = {
-        {"sliding", 1280, 1024, 37, true},   {"sliding", 1280, 1024, 1023, true}, {"sliding", 1280, 1024, 2520, true},
-        {"sliding", 1280, 1024, 8191, true}, {"full", 16384, 0, 37, false},      {"full", 16384, 0, 100, false},
-        {"full", 16384, 0, 255, false},      {"full", 16384, 0, 256, false},     {"full", 16384, 0, 511, false},
-        {"full", 16384, 0, 1023, false},     {"full", 16384, 0, 2520, false},    {"full", 16384, 0, 8191, false},
-        {"full", 16384, 0, 16383, false},
-        // position-canonical plan: aligned sliding row (4 chunks), short window straddling a unit (one pass from first),
-        // past 16K keys (512-key aligned chunks)
-        {"sliding", 1280, 1024, 2559, true}, {"short", 256, 200, 3000, true}, {"full", 20480, 0, 20000, false},
-    };
-    for (const auto& c : cases) run_case(c, iters, check_only);
+    unsigned launches = 0;
+    const unsigned refused = check_args(launches);  // host only: no CUDA call before this line
+    std::printf("ARGS %s launches=%u refused=%u\n", refused == 0 ? "ok" : "FAIL", launches, refused);
+    if (refused != 0) return 3;
+    if (args_only) return 0;
+    for (const auto& c : kCases) run_case(c, iters, check_only);
     run_plain();
     std::printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

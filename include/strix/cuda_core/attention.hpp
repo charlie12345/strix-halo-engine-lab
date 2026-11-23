@@ -77,6 +77,13 @@ cudaError_t attention_decode_row_phase(const AttentionDims& d, const float* q, c
 // Live slices of the prepared / planned forms (scheduling only, SAME bits): a warp whose 16 rows all lie at or past `rows`
 // (one-row step, verify-row, lane and planned calls; a prompt's last tile) only copies K/V and meets the barriers, so a one-row
 // call does 1/8 of the tile's mma work.
+inline constexpr std::uint32_t kPrefillFlashHeadDim = 256;  // the plain prompt flash (both pipes); the prepared forms serve 128
+// Host-only admission of attention_prefill_flash (no CUDA call, overflow-safe): the launch returns cudaErrorInvalidValue exactly
+// when this is false, so a caller or a harness can refuse a wrong argument before any device work.
+[[nodiscard]] inline bool can_launch_prefill_flash(const AttentionDims& d, std::uint32_t pos0, std::uint32_t rows) {
+    return d.head_dim == kPrefillFlashHeadDim && rows != 0 && d.kv_heads != 0 && d.heads % d.kv_heads == 0 &&
+           d.heads / d.kv_heads <= 8 && pos0 <= d.max_positions && rows <= d.max_positions - pos0;
+}
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
                                     float* out, cudaStream_t stream, FlashPipe pipe = FlashPipe::pad2, FlashTail tail = FlashTail::off,

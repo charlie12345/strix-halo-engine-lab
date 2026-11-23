@@ -357,6 +357,15 @@ public:
     }
 
 #if defined(__HIPCC__)
+    // Projections on a BF16 operand image (the shared tile's image rows: same bits as dense on the FP32 rows).
+    static constexpr bool admits_dense_bf16_image(unsigned width, unsigned rows) {
+        return core::fma_rows::admits_bf16_image_rows(width, rows);
+    }
+    void dense_bf16_image(const std::uint16_t* input, unsigned width, unsigned rows,
+                          std::span<const Projection> projections) {
+        check(core::fma_rows::enqueue_bf16_image_rows(input, width, rows, projections, kVocabulary, stream_));
+    }
+
     // Low-rank controller gate pair with the controller as the shared tile's epilogue; false = not admitted.
     bool dense_controller(const float* input, unsigned width, unsigned rows, std::span<const Projection> gates,
                           const core::residual_mix::ControllerArgs& control) {

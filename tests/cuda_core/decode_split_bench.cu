@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -167,7 +168,7 @@ void run_case(const Case& c, int iters, bool check_only) {
     auto fz = out_swz.get();
     const bool pipes_equal = std::memcmp(fl.data(), fz.data(), fl.size() * sizeof(float)) == 0;
     if (g_inject_nonfinite)
-        for (auto* v : {&first, &second, &fl, &fz}) (*v)[0] = HUGE_VALF;
+        for (auto* v : {&first, &second, &fl, &fz}) (*v)[0] = std::numeric_limits<float>::infinity();
 
     // double reference
     const unsigned lo = c.window && c.position >= c.window ? c.position - c.window + 1U : 0U;

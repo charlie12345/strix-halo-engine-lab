@@ -40,6 +40,27 @@ enum class Decode : std::uint8_t { reference, shift };
 // fit. automatic: tall where it fits, else staged. A backend with a single schedule ignores the trait.
 enum class Schedule : std::uint8_t { automatic, staged, tall };
 
+// Operand form of a tile launch (backend-neutral trait). bf16_tile: the tile family above (Decode / Schedule). small_f16
+// (FAST, bit-changing): tiles of at most kSmallMaxRows rows on the small-M schedule of the f16 tile family
+// (core/f16_tile_gemm_small.hpp with core/microscaled_f16_staging.hpp): the codes are FP16 WMMA operands held in
+// registers (one weight read per tile, no LDS stage for B), one FP32 multiplier per scale group on the accumulator, the
+// outer scale at the store. Row r's bits depend on its own inputs and the shape only (not on the tile's other rows or
+// the row tile count). Needs max_tile_rows in 1..kSmallMaxRows, inputs % 128 == 0, outputs % 64 == 0, 4-byte aligned
+// scale rows; the activated (epilogue) launches refuse it.
+enum class Form : std::uint8_t { bf16_tile, small_f16 };
+inline constexpr unsigned kSmallMaxRows = 48U;
+
+// Row plan of the small form: CTAs of 16 row_tiles rows (row_tiles 1 for tiles of <= 16 rows, else 2), row_blocks of them
+// per tile (y grid = tiles x row_blocks); {0, 0} refuses (unknown or too many rows).
+struct SmallRows {
+    unsigned row_tiles, row_blocks;
+};
+STRIX_GROUPED_ROWS_HD constexpr SmallRows small_rows(unsigned max_tile_rows) {
+    if (max_tile_rows == 0U || max_tile_rows > kSmallMaxRows) return {0U, 0U};
+    const unsigned row_tiles = max_tile_rows <= 16U ? 1U : 2U;
+    return {row_tiles, (max_tile_rows + 16U * row_tiles - 1U) / (16U * row_tiles)};
+}
+
 struct Args {
     const TileRows* tiles{};
     unsigned count{};
@@ -58,6 +79,7 @@ struct Args {
     float up_cap{};
     Decode decode{Decode::reference};
     Schedule schedule{Schedule::automatic};
+    Form form{Form::bf16_tile};
 };
 
 // Args of a gate-up whose tiles read their input rows in place: a tile whose input is gather_from + first x input_row

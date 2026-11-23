@@ -59,6 +59,7 @@ struct HipBackend {
     static constexpr auto launch_activated_indirect = grouped_microscaled::launch_activated_indirect<Format>;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
+    static constexpr bool small_form = true;  // grouped_microscaled::Form::small_f16
 #endif
 };
 #endif
@@ -283,6 +284,9 @@ struct DevicePlan {
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16;
     // Schedule of both BF16 projections (never changes bits): automatic = the backend's tall slab schedule where it fits.
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic;
+    // Operand form of both projections (FAST trait, grouped_microscaled::Form): small_f16 needs a backend with the small
+    // form (Backend::small_form) and plan rows <= kSmallMaxRows; it runs gate-up without the activation epilogue.
+    grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile;
 };
 
 // Load-time admission of the W4A4 operand class for one layer's experts (stage copies need 16-byte code rows and 8-byte scale
@@ -356,6 +360,12 @@ inline typename Backend::Status enqueue(
                                   plan.tile_count, plan.failure, max_tile_rows};
     gate_up.decode = down.decode = plan.decode;
     gate_up.schedule = down.schedule = plan.schedule;
+    gate_up.form = down.form = plan.form;
+    if (plan.form != grouped_microscaled::Form::bf16_tile) {
+        if constexpr (!requires { Backend::small_form; }) return Backend::invalid_value;
+        if (plan.rows > grouped_microscaled::kSmallMaxRows || plan.activations != grouped_w4a4::Activations::bf16)
+            return Backend::invalid_value;
+    }
     if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
     // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at
     // workspace.bf16 (the base the plan's gathered addresses are relative to) instead of top_k gathered copies; each
@@ -404,7 +414,7 @@ inline typename Backend::Status enqueue(
     if (status != Backend::success) return status;
     bool epilogue = false;
     if constexpr (activation_epilogue<Config, Backend>)
-        epilogue = workspace.activation.size() >= need.activation &&
+        epilogue = plan.form == grouped_microscaled::Form::bf16_tile && workspace.activation.size() >= need.activation &&
                    reinterpret_cast<std::uintptr_t>(workspace.activation.data()) % 16U == 0U;
     if (epilogue) {
         // The plan's down inputs address BF16 activation rows in workspace.bf16: rebased into workspace.activation
@@ -462,7 +472,8 @@ inline typename Backend::Status enqueue_resident(
     Workspace workspace, typename Backend::Stream stream, LogitExtent logit_extent, Route select,
     grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference,
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16,
-    grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic) {
+    grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic,
+    grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile) {
     using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
     device_grouped::Args args{};
     if (!prepare_resident<Config, Backend>(layer, rows, route, matrices, csr, out, workspace, args)) {
@@ -483,7 +494,7 @@ inline typename Backend::Status enqueue_resident(
     const auto tiles = args.out.tile_capacity;
     const DevicePlan plan{layer, rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
                           {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles},
-                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule};
+                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule, form};
     return enqueue<Config, Backend>(plan, input, output, workspace, stream);
 }
 #endif

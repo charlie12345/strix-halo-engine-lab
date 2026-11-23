@@ -1,6 +1,10 @@
 #pragma once
 
 #include "core/f16_tile_gemm.hpp"
+#if defined(__HIPCC__)
+#include "core/f16_tile_gemm_small.hpp"
+#include "core/microscaled_f16_staging.hpp"
+#endif
 #include "moe_core/expert_activation.hpp"
 #include "moe_core/grouped_microscaled_rows.hpp"
 
@@ -125,6 +129,74 @@ struct IndirectRows {
     }
 };
 
+// Small form (Form::small_f16, FAST): one CTA per (64-column panel, tile, row block); the tile's rows read in place
+// (map: the gathered row r is gather_from + map[r] x input_row) or from its own input rows (rebased like TileBinding).
+template <packed::MatrixFormat Format>
+struct SmallTile {
+    using Operand = core::microscaled_f16::Operand<Format>;
+    struct AChunk {
+        gemm::U4 v;
+    };
+    unsigned K, rows, outputs;
+    packed::PackedMatrix weights;
+    const std::uint16_t* input;
+    std::size_t input_row;
+    const std::uint32_t* map;
+    float* output;
+    std::size_t output_row;
+
+    __device__ __forceinline__ typename Operand::Row row(unsigned column) const { return Operand::row(weights, column); }
+    __device__ __forceinline__ AChunk load_a(unsigned r, unsigned k, bool in) const {
+        const std::size_t base = (map ? std::size_t{map[r]} : std::size_t{r}) * input_row;
+        return {in ? *reinterpret_cast<const gemm::U4*>(input + base + k) : gemm::U4{}};
+    }
+    // Eight BF16 elements to FP16 pairs (exact for |x| in the FP16 normal range).
+    __device__ __forceinline__ static gemm::U4 pack_a(const AChunk& x) {
+        gemm::U4 out;
+#pragma unroll
+        for (unsigned i = 0; i < 4U; ++i)
+            out[i] = gemm::detail::pack(__builtin_bit_cast(float, x.v[i] << 16U),
+                                        __builtin_bit_cast(float, x.v[i] & 0xFFFF0000U));
+        return out;
+    }
+    __device__ __forceinline__ void store(unsigned r, unsigned column, float sum) const {
+        output[std::size_t{r} * output_row + column] = sum * weights.outer_scale;
+    }
+};
+
+template <packed::MatrixFormat Format, unsigned RowTiles>
+__global__ __launch_bounds__(128) void small_kernel(Args args, const std::uint32_t* gather_rows,
+                                                    const std::uint16_t* gather_from, unsigned row_blocks) {
+    const unsigned tile = blockIdx.y / row_blocks, r0 = blockIdx.y % row_blocks * (16U * RowTiles);
+    if (!TileBinding<Format>::active(args, tile)) return;
+    const TileRows rows = args.tiles[tile];
+    if (r0 >= rows.rows) return;
+    SmallTile<Format> t{args.inputs, rows.rows, args.outputs, rows.weights, rows.input, rows.input_row, nullptr,
+                        rows.output, rows.output_row};
+    if (gather_rows) {
+        t.map = gather_rows + static_cast<std::size_t>(rows.input - gather_from) / rows.input_row;
+        t.input = gather_from;
+    } else if (args.rebase_to) {
+        t.input = args.rebase_to + (rows.input - args.rebase_from);
+    }
+    gemm::small_m::run<typename SmallTile<Format>::Operand, RowTiles, 1U>(t, r0, blockIdx.x * gemm::kProjectionPanel);
+}
+
+template <packed::MatrixFormat Format>
+inline hipError_t launch_small(const Args& args, const std::uint32_t* gather_rows, const std::uint16_t* gather_from,
+                               hipStream_t stream) {
+    const auto plan = small_rows(args.max_tile_rows);
+    if (plan.row_tiles == 0U || args.inputs % 128U != 0U || args.outputs % gemm::kProjectionPanel != 0U ||
+        args.count > 65535U / plan.row_blocks)
+        return hipErrorInvalidValue;
+    const dim3 grid(args.outputs / gemm::kProjectionPanel, args.count * plan.row_blocks);
+    if (plan.row_tiles == 1U)
+        STRIX_HIP_LAUNCH(Rdna3Layout, small_kernel<Format, 1U><<<grid, 128, 0, stream>>>(args, gather_rows, gather_from, plan.row_blocks));
+    else
+        STRIX_HIP_LAUNCH(Rdna3Layout, small_kernel<Format, 2U><<<grid, 128, 0, stream>>>(args, gather_rows, gather_from, plan.row_blocks));
+    return hipGetLastError();
+}
+
 // Schedule selection of a tile launch: tall where the inputs are a multiple of its stage (refused for Schedule::tall
 // otherwise); Schedule::staged or a narrower K: the incumbent over ceil(max tile rows / 128) row slices.
 template <class Binding, class A>
@@ -147,6 +219,7 @@ inline bool fits_indirect(const IndirectArgs& args) {
 template <packed::MatrixFormat Format>
 inline hipError_t launch(const Args& args, hipStream_t stream) {
     if (!fits(args)) return hipErrorInvalidValue;
+    if (args.form == Form::small_f16) return launch_small<Format>(args, nullptr, nullptr, stream);
     return launch_tiles<TileBinding<Format>>(args, stream);
 }
 
@@ -155,7 +228,7 @@ inline hipError_t launch(const Args& args, hipStream_t stream) {
 template <packed::MatrixFormat Format>
 inline hipError_t launch_activated(const Args& args, hipStream_t stream) {
     if (!fits(args) || !args.pair_rows || !args.rebase_from || !args.rebase_to || (args.outputs / 2U) % 64U != 0U ||
-        !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F))
+        !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F) || args.form != Form::bf16_tile)
         return hipErrorInvalidValue;
     return launch_tiles<ActivatedTileBinding<Format>>(args, stream);
 }
@@ -164,13 +237,14 @@ inline hipError_t launch_activated(const Args& args, hipStream_t stream) {
 template <packed::MatrixFormat Format>
 inline hipError_t launch_indirect(const IndirectArgs& args, hipStream_t stream) {
     if (!fits_indirect(args)) return hipErrorInvalidValue;
+    if (args.form == Form::small_f16) return launch_small<Format>(args, args.gather_rows, args.gather_from, stream);
     return launch_tiles<IndirectRows<TileBinding<Format>>>(args, stream);
 }
 
 template <packed::MatrixFormat Format>
 inline hipError_t launch_activated_indirect(const IndirectArgs& args, hipStream_t stream) {
     if (!fits_indirect(args) || !args.pair_rows || !args.rebase_from || !args.rebase_to || (args.outputs / 2U) % 64U != 0U ||
-        !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F))
+        !(args.gate_cap > 0.0F) || !(args.up_cap > 0.0F) || args.form != Form::bf16_tile)
         return hipErrorInvalidValue;
     return launch_tiles<IndirectRows<ActivatedTileBinding<Format>>>(args, stream);
 }

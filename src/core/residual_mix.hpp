@@ -556,7 +556,7 @@ __device__ __forceinline__ void emit_registers(const Args& args, std::size_t off
 // The mix body over rows first, first + step, ... (every thread of the block runs it; each row ends with a block
 // barrier). The mix kernel runs it from blockIdx.x by gridDim.x; the transition body runs its one row (0, 1).
 template <bool Normalized, bool ParallelBanks, class Args>
-__device__ __forceinline__ void mix_rows(const Args& args, std::size_t first, std::size_t step, float* scratch,
+__device__ __forceinline__ void mix_rows(Args args, unsigned first, unsigned step, float* scratch,
                                          float* inverse, float (*probability)[kMaxBanks]) {
     using Jobs = MixJobs<Args>;
     constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;

@@ -12,13 +12,17 @@ namespace strix::moe_core::microscaled_r1 {
 // Launch geometry. A wave owns `columns` consecutive outputs and streams their rows together (gate_up: the gate and
 // up rows of each column; down_combine: one row per column per routed expert). Each row keeps its own accumulator,
 // lane->K mapping and butterfly, so the column count changes no output bit. It sets how many rows share one wave's
-// dependent load chain (ids -> matrices -> codes -> scales).
+// dependent load chain (ids -> matrices -> codes -> scales): on gfx1151 one row per wave left that chain carrying
+// 1.3 KB (gate) / 0.65 KB (down) and the kernels at 61 % / 53 % of the byte roof.
+// sm_120 (no-model bench cuda_core_moe_r1_geometry_bench, synthetic top-8 2304 / 1152 experts, rows 1): one column
+// per warp left gate_up / down_combine at 880 / 655-700 GB/s (NVFP4); two / four columns are 10 % / 14-19 % faster
+// per launch, with the same bits.
 struct Geometry {
     unsigned gate_columns, down_columns;
 };
 inline constexpr unsigned kWavesPerBlock = 8;
 inline constexpr Geometry kHipGeometry{2U, 4U};
-inline constexpr Geometry kCudaGeometry{1U, 1U};
+inline constexpr Geometry kCudaGeometry{2U, 4U};
 
 STRIX_R1_HD constexpr unsigned gate_blocks(unsigned intermediate, unsigned columns) {
     return (intermediate - 1U) / (kWavesPerBlock * columns) + 1U;
@@ -36,4 +40,3 @@ STRIX_R1_HD constexpr unsigned slot_row(unsigned col, unsigned i, unsigned colum
 
 }  // namespace strix::moe_core::microscaled_r1
 
-#undef STRIX_R1_HD

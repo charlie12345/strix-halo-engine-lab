@@ -18,7 +18,8 @@
 // Mix rows are written to a row type M with arrays pre[N] (+ post[N], + comb[N * N] when the Spec has them), e.g.
 // MixRow<S> below or a layout-equal model type (::strix::ds41::HcMix).
 
-#include "strix/ds41_layer.hpp"  // declared arithmetic (declared_sigmoid / rsqrt / exp, f16_to_float, round_to_bf16)
+#include "strix/core/chunked_dot.hpp"
+#include "strix/numeric/declared.hpp"  // declared arithmetic (declared_sigmoid / rsqrt / exp, f16_to_float, round_to_bf16)
 #include "strix/hc/hc_contract.hpp"
 
 #if defined(__HIPCC__)
@@ -32,6 +33,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#if !defined(__HIPCC__) && !defined(__GNUC__)
+#include <cmath>
+#endif
 
 namespace strix::core::hc {
 
@@ -50,6 +54,17 @@ struct PackedForm {
     static constexpr unsigned iterations = Iters;
     static constexpr unsigned streams = 4;
     static constexpr unsigned mixes = 24;
+};
+
+// The declared scalar arithmetic of a packed form (basic IEEE operations only, no transcendental intrinsics):
+// exp = declared_exp, sigmoid = 1 / (1 + declared_exp(-x)), rstd = 1 / correctly-rounded-sqrt(ss / n + eps).
+// Every packed-form binding that declares this arithmetic names this struct instead of keeping a model-named copy.
+struct DeclaredArithmetic {
+    STRIX_HC_HD static float exp(float x) { return ::strix::ds41::declared_exp(x); }
+    STRIX_HC_HD static float sigmoid(float x) { return 1.0F / (1.0F + ::strix::ds41::declared_exp(-x)); }
+    STRIX_HC_HD static float rstd(float sum_squares, unsigned n, float eps) {
+        return 1.0F / ::strix::ds41::declared_sqrt(sum_squares / static_cast<float>(n) + eps);
+    }
 };
 
 STRIX_HC_HD inline float packed_sum(float a, float b, float c, float d) {
@@ -169,9 +184,123 @@ const float* consume_peer(const float* peer, const void* payload, Wait wait) {
     return static_cast<const float*>(payload);
 }
 
+// Normalized projection: a producer of the projected packed input (PackedInput::projected). Unlike the raw form, the
+// stream row is normalized BEFORE the dot: f_i = x_i * rr (one rounding per element), then every mix is a blocked dot
+// of f. Squares: Lanes lane-strided chains (lane l: i = l, l + Lanes, ... ascending, fmaf from +0), pairwise tree
+// s_i = s_i + s_{i+h} for h = Lanes / 2 .. 1, rr = Math::rstd(ss, columns, eps). Dot: Blocks contiguous blocks of Block
+// inputs, block j: fmaf ascending from +0, then the pairwise tree p_i = p_i + p_{i+h} for h = Blocks / 2 .. 1.
+// Every helper is one stage of that order; schedules (block per j, last arrival, distributed tree) keep the bits.
+STRIX_HC_HD inline float projection_fma(float a, float b, float c) {
+#if defined(__HIPCC__) || defined(__GNUC__)
+    return __builtin_fmaf(a, b, c);
+#else
+    return std::fma(a, b, c);
+#endif
+}
+
+template <unsigned Lanes, unsigned Block, unsigned Blocks>
+struct NormalizedProjection {
+    static constexpr unsigned lanes = Lanes, block = Block, blocks = Blocks, columns = Block * Blocks;
+    static_assert((Lanes & (Lanes - 1)) == 0 && (Blocks & (Blocks - 1)) == 0 && columns % Lanes == 0, "power-of-two trees");
+
+    // Chain of lane `lane` of the sum of squares.
+    STRIX_HC_HD static inline float lane_squares(const float* x, unsigned lane) {
+        float a = 0.0F;
+        for (unsigned i = lane; i < columns; i += Lanes) a = projection_fma(x[i], x[i], a);
+        return a;
+    }
+    // The same chain with every load issued before the first fmaf.
+    STRIX_HC_HD static inline float lane_squares_staged(const float* x, unsigned lane) {
+        const float* xl = x + lane;
+        float v[columns / Lanes];
+#if defined(__HIPCC__)
+#pragma unroll
+#endif
+        for (unsigned k = 0; k < columns / Lanes; ++k) v[k] = xl[k * Lanes];
+        float a = 0.0F;
+#if defined(__HIPCC__)
+#pragma unroll
+#endif
+        for (unsigned k = 0; k < columns / Lanes; ++k) a = projection_fma(v[k], v[k], a);
+        return a;
+    }
+    // Tree levels h = Count / 2 .. 1 for schedules that run one level at a time.
+    template <unsigned Count, class Level>
+    STRIX_HC_HD static inline void levels(Level level) {
+        for (unsigned h = Count / 2; h > 0; h >>= 1U) level(h);
+    }
+    template <unsigned Count>
+    STRIX_HC_HD static inline float tree(float* p) {
+        for (unsigned h = Count / 2; h >= 1; h /= 2)
+            for (unsigned i = 0; i < h; ++i) p[i] = p[i] + p[i + h];
+        return p[0];
+    }
+    template <class Math>
+    STRIX_HC_HD static inline float rstd(float ss, float eps) {
+        return Math::rstd(ss, columns, eps);
+    }
+    STRIX_HC_HD static inline float normalized(float x, float rr) { return x * rr; }
+    // Chain of one block: f and w point at the block's first input.
+    STRIX_HC_HD static inline float block_dot(const float* f, const float* w) {
+        float acc = 0.0F;
+        for (unsigned i = 0; i < Block; ++i) acc = projection_fma(f[i], w[i], acc);
+        return acc;
+    }
+    // Scalar order of one row: f[columns] (normalized row) and z[mixes] (projected input), fn row-major [mixes][columns].
+    template <class Math>
+    STRIX_HC_HD static inline void project_row(const float* x, const float* fn, unsigned mixes, float eps, float* f, float* z) {
+        float s[Lanes];
+        for (unsigned l = 0; l < Lanes; ++l) s[l] = lane_squares(x, l);
+        const float rr = rstd<Math>(tree<Lanes>(s), eps);
+        for (unsigned i = 0; i < columns; ++i) f[i] = normalized(x[i], rr);
+        for (unsigned o = 0; o < mixes; ++o) {
+            float p[Blocks];
+            for (unsigned j = 0; j < Blocks; ++j) p[j] = block_dot(f + j * Block, fn + static_cast<std::size_t>(o) * columns + j * Block);
+            z[o] = tree<Blocks>(p);
+        }
+    }
+#if defined(__HIPCC__)
+    // Squares tree over the Lanes threads of a block (s holds Lanes floats; one barrier per level); every lane returns ss.
+    __device__ __forceinline__ static float lds_tree(float* s, float part) {
+        const unsigned l = threadIdx.x;
+        s[l] = part;
+        __syncthreads();
+        for (unsigned h = Lanes / 2; h > 0; h >>= 1U) {
+            if (l < h) s[l] = s[l] + s[l + h];
+            __syncthreads();
+        }
+        const float r = s[0];
+        __syncthreads();
+        return r;
+    }
+    // Block tree of one chain on 8 lanes: lane a owns partials a + 8 k; local levels are the tree's offsets 32, 16, 8
+    // (same left operands), the shuffles its offsets 4, 2, 1. The total is valid on lane 0. Coherent: the partials were
+    // stored by other work groups of the same launch, read at agent scope.
+    template <bool Coherent>
+    __device__ __forceinline__ static float lanes8_tree(const float* src, unsigned lane) {
+        static_assert(Blocks == 64, "8 lanes x 8 partials");
+        float p[8];
+#pragma unroll
+        for (unsigned k = 0; k < 8; ++k)
+            p[k] = Coherent ? __hip_atomic_load(&src[lane + 8 * k], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : src[lane + 8 * k];
+#pragma unroll
+        for (unsigned h = 4; h > 0; h >>= 1U) {
+#pragma unroll
+            for (unsigned k = 0; k < h; ++k) p[k] = p[k] + p[k + h];
+        }
+        float acc = p[0];
+        for (unsigned h = 4; h > 0; h >>= 1U) {
+            const float peer = __shfl_down(acc, h, 8);
+            if (lane < h) acc = acc + peer;
+        }
+        return acc;
+    }
+#endif
+};
+
 #if defined(__HIPCC__)
 inline constexpr unsigned wave = 32;
-inline constexpr unsigned chunk = static_cast<unsigned>(::strix::ds41::dot_chunk);  // elements per wave chunk of the long dots
+inline constexpr unsigned chunk = static_cast<unsigned>(::strix::core::dot_chunk);  // elements per wave chunk of the long dots
 inline constexpr unsigned chunk_k = chunk / wave;                          // values per lane in a chunk
 inline constexpr unsigned mix_tile = 8;                                    // rows per mix-partial block
 
@@ -217,11 +346,11 @@ __device__ __forceinline__ float butterfly(float v) {
     return v;
 }
 template <Spec S> __device__ __forceinline__ float fn_value(const FnElem<S>* __restrict__ fn, std::size_t i) {
-    if constexpr (S.fn == FnType::f16) return ::strix::ds41::f16_to_float(fn[i]);
+    if constexpr (S.fn == FnType::f16) return ::strix::numeric::f16_to_float(fn[i]);
     else return fn[i];
 }
 template <Spec S> __device__ __forceinline__ float store_value(float v) {
-    if constexpr (S.store == Store::bf16) return ::strix::ds41::round_to_bf16(v);
+    if constexpr (S.store == Store::bf16) return ::strix::numeric::round_to_bf16(v);
     else return v;
 }
 template <Spec S> __device__ __forceinline__ float post_value(float sigmoid) {
@@ -293,13 +422,13 @@ __device__ __forceinline__ void mix_final_wave(const float* __restrict__ partial
         for (unsigned c = 0; c < chunks; ++c) d = d + p[c];
     }
     constexpr unsigned h = S.streams;
-    const float rr = ::strix::ds41::declared_rsqrt(__shfl(d, static_cast<int>(mix_rows<S>), wave) / static_cast<float>(n) + norm_eps);
+    const float rr = ::strix::numeric::declared_rsqrt(__shfl(d, static_cast<int>(mix_rows<S>), wave) / static_cast<float>(n) + norm_eps);
     M& o = out[r];
     if constexpr (S.post_rows() == 0U) {
-        if (t < h) o.pre[t] = ::strix::ds41::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
+        if (t < h) o.pre[t] = ::strix::numeric::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
     } else {
-        if (t < h) o.pre[t] = ::strix::ds41::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
-        else if (t < 2 * h) o.post[t - h] = post_value<S>(::strix::ds41::declared_sigmoid((d * rr) * scale[1] + base[t]));
+        if (t < h) o.pre[t] = ::strix::numeric::declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
+        else if (t < 2 * h) o.post[t - h] = post_value<S>(::strix::numeric::declared_sigmoid((d * rr) * scale[1] + base[t]));
     }
     if constexpr (S.comb_rows() != 0U) {
         const unsigned e = t & 15U, j = e / h, k = e % h;
@@ -307,7 +436,7 @@ __device__ __forceinline__ void mix_final_wave(const float* __restrict__ partial
         auto at = [&](float x, unsigned jj, unsigned kk) { return __shfl(x, static_cast<int>(jj * h + kk), wave); };
         float mx = at(v, j, 0);
         for (unsigned kk = 1; kk < h; ++kk) { const float y = at(v, j, kk); mx = y > mx ? y : mx; }
-        v = ::strix::ds41::declared_exp(v - mx);
+        v = ::strix::numeric::declared_exp(v - mx);
         float sum = 0.0F;
         for (unsigned kk = 0; kk < h; ++kk) sum = sum + at(v, j, kk);
         v = v / sum + hc_eps;

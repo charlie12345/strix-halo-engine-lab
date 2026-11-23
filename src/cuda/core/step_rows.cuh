@@ -2,6 +2,7 @@
 
 #include "../../core/dense_row_plan.hpp"
 #include "../../core/step_rows_plan.hpp"
+#include "strix/exec/descriptor.hpp"
 
 #include <cuda_runtime.h>
 

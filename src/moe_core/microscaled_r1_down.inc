@@ -1,6 +1,11 @@
 // The planned entry has a compact group for each selection slot. The legacy
 // entry still computes that rank in the kernel, including for repeated IDs.
-    if (args.failure && *args.failure != 0U) return;
+    if (args.failure && args.failure[blockIdx.y] != 0U) return;
+    const auto at = row_offsets<TopK>(blockIdx.y, args.hidden, args.intermediate);
+    args.ids += at.route;
+    args.weights += at.route;
+    args.activation += at.activation;
+    args.output += at.output;
     __shared__ float terms[STRIX_R1_DOWN_COLUMNS][TopK];
     const unsigned col = blockIdx.x * STRIX_R1_DOWN_COLUMNS;
     const unsigned live = args.hidden - col;

@@ -2,6 +2,7 @@
 #include "strix/engine_profile.hpp"
 #include "strix/onfly_i4.hpp"
 #include "strix/prefill_identity.hpp"
+#include "strix/session/kv_precision.hpp"
 #include <array>
 #include <cstdlib>
 #include <functional>
@@ -27,6 +28,12 @@ using ::strix::profile::status_name;
 inline std::span<const Lever> levers() { return table; }
 using ::strix::profile::parse;  // shared tier words: exact (= default)|fast|quality|turbo
 inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
+// KV precision (--kv, strix/session/kv_precision.hpp): native BF16; the HIP 8-bit form is int8 (kv-int8-tok-v1, admitted
+// routes in validate_resolved_attention_kv_storage). gfx1151 has no FP8, so --kv fp8 is refused and turbo keeps BF16.
+inline constexpr ::strix::session::kv_precision::Caps kKvCaps{
+    "qwen-hip", ::strix::session::kv_precision::Precision::bf16,
+    ::strix::session::kv_precision::bit(::strix::session::kv_precision::Precision::int8), {}, {},
+    "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1)"};
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
 inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{
     {true, true, false}, {false, false, false, false, true, false, false, false, false}, "rtn-g64",
@@ -161,6 +168,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
     Resolution out{profile, {}, {}, {}};
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
+    const bool preset = ::strix::profile::model_preset();
     out.weights = ::strix::profile::turbo::resolve_weights(out.is_turbo(), inputs.weights,
         [&inputs](const char* key) { return environment(inputs.env, key); }, inputs.caps ? *inputs.caps : kWeightCaps);
     for (const auto& lever : rows) {
@@ -174,12 +182,13 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             ::strix::profile::regime_gate(inputs.regimes, lever.name, wanted, inputs.max_prompt_tokens) != nullptr;
         const bool cell_ready = lever.ready[column] || regime;
         const bool cell_provisional = lever.provisional[column] && !regime;
+        const auto admission = ::strix::profile::admit_profile_column(
+            cell_ready, lever.runnable[column], allow_pending, cell_provisional, preset);
         bool inherited = false;
         if (env && !cli && !wanted.empty() && std::string_view(env) == wanted) {
             const char* owned = environment(inputs.env, marker_key(lever));
-            const auto status = ::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional);
-            inherited = owned && std::string_view(owned) == marker(profile, status, env) &&
-                (status != Status::pending);
+            inherited = owned && std::string_view(owned) == marker(profile, admission, env) &&
+                (admission != Status::pending);
         }
         Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
         if (cli || (env && !inherited)) {
@@ -194,12 +203,12 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
                 throw std::invalid_argument(std::string(lever.env.empty() ? lever.option : lever.env) + "=" + entry.value +
                     " is not in this build (" + std::string(lever.source) + ")");
         } else if (wanted.empty()) continue;
-        else if (::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional) == Status::pending) {
+        else if (admission == Status::pending) {
             entry.status = Status::pending;
             entry.target = std::string(lever.target.empty() ? wanted : lever.target);
         } else {
             entry.value = std::string(wanted);
-            entry.status = ::strix::profile::admit_column(cell_ready, lever.runnable[column], allow_pending, cell_provisional);
+            entry.status = admission;
             if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
         }
         out.entries.push_back(std::move(entry));

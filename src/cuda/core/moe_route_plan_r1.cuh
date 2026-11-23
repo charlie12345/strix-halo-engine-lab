@@ -6,7 +6,7 @@
 
 namespace strix::moe_core::microscaled_r1::detail {
 
-template <packed::MatrixFormat Format, unsigned Columns>
+template <packed::MatrixFormat Format, unsigned TopK, unsigned Columns>
 __global__ __launch_bounds__(kThreads) void planned_gate_up(Args args) {
 #define STRIX_R1_GATE_COLUMNS Columns
 #include "moe_core/microscaled_r1_gate_up.inc"
@@ -64,7 +64,7 @@ void route_plan(const float* input, const float* weight, const float* bias, Rout
 template <plan_r1::MatrixFormat Format, unsigned TopK, unsigned Columns>
 cudaError_t launch_gate_up(const experts_r1::Args& args, cudaStream_t stream) {
     const dim3 grid(experts_r1::gate_blocks(args.intermediate, Columns), TopK);
-    experts_r1::detail::planned_gate_up<Format, Columns>
+    experts_r1::detail::planned_gate_up<Format, TopK, Columns>
         <<<grid, experts_r1::detail::kThreads, 0, stream>>>(args);
     return cudaGetLastError();
 }

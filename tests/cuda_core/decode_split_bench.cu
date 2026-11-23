@@ -7,6 +7,8 @@
 // Every launch is checked (a failed launch exits rc 2); outputs start as a sentinel and every live element must be written;
 // the blocks are checked against the double reference on sampled rows. --inject-unwritten skips the 17-row launch (negative
 // control: the run must FAIL).
+// The one-row flash also runs with the swz3 pipe (three stages, prefetch distance 2): its digest must equal the pad2 one
+// (layouts change addresses, never arithmetic) and TIME reports both pipes with GB/s of the unique K/V bytes walked.
 // Usage: cuda_core_decode_split_bench [--iters N] [--check-only] [--inject-unwritten]
 #include "strix/cuda_core/attention.hpp"
 #include "strix/attention_split_plan.hpp"
@@ -102,7 +104,8 @@ void run_case(const Case& c, int iters, bool check_only) {
     for (auto& x : hs) x = uni(rng) * 2.0f;
 
     Dev<std::uint16_t> dk(cache_elems), dv(cache_elems);
-    Dev<float> dq(hq.size()), db(hb.size()), ds(hs.size()), out_flash(kHeads * kDim), out_split(kHeads * kDim);
+    Dev<float> dq(hq.size()), db(hb.size()), ds(hs.size()), out_flash(kHeads * kDim), out_split(kHeads * kDim),
+        out_swz(kHeads * kDim);
     Dev<std::uint32_t> dpos(1);
     dk.put(hk);
     dv.put(hv);
@@ -120,15 +123,21 @@ void run_case(const Case& c, int iters, bool check_only) {
     const auto* vb = reinterpret_cast<const __nv_bfloat16*>(dv.p);
     out_flash.poison();
     out_split.poison();
+    out_swz.poison();
     const auto flash = [&] {
         return cc::attention_prefill_prepared_bf16(dims, prepared, dq.p, kb, vb, c.position, 1, out_flash.p, nullptr,
                                                    cc::FlashPipe::pad2, dpos.p);
+    };
+    const auto flash_swz = [&] {
+        return cc::attention_prefill_prepared_bf16(dims, prepared, dq.p, kb, vb, c.position, 1, out_swz.p, nullptr,
+                                                   cc::FlashPipe::swz3, dpos.p);
     };
     const auto split = [&] {
         return cc::attention_decode_prepared_split_bf16(dims, prepared, dq.p, kb, vb, dpos.p, out_split.p, ws.p, ws_bytes,
                                                         nullptr);
     };
     check(flash(), "flash");
+    check(flash_swz(), "flash swz3");
     check(split(), "split 1");
     check(cudaDeviceSynchronize(), "sync");
     const auto first = out_split.get();
@@ -137,6 +146,8 @@ void run_case(const Case& c, int iters, bool check_only) {
     const auto second = out_split.get();
     const bool det = std::memcmp(first.data(), second.data(), first.size() * sizeof(float)) == 0;
     const auto fl = out_flash.get();
+    const auto fz = out_swz.get();
+    const bool pipes_equal = std::memcmp(fl.data(), fz.data(), fl.size() * sizeof(float)) == 0;
 
     // double reference
     const unsigned lo = c.window && c.position >= c.window ? c.position - c.window + 1U : 0U;
@@ -174,7 +185,7 @@ void run_case(const Case& c, int iters, bool check_only) {
     // FP32 split: bound 1e-4 of the output scale; it must not be worse than the BF16-operand flash.
     const double bound = 1e-4 * std::max(scale_ref, 1e-3);
     const std::size_t miss1 = unwritten(fl, fl.size()) + unwritten(first, first.size());
-    bool ok = det && miss1 == 0 && err_flash == err_flash && err_split <= bound && err_split <= std::max(err_flash, bound);
+    bool ok = det && pipes_equal && unwritten(fz, fz.size()) == 0 && miss1 == 0 && err_flash == err_flash && err_split <= bound && err_split <= std::max(err_flash, bound);
     const auto plan = strix::attn_split::decode_split_plan(c.position, c.window);
     // FNV-1a of output bits: compares two builds of the kernels case by case (schedule changes must keep them)
     const auto fnv = [](const std::vector<float>& v) {
@@ -269,19 +280,20 @@ void run_case(const Case& c, int iters, bool check_only) {
     ok = ok && miss_rows == 0 && err_rows == err_rows && err_rows <= bound_rows;
     if (!ok) g_fail = true;
     std::printf("SPLIT %s pos=%u window=%u wrapped=%d splits=%u chunk=%u err_split=%.3e err_flash=%.3e ref_scale=%.3e det=%s "
-                "bits=%016llx flash_bits=%016llx err_rows=%.3e unwritten=%zu rows=%s %s\n",
+                "bits=%016llx flash_bits=%016llx swz3=%s err_rows=%.3e unwritten=%zu rows=%s %s\n",
                 c.name, c.position, c.window, c.wrapped ? 1 : 0, plan.splits, plan.chunk, err_split, err_flash, scale_ref,
-                det ? "EQUAL" : "DIFF", fnv(first), fnv(fl), err_rows, miss1 + miss_rows, rows_text, ok ? "PASS" : "FAIL");
+                det ? "EQUAL" : "DIFF", fnv(first), fnv(fl), pipes_equal ? "EQUAL" : "DIFF", err_rows, miss1 + miss_rows, rows_text, ok ? "PASS" : "FAIL");
     if (check_only) return;
 
     cudaEvent_t a, b;
     check(cudaEventCreate(&a), "event");
     check(cudaEventCreate(&b), "event");
-    float us[2] = {0, 0};
-    for (int arm = 0; arm < 2; ++arm) {
-        for (int w = 0; w < 10; ++w) check(arm ? split() : flash(), "warm");
+    float us[3] = {0, 0, 0};
+    const auto launch = [&](int arm) { return arm == 0 ? flash() : arm == 1 ? split() : flash_swz(); };
+    for (int arm = 0; arm < 3; ++arm) {
+        for (int w = 0; w < 10; ++w) check(launch(arm), "warm");
         check(cudaEventRecord(a), "rec");
-        for (int i = 0; i < iters; ++i) check(arm ? split() : flash(), "run");
+        for (int i = 0; i < iters; ++i) check(launch(arm), "run");
         check(cudaEventRecord(b), "rec");
         check(cudaEventSynchronize(b), "sync");
         float ms = 0;
@@ -290,8 +302,14 @@ void run_case(const Case& c, int iters, bool check_only) {
     }
     cudaEventDestroy(a);
     cudaEventDestroy(b);
-    std::printf("TIME %s pos=%u flash_us=%.2f split_us=%.2f ratio=%.2f\n", c.name, c.position, us[0], us[1],
-                us[1] > 0 ? us[0] / us[1] : 0.0f);
+    // unique K/V bytes of the walk (each KV head once; the 3 query heads of a group re-read it from L2)
+    const unsigned walked = c.position - lo + 1U;
+    const double kv_bytes = 2.0 * walked * kKv * kDim * sizeof(std::uint16_t);
+    const auto gbs = [&](float t) { return t > 0 ? kv_bytes / (1000.0 * t) : 0.0; };
+    std::printf("TIME %s pos=%u flash_us=%.2f split_us=%.2f ratio=%.2f swz3_us=%.2f swz3/pad2=%.3f kv_MB=%.2f "
+                "GBs_pad2=%.0f GBs_swz3=%.0f\n",
+                c.name, c.position, us[0], us[1], us[1] > 0 ? us[0] / us[1] : 0.0f, us[2], us[0] > 0 ? us[2] / us[0] : 0.0f,
+                kv_bytes / 1e6, gbs(us[0]), gbs(us[2]));
 }
 
 }  // namespace

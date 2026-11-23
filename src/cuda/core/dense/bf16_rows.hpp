@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/bf16_dense_row_plan.hpp"
+#include "cuda/core/dense/bf16_row_abi.hpp"
 #include "core/dense_row_plan.hpp"
 #include "cuda/core/lookup_cuda.cuh"
 #include "strix/core/rows.hpp"

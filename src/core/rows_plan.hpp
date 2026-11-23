@@ -11,11 +11,17 @@ struct RoleFormat {
     weight::FormatId format;
 };
 
+// How an MXFP8 job with `splits == 0` gets its count. `incumbent` is the default of every binding: the count of
+// the incumbent rows plan (split_k::factor), so the arithmetic is the incumbent tree. `occupancy` is an explicit,
+// opt-in numerical identity (kMxfp8OccupancySplitIdentity): the count that fills the device wave target.
+enum class SplitPolicy : std::uint8_t { incumbent, occupancy };
+
 struct RoleJob {
     weight::Role role;
     Job job;
-    // Zero selects the planner's count. A pinned count replays an MXFP8 identity.
+    // Zero selects the count of `policy`. A pinned count replays an MXFP8 identity.
     std::uint32_t splits = 0;
+    SplitPolicy policy = SplitPolicy::incumbent;
 };
 
 struct SplitLimits {
@@ -43,6 +49,10 @@ struct SplitTree {
     constexpr bool operator==(const SplitTree&) const = default;
 };
 
+// Numerical identity of the occupancy-selected MXFP8 tree (SplitPolicy::occupancy); the incumbent tree keeps
+// kMxfp8SplitIdentity.
+inline constexpr std::string_view kMxfp8OccupancySplitIdentity = "mxfp8-f32-block-dot-splitk-occupancy-v1";
+
 struct PlannedLaunch {
     Launch launch;
     std::array<SplitTree, kMaxJobs> trees; // Empty for unsplit row-tile forms.
@@ -68,8 +78,8 @@ private:
 };
 
 // Formats are supplied by the caller's resolved weight-role policy. This plan
-// takes FP32 activations. Each MXFP8 job chooses its count from its shape and
-// device limits so grouping or a different row count cannot change its bits.
+// takes FP32 activations. An MXFP8 job's count is a function of its shape (and, for the opt-in occupancy policy,
+// the device) so grouping or a different row count cannot change its bits. The default is the incumbent count.
 [[nodiscard]] RowsPlan plan_rows(std::span<const RoleJob> jobs, std::span<const RoleFormat> formats,
                                  std::uint32_t rows, const device::Profile& device, SplitLimits limits);
 

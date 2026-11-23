@@ -52,9 +52,15 @@ RowsPlan plan_rows(std::span<const RoleJob> jobs, std::span<const RoleFormat> fo
             const auto chunks = entry.job.in / launch.chunk_in;
             const auto cap = std::min(chunks, limits.max_splits);
             auto splits = launch.splits[member];
+            auto identity = launch.split_identity();
             if (launch.form == Form::mxfp8_split_k) {
-                const auto needed = (result.target_blocks_ + blocks - 1) / blocks;
-                splits = entry.splits != 0 ? entry.splits : static_cast<std::uint32_t>(std::min<std::uint64_t>(needed, cap));
+                if (entry.splits != 0) {
+                    splits = entry.splits;
+                } else if (entry.policy == SplitPolicy::occupancy) {
+                    const auto needed = (result.target_blocks_ + blocks - 1) / blocks;
+                    splits = static_cast<std::uint32_t>(std::min<std::uint64_t>(needed, cap));
+                    identity = kMxfp8OccupancySplitIdentity;
+                }
             } else if (entry.splits != 0 && entry.splits != splits) {
                 throw std::invalid_argument("rows: requested split changes the incumbent arithmetic");
             }
@@ -62,7 +68,7 @@ RowsPlan plan_rows(std::span<const RoleJob> jobs, std::span<const RoleFormat> fo
 
             planned.roles[member] = entry.role;
             if (launch.form != Form::row_tile)
-                planned.trees[member] = {launch.split_identity(), launch.chunk_in, chunks, splits};
+                planned.trees[member] = {identity, launch.chunk_in, chunks, splits};
             planned.launch.splits[member] = splits;
             planned.launch.useful_blocks += std::uint64_t{blocks} * splits;
         }
@@ -72,7 +78,7 @@ RowsPlan plan_rows(std::span<const RoleJob> jobs, std::span<const RoleFormat> fo
 
 float mxfp8_rows_reference(const SplitTree& tree, std::span<const std::uint8_t> codes,
                            std::span<const std::uint8_t> scales, std::span<const float> x) {
-    if (!tree.valid() || tree.arithmetic != kMxfp8SplitIdentity || tree.chunk_in != kBlockIn ||
+    if (!tree.valid() || (tree.arithmetic != kMxfp8SplitIdentity && tree.arithmetic != kMxfp8OccupancySplitIdentity) || tree.chunk_in != kBlockIn ||
         codes.size() != std::uint64_t{tree.chunks} * tree.chunk_in || x.size() != codes.size() ||
         scales.size() != tree.chunks)
         throw std::invalid_argument("rows: invalid MXFP8 reference tree or input");

@@ -40,7 +40,8 @@ void occupancy() {
     strix::device::Profile device{};
     device.units = 3;
     auto q = make_job(weight::Role::attention_q, rows::kMxfp8Rows, 128, 7 * 32);
-    const auto k = make_job(weight::Role::attention_k, rows::kMxfp8Rows, 16, 5 * 32);
+    auto k = make_job(weight::Role::attention_k, rows::kMxfp8Rows, 16, 5 * 32);
+    q.policy = k.policy = rows::SplitPolicy::occupancy; // the opt-in identity; the default is the incumbent tree
     const auto head = make_job(weight::Role::head, weight::kBf16WeightStorage, 32, 128);
     const auto nvfp4 = make_job(weight::Role::dense_up, rows::kNvfp4Records, 128, 4 * 128);
     const std::array jobs{q, k, head, nvfp4};
@@ -67,11 +68,54 @@ void occupancy() {
     const auto wide_target = rows::plan_rows({&q, 1}, formats, 1, device, {32});
     check(wide_target.target_blocks() == 4ULL * device.units && wide_target.launches()[0].trees[0].splits == 7,
           "nonwrapping wave count");
+    check(wide_target.launches()[0].trees[0].arithmetic == rows::kMxfp8OccupancySplitIdentity &&
+          rows::kMxfp8OccupancySplitIdentity != rows::kMxfp8SplitIdentity, "occupancy tree has its own identity");
     q.splits = 8;
     rejects([&] { (void)rows::plan_rows({&q, 1}, formats, 1, device, {32}); });
     q.splits = 2;
     rejects([&] { (void)rows::plan_rows({&q, 1}, formats, 1, device, {1}); });
     std::puts("PASS B2 rows occupancy");
+}
+
+void incumbent_default() {
+    // A binding that does not ask for occupancy gets the incumbent rows.hpp count for every shape and device size.
+    for (const unsigned units : {1U, 3U, 16U, 40U, 0xffffffffU}) {
+        strix::device::Profile device{};
+        device.units = units;
+        for (const unsigned out : {16U, 48U, 64U, 128U, 256U, 4096U}) {
+            for (const unsigned chunks : {1U, 2U, 5U, 7U, 8U, 33U, 128U}) {
+                const auto q = make_job(weight::Role::attention_q, rows::kMxfp8Rows, out, chunks * 32);
+                const std::array one{q.job};
+                const auto incumbent = rows::plan({one, 1}, device).launches()[0].splits[0];
+                const auto plan = rows::plan_rows({&q, 1}, formats, 1, device, {65535});
+                const auto& tree = plan.launches()[0].trees[0];
+                check(tree.splits == incumbent && plan.launches()[0].launch.splits[0] == incumbent &&
+                      tree.arithmetic == rows::kMxfp8SplitIdentity, "default plan is the incumbent choice");
+            }
+        }
+    }
+    // 128 outputs x 224 inputs on one unit: incumbent seven splits; the occupancy tree (two splits) is another
+    // identity with other bits on cancelling terms.
+    strix::device::Profile device{};
+    device.units = 1;
+    auto q = make_job(weight::Role::attention_q, rows::kMxfp8Rows, 128, 7 * 32);
+    std::array<float, 7 * 32> x{};
+    std::array<std::uint8_t, 7 * 32> codes{};
+    std::array<std::uint8_t, 7> scales{};
+    constexpr std::array values{0x1p26f, 0.0f, 0.0f, -0x1p26f, 1.0f, 0.0f, 0.0f};
+    codes.fill(0x40);
+    scales.fill(126);
+    for (std::size_t c = 0; c < values.size(); ++c) x[c * 32] = values[c];
+    const auto bits = [](float v) { return std::bit_cast<std::uint32_t>(v); };
+    const auto def = rows::plan_rows({&q, 1}, formats, 1, device, {32}).launches()[0].trees[0];
+    check(def.splits == 7, "incumbent keeps seven splits");
+    check(bits(rows::mxfp8_rows_reference(def, codes, scales, x)) == bits(1.0f), "incumbent cancellation bits");
+    q.policy = rows::SplitPolicy::occupancy;
+    const auto occ = rows::plan_rows({&q, 1}, formats, 1, device, {32}).launches()[0].trees[0];
+    check(occ.splits == 2 && occ.arithmetic == rows::kMxfp8OccupancySplitIdentity, "occupancy opt-in selects two");
+    check(occ.range(0).end == 3 && occ.range(1).end == 7, "occupancy chunk ranges");
+    check(bits(rows::mxfp8_rows_reference(occ, codes, scales, x)) == bits(0.0f), "occupancy cancellation bits");
+    std::puts("PASS B2 rows incumbent default");
 }
 
 void split_reference() {
@@ -143,6 +187,7 @@ void admission() {
 int main() {
     try {
         occupancy();
+        incumbent_default();
         split_reference();
         admission();
     } catch (const std::exception& error) {

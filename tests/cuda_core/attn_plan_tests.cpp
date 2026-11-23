@@ -57,9 +57,7 @@ int main() {
     check(!attn::make_decode_plan(native, kNativeSplitHeadDim), "strided gate requires the native head dimension");
     check(attn::make_decode_plan(native, 128).has_value(), "strided gate uses the caller's native head dimension");
     native.order = attn::DecodeOrder::online_e4m3;
-    plan = attn::make_decode_plan(native, 128);
-    check(plan && plan->splits == 3 && plan->score_floats == 0 && plan->stat_floats == 36 &&
-          plan->scratch_floats == 12U * 3U * 130U, "native E4M3 workspace uses the supplied head dimension");
+    check(!attn::make_decode_plan(native, 128), "the FP8 shadow plan declines a head dimension it does not cover");
     check(!attn::make_decode_plan(native, kNativeSplitHeadDim), "E4M3 requires the native head dimension");
     check(!attn::make_decode_plan(dense, 0) && !attn::make_decode_plan(dense, 513),
           "reject invalid native split head dimensions");

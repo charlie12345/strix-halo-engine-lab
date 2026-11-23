@@ -21,6 +21,7 @@
 #include "core/controller_mix.hpp"
 #include "core/pointwise.hpp"
 #include "ops/norm/norm_device.hpp"
+#include "ops/norm/rms_bf16_rows.hpp"
 #include "strix/attn/group_pool.hpp"
 #endif
 
@@ -318,6 +319,16 @@ inline bool fits(const TransitionArgs& args) {
     return true;
 }
 
+// Admission of the HIP transition body (residual_mix::launch_transition): the contract, a paired-bank block of at
+// least 256 threads (bank_count >= 2, the readout launch_mix runs for one row of more than one bank), the register
+// width of that readout, and no a8g32 image (the HIP decode leaves store none). Anything else runs the separate leaves.
+[[nodiscard]] inline bool hip_transition_admits(const TransitionArgs& args) {
+    if (!fits(args) || args.mix.bank_count < 2U || args.mix.width > kTransitionMaxWidth) return false;
+    for (const auto& norm : args.norm)
+        if (norm.codes || norm.deltas || norm.sums) return false;
+    return true;
+}
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #if defined(__HIPCC__)
 using Error = hipError_t;
@@ -543,22 +554,46 @@ __device__ __forceinline__ void emit_registers(const Args& args, std::size_t off
 // The parallel schedule launches one blockDim.y slice per bank. Each x thread
 // owns virtual lanes x and x+128, so their first add is stage 128 of the original
 // tree. All slices enter the remaining stages and their block barriers together.
-template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs>
-static __global__ void mix(Args args) {
+// The thread roles of one mix block, computed once per block.
+struct MixLanes {
+    unsigned lane;
+    unsigned first_bank;
+    unsigned banks_per_slice;
+    unsigned output_lane;
+    unsigned output_stride;
+    float score_scale;
+    bool registers;
+};
+
+template <bool ParallelBanks, class Args>
+__device__ __forceinline__ MixLanes mix_lanes(const Args& args) {
+    constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
+    const unsigned first_bank = ParallelBanks ? threadIdx.y : 0U;
+    return {threadIdx.x,
+            first_bank,
+            ParallelBanks ? 1U : args.bank_count,
+            ParallelBanks ? first_bank * bank_threads + threadIdx.x : threadIdx.x,
+            ParallelBanks ? blockDim.y * bank_threads : kThreads,
+            1.0F / pool::sqrt_rn(static_cast<float>(args.width)),
+            kMixRegisterForm && ParallelBanks && args.width <= kMixRegisterWidth};
+}
+
+// One readout row of the mix body (every thread of the block calls it; it ends with a block barrier). The mix kernel
+// runs it per row; the transition body runs it for its one row between its prologue and its norm epilogue.
+template <bool Normalized, bool ParallelBanks, class Args>
+__device__ __forceinline__ void mix_row(const Args& args, std::size_t row, const MixLanes& lanes, float* scratch,
+                                        float* inverse, float (*probability)[kMaxBanks]) {
     using Jobs = MixJobs<Args>;
     constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
-    __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
-    __shared__ float inverse[kMaxBanks];
-    __shared__ float probability[kMaxQueries][kMaxBanks];
-    const unsigned lane = threadIdx.x;
-    const unsigned first_bank = ParallelBanks ? threadIdx.y : 0U;
-    const unsigned banks_per_slice = ParallelBanks ? 1U : args.bank_count;
-    const unsigned output_lane = ParallelBanks ? first_bank * bank_threads + lane : lane;
-    const unsigned output_stride = ParallelBanks ? blockDim.y * bank_threads : kThreads;
+    const unsigned lane = lanes.lane;
+    const unsigned first_bank = lanes.first_bank;
+    const unsigned banks_per_slice = lanes.banks_per_slice;
+    const unsigned output_lane = lanes.output_lane;
+    const unsigned output_stride = lanes.output_stride;
     auto* bank_scratch = scratch + first_bank * bank_threads;
-    const float score_scale = 1.0F / pool::sqrt_rn(static_cast<float>(args.width));
-    const bool registers = kMixRegisterForm && ParallelBanks && args.width <= kMixRegisterWidth;
-    for (std::size_t row = blockIdx.x; row < Jobs::rows(args); row += gridDim.x) {
+    const float score_scale = lanes.score_scale;
+    const bool registers = lanes.registers;
+    {
         const auto offset = row * args.width;
         if constexpr (ParallelBanks && kMixRegisterForm) {
             if (registers)
@@ -609,7 +644,7 @@ static __global__ void mix(Args args) {
             if (registers) {
                 emit_registers<Normalized>(args, offset, output_lane, output_stride, inverse, probability);
                 __syncthreads();
-                continue;
+                return;
             }
         }
         for (unsigned query = 0; query < Jobs::queries(args); ++query) {
@@ -624,6 +659,82 @@ static __global__ void mix(Args args) {
             }
         }
         __syncthreads();
+    }
+}
+
+template <bool Normalized, bool ParallelBanks = false, class Args = MixArgs>
+static __global__ void mix(Args args) {
+    constexpr unsigned bank_threads = ParallelBanks ? kPairedBankThreads : kThreads;
+    __shared__ float scratch[ParallelBanks ? bank_threads * kMaxBanks : kThreads];
+    __shared__ float inverse[kMaxBanks];
+    __shared__ float probability[kMaxQueries][kMaxBanks];
+    const MixLanes lanes = mix_lanes<ParallelBanks>(args);
+    for (std::size_t row = blockIdx.x; row < MixJobs<Args>::rows(args); row += gridDim.x)
+        mix_row<Normalized, ParallelBanks>(args, row, lanes, scratch, inverse, probability);
+}
+
+// HIP body of TransitionArgs (admission: hip_transition_admits). One block in the paired-bank geometry of launch_mix
+// for one row (kPairedBankThreads x bank_count threads, bank_count >= 2):
+//   prologue  the AddArgs expression (__fadd_rn, then bf16_round when round_bf16) for every element, stored to the
+//             current bank, then a block barrier (the readout reads it back through the workgroup fence);
+//   readout   mix_row, the incumbent paired-bank row body (register form for width <= kMixRegisterWidth);
+//   epilogue  per normed query, the register form of rmsnorm_strided_kernel<Bf16ScaleSqrtDivTraits, 256> (the
+//             enqueue_rms_bf16_rows parallel leaf) at virtual lane y * kPairedBankThreads + x: the same lane chains,
+//             weights, 256-lane LDS halving tree, factor and output expression.
+inline constexpr unsigned kTransitionNormLanes = 256;
+inline constexpr unsigned kTransitionNormRegs = kTransitionMaxWidth / kTransitionNormLanes;
+
+template <bool Normalized>
+static __global__ void __launch_bounds__(kPairedBankThreads * kMaxBanks) transition(TransitionArgs args) {
+    using Traits = ops::norm::Bf16ScaleSqrtDivTraits;
+    __shared__ float scratch[kPairedBankThreads * kMaxBanks];
+    __shared__ float inverse[kMaxBanks];
+    __shared__ float probability[kMaxQueries][kMaxBanks];
+    static_assert(kTransitionNormLanes <= kPairedBankThreads * kMaxBanks);
+    const unsigned threads = blockDim.x * blockDim.y;
+    const unsigned lane = threadIdx.y * blockDim.x + threadIdx.x;
+    const unsigned width = args.mix.width;
+    if (args.add.lhs != nullptr) {
+        for (unsigned i = lane; i < width; i += threads) {
+            const float sum = __fadd_rn(args.add.lhs[i], args.add.rhs[i]);
+            args.add.output[i] = args.add.round_bf16 ? gi::bf16_round(sum) : sum;
+        }
+        __syncthreads();
+    }
+    mix_row<Normalized, true>(args.mix, 0, mix_lanes<true>(args.mix), scratch, inverse, probability);
+    const bool norm_lane = lane < kTransitionNormLanes;
+    for (unsigned q = 0; q < args.mix.query_count; ++q) {
+        const TransitionNorm& norm = args.norm[q];
+        if (norm.output == nullptr) continue;  // the same for every thread of the block
+        const float* row = args.mix.output[q];
+        float v[kTransitionNormRegs], weight[kTransitionNormRegs];
+#pragma unroll
+        for (unsigned k = 0; k < kTransitionNormRegs; ++k) {
+            const unsigned i = lane + k * kTransitionNormLanes;
+            v[k] = norm_lane && i < width ? row[i] : 0.0F;
+        }
+        float squares = 0.0F;
+#pragma unroll
+        for (unsigned k = 0; k < kTransitionNormRegs; ++k) {
+            const unsigned i = lane + k * kTransitionNormLanes;
+            if (norm_lane && i < width)
+                squares = ops::norm::square_step<ops::norm::square_form_of<Traits>()>(squares, v[k]);
+        }
+#pragma unroll
+        for (unsigned k = 0; k < kTransitionNormRegs; ++k) {
+            const unsigned i = lane + k * kTransitionNormLanes;
+            weight[k] = 1.0F;
+            if (norm.gain && norm_lane && i < width) weight[k] = Traits::load(norm.gain, 0, i);
+        }
+        const float sum = ops::norm::lds_halving_sum_lanes<kTransitionNormLanes>(scratch, squares, lane);
+        const float factor = Traits::inv_sqrt(sum / static_cast<float>(width) + args.norm_epsilon);
+#pragma unroll
+        for (unsigned k = 0; k < kTransitionNormRegs; ++k) {
+            const unsigned i = lane + k * kTransitionNormLanes;
+            if (norm_lane && i < width)
+                ops::norm::rmsnorm_emit<Traits>(norm.gain, 0, norm.output, 0, ops::norm::NoStore{}, i, v[k], factor,
+                                                weight[k]);
+        }
     }
 }
 #endif
@@ -736,6 +847,16 @@ inline Error launch_mix(const MixArgs& args, Stream stream) {
 }
 
 #if defined(__HIPCC__)
+// One launch for the add -> bank readout -> layer-input RMS chain of one token row: every image the launch_add,
+// launch_mix and enqueue_rms_bf16_rows (parallel) leaves store, with their bits (HIP transition fixture).
+inline Error launch_transition(const TransitionArgs& args, Stream stream) {
+    if (!hip_transition_admits(args)) return invalid_value;
+    const dim3 threads(detail::kPairedBankThreads, args.mix.bank_count);
+    if (args.mix.normalized) detail::transition<true><<<1, threads, 0, stream>>>(args);
+    else detail::transition<false><<<1, threads, 0, stream>>>(args);
+    return detail::last_error();
+}
+
 // Every job of the batch in one launch. Job j's output bits are those of launch_mix(job_args(args, j)): the same
 // kernel body, schedule and per-query arithmetic, addressed by job instead of by query.
 inline Error launch_bank_batch(const BankBatchArgs& args, Stream stream) {

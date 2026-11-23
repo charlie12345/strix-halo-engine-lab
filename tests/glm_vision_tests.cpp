@@ -281,7 +281,7 @@ void test_validate() {
     bad_meta([](File& f) { f.drop("mm.patch_merger.bias"); }, "missing tensor mm.patch_merger.bias");
     bad_meta([](File& f) { f.add("v.position_embd.weight", {kW, 16}, 0.1F); }, "unexpected tensor v.position_embd.weight");
     bad_meta([](File& f) { f.add("mm.model.fc.bias", {kP}, 0.1F); }, "unexpected tensor mm.model.fc.bias");
-    bad_meta([](File& f) { f.tensor("v.blk.0.attn_q_norm.weight").dims = {kW}; f.tensor("v.blk.0.attn_q_norm.weight").data.resize(kW); },
+    bad_meta([](File& f) { f.tensor("v.blk.0.attn_q_norm.weight").dims.assign(1, kW); f.tensor("v.blk.0.attn_q_norm.weight").data.resize(kW); },
              "unexpected shape");
     // One layout for every block: a fused tensor in block 0 makes the file a fused one, which block 1 then is not.
     bad_meta([](File& f) { f.add("v.blk.0.attn_qkv.weight", {kW, 3 * kW}, 0.1F); }, "missing tensor v.blk.1.attn_qkv.weight");

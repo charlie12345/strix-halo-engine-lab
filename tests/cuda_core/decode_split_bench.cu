@@ -338,6 +338,53 @@ void run_case(const Case& c, int iters, bool check_only) {
 
 }  // namespace
 
+// Plain prompt flash (the unprepared form, Qwen's prefill): the pad2 body with and without the tail split, whose
+// tail warps are the inactive-warp path of the body. Output digests compare two builds case by case; every element
+// must be written and finite.
+void run_plain() {
+    constexpr unsigned kCapacity = 2048U;
+    std::mt19937 rng(777U);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    const std::size_t cache_elems = std::size_t{kCapacity} * kKv * kDim;
+    std::vector<std::uint16_t> hk(cache_elems), hv(cache_elems);
+    for (auto& x : hk) x = f2bf(uni(rng) * 2.0f);
+    for (auto& x : hv) x = f2bf(uni(rng));
+    constexpr unsigned kMaxRowsPlain = 1000U;
+    std::vector<float> hq(std::size_t{kMaxRowsPlain} * kHeads * kDim);
+    for (auto& x : hq) x = uni(rng) * 2.0f;
+    Dev<std::uint16_t> dk(cache_elems), dv(cache_elems);
+    Dev<float> dq(hq.size()), out(hq.size());
+    dk.put(hk);
+    dv.put(hv);
+    dq.put(hq);
+    const cc::AttentionDims dims{kHeads, kKv, kDim, kScale, kCapacity};
+    const auto* kb = reinterpret_cast<const __nv_bfloat16*>(dk.p);
+    const auto* vb = reinterpret_cast<const __nv_bfloat16*>(dv.p);
+    struct Plain { unsigned pos0, rows; };
+    const Plain cases[] = {{0U, 17U}, {0U, 129U}, {700U, 1000U}, {1023U, 300U}};
+    for (const auto& c : cases) {
+        for (const auto tail : {cc::FlashTail::off, cc::FlashTail::split}) {
+            out.poison();
+            const cc::GroupedView qv{c.rows, kHeads, kDim};
+            check(cc::attention_prefill_flash(dims, dq.p, qv, nullptr, {}, kb, vb, c.pos0, c.rows, out.p, nullptr,
+                                              cc::FlashPipe::pad2, tail), "plain flash");
+            check(cudaDeviceSynchronize(), "sync plain");
+            const auto o = out.get();
+            const std::size_t live = std::size_t{c.rows} * kHeads * kDim, miss = unwritten(o, live), bad = nonfinite(o, live);
+            unsigned long long bits = 1469598103934665603ULL;
+            for (std::size_t i = 0; i < live; ++i) {
+                std::uint32_t u = 0;
+                std::memcpy(&u, &o[i], sizeof u);
+                for (unsigned b = 0; b < 4U; ++b) bits = (bits ^ ((u >> (8U * b)) & 0xffU)) * 1099511628211ULL;
+            }
+            const bool ok = miss == 0 && bad == 0;
+            if (!ok) g_fail = true;
+            std::printf("PLAIN pos0=%u rows=%u tail=%s bits=%016llx unwritten=%zu nonfinite=%zu %s\n", c.pos0, c.rows,
+                        tail == cc::FlashTail::split ? "split" : "off", bits, miss, bad, ok ? "PASS" : "FAIL");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     int iters = 200;
     bool check_only = false;
@@ -364,6 +411,7 @@ int main(int argc, char** argv) {
         {"sliding", 1280, 1024, 2559, true}, {"short", 256, 200, 3000, true}, {"full", 20480, 0, 20000, false},
     };
     for (const auto& c : cases) run_case(c, iters, check_only);
+    run_plain();
     std::printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

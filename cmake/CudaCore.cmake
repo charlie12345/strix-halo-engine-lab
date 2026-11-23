@@ -57,7 +57,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 add_library(strix_qwen35_cuda STATIC ${_cc_root}/src/qwen35/cuda/engine.cu ${_cc_root}/src/gguf_reader.cpp
     ${_cc_root}/src/qwen35/config.cpp ${_cc_root}/src/qwen35/family.cpp ${_cc_root}/src/model_family_registry.cpp)
 target_link_libraries(strix_qwen35_cuda PUBLIC strix_cuda_core_kernels)
-target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include)
+target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)

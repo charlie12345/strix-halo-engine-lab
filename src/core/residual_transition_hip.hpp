@@ -16,14 +16,15 @@ namespace detail {
 
 // HIP body of TransitionArgs (admission: hip_transition_admits). One block in the paired-bank geometry of launch_mix
 // for one row (kPairedBankThreads x bank_count threads, bank_count >= 2):
-//   prologue  the AddArgs expression (__fadd_rn, then bf16_round when round_bf16) for every element, stored to the
-//             current bank, then a block barrier (the readout reads it back through the workgroup fence);
+//   prologue  the AddArgs expression (__fadd_rn, then bf16_round when round_bf16) for every element, all operands read
+//             (block barrier) before any store to the current bank, then a block barrier (the readout reads it back through the workgroup fence);
 //   readout   mix_rows (one row), the incumbent paired-bank body (register form for width <= kMixRegisterWidth);
 //   epilogue  per normed query, the register form of rmsnorm_strided_kernel<Bf16ScaleSqrtDivTraits, 256> (the
 //             enqueue_rms_bf16_rows parallel leaf) at virtual lane y * kPairedBankThreads + x: the same lane chains,
 //             weights, 256-lane LDS halving tree, factor and output expression.
 inline constexpr unsigned kTransitionNormLanes = 256;
 inline constexpr unsigned kTransitionNormRegs = kTransitionMaxWidth / kTransitionNormLanes;
+inline constexpr unsigned kTransitionAddRegs = kTransitionMaxWidth / (2U * kPairedBankThreads);
 
 template <bool Normalized>
 static __global__ void __launch_bounds__(kPairedBankThreads * kMaxBanks) transition(TransitionArgs args) {
@@ -36,9 +37,24 @@ static __global__ void __launch_bounds__(kPairedBankThreads * kMaxBanks) transit
     const unsigned lane = threadIdx.y * blockDim.x + threadIdx.x;
     const unsigned width = args.mix.width;
     if (args.add.lhs != nullptr) {
-        for (unsigned i = lane; i < width; i += threads) {
-            const float sum = __fadd_rn(args.add.lhs[i], args.add.rhs[i]);
-            args.add.output[i] = args.add.round_bf16 ? gi::bf16_round(sum) : sum;
+        // The contract lets the add operands alias any image, a shifted window of the current bank included, so every
+        // operand is read before any store: the block's sums stay in registers across a barrier, then are stored.
+        // threads >= 2 x kPairedBankThreads (admission: bank_count >= 2) covers width <= kTransitionMaxWidth.
+        float sums[kTransitionAddRegs];
+#pragma unroll
+        for (unsigned k = 0; k < kTransitionAddRegs; ++k) {
+            const unsigned i = lane + k * threads;
+            sums[k] = 0.0F;
+            if (i < width) {
+                const float sum = __fadd_rn(args.add.lhs[i], args.add.rhs[i]);
+                sums[k] = args.add.round_bf16 ? gi::bf16_round(sum) : sum;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned k = 0; k < kTransitionAddRegs; ++k) {
+            const unsigned i = lane + k * threads;
+            if (i < width) args.add.output[i] = sums[k];
         }
         __syncthreads();
     }

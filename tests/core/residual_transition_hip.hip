@@ -194,6 +194,56 @@ bool run_case(const Case& test, std::uint32_t seed, hipStream_t stream) {
     return bad == 0;
 }
 
+// Review regression: the add operands may alias a shifted window of the current bank (lhs = output +- shift in one
+// allocation). Every operand must be read before any store, so the bank equals lhs + rhs of the operand snapshot, and
+// the readout and norms equal the leaves run on that expected bank without a prologue.
+bool shifted_alias(unsigned width, int shift, bool rhs_aliases, std::uint32_t seed, hipStream_t stream) {
+    std::mt19937 random(seed);
+    const auto span = static_cast<std::size_t>(shift < 0 ? -shift : shift);
+    const std::size_t room = width + span;
+    const auto bank0 = values(width, random, 2.0F, false);
+    const auto buffer = values(room, random, 2.0F, false);
+    const auto other = values(width, random, 2.0F, false);
+    auto* queries = upload(values(width, random, 0.25F, false));
+    auto* gain = upload(gains(width, random));
+    float* all = upload(buffer);
+    float* rhs_dev = upload(other);
+    // shift > 0: lhs above the output; shift < 0: lhs below it. rhs_aliases: rhs is the other end of the window.
+    float* output = all + (shift > 0 ? 0 : span);
+    const float* lhs = all + (shift > 0 ? span : 0);
+    const float* rhs = rhs_aliases ? output : rhs_dev;
+    const float* lhs_host = buffer.data() + (shift > 0 ? span : 0);
+    const float* rhs_host = rhs_aliases ? buffer.data() + (shift > 0 ? 0 : span) : other.data();
+    std::vector<float> expected(width);
+    for (std::size_t i = 0; i < width; ++i) expected[i] = lhs_host[i] + rhs_host[i];
+    Arm leaves = make_arm({bank0, expected}, other, 1, width);
+    Arm fused = make_arm({bank0}, other, 1, width);
+    if (!queries || !gain || !all || !rhs_dev || !valid(leaves) || !valid(fused)) {
+        std::printf("residual transition hip shifted alias: FAIL (allocation)\n");
+        return false;
+    }
+    fused.banks.push_back(output);
+    const Case test{"shifted alias", width, 2, 1, Prologue::none, 0x1, true, false, false};
+    const auto leaf_args = bind(test, leaves, queries, gain);
+    auto fused_args = bind(test, fused, queries, gain);
+    fused_args.add = {lhs, rhs, output, width, false};
+    if (!mix::hip_transition_admits(fused_args)) {
+        std::printf("residual transition hip shifted alias: FAIL (admission)\n");
+        return false;
+    }
+    if (!run_leaves(leaf_args, stream) || !ok(mix::launch_transition(fused_args, stream)) ||
+        !ok(hipStreamSynchronize(stream))) {
+        std::printf("residual transition hip shifted alias: FAIL (launch)\n");
+        return false;
+    }
+    std::size_t bad = mismatches(expected, download(output, width));
+    bad += mismatches(download(leaves.outputs[0], width), download(fused.outputs[0], width));
+    bad += mismatches(download(leaves.normed[0], width), download(fused.normed[0], width));
+    std::printf("residual transition hip shifted alias width %u shift %d%s: %s (%zu mismatching values)\n", width, shift,
+                rhs_aliases ? " rhs aliased" : "", bad == 0 ? "ok" : "FAIL", bad);
+    return bad == 0;
+}
+
 // Shapes the HIP body declines: the caller keeps the separate leaves.
 bool refusals() {
     float dummy[8]{};
@@ -262,6 +312,9 @@ int main() {
     bool pass = refusals();
     std::uint32_t seed = 1234;
     for (const auto& test : cases) pass = run_case(test, seed++, stream) && pass;
+    for (const unsigned width : {512U, 2304U})
+        for (const int shift : {128, -128, 1, -1})
+            for (const bool rhs_aliases : {false, true}) pass = shifted_alias(width, shift, rhs_aliases, seed++, stream) && pass;
     std::printf("residual transition hip: %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

@@ -1,5 +1,6 @@
 #include "core/dense_bf16_narrow_plan.hpp"
 #include "core/mix_latency_plan.hpp"
+#include "cuda/core/mix_cuda_latency_plan.hpp"
 #include "strix/exec/catalog.hpp"
 
 #include <cmath>

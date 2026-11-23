@@ -46,11 +46,11 @@ int main() {
     auto e4m3 = dense;
     e4m3.order = attn::DecodeOrder::online_e4m3;
     e4m3.rows = 8;
-    plan = attn::make_decode_plan(e4m3);
+    plan = attn::make_decode_plan(e4m3, kNativeSplitHeadDim);
     check(plan && plan->splits == 4U && plan->scratch_floats == 8U * 24U * 4U * 258U,
           "FP8 decode and its native shadow use the same split plan");
     e4m3.sinks = true;
-    check(!attn::make_decode_plan(e4m3), "FP8 declines sinks outside the native contract");
+    check(!attn::make_decode_plan(e4m3, kNativeSplitHeadDim), "FP8 declines sinks outside the native contract");
 
     attn::DecodeSpec native{128, 12, 3, 1, 4097, 4097};
     native.gate = attn::OutputGate::sigmoid_strided;

@@ -12,11 +12,19 @@
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/session/cli_output.hpp"
 #include "strix/spec/engine_target.hpp"
+#if defined(STRIX_INKLING2_CLI_VISION)
+#include "inkling2/inkling2_vision.hpp"
+#include "strix/model_content_hash.hpp"
+#include "strix/vision/encoder.hpp"
+#include "strix/vision/serial_media.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <memory>
 
@@ -39,6 +47,39 @@ inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
 inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
 #endif
 
+#if defined(STRIX_INKLING2_CLI_VISION)
+// Image input of --messages: the checkpoint's vision tower (inkling2_vision.hpp adapter) on the device tower, opened
+// at the first image. The adapter identity carries the checkpoint's content digest.
+inline std::unique_ptr<serve::SerialMediaInput> open_media(const std::string& checkpoint) {
+    std::ifstream config(std::filesystem::path(checkpoint).parent_path() / "config.json", std::ios::binary);
+    if (!config) throw std::runtime_error("Inkling 2 image input needs config.json beside the checkpoint");
+    const std::string text{std::istreambuf_iterator<char>(config), std::istreambuf_iterator<char>()};
+    const auto spec = parse_vision_spec(text);
+    const auto content = sha256_file_content(checkpoint);
+    std::string digest = "sha256:";
+    for (const auto byte : content.bytes) {
+        digest += "0123456789abcdef"[static_cast<unsigned>(byte) >> 4U];
+        digest += "0123456789abcdef"[static_cast<unsigned>(byte) & 15U];
+    }
+    vision::SerialMediaSpec media;
+    media.shard = checkpoint;
+    media.tensors = vision_tensor_specs(spec);
+    media.ignored_prefix = std::string(kVisionIgnoredPrefix);
+    media.placeholder = std::string(serve::kInkling2ImagePlaceholder);
+    media.lm_width = kHiddenWidth;
+    return std::make_unique<vision::SerialMedia>(std::make_unique<VisionAdapter>(spec, std::move(digest)), std::move(media),
+        [](const vision::EncoderConfig& c, const vision::EncoderWeights& w) -> std::unique_ptr<vision::EncoderBackend> {
+#if defined(__HIPCC__)
+            auto encoder = std::make_unique<vision::Encoder>(c);
+            encoder->load(w);
+            return encoder;
+#else
+            return std::make_unique<vision::ReferenceEncoder>(c, w);
+#endif
+        });
+}
+#endif
+
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
@@ -55,6 +96,12 @@ public:
 
     unsigned decode(unsigned token, std::span<float> logits) override {
         return decoder_.decode(token, logits);
+    }
+
+    std::uint32_t prefill_embedded(std::span<const std::uint32_t> ids,
+                                   const std::shared_ptr<const session::EmbedTable>& table,
+                                   std::span<float> logits) override {
+        return decoder_.prefill_embedded(ids, table, logits);
     }
 
     spec::VerifyTarget* verify_target() override { return &target_; }
@@ -245,6 +292,10 @@ int main(int argc, char** argv) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
             packed_decode_default, serve::render_inkling2_chat_request, true};
+#if defined(STRIX_INKLING2_CLI_VISION)
+        family.media = cli::open_media;
+        family.render_media_messages = serve::render_inkling2_chat_media_request;
+#endif
         // Off switch: STRIX_INKLING_PREFILL_TAIL=0 restores greedy chunks (same logits).
         family.prefill_tail_divisor =
             strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;

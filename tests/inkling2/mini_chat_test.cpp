@@ -74,10 +74,38 @@ bool check_errors() {
     return true;
 }
 
+bool check_media() {
+    // After media::normalize an image part is {"type": "image", "media": k}; the media entry point writes one image
+    // frame per part (chat_template.jinja: <|content_image|><|unused_200054|><|end_message|>), text parts unchanged.
+    constexpr std::string_view body =
+        R"({"messages":[{"role":"user","content":[{"type":"text","text":"A:"},{"type":"image","media":0},)"
+        R"({"type":"text","text":"Describe it."}]}]})";
+    constexpr std::string_view expected =
+        "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+        "<|message_user|><|content_text|>A:<|end_message|>"
+        "<|message_user|><|content_image|><|unused_200054|><|end_message|>"
+        "<|message_user|><|content_text|>Describe it.<|end_message|>";
+    if (!matches("media request", render_inkling2_chat_media_request(body), expected)) return false;
+    if (kInkling2ImagePlaceholder != "<|unused_200054|>") return false;
+    for (const auto input : {R"({"messages":[{"role":"assistant","content":[{"type":"image","media":0}]}]})"}) {
+        try {
+            (void)render_inkling2_chat_media_request(input);
+            std::cerr << "accepted an assistant image: " << input << '\n';
+            return false;
+        } catch (const ChatTemplateError&) {}
+    }
+    try {
+        (void)render_inkling2_chat_request(body);  // the text entry point keeps refusing images
+        std::cerr << "the text entry point accepted an image\n";
+        return false;
+    } catch (const ChatTemplateError&) {}
+    return true;
+}
+
 }  // namespace
 
 int main() {
-    return check_template() && check_errors() &&
+    return check_template() && check_errors() && check_media() &&
            matches("shared compact JSON", chat_kit::compact_json(parse_json(R"({"z":[1e-4,1e-5,1e15,1e16,-0.0,-0],"a":0})"),
                                                                  chat_kit::JsonKeyOrder::recursive),
                    R"({"a":0,"z":[0.0001,1e-05,1000000000000000.0,1e+16,-0.0,0]})") ? 0 : 1;

@@ -16,6 +16,10 @@
 #include "strix/exec/cohort_programs.hpp"
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
+#include "strix/session/embed_splice.hpp"
+#if defined(__HIPCC__)
+#include "strix/session/embed_splice_hip.hpp"
+#endif
 
 #if !defined(__HIPCC__)
 #include "cuda/core/step_inputs.cuh"
@@ -119,6 +123,36 @@ public:
         return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
             return append(state, chunk, last, last ? logits : std::span<float>{});
         }, prefill_rows_, tail_rows_);
+    }
+
+    // Prefill of a prompt holding virtual ids (session/embed_rows.hpp) resolved by `table` (image rows): the ids
+    // resolve to the placeholder token of their span, the token rows are embedded and normalized as for text, then
+    // the provided rows overwrite their run rows (no token embedding norm: the vision projector output is the
+    // layer-0 input). Without a virtual id this is prefill(). HIP only.
+    [[nodiscard]] unsigned prefill_embedded(std::span<const unsigned> prompt,
+                                            const std::shared_ptr<const session::EmbedTable>& table,
+                                            std::span<float> logits = {}) {
+        static_assert(std::is_same_v<unsigned, std::uint32_t>);
+        if (!table || !session::has_embed_ids(prompt)) return prefill(prompt, logits);
+#if defined(__HIPCC__)
+        auto run = session::resolve_embed_run(prompt, table, {kHiddenWidth});
+        run.splice.validate(run.tokens.size(), kHiddenWidth);
+        backend_.abandon_capture();
+        auto& state = slots_.front()->state();
+        validate_inputs(state, run.tokens, logits);
+        const auto* base = run.tokens.data();
+        struct Clear {
+            const session::EmbedSplice*& splice;
+            ~Clear() { splice = nullptr; }
+        } clear{splice_};
+        splice_ = &run.splice;
+        return state.append_sequence(std::span<const unsigned>(run.tokens), [&](std::span<const unsigned> chunk, bool last) {
+            splice_first_ = static_cast<std::uint64_t>(chunk.data() - base);
+            return append(state, chunk, last, last ? logits : std::span<float>{});
+        }, prefill_rows_, tail_rows_);
+#else
+        throw std::invalid_argument("Inkling 2 Mini: provided embedding rows are HIP only");
+#endif
     }
 
     [[nodiscard]] unsigned decode(unsigned token, std::span<float> logits = {}) try {
@@ -458,6 +492,7 @@ private:
             enqueue_mini_hip_embeddings(table, ids, output, stream_.get());
         }
         backend_.rms(output.data(), gain.data(), output.data(), rows);
+        if (splice_ && !step) splice_rows(output, rows);
 #else
         if (!step) {
             // The caller's token span can be pageable.
@@ -467,6 +502,27 @@ private:
             step ? &step->token : token_ids_.data(), output.data(), rows, stream_.get()));
 #endif
     }
+
+#if defined(__HIPCC__)
+    // The provided rows of this chunk (run rows [splice_first_, splice_first_ + rows)) over its embedded rows.
+    void splice_rows(MiniMutableRows output, unsigned rows) {
+        const auto part = splice_->slice(splice_first_, splice_first_ + rows);
+        if (part.empty()) return;
+        if (part.format != session::EmbedRowFormat::bf16) throw std::invalid_argument("Inkling 2 Mini: image rows must be BF16");
+        if (!splice_staging_) splice_staging_.emplace(std::size_t{max_rows_} * kHiddenWidth);
+        // The staging of an earlier chunk was read by that chunk's stream work, which finished before it committed.
+        std::uint64_t staged = 0;
+        for (const auto& segment : part.segments) {
+            const auto words = std::size_t{segment.rows} * kHiddenWidth;
+            mini_gpu::copy(splice_staging_->data() + staged, segment.data, words * sizeof(std::uint16_t),
+                           mini_gpu::host_to_device, stream_.get());
+            session::enqueue_embed_splice(output.data(), 1U, splice_staging_->data() + staged, kHiddenWidth,
+                                          part.format, segment.run_row, segment.rows, stream_.get());
+            backend_.check(hipGetLastError());
+            staged += words;
+        }
+    }
+#endif
 
     [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::FormatId storage) {
         MiniTextWeights source;
@@ -639,6 +695,9 @@ private:
 #endif
     }
 
+    const session::EmbedSplice* splice_ = nullptr;  // prefill_embedded only
+    std::uint64_t splice_first_ = 0;
+    std::optional<mini_gpu::Buffer<std::uint16_t>> splice_staging_;
     unsigned prefill_rows_, tail_rows_, decode_rows_, max_rows_;
     MiniSessionStatePlan layout_;
     MiniResidentWeightPlan weight_plan_;

@@ -27,3 +27,4 @@ strix_servespec_host_test(NAME inkling2-vision
 if(TARGET inkling2-vision AND NOT MSVC)
     target_compile_options(inkling2-vision PRIVATE -ffp-contract=off -fno-fast-math)
 endif()
+

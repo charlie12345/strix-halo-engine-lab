@@ -28,17 +28,28 @@ struct WeightLoadPolicy {
     Id id;
     FormatId target;
     Id legacy{};
+    // The output head's storage when it differs from the other tagged roles' (empty name: `target`). The per-role
+    // format map of a mix is data of the shared policy row, never a model code path.
+    FormatId head{};
+    [[nodiscard]] constexpr FormatId head_target() const noexcept { return head.name.empty() ? target : head; }
 };
 
 // Attention projections and the output head stored as Q8_0, converted from BF16 at load.
 inline constexpr WeightLoadPolicy kAttentionHeadQ8Policy{{"weights.attention_head.q8_0", 1}, kQ8WeightStorage};
 // The output head alone stored as Q8_0, converted from BF16 at load.
 inline constexpr WeightLoadPolicy kHeadQ8Policy{{"weights.head.q8_0", 1}, kQ8WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 2> kWeightLoadPolicies{&kAttentionHeadQ8Policy, &kHeadQ8Policy};
+// Low-bit mixes (strix/weight/host_lowbit.hpp, converted from BF16 at load; HIP consumers): attention projections and
+// head q6_g64; attention q4_g64 with a q6_g64 head; both q4_g64.
+inline constexpr WeightLoadPolicy kAttentionHeadQ6Policy{{"weights.attention_head.q6_g64", 1}, kQ6G64WeightStorage};
+inline constexpr WeightLoadPolicy kAttentionQ4HeadQ6Policy{
+    {"weights.attention_q4_g64.head_q6_g64", 1}, kQ4G64WeightStorage, {}, kQ6G64WeightStorage};
+inline constexpr WeightLoadPolicy kAttentionHeadQ4Policy{{"weights.attention_head.q4_g64", 1}, kQ4G64WeightStorage};
+inline constexpr std::array<const WeightLoadPolicy*, 5> kWeightLoadPolicies{
+    &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionHeadQ6Policy, &kAttentionQ4HeadQ6Policy, &kAttentionHeadQ4Policy};
 
 // The binding of a shared policy by a model whose earlier records stored it under `legacy`.
 [[nodiscard]] constexpr WeightLoadPolicy with_legacy(const WeightLoadPolicy& shared, Id legacy) noexcept {
-    return {shared.id, shared.target, legacy};
+    return {shared.id, shared.target, legacy, shared.head};
 }
 
 // True when `key` is the 'name@revision' text of `id` (decimal revision, no sign, no leading zero).
@@ -118,16 +129,28 @@ struct WeightLoadRequest {
     bool allow_pending = false;  // Explicit, stamped qualification-arm opt-in.
 };
 
+// Resolved storage of the two tagged role classes (the output head, every other tagged role). One FormatId converts to
+// the same storage for both.
+struct RoleStorage {
+    FormatId attention = kBf16WeightStorage, head = kBf16WeightStorage;
+    constexpr RoleStorage() noexcept = default;
+    constexpr RoleStorage(FormatId all) noexcept : attention(all), head(all) {}  // NOLINT(google-explicit-constructor)
+    constexpr RoleStorage(FormatId attention_storage, FormatId head_storage) noexcept
+        : attention(attention_storage), head(head_storage) {}
+};
+
 struct WeightLoadPlan {
     Id policy;
-    FormatId storage;
+    FormatId storage;  // every tagged role but the head
     profile::Status status;
     std::string_view reason;
     Digest256 gate_v2_pass{}, measured_gain{};
+    FormatId head_storage = kBf16WeightStorage;
 
     [[nodiscard]] FormatId storage_for(std::optional<Role> role) const {
-        return role ? storage : kBf16WeightStorage;
+        return !role ? kBf16WeightStorage : *role == Role::head ? head_storage : storage;
     }
+    [[nodiscard]] RoleStorage roles() const { return {storage, head_storage}; }
 };
 
 // A 64-hex content digest literal for receipt rows compiled into a decision table. A malformed literal yields the

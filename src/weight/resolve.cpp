@@ -17,9 +17,13 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         plan.reason = "weight load lever disabled";
         return plan;
     }
-    const bool runnable = !policy.id.name.empty() && policy.id.revision &&
-        policy.target == kQ8WeightStorage && find_format(registry, policy.target) &&
-        std::ranges::find(request.consumer_formats, policy.target) != request.consumer_formats.end();
+    // Each tagged role class needs a compact target the registry knows and every consumer of the request runs.
+    const auto consumed = [&](FormatId format) {
+        return format != kBf16WeightStorage && find_format(registry, format) &&
+               std::ranges::find(request.consumer_formats, format) != request.consumer_formats.end();
+    };
+    const bool runnable = !policy.id.name.empty() && policy.id.revision && consumed(policy.target) &&
+        consumed(policy.head_target());
     const auto* decision = runnable ? find_weight_load_decision(policy, request.scope, decisions) : nullptr;
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
     if (plan.status == profile::Status::pending) {
@@ -27,6 +31,7 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         return plan;
     }
     plan.storage = policy.target;
+    plan.head_storage = policy.head_target();
     plan.reason = "unqualified weight load arm";
     if (decision) {
         plan.gate_v2_pass = decision->gate_v2_pass;

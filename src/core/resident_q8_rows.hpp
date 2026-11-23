@@ -133,16 +133,21 @@ inline row_transforms::Status enqueue_resident_q8_projections(
     if (projections.empty() || projections.size() > Capacity) return row_transforms::invalid;
 #if defined(__HIPCC__)
     constexpr auto success = hipSuccess;
-    // Projections of one low-bit storage above the sweep rows: one launch over all their panels.
+    // Projections of one low-bit storage above the sweep: one launch over all their panels (a mix of storages runs
+    // each projection on its own route below).
     const auto* first = std::get_if<weight::ResidentMatrixView>(&projections.front().weights);
-    const bool lowbit = first && (first->storage == weight::kQ4G64WeightStorage || first->storage == weight::kQ6G64WeightStorage);
+    bool lowbit = first && (first->storage == weight::kQ4G64WeightStorage || first->storage == weight::kQ6G64WeightStorage);
+    for (const auto& projection : projections) {
+        const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
+        lowbit = lowbit && matrix && matrix->storage == first->storage;
+    }
     unsigned panels = 0U;
     for (const auto& projection : projections) panels += (projection.outputs + kLowBitPanelColumns - 1U) / kLowBitPanelColumns;
     if (lowbit && plan_lowbit_rows(rows, panels, width / weight::Q4G64Storage::group).route != LowBitRoute::rows) {
         f16_tile_gemm::Q8ProjectionGroup<Capacity> group{};
         for (const auto& projection : projections) {
             const auto* matrix = std::get_if<weight::ResidentMatrixView>(&projection.weights);
-            if (!matrix || matrix->storage != first->storage || matrix->columns != width ||
+            if (!matrix || matrix->columns != width ||
                 matrix->rows != projection.outputs ||
                 !valid_resident_lowbit_rows(*matrix, projection.outputs, input, rows, projection.output))
                 return row_transforms::invalid;

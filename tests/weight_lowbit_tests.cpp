@@ -7,6 +7,7 @@
 #include "core/weight_decode.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/host_q8.hpp"
+#include "strix/weight/levers.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -182,6 +183,39 @@ void check_lowbit_plan() {
     check(co::lowbit_small_splits(36U, 48U) == 2U, "plan: o 36 panels");
 }
 
+// Shared weight load resolver with per-role mixes: a low-bit policy resolves only when every role class's format is
+// consumed; the head takes its own storage; Q8_0 rows are unchanged.
+void check_lowbit_policies() {
+    const wei::WeightLoadScope scope{};
+    constexpr std::array all{wei::kBf16WeightStorage, wei::kQ8WeightStorage, wei::kQ4G64WeightStorage,
+                             wei::kQ6G64WeightStorage};
+    constexpr std::array no_q6{wei::kBf16WeightStorage, wei::kQ8WeightStorage, wei::kQ4G64WeightStorage};
+    const auto resolve = [&](const wei::WeightLoadPolicy& policy, strix::profile::Name tier,
+                             std::span<const wei::FormatId> consumers) {
+        return wei::resolve_weight_load(wei::builtin_registry(), policy, {tier, scope, consumers, true, true}, {});
+    };
+    const auto mix = resolve(wei::kAttentionQ4HeadQ6Policy, strix::profile::Name::fast, all);
+    check(mix.storage == wei::kQ4G64WeightStorage && mix.head_storage == wei::kQ6G64WeightStorage &&
+              mix.status == strix::profile::Status::unqualified, "mix resolves q4 attention + q6 head");
+    check(mix.storage_for(wei::Role::head) == wei::kQ6G64WeightStorage &&
+              mix.storage_for(wei::Role::attention_o) == wei::kQ4G64WeightStorage &&
+              mix.storage_for(std::nullopt) == wei::kBf16WeightStorage, "mix storage per role");
+    const auto missing = resolve(wei::kAttentionQ4HeadQ6Policy, strix::profile::Name::fast, no_q6);
+    check(missing.storage == wei::kBf16WeightStorage && missing.head_storage == wei::kBf16WeightStorage,
+          "mix without a q6 consumer stays BF16");
+    const auto turbo = resolve(wei::kAttentionHeadQ4Policy, strix::profile::Name::turbo, all);
+    check(turbo.storage == wei::kQ4G64WeightStorage && turbo.head_storage == wei::kQ4G64WeightStorage, "q4 turbo arm");
+    const auto exact = resolve(wei::kAttentionHeadQ6Policy, strix::profile::Name::standard, all);
+    check(exact.storage == wei::kBf16WeightStorage && exact.head_storage == wei::kBf16WeightStorage, "EXACT stays BF16");
+    const auto q8 = resolve(wei::kAttentionHeadQ8Policy, strix::profile::Name::fast, all);
+    check(q8.storage == wei::kQ8WeightStorage && q8.head_storage == wei::kQ8WeightStorage, "Q8_0 policy unchanged");
+    const auto bound = wei::with_legacy(wei::kAttentionQ4HeadQ6Policy, {"legacy-mix", 1});
+    check(bound.head_target() == wei::kQ6G64WeightStorage && bound.target == wei::kQ4G64WeightStorage,
+          "a legacy binding keeps the head format");
+    check(wei::find_weight_load_policy("weights.attention_q4_g64.head_q6_g64@1") == &wei::kAttentionQ4HeadQ6Policy,
+          "mix key finds its shared row");
+}
+
 }  // namespace
 
 int main() {
@@ -189,6 +223,7 @@ int main() {
     check_format<wei::Q6G64Storage, wd::Format::q6_g64>("q6_g64");
     check_q8_unchanged();
     check_lowbit_plan();
+    check_lowbit_policies();
     if (failures) {
         std::cerr << failures << " failures\n";
         return 1;

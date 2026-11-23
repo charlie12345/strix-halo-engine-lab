@@ -227,94 +227,94 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
             asm volatile("cp.async.commit_group;");
         }
         stage_idx = stage_idx + 1 == static_cast<std::uint32_t>(LY::STAGES) ? 0 : stage_idx + 1;
-        if (!act) {  // copy/barrier participant only
-            if constexpr (LY::STAGES == 2) __syncthreads();
-            continue;
-        }
-        const unsigned char* sK = smem + stage;
-        const std::uint32_t sV = smem_base + stage;
-        float s[4][4];
+        // Inactive warps only copy K/V: they skip the compute, and every warp meets the end-of-tile barrier
+        // (pad2) at this one call site.
+        if (act) {
+            const unsigned char* sK = smem + stage;
+            const std::uint32_t sV = smem_base + stage;
+            float s[4][4];
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
+            for (int nt = 0; nt < 4; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
 #pragma unroll
-        for (int ks = 0; ks < D / 16; ++ks) {
+            for (int ks = 0; ks < D / 16; ++ks) {
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    const uint2 b = *reinterpret_cast<const uint2*>(sK + LY::k_read(nt * 8 + g, ks, q4));
+                    mma_bf16(s[nt], qa[ks], b.x, b.y);
+                }
+            }
+            const std::uint32_t key0 = tile_start + t * KT;
+            // scale (log2 domain) and causal mask
+            const bool need_mask = key0 + KT - 1 > pos0 + wrow0;
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float v = s[nt][j] * sl2;
+                    if constexpr (Prepared) {
+                        const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1);
+                        const std::uint32_t qp = j < 2 ? qpos0 : qpos1, qr = j < 2 ? qrow0 : qrow1;
+                        const auto lo = attn_core::mask::window_lo(qp, prepared.window);
+                        if constexpr (Bidirectional) {
+                            if (qr >= rows || !fixed.contains(kp)) v = attn_core::mask::excluded_score;
+                        } else {
+                            bool visible = qr < rows && attn_core::mask::causal_ok(kp, qp, lo);
+                            if constexpr (Keys::step) visible = visible && keys.visible(kp);
+                            if (!visible) {
+                                v = attn_core::mask::excluded_score;
+                            } else {
+                                v += bias.score_bias(qr, head, qp, kp) * log2e;
+                            }
+                        }
+                    } else if (need_mask) {
+                        const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1), qp = j < 2 ? qpos0 : qpos1;
+                        if (kp > qp) v = attn_core::mask::excluded_score;
+                    }
+                    s[nt][j] = v;
+                }
+            float mx0 = attn_core::mask::excluded_score, mx1 = attn_core::mask::excluded_score;
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
-                const uint2 b = *reinterpret_cast<const uint2*>(sK + LY::k_read(nt * 8 + g, ks, q4));
-                mma_bf16(s[nt], qa[ks], b.x, b.y);
+                mx0 = fmaxf(mx0, fmaxf(s[nt][0], s[nt][1]));
+                mx1 = fmaxf(mx1, fmaxf(s[nt][2], s[nt][3]));
             }
-        }
-        const std::uint32_t key0 = tile_start + t * KT;
-        // scale (log2 domain) and causal mask
-        const bool need_mask = key0 + KT - 1 > pos0 + wrow0;
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+            const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
+            const float n0s = n0 == attn_core::mask::excluded_score ? 0.0f : n0, n1s = n1 == attn_core::mask::excluded_score ? 0.0f : n1;
+            const float al0 = exp2f(m0 - n0s), al1 = exp2f(m1 - n1s);  // m = -inf -> 0
+            m0 = n0;
+            m1 = n1;
+            l0 *= al0;
+            l1 *= al1;
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt)
+            for (int i = 0; i < D / 8; ++i) {
+                o[i][0] *= al0; o[i][1] *= al0; o[i][2] *= al1; o[i][3] *= al1;
+            }
+            std::uint32_t pa[2][4];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                float v = s[nt][j] * sl2;
-                if constexpr (Prepared) {
-                    const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1);
-                    const std::uint32_t qp = j < 2 ? qpos0 : qpos1, qr = j < 2 ? qrow0 : qrow1;
-                    const auto lo = attn_core::mask::window_lo(qp, prepared.window);
-                    if constexpr (Bidirectional) {
-                        if (qr >= rows || !fixed.contains(kp)) v = attn_core::mask::excluded_score;
-                    } else {
-                        bool visible = qr < rows && attn_core::mask::causal_ok(kp, qp, lo);
-                        if constexpr (Keys::step) visible = visible && keys.visible(kp);
-                        if (!visible) {
-                            v = attn_core::mask::excluded_score;
-                        } else {
-                            v += bias.score_bias(qr, head, qp, kp) * log2e;
-                        }
-                    }
-                } else if (need_mask) {
-                    const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1), qp = j < 2 ? qpos0 : qpos1;
-                    if (kp > qp) v = attn_core::mask::excluded_score;
+            for (int nt = 0; nt < 4; ++nt) {
+                const float p00 = exp2f(s[nt][0] - n0s), p01 = exp2f(s[nt][1] - n0s), p10 = exp2f(s[nt][2] - n1s), p11 = exp2f(s[nt][3] - n1s);
+                l0 += p00 + p01;
+                l1 += p10 + p11;
+                const std::uint32_t lo = pack2(p00, p01), hi = pack2(p10, p11);
+                pa[nt >> 1][(nt & 1) * 2 + 0] = lo;
+                pa[nt >> 1][(nt & 1) * 2 + 1] = hi;
+            }
+            // O += P V : a0 = (row g, keys 2q..) of n-tile 2j, a1 = (row g+8, n-tile 2j), a2 = (row g, n-tile 2j+1), a3 = (g+8, 2j+1)
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const std::uint32_t a[4] = {pa[j][0], pa[j][1], pa[j][2], pa[j][3]};
+#pragma unroll
+                for (int np = 0; np < D / 16; ++np) {
+                    std::uint32_t b[4];
+                    const std::uint32_t key = 16 * j + ((lane >> 3) & 1) * 8 + (lane & 7), dcol = 8 * (2 * np + (lane >> 4));
+                    ldsm_x4_trans(b, sV + LY::v_chunk(key, dcol / 8));
+                    mma_bf16(o[2 * np], a, b[0], b[1]);
+                    mma_bf16(o[2 * np + 1], a, b[2], b[3]);
                 }
-                s[nt][j] = v;
-            }
-        float mx0 = attn_core::mask::excluded_score, mx1 = attn_core::mask::excluded_score;
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            mx0 = fmaxf(mx0, fmaxf(s[nt][0], s[nt][1]));
-            mx1 = fmaxf(mx1, fmaxf(s[nt][2], s[nt][3]));
-        }
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
-        const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
-        const float n0s = n0 == attn_core::mask::excluded_score ? 0.0f : n0, n1s = n1 == attn_core::mask::excluded_score ? 0.0f : n1;
-        const float al0 = exp2f(m0 - n0s), al1 = exp2f(m1 - n1s);  // m = -inf -> 0
-        m0 = n0;
-        m1 = n1;
-        l0 *= al0;
-        l1 *= al1;
-#pragma unroll
-        for (int i = 0; i < D / 8; ++i) {
-            o[i][0] *= al0; o[i][1] *= al0; o[i][2] *= al1; o[i][3] *= al1;
-        }
-        std::uint32_t pa[2][4];
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            const float p00 = exp2f(s[nt][0] - n0s), p01 = exp2f(s[nt][1] - n0s), p10 = exp2f(s[nt][2] - n1s), p11 = exp2f(s[nt][3] - n1s);
-            l0 += p00 + p01;
-            l1 += p10 + p11;
-            const std::uint32_t lo = pack2(p00, p01), hi = pack2(p10, p11);
-            pa[nt >> 1][(nt & 1) * 2 + 0] = lo;
-            pa[nt >> 1][(nt & 1) * 2 + 1] = hi;
-        }
-        // O += P V : a0 = (row g, keys 2q..) of n-tile 2j, a1 = (row g+8, n-tile 2j), a2 = (row g, n-tile 2j+1), a3 = (g+8, 2j+1)
-#pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const std::uint32_t a[4] = {pa[j][0], pa[j][1], pa[j][2], pa[j][3]};
-#pragma unroll
-            for (int np = 0; np < D / 16; ++np) {
-                std::uint32_t b[4];
-                const std::uint32_t key = 16 * j + ((lane >> 3) & 1) * 8 + (lane & 7), dcol = 8 * (2 * np + (lane >> 4));
-                ldsm_x4_trans(b, sV + LY::v_chunk(key, dcol / 8));
-                mma_bf16(o[2 * np], a, b[0], b[1]);
-                mma_bf16(o[2 * np + 1], a, b[2], b[3]);
             }
         }
         if constexpr (LY::STAGES == 2) __syncthreads();

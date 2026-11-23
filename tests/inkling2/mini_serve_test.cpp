@@ -327,6 +327,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
+        // The route line names the committed rows per regime (why the image stays BF16 on this backend).
+        const bool hip = std::string_view(backend) == "hip";
+        require(hip ? out.str().find(" weight_rows prefill=gate-only@gfx1151,decode=none") != std::string::npos
+                    : out.str().find("weight_rows") == std::string::npos,
+                "inspection does not name the committed per-regime rows");
     };
     inspect();
 

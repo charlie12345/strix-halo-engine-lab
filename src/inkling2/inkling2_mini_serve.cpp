@@ -186,16 +186,23 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;
-            if (kMiniWeightLoadDecisions.empty() || opt.tier == profile::Name::standard || opt.weight_options.disable_q8) {
+            // Without a device the plan is exact unless a full row (gate + gain) of this backend could match there.
+            const auto of_backend = [backend](const weight::WeightLoadDecision& row) { return row.scope.backend == backend; };
+            const bool device_dependent = opt.tier != profile::Name::standard && !opt.weight_options.disable_q8 &&
+                std::ranges::any_of(kMiniWeightLoadDecisions, [&](const weight::WeightLoadDecision& row) {
+                    return of_backend(row) && !(row.measured_gain == weight::Digest256{});
+                });
+            if (!device_dependent) {
                 const weight::WeightLoadScope scope{backend, {}, {}, {}, {}, {}};
                 const auto plan = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope, opt.context);
                 out << " weight_storage " << plan.storage.name << '@' << plan.storage.revision
                     << " weight_status " << profile::status_name(plan.status);
             } else {
-                out << " weight_status pending-device weight_rows "
-                    << weight::registered_regime_rows(kMiniWeightLoadPolicy, backend, kMiniWeightLoadRegimes,
-                                                      kMiniWeightLoadDecisions);
+                out << " weight_status pending-device";
             }
+            if (std::ranges::any_of(kMiniWeightLoadDecisions, of_backend))
+                out << " weight_rows " << weight::registered_regime_rows(kMiniWeightLoadPolicy, backend,
+                                                                         kMiniWeightLoadRegimes, kMiniWeightLoadDecisions);
             out << '\n';
         },
         [backends = std::move(backends), tokenizer = std::move(tokenizer), chat = std::move(chat)]

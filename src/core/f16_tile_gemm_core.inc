@@ -16,7 +16,8 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Bf16Proj
     constexpr bool kA16 = false;
     constexpr Layout L = Layout::NK;
 #elif defined(STRIX_F16_TILE_Q8)
-template <unsigned Capacity>
+// Staging: the Q8_0 block decoder, or a low-bit storage decoder of the same interface (core/lowbit_f16_staging.hpp).
+template <unsigned Capacity, class Staging = q8_f16_staging::Q8F16Staging>
 __device__ __forceinline__ void q8_core(const Args& p, Storage& lds, const Q8ProjectionGroup<Capacity>& group) {
     constexpr bool kA16 = false;
 #else
@@ -98,8 +99,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #elif defined(STRIX_F16_TILE_Q8)
     const unsigned wc = (tid >> 1U) % kProjectionPanel;
     const std::uint8_t* wp = wc < left ? projection.weights + std::size_t{col0 + wc} * p.w_ld : nullptr;
-    using Staging = q8_f16_staging::Q8F16Staging;
-    Staging::Raw rb;
+    typename Staging::Raw rb;
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
     // Inactive columns stage a valid weight row. Only live columns store.
     const unsigned wc = (tid >> 1U) % kProjectionPanel;

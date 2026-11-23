@@ -41,6 +41,7 @@
 #include "core/controller_mix.hpp"
 #include "core/nvfp4_bf16_table.hpp"
 #include "core/q8_f16_staging.hpp"
+#include "core/lowbit_f16_staging.hpp"
 #include "strix/attn/group_indexer.hpp"
 #include <hip/hip_runtime.h>
 #endif
@@ -287,6 +288,28 @@ inline hipError_t gemm_q8_projections(const float* a, unsigned rows, unsigned K,
     const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
     const auto w_row_bytes = static_cast<std::size_t>(weight::Q8Storage::row_bytes(K));
     STRIX_HIP_LAUNCH(Rdna3Layout, q8_projection_kernel<Capacity><<<grid, kThreads, 0, stream>>>(a, rows, K, w_row_bytes, group));
+    return hipGetLastError();
+}
+
+// Low-bit resident projections (q4_g64 / q6_g64) on the same tile: the Q8_0 projection core with the low-bit staging
+// trait, w16 = fp16_rne(float(code) * float(d)) (resident-lowbit-f16-tile-v1, FAST). K % 128 == 0 (whole superblocks).
+template <unsigned Capacity, class LowBit>
+__global__ __launch_bounds__(kThreads)
+void lowbit_projection_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_bytes,
+                              Q8ProjectionGroup<Capacity> group) {
+    const Args p{a, nullptr, K, 0U, nullptr, w_row_bytes, 0U, nullptr, 0U, 0U, rows, K, 0U, 1U};
+    __shared__ Storage lds;
+    q8_core<Capacity, lowbit_f16::LowBitF16Staging<LowBit>>(p, lds, group);
+}
+
+template <class LowBit, unsigned Capacity>
+inline hipError_t gemm_lowbit_projections(const float* a, unsigned rows, unsigned K,
+                                          const Q8ProjectionGroup<Capacity>& group, hipStream_t stream) {
+    static_assert(Capacity <= 32U);  // The total panel count fits unsigned.
+    const dim3 grid((group.first_panel[group.count] + 1U) / 2U, (rows + kBM - 1U) / kBM);
+    const auto w_row_bytes = static_cast<std::size_t>(LowBit::row_bytes(K));
+    STRIX_HIP_LAUNCH(Rdna3Layout,
+                     lowbit_projection_kernel<Capacity, LowBit><<<grid, kThreads, 0, stream>>>(a, rows, K, w_row_bytes, group));
     return hipGetLastError();
 }
 

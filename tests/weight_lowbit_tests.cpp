@@ -3,6 +3,7 @@
 // host build) agree element by element; codes stay in range; the chosen scale never reconstructs worse than the
 // unclipped scale; the Q8_0 loader is unchanged by the shared block source.
 #include "core/iu4_onfly.hpp"
+#include "core/resident_row_plan.hpp"
 #include "core/weight_decode.hpp"
 #include "strix/weight/host_lowbit.hpp"
 #include "strix/weight/host_q8.hpp"
@@ -153,12 +154,41 @@ void check_q8_unchanged() {
     check(std::memcmp(part.data(), expected.data() + 17, 50) == 0, "q8 partial bytes unchanged");
 }
 
+// Route plan of low-bit launches (core/resident_row_plan.hpp): the small route's K split is a function of the launch
+// shape only, every split keeps >= 4 groups, and the Inkling attention shapes take the expected splits.
+void check_lowbit_plan() {
+    namespace co = strix::core;
+    check(co::plan_lowbit_rows(1U, 36U, 48U).route == co::LowBitRoute::rows, "plan: one row of o runs the rows sweep");
+    check(co::plan_lowbit_rows(1U, 80U, 36U).route == co::LowBitRoute::small_tile, "plan: one row of q|k|v runs small");
+    check(co::plan_lowbit_rows(2U, 36U, 48U).route == co::LowBitRoute::small_tile, "plan: two rows run small");
+    check(co::plan_lowbit_rows(co::kLowBitSmallRows + 1U, 48U, 36U).route == co::LowBitRoute::tile, "plan: prefill tile");
+    for (const unsigned panels : {1U, 2U, 7U, 16U, 36U, 48U, 80U, 200U})
+        for (const unsigned groups : {2U, 4U, 8U, 18U, 36U, 48U, 72U}) {
+            const auto base = co::plan_lowbit_rows(co::kLowBitSmallRows, panels, groups);
+            for (unsigned rows = panels < co::kLowBitSweepMaxPanels ? 2U : 1U; rows <= co::kLowBitSmallRows; ++rows) {
+                const auto plan = co::plan_lowbit_rows(rows, panels, groups);
+                check(plan.route == co::LowBitRoute::small_tile && plan.splits == base.splits,
+                      "plan: small route split independent of rows");
+            }
+            const unsigned s = base.splits;
+            check(s == 1U || s == 2U || s == 4U, "plan: split count 1/2/4");
+            check(s == 1U || groups >= 4U * s, "plan: every split keeps >= 4 groups");
+            check(s == 1U || 4U * panels * (s / 2U) < co::kLowBitSmallTargetWaves, "plan: no split beyond the wave target");
+        }
+    // Inkling 2 Mini attention (K 2304 = 36 groups, o K 3072 = 48 groups): q|k|v one launch, q / k alone, o.
+    check(co::lowbit_small_splits(80U, 36U) == 1U, "plan: q|k|v 80 panels");
+    check(co::lowbit_small_splits(48U, 36U) == 1U, "plan: q 48 panels");
+    check(co::lowbit_small_splits(16U, 36U) == 4U, "plan: k 16 panels");
+    check(co::lowbit_small_splits(36U, 48U) == 2U, "plan: o 36 panels");
+}
+
 }  // namespace
 
 int main() {
     check_format<wei::Q4G64Storage, wd::Format::q4_g64>("q4_g64");
     check_format<wei::Q6G64Storage, wd::Format::q6_g64>("q6_g64");
     check_q8_unchanged();
+    check_lowbit_plan();
     if (failures) {
         std::cerr << failures << " failures\n";
         return 1;

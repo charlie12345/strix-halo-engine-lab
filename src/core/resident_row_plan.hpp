@@ -34,9 +34,8 @@ inline bool valid_resident_q8_rows(const weight::ResidentMatrixView& matrix, uns
            matrix.rows <= matrix.bytes.size() / matrix.row_bytes;
 }
 
-// Low-bit resident rows (strix/weight/host_lowbit.hpp): decode / verify windows only (rows <= gemv_rows::max_rows) on
-// the dense rows family. Wider windows (prefill) have no tile consumer for these storages yet and are refused, so a
-// binding cannot silently re-stream the weights once per 16 rows.
+// Low-bit resident rows (strix/weight/host_lowbit.hpp) on HIP: every row count up to the tile grid limit; the route
+// (plan_lowbit_rows below) picks the dense rows sweep, the small-M WMMA schedule or the 128-row projection tile.
 inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix, unsigned outputs,
                                        const float* input, unsigned rows, const float* output) {
     constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
@@ -46,7 +45,7 @@ inline bool valid_resident_lowbit_rows(const weight::ResidentMatrixView& matrix,
     const auto row_bytes = q4 ? weight::Q4G64Storage::row_bytes(matrix.columns) : weight::Q6G64Storage::row_bytes(matrix.columns);
     return input && output && input != output && reinterpret_cast<std::uintptr_t>(input) % 16U == 0U &&
            matrix.bytes.data() && reinterpret_cast<std::uintptr_t>(matrix.bytes.data()) % 16U == 0U &&
-           rows != 0U && rows <= gemv_rows::max_rows && outputs != 0U && outputs <= matrix.rows &&
+           rows != 0U && rows <= 65535U * f16_tile_gemm::kBM && outputs != 0U && outputs <= matrix.rows &&
            outputs <= max_extent && outputs <= max_floats / rows && matrix.columns != 0U &&
            matrix.columns <= max_floats / rows && matrix.columns <= max_extent &&
            matrix.columns % weight::Q4G64Storage::elements == 0U && matrix.row_bytes == row_bytes &&
@@ -71,8 +70,48 @@ static_assert(kResidentQ8ArithmeticHip[0].name != kResidentQ8ArithmeticHip[1].na
               kResidentQ8ArithmeticHip[0].revision && kResidentQ8ArithmeticHip[1].revision &&
               kResidentQ8ArithmeticCuda[0].revision && kResidentQ8ArithmeticCuda[1].revision);
 
-inline constexpr std::array<weight::ArithmeticId, 2> kResidentLowBitArithmeticHip{{
-    {"hip.q4_g64.dense-linear-tight-rows", 1}, {"hip.q6_g64.dense-linear-tight-rows", 1}}};
+// Route of a low-bit resident launch, backend-neutral. Each route's arithmetic is one identity below:
+//   rows       one row of a launch narrower than kLowBitSweepMaxPanels 64-column panels: the dense rows sweep
+//              (core/dense_linear.hpp), one VALU FMA per weight and row (its cost grows with the rows: VALU bound >= 8);
+//   small_tile rows <= kLowBitSmallRows: the small-M WMMA schedule (f16_tile_gemm_small.hpp), one weight read per
+//              48-row block, integer codes as the FP16 operand, one group scale per K64 on the FP32 accumulator;
+//   tile       wider windows (prefill): the 128-row projection tile with the low-bit staging trait.
+// The small route's K split depends on the launch shape only (panels, groups), never on the row count, so a row's bits
+// do not change with the batch width inside the route.
+enum class LowBitRoute : std::uint8_t { rows, small_tile, tile };
+struct LowBitPlan {
+    LowBitRoute route;
+    unsigned splits;  // small_tile: K splits per CTA (1 / 2 / 4); 1 otherwise
+};
+// Constants from the no-model fixture (gfx1151, tests/hip_dense_lowbit_bench.hip): one row of a single projection
+// streams faster on the sweep (o 2304 x 3072 q4: 188 vs 161 GB/s), a grouped q | k | v launch (80 panels) faster on the
+// small route (189 vs 162 GB/s for three sweeps); splits beyond ~2 waves per SIMD only add stage barriers (q 48
+// panels: S = 1 / 2 / 4 at 170 / 161 / 138 GB/s; k 16 panels: 90 / 110 / 112 GB/s).
+inline constexpr unsigned kLowBitSweepRows = 1U;
+inline constexpr unsigned kLowBitSweepMaxPanels = 64U;
+inline constexpr unsigned kLowBitSmallRows = 48U;
+inline constexpr unsigned kLowBitPanelColumns = f16_tile_gemm::kBN / 2U;  // one small-M CTA per 64-column panel
+// Waves the small route aims to keep resident (gfx1151: 40 CU x 2 SIMD x 2); a split is taken only while every split
+// keeps >= 4 groups of 64 inputs.
+inline constexpr unsigned kLowBitSmallTargetWaves = 160U;
+
+constexpr unsigned lowbit_small_splits(unsigned panels, unsigned groups,
+                                       unsigned target_waves = kLowBitSmallTargetWaves) {
+    unsigned splits = 1U;
+    while (splits < 4U && 4ULL * panels * splits < target_waves && groups >= 8U * splits) splits *= 2U;
+    return splits;
+}
+
+constexpr LowBitPlan plan_lowbit_rows(unsigned rows, unsigned panels, unsigned groups) {
+    if (rows <= kLowBitSweepRows && panels < kLowBitSweepMaxPanels) return {LowBitRoute::rows, 1U};
+    if (rows <= kLowBitSmallRows) return {LowBitRoute::small_tile, lowbit_small_splits(panels, groups)};
+    return {LowBitRoute::tile, 1U};
+}
+
+inline constexpr std::array<weight::ArithmeticId, 6> kResidentLowBitArithmeticHip{{
+    {"hip.q4_g64.dense-linear-tight-rows", 1}, {"hip.q6_g64.dense-linear-tight-rows", 1},
+    {"hip.q4_g64.f16-small-m-group-scale", 1}, {"hip.q6_g64.f16-small-m-group-scale", 1},
+    {"hip.q4_g64.f16-tile-staging", 1}, {"hip.q6_g64.f16-tile-staging", 1}}};
 
 // Dispatch consecutive projections of each storage class together, preserving
 // order across BF16 and compact runs. The compact binding validates its format.

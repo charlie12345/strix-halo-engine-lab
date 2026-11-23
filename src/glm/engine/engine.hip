@@ -20,6 +20,7 @@
 // tools/glm/split_plan.py (H128-aligned EXL3 slices, plain tensors by rows).
 #include "strix/glm/engine.hpp"
 #include "strix/session/prefill_session.hpp"
+#include "strix/session/embed_splice_hip.hpp"
 
 #include "glm/engine/glm_fast_attn.hpp"
 #include "glm/engine/glm_fast_moe.hpp"
@@ -34,6 +35,7 @@
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/prefill/glm_pf_router_wmma.hpp"
 #include "glm/engine/glm_lib.hpp"
+#include "glm/engine/glm_embed_splice.hpp"
 #include "glm/engine/glm_pack.hpp"
 #include "glm/engine/glm_r1b.hpp"
 #include "glm/engine/glm_kvshard.hpp"
@@ -64,6 +66,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace strix::glm::engine {
 
@@ -600,6 +603,11 @@ struct Engine::Impl {
     bool pf_installed = false;  // pf came from Engine::set_prefill (not the default reference path)
     std::vector<LayerW> layers;
     std::uint16_t* embed = nullptr;
+    // Provided embedding rows (Engine::set_embed_rows): the splice of the next prefill call, the part inside the chunk
+    // in progress and the device staging of one chunk's rows (sized in set_embed_rows, never during a prefill).
+    strix::session::EmbedSplice embed_next, embed_chunk;
+    std::uint16_t* embed_stage = nullptr;
+    std::size_t embed_stage_rows = 0;
     const std::uint16_t* final_norm = nullptr;
     Linear head;
     std::uint32_t vocab0 = 0, vocab_n = 0;
@@ -2265,6 +2273,23 @@ struct Engine::Impl {
         check_flag("seqpar layers");
     }
 
+    // Provided rows of the chunk in progress (embed_chunk, run rows relative to the chunk) replace the table rows the
+    // embed kernel wrote, in every residual stream copy. With sequence parallelism a rank embeds only the rows it
+    // owns, so it splices only those. The host rows stay alive in the caller's splice until the prefill has synchronized.
+    void splice_embed_rows(unsigned R, bool seqpar) {
+        embed_chunk.validate(R, kHidden);
+        if (embed_chunk.rows() > embed_stage_rows) throw std::logic_error("embed rows: the staging is smaller than the chunk's rows");
+        std::size_t at = 0;  // first staged row of the segment: segments lie back to back in the staging
+        for (const auto& seg : embed_chunk.segments) {
+            hip_ok(hipMemcpyAsync(embed_stage + at * kHidden, seg.data, static_cast<std::size_t>(seg.rows) * kHidden * 2, hipMemcpyHostToDevice, stream),
+                   "embed rows");
+            at += seg.rows;
+        }
+        for (const EmbedPiece& piece : embed_pieces(embed_chunk, R, seqpar, opt.pf_pipeline, opt.rank))
+            strix::session::enqueue_embed_splice(X, kHc, embed_stage + piece.staged_row * kHidden, kHidden, embed_chunk.format, piece.run_row,
+                                                 piece.rows, stream);
+    }
+
     // sp != nullptr: speculative verify rows (one slot): checkpoints go to sp->row_flag[r], nothing throws here.
     // pfc: a chunk of a chunked prefill (rows of one slot, any count <= max_rows): attention, MoE and the dense FFN go
     // through the PrefillPath seam; the row-batched Tier A sites use pf::hc_pre_rows / pf::dense_rows (== decode bits).
@@ -2325,6 +2350,7 @@ struct Engine::Impl {
             STRIX_HIP_LAUNCH(Rdna3Layout, embed4_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, X));
         }
         hip_ok(hipGetLastError(), "embed");
+        if (pfc && l0 == 0 && !embed_chunk.empty()) splice_embed_rows(R, seqpar);
         mark(segEmbed);
         if (!pfc && R > 8) throw std::invalid_argument("layers_forward: decode calls take 1..8 rows");
         if (R > std::max<unsigned>(8U, opt.max_rows)) throw std::invalid_argument("layers_forward: rows > max_rows");
@@ -2544,8 +2570,14 @@ struct Engine::Impl {
     bool reference_prefill_installed() const { return dynamic_cast<const ReferencePrefill*>(pf.get()) != nullptr; }
     // Chunked prefill through the PrefillPath (prefill): chunks of max_rows rows; head on the last row only.
     unsigned score_calls_ = 0;  // prefill calls of this process (score dump file index)
-    std::uint32_t prefill_chunked(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
+    std::uint32_t prefill_chunked(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                                  const strix::session::EmbedSplice& embeds = {}) {
         if (tokens.empty()) throw std::invalid_argument("prefill: no tokens");
+        embeds.validate(tokens.size(), kHidden);
+        struct ChunkSplice {  // no forward after this call sees a stale chunk splice
+            strix::session::EmbedSplice& chunk;
+            ~ChunkSplice() { chunk = {}; }
+        } chunk_splice{embed_chunk};
         ++score_calls_;
         if (opt.layers != kLayers && !smoke_head) throw std::logic_error("prefill needs all 45 layers (G3 uses gate_residual)");
         if (slot >= opt.slots) throw std::out_of_range("prefill slot");
@@ -2557,6 +2589,7 @@ struct Engine::Impl {
             const std::size_t n = std::min(C, tokens.size() - c0);
             rows.resize(n);
             for (std::size_t i = 0; i < n; ++i) rows[i] = Row{slot, tokens[c0 + i], pos0 + c0 + i};
+            embed_chunk = embeds.empty() ? strix::session::EmbedSplice{} : embeds.slice(c0, c0 + n);
             layers_forward(rows, opt.layers, ForwardKind::Prefill);
         }
         const unsigned last = static_cast<unsigned>(rows.size() - 1);
@@ -2679,6 +2712,7 @@ struct Engine::Impl {
             throw std::logic_error("prefill_mtp needs all 45 trunk layers and MTP");
         if (!pf->exact_linears() || reference_prefill_installed())
             throw std::logic_error("prefill_mtp requires an exact chunked PrefillPath (gemv)");
+        if (!embed_next.empty()) throw std::logic_error("prefill_mtp: embedding rows take the plain chunked prefill (Engine::prefill)");
         if (tokens.empty()) throw std::invalid_argument("prefill_mtp: no tokens");
         if (slot >= opt.slots || pos0 > opt.capacity || tokens.size() > opt.capacity - pos0)
             throw std::out_of_range("prefill_mtp: slot / capacity");
@@ -3154,7 +3188,11 @@ std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t>
             strix::glm::r1b::set_active(saved_active);
         }
     } scope(impl_->r1b, impl_->identity == IdentityMode::kR1b);
-    if (!impl_->reference_prefill_installed()) return impl_->prefill_chunked(slot, tokens, pos0);
+    // The splice of this call: taken here so a refused or failed call does not leave it for a later one. It owns the
+    // host rows until prefill_chunked has synchronized the stream.
+    const strix::session::EmbedSplice embeds = std::exchange(impl_->embed_next, {});
+    if (!impl_->reference_prefill_installed()) return impl_->prefill_chunked(slot, tokens, pos0, embeds);
+    if (!embeds.empty()) throw std::logic_error("embedding rows need a chunked prefill path (the reference prefill runs decode steps)");
     if (impl_->kv_shard) throw std::logic_error("kvshard: install the bounded chunked prefill path");
     // Reference identity (arithmetic contract 6.2): prefill = decode, one row at a time; returns the greedy token after the last.
     std::uint32_t next = 0;
@@ -3201,6 +3239,24 @@ bool Engine::prefill_units_admit(std::uint64_t rows) const { return impl_->prefi
 std::uint32_t Engine::prefill_units_total() const { return impl_->units.total; }
 bool Engine::prefill_units_active() const { return impl_->units.active; }
 std::vector<std::uint32_t> Engine::step(std::span<const Row> rows) { return impl_->step(rows); }
+void Engine::set_embed_rows(strix::session::EmbedSplice splice) {
+    auto& m = *impl_;
+    if (m.units.active) throw std::logic_error("set_embed_rows: a prompt's prefill units are in progress");
+    if (!splice.empty()) {
+        if (splice.width != kHidden) throw std::invalid_argument("embed rows: row width differs from the model");
+        // A chunk holds at most max_rows rows, and never more provided rows than the whole splice.
+        const std::size_t need = static_cast<std::size_t>(std::min<std::uint64_t>(splice.rows(), std::max<std::uint32_t>(8U, m.opt.max_rows)));
+        if (need > m.embed_stage_rows) {
+            hip_ok(hipStreamSynchronize(m.stream), "embed rows staging");
+            if (m.embed_stage != nullptr) hip_ok(hipFree(m.embed_stage), "embed rows staging free");
+            m.embed_stage = nullptr;
+            m.embed_stage_rows = 0;
+            m.embed_stage = dalloc<std::uint16_t>(need * kHidden);
+            m.embed_stage_rows = need;
+        }
+    }
+    m.embed_next = std::move(splice);
+}
 void Engine::reset(std::uint32_t slot) { impl_->reset(slot); }
 void Engine::set_attn(std::shared_ptr<AttnPath> p) {
     if (impl_->kv_shard) throw std::logic_error("kvshard: replacing the attention seam is not admitted");

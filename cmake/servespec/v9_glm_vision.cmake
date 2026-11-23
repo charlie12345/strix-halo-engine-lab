@@ -29,3 +29,16 @@ if(TARGET glm5-vision)
     endif()
     set_tests_properties(glm5-vision PROPERTIES LABELS "cpu;glm")
 endif()
+
+# Image rows in the GLM prefill (Engine::set_embed_rows): the engine binds the shared device splice; which rows a rank
+# writes under sequence-parallel prefill is host code with its own test.
+if(TARGET strix_glm5_engine AND TARGET strix_embed_splice_hip)
+    target_link_libraries(strix_glm5_engine PUBLIC strix_embed_splice_hip)
+endif()
+strix_servespec_host_test(NAME glm5-embed-splice
+    SOURCES tests/glm_embed_splice_cpu_tests.cpp
+    LIBS strix_model_data)
+if(TARGET glm5-embed-splice)
+    target_include_directories(glm5-embed-splice PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    set_tests_properties(glm5-embed-splice PROPERTIES LABELS "cpu;glm;exactness")
+endif()

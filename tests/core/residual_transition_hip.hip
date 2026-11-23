@@ -10,9 +10,8 @@
 // The fixture binds the add, readout and transition leaves; the unused kernels would warn here.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
-#include "core/residual_mix.hpp"
+#include "core/residual_transition_hip.hpp"
 #pragma clang diagnostic pop
-#include "ops/norm/rms_bf16_rows.hpp"
 
 #include <hip/hip_runtime.h>
 

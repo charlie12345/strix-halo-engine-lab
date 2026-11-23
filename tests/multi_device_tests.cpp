@@ -296,7 +296,8 @@ void registered_models(const std::filesystem::path& root) {
         require(member && member->find("form") && member->find("form")->as_string() == "single",
                 entry.name + ": effective config states multi_device.form = single on one device");
         if (entry.name == "inkling2-mini") {
-            // Two whole-model devices: replicas for every tier and phase (the long-prefill regime is parked).
+            // Two whole-model devices: replicas for every tier and phase (no regime: the model declares no staged form).
+            require(p.regimes.empty() && p.forms.size() == 2, "inkling2-mini: single + replica, no parked regime");
             for (Name tier : {Name::standard, Name::fast, Name::turbo})
                 for (auto phase : {md::Phase::request, md::Phase::prefill, md::Phase::decode}) {
                     const auto d = md::select(p, query(tier, 2, phase, 32768, 1));
@@ -306,6 +307,16 @@ void registered_models(const std::filesystem::path& root) {
             const auto router = strix::profile::resolve_replica_router(description, {}, 2);
             require(router.placement.form == md::Form::replica && router.requested == Name::standard,
                     "inkling2-mini: the router admits two replicas under the EXACT default");
+            // One endpoint is not a replica set: the router refuses it, for every tier.
+            for (Name tier : {Name::standard, Name::fast, Name::turbo})
+                refuses([&] { (void)strix::profile::resolve_replica_router(description, tier, 1); },
+                        "does not resolve the replica form for 1 replicas");
+            // A standalone two-device launch reports replicas but is not admitted: it would start one worker.
+            md::Query two;
+            two.devices = 2;
+            const auto standalone = strix::profile::resolve_model_preset(description, {}, "hip", two);
+            require(standalone.placement.form == md::Form::replica, "inkling2-mini: two devices report replicas");
+            refuses([&] { md::admit(standalone.placement, md::Executor::engine); }, "runs behind strix-router");
         }
     }
 }

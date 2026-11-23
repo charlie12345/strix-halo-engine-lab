@@ -65,7 +65,8 @@ levers = "fast"
 # Multi-device placement, resolved by the shared profile resolver (strix run/serve --device-count N, strix-router
 # --description). Two whole-model nodes serve independent requests as replicas behind strix-router: each request
 # runs on one node with the single-node identity. One device resolves single, exactly as before. Staged prefill
-# and tensor forms are not bound for this model; the long-prefill regime waits for its receipt.
+# and tensor forms are not bound for this model: a regime that uses one arrives with the declared form and its
+# qualification. Only strix-router executes the replica form; each worker is a one-device launch.
 [multi_device]
 version = 1
 default = "replica"
@@ -74,9 +75,3 @@ fallback = "single"
 [multi_device.forms.replica]
 ranks = 2
 objective = "throughput"
-
-[multi_device.regimes.long_prefill]
-phase = "prefill"
-min_prompt_rows = 4096
-prefer = ["layers", "single"]
-enabled = false

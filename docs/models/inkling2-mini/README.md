@@ -86,23 +86,34 @@ request runs on one node with the single-node identity. The
 with one device the same resolver selects `single`, as before.
 
 ```sh
-# on each node
-strix-serve --model inkling2-mini --checkpoint MODEL.safetensors --port 18196
+# on node A and on node B: one worker each, listening on that node's private address
+# (the listener defaults to 127.0.0.1, which the other node cannot reach)
+strix-serve --model inkling2-mini --checkpoint MODEL.safetensors --bind NODE_A_ADDRESS --port 18196   # node A
+strix-serve --model inkling2-mini --checkpoint MODEL.safetensors --bind NODE_B_ADDRESS --port 18196   # node B
+# check that both workers answer from the router's node
+curl -fsS http://NODE_A_ADDRESS:18196/health && curl -fsS http://NODE_B_ADDRESS:18196/health
 # on the node that takes the API traffic
 strix-router --description models/inkling2-mini.toml \
-  --replica http://NODE_A:18196 --replica http://NODE_B:18196 --listen 0.0.0.0:8090
+  --replica http://NODE_A_ADDRESS:18196 --replica http://NODE_B_ADDRESS:18196 --listen 0.0.0.0:8090
 ```
 
 The router prints `effective-multi-device {...}` and refuses to start if
-the model data does not admit replicas for that many endpoints.
-`strix run|serve inkling2-mini --device-count 2 --print-effective-config` prints
-the same placement. To roll back, start the router without
-`--description`, or serve from one node.
+the model data does not admit replicas for that many endpoints (one
+endpoint is refused). Only the router executes the replica form: each
+worker is a one-device launch, and `strix run|serve inkling2-mini
+--device-count 2` without `--print-effective-config` is refused, since one
+process would start one worker. `strix run|serve inkling2-mini
+--device-count 2 --print-effective-config` prints the same placement as the
+router. To roll back, start the router without `--description`, or serve
+from one node.
 
-Dos nodos: cada nodo ejecuta un `strix-serve` completo y `strix-router`
-reparte las peticiones; cada petición se resuelve en un solo nodo con la
-identidad de un nodo. Para volver atrás, arranca el router sin
-`--description` o sirve desde un nodo.
+Dos nodos: cada nodo ejecuta un `strix-serve` completo, escuchando en su
+dirección privada (`--bind`; por defecto escucha en 127.0.0.1 y el otro
+nodo no lo alcanza), y `strix-router` reparte las peticiones; cada petición
+se resuelve en un solo nodo con la identidad de un nodo. Solo el router
+ejecuta la forma `replica`; `strix run|serve --device-count 2` sin
+`--print-effective-config` se rechaza. Para volver atrás, arranca el router
+sin `--description` o sirve desde un nodo.
 
 ## Execution and reuse
 

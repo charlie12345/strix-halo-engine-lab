@@ -11,8 +11,11 @@
 // Three kernels:
 //   quantise: FP32 rows -> rotated (fwht128 per 128 inputs) 4-bit codes in the iu4 fragment tile layout, the integer
 //     group scales u (one dword per row per 128 block = 4 groups of 32) and the row base. One wave per row.
-//   requantise (load time): the IU4 g64 pack -> rotated per-128 codes (same tile layout) + FP32 steps in a tile order.
+//   requantise (load time): a weight source (the IU4 g64 pack; microscaled expert matrices) -> rotated per-128 codes
+//     (same tile layout) + FP32 steps in a tile order.
 //   gemm: y[m][n] = base_m * sum_b fmaf(float(t_b), wstep[n][b], .) with t_b = sum_{g in b} u_g P_g (int32, exact).
+//     Traits: dense (grid over the m x n blocks of one matrix) and grouped (GroupCta: one CTA per group tile of <= 128
+//     gathered rows with its own weight image, e.g. routed expert tiles; plain or paired gate / up epilogue).
 //
 // Geometry (gemm): the WMMA computes W . x^T: A operand = 16 weight rows n, B operand = 16 activation rows m. The i32
 // result puts one m per lane (m = lane % 16) and 8 n per lane (n = 2 e + lane / 16), so the A-group scale u_g is a lane
@@ -67,6 +70,25 @@ struct OutCols {
     float* y;
     unsigned stride, tiles;
     __device__ __forceinline__ f16_dense_tall::ColumnTile tile(unsigned i) const { return {nullptr, y + 16U * i, stride, i < tiles}; }
+};
+
+// Grouped trait (expert tiles; same contract per output): one CTA = 1..kCtaTilesM * 16 rows of one group tile that
+// share one weight image; grid x = tiles, grid y = blocks of kCtaTilesN W tiles, grid z = row slices of taller tiles. Src::active(t) refuses tiles past a
+// device count (uniform, before any barrier); Src::bind(t) gives the CTA's operands. Activation row r of the tile is
+// row map ? map[first + r] : first + r of the Act image (dense layout: e.g. a token image read through a routing map,
+// or rows already in tile order). The CTA stores rows r < rows only.
+struct GroupCta {
+    Weights w;                      // the group's rotated image (in = Act::in, n = the launch's n)
+    const std::uint32_t* map;       // optional image row map
+    unsigned first, rows;
+    float* y;                       // output row r at y + r * y_row
+    std::size_t y_row;
+};
+// Epilogues: PlainOut y[r][o] = acc * base (the dense rounding). A paired epilogue (kPaired = true, float operator()(gate,
+// up)) reads W tiles 2 c and 2 c + 1 as the two halves of output columns 16 c .. 16 c + 15 and stores h[r][16 c + j] =
+// epi(gate, up) (the weight image is built in that column order: iu4a4_rot::paired_column), n / 2 outputs per row.
+struct PlainOut {
+    static constexpr bool kPaired = false;
 };
 
 namespace detail {
@@ -266,14 +288,24 @@ __global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restri
 }
 
 // One thread per (column n, block b); load time.
-__global__ __launch_bounds__(256) void requantise_kernel(const std::uint8_t* __restrict__ pack, const std::uint16_t* __restrict__ scales,
-                                                         unsigned in, unsigned n, std::uint8_t* __restrict__ dst, float* __restrict__ step) {
+// Load-time requantisation (one thread per column and 128 block) from a weight source: Src::column(n, b) gives the value
+// functor of iu4a4_rot::requantise_values (the IU4 g64 pack: G64Source; expert images: moe_core/grouped_iu4a4.hpp).
+template <class Src>
+__global__ __launch_bounds__(256) void requantise_kernel(Src src, unsigned in, unsigned n, std::uint8_t* __restrict__ dst, float* __restrict__ step) {
     const std::size_t id = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const unsigned blocks = in / rot::kBlock;
     if (id >= std::size_t(n) * blocks) return;
     const unsigned col = static_cast<unsigned>(id % n), b = static_cast<unsigned>(id / n);
-    step[step_index(b, col, n)] = rot::requantise_codes(pack, scales, in, n, col, b, dst);
+    step[step_index(b, col, n)] = src.requantise(col, b, n, dst);
 }
+struct G64Source {
+    const std::uint8_t* pack;
+    const std::uint16_t* scales;
+    unsigned in;
+    __device__ __forceinline__ float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
+        return rot::requantise_codes(pack, scales, in, n, col, b, dst);
+    }
+};
 
 // GEMM main loop. The CTA stages each 128-input block of its 8 W tiles and 8 x tiles in LDS (2 KB per K16 unit:
 // W tiles then x tiles, 128 B each = the global fragment layout, so a piece is one 16 B copy), double buffered: the
@@ -284,6 +316,59 @@ __global__ __launch_bounds__(256) void requantise_kernel(const std::uint8_t* __r
 // unit ahead. The arithmetic per group / block is the contract's (iu4a4_rot::dot), unchanged.
 inline constexpr unsigned kUnitBytes = 2048U, kCodeBytes = 8U * kUnitBytes, kSideBytes = 1024U, kBlockBytes = kCodeBytes + kSideBytes;
 static_assert(kCtaTilesN == 8U && kCtaTilesM == 8U, "a staged unit holds 8 W tiles and 8 x tiles (64 x 16 B per side)");
+// The contract arithmetic of one staged 128-input block `buf` (codes, then side data) for a wave's kTw x kTm tiles,
+// added to acc (shared by the dense and the grouped launch: same operations, same order).
+__device__ __forceinline__ void block_dot(const std::uint8_t* buf, unsigned wn, unsigned wm, unsigned l16, unsigned hi, float (&acc)[kTw][kTm][8]) {
+    const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];  // fragment sets in ping-pong (named: no ring copies)
+    const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j)
+                c[i][j] = STRIX_HIP_WMMA_IU4(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
+    };
+    const I2* wl = reinterpret_cast<const I2*>(buf + wn * (kTw * 128U) + l16 * 8U);
+    const I2* xl = reinterpret_cast<const I2*>(buf + 1024U + wm * (kTm * 128U) + l16 * 8U);
+    const auto load = [&](unsigned k, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned i = 0; i < kTw; ++i) wd[i] = wl[(k * kUnitBytes + i * 128U) / 8U];
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j) xd[j] = xl[(k * kUnitBytes + j * 128U) / 8U];
+    };
+    const std::uint8_t* sd = buf + kCodeBytes;
+    std::uint32_t ub[kTm];
+#pragma unroll
+    for (unsigned j = 0; j < kTm; ++j) ub[j] = reinterpret_cast<const std::uint32_t*>(sd + 512U + (wm * kTm + j) * 64U)[l16];
+    I8 t[kTw][kTm];
+    load(0U, wa, xa);
+#pragma unroll
+    for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+        I8 c[kTw][kTm];
+        load(2U * g + 1U, wb, xb);
+        mma(wa, xa, c, true);
+        if (g + 1U < rot::kGroupsPerBlock) load(2U * g + 2U, wa, xa);
+        mma(wb, xb, c, false);
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j) {
+            const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
+        }
+    }
+#pragma unroll
+    for (unsigned i = 0; i < kTw; ++i) {
+        const F4* sb = reinterpret_cast<const F4*>(sd + (wn * kTw + i) * 64U + hi * 32U);
+        const F4 s0 = sb[0], s1 = sb[1];
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e)
+                acc[i][j][e] = __builtin_fmaf(static_cast<float>(t[i][j][e]), e < 4U ? s0[e] : s1[e - 4U], acc[i][j][e]);
+    }
+}
 template <class Cols, class Store>
 __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, Store store) {
     __shared__ __attribute__((aligned(16))) std::uint8_t lds[2U * kBlockBytes];
@@ -329,63 +414,13 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
         for (unsigned j = 0; j < kTm; ++j)
 #pragma unroll
             for (unsigned e = 0; e < 8U; ++e) acc[i][j][e] = 0.0F;
-    const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
-    I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];  // fragment sets in ping-pong (named: no ring copies)
-    const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
-#pragma unroll
-        for (unsigned i = 0; i < kTw; ++i)
-#pragma unroll
-            for (unsigned j = 0; j < kTm; ++j)
-                c[i][j] = STRIX_HIP_WMMA_IU4(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
-    };
     fetch(0U);
     put(0U);
     __syncthreads();
     for (unsigned b = 0; b < blocks; ++b) {
         const bool more = b + 1U < blocks;
         if (more) fetch(b + 1U);
-        if (live) {
-            const I2* wl = reinterpret_cast<const I2*>(lds + (b & 1U) * kBlockBytes + wn * (kTw * 128U) + l16 * 8U);
-            const I2* xl = reinterpret_cast<const I2*>(lds + (b & 1U) * kBlockBytes + 1024U + wm * (kTm * 128U) + l16 * 8U);
-            const auto load = [&](unsigned k, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
-#pragma unroll
-                for (unsigned i = 0; i < kTw; ++i) wd[i] = wl[(k * kUnitBytes + i * 128U) / 8U];
-#pragma unroll
-                for (unsigned j = 0; j < kTm; ++j) xd[j] = xl[(k * kUnitBytes + j * 128U) / 8U];
-            };
-            const std::uint8_t* sd = lds + (b & 1U) * kBlockBytes + kCodeBytes;
-            std::uint32_t ub[kTm];
-#pragma unroll
-            for (unsigned j = 0; j < kTm; ++j) ub[j] = reinterpret_cast<const std::uint32_t*>(sd + 512U + (wm * kTm + j) * 64U)[l16];
-            I8 t[kTw][kTm];
-            load(0U, wa, xa);
-#pragma unroll
-            for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
-                I8 c[kTw][kTm];
-                load(2U * g + 1U, wb, xb);
-                mma(wa, xa, c, true);
-                if (g + 1U < rot::kGroupsPerBlock) load(2U * g + 2U, wa, xa);
-                mma(wb, xb, c, false);
-#pragma unroll
-                for (unsigned j = 0; j < kTm; ++j) {
-                    const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
-#pragma unroll
-                    for (unsigned i = 0; i < kTw; ++i)
-#pragma unroll
-                        for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
-                }
-            }
-#pragma unroll
-            for (unsigned i = 0; i < kTw; ++i) {
-                const F4* sb = reinterpret_cast<const F4*>(sd + (wn * kTw + i) * 64U + hi * 32U);
-                const F4 s0 = sb[0], s1 = sb[1];
-#pragma unroll
-                for (unsigned j = 0; j < kTm; ++j)
-#pragma unroll
-                    for (unsigned e = 0; e < 8U; ++e)
-                        acc[i][j][e] = __builtin_fmaf(static_cast<float>(t[i][j][e]), e < 4U ? s0[e] : s1[e - 4U], acc[i][j][e]);
-            }
-        }
+        if (live) block_dot(lds + (b & 1U) * kBlockBytes, wn, wm, l16, hi, acc);
         if (more) put((b + 1U) & 1U);
         __syncthreads();
     }
@@ -413,6 +448,130 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
         s.close();
     });
 }
+
+// Grouped trait of the GEMM (see GroupCta): the dense copy roles, block_dot and output rounding; the x side copies two
+// gathered rows per 16 B piece (8 B each, the same LDS layout) and their u words one by one.
+template <class Src, class Epi>
+__global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsigned n, Epi epi) {
+    __shared__ __attribute__((aligned(16))) std::uint8_t lds[2U * kBlockBytes];
+    if (!src.active(blockIdx.x)) return;  // uniform, before any barrier
+    GroupCta g = src.bind(blockIdx.x);
+    // Row slice z of the tile: rows [128 z, 128 z + 128) (a plan tile taller than one CTA).
+    const unsigned skip = blockIdx.z * kCtaTilesM * 16U, all = f16_dense_tall::detail::uni(g.rows);
+    if (all <= skip) return;
+    const unsigned rows = all - skip < kCtaTilesM * 16U ? all - skip : kCtaTilesM * 16U;
+    g.first += skip;
+    g.y += std::size_t(skip) * g.y_row;
+    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, l16 = lane & 15U, hi = lane >> 4U;
+    const unsigned ntiles = f16_dense_tall::detail::uni(n) / 16U, mp = padded_rows(f16_dense_tall::detail::uni(a.rows));
+    const unsigned mtiles = (rows + 15U) / 16U, blocks = f16_dense_tall::detail::uni(a.in) / rot::kBlock;
+    const unsigned wn = wave % kWavesN, wm = wave / kWavesN;
+    const unsigned nt0 = blockIdx.y * kCtaTilesN + wn * kTw, mt0 = wm * kTm;
+    const bool live = mt0 < mtiles;  // a wave without a live x tile still copies and meets the barriers
+    const auto image_row = [&](unsigned r) __attribute__((always_inline)) {
+        const unsigned c = g.first + (r < rows ? r : rows - 1U);  // rows past the tile re-read its last row (never stored)
+        return g.map ? g.map[c] : c;
+    };
+    // Code copy: piece q of a block = unit 2 q + (tid >> 7); waves 0-1 / 4-5 copy W (as the dense launch), 2-3 / 6-7 x.
+    const unsigned side = (tid >> 6U) & 1U, piece = tid & 63U, cu = tid >> 7U;
+    const unsigned dst = cu * kUnitBytes + side * 1024U + piece * 16U;
+    const std::size_t wstride = std::size_t(ntiles) * 8U;  // one K16 unit of W, in 16 B pieces
+    const unsigned wtile = blockIdx.y * kCtaTilesN + (piece >> 3U), wct = wtile < ntiles ? wtile : ntiles - 1U;
+    const GI4* wsrc = (const GI4*)g.w.codes + std::size_t(cu) * wstride + std::size_t(wct) * 8U + (piece & 7U);
+    typedef const __attribute__((address_space(1))) I2 GI2;
+    const unsigned xt = (piece >> 3U) < mtiles ? (piece >> 3U) : mtiles - 1U, xr = xt * 16U + 2U * (piece & 7U);
+    const unsigned r0 = image_row(xr), r1 = image_row(xr + 1U);
+    const GI2* x0 = (const GI2*)(a.codes + std::size_t(r0 / 16U) * 128U + (r0 % 16U) * 8U) + std::size_t(cu) * mp;
+    const GI2* x1 = (const GI2*)(a.codes + std::size_t(r1 / 16U) * 128U + (r1 % 16U) * 8U) + std::size_t(cu) * mp;
+    // Side copy: tid < 32 the steps of W tile tid / 4 (as the dense launch); 32 <= tid < 64 the u of 4 rows of x tile.
+    const unsigned sq = tid & 31U;
+    const bool wside = tid < 32U, xside = tid >= 32U && tid < 64U;
+    const unsigned stile = blockIdx.y * kCtaTilesN + (sq >> 2U), stc = stile < ntiles ? stile : ntiles - 1U;
+    const GI4* ssrc = (const GI4*)g.w.step + std::size_t(stc) * 4U + (sq & 3U);
+    const std::size_t sstride = std::size_t(ntiles) * 4U;
+    const unsigned ut = (sq >> 2U) < mtiles ? (sq >> 2U) : mtiles - 1U;
+    unsigned ur[4];
+#pragma unroll
+    for (unsigned i = 0; i < 4U; ++i) ur[i] = image_row(ut * 16U + (sq & 3U) * 4U + i);
+    const GU32* ug = (const GU32*)a.u;
+    I4 stg[4], sstg = {0, 0, 0, 0};
+    const auto fetch = [&](unsigned b) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) {
+            const std::size_t unit = std::size_t(b) * 8U + 2U * q;
+            if (side == 0U) {
+                stg[q] = wsrc[unit * wstride];
+            } else {
+                const I2 lo = x0[unit * mp], hv = x1[unit * mp];
+                const I4 pair = {lo[0], lo[1], hv[0], hv[1]};
+                stg[q] = pair;
+            }
+        }
+        if (wside) {
+            sstg = ssrc[std::size_t(b) * sstride];
+        } else if (xside) {
+            const std::size_t ub = std::size_t(b) * mp;
+            const I4 words = {static_cast<int>(ug[ub + ur[0]]), static_cast<int>(ug[ub + ur[1]]), static_cast<int>(ug[ub + ur[2]]),
+                              static_cast<int>(ug[ub + ur[3]])};
+            sstg = words;
+        }
+    };
+    const bool scopy = tid < 64U;
+    const auto put = [&](unsigned buf) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) *reinterpret_cast<I4*>(lds + buf * kBlockBytes + dst + q * 2U * kUnitBytes) = stg[q];
+        if (scopy) *reinterpret_cast<I4*>(lds + buf * kBlockBytes + kCodeBytes + tid * 16U) = sstg;
+    };
+    float acc[kTw][kTm][8];
+#pragma unroll
+    for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) acc[i][j][e] = 0.0F;
+    fetch(0U);
+    put(0U);
+    __syncthreads();
+    for (unsigned b = 0; b < blocks; ++b) {
+        const bool more = b + 1U < blocks;
+        if (more) fetch(b + 1U);
+        if (live) block_dot(lds + (b & 1U) * kBlockBytes, wn, wm, l16, hi, acc);
+        if (more) put((b + 1U) & 1U);
+        __syncthreads();
+    }
+    (void)epi;
+    if (!live) return;  // after the last barrier
+#pragma unroll
+    for (unsigned j = 0; j < kTm; ++j) {
+        const unsigned r = (mt0 + j) * 16U + l16;
+        if (mt0 + j >= mtiles || r >= rows) continue;
+        const float bm = a.base[image_row(r)];
+        float* yr = g.y + std::size_t(r) * g.y_row;
+        if constexpr (!Epi::kPaired) {
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) {
+                if (nt0 + i >= ntiles) continue;
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) {
+                    float v = acc[i][j][e] * bm;
+                    asm volatile("" : "+v"(v));  // y = acc * base rounded once, as the dense launch
+                    yr[(nt0 + i) * 16U + 2U * e + hi] = v;
+                }
+            }
+        } else {
+#pragma unroll
+            for (unsigned i = 0; i < kTw; i += 2U) {
+                if (nt0 + i + 1U >= ntiles) continue;
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) {
+                    float gate = acc[i][j][e] * bm, up = acc[i + 1U][j][e] * bm;
+                    asm volatile("" : "+v"(gate), "+v"(up));
+                    yr[((nt0 + i) / 2U) * 16U + 2U * e + hi] = epi(gate, up);
+                }
+            }
+        }
+    }
+}
 }  // namespace detail
 
 // Host side (stream-ordered; callers check supported() and hipGetLastError()).
@@ -426,10 +585,26 @@ template <class F = detail::Ident> inline void enqueue_quantise_map2(const float
 inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
     enqueue_quantise_map2<detail::Ident>(x, nullptr, x_stride, a, s);
 }
+// Requantisation from a weight source (Src::requantise(col, b, n, dst) -> step, see detail::requantise_kernel).
+template <class Src>
+inline void enqueue_requantise_source(const Src& src, unsigned in, unsigned n, std::uint8_t* dst, float* step, hipStream_t s) {
+    const std::size_t threads = std::size_t(n) * (in / rot::kBlock);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::requantise_kernel<Src>), dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256), 0, s, src, in, n,
+                         dst, step);
+}
+// Grouped launch (GroupCta): `tiles` CTAs in x. Limits: supported(a.in, n), 0 < tiles <= 0x7fffffff, a paired epilogue
+// n % 32 == 0; every image row a map names is < a.rows.
+inline bool grouped_supported(unsigned in, unsigned n, bool paired) { return supported(in, n) && (!paired || n % 32U == 0U); }
+// max_tile_rows: the plan's tallest tile (grid z = row slices of kCtaTilesM * 16 rows; a slice past a tile leaves).
+template <class Src, class Epi = PlainOut>
+inline void enqueue_grouped_gemm(const Src& src, unsigned tiles, unsigned max_tile_rows, unsigned n, const Act& a, hipStream_t s, Epi epi = {}) {
+    const unsigned slices = (max_tile_rows + kCtaTilesM * 16U - 1U) / (kCtaTilesM * 16U);
+    const dim3 grid(tiles, (n / 16U + kCtaTilesN - 1U) / kCtaTilesN, slices > 0U ? slices : 1U);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::grouped_gemm_kernel<Src, Epi>), grid, dim3(32U * kWavesN * kWavesM), 0, s, src, a, n, epi);
+}
 inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* scales, unsigned in, unsigned n, std::uint8_t* dst, float* step,
                                hipStream_t s) {
-    const std::size_t threads = std::size_t(n) * (in / rot::kBlock);
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::requantise_kernel, dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256), 0, s, pack, scales, in, n, dst, step);
+    enqueue_requantise_source(detail::G64Source{pack, scales, in}, in, n, dst, step, s);
 }
 template <class Cols, class Store = f16_dense_tall::RawStore>
 inline void enqueue_gemm(const Weights& w, const Act& a, Cols cols, hipStream_t s, Store store = {}) {

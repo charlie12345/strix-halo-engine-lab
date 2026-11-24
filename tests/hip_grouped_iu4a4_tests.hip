@@ -1,0 +1,398 @@
+// Device fixture of the grouped rotated A4W4 expert class (moe_core/grouped_iu4a4.hpp on the grouped trait of
+// core/iu4a4_dense.hpp), bit for bit:
+//   - the expert requantisation (NVFP4 and MXFP8 sources, plain and paired column order, contiguous and interleaved
+//     row order) against ExpertSource on the host;
+//   - every plain output of a routed gate/up and down launch against iu4a4_rot::dot of its gathered row (token image
+//     read through the assignment -> token map; down rows in assignment order located through the gate/up tiles);
+//   - the paired SwiGLU epilogue against the plain outputs of the same image put through the same device activation;
+//   - rows outside the tiles stay untouched; a device tile count refuses the tiles past it.
+// --bench [tokens]: Inkling 2 Mini shapes (128 experts, top-8, hidden 2304, ffn 1152), uniform routing, ms and TOPS of
+// the token quantise, paired gate/up, h quantise and down launches (plan tiles of <= 256 rows as the HIP plan) (no reference; a rate, not a model receipt).
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
+#include "moe_core/grouped_iu4a4.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace {
+namespace gi = strix::moe_core::grouped_iu4a4;
+namespace ad = strix::core::iu4a4_dense;
+namespace rot = strix::core::iu4a4_rot;
+namespace packed = strix::weight::microscaled;
+using strix::moe_core::grouped_microscaled::TileRows;
+#define CHECK(x) do { const hipError_t e_ = (x); if (e_ != hipSuccess) { std::printf("HIP %s at %d\n", hipGetErrorString(e_), __LINE__); std::exit(2); } } while (0)
+
+std::uint32_t bits(float v) {
+    std::uint32_t b;
+    std::memcpy(&b, &v, 4);
+    return b;
+}
+bool same(float a, float b) { return (std::isnan(a) && std::isnan(b)) || bits(a) == bits(b); }
+
+template <class T>
+T* upload(const std::vector<T>& v) {
+    T* d = nullptr;
+    CHECK(hipMalloc(&d, std::max<std::size_t>(v.size(), 1U) * sizeof(T)));
+    if (!v.empty()) CHECK(hipMemcpy(d, v.data(), v.size() * sizeof(T), hipMemcpyHostToDevice));
+    return d;
+}
+template <class T>
+std::vector<T> download(const T* d, std::size_t count) {
+    std::vector<T> v(count);
+    if (count) CHECK(hipMemcpy(v.data(), d, count * sizeof(T), hipMemcpyDeviceToHost));
+    return v;
+}
+
+// A layer's experts of one projection: rows x in each, stored contiguously (expert e at e * stride).
+struct Bank {
+    packed::MatrixFormat format;
+    unsigned experts, rows, in;
+    packed::RowOrder order;
+    std::vector<std::uint8_t> codes, scales;
+    std::uint8_t *dcodes = nullptr, *dscales = nullptr;
+    std::size_t code_row() const { return format == packed::MatrixFormat::nvfp4 ? in / 2U : in; }
+    std::size_t scale_row() const { return in / (format == packed::MatrixFormat::nvfp4 ? 16U : 32U); }
+    packed::PackedMatrix matrix(unsigned e, bool device) const {
+        const std::uint8_t* c = (device ? dcodes : codes.data()) + std::size_t(e) * rows * code_row();
+        const std::uint8_t* s = (device ? dscales : scales.data()) + std::size_t(e) * rows * scale_row();
+        return {c, s, rows, in, format == packed::MatrixFormat::nvfp4 ? 0.75F : 1.0F, order};
+    }
+};
+Bank make_bank(packed::MatrixFormat f, unsigned experts, unsigned rows, unsigned in, packed::RowOrder order, std::mt19937& g) {
+    Bank b{f, experts, rows, in, order, {}, {}};
+    b.codes.resize(std::size_t(experts) * rows * b.code_row());
+    b.scales.resize(std::size_t(experts) * rows * b.scale_row());
+    for (auto& c : b.codes) {
+        c = static_cast<std::uint8_t>(g());
+        if (f == packed::MatrixFormat::mxfp8 && (c & 0x7fU) == 0x7fU) c = 0x3cU;  // no E4M3 NaN codes
+    }
+    // NVFP4: E4M3 block scales 2^-3 .. 2^1; MXFP8: E8M0 2^-8 .. 2^-4.
+    for (auto& s : b.scales) s = static_cast<std::uint8_t>(f == packed::MatrixFormat::nvfp4 ? 0x20U + g() % 32U : 119U + g() % 5U);
+    b.dcodes = upload(b.codes);
+    b.dscales = upload(b.scales);
+    return b;
+}
+
+struct Image {
+    std::uint8_t* codes = nullptr;
+    float* steps = nullptr;
+    gi::ExpertImage view{};
+};
+Image requantise(const Bank& b, unsigned pair_rows) {
+    const unsigned n = b.rows;
+    Image im;
+    im.view.code_bytes = gi::image_code_bytes(b.in, n);
+    im.view.step_floats = gi::image_step_floats(b.in, n);
+    CHECK(hipMalloc(&im.codes, im.view.code_bytes * b.experts));
+    CHECK(hipMalloc(&im.steps, im.view.step_floats * b.experts * 4U));
+    for (unsigned e = 0; e < b.experts; ++e) {
+        if (b.format == packed::MatrixFormat::nvfp4)
+            gi::enqueue_requantise_expert<packed::MatrixFormat::nvfp4>(b.matrix(e, true), pair_rows, b.in, n, im.codes + e * im.view.code_bytes,
+                                                                       im.steps + e * im.view.step_floats, nullptr);
+        else
+            gi::enqueue_requantise_expert<packed::MatrixFormat::mxfp8>(b.matrix(e, true), pair_rows, b.in, n, im.codes + e * im.view.code_bytes,
+                                                                       im.steps + e * im.view.step_floats, nullptr);
+    }
+    CHECK(hipGetLastError());
+    im.view.codes = im.codes;
+    im.view.steps = im.steps;
+    return im;
+}
+// Host image of expert e (codes in the rotated tile layout, steps [n][blocks] as iu4a4_rot::dot reads them).
+template <packed::MatrixFormat F>
+void host_image(const Bank& b, unsigned e, unsigned pair_rows, std::vector<std::uint8_t>& codes, std::vector<float>& steps) {
+    const unsigned n = b.rows, blocks = b.in / rot::kBlock;
+    codes.assign(gi::image_code_bytes(b.in, n), 0);
+    steps.assign(std::size_t(n) * blocks, 0.0F);
+    const gi::ExpertSource<F> src{b.matrix(e, false), pair_rows};
+    for (unsigned blk = 0; blk < blocks; ++blk)
+        for (unsigned c = 0; c < n; ++c) steps[std::size_t(c) * blocks + blk] = src.requantise(c, blk, n, codes.data());
+}
+void host_image(const Bank& b, unsigned e, unsigned pair_rows, std::vector<std::uint8_t>& codes, std::vector<float>& steps) {
+    if (b.format == packed::MatrixFormat::nvfp4) host_image<packed::MatrixFormat::nvfp4>(b, e, pair_rows, codes, steps);
+    else host_image<packed::MatrixFormat::mxfp8>(b, e, pair_rows, codes, steps);
+}
+
+// Routing: token t picks k distinct experts; assignments sorted by expert; tiles of <= 128 rows per expert.
+struct Plan {
+    std::vector<std::uint32_t> token;  // assignment -> token
+    std::vector<unsigned> expert;      // assignment -> expert
+    std::vector<unsigned> tile_first, tile_rows, tile_expert;
+};
+Plan route(unsigned tokens, unsigned experts, unsigned k, std::mt19937& g, bool skew, unsigned cap) {
+    std::vector<std::pair<unsigned, std::uint32_t>> as;
+    std::vector<unsigned> ids(experts);
+    std::iota(ids.begin(), ids.end(), 0U);
+    for (unsigned t = 0; t < tokens; ++t) {
+        std::shuffle(ids.begin(), ids.end(), g);
+        if (skew) std::sort(ids.begin(), ids.begin() + std::min<std::ptrdiff_t>(experts, 2 * std::ptrdiff_t(k)));  // favour low ids
+        for (unsigned j = 0; j < k; ++j) as.push_back({ids[j], t});
+    }
+    std::stable_sort(as.begin(), as.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    Plan p;
+    for (const auto& a : as) p.token.push_back(a.second), p.expert.push_back(a.first);
+    for (std::size_t a = 0; a < as.size();) {
+        std::size_t end = a;
+        while (end < as.size() && as[end].first == as[a].first && end - a < cap) ++end;
+        p.tile_first.push_back(static_cast<unsigned>(a));
+        p.tile_rows.push_back(static_cast<unsigned>(end - a));
+        p.tile_expert.push_back(as[a].first);
+        a = end;
+    }
+    return p;
+}
+
+struct Act {
+    ad::Act act{};
+    void alloc(unsigned rows, unsigned in) {
+        act.rows = rows;
+        act.in = in;
+        CHECK(hipMalloc(&act.codes, ad::act_code_bytes(rows, in)));
+        CHECK(hipMalloc(&act.u, ad::act_u_bytes(rows, in)));
+        CHECK(hipMalloc(&act.base, ad::act_base_bytes(rows)));
+    }
+};
+
+__global__ void swiglu_check_kernel(const float* plain, unsigned rows, unsigned n, float* h, gi::SwigluOut epi) {
+    const std::size_t id = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned f = n / 2U;
+    if (id >= std::size_t(rows) * f) return;
+    const unsigned r = static_cast<unsigned>(id / f), c = static_cast<unsigned>(id % f);
+    const unsigned gcol = 32U * (c / 16U) + c % 16U;  // paired order: tile 2 j = gate, 2 j + 1 = up of outputs 16 j ..
+    h[id] = epi(plain[std::size_t(r) * n + gcol], plain[std::size_t(r) * n + gcol + 16U]);
+}
+
+struct Launch {
+    std::vector<TileRows> gate_tiles, down_tiles;
+    TileRows *dgate = nullptr, *ddown = nullptr;
+    std::uint16_t* index_base = nullptr;
+    std::uint32_t* dmap = nullptr;
+    unsigned* dcount = nullptr;
+};
+Launch make_launch(const Plan& p, const Bank& gate, const Bank& down, float* y, unsigned n_down, unsigned count) {
+    Launch l;
+    l.index_base = upload(std::vector<std::uint16_t>(p.token.size() + 1U, 0));
+    for (std::size_t t = 0; t < p.tile_first.size(); ++t) {
+        TileRows g{gate.matrix(p.tile_expert[t], true), l.index_base + p.tile_first[t], nullptr, 1U, 0U, p.tile_rows[t]};
+        TileRows d{down.matrix(p.tile_expert[t], true), nullptr, y + std::size_t(p.tile_first[t]) * n_down, 0U, n_down, p.tile_rows[t]};
+        l.gate_tiles.push_back(g);
+        l.down_tiles.push_back(d);
+    }
+    l.dgate = upload(l.gate_tiles);
+    l.ddown = upload(l.down_tiles);
+    l.dmap = upload(p.token);
+    l.dcount = upload(std::vector<unsigned>{count});
+    return l;
+}
+gi::TileSource source(const Launch& l, const Bank& bank, const Image& im, bool gate_side, unsigned n, float* h, std::size_t h_row) {
+    gi::TileSource s{};
+    s.tiles = gate_side ? l.dgate : l.ddown;
+    s.index_tiles = l.dgate;
+    s.index_base = l.index_base;
+    s.map = gate_side ? l.dmap : nullptr;
+    s.tile_count = l.dcount;
+    s.codes_from = bank.dcodes;
+    s.codes_stride = std::size_t(bank.rows) * bank.code_row();
+    s.image = im.view;
+    s.in = bank.in;
+    s.n = n;
+    s.h = h;
+    s.h_row = h_row;
+    return s;
+}
+
+int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsigned ffn, packed::MatrixFormat f, packed::RowOrder order,
+            bool skew, unsigned seed, bool cut, unsigned cap = 128U) {
+    std::mt19937 g(seed);
+    const Bank gate = make_bank(f, experts, 2U * ffn, hidden, order, g), down = make_bank(f, experts, hidden, ffn, packed::RowOrder::contiguous, g);
+    const Plan p = route(tokens, experts, k, g, skew, cap);
+    const unsigned A = static_cast<unsigned>(p.token.size()), tiles = static_cast<unsigned>(p.tile_first.size());
+    const unsigned count = cut ? tiles - 1U : tiles, live_rows = cut ? A - p.tile_rows.back() : A;
+    const unsigned tall = *std::max_element(p.tile_rows.begin(), p.tile_rows.end());
+    const unsigned ng = 2U * ffn;
+    // Token rows (normal, outlier channels, one zero row) -> token image.
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::vector<float> x(std::size_t(tokens) * hidden);
+    for (auto& v : x) v = nd(g);
+    for (unsigned t = 0; t < tokens; ++t)
+        for (unsigned c = 5; c < hidden; c += 97U) x[std::size_t(t) * hidden + c] *= 30.0F;
+    if (tokens > 2U) std::fill(x.begin() + 2 * std::ptrdiff_t(hidden), x.begin() + 3 * std::ptrdiff_t(hidden), 0.0F);
+    float* dx = upload(x);
+    Act tok, hact;
+    tok.alloc(tokens, hidden);
+    hact.alloc(A, ffn);
+    ad::enqueue_quantise(dx, hidden, tok.act, nullptr);
+    const Image gim = requantise(gate, ffn), dim = requantise(down, 0U);
+    // Outputs prefilled with a NaN pattern; one guard row past the end.
+    float *dplain = nullptr, *dh = nullptr, *dhc = nullptr, *dy = nullptr;
+    CHECK(hipMalloc(&dplain, std::size_t(A + 1U) * ng * 4U));
+    CHECK(hipMalloc(&dh, std::size_t(A + 1U) * ffn * 4U));
+    CHECK(hipMalloc(&dhc, std::size_t(A) * ffn * 4U));
+    CHECK(hipMalloc(&dy, std::size_t(A + 1U) * hidden * 4U));
+    CHECK(hipMemset(dplain, 0xff, std::size_t(A + 1U) * ng * 4U));
+    CHECK(hipMemset(dh, 0xff, std::size_t(A + 1U) * ffn * 4U));
+    CHECK(hipMemset(dy, 0xff, std::size_t(A + 1U) * hidden * 4U));
+    const Launch l = make_launch(p, gate, down, dy, hidden, count);
+    const gi::SwigluOut epi{4.0F, 25.0F};
+    // Plain gate/up (rows in assignment order through h = dplain), paired gate/up -> h, its device check, then down.
+    ad::enqueue_grouped_gemm(source(l, gate, gim, true, ng, dplain, ng), tiles, tall, ng, tok.act, nullptr);
+    ad::enqueue_grouped_gemm(source(l, gate, gim, true, ng, dh, ffn), tiles, tall, ng, tok.act, nullptr, epi);
+    hipLaunchKernelGGL(swiglu_check_kernel, dim3(static_cast<unsigned>((std::size_t(A) * ffn + 255U) / 256U)), dim3(256), 0, nullptr, dplain, A, ng, dhc, epi);
+    // h rows past the cut are NaN-pattern: quantise them anyway (their down tiles are refused).
+    ad::enqueue_quantise(dh, ffn, hact.act, nullptr);
+    ad::enqueue_grouped_gemm(source(l, down, dim, false, hidden, nullptr, 0U), tiles, tall, hidden, hact.act, nullptr);
+    CHECK(hipGetLastError());
+    CHECK(hipDeviceSynchronize());
+
+    unsigned bad_img = 0, bad_plain = 0, bad_pair = 0, bad_down = 0, bad_guard = 0;
+    // Images.
+    std::vector<std::uint8_t> hc;
+    std::vector<float> hs;
+    std::vector<std::vector<std::uint8_t>> gcodes(experts), dcodes(experts);
+    std::vector<std::vector<float>> gsteps(experts), dsteps(experts);
+    const auto dg = download(gim.codes, gim.view.code_bytes * experts), dd = download(dim.codes, dim.view.code_bytes * experts);
+    const auto sg = download(gim.steps, gim.view.step_floats * experts), sd = download(dim.steps, dim.view.step_floats * experts);
+    for (unsigned e = 0; e < experts; ++e) {
+        for (int side = 0; side < 2; ++side) {
+            const Bank& b = side == 0 ? gate : down;
+            host_image(b, e, side == 0 ? ffn : 0U, hc, hs);
+            const auto& dc = side == 0 ? dg : dd;
+            const auto& ds = side == 0 ? sg : sd;
+            const std::size_t cb = side == 0 ? gim.view.code_bytes : dim.view.code_bytes, sf = side == 0 ? gim.view.step_floats : dim.view.step_floats;
+            const unsigned n = b.rows, blocks = b.in / rot::kBlock;
+            for (std::size_t i = 0; i < cb; ++i) bad_img += hc[i] != dc[e * cb + i];
+            for (unsigned blk = 0; blk < blocks; ++blk)
+                for (unsigned c = 0; c < n; ++c) bad_img += bits(hs[std::size_t(c) * blocks + blk]) != bits(ds[e * sf + ad::step_index(blk, c, n)]);
+            (side == 0 ? gcodes : dcodes)[e] = hc;
+            (side == 0 ? gsteps : dsteps)[e] = hs;
+        }
+    }
+    // Activation images as the device made them (the quantiser is the dense fixture's subject).
+    const unsigned tmp = ad::padded_rows(tokens), hmp = ad::padded_rows(A);
+    const auto tc = download(tok.act.codes, ad::act_code_bytes(tokens, hidden));
+    const auto tu = download(tok.act.u, ad::act_u_bytes(tokens, hidden) / 4U);
+    const auto tb = download(tok.act.base, tmp);
+    const auto hcod = download(hact.act.codes, ad::act_code_bytes(A, ffn));
+    const auto hu = download(hact.act.u, ad::act_u_bytes(A, ffn) / 4U);
+    const auto hb = download(hact.act.base, hmp);
+    const auto row_of = [](const std::vector<std::uint8_t>& codes, const std::vector<std::uint32_t>& u, unsigned r, unsigned in, unsigned mp,
+                           std::vector<std::int8_t>& rc, std::vector<std::uint8_t>& ru) {
+        rc.resize(in);
+        ru.resize(in / rot::kGroupA);
+        for (unsigned c = 0; c < in; ++c) rc[c] = static_cast<std::int8_t>(rot::pack_code(codes.data(), c, r, mp));
+        for (unsigned blk = 0; blk < in / rot::kBlock; ++blk)
+            for (unsigned q = 0; q < rot::kGroupsPerBlock; ++q) ru[blk * 4U + q] = static_cast<std::uint8_t>((u[std::size_t(blk) * mp + r] >> (8U * q)) & 255U);
+    };
+    const auto plain = download(dplain, std::size_t(A + 1U) * ng), h = download(dh, std::size_t(A + 1U) * ffn), hchk = download(dhc, std::size_t(A) * ffn);
+    const auto y = download(dy, std::size_t(A + 1U) * hidden);
+    std::vector<std::int8_t> rc;
+    std::vector<std::uint8_t> ru;
+    for (unsigned a = 0; a < A; ++a) {
+        const unsigned e = p.expert[a], t = p.token[a];
+        const bool live = a < live_rows;
+        row_of(tc, tu, t, hidden, tmp, rc, ru);
+        for (unsigned c = 0; c < ng; ++c) {
+            const float dev = plain[std::size_t(a) * ng + c];
+            const float ref = live ? rot::dot(rc.data(), ru.data(), tb[t], gcodes[e].data(), gsteps[e].data(), hidden, ng, c) : dev;
+            if (live ? !same(dev, ref) : bits(dev) != 0xffffffffU) {
+                if (bad_plain < 3U) std::printf("  plain a %u c %u dev 0x%08x ref 0x%08x\n", a, c, bits(dev), bits(ref));
+                ++bad_plain;
+            }
+        }
+        for (unsigned c = 0; c < ffn; ++c) {
+            const float dev = h[std::size_t(a) * ffn + c];
+            bad_pair += live ? !same(dev, hchk[std::size_t(a) * ffn + c]) : bits(dev) != 0xffffffffU;
+        }
+        row_of(hcod, hu, a, ffn, hmp, rc, ru);
+        for (unsigned c = 0; c < hidden; ++c) {
+            const float dev = y[std::size_t(a) * hidden + c];
+            const float ref = live ? rot::dot(rc.data(), ru.data(), hb[a], dcodes[e].data(), dsteps[e].data(), ffn, hidden, c) : dev;
+            if (live ? !same(dev, ref) : bits(dev) != 0xffffffffU) {
+                if (bad_down < 3U) std::printf("  down a %u c %u dev 0x%08x ref 0x%08x\n", a, c, bits(dev), bits(ref));
+                ++bad_down;
+            }
+        }
+    }
+    for (unsigned c = 0; c < ng; ++c) bad_guard += bits(plain[std::size_t(A) * ng + c]) != 0xffffffffU;
+    for (unsigned c = 0; c < ffn; ++c) bad_guard += bits(h[std::size_t(A) * ffn + c]) != 0xffffffffU;
+    for (unsigned c = 0; c < hidden; ++c) bad_guard += bits(y[std::size_t(A) * hidden + c]) != 0xffffffffU;
+    const bool ok = !(bad_img | bad_plain | bad_pair | bad_down | bad_guard);
+    std::printf("%s %s %s%s%s tokens %u experts %u k %u hidden %u ffn %u tiles %u (run %u): image %u plain %u paired %u down %u guard %u differ\n",
+                ok ? "PASS" : "FAIL", f == packed::MatrixFormat::nvfp4 ? "nvfp4" : "mxfp8", order == packed::RowOrder::contiguous ? "contig" : "interleaved",
+                skew ? " skew" : "", cut ? " cut" : "", tokens, experts, k, hidden, ffn, tiles, count, bad_img, bad_plain, bad_pair, bad_down, bad_guard);
+    return ok ? 0 : 1;
+}
+
+int bench(unsigned tokens) {
+    const unsigned experts = 128U, k = 8U, hidden = 2304U, ffn = 1152U, ng = 2U * ffn;
+    std::mt19937 g(7U);
+    const Bank gate = make_bank(packed::MatrixFormat::nvfp4, experts, ng, hidden, packed::RowOrder::contiguous, g);
+    const Bank down = make_bank(packed::MatrixFormat::nvfp4, experts, hidden, ffn, packed::RowOrder::contiguous, g);
+    const Plan p = route(tokens, experts, k, g, false, 256U);
+    const unsigned A = static_cast<unsigned>(p.token.size()), tiles = static_cast<unsigned>(p.tile_first.size());
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::vector<float> x(std::size_t(tokens) * hidden);
+    for (auto& v : x) v = nd(g);
+    float* dx = upload(x);
+    Act tok, hact;
+    tok.alloc(tokens, hidden);
+    hact.alloc(A, ffn);
+    const Image gim = requantise(gate, ffn), dim = requantise(down, 0U);
+    float *dh = nullptr, *dy = nullptr;
+    CHECK(hipMalloc(&dh, std::size_t(A) * ffn * 4U));
+    CHECK(hipMalloc(&dy, std::size_t(A) * hidden * 4U));
+    const Launch l = make_launch(p, gate, down, dy, hidden, tiles);
+    const gi::SwigluOut epi{4.0F, 25.0F};
+    const auto gs = source(l, gate, gim, true, ng, dh, ffn), ds = source(l, down, dim, false, hidden, nullptr, 0U);
+    hipEvent_t ev[5];
+    for (auto& e : ev) CHECK(hipEventCreate(&e));
+    const unsigned reps = 10U;
+    float ms[4] = {0, 0, 0, 0};
+    for (unsigned it = 0; it < reps + 2U; ++it) {
+        CHECK(hipEventRecord(ev[0], nullptr));
+        ad::enqueue_quantise(dx, hidden, tok.act, nullptr);
+        CHECK(hipEventRecord(ev[1], nullptr));
+        ad::enqueue_grouped_gemm(gs, tiles, 256U, ng, tok.act, nullptr, epi);
+        CHECK(hipEventRecord(ev[2], nullptr));
+        ad::enqueue_quantise(dh, ffn, hact.act, nullptr);
+        CHECK(hipEventRecord(ev[3], nullptr));
+        ad::enqueue_grouped_gemm(ds, tiles, 256U, hidden, hact.act, nullptr);
+        CHECK(hipEventRecord(ev[4], nullptr));
+        CHECK(hipEventSynchronize(ev[4]));
+        if (it < 2U) continue;
+        for (unsigned s = 0; s < 4U; ++s) {
+            float t = 0.0F;
+            CHECK(hipEventElapsedTime(&t, ev[s], ev[s + 1U]));
+            ms[s] += t / float(reps);
+        }
+    }
+    CHECK(hipGetLastError());
+    const double fg = 2.0 * A * hidden * ng, fd = 2.0 * A * ffn * hidden;
+    std::printf("BENCH tokens %u assignments %u tiles %u: quant_tok %.3f ms | gate_up %.3f ms %.1f TOPS | quant_h %.3f ms | down %.3f ms %.1f TOPS | visit %.3f ms\n",
+                tokens, A, tiles, double(ms[0]), double(ms[1]), fg / (double(ms[1]) * 1e9), double(ms[2]), double(ms[3]), fd / (double(ms[3]) * 1e9),
+                double(ms[0] + ms[1] + ms[2] + ms[3]));
+    return 0;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench") return bench(argc > 2 ? static_cast<unsigned>(std::strtoul(argv[2], nullptr, 10)) : 8237U);
+    int fails = 0;
+    using F = packed::MatrixFormat;
+    using O = packed::RowOrder;
+    fails += fixture(97U, 5U, 3U, 256U, 128U, F::nvfp4, O::contiguous, false, 1U, false);
+    fails += fixture(300U, 4U, 2U, 384U, 128U, F::nvfp4, O::interleaved_halves, true, 2U, false);  // tiles of 128 + tails
+    fails += fixture(150U, 6U, 4U, 256U, 128U, F::mxfp8, O::contiguous, false, 3U, false);
+    fails += fixture(200U, 3U, 2U, 128U, 256U, F::nvfp4, O::contiguous, true, 4U, true);  // device tile count cuts the last tile
+    fails += fixture(700U, 3U, 2U, 256U, 128U, F::nvfp4, O::contiguous, true, 5U, false, 256U);  // 256-row tiles: row slices
+    std::printf("%s\n", fails ? "FAIL" : "ALL PASS");
+    return fails ? 1 : 0;
+}

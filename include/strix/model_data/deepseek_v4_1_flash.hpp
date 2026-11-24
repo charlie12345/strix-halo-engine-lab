@@ -87,7 +87,6 @@ namespace legacy_env {
 inline constexpr std::string_view STRIX_DS41_EXPERT_SLOTS = "forms.tensor.expert_partition";
 inline constexpr std::string_view STRIX_DS41_EXPERT_TP = "forms.tensor.expert_partition";
 inline constexpr std::string_view STRIX_DS41_EXPERT_TP_LAYOUT = "forms.tensor.expert_partition";
-inline constexpr std::string_view STRIX_DS41_F16_PAIR = "forms.tensor.wire";
 } // namespace legacy_env
 } // namespace multi_device
 inline constexpr std::string_view name = "deepseek-v4.1-flash";

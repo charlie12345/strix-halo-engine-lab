@@ -164,21 +164,36 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             selection.arguments = std::move(local.args);
             if (request.backend.empty()) request.backend = std::move(local.backend);
         }
-        const bool preset_requested = request.tier || request.print || !request.asset.empty() || !request.backend.empty() ||
-            request.placement.placement || request.placement.devices != 1;
+        // A placement query alone does not apply a model preset: it is validated (below) against the effective tier,
+        // so a family-native --profile after `--` keeps its passthrough (same design as strix run/serve).
+        const bool preset_requested = request.tier || request.print || !request.asset.empty() || !request.backend.empty();
+        const bool placement_requested = request.placement.placement || request.placement.devices != 1;
+        std::optional<std::string> native_word;
+        for (std::size_t i = 0; i < selection.arguments.size() && !native_word; ++i) {
+            const auto& a = selection.arguments[i];
+            if (a.starts_with("--profile=")) native_word = a.substr(10);
+            else if (a == "--profile" && i + 1 < selection.arguments.size()) native_word = selection.arguments[i + 1];
+        }
+        const bool native_profile = !request.tier && !request.print && native_word.has_value();
+        // The effective placement, resolved once: the native tier when one is given, else the shell resolver's.
+        const auto placement_for = [&](std::string_view backend_name) {
+            if (native_profile) {
+                auto query = request.placement;
+                try { query.tier = profile::parse_tier(*native_word); } catch (const std::invalid_argument&) {}   // the engine rejects it
+                return profile::multi_device::resolve(selection.description, query);
+            }
+            return profile::resolve_model_preset(selection.description, request.tier, backend_name, request.placement).placement;
+        };
         const std::string_view backend = request.backend.empty() ? "hip" : std::string_view(request.backend);
         if (request.print && request.asset.empty() && selection.arguments.empty()) {
             out << profile::resolve_model_preset(selection.description, request.tier, backend, request.placement).config.dump() << '\n';
             return 0;
         }
         const bool external_cuda = backend == "cuda" && !(factory && factory->serves_cuda);
-        if (preset_requested && (!factory || external_cuda) && shell.launch) {
+        if ((preset_requested || placement_requested) && (!factory || external_cuda) && shell.launch) {
             // The native handoff carries the whole query (device count, placement) to the backend launcher, which
             // resolves it again; refuse here first so no launch starts for a form one engine does not execute.
-            if (!request.print)
-                profile::multi_device::admit(
-                    profile::resolve_model_preset(selection.description, request.tier, backend, request.placement).placement,
-                    profile::multi_device::Executor::engine);
+            if (!request.print) profile::multi_device::admit(placement_for(backend), profile::multi_device::Executor::engine);
             return shell.launch(selection, request, out);
         }
         if (!factory) {
@@ -187,21 +202,28 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
         }
         if (external_cuda) throw std::invalid_argument("no CUDA launcher in this build");
         std::optional<profile::PresetScope> scope;
+        if (placement_requested && !preset_requested)
+            profile::multi_device::admit(placement_for(backend), profile::multi_device::Executor::engine);
         if (preset_requested) {
             if (!request.asset.empty()) {
                 selection.arguments.insert(selection.arguments.begin(), request.asset);
                 if (!factory->asset_option.empty())
                     selection.arguments.emplace(selection.arguments.begin(), factory->asset_option);
             }
-            const auto preset = profile::resolve_model_preset(selection.description, request.tier, backend, request.placement);
-            // This process serves one worker: only `single` executes here (replicas run behind strix-router).
-            if (!request.print) profile::multi_device::admit(preset.placement, profile::multi_device::Executor::engine);
-            preset.append_options(selection.arguments);
-            if (request.print) {
-                out << preset.config.dump() << '\n' << std::flush;
-                selection.arguments.emplace_back("--print-effective-config");
+            if (native_profile) {
+                // The native --profile is the tier: no preset injection, the placement is admitted at that tier.
+                profile::multi_device::admit(placement_for(backend), profile::multi_device::Executor::engine);
+            } else {
+                const auto preset = profile::resolve_model_preset(selection.description, request.tier, backend, request.placement);
+                // This process serves one worker: only `single` executes here (replicas run behind strix-router).
+                if (!request.print) profile::multi_device::admit(preset.placement, profile::multi_device::Executor::engine);
+                preset.append_options(selection.arguments);
+                if (request.print) {
+                    out << preset.config.dump() << '\n' << std::flush;
+                    selection.arguments.emplace_back("--print-effective-config");
+                }
+                scope.emplace();
             }
-            scope.emplace();
         }
         factory->validate(selection);
         if(factory->early_exit) if(auto result=factory->early_exit(selection,out)) return *result;

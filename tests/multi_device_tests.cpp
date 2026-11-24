@@ -199,6 +199,15 @@ void validation() {
             "unknown form");
     refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.regimes.a]\nprefer = ['single']\n"
                               "[multi_device.regimes.b]\nprefer = ['single']\n"); }, "order must list every regime");
+    // Review r9 M2: a repeated name no longer stands in for a missing regime, and a short order is refused.
+    refuses([] { (void)policy("[multi_device]\nversion = 1\norder = ['a', 'a']\n[multi_device.regimes.a]\n"
+                              "prefer = ['single']\n[multi_device.regimes.b]\nprefer = ['single']\n"); },
+            "repeats");
+    refuses([] { (void)policy("[multi_device]\nversion = 1\norder = ['a']\n[multi_device.regimes.a]\n"
+                              "prefer = ['single']\n[multi_device.regimes.b]\nprefer = ['single']\n"); },
+            "order must list every regime");
+    refuses([] { (void)policy("[multi_device]\nversion = 1\norder = ['a', 'a']\n[multi_device.regimes.a]\n"
+                              "prefer = ['single']\n"); }, "repeats");
     refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.regimes.a]\nprefer = ['single']\n"
                               "min_prompt_rows = 9\nmax_prompt_rows = 8\n"); }, "min_prompt_rows > max_prompt_rows");
     refuses([] { (void)policy("[multi_device]\nversion = 1\n[multi_device.forms.tensor]\nexpert_shares = [0.7, 0.7]\n"); },

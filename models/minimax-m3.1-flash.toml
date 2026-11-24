@@ -74,7 +74,6 @@ levers = "fast"
 # config when set; they still act inside the engine).
 [multi_device.legacy_env]
 STRIX_SPLIT = "forms.layers"
-STRIX_MMX_PREFILL_PIPE_PAIR = "forms.layers"
 STRIX_SPLIT_CUT = "forms.layers.cut"
 STRIX_SPLIT_BLOCK = "forms.layers.window_rows"
 STRIX_MM_PF_GROUP = "forms.layers.window_rows"

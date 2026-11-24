@@ -30,8 +30,24 @@ struct MiniPreparedHipBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGqa
     }
 };
 
+// The resident backend's prefill projections: each call goes through the shared routed entry, which stores the call's
+// BF16 operand image once in operand_image (rows x widest input u16) when its whole-tile projections pay for it
+// (same bits as linear() above; other calls make the launches linear() makes).
+struct MiniPreparedHipImageBackend : MiniPreparedHipBackend {
+    std::span<std::uint16_t> operand_image;
+
+    Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
+        return core::fma_rows::enqueue_bf16_rows_routed(input, width, rows, views, kVocabulary, operand_image, stream);
+    }
+};
+
 // The same backend for a visit whose flash projects the relative bias (MiniHipAttentionProjectedPolicy).
 struct MiniPreparedHipProjectedBackend : MiniPreparedHipBackend {
+    bool relative_bias_in_attention(unsigned) const { return true; }
+};
+
+// The resident image backend for a visit whose flash projects the relative bias.
+struct MiniPreparedHipImageProjectedBackend : MiniPreparedHipImageBackend {
     bool relative_bias_in_attention(unsigned) const { return true; }
 };
 

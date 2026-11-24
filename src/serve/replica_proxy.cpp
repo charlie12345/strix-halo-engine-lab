@@ -114,7 +114,7 @@ void require_distinct_replicas(const std::vector<ReplicaEndpoint>& replicas) {
 ReplicaProxy::ReplicaProxy(ReplicaProxyConfig config)
     : config_(std::move(config)),
       router_(config_.replicas.size(), config_.affinity_entries, config_.block_bytes),
-      states_(config_.replicas.size()), counters_(config_.replicas.size()) {}
+      states_(config_.replicas.size()), generations_(config_.replicas.size()), counters_(config_.replicas.size()) {}
 
 ReplicaState ReplicaProxy::probe(std::size_t replica, const std::string& connect_host) const {
     HttpClientRequest request;
@@ -158,14 +158,12 @@ void ReplicaProxy::refresh() {
     if (!pinned) {
         for (std::size_t r = 0; r < config_.replicas.size(); ++r) {
             auto next = probe(r, {});
-            bool lost = false;
-            {
-                const std::lock_guard lock(mutex_);
-                lost = states_[r].healthy && !next.healthy;
-                next.ewma_ms_per_token = states_[r].ewma_ms_per_token;
-                states_[r] = std::move(next);
-            }
-            if (lost) router_.forget(r);
+            const std::lock_guard lock(mutex_);
+            if (states_[r].healthy && !next.healthy) router_.forget(r);
+            if (states_[r].healthy != next.healthy || states_[r].worker_instance_id != next.worker_instance_id)
+                ++generations_[r];
+            next.ewma_ms_per_token = states_[r].ewma_ms_per_token;
+            states_[r] = std::move(next);
         }
         return;
     }
@@ -182,7 +180,9 @@ void ReplicaProxy::refresh() {
                 return peer.worker_instance_id == id;
             }) > 1)
             state.healthy = false;
-        if ((states_[r].healthy && !state.healthy) || states_[r].worker_instance_id != id) router_.forget(r);
+        const bool replaced = states_[r].worker_instance_id != id;
+        if ((states_[r].healthy && !state.healthy) || replaced) router_.forget(r);
+        if (states_[r].healthy != state.healthy || replaced) ++generations_[r];
         state.ewma_ms_per_token = states_[r].ewma_ms_per_token;
     }
     states_ = std::move(next);
@@ -246,16 +246,27 @@ void ReplicaProxy::forward(const HttpRequest& request, HttpResponseWriter& respo
     const auto route = route_request_from_http(request.path, request.header("x-session-id"), request.body, storage);
     std::uint64_t excluded = 0;
     for (;;) {
-        const auto snapshot = states();
-        const std::size_t replica = router_.place(route, snapshot, excluded);
+#ifdef STRIX_REPLICA_PROXY_TEST_PAUSE
+        STRIX_REPLICA_PROXY_TEST_PAUSE(before_placement);
+#endif
+        std::size_t replica;
+        std::uint64_t generation = 0;
+        RouteReason reason = RouteReason::none;
+        {
+            // Selection also publishes affinity. Order both with refresh's health and affinity updates.
+            const std::lock_guard lock(mutex_);
+            replica = router_.place(route, states_, excluded);
+            if (replica != kNoReplica) {
+                generation = generations_[replica];
+                reason = router_.last_reason();
+            }
+        }
         if (replica == kNoReplica) {
             ++unplaced_;
             response.send(503, "application/json", error_body("overloaded_error", "no healthy replica"),
                 {{"Retry-After", "1"}});
             return;
         }
-        const RouteReason reason = router_.last_reason();
-
         HttpClientRequest out;
         out.host = config_.replicas[replica].host;
         out.port = config_.replicas[replica].port;
@@ -303,10 +314,17 @@ void ReplicaProxy::forward(const HttpRequest& request, HttpResponseWriter& respo
 
         if (!result.ok && !result.cancelled && !result.request_sent) {
             // Nothing reached the replica: it cannot have started the request, so another replica may take it.
+#ifdef STRIX_REPLICA_PROXY_TEST_PAUSE
+            STRIX_REPLICA_PROXY_TEST_PAUSE(before_connect_failure);
+#endif
             {
                 const std::lock_guard lock(mutex_);
-                states_[replica].healthy = false;
-                ++counters_[replica].failed;
+                if (generations_[replica] == generation) {
+                    states_[replica].healthy = false;
+                    ++generations_[replica];
+                    if (!connect_hosts_.empty()) router_.forget(replica);
+                    ++counters_[replica].failed;
+                }
             }
             excluded |= 1ULL << replica;
             ++retried_;

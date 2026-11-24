@@ -68,6 +68,7 @@ private:
     mutable std::mutex mutex_;
     std::vector<std::string> connect_hosts_; // populated once by policy admission, before serving
     std::vector<ReplicaState> states_;
+    std::vector<std::uint64_t> generations_; // advances when a slot's worker or availability changes
     std::vector<Counters> counters_;
     std::atomic<std::uint64_t> retried_{0}, unplaced_{0};
 };

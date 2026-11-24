@@ -28,7 +28,7 @@ inline PrefillOptions arm_precision(const std::string& label) {
     }
     if (label.rfind("m16_", 0) == 0 && label.size() > 4) {  // + ds41-moe-f16wmma-v1 (relaxed MoE FP16 operands)
         PrefillOptions e = arm_precision(label.substr(4));
-        e.fast_moe_f16 = true;
+        e.fast_moe_f16 = e.fast_i4 == 0;
         return e;
     }
     if (label.rfind("sh_", 0) == 0 && label.size() > 3) {  // + ds41-shared-f16-v1 (shared expert on the FAST dense core)
@@ -42,6 +42,7 @@ inline PrefillOptions arm_precision(const std::string& label) {
         return e;
     }
     PrefillOptions o;
+    o.fast_i4 = 0;  // named controls must not inherit the candidate from the process
     o.decoder_replay_override = true;  // every named arm is explicit, including exact/null OFF
     if (label == "exact") return o;
     if (label == "dense") { o.fp16_dense = true; return o; }
@@ -97,6 +98,20 @@ inline PrefillOptions arm_precision(const std::string& label) {
     return o;
 }
 
+// Both diagnostic ranks use the same manifest. Check candidate scope before entering the timed prefill.
+template<class Communicator, class TagKind>
+inline void verify_i4_scope(const PrefillOptions& arm, Communicator& comm, TagKind kind) {
+    if (arm.fast_i4 != 1) return;
+    using ds41::fast_profile::MoeI4Scope;
+    const auto scope = ds41::fast_profile::moe_i4_scope();
+    auto peer = MoeI4Scope::invalid;
+    comm.exchange_host(std::as_bytes(std::span(&scope, 1)), std::as_writable_bytes(std::span(&peer, 1)),
+                       {static_cast<std::uint32_t>(kind), 0x69347363U, 0U});
+    if (scope == MoeI4Scope::invalid || peer == MoeI4Scope::invalid)
+        throw std::invalid_argument("STRIX_DS41_FAST_I4_SCOPE must be all or gu on both ranks");
+    if (scope != peer) throw std::invalid_argument("ranks disagree on STRIX_DS41_FAST_I4_SCOPE");
+}
+
 // Profile of an arm for the gate's execution witness: "exact" (incumbent arithmetic; the null controls perturb it),
 // "fast-prefill" (the FAST prefill levers fast3 / fast3b<R>), else "diagnostic" (no floor-rule role).
 inline PrefillOptions executed_precision(PrefillOptions o, const PrefillResult& run) {
@@ -106,7 +121,7 @@ inline PrefillOptions executed_precision(PrefillOptions o, const PrefillResult& 
 }
 
 inline std::string arm_profile(const PrefillOptions& o) {
-    if (o.fast_i4 > 0 || (!o.decoder_replay_override && o.decoder_replay_rows == 0U)) return "diagnostic";
+    if (o.fast_i4 != 0 || (!o.decoder_replay_override && o.decoder_replay_rows == 0U)) return "diagnostic";
     const bool fast3 = o.fast_attention && o.fast_attention_flash && o.fast_moe && o.fast_dense;
     const bool other = o.fp16_dense || o.bf16_attention || o.fp16_fast || o.fp16_keep_a8 || o.fp16_wsplit ||
                        o.fp16_projections != 31U || o.approx_layer_first != 0U || o.approx_layer_end != 1000U || o.fp16_min_rows != 0U;

@@ -65,11 +65,13 @@ inline constexpr std::array<strix::profile::Lever, 13> profile_table{{
      "FAST MoE down FP16 operands ds41-moe-f16wmma-v1 (#721) in the fast set; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800)",
      false, {false, true, false, false}, true},
     // Prefill only: routed experts as IU4 codes x A4 activations (gguf-iu4-direct-v1; the stored IQ2_XXS / Q2_K weights
-    // are decoded inside the product, no pack). TURBO candidate: the ladder keeps it off until a measured prefill row
-    // shows it faster than FAST; explicit STRIX_DS41_FAST_I4=1 runs it and turns the relaxed MoE of the profile off.
+    // are decoded inside the product, no pack). Automatic TURBO admission needs the actual request prefill regime
+    // and must replace relaxed MoE atomically for execution and prefix identity. Explicit STRIX_DS41_FAST_I4=1
+    // already displaces the profile-selected relaxed MoE.
     {"moe_iu4", "STRIX_DS41_FAST_I4", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, false, true, true}, "gguf-iu4-direct-v1", "0",
-     "pending: TURBO prefill timing over FAST and its quality (KL / top-1 / dNLL vs BF16) for gguf-iu4-direct-v1", false,
+     "pending: TURBO prefill timing over FAST and quality (KL / top-1 / dNLL vs BF16) for gguf-iu4-direct-v1; "
+     "automatic admission requires the request prefill regime and atomic replacement of relaxed MoE", false,
      {}, true},
     {"moe_iu4_scope", "STRIX_DS41_FAST_I4_SCOPE", "", {"", "", "", ""}, "", strix::profile::Kind::bit_changing,
      {}, {true, true, true, true}, "", "", "explicit IU4 projection scope: all (default) or gu", false, {}, true},

@@ -1,3 +1,4 @@
+#include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
 
 #include <cstring>
@@ -15,12 +16,15 @@ void require(bool passed, const char* detail) {
     if (!passed) throw std::runtime_error(detail);
 }
 
-// Hermetic environment: only the named expert switch (default: W4A4), when given.
-profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const char* name = "STRIX_INK_MOE_W4A4") {
+// Hermetic environment: only the W4A4 expert switch and the two image switches, when given.
+profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const char* image = nullptr,
+                       const char* narrow = nullptr) {
     profile::Inputs in;
     in.profile = tier;
-    in.env = [value, name](const char* key) -> const char* {
-        return value != nullptr && std::strcmp(key, name) == 0 ? value : nullptr;
+    in.env = [value, image, narrow](const char* key) -> const char* {
+        if (std::strcmp(key, "STRIX_INK_MOE_W4A4") == 0) return value;
+        if (std::strcmp(key, "STRIX_INK_COMBINE_IMAGE") == 0) return image;
+        return std::strcmp(key, "STRIX_MOE_EXPERTS_NVFP4") == 0 ? narrow : nullptr;
     };
     return in;
 }
@@ -28,7 +32,6 @@ profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const ch
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 2U, "two Inkling lever rows");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -48,7 +51,9 @@ void test_resolution() {
     require(exact.qualification() == "qualified", "exact receipt");
     const profile::Engine legacy{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
     require(exact.fingerprint() == profile::resolve(legacy, inputs(profile::Name::standard)).fingerprint(),
-            "exact identity unchanged by the additive row");
+            "exact identity unchanged by the additive rows by default");
+    const auto exact_on = profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard, nullptr, "1"));
+    require(exact.fingerprint() != exact_on.fingerprint(), "the selected down image is part of the run identity");
 
     mini::MiniWeightOptions options;
     for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
@@ -83,35 +88,111 @@ void test_resolution() {
     require(refused, "malformed W4A4 switch must be refused");
 }
 
+// The down-image lever: off in every profile unless selected explicitly (STRIX_INK_COMBINE_IMAGE=1), one value for every
+// entry point (the CLI, the gate and the server resolve through resolve_mini_profile), a malformed value is refused, and
+// only gfx1151 admits the image route.
+void test_combine_image() {
+    const auto* lever = &mini::kMiniProfile.table[1];
+    require(lever->name == mini::kMiniCombineImage && lever->name == "inkling2-mini-combine-down-image@1", "image identity");
+    require(lever->env == "STRIX_INK_COMBINE_IMAGE" && lever->off == "0" && lever->builtin == "0", "image off switch");
+    require(lever->kind == profile::Kind::exact, "image lever is exact");
+    for (const auto& cell : lever->value) require(cell.empty(), "no profile column selects the image");
+    const profile::Engine bare{"inkling2-mini", "", {}, false, "inkling2-mini-turbo-v1"};
+    require(profile::resolve(bare, inputs(profile::Name::standard)).find(mini::kMiniCombineImage) == nullptr &&
+                !mini::mini_combine_image(profile::resolve(bare, inputs(profile::Name::standard))),
+            "a table without the row keeps the FP32 down rows");
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        options.tier = inputs(tier);
+        const auto resolved = mini::resolve_mini_profile(options, true);
+        require(!mini::mini_combine_image(resolved), "no profile selects the image by default");
+        require(resolved.find(mini::kMiniCombineImage)->value == "0", "default value is the builtin 0");
+        if (tier == profile::Name::standard) require(resolved.qualification() == "qualified", "exact stays qualified");
+        options.tier = inputs(tier, nullptr, "0");
+        require(!mini::mini_combine_image(mini::resolve_mini_profile(options, true)), "explicit 0 switches the image off");
+        options.tier = inputs(tier, nullptr, "1");
+        require(mini::mini_combine_image(mini::resolve_mini_profile(options, true)), "explicit 1 selects the image");
+    }
+    bool refused = false;
+    try {
+        options.tier = inputs(profile::Name::standard, nullptr, "yes");
+        static_cast<void>(mini::resolve_mini_profile(options, true));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "malformed image switch must be refused");
+    require(mini::mini_combine_image_arch("gfx1151"), "gfx1151 is the qualified target");
+    for (const char* arch : {"gfx1150", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx115", "gfx11510", ""})
+        require(!mini::mini_combine_image_arch(arch), "the image is declined outside gfx1151");
+}
+
+// A decoder that records what it was configured with: every entry point configures through configure_mini_decoder.
+struct FakeDecoder {
+    strix::moe_core::grouped_w4a4::Activations w4a4 = strix::moe_core::grouped_w4a4::Activations::bf16;
+    int image_calls = 0;
+    bool image = false, runs = true;
+    void set_moe_w4a4(strix::moe_core::grouped_w4a4::Activations a) { w4a4 = a; }
+    bool set_combine_image(bool selected) { ++image_calls; image = selected; return selected && runs; }
+};
+
+void test_configure() {
+    mini::MiniWeightOptions options;
+    options.tier = inputs(profile::Name::standard, nullptr, "1");
+    const auto resolved = mini::resolve_mini_profile(options, true);
+    FakeDecoder decoder;
+    require(mini::configure_mini_decoder(decoder, resolved) && decoder.image_calls == 1 && decoder.image,
+            "the resolved image lever reaches the decoder");
+    FakeDecoder declined;
+    declined.runs = false;
+    require(!mini::configure_mini_decoder(declined, resolved) && declined.image,
+            "a target that does not run the image declines");
+    require(std::string(mini::mini_down_image_name(true, true)) == "on" &&
+                std::string(mini::mini_down_image_name(false, true)) == "declined" &&
+                std::string(mini::mini_down_image_name(false, false)) == "off", "startup field names");
+    options.tier = inputs(profile::Name::standard, nullptr, "0");
+    FakeDecoder off;
+    require(!mini::configure_mini_decoder(off, mini::resolve_mini_profile(options, true)) && !off.image && off.image_calls == 1,
+            "an off switch is passed through");
+}
+
 // The narrow expert image row: bit-changing, off in EXACT, pending (off) in FAST and TURBO until its gate and served
 // receipt; an explicit STRIX_MOE_EXPERTS_NVFP4=1 opts in (unqualified), 0 is the off switch, other values are refused.
 void test_narrow_experts() {
-    const auto& lever = mini::kMiniProfile.table[1];
+    const auto& lever = mini::kMiniProfile.table[2];
     require(lever.name == mini::kMiniExpertsNvfp4 && lever.name == "moe.experts.mxfp8-nvfp4@1", "narrow identity");
     require(lever.env == "STRIX_MOE_EXPERTS_NVFP4" && lever.off == "0" && lever.builtin == "0", "narrow off switch");
     require(lever.kind == profile::Kind::bit_changing && lever.value[0].empty() && lever.value[3] == "1",
             "narrow: exact off, turbo target on");
     for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
         require(!lever.ready[column] && !lever.provisional[column], "narrow row stays opt-in until measured");
-    constexpr const char* env = "STRIX_MOE_EXPERTS_NVFP4";
     require(!mini::mini_experts_nvfp4(profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard))),
             "exact keeps the checkpoint expert image");
     mini::MiniWeightOptions options;
+    options.tier = inputs(profile::Name::standard, nullptr, nullptr, "1");
+    bool exact_refused = false;
+    try {
+        static_cast<void>(mini::resolve_mini_profile(options, true));
+    } catch (const std::invalid_argument& error) {
+        exact_refused = std::string_view(error.what()).find("forbidden under --profile exact") != std::string_view::npos;
+    }
+    require(exact_refused, "EXACT must refuse the explicit narrow image");
+    options.tier = inputs(profile::Name::standard, nullptr, nullptr, "0");
+    require(!mini::mini_experts_nvfp4(mini::resolve_mini_profile(options, true)), "EXACT admits explicit off");
     for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
         require(!mini::mini_experts_nvfp4(profile::resolve(mini::kMiniProfile, inputs(tier))),
                 "pending row keeps the checkpoint expert image by default");
-        options.tier = inputs(tier, "1", env);
+        options.tier = inputs(tier, nullptr, nullptr, "1");
         const auto opted = mini::resolve_mini_profile(options, true);
         require(mini::mini_experts_nvfp4(opted), "explicit opt-in loads the narrow image");
         require(opted.qualification() == "unqualified: " + std::string(mini::kMiniExpertsNvfp4),
                 "explicit narrow opt-in is unqualified");
         require(!mini::mini_moe_w4a4(opted), "the narrow switch leaves the W4A4 lever alone");
-        options.tier = inputs(tier, "0", env);
+        options.tier = inputs(tier, nullptr, nullptr, "0");
         require(!mini::mini_experts_nvfp4(mini::resolve_mini_profile(options, true)), "narrow off switch");
     }
     bool refused = false;
     try {
-        options.tier = inputs(profile::Name::turbo, "yes", env);
+        options.tier = inputs(profile::Name::turbo, nullptr, nullptr, "yes");
         static_cast<void>(mini::resolve_mini_profile(options, true));
     } catch (const std::invalid_argument&) {
         refused = true;
@@ -125,6 +206,8 @@ int main() {
     try {
         test_row();
         test_resolution();
+        test_combine_image();
+        test_configure();
         test_narrow_experts();
     } catch (const std::exception& error) {
         std::cerr << "inkling2-mini-moe-lever: " << error.what() << '\n';

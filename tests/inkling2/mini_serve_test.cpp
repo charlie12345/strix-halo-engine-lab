@@ -305,7 +305,7 @@ void set_image_env(const char* value) {
 }
 
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16, bool image = false) {
+            W4a4 w4a4 = W4a4::bf16, bool image = false, bool controller_one_plane = false) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -314,6 +314,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
+        require(options.controller_one_plane == controller_one_plane, "controller plane value did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
@@ -340,6 +341,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                        "--profile", "fast", "--speculation", "off"};
     std::vector<std::string> strings(std::begin(args), std::end(args));
     if (qualify_q8) strings.emplace_back("--qualify-q8");
+    if (controller_one_plane) strings.insert(strings.end(), {"--controller-planes", "1"});
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
         std::vector<char*> argv;
         for (auto& arg : strings) argv.push_back(arg.data());
@@ -350,7 +352,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         strings.emplace_back("--family-inspect");
         const auto rc = run({}, out, error);
         strings.pop_back();
-        require(rc == 0 && !created, "Inkling profile inspection should run without device work");
+        if (rc != 0) throw std::runtime_error(error.str());
+        require(!created, "Inkling profile inspection should run without device work");
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
@@ -438,6 +441,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (argc == 3 && std::string_view(argv[2]) == "--controller-planes-only") {
+        wiring(argv[1], "cuda", false);
+        wiring(argv[1], "cuda", false, false, W4a4::bf16, false, true);
+        return 0;
+    }
     require(argc == 2, "expected repository root");
     set_image_env(nullptr);
     admission();
@@ -447,6 +455,7 @@ int main(int argc, char** argv) try {
         wiring(argv[1], backend, true);
     }
     wiring(argv[1], "cuda", false, true);
+    wiring(argv[1], "cuda", false, false, W4a4::bf16, false, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {

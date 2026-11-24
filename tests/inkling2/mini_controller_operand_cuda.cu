@@ -1,28 +1,27 @@
-// The controller's declared operand class on the tall CUDA dense dispatch the resident backend uses
-// (inkling2::enqueue_controller_dense, mma3, 2048 rows): down (K = 2 x 2304 RMS-normalised BF16 rows -> rank 64) and
-// the forget/gain pair (K = 64 BF16 latent -> 2304). The operand class that runs comes from the production
-// certificate (MiniControllerCertificate, filled from the staged weight bytes exactly as
-// MiniResidentWeights::certify_controllers fills it), and the outputs are compared bit for bit with a three-plane
-// (fp32 operand) baseline through the same kernels: ordinary weights run one plane, an infinite forget weight and
-// oversized finite down weights (latent overflow) run three planes. The latent of the gate stage is the output of
-// the dispatched down stage.
+// Exercise the CUDA resident controller dispatch with the shared controller's normalization and latent producer.
+#include "inkling2/inkling2_mini_controller_device.hpp"
 #include "inkling2/inkling2_mini_controller_operands_cuda.hpp"
+#include "inkling2/inkling2_mini_dense_cuda.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <cstdint>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
-#include <vector>
 
 namespace {
 
 namespace cc = strix::cuda_core;
 namespace core = strix::core;
+namespace mini = strix::inkling2;
 
-constexpr unsigned kWidth = 2304, kRank = 64, kRows = 2048;
+constexpr unsigned kRows = 2048;
+constexpr auto kController = mini::kMiniController;
+constexpr auto kWidth = kController.width;
+constexpr auto kRank = kController.rank;
+constexpr auto kElements = std::size_t{kRows} * kWidth;
+constexpr auto kScratch = kController.scratch_elements(kRows);
 
 void require(cudaError_t status) {
     if (status == cudaSuccess) return;
@@ -36,145 +35,108 @@ struct Buffer {
     ~Buffer() { (void)cudaFree(data); }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
+    std::span<T> span() { return {data, size}; }
     T* data = nullptr;
     std::size_t size;
 };
 
-std::uint32_t seed = 0x5EED1238U;
-std::uint32_t next() { return seed = 1664525U * seed + 1013904223U; }
+struct ControllerOps {
+    cc::BigCtx* context;
+    const mini::MiniControllerCertificate* certificate;
+    core::Bf16Operand forced = core::Bf16Operand::fp32;
+    std::array<core::Bf16Operand, 2> operands{};
+    std::size_t calls{};
 
-float bf16_round(float value) {
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof bits);
-    bits = (bits + 0x7FFFU + ((bits >> 16U) & 1U)) & 0xFFFF0000U;  // nearest even, finite inputs
-    std::memcpy(&value, &bits, sizeof bits);
-    return value;
-}
-
-// RMS-normalised BF16 rows (the controller's down operands) or small BF16 latent values.
-void fill_rows(float* rows, std::size_t count, unsigned width, bool normalise) {
-    std::vector<float> row(width);
-    for (std::size_t r = 0; r < count; ++r) {
-        double squares = 0.0;
-        for (auto& x : row) {
-            x = static_cast<float>(static_cast<int>(next() >> 8U) - 8388608) * 0x1p-21F;
-            squares += double{x} * x;
+    cudaStream_t stream() const { return nullptr; }
+    void check(cudaError_t status) const { require(status); }
+    void rms(const float* input, const std::uint16_t* gain, float* output, unsigned rows) const {
+        check(mini::enqueue_mini_cuda_rmsnorm(input, gain, output, rows, stream()));
+    }
+    void dense(const float* input, unsigned width, unsigned rows, std::span<const core::Bf16RowProjection> projections,
+               core::Bf16Operand declared) {
+        if (certificate) {
+            const auto launch = mini::enqueue_controller_dense(*certificate, input, width, rows, projections,
+                                                               stream(), context, declared);
+            check(launch.status);
+            operands.at(calls++) = launch.operand;
+        } else {
+            check(cc::enqueue_bf16_dense_rows(input, width, rows, projections, stream(),
+                                             cc::DenseArith::mma3, context, nullptr, forced));
         }
-        const float scale = normalise ? static_cast<float>(1.0 / std::sqrt(squares / width + 1e-6)) : 1.0F;
-        for (unsigned i = 0; i < width; ++i) rows[r * width + i] = bf16_round(row[i] * scale);
     }
-}
-
-void fill_weights(std::uint16_t* weights, std::size_t count) {
-    for (std::size_t i = 0; i < count; ++i) {
-        const auto bits = next();
-        weights[i] = static_cast<std::uint16_t>(0x3C00U | ((bits >> 16U) & 0x8000U) | ((bits >> 12U) & 0x01FFU));
-    }
-}
-
-namespace inkling = strix::inkling2;
-
-// One projection group through the production dispatch (declared one plane) and the three-plane baseline.
-struct Pair {
-    bool equal;
-    core::Bf16Operand route;
 };
 
-Pair run_pair(const inkling::MiniControllerCertificate& certificate, const float* input, unsigned width,
-              std::span<const core::Bf16RowProjection> dispatched, std::span<const core::Bf16RowProjection> baseline,
-              std::size_t elements, cc::BigCtx* context) {
-    require(inkling::enqueue_controller_dense(certificate, input, width, kRows, dispatched, nullptr, context,
-                                              core::Bf16Operand::bf16_exact));
-    require(cc::enqueue_bf16_dense_rows(input, width, kRows, baseline, nullptr, cc::DenseArith::mma3, context, nullptr,
-                                        core::Bf16Operand::fp32));
+bool equal(std::span<const float> a, std::span<const float> b) {
+    return std::memcmp(a.data(), b.data(), a.size_bytes()) == 0;
+}
+
+bool run_case(std::string_view name, cc::BigCtx* context, Buffer<std::uint16_t>& down, Buffer<std::uint16_t>& forget,
+              Buffer<std::uint16_t>& gain, std::span<const float> raw, std::span<const float> message,
+              const std::uint16_t* norm, core::Bf16Operand expected, bool require_difference = false) {
+    mini::MiniControllerCertificate certificate;
+    certificate.add_down(down.span());
+    certificate.add_gate(forget.span());
+    certificate.add_gate(gain.span());
+
+    const core::residual_mix::ControllerWeights weights{{}, down.data, forget.data, gain.data, norm};
+    Buffer<float> scratch(kScratch), baseline_scratch(kScratch), output(kElements), baseline_output(kElements);
+    ControllerOps ops{context, &certificate}, baseline{context, nullptr};
+    const auto run = [&](ControllerOps& operations, Buffer<float>& result, Buffer<float>& work) {
+        core::residual_mix::enqueue_low_rank_controller_tail(kController, weights, kRows, raw, message,
+                                                           result.span(), work.span(), operations);
+    };
+    run(ops, output, scratch);
+    run(baseline, baseline_output, baseline_scratch);
     require(cudaDeviceSynchronize());
-    Pair result{true, certificate.route(core::Bf16Operand::bf16_exact)};
-    for (std::size_t p = 0; p < dispatched.size(); ++p)
-        if (std::memcmp(dispatched[p].output, baseline[p].output, elements * sizeof(float))) result.equal = false;
-    return result;
-}
 
-std::span<const std::uint16_t> bits(const Buffer<std::uint16_t>& weights) { return {weights.data, weights.size}; }
-
-struct Outcome {
-    Pair down, gates;
-};
-
-// The chain on the given weights: down on the normalised operands, then the gates on the dispatched down latent.
-Outcome run_chain(Buffer<std::uint16_t>& down, Buffer<std::uint16_t>& forget, Buffer<std::uint16_t>& gain,
-                  const float* operands, cc::BigCtx* context) {
-    inkling::MiniControllerCertificate certificate;
-    certificate.add_down(bits(down));
-    certificate.add_gate(bits(forget));
-    certificate.add_gate(bits(gain));
-    Buffer<float> latent(std::size_t{kRows} * kRank), latent_baseline(std::size_t{kRows} * kRank);
-    const core::Bf16RowProjection d1[] = {{down.data, kRank, latent.data, true}};
-    const core::Bf16RowProjection d3[] = {{down.data, kRank, latent_baseline.data, true}};
-    Outcome outcome{};
-    outcome.down = run_pair(certificate, operands, 2U * kWidth, d1, d3, std::size_t{kRows} * kRank, context);
-    Buffer<float> f1(std::size_t{kRows} * kWidth), f3(std::size_t{kRows} * kWidth), g1(std::size_t{kRows} * kWidth),
-        g3(std::size_t{kRows} * kWidth);
-    const core::Bf16RowProjection p1[] = {{forget.data, kWidth, f1.data, false}, {gain.data, kWidth, g1.data, false}};
-    const core::Bf16RowProjection p3[] = {{forget.data, kWidth, f3.data, false}, {gain.data, kWidth, g3.data, false}};
-    // Both gate runs read the dispatched down latent.
-    outcome.gates = run_pair(certificate, latent.data, kRank, p1, p3, std::size_t{kRows} * kWidth, context);
-    return outcome;
+    // The controller leaves the forget/gain logits and the rounded latent in its scratch.
+    const auto gate_bits_equal = [&] {
+        return equal(scratch.span().subspan(kElements, 2U * kElements),
+                     baseline_scratch.span().subspan(kElements, 2U * kElements));
+    };
+    const bool identical = gate_bits_equal() && equal(scratch.span().subspan(4U * kElements),
+        baseline_scratch.span().subspan(4U * kElements)) && equal(output.span(), baseline_output.span());
+    bool sensitive = true;
+    if (require_difference) {
+        ControllerOps forced{context, nullptr, core::Bf16Operand::bf16_exact};
+        run(forced, output, scratch);
+        require(cudaDeviceSynchronize());
+        sensitive = !gate_bits_equal();
+    }
+    const bool passed = ops.calls == 2U && ops.operands == std::array{expected, expected} && identical && sensitive;
+    std::cout << (passed ? "PASS " : "FAIL ") << name << ' '
+              << (ops.operands[0] == core::Bf16Operand::bf16_exact ? 1 : 3)
+              << " planes, latent/gates/output bitwise match " << identical << ", refusal sensitive " << sensitive << '\n';
+    return passed;
 }
 
 }  // namespace
 
 int main() {
-    std::unique_ptr<cc::BigCtx, decltype(&cc::dense_big_ctx_destroy)> ctx(cc::dense_big_ctx_create(),
-                                                                        cc::dense_big_ctx_destroy);
-    if (!ctx) return 1;
-    const unsigned down_k = 2U * kWidth;
-    Buffer<float> operands(std::size_t{kRows} * down_k);
-    fill_rows(operands.data, std::size_t{kRows} * 2U, kWidth, true);  // raw and message halves, each normalised
-    Buffer<std::uint16_t> down(std::size_t{kRank} * down_k), forget(std::size_t{kWidth} * kRank),
-        gain(std::size_t{kWidth} * kRank);
-    fill_weights(down.data, down.size);
-    fill_weights(forget.data, forget.size);
-    fill_weights(gain.data, gain.size);
-
-    // 1. Ordinary finite weights: one plane runs, same bits as three planes.
-    const auto finite = run_chain(down, forget, gain, operands.data, ctx.get());
-    const bool finite_one_plane = finite.down.route == core::Bf16Operand::bf16_exact;
-
-    // 2. An infinite forget weight hit by a positive latent value. One plane would give inf where three planes give NaN
-    // (0 x inf on the zero planes): the certificate refuses, the dispatch runs three planes.
-    forget.data[0] = 0x7F80U;
-    const auto infinite = run_chain(down, forget, gain, operands.data, ctx.get());
-    const bool infinite_three_planes = infinite.gates.route == core::Bf16Operand::fp32;
-    {
-        // INFO only: forcing one plane on these weights really differs from the baseline.
-        Buffer<float> latent(std::size_t{kRows} * kRank), f1(std::size_t{kRows} * kWidth), f3(std::size_t{kRows} * kWidth);
-        for (unsigned r = 0; r < kRows; ++r)
-            for (unsigned i = 0; i < kRank; ++i) latent.data[std::size_t{r} * kRank + i] = 1.0F;
-        const core::Bf16RowProjection q1[] = {{forget.data, kWidth, f1.data, false}};
-        const core::Bf16RowProjection q3[] = {{forget.data, kWidth, f3.data, false}};
-        require(cc::enqueue_bf16_dense_rows(latent.data, kRank, kRows, q1, nullptr, cc::DenseArith::mma3, ctx.get(),
-                                            nullptr, core::Bf16Operand::bf16_exact));
-        require(cc::enqueue_bf16_dense_rows(latent.data, kRank, kRows, q3, nullptr, cc::DenseArith::mma3, ctx.get(),
-                                            nullptr, core::Bf16Operand::fp32));
-        require(cudaDeviceSynchronize());
-        std::cout << (std::memcmp(f1.data, f3.data, f1.size * sizeof(float)) ? "INFO" : "INFO (no difference)")
-                  << " forced one plane on an infinite forget weight differs from three planes (why the guard exists)\n";
+    std::unique_ptr<cc::BigCtx, decltype(&cc::dense_big_ctx_destroy)> context(cc::dense_big_ctx_create(),
+                                                                            cc::dense_big_ctx_destroy);
+    if (!context) return 1;
+    Buffer<float> raw(kElements), message(kElements);
+    for (std::size_t i = 0; i < kElements; ++i) {
+        raw.data[i] = static_cast<float>(1U + i % 17U);
+        message.data[i] = static_cast<float>(1U + i % 13U);
     }
-    forget.data[0] = 0x3F80U;
+    Buffer<std::uint16_t> down(std::size_t{kRank} * kController.down_operand_elements());
+    Buffer<std::uint16_t> forget(std::size_t{kWidth} * kRank), gain(forget.size), norm(kWidth);
+    std::ranges::fill(down.span(), 0x3C00U);
+    std::ranges::fill(forget.span(), 0x3C00U);
+    std::ranges::fill(gain.span(), 0x3C00U);
+    std::ranges::fill(norm.span(), 0x3F80U);
 
-    // 3. Oversized finite down weights (2^127) under normalised operands: the latent overflows, the certificate refuses.
-    for (std::size_t i = 0; i < down.size; ++i) down.data[i] = 0x7F00U;
-    const auto oversized = run_chain(down, forget, gain, operands.data, ctx.get());
-    const bool oversized_three_planes = oversized.down.route == core::Bf16Operand::fp32;
-
-    std::cout << (finite.down.equal && finite.gates.equal && finite_one_plane ? "PASS" : "FAIL")
-              << " finite weights: certified one plane, down and gates bitwise == three planes\n"
-              << (infinite.down.equal && infinite.gates.equal && infinite_three_planes ? "PASS" : "FAIL")
-              << " infinite forget weight: refused, dispatch bitwise == three planes\n"
-              << (oversized.down.equal && oversized.gates.equal && oversized_three_planes ? "PASS" : "FAIL")
-              << " oversized finite down weights: refused, dispatch bitwise == three planes\n";
-    return finite.down.equal && finite.gates.equal && finite_one_plane && infinite.down.equal && infinite.gates.equal &&
-                   infinite_three_planes && oversized.down.equal && oversized.gates.equal && oversized_three_planes
-               ? 0
-               : 1;
+    const auto test = [&](std::string_view name, core::Bf16Operand expected, bool require_difference = false) {
+        return run_case(name, context.get(), down, forget, gain, raw.span(), message.span(), norm.data,
+                        expected, require_difference);
+    };
+    const bool finite = test("finite", core::Bf16Operand::bf16_exact);
+    forget.data[0] = 0x7F80U;
+    const bool infinite = test("infinite forget", core::Bf16Operand::fp32, true);
+    forget.data[0] = 0x3C00U;
+    std::ranges::fill(down.span(), 0x7F00U);
+    const bool oversized = test("oversized finite down", core::Bf16Operand::fp32, true);
+    return finite && infinite && oversized ? 0 : 1;
 }

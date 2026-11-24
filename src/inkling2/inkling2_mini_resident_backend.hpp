@@ -381,12 +381,11 @@ public:
     }
 
 #if !defined(__HIPCC__)
-    // The shared controller declares its BF16-rounded operands: the tall chain runs one activation plane (same bits)
-    // where the staged controller weights are certified (finite weights, sums kept finite); otherwise FP32 operands.
+    // The opt-in CUDA schedule uses one plane for declared BF16 operands with certified resident weights.
     void dense(const float* input, unsigned width, unsigned rows, std::span<const Projection> projections,
                core::Bf16Operand operand) {
         check(enqueue_controller_dense(weights_.controller_certificate(), input, width, rows, projections, stream_,
-                                       big_context_.get(), operand));
+                                       big_context_.get(), operand).status);
     }
 #endif
 

@@ -15,6 +15,11 @@
 namespace strix::inkling2 {
 
 using MiniResidentRange = weight::ResidentSliceRange;
+using MiniReadControllerBits = std::function<void(std::span<const std::uint16_t>, std::span<std::uint16_t>)>;
+
+// The certificate describes the exact BF16 bytes of these resident slices. The reader transfers those slices to host.
+[[nodiscard]] MiniControllerCertificate read_mini_controller_certificate(const weight::ResidentSlices& slices,
+                                                                         const MiniReadControllerBits& read);
 
 class MiniResidentWeightPlan {
 public:
@@ -42,16 +47,13 @@ private:
 class MiniResidentWeights {
 public:
     [[nodiscard]] static MiniResidentWeights bind(const MiniResidentWeightPlan& plan,
-                                                  std::span<const std::uint8_t> storage);
+                                                  std::span<const std::uint8_t> storage,
+                                                  const MiniReadControllerBits& read_controller_bits = {});
     [[nodiscard]] std::span<const std::uint16_t> bf16(std::string_view name) const;
     [[nodiscard]] weight::ResidentBf16Rows bf16_rows(std::string_view name) const;
     [[nodiscard]] std::span<const float> f32(std::string_view name) const;
     [[nodiscard]] std::span<const MiniMoeExpert> experts(unsigned physical) const;
     [[nodiscard]] bool compact() const { return head_.has_value(); }
-    // Certifies the controller operand class from the controller tensors this object holds: `read` copies a staged
-    // BF16 tensor to host memory (a device copy on CUDA). The certificate is a function of these bytes only.
-    void certify_controllers(const std::function<void(std::span<const std::uint16_t> staged,
-                                                      std::span<std::uint16_t> host)>& read);
     [[nodiscard]] const MiniControllerCertificate& controller_certificate() const { return controller_certificate_; }
     [[nodiscard]] const weight::ResidentMatrixView& compact_head() const { return head_.value(); }
     [[nodiscard]] const attn_core::ResidentPreparedGqaWeights& compact_attention(unsigned physical) const {

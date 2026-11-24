@@ -27,6 +27,7 @@ struct MiniServeOptions {
     // Resolved exact down-image lever (mini_combine_image): the HIP resident prefill stores the BF16 down image where the
     // target is qualified.
     bool combine_image = false;
+    bool controller_one_plane = false;
 };
 
 struct MiniServeCohort {

@@ -204,6 +204,12 @@ void test_options() {
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
+    require(strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "1"}).tier),
+            "CLI must resolve the explicit one-plane candidate");
+    require(!strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "3"}).tier),
+            "CLI must resolve the three-plane incumbent");
+    expect_invalid([] { (void)parse({"1", "--profile", "exact", "--controller-planes", "1"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--controller-planes", "2"}); });
     require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
     require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
     expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });

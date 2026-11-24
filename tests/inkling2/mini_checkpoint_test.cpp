@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -335,6 +336,48 @@ bool check_controller_certificate() {
            route(finite, finite) == one && mini::MiniControllerCertificate{}.route(one) == three;
 }
 
+bool check_controller_residency(const Fixture& fixture) {
+    constexpr auto one = strix::core::Bf16Operand::bf16_exact, three = strix::core::Bf16Operand::fp32;
+    const auto route = [&](std::uint16_t forget_bits, std::uint16_t down_bits) {
+        const auto source = std::make_shared<HeaderSource>(fixture.header.dump(), fixture.payload_size);
+        wei::TensorIndex index;
+        mini::MiniTextWeights weights;
+        if (!wei::index_safetensors(source, index) || !weights.bind(index)) return std::optional<strix::core::Bf16Operand>{};
+        std::vector<wei::ResidentSlicePlan::NamedTensor> tensors;
+        for (const auto& tensor : index.tensors) {
+            const std::string_view name(tensor.name);
+            if (name.find(".controllers.") != std::string_view::npos)
+                tensors.push_back({name.substr(mini::kMiniTextTensorPrefix.size()), weights.find(name)});
+        }
+        const auto plan = wei::ResidentSlicePlan::make(std::move(tensors), alignof(float));
+        std::vector<std::uint16_t> backing(plan.bytes() / sizeof(std::uint16_t));
+        auto bytes = std::span(reinterpret_cast<std::uint8_t*>(backing.data()), plan.bytes());
+        const auto stage = [&](std::string_view name, std::uint16_t bits) {
+            const auto& slice = weights.find(name)->payload;
+            auto& payload = source->stage(slice);
+            payload[0] = static_cast<wei::Byte>(bits & 0xFFU);
+            payload[1] = static_cast<wei::Byte>(bits >> 8U);
+            const auto location = std::ranges::find(plan.ranges(), slice.range.offset,
+                [](const wei::ResidentSliceRange& range) { return range.source.range.offset; });
+            return location != plan.ranges().end() &&
+                   static_cast<bool>(location->source.source->read(location->source.range,
+                       std::as_writable_bytes(bytes.subspan(location->destination_offset, location->bytes))));
+        };
+        const auto prefix = "model.llm.layers." + std::to_string(mini::kCoreFirst) + ".controllers.attn.";
+        if (!stage(prefix + "forget_weight", forget_bits) || !stage(prefix + "down_weight", down_bits))
+            return std::optional<strix::core::Bf16Operand>{};
+        const auto resident = wei::ResidentSlices::bind(plan, bytes);
+        const auto certificate = mini::read_mini_controller_certificate(resident,
+            [](std::span<const std::uint16_t> bits, std::span<std::uint16_t> host) {
+                std::ranges::copy(bits, host.begin());
+            });
+        if (source->payload_reads() != 2U) return std::optional<strix::core::Bf16Operand>{};
+        return std::optional{certificate.route(one)};
+    };
+    return route(0x7F80U, 0x3F80U) == three && route(0x3F80U, 0x3F80U) == one &&
+           route(0x3F80U, 0x7F00U) == three;
+}
+
 }  // namespace
 
 int main() {
@@ -342,6 +385,10 @@ int main() {
     Fixture fixture;
     for (const auto& tensor : mini::mini_text_tensor_schema()) fixture.add(tensor);
     fixture.add({"model.visual.test.weight", "BF16", {4, 4}});
+    if (!check_controller_residency(fixture)) {
+        std::cerr << "controller routing must follow bytes staged from each checkpoint\n";
+        return 91;
+    }
 
     wei::TensorIndex indexed;
     const auto source = std::make_shared<HeaderSource>(fixture.header.dump(), fixture.payload_size);

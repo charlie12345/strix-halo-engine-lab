@@ -73,7 +73,8 @@ public:
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
                         weight::FormatId storage = weight::kBf16WeightStorage, unsigned verify_rows = 0U,
-                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U)
+                        bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U,
+                        bool controller_one_plane = false)
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           tail_rows_(admitted_tail_rows(prefill_rows_, tail_rows <= std::numeric_limits<unsigned>::max() - prefill_rows_
                      ? tail_rows : throw std::invalid_argument("Inkling 2 Mini: invalid prefill tail"))),
@@ -90,7 +91,7 @@ public:
 #if !defined(__HIPCC__)
           token_ids_(max_rows_),
 #endif
-          weights_(upload_weights()), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs),
+          weights_(upload_weights(controller_one_plane)), backend_(weights_, max_rows_, stream_.get(), packed_decode, step_graphs),
           greedy_(decode_rows_, kOutputVocabulary) {
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
@@ -541,23 +542,29 @@ private:
         return MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule());
     }
 
-    [[nodiscard]] MiniResidentWeights upload_weights() {
+    [[nodiscard]] MiniResidentWeights upload_weights(bool controller_one_plane) {
 #if defined(__HIPCC__)
         core::HipWeightUploader uploader;
 #else
         strix::cuda::core::WeightUploader uploader;
 #endif
         core::WeightSliceLoader loader(uploader, {});
-        auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
-        loader.load_resident(weight_plan_.slices(), weight_storage_.span());
 #if !defined(__HIPCC__)
         // Only the CUDA dense route consumes the controller certificate: it reads the staged controller tensors back
         // (a few MiB) instead of re-reading the checkpoint, so the HIP load path is unchanged.
-        weights.certify_controllers([&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
-            mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
-            mini_gpu::synchronize(stream_.get());
-        });
+        if (controller_one_plane) {
+            loader.load_resident(weight_plan_.slices(), weight_storage_.span());
+            return MiniResidentWeights::bind(weight_plan_, weight_storage_.span(),
+                [&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
+                    mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
+                    mini_gpu::synchronize(stream_.get());
+                });
+        }
+#else
+        static_cast<void>(controller_one_plane);
 #endif
+        auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
+        loader.load_resident(weight_plan_.slices(), weight_storage_.span());
         return weights;
     }
 

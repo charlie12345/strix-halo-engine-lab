@@ -14,7 +14,7 @@ namespace strix::inkling2 {
 // tall dense route. The one-plane class (core::Bf16Operand::bf16_exact) is admitted only when the certificate proves
 // the bound of core::low_rank_operands_bounded over the controller weights as staged; any other state is the FP32
 // class (three planes). The certificate is only filled from tensors the resident weights hold (see
-// MiniResidentWeights::certify_controllers), never from a second source.
+// read_mini_controller_certificate), never from a second source.
 class MiniControllerCertificate {
 public:
     void add_down(std::span<const std::uint16_t> bf16_bits) {

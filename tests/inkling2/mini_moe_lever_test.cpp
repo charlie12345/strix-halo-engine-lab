@@ -17,14 +17,40 @@ void require(bool passed, const char* detail) {
 }
 
 // Hermetic environment: only the W4A4 expert switch and the down-image switch, when given.
-profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const char* image = nullptr) {
+profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const char* image = nullptr,
+                       const char* controller = nullptr) {
     profile::Inputs in;
     in.profile = tier;
-    in.env = [value, image](const char* key) -> const char* {
+    in.env = [value, image, controller](const char* key) -> const char* {
         if (std::strcmp(key, "STRIX_INK_MOE_W4A4") == 0) return value;
+        if (std::strcmp(key, "STRIX_INK_CONTROLLER_PLANES") == 0) return controller;
         return image != nullptr && std::strcmp(key, "STRIX_INK_COMBINE_IMAGE") == 0 ? image : nullptr;
     };
     return in;
+}
+
+void test_controller_planes() {
+    constexpr std::string_view id = "inkling2-mini-controller-planes@1";
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        options.tier = inputs(tier);
+        const auto incumbent = mini::resolve_mini_profile(options, true);
+        const auto* entry = incumbent.find(id);
+        require(entry && entry->value == "3", "controller must keep three planes by default");
+        options.tier = inputs(tier, nullptr, nullptr, "3");
+        require(mini::resolve_mini_profile(options, true).fingerprint() == incumbent.fingerprint(),
+                "explicit three planes preserves the incumbent identity");
+        options.tier = inputs(tier, nullptr, nullptr, "1");
+        bool refused = false;
+        try {
+            const auto candidate = mini::resolve_mini_profile(options, true);
+            require(candidate.find(id)->value == "1" && candidate.fingerprint() != incumbent.fingerprint(),
+                    "one plane carries its own candidate identity");
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused == (tier == profile::Name::standard), "EXACT refuses the unqualified one-plane route");
+    }
 }
 
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
@@ -160,6 +186,7 @@ int main() {
         test_row();
         test_resolution();
         test_combine_image();
+        test_controller_planes();
         test_configure();
     } catch (const std::exception& error) {
         std::cerr << "inkling2-mini-moe-lever: " << error.what() << '\n';

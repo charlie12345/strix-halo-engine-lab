@@ -25,7 +25,7 @@ inline MiniServeCohort make_mini_device_cohort(
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
     const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
-        false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
+        false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, 0U, opt.controller_one_plane);
     const bool down_image = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();

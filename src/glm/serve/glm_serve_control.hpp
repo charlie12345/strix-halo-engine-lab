@@ -29,7 +29,7 @@
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 10;  // v10: prefill embed frame (kPrefillEmbeds); v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
+inline constexpr std::uint32_t kControlVersion = 11;  // v11: sampled MTP (kRunSample / kRunSampleDrafts on mtp_run / mtp_enter); v10: prefill embed frame (kPrefillEmbeds); v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 // prefill pflags (with kPrefillMtp): a prefill_mtp session of layer units; `budget` = units to run (0: cancel it).
@@ -49,6 +49,11 @@ inline constexpr std::uint32_t kPrefillPending = 0xFFFFFFFEU;  // a prefill unit
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
 inline constexpr std::uint32_t kPrefixReply = 8U;     // prefix_prepare pflags: reply-end snapshot (default: prompt-end)
 inline constexpr std::uint32_t kPrefixPressure = 16U; // prefix_evict pflags: eviction under memory pressure
+// mtp_run / mtp_enter pflags: the request samples (temperature > 0). kRunSample: the decoder's verify rows are decided
+// by the lead's sampler (strix::serve::decide_pair_window); kRunSampleDrafts (only with kRunSample): drafts are drawn
+// from the drafter's rows too (strix::serve::pick_pair_draft). Both ranks run the same exchanges.
+inline constexpr std::uint32_t kRunSample = 1U;
+inline constexpr std::uint32_t kRunSampleDrafts = 2U;
 inline constexpr std::uint32_t kEnterSeed = 4U;   // mtp_enter pflags: open the C1 decoder from the slot's batched-spec seed
 inline constexpr std::uint32_t kImportFailed = ~0U;  // import_state's token on a rank whose restore failed
 inline constexpr std::uint32_t kImportDsaOnce = 8U;  // import_state pflags: hand-off v2, rank 0 relays the DSA components to rank 1
@@ -376,6 +381,10 @@ public:
     void exchange_sampling_logits(std::span<const float> out, std::span<float> in, std::uint64_t chunk) {
         wire_(std::as_bytes(out), std::as_writable_bytes(in), 2, (lock_.round() << 20) | chunk);
     }
+    // Decision words of a sampled window or draft: one message index space with exchange_sampling_logits per round.
+    void exchange_sampling_words(std::span<const std::uint32_t> out, std::span<std::uint32_t> in, std::uint64_t chunk) {
+        wire_(std::as_bytes(out), std::as_writable_bytes(in), 2, (lock_.round() << 20) | chunk);
+    }
     [[nodiscard]] bool paired() const noexcept { return static_cast<bool>(wire_); }
     [[nodiscard]] std::uint64_t round() const noexcept { return lock_.round(); }
     [[nodiscard]] std::uint32_t rank() const noexcept { return lock_.rank(); }
@@ -386,6 +395,28 @@ private:
     std::uint64_t echo_round_ = kNoRound;
     std::uint32_t echo_count_ = 0, echo_token_ = 0, echo_hash_ = 2166136261U;
 };
+
+// A sampled MTP command as the engine adapter sees it: the pair's channel (its sampling exchanges), the lead's sampler
+// (null on the follower) and the kRunSample / kRunSampleDrafts flags.
+struct SampledRun {
+    Channel* ch = nullptr;
+    strix::TokenSampler* sampler = nullptr;
+    std::uint32_t flags = 0;
+};
+
+// The sampled-MTP flags of an mtp_run / mtp_enter command (kEnterSeed excluded), checked; with flags the lead must hold
+// the request's sampler.
+inline SampledRun sampled_run(const Control& c, Channel& ch, bool sender, std::span<const strix::serve::PairSamplingRow> choices,
+                              std::uint32_t other_flags, const char* what) {
+    SampledRun run{&ch, nullptr, c.pflags & ~other_flags};
+    if ((run.flags & ~(kRunSample | kRunSampleDrafts)) != 0 || (run.flags == kRunSampleDrafts))
+        throw ProtocolError(std::string("control channel: ") + what + " flags");
+    if (run.flags != 0 && sender) {
+        if (choices.empty() || choices[0].sampler == nullptr) throw std::logic_error("control channel: sampled MTP without a sampler");
+        run.sampler = choices[0].sampler;
+    }
+    return run;
+}
 
 // The embed frame of a prefill chunk with virtual ids (kPrefillEmbeds), after its tokens. Eng: embed_frame(ids) ->
 // frame bytes (the lead: the rows of the spans its peer does not hold yet, for the table it was bound to);
@@ -618,12 +649,26 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
         case Cmd::mtp_enter: {
             if (c.pslot >= kMaxRows || c.row[0].slot >= slots || c.row[0].pos + 1 >= capacity)
                 throw ProtocolError("control channel: mtp_enter out of range");
-            eng.mtp_enter(c.pslot, c.row[0], (c.pflags & kEnterSeed) != 0);
+            const SampledRun run = sampled_run(c, ch, sender, choices, kEnterSeed, "mtp_enter");
+            if (run.flags == 0) {
+                eng.mtp_enter(c.pslot, c.row[0], (c.pflags & kEnterSeed) != 0);
+            } else if constexpr (requires { eng.mtp_enter(c.pslot, c.row[0], true, run); }) {
+                eng.mtp_enter(c.pslot, c.row[0], (c.pflags & kEnterSeed) != 0, run);
+            } else {
+                throw ProtocolError("control channel: sampled MTP unavailable");
+            }
             return out;
         }
         case Cmd::mtp_run: {
             if (c.pslot >= slots || c.cycles == 0 || c.budget == 0) throw ProtocolError("control channel: mtp_run out of range");
-            out = eng.mtp_run(c.pslot, c.budget, c.cycles);
+            const SampledRun run = sampled_run(c, ch, sender, choices, 0U, "mtp_run");
+            if (run.flags == 0) {
+                out = eng.mtp_run(c.pslot, c.budget, c.cycles);
+            } else if constexpr (requires { eng.mtp_run(c.pslot, c.budget, c.cycles, run); }) {
+                out = eng.mtp_run(c.pslot, c.budget, c.cycles, run);
+            } else {
+                throw ProtocolError("control channel: sampled MTP unavailable");
+            }
             break;
         }
         case Cmd::spec_verify: {

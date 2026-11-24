@@ -725,6 +725,60 @@ void queued_successor_interleave() {
 
 }
 
+
+// FakeEng with the sampled MTP entry points: records what replay hands them.
+struct SampledProbe : FakeEng {
+    using FakeEng::FakeEng;
+    using FakeEng::mtp_enter;
+    using FakeEng::mtp_run;
+    std::vector<gs::SampledRun> runs, enters;
+    std::vector<std::uint32_t> mtp_run(std::uint32_t, std::uint32_t, std::uint32_t, gs::SampledRun run) {
+        runs.push_back(run);
+        return {5, 6};
+    }
+    void mtp_enter(std::uint32_t, const gs::WireRow&, bool, gs::SampledRun run) { enters.push_back(run); }
+};
+
+void test_sampled_mtp_replay() {
+    gs::Channel solo({}, 0);
+    solo.hello(hello_for(2, 64, 1));
+    strix::TokenSamplingPolicy policy;
+    policy.temperature = 0.8F;
+    strix::TokenSampler sampler(policy, strix::TokenSamplerOptions{});
+    const std::array<sv::PairSamplingRow, 1> choice{{{&sampler, 0}}};
+    std::vector<std::uint32_t> none;
+    gs::Control run;
+    run.cmd = static_cast<std::uint32_t>(gs::Cmd::mtp_run);
+    run.pslot = 1;
+    run.budget = 9;
+    run.cycles = 2;
+    run.pflags = gs::kRunSample;
+    CHECK(gs::decode(gs::encode(run)).pflags == gs::kRunSample);
+    FakeEng plain(2);  // no sampled entry points: a sampled command is a protocol error, not a greedy run
+    CHECK(throws_with([&] { (void)gs::replay(plain, solo, run, none, true, 2, 64, nullptr, choice); }, "sampled MTP unavailable"));
+    SampledProbe probe(2);
+    const auto out = gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice);
+    CHECK(out == (std::vector<std::uint32_t>{5, 6}) && probe.runs.size() == 1);
+    CHECK(probe.runs.at(0).ch == &solo && probe.runs.at(0).sampler == &sampler && probe.runs.at(0).flags == gs::kRunSample);
+    (void)gs::replay(probe, solo, run, none, false, 2, 64);  // the follower runs the same command without a sampler
+    CHECK(probe.runs.size() == 2 && probe.runs.at(1).sampler == nullptr && probe.runs.at(1).flags == gs::kRunSample);
+    CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64); }, "sampled MTP without a sampler"));
+    run.pflags = gs::kRunSample | 8U;
+    CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice); }, "mtp_run flags"));
+    run.pflags = gs::kRunSampleDrafts;  // sampled drafts need sampled targets
+    CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice); }, "mtp_run flags"));
+    gs::Control enter;
+    enter.cmd = static_cast<std::uint32_t>(gs::Cmd::mtp_enter);
+    enter.pslot = 0;
+    enter.row[0] = {1, 4, 7};
+    enter.pflags = gs::kRunSample | gs::kRunSampleDrafts;
+    (void)gs::replay(probe, solo, enter, none, true, 2, 64, nullptr, choice);
+    CHECK(probe.enters.size() == 1 && probe.enters.at(0).flags == (gs::kRunSample | gs::kRunSampleDrafts) &&
+          probe.enters.at(0).sampler == &sampler);
+    CHECK(gs::kControlVersion == 11);
+    std::printf("sampled MTP replay: flags and the lead's sampler reach the engine; unknown flags and engines refused\n");
+}
+
 }  // namespace
 
 // Host protocol regressions: geometry decline and imports ready inside/between pieces.
@@ -1179,6 +1233,7 @@ void prefix_root_sibling() {
 }
 
 int main(int argc, char** argv) {
+    test_sampled_mtp_replay();
     if (argc == 2 && std::string(argv[1]) == "--prefix-root") {
         prefix_root_sibling();
         return failures == 0 ? 0 : 1;

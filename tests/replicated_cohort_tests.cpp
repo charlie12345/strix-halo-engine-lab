@@ -113,6 +113,7 @@ public:
         receive(in);
     }
     std::string name() const override { return "test-queue"; }
+    bool supports_peer_abort() const noexcept override { return true; }
     void abort(const std::string& why) override {
         std::lock_guard lock(wire_->m);
         if (!wire_->aborted) wire_->why = why;
@@ -284,6 +285,12 @@ struct Pair {
     std::shared_ptr<Wire> wire = std::make_shared<Wire>();
     QueueTransport t0{wire, 0}, t1{wire, 1};
 };
+
+strix::dist::ExchangeTransport exchange_adapter(QueueTransport& link) {
+    return strix::dist::ExchangeTransport(
+        [&link](auto out, auto in) { link.exchange(out, in); }, "test-exchange",
+        [&link](const std::string& why) { link.abort(why); });
+}
 
 // Runs rank 1 on its own thread; returns its round count (or the error it stopped with).
 struct Follower {
@@ -634,6 +641,81 @@ void run_exchange_abort_allocation_failure() {
     check(retry.aborted() && retried, "exchange abort: a failed callback does not swallow the empty retry");
 }
 
+void run_callbackless_exchange_rejection() {
+    unsigned frames = 0;
+    const auto exchange = [&](auto, auto) {
+        ++frames;
+        throw std::runtime_error("unexpected frame");
+    };
+    strix::dist::ExchangeTransport t0(exchange), t1(exchange);
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    bool leader_rejected = false, follower_rejected = false;
+    try {
+        ReplicatedCohort rep(be0, t0);
+        rep.keepalive();
+    } catch (const std::invalid_argument& e) {
+        leader_rejected = std::string_view(e.what()).find("peer cancellation") != std::string_view::npos;
+    } catch (const std::runtime_error&) {}
+    try {
+        (void)follow_cohort(be1, t1);
+    } catch (const std::invalid_argument& e) {
+        follower_rejected = std::string_view(e.what()).find("peer cancellation") != std::string_view::npos;
+    } catch (const std::runtime_error&) {}
+    check(leader_rejected && follower_rejected && frames == 0,
+          "exchange admission: both ranks reject a missing abort callback before any frame");
+}
+
+void run_verify_publication_failure() {
+    using namespace std::chrono_literals;
+    struct PayloadFailure { unsigned frame; };
+    Pair wire;
+    auto t0 = exchange_adapter(wire.t0), t1 = exchange_adapter(wire.t1);
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    std::promise<void> receiving_payload;
+    auto waiting = receiving_payload.get_future();
+    wire.t1.tamper = [&](auto&, std::uint64_t index) {
+        if (index == 1) receiving_payload.set_value();
+    };
+    wire.t0.tamper = [&](auto&, std::uint64_t index) {
+        if (index != 1) return;
+        if (waiting.wait_for(5s) != std::future_status::ready)
+            throw std::runtime_error("follower did not enter the continuation exchange");
+        throw PayloadFailure{1};
+    };
+    ReplicatedCohort rep(be0, t0);
+    auto follow = std::async(std::launch::async, [&] {
+        try {
+            (void)follow_cohort(be1, t1);
+        } catch (const std::exception& e) {
+            return std::string(e.what());
+        }
+        return std::string{};
+    });
+    const CohortGroup group{0, kReplicaBlockWords, false};
+    const std::uint32_t tokens[kReplicaBlockWords] = {};
+    std::uint32_t top[kReplicaBlockWords] = {};
+    bool rethrew = false;
+    try {
+        rep.verify({&group, 1}, tokens, top);
+    } catch (const PayloadFailure& error) {
+        rethrew = error.frame == 1;
+    } catch (const std::exception&) {}
+    wire.t0.tamper = {};
+    check(rethrew && rep.rounds() == 0, "verify publication: rethrows the original continuation failure");
+    const bool cancelled = follow.wait_for(2s) == std::future_status::ready;
+    check(cancelled && t0.aborted(), "verify publication: abort wakes the follower while both adapters live");
+    if (!cancelled) wire.t0.abort("test cleanup");
+    check(follow.get() == "link aborted: " && be0.forwards == 0 && be1.forwards == 0,
+          "verify publication: empty abort reason reaches the peer before either backend runs");
+    bool closed = false;
+    try {
+        rep.keepalive();
+    } catch (const std::logic_error&) {
+        closed = true;
+    } catch (const std::runtime_error&) {}
+    check(closed, "verify publication: rank 0 refuses reuse of the replica");
+}
+
 void run_follower_abort_allocation_failure() {
     Pair wire;
     FakeBackend be0(1, 4, 23), be1(1, 4, 23);
@@ -662,7 +744,6 @@ void run_follower_abort_allocation_failure() {
     check(wire.wire->aborted, "follower abort: cancels the link when building the reason fails");
 }
 
-#ifdef STRIX_TEST_REPLICA_TRANSPORTS
 void run_verify_transport_failure(strix::dist::Transport& t0, strix::dist::Transport& t1) {
     using namespace std::chrono_literals;
     const auto name = t0.name();
@@ -711,6 +792,13 @@ void run_verify_transport_failure(strix::dist::Transport& t0, strix::dist::Trans
           name + ": follower exits with a cancellation error");
 }
 
+void run_exchange_verify_failure() {
+    Pair wire;
+    auto t0 = exchange_adapter(wire.t0), t1 = exchange_adapter(wire.t1);
+    run_verify_transport_failure(t0, t1);
+}
+
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
 void run_real_transports() {
     using namespace std::chrono_literals;
     using namespace strix::dist;
@@ -826,6 +914,9 @@ int main() {
     run_verify_allocation_failure();
     run_verify_backend_failure();
     run_exchange_abort_allocation_failure();
+    run_callbackless_exchange_rejection();
+    run_exchange_verify_failure();
+    run_verify_publication_failure();
     run_follower_abort_allocation_failure();
 #ifdef STRIX_TEST_REPLICA_TRANSPORTS
     run_real_transports();

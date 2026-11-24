@@ -95,8 +95,9 @@ TokenSampler sampler_of(std::span<const std::uint32_t> w) {
     return TokenSampler(p, o);
 }
 
-void check_frame(std::uint32_t frame_words) {
+void check_replica_link(const dist::Transport& link, std::uint32_t frame_words) {
     if (frame_words == 0U) throw std::invalid_argument("cohort replica: frame_words >= 1");
+    if (!link.supports_peer_abort()) throw std::invalid_argument("cohort replica: transport requires peer cancellation");
 }
 
 void abort_link(dist::Transport& link, const char* reason) noexcept {
@@ -115,7 +116,7 @@ void abort_link(dist::Transport& link, const char* reason) noexcept {
 
 ReplicatedCohort::ReplicatedCohort(CohortBackend& local, dist::Transport& link, ReplicaOptions options)
     : local_(local), link_(link), options_(options) {
-    check_frame(options_.frame_words);
+    check_replica_link(link_, options_.frame_words);
 }
 
 ReplicatedCohort::~ReplicatedCohort() {
@@ -174,6 +175,9 @@ void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t f
         }
     } catch (const std::exception& error) {
         abort_replica(error.what());
+        throw;
+    } catch (...) {
+        abort_replica("");
         throw;
     }
     deferred_.clear();
@@ -326,7 +330,7 @@ void ReplicatedCohort::close() {
 }
 
 std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, ReplicaOptions options) {
-    check_frame(options.frame_words);
+    check_replica_link(link, options.frame_words);
     std::uint64_t round = 0;
     Block out{}, in{};
     std::vector<std::uint32_t> payload, top;

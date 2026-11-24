@@ -117,6 +117,7 @@ public:
         receive(in);
     }
     [[nodiscard]] std::string name() const override { return "memory"; }
+    [[nodiscard]] bool supports_peer_abort() const noexcept override { return true; }
     void abort(const std::string&) override {
         {
             std::scoped_lock lock(out_->mutex, in_->mutex);
@@ -778,6 +779,7 @@ private:
     }
 
 public:
+    [[nodiscard]] bool supports_peer_abort() const noexcept override { return true; }
     void abort(const std::string& why) override {
         {
             std::lock_guard lock(root_mutex_);
@@ -1376,6 +1378,7 @@ public:
         }
     }
     [[nodiscard]] std::string name() const override { return "tcp"; }
+    [[nodiscard]] bool supports_peer_abort() const noexcept override { return true; }
     void abort(const std::string&) override {
         // Wake both directions and leave the descriptor owned until the worker has joined.
         (void)::shutdown(fd_, SHUT_RDWR);

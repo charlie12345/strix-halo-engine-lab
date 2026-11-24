@@ -30,6 +30,8 @@
 // beyond the block's inline area follow from rank 0 in frames of at most ReplicaOptions::frame_words words. Words are
 // host order: both ranks are the same architecture.
 //
+// Both ranks require a link whose abort wakes the peer and check that capability before sending or receiving a frame.
+//
 // Pure host code: no device types. Engines bind CohortBackend on each rank; the replication lives here.
 namespace strix::serve {
 

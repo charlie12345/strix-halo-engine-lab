@@ -465,9 +465,15 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
 // gathered row per block (4 x 16 B, two K16 units each) into the same LDS fragment layout, so a gathered row costs whole
 // lines. Grid: x = blocks of kCtaTilesN W tiles (fastest: the CTAs of one tile slice share its rows in L2), y = tile *
 // slices + slice (the slices and tiles of one expert run together and share its weight block).
+// Epilogue staging of the grouped trait: a wave's 32 rows x 32 columns at a row stride of 36 floats (16 B aligned rows;
+// 36 l16 mod 64 + hi hits 32 distinct banks per store).
+inline constexpr unsigned kStageStride = 36U;
+inline constexpr unsigned kGroupedLds = 2U * kBlockBytes > kWavesN * kWavesM * kTm * 16U * kStageStride * 4U
+                                            ? 2U * kBlockBytes
+                                            : kWavesN * kWavesM * kTm * 16U * kStageStride * 4U;
 template <class Src, class Epi>
 __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsigned n, unsigned slices, Epi epi) {
-    __shared__ __attribute__((aligned(16))) std::uint8_t lds[2U * kBlockBytes];
+    __shared__ __attribute__((aligned(16))) std::uint8_t lds[kGroupedLds];
     const unsigned tile = blockIdx.y / slices, slice = blockIdx.y % slices;
     if (!src.active(tile)) return;  // uniform, before any barrier
     GroupCta g = src.bind(tile);
@@ -551,36 +557,60 @@ __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsig
         if (more) put((b + 1U) & 1U);
         __syncthreads();
     }
-    (void)epi;
     if (!live) return;  // after the last barrier
+    // Epilogue through LDS (the operand buffers are dead after the last barrier). The WMMA layout gives a lane 2 adjacent
+    // columns of 16 rows, so direct stores cost 16 lines of 8 B per instruction (measured: ~6.6 ms fixed per 8K launch).
+    // Each wave stages its values in a private 32-row x 32-column region (row stride kStageStride: conflict-free writes),
+    // then stores whole 16 B chunks, 8 lanes per row (128 B contiguous). The stored values and their rounding are the
+    // direct form's, bit for bit; only the store order changes. Plain: 2 phases of 2 W tiles; paired: 1 phase of 2 pairs.
+    constexpr unsigned kPhases = Epi::kPaired ? 1U : kTw / 2U;
+    float* const st = reinterpret_cast<float*>(lds) + wave * (kTm * 16U * kStageStride);
+    const unsigned c0 = Epi::kPaired ? nt0 * 8U : nt0 * 16U;  // first output column of this wave
+    const bool vec = ((reinterpret_cast<std::uintptr_t>(g.y) | (g.y_row * sizeof(float))) & 15U) == 0U;  // uniform
+    float bm[kTm];
 #pragma unroll
-    for (unsigned j = 0; j < kTm; ++j) {
-        const unsigned r = (mt0 + j) * 16U + l16;
-        if (mt0 + j >= mtiles || r >= rows) continue;
-        const float bm = a.base[image_row(r)];
-        float* yr = g.y + std::size_t(r) * g.y_row;
-        if constexpr (!Epi::kPaired) {
+    for (unsigned j = 0; j < kTm; ++j) bm[j] = a.base[image_row((mt0 + j) * 16U + l16)];  // clamped row: always readable
 #pragma unroll
-            for (unsigned i = 0; i < kTw; ++i) {
-                if (nt0 + i >= ntiles) continue;
+    for (unsigned p = 0; p < kPhases; ++p) {
 #pragma unroll
-                for (unsigned e = 0; e < 8U; ++e) {
-                    float v = acc[i][j][e] * bm;
-                    asm volatile("" : "+v"(v));  // y = acc * base rounded once, as the dense launch
-                    yr[(nt0 + i) * 16U + 2U * e + hi] = v;
-                }
-            }
-        } else {
+        for (unsigned j = 0; j < kTm; ++j)
 #pragma unroll
-            for (unsigned i = 0; i < kTw; i += 2U) {
-                if (nt0 + i + 1U >= ntiles) continue;
+            for (unsigned k = 0; k < 2U; ++k)
 #pragma unroll
                 for (unsigned e = 0; e < 8U; ++e) {
-                    float gate = acc[i][j][e] * bm, up = acc[i + 1U][j][e] * bm;
-                    asm volatile("" : "+v"(gate), "+v"(up));
-                    yr[((nt0 + i) / 2U) * 16U + 2U * e + hi] = epi(gate, up);
+                    float v;
+                    if constexpr (!Epi::kPaired) {
+                        v = acc[2U * p + k][j][e] * bm[j];
+                        asm volatile("" : "+v"(v));  // y = acc * base rounded once, as the dense launch
+                    } else {
+                        float gate = acc[2U * k][j][e] * bm[j], up = acc[2U * k + 1U][j][e] * bm[j];
+                        asm volatile("" : "+v"(gate), "+v"(up));
+                        v = epi(gate, up);
+                    }
+                    st[(j * 16U + l16) * kStageStride + k * 16U + 2U * e + hi] = v;
                 }
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#pragma unroll
+        for (unsigned it = 0; it < kTm * 16U / 4U; ++it) {
+            const unsigned row = it * 4U + lane / 8U, ch = lane % 8U, r = mt0 * 16U + row;
+            // Column tile of the chunk: plain W tile nt0 + 2 p + ch / 4; paired pair (nt0 + 2 (ch / 4), + 1).
+            const bool col_live = Epi::kPaired ? nt0 + 2U * (ch / 4U) + 1U < ntiles : nt0 + 2U * p + ch / 4U < ntiles;
+            if (r >= rows || !col_live) continue;
+            const F4 v = *reinterpret_cast<const F4*>(st + row * kStageStride + ch * 4U);
+            float* yp = g.y + std::size_t(r) * g.y_row + c0 + p * 32U + ch * 4U;
+            if (vec) {
+                *reinterpret_cast<F4*>(yp) = v;
+            } else {
+#pragma unroll
+                for (unsigned q = 0; q < 4U; ++q) yp[q] = v[q];
             }
+        }
+        if (p + 1U < kPhases) {
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");  // the next phase overwrites the region
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
         }
     }
 }

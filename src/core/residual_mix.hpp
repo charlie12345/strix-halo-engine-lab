@@ -937,6 +937,10 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
     bool image = false;
 #if defined(__HIPCC__)
     const std::span<const Bf16RowProjection> down_rows(down);
+    // A backend with the image launch admits with the down weights in view; an older two-argument admission would
+    // silently keep the FP32 operands, so it does not compile.
+    static_assert(!requires { operations.admits_dense_bf16_image(stride, rows); },
+                  "admits_dense_bf16_image takes (stride, rows, down projections)");
     if constexpr (requires {
                       { operations.admits_dense_bf16_image(stride, rows, down_rows) } -> std::same_as<bool>;
                       operations.dense_bf16_image(static_cast<const std::uint16_t*>(nullptr), stride, rows, down_rows);

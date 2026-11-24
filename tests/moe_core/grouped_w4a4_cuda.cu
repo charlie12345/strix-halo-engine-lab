@@ -72,6 +72,11 @@ std::uint8_t encode_e2m1(float x) {  // |x| <= 6
     }
     return static_cast<std::uint8_t>(best | (std::signbit(x) ? 8U : 0U));
 }
+// Expected residual of the two-term rule r2@1, written independently of moe_core/nvfp4_act_rule.hpp: the literal E2M1
+// values above and one FP32 FMA per element, r_i = -fma(q_i, scale, -v_i) = v_i - q_i * scale rounded once.
+void residual_expected(const float (&v)[16], float scale, const std::uint8_t* codes, float (&r)[16]) {
+    for (unsigned i = 0; i < 16U; ++i) r[i] = -std::fma(e2m1_value((codes[i / 2U] >> (4U * (i & 1U))) & 15U), scale, -v[i]);
+}
 // Code bytes equal up to the sign of zero (E2M1 0x8 = -0 decodes to 0 like 0x0).
 bool same_codes(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) {
     const auto norm = [](std::uint8_t v) {
@@ -363,9 +368,7 @@ void correctness(std::mt19937& rng) {
                     for (unsigned q = 0; q < K / 16U; ++q) {
                         float v[16], r[16];
                         std::memcpy(v, x + 16U * q, sizeof v);
-                        std::uint32_t word[2];
-                        std::memcpy(word, hc.data() + 8U * q, sizeof word);
-                        strix::moe_core::nvfp4_act::residual(v, e4m3_value(hs[q]) * hr, word, r);
+                        residual_expected(v, e4m3_value(hs[q]) * hr, hc.data() + 8U * q, r);
                         std::memcpy(resid.data() + 16U * q, r, sizeof r);
                     }
                     float hr2;
@@ -375,7 +378,8 @@ void correctness(std::mt19937& rng) {
                     ok2 = ok2 && hr == r2[a] && same_codes(hc.data(), dc, K / 2U) && same_codes(h2c.data(), dc + K / 2U, K / 2U) &&
                           std::memcmp(hs.data(), ds, K / 16U) == 0 && std::memcmp(h2s.data(), ds + K / 16U, K / 16U) == 0;
                 }
-                check(ok2, "quantiser r2@1 (each rule) FP32 gather bitwise: [term 1 | residual term] at one row scale");
+                check(ok2, "quantiser r2@1 (each rule) FP32 gather: scales and row scale bitwise, codes equal modulo signed zero, "
+                           "residual expected independently (literal E2M1 values, FP32 FMA)");
                 const gw::Args args2{{dtiles, static_cast<unsigned>(tiles.size()), K, kOut, nullptr, nullptr, 64U}, dbase, image3, nullptr, 2U};
                 check(gw::fits(args2) && !gw::fits(gw::Args{args2.tiles, dbase, image, nullptr, 2U}),
                       "two-term projection admits a two-term image only");
@@ -433,34 +437,37 @@ void correctness(std::mt19937& rng) {
                     CK(cudaFree(dtok2));
                 }
             }
-            // BF16 source rows (the down input of nvfp4_mse_r2), two terms, mse@1: bitwise as the rule on their FP32 widening.
-            CK(strix::cuda::core::grouped_w4a4::quantize(
-                gw::QuantizeArgs<std::uint16_t>{dbrows, K, nullptr, assignments, K, image3, nullptr, 2U}, nullptr,
-                gw::ScaleRule::mse));
-            CK(cudaMemcpy(c2.data(), image3.codes, c2.size(), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(s2.data(), image3.scales, s2.size(), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(r2.data(), image3.row_scale, r2.size() * 4, cudaMemcpyDeviceToHost));
-            bool okb = true;
-            for (unsigned a = 0; a < assignments; ++a) {
-                const float* x = bwide.data() + std::size_t{a} * K;
-                float hr;
-                quantize_host(x, K, hc.data(), hs.data(), &hr, true);
-                for (unsigned q = 0; q < K / 16U; ++q) {
-                    float v[16], r[16];
-                    std::memcpy(v, x + 16U * q, sizeof v);
-                    std::uint32_t word[2];
-                    std::memcpy(word, hc.data() + 8U * q, sizeof word);
-                    strix::moe_core::nvfp4_act::residual(v, e4m3_value(hs[q]) * hr, word, r);
-                    std::memcpy(resid.data() + 16U * q, r, sizeof r);
+            // BF16 source rows (the down input of the two-term classes), two terms with mse@1 (nvfp4_mse_r2) and nearest@1 terms
+            // (nvfp4_r2): as the rule on their FP32 widening.
+            for (const bool mse : {true, false}) {
+                CK(strix::cuda::core::grouped_w4a4::quantize(
+                    gw::QuantizeArgs<std::uint16_t>{dbrows, K, nullptr, assignments, K, image3, nullptr, 2U}, nullptr,
+                    mse ? gw::ScaleRule::mse : gw::ScaleRule::nearest));
+                CK(cudaMemcpy(c2.data(), image3.codes, c2.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(s2.data(), image3.scales, s2.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(r2.data(), image3.row_scale, r2.size() * 4, cudaMemcpyDeviceToHost));
+                bool okb = true;
+                for (unsigned a = 0; a < assignments; ++a) {
+                    const float* x = bwide.data() + std::size_t{a} * K;
+                    float hr;
+                    quantize_host(x, K, hc.data(), hs.data(), &hr, mse);
+                    for (unsigned q = 0; q < K / 16U; ++q) {
+                        float v[16], r[16];
+                        std::memcpy(v, x + 16U * q, sizeof v);
+                        residual_expected(v, e4m3_value(hs[q]) * hr, hc.data() + 8U * q, r);
+                        std::memcpy(resid.data() + 16U * q, r, sizeof r);
+                    }
+                    float hr2;
+                    quantize_host(resid.data(), K, h2c.data(), h2s.data(), &hr2, mse, &hr);
+                    const std::uint8_t* dc = c2.data() + std::size_t{a} * K;
+                    const std::uint8_t* ds = s2.data() + std::size_t{a} * K / 8U;
+                    okb = okb && hr == r2[a] && same_codes(hc.data(), dc, K / 2U) &&
+                          same_codes(h2c.data(), dc + K / 2U, K / 2U) && std::memcmp(hs.data(), ds, K / 16U) == 0 &&
+                          std::memcmp(h2s.data(), ds + K / 16U, K / 16U) == 0;
                 }
-                float hr2;
-                quantize_host(resid.data(), K, h2c.data(), h2s.data(), &hr2, true, &hr);
-                const std::uint8_t* dc = c2.data() + std::size_t{a} * K;
-                const std::uint8_t* ds = s2.data() + std::size_t{a} * K / 8U;
-                okb = okb && hr == r2[a] && same_codes(hc.data(), dc, K / 2U) && same_codes(h2c.data(), dc + K / 2U, K / 2U) &&
-                      std::memcmp(hs.data(), ds, K / 16U) == 0 && std::memcmp(h2s.data(), ds + K / 16U, K / 16U) == 0;
+                check(okb, mse ? "quantiser r2@1 (mse@1 terms) BF16 rows: scales bitwise, codes equal modulo signed zero, one row scale"
+                               : "quantiser r2@1 (nearest@1 terms) BF16 rows: scales bitwise, codes equal modulo signed zero, one row scale");
             }
-            check(okb, "quantiser r2@1 (mse@1 terms) BF16 rows: scales bitwise, codes equal modulo signed zero, one row scale");
             // Native admission: a base width the projection rejects (K = 64, so K x terms = 128) is refused by the quantiser.
             const auto narrow = gw::make_image(dimage3, assignments, 64U, 2U);
             check(strix::cuda::core::grouped_w4a4::quantize(

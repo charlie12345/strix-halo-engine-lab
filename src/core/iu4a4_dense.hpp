@@ -329,44 +329,75 @@ inline constexpr unsigned kUnitBytes = 2048U, kCodeBytes = 8U * kUnitBytes, kSid
 static_assert(kCtaTilesN == 8U && kCtaTilesM == 8U, "a staged unit holds 8 W tiles and 8 x tiles (64 x 16 B per side)");
 // The contract arithmetic of one staged 128-input block `buf` (codes, then side data) for a wave's kTw x kTm tiles,
 // added to acc (shared by the dense and the grouped launch: same operations, same order).
+// SplitC (the grouped trait): the integer accumulator c holds one x tile at a time (kTw x 8 registers instead of
+// kTw x kTm x 8; the gathered launch spilled its staging registers in the K loop). Every t is the same exact integer
+// sum in the same group order, so acc is the same bits; the dense launch keeps the default form.
+template <bool SplitC = false>
 __device__ __forceinline__ void block_dot(const std::uint8_t* buf, unsigned wn, unsigned wm, unsigned l16, unsigned hi, float (&acc)[kTw][kTm][8]) {
-    const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
-    I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];  // fragment sets in ping-pong (named: no ring copies)
-    const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
-#pragma unroll
-        for (unsigned i = 0; i < kTw; ++i)
-#pragma unroll
-            for (unsigned j = 0; j < kTm; ++j)
-                c[i][j] = STRIX_HIP_WMMA_IU4(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
-    };
     const I2* wl = reinterpret_cast<const I2*>(buf + wn * (kTw * 128U) + l16 * 8U);
     const I2* xl = reinterpret_cast<const I2*>(buf + 1024U + wm * (kTm * 128U) + l16 * 8U);
-    const auto load = [&](unsigned k, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
-#pragma unroll
-        for (unsigned i = 0; i < kTw; ++i) wd[i] = wl[(k * kUnitBytes + i * 128U) / 8U];
-#pragma unroll
-        for (unsigned j = 0; j < kTm; ++j) xd[j] = xl[(k * kUnitBytes + j * 128U) / 8U];
-    };
     const std::uint8_t* sd = buf + kCodeBytes;
     std::uint32_t ub[kTm];
 #pragma unroll
     for (unsigned j = 0; j < kTm; ++j) ub[j] = reinterpret_cast<const std::uint32_t*>(sd + 512U + (wm * kTm + j) * 64U)[l16];
     I8 t[kTw][kTm];
-    load(0U, wa, xa);
-#pragma unroll
-    for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
-        I8 c[kTw][kTm];
-        load(2U * g + 1U, wb, xb);
-        mma(wa, xa, c, true);
-        if (g + 1U < rot::kGroupsPerBlock) load(2U * g + 2U, wa, xa);
-        mma(wb, xb, c, false);
-#pragma unroll
-        for (unsigned j = 0; j < kTm; ++j) {
-            const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+    if constexpr (!SplitC) {
+        const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+        I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];  // fragment sets in ping-pong (named: no ring copies)
+        const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
 #pragma unroll
             for (unsigned i = 0; i < kTw; ++i)
 #pragma unroll
-                for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
+                for (unsigned j = 0; j < kTm; ++j)
+                    c[i][j] = STRIX_HIP_WMMA_IU4(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
+        };
+        const auto load = [&](unsigned k, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) wd[i] = wl[(k * kUnitBytes + i * 128U) / 8U];
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j) xd[j] = xl[(k * kUnitBytes + j * 128U) / 8U];
+        };
+        load(0U, wa, xa);
+#pragma unroll
+        for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+            I8 c[kTw][kTm];
+            load(2U * g + 1U, wb, xb);
+            mma(wa, xa, c, true);
+            if (g + 1U < rot::kGroupsPerBlock) load(2U * g + 2U, wa, xa);
+            mma(wb, xb, c, false);
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j) {
+                const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+#pragma unroll
+                for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+                    for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
+            }
+        }
+    } else {
+        const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+        for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+            I2 w0[kTw], w1[kTw];
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) {
+                w0[i] = wl[((2U * g) * kUnitBytes + i * 128U) / 8U];
+                w1[i] = wl[((2U * g + 1U) * kUnitBytes + i * 128U) / 8U];
+            }
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j) {
+                const I2 x0 = xl[((2U * g) * kUnitBytes + j * 128U) / 8U], x1 = xl[((2U * g + 1U) * kUnitBytes + j * 128U) / 8U];
+                I8 c[kTw];
+#pragma unroll
+                for (unsigned i = 0; i < kTw; ++i) c[i] = STRIX_HIP_WMMA_IU4(true, w0[i], true, x0, zero, false);
+#pragma unroll
+                for (unsigned i = 0; i < kTw; ++i) c[i] = STRIX_HIP_WMMA_IU4(true, w1[i], true, x1, c[i], false);
+                const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+#pragma unroll
+                for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+                    for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][e]) : __mul24(ug, c[i][e]) + t[i][j][e];
+            }
         }
     }
 #pragma unroll
@@ -553,7 +584,7 @@ __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsig
     for (unsigned b = 0; b < blocks; ++b) {
         const bool more = b + 1U < blocks;
         if (more) fetch(b + 1U);
-        if (live) block_dot(lds + (b & 1U) * kBlockBytes, wn, wm, l16, hi, acc);
+        if (live) block_dot<true>(lds + (b & 1U) * kBlockBytes, wn, wm, l16, hi, acc);
         if (more) put((b + 1U) & 1U);
         __syncthreads();
     }
@@ -614,6 +645,20 @@ __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsig
         }
     }
 }
+// Row copy of a row-major A4 image (enqueue_quantise_rows layout): dst row a = src row map[a] (codes, u, base), bit for
+// bit; a map entry past src.rows leaves dst row a unwritten. One wave per row, 16 B per lane.
+__global__ __launch_bounds__(256) void gather_rows_kernel(Act src, const std::uint32_t* __restrict__ map, Act dst) {
+    const unsigned row = blockIdx.x * 8U + (threadIdx.x >> 5U), lane = threadIdx.x & 31U;
+    if (row >= dst.rows) return;
+    const unsigned from = map[row];
+    if (from >= src.rows) return;
+    const unsigned in = dst.in, pieces = in / 32U, blocks = in / rot::kBlock;
+    const GI4* sc = (const GI4*)(src.codes + std::size_t(from) * (in / 2U));
+    I4* dc = reinterpret_cast<I4*>(dst.codes + std::size_t(row) * (in / 2U));
+    for (unsigned q = lane; q < pieces; q += 32U) dc[q] = sc[q];
+    for (unsigned q = lane; q < blocks; q += 32U) dst.u[std::size_t(row) * blocks + q] = src.u[std::size_t(from) * blocks + q];
+    if (lane == 0U) dst.base[row] = src.base[from];
+}
 }  // namespace detail
 
 // Host side (stream-ordered; callers check supported() and hipGetLastError()).
@@ -631,6 +676,12 @@ inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hi
 // The row-major image of the grouped launch (same values as enqueue_quantise; byte sizes act_*_bytes).
 inline void enqueue_quantise_rows(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
     enqueue_quantise_map2<detail::Ident, true>(x, nullptr, x_stride, a, s);
+}
+// dst row a = src row map[a] of a row-major image (same in; dst.rows rows): a grouped launch over dst reads contiguous rows
+// (map = nullptr) instead of gathering src rows; the values are the same bits.
+inline void enqueue_gather_rows(const Act& src, const std::uint32_t* map, const Act& dst, hipStream_t s) {
+    if (dst.rows == 0U) return;
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::gather_rows_kernel, dim3((dst.rows + 7U) / 8U), dim3(256), 0, s, src, map, dst);
 }
 // Requantisation from a weight source (Src::requantise(col, b, n, dst) -> step, see detail::requantise_kernel).
 template <class Src>

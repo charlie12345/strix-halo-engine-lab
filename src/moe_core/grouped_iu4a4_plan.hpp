@@ -32,7 +32,8 @@ struct LayerImages {
 struct Selection {
     const LayerImages* images{};
 };
-// Bytes of the two activation images of one pass (token rows x hidden, assignment rows x intermediate), 256 B aligned
+// Bytes of the three activation images of one pass (token rows x hidden; the same image gathered into assignment order,
+// assignment rows x hidden, so the gate/up tiles read contiguous rows; assignment rows x intermediate), 256 B aligned
 // each; the HIP pass refuses a smaller workspace.
 constexpr std::size_t align256(std::size_t v) { return (v + 255U) / 256U * 256U; }
 constexpr std::size_t act_image_bytes(unsigned rows, unsigned in) {
@@ -40,11 +41,11 @@ constexpr std::size_t act_image_bytes(unsigned rows, unsigned in) {
     return align256(mp * in / 2U) + align256(mp * (in / kInputBlock) * 4U) + align256(mp * 4U);
 }
 constexpr std::size_t act_bytes(unsigned rows, unsigned assignments, unsigned hidden, unsigned intermediate) {
-    return act_image_bytes(rows, hidden) + act_image_bytes(assignments, intermediate);
+    return act_image_bytes(rows, hidden) + act_image_bytes(assignments, hidden) + act_image_bytes(assignments, intermediate);
 }
 // One grouped expert pass of the class (the backend-neutral dispatcher fills it; plan, tiles and outputs as the BF16 tile):
-// token rows (FP32 rows x hidden) -> A4 token image; gate/up tiles (rows through assignment_rows) with the paired SwiGLU
-// epilogue -> h (FP32 [assignment][intermediate]); h -> A4 image; down tiles -> their outputs (the combine's rows).
+// token rows (FP32 rows x hidden) -> A4 token image -> copied into assignment order (assignment_rows); gate/up tiles
+// with the paired SwiGLU epilogue -> h (FP32 [assignment][intermediate]); h -> A4 image; down tiles -> their outputs (the combine's rows).
 struct Pass {
     const float* tokens{};
     unsigned rows{}, assignments{}, hidden{}, intermediate{};

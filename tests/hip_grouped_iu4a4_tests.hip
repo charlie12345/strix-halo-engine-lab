@@ -245,6 +245,19 @@ int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsi
     // Plain gate/up (rows in assignment order through h = dplain), paired gate/up -> h, its device check, then down.
     ad::enqueue_grouped_gemm(source(l, gate, gim, true, ng, dplain, ng), tiles, tall, ng, tok.act, nullptr);
     ad::enqueue_grouped_gemm(source(l, gate, gim, true, ng, dh, ffn), tiles, tall, ng, tok.act, nullptr, epi);
+    // The pass's form: the token image copied into assignment order, paired gate/up over it without the map -> dhg
+    // (must equal dh bit for bit, unwritten rows included).
+    Act gath;
+    gath.alloc(A, hidden);
+    float* dhg = nullptr;
+    CHECK(hipMalloc(&dhg, std::size_t(A + 1U) * ffn * 4U));
+    CHECK(hipMemset(dhg, 0xff, std::size_t(A + 1U) * ffn * 4U));
+    ad::enqueue_gather_rows(tok.act, l.dmap, gath.act, nullptr);
+    {
+        gi::TileSource sg = source(l, gate, gim, true, ng, dhg, ffn);
+        sg.map = nullptr;
+        ad::enqueue_grouped_gemm(sg, tiles, tall, ng, gath.act, nullptr, epi);
+    }
     hipLaunchKernelGGL(swiglu_check_kernel, dim3(static_cast<unsigned>((std::size_t(A) * ffn + 255U) / 256U)), dim3(256), 0, nullptr, dplain, A, ng, dhc, epi);
     // h rows past the cut are NaN-pattern: quantise them anyway (their down tiles are refused).
     ad::enqueue_quantise_rows(dh, ffn, hact.act, nullptr);
@@ -252,7 +265,11 @@ int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsi
     CHECK(hipGetLastError());
     CHECK(hipDeviceSynchronize());
 
-    unsigned bad_img = 0, bad_plain = 0, bad_pair = 0, bad_down = 0, bad_guard = 0;
+    unsigned bad_img = 0, bad_plain = 0, bad_pair = 0, bad_down = 0, bad_guard = 0, bad_gather = 0;
+    {
+        const auto a0 = download(dh, std::size_t(A + 1U) * ffn), a1 = download(dhg, std::size_t(A + 1U) * ffn);
+        for (std::size_t i = 0; i < a0.size(); ++i) bad_gather += bits(a0[i]) != bits(a1[i]);
+    }
     // Images.
     std::vector<std::uint8_t> hc;
     std::vector<float> hs;
@@ -330,10 +347,10 @@ int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsi
     for (unsigned c = 0; c < ng; ++c) bad_guard += bits(plain[std::size_t(A) * ng + c]) != 0xffffffffU;
     for (unsigned c = 0; c < ffn; ++c) bad_guard += bits(h[std::size_t(A) * ffn + c]) != 0xffffffffU;
     for (unsigned c = 0; c < hidden; ++c) bad_guard += bits(y[std::size_t(A) * hidden + c]) != 0xffffffffU;
-    const bool ok = !(bad_img | bad_plain | bad_pair | bad_down | bad_guard);
-    std::printf("%s %s %s%s%s tokens %u experts %u k %u hidden %u ffn %u tiles %u (run %u): image %u plain %u paired %u down %u guard %u differ\n",
+    const bool ok = !(bad_img | bad_plain | bad_pair | bad_down | bad_guard | bad_gather);
+    std::printf("%s %s %s%s%s tokens %u experts %u k %u hidden %u ffn %u tiles %u (run %u): image %u plain %u paired %u down %u guard %u gathered %u differ\n",
                 ok ? "PASS" : "FAIL", f == packed::MatrixFormat::nvfp4 ? "nvfp4" : "mxfp8", order == packed::RowOrder::contiguous ? "contig" : "interleaved",
-                skew ? " skew" : "", cut ? " cut" : "", tokens, experts, k, hidden, ffn, tiles, count, bad_img, bad_plain, bad_pair, bad_down, bad_guard);
+                skew ? " skew" : "", cut ? " cut" : "", tokens, experts, k, hidden, ffn, tiles, count, bad_img, bad_plain, bad_pair, bad_down, bad_guard, bad_gather);
     return ok ? 0 : 1;
 }
 
@@ -358,6 +375,12 @@ int bench(unsigned tokens) {
     const Launch l = make_launch(p, gate, down, dy, hidden, tiles);
     const gi::SwigluOut epi{4.0F, 25.0F};
     const auto gs = source(l, gate, gim, true, ng, dh, ffn), ds = source(l, down, dim, false, hidden, nullptr, 0U);
+    // The pass's form: quant_tok includes the copy into assignment order; gate_up reads it without the map. The map form
+    // (gate_up_map) is timed after the loop for the attribution.
+    Act gath;
+    gath.alloc(A, hidden);
+    gi::TileSource gsc = gs;
+    gsc.map = nullptr;
     hipEvent_t ev[5];
     for (auto& e : ev) CHECK(hipEventCreate(&e));
     const unsigned reps = 10U;
@@ -365,8 +388,9 @@ int bench(unsigned tokens) {
     for (unsigned it = 0; it < reps + 2U; ++it) {
         CHECK(hipEventRecord(ev[0], nullptr));
         ad::enqueue_quantise_rows(dx, hidden, tok.act, nullptr);
+        ad::enqueue_gather_rows(tok.act, l.dmap, gath.act, nullptr);
         CHECK(hipEventRecord(ev[1], nullptr));
-        ad::enqueue_grouped_gemm(gs, tiles, 256U, ng, tok.act, nullptr, epi);
+        ad::enqueue_grouped_gemm(gsc, tiles, 256U, ng, gath.act, nullptr, epi);
         CHECK(hipEventRecord(ev[2], nullptr));
         ad::enqueue_quantise_rows(dh, ffn, hact.act, nullptr);
         CHECK(hipEventRecord(ev[3], nullptr));
@@ -379,6 +403,17 @@ int bench(unsigned tokens) {
             CHECK(hipEventElapsedTime(&t, ev[s], ev[s + 1U]));
             ms[s] += t / float(reps);
         }
+    }
+    float mms = 0.0F;
+    for (unsigned it = 0; it < reps + 2U; ++it) {
+        CHECK(hipEventRecord(ev[0], nullptr));
+        ad::enqueue_grouped_gemm(gs, tiles, 256U, ng, tok.act, nullptr, epi);
+        CHECK(hipEventRecord(ev[1], nullptr));
+        CHECK(hipEventSynchronize(ev[1]));
+        if (it < 2U) continue;
+        float t = 0.0F;
+        CHECK(hipEventElapsedTime(&t, ev[0], ev[1]));
+        mms += t / float(reps);
     }
     // Reference: the dense launch of the same contract at the same shapes, one matrix (expert 0) for all A rows
     // (no gather, no tiles, column-layout image): what the arithmetic costs without grouping.
@@ -413,9 +448,9 @@ int bench(unsigned tokens) {
     const double fg = 2.0 * A * hidden * ng, fd = 2.0 * A * ffn * hidden;
     std::printf("DENSE-REF rows %u: gate_up %.3f ms %.1f TOPS | down %.3f ms %.1f TOPS\n", A, double(dms[0]), fg / (double(dms[0]) * 1e9),
                 double(dms[1]), fd / (double(dms[1]) * 1e9));
-    std::printf("BENCH tokens %u assignments %u tiles %u: quant_tok %.3f ms | gate_up %.3f ms %.1f TOPS | quant_h %.3f ms | down %.3f ms %.1f TOPS | visit %.3f ms\n",
+    std::printf("BENCH tokens %u assignments %u tiles %u: quant_tok+copy %.3f ms | gate_up %.3f ms %.1f TOPS | quant_h %.3f ms | down %.3f ms %.1f TOPS | visit %.3f ms | gate_up_map %.3f ms\n",
                 tokens, A, tiles, double(ms[0]), double(ms[1]), fg / (double(ms[1]) * 1e9), double(ms[2]), double(ms[3]), fd / (double(ms[3]) * 1e9),
-                double(ms[0] + ms[1] + ms[2] + ms[3]));
+                double(ms[0] + ms[1] + ms[2] + ms[3]), double(mms));
     return 0;
 }
 }  // namespace

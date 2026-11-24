@@ -79,9 +79,22 @@ void decode_and_pair(packed::RowOrder order, unsigned seed) {
         }
     expect(bad_pair == 0U, "paired image column == plain image column");
 }
+// The pass workspace holds three images (token rows x hidden; the same rows copied into assignment order, assignment
+// rows x hidden; assignment rows x intermediate), each 256 B aligned: a workspace sized by act_bytes fits every carve.
+void workspace_holds_three_images() {
+    using strix::moe_core::grouped_iu4a4::act_bytes;
+    using strix::moe_core::grouped_iu4a4::act_image_bytes;
+    for (const unsigned rows : {1U, 97U, 4309U, 8237U, 32760U}) {
+        const unsigned a = rows * 8U;
+        const std::size_t want = act_image_bytes(rows, 2304U) + act_image_bytes(a, 2304U) + act_image_bytes(a, 1152U);
+        expect(act_bytes(rows, a, 2304U, 1152U) == want, "act_bytes = token + assigned + inner images");
+        expect(act_image_bytes(a, 2304U) >= std::size_t(a) * (2304U / 2U + 2304U / 128U * 4U + 4U), "assigned image holds codes, u, base");
+    }
+}
 }  // namespace
 
 int main() {
+    workspace_holds_three_images();
     paired_order(16U);
     paired_order(64U);
     paired_order(1152U);

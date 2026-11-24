@@ -4910,6 +4910,28 @@ over to batched plain steps.
 - **Measured gain:** `--selftest 8` (8 built-in short chat prompts in the GLM chat template, 22-59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, prefix cache off), steady-state aggregate decode, G2 on (off): C2 53.03 (37.83) tok/s (+40 %), C4 59.88 (53.64) (+12 %), C6 62.50 (62.44), C8 69.48 (69.37) (handed over); C1 39.97 tok/s through MTP vs 25.30 plain
 - **Implementation / evidence:** [server](../apps/glm_serve_main.cpp), [lead loop](../src/glm/serve/glm_serve_lead.hpp)
 
+<a id="glm-serve-sampled-mtp"></a>
+
+### Server MTP for sampled requests
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_SERVE_SAMPLED_MTP`. **Default:** off (opt-in; pair gates pending).
+
+With the switch on, a sampled request (`temperature > 0`, identity `sampling-v1`) in `strix-glm5-serve` decodes through
+the single-request MTP route instead of plain steps. After each verify, rank 1 sends its vocabulary half of every
+row rank 0 reaches; rank 0 decides the rows in order with the request's sampler under coupled acceptance (a row is
+sampled as without a draft, with the uniform of its absolute position; the draft is accepted when it equals that
+token), then sends the decided tokens back, and both ranks accept, commit and catch up the drafter from them
+([shared window decision](../include/strix/serve/pair_sampling.hpp) `decide_pair_window`). Drafts stay the drafter's
+greedy tokens. A sampled first token re-seeds the drafter from the prompt's last row (`mtp_enter`).
+
+- **Preconditions:** `strix-glm5-serve` with MTP on and sampling available (both ranks vote for it in the hello); one sampled request decoding (C1).
+- **Automatic selection:** none; batched MTP verify (G2) never takes a sampled request (with one decoding, the server uses batched plain steps).
+- **Fallback notice:** the request's `sampling_receipt` counts drafts, accepted and rejected rows (all zero on plain steps).
+- **Exactness evidence:** host fake pair: three sampled requests x 40 tokens equal plain sampling of the same seeds, also beside a greedy request with G2 on; shared window tests: coupled windows equal plain sampling on both ranks, cut windows send no extra rows. Pair gates pending: SP1a (`strix-glm5-rank --spec-oracle`, committed-row logits bitwise equal plain steps) on the current build, and the same sampled requests served with the switch on and off with equal token vectors on both ranks.
+- **Off switch:** unset or `STRIX_GLM_SERVE_SAMPLED_MTP=0` (plain steps); `STRIX_GLM_SERVE_MTP=0` turns off MTP for every request
+- **Measured gain:** not measured yet (prediction only: acceptance falls with temperature because drafts are greedy; each decided row moves one vocabulary half, about 310 KB, over the pair link).
+- **Implementation / evidence:** [lead loop](../src/glm/serve/glm_serve_lead.hpp), [server adapter](../apps/glm_serve_main.cpp), [decoder hook](../src/glm/spec/glm_spec_run.cpp), [tests](../tests/glm_serve_cpu_tests.cpp)
+
 <a id="glm-serve-prefill-chunk"></a>
 
 ### Server decode-first chunked prefill

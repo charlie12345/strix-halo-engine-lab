@@ -7,7 +7,9 @@
 #include "strix/weight/formats/scalar_float.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
+#include <string_view>
 
 namespace strix::core::fma_rows {
 
@@ -157,8 +159,34 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
 }
 
 // Image rows from this height up take the K64 packed schedule where the shape admits it (measured faster than the K32
-// image tile at 4,096 and 8,192 rows on every wide shape; lower heights keep the K32 image tile).
-inline constexpr unsigned kPackedImageMinRows = 1024U;
+// image tile at 4,096 and 8,192 rows on every wide shape; lower heights keep the K32 image tile). It is also the lowest
+// height of a routed call: no receipt measures the image routes below it (review r17), so lower calls keep their rows.
+inline constexpr unsigned kPackedImageMinRows = 4096U;
+
+// The image routes' profitability data (kImageRoutePolicy) is measured on one device class only: gfx1151 with wave32
+// (Strix Halo, 40 CUs). Any other HIP device keeps the incumbent launches of enqueue_bf16_rows.
+constexpr bool image_routes_measured_device(std::string_view arch, unsigned wave_size, unsigned compute_units) {
+    return wave_size == 32U && compute_units == 40U && (arch == "gfx1151" || arch.starts_with("gfx1151:"));
+}
+
+// image_routes_measured_device of the current device (first call per device ordinal, then cached; an unknown device
+// or a failed query keeps the incumbent).
+inline bool image_routes_device_qualified() {
+    constexpr int kSlots = 16;
+    static std::atomic<unsigned char> cached[kSlots] = {};  // 0 unknown, 1 qualified, 2 not
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0) return false;
+    if (dev < kSlots) {
+        const auto known = cached[dev].load(std::memory_order_relaxed);
+        if (known != 0U) return known == 1U;
+    }
+    hipDeviceProp_t prop{};
+    const bool qualified = hipGetDeviceProperties(&prop, dev) == hipSuccess && prop.multiProcessorCount > 0 &&
+                           image_routes_measured_device(prop.gcnArchName, static_cast<unsigned>(prop.warpSize),
+                                                        static_cast<unsigned>(prop.multiProcessorCount));
+    if (dev < kSlots) cached[dev].store(qualified ? 1U : 2U, std::memory_order_relaxed);
+    return qualified;
+}
 
 inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned input_width, unsigned rows,
                                           std::span<const Bf16RowProjection> projections, unsigned max_outputs,
@@ -303,7 +331,8 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
                                            std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                            std::span<std::uint16_t> image, hipStream_t stream) {
     ImageRoute routes[kImageRouteMaxProjections]{};
-    if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
+    if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U || !image_routes_device_qualified() ||
+        !image_routes_order_free(input, input_width, rows, projections) ||
         !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes))
         return for_each_bf16_projection_group<kGroupMax>(projections, hipSuccess, [&](auto group) {
             return enqueue_bf16_rows(input, input_width, rows, group, max_outputs, stream);

@@ -276,9 +276,45 @@ static bool check_image_routes() {
     return !strix::core::plan_image_routes<3U>(policy, K, 8192U, call, kWide, few, group_admits, image_admits);
 }
 
+// A routed call reorders launches by route: an output that aliases the input, another output or another weight keeps
+// the incumbent sequence (review r17: an FMA group 0 and a packed group 1 writing the same output buffer).
+static bool check_image_route_order() {
+    using strix::core::Bf16RowProjection;
+    constexpr unsigned K = 2304U, rows = 4096U;
+    const auto at = [](std::uintptr_t address) { return address; };
+    const auto f32 = [](std::uintptr_t address) { return reinterpret_cast<float*>(address); };
+    const auto w16 = [](std::uintptr_t address) { return reinterpret_cast<const std::uint16_t*>(address); };
+    constexpr std::uintptr_t gib = std::uintptr_t{1} << 30U;
+    const float* input = f32(at(1U * gib));
+    const unsigned widths[4] = {2048U, 128U, 128U, 2048U};
+    std::array<Bf16RowProjection, 4> call{};
+    for (unsigned p = 0; p < 4U; ++p)
+        call[p] = {w16(at((2U + p) * gib) + (p == 0U ? 2U : 0U)), widths[p], f32(at((8U + p) * gib)), false, 0U};
+    if (!strix::core::image_routes_order_free(input, K, rows, call)) return false;  // disjoint: routes may reorder
+    auto alias = call;
+    alias[3].output = alias[0].output;  // FMA-first group 0 and packed group 1 write the same buffer
+    if (strix::core::image_routes_order_free(input, K, rows, alias)) return false;
+    auto inside = call;
+    inside[3].output = alias[0].output + std::size_t{rows} * widths[0] - 1U;  // last float of output 0
+    if (strix::core::image_routes_order_free(input, K, rows, inside)) return false;
+    auto onto_weights = call;
+    onto_weights[1].output = f32(reinterpret_cast<std::uintptr_t>(call[2].weights) + 64U);
+    if (strix::core::image_routes_order_free(input, K, rows, onto_weights)) return false;
+    auto onto_input = call;
+    onto_input[2].output = const_cast<float*>(input) + 16U;
+    if (strix::core::image_routes_order_free(input, K, rows, onto_input)) return false;
+    auto adjacent = call;  // output 3 starts on the first byte after output 0: still disjoint
+    adjacent[3].output = call[0].output + std::size_t{rows} * widths[0];
+    if (!strix::core::image_routes_order_free(input, K, rows, adjacent)) return false;
+    auto wrapped = call;  // a range past the top of the address space counts as overlapping
+    wrapped[1].output = f32(std::numeric_limits<std::uintptr_t>::max() - 64U);
+    return !strix::core::image_routes_order_free(input, K, rows, wrapped);
+}
+
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
-        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() || !check_image_routes()) {
+        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() || !check_image_routes() ||
+        !check_image_route_order()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

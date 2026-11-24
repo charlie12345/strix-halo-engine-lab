@@ -11,10 +11,15 @@
 //   ikl ikf  one-slice lane-score form: D 128, bf16, GQA group 3 (12 waves), 64 positions, 8192 rows from position 0,
 //            window 1024 (ikl) / full causal (ikf)
 //   ibl ibf  the same with a relative bias projected inside the flash (width 16, extent 1024)
+//   o80 o64  one-term FP16 vision forms on a causal stand-in (1024 rows from position 4095)
+//   b80 b64  the vision encoder's own one-term geometry (src/vision/encoder.hip BidirPolicy): bidirectional over n
+//            keys (row r at logical position n - 1 + r, window n, logical key p backed by key p % n, mask:: bidir
+//            functions), its scales 1/sqrt(80) and 1/8, n off the 64-row and 16-key tiles (1000, 1031, 37 rows)
 // Usage: strix-dense-flash-bench [REPS] [CASE]   (CASE: one name above; default all)
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 #include "attn_core/dense_flash_prefill.hpp"
+#include "attn_core/masks.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -69,6 +74,12 @@ struct Classic2 : Classic<D, 1U, 64U, tile::Operand::f16> {
     __device__ static const std::uint16_t* key_lo(const Args& a, unsigned p, unsigned h) { return a.k + (std::size_t(p - a.k0) * a.kv_heads + h) * D; }
     __device__ static const std::uint16_t* value_t_lo(const Args& a, unsigned h, unsigned d) { return a.vt + std::size_t(h * D + d) * a.vstride - a.k0; }
 };
+template <unsigned D>  // one-term vision encoder policy: its scale (the bench's Classic uses 1/16 for every D < 512)
+struct Vision1 : Classic<D, 1U, 64U, tile::Operand::f16> {
+    using Args = BArgs;
+    static constexpr float kScaleLog2 = (D == 64U ? 0.125F : 0.11180339887498948F) * 1.44269504088896341F;
+    static_assert(D == 64U || D == 80U);
+};
 template <unsigned D, unsigned G>  // one-slice form with the relative bias projected in the flash
 struct Rel : Classic<D, G, 64U, tile::Operand::bf16> {
     using Args = BArgs;
@@ -115,6 +126,7 @@ struct Case {
     unsigned D, heads, kv_heads, rows, p0, window;
     bool f16;
     Special special = Special::none;
+    bool bidir = false;  // rows = n keys, p0 = bidir_position(n), window = bidir_window(n), key p holds key p % n
 };
 
 bool g_flag_failed = false;
@@ -158,11 +170,27 @@ template <class P> void run(const Case& c, unsigned reps) {
     std::uniform_real_distribution<float> u(-1.0F, 1.0F);
     std::vector<float> q(std::size_t(c.rows) * H * D);
     for (auto& x : q) x = u(g);
+    // Overflow case: non-negative queries, so the all +30 key at position 40 dominates every row that sees it (a later
+    // maximum after the overflowing first tile: alpha 0, then tied maxima).
+    if (c.special == Special::overflow)
+        for (auto& x : q) x = x < 0.0F ? -x : x;
     std::vector<std::uint16_t> kfull(std::size_t(keys) * KH * D), vt(std::size_t(KH) * D * vstride, 0U);
     for (auto& x : kfull) x = round_op(u(g), c.f16);
     std::vector<std::uint16_t> vrows(std::size_t(keys) * KH * D);
     for (auto& x : vrows) x = round_op(u(g), c.f16);
     apply_special(c, keys, KH, kfull, vrows);
+    if (c.bidir) {  // the encoder's wrapped storage: logical key p (up to 2 n - 2) is backed by key bidir_key(p, n)
+        const unsigned n = c.rows;
+        if (c.p0 != strix::attn_core::mask::bidir_position(n) || c.window != strix::attn_core::mask::bidir_window(n) ||
+            k0 != 0U || keys < strix::attn_core::mask::bidir_capacity(n))
+            throw std::runtime_error("bidirectional case geometry");
+        const std::size_t row = std::size_t(KH) * D;
+        for (unsigned p = n; p < keys; ++p) {
+            const unsigned src = strix::attn_core::mask::bidir_key(p, n);
+            std::copy_n(kfull.begin() + std::ptrdiff_t(src * row), row, kfull.begin() + std::ptrdiff_t(p * row));
+            std::copy_n(vrows.begin() + std::ptrdiff_t(src * row), row, vrows.begin() + std::ptrdiff_t(p * row));
+        }
+    }
     for (unsigned p = 0; p < keys; ++p)
         for (unsigned h = 0; h < KH; ++h)
             for (unsigned d = 0; d < D; ++d) vt[std::size_t(h * D + d) * vstride + p] = vrows[(std::size_t(p) * KH + h) * D + d];
@@ -258,9 +286,15 @@ int main(int argc, char** argv) {
         if (want("ikf")) run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikf", 128U, 24U, 8U, 8192U, 0U, 0U, false}, reps);
         if (want("ibl")) run<Rel<128U, 3U>>({"ibl", 128U, 24U, 8U, 8192U, 0U, 1024U, false}, reps);
         if (want("ibf")) run<Rel<128U, 3U>>({"ibf", 128U, 24U, 8U, 8192U, 0U, 0U, false}, reps);
-        // One-term FP16 vision encoder forms (the FAST route's lane-score body; bidirectional: every row sees every key).
+        // One-term FP16 vision forms on a causal stand-in (the FAST route's lane-score body).
         if (want("o80")) run<Classic<80U, 1U, 64U, tile::Operand::f16>>({"o80", 80U, 16U, 16U, 1024U, 4095U, 0U, true}, reps);
         if (want("o64")) run<Classic<64U, 1U, 64U, tile::Operand::f16>>({"o64", 64U, 16U, 16U, 1024U, 4095U, 0U, true}, reps);
+        // The encoder's bidirectional one-term geometry and scales; n off the row and key tiles.
+        if (want("b80")) run<Vision1<80U>>({"b80", 80U, 16U, 16U, 1000U, 999U, 1000U, true, Special::none, true}, reps);
+        if (want("b64")) {
+            run<Vision1<64U>>({"b64", 64U, 16U, 16U, 1031U, 1030U, 1031U, true, Special::none, true}, reps);
+            run<Vision1<64U>>({"b64-s", 64U, 16U, 16U, 37U, 36U, 37U, true, Special::none, true}, reps);
+        }
         // Exceptional values on the lane-score forms (BF16 Inkling local / full / projected bias, FP16 one-term vision)
         // and on the two-term vision comparison form.
         using S = Special;

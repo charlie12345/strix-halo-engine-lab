@@ -452,6 +452,11 @@ private:
         };
         auto* attended = take(kQueryWidth);
         auto* gated = take(kQueryWidth);
+#if defined(__HIPCC__)
+        // The prefill projections' BF16 operand image: rows x the widest projection input (u16).
+        const std::span<std::uint16_t> operand_image(reinterpret_cast<std::uint16_t*>(take(kQueryWidth / 2U)),
+                                                     std::size_t{max_rows_} * kQueryWidth);
+#endif
         const auto* lag = mini_convolution_layer(lag_weights_.data(), visit);
         auto* failure = flags_.data() + visit.logical_layer;
         const auto* step = capture_descriptor();
@@ -485,7 +490,8 @@ private:
                                                 workspace(splits).size(), splits))
                 check(hipErrorInvalidValue);
         };
-        const detail::MiniResidentGqaBackend<> adapter{{{stream_}}, gate_order_null_ ? &null_applications_ : nullptr};
+        const detail::MiniResidentGqaBackend<detail::MiniPreparedHipImageBackend> adapter{
+            {{{stream_}}, operand_image}, gate_order_null_ ? &null_applications_ : nullptr};
         const auto prepare_with = [&](const auto& body) { return body(adapter); };
         auto* operand_failure = failure;
         const auto launch_group = [&](const MiniResidentAttentionGroup& group, std::size_t base) {
@@ -637,7 +643,8 @@ private:
             if (single && !adapter.null_applications && route_.attention_rows >= rows &&
                 mini_hip_bias_in_attention(rows, key_splits(image_of(*single, 0U)), device_position,
                                            work.relative_features, bias_weights)) {
-                const detail::MiniResidentGqaBackend<detail::MiniPreparedHipProjectedBackend> projected{{{{stream_}}}, nullptr};
+                const detail::MiniResidentGqaBackend<detail::MiniPreparedHipImageProjectedBackend> projected{
+                    {{{{stream_}}, operand_image}}, nullptr};
                 check(prepare(projected));
                 check(enqueue_mini_hip_attention_projected<true>(visit, image_of(*single, 0U), cache_of(*single),
                                                                  work.relative_features, bias_weights, failure, stream_));
@@ -823,7 +830,11 @@ private:
 
     static constexpr std::size_t attention_elements(unsigned rows) {
         return std::size_t{rows} * (4U * kKvWidth + 2U * kKvHeads * kConvTaps +
-            kQueryHeads * kRelativeWidth + 4U * kQueryWidth + kQueryHeads * kRelativeExtent + kQueryHeads);
+            kQueryHeads * kRelativeWidth + 4U * kQueryWidth + kQueryHeads * kRelativeExtent + kQueryHeads
+#if defined(__HIPCC__)
+            + kQueryWidth / 2U  // the u16 operand image of the prefill projections
+#endif
+            );
     }
 
     static constexpr std::size_t route_elements(unsigned rows, unsigned tiles) {

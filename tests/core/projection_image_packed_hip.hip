@@ -106,10 +106,10 @@ int main(int argc, char** argv) {
                                      {"routed_q_call", 2304U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, true, 0U, true},
                                      {"routed_o_pitched", 3072U, {2304U}, true, true, 3200U, true},
                                      {"routed_kv_narrow", 2304U, {1024U, 32U}, false, true, 0U, false}};
-    const std::vector<unsigned> heights = {1000U, 1024U, 4100U, 8192U, 8209U};
+    const std::vector<unsigned> heights = {1000U, 1024U, 4100U, 8192U, 8209U, 9232U};  // 9,232: above the measured band
     std::mt19937 rng(20261124U);
     std::normal_distribution<float> nd(0.0F, 1.0F);
-    const unsigned max_rows = 8209U, max_k = 3072U, bench_rows = 8192U;
+    const unsigned max_rows = 9232U, max_k = 3072U, bench_rows = 8192U;
     std::vector<float> host_a(std::size_t{max_rows} * max_k);
     for (auto& v : host_a) v = nd(rng);
     host_a[17] = 0.0F, host_a[18] = -0.0F, host_a[19] = 1.0e-40F;  // signed zero and a subnormal input
@@ -311,7 +311,8 @@ int main(int argc, char** argv) {
                 strix::core::ImageRoute routes[fma_rows::kImageRouteMaxProjections]{};
                 const bool planned =
                     fma_rows::detail::plan_bf16_image_call(c.K, rows, img.projections, kMaxOutputs, scratch, routes);
-                admitted = planned == (c.expect_image && rows >= fma_rows::kPackedImageMinRows);
+                admitted = planned ==
+                           (c.expect_image && strix::core::image_rows_measured(fma_rows::kImageRoutePolicy, rows));
             }
             require(image_arm(img), "image rows");
             require(hipDeviceSynchronize(), "sync");

@@ -162,6 +162,14 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
 // image tile at 4,096 and 8,192 rows on every wide shape; lower heights keep the K32 image tile). It is also the lowest
 // height of a routed call: no receipt measures the image routes below it (review r17), so lower calls keep their rows.
 inline constexpr unsigned kPackedImageMinRows = 4096U;
+// The greatest measured height: one 8,192-row prefill chunk with its absorbed tail (up to chunk / 8 rows; full-model
+// runs at 8,209 / 8,237 / 8,292 rows). Taller calls keep the incumbent launches until a receipt measures them.
+inline constexpr unsigned kPackedImageMaxRows = 8192U + 8192U / 8U;
+
+// The image routes of the shared tile on gfx11 (backend data, measured at 8,192 rows, K 2,304: FP32 route 0.150 ms per
+// 128-column tile, packed K64 0.109 ms, image pass 0.48 ms -> the image pays from ~12 packed tiles in one call; 16 kept).
+inline constexpr ImageRoutePolicy kImageRoutePolicy{kPackedImageMinRows, f16_tile_gemm::ImageProjectionSchedule::kStageK,
+                                                    f16_tile_gemm::kBN, 16U * f16_tile_gemm::kBN, kPackedImageMaxRows};
 
 // The image routes' profitability data (kImageRoutePolicy) is measured on one device class only: gfx1151 with wave32
 // and kMeasuredComputeUnits (40) CUs (Strix Halo). arch is gcnArchName without its feature suffix; compute_units comes
@@ -204,8 +212,10 @@ inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned i
     f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> group{};
     for (const auto& projection : projections)
         group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
-    // Prefill heights on whole 128-column projections take the packed-operand core's K64 schedule (same bits).
-    if (rows >= kPackedImageMinRows && f16_tile_gemm::admits_packed_image_projections(input_width, group))
+    // Measured prefill heights on the measured device class, on whole 128-column projections, take the packed-operand
+    // core's K64 schedule (same bits); every other call keeps the K32 image tile.
+    if (image_packed_schedule(kImageRoutePolicy, image_routes_device_qualified(), rows) &&
+        f16_tile_gemm::admits_packed_image_projections(input_width, group))
         return f16_tile_gemm::gemm_bf16_projections_image_packed(input, rows, input_width, group, stream);
     f16_tile_gemm::gemm_bf16_projections_image(input, rows, input_width, group, stream);
     return hipGetLastError();
@@ -252,10 +262,6 @@ inline hipError_t enqueue_bf16_operand_image(const float* input, unsigned width,
     return hipGetLastError();
 }
 
-// The image routes of the shared tile on gfx11 (backend data, measured at 8,192 rows, K 2,304: FP32 route 0.150 ms per
-// 128-column tile, packed K64 0.109 ms, image pass 0.48 ms -> the image pays from ~12 packed tiles in one call; 16 kept).
-inline constexpr ImageRoutePolicy kImageRoutePolicy{kPackedImageMinRows, f16_tile_gemm::ImageProjectionSchedule::kStageK,
-                                                    f16_tile_gemm::kBN, 16U * f16_tile_gemm::kBN};
 inline constexpr std::size_t kImageRouteMaxProjections = 8U;
 
 namespace detail {

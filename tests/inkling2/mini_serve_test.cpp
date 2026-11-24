@@ -1,6 +1,7 @@
 #include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_serve.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
+#include "inkling2_mini_cli.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
@@ -8,8 +9,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <future>
+#include <initializer_list>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -316,6 +319,100 @@ void set_image_env(const char* value) {
 #endif
 }
 
+void set_expert_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_MOE_EXPERTS_NVFP4", value ? value : "") == 0, "cannot set STRIX_MOE_EXPERTS_NVFP4");
+#else
+    require((value ? setenv("STRIX_MOE_EXPERTS_NVFP4", value, 1) : unsetenv("STRIX_MOE_EXPERTS_NVFP4")) == 0,
+            "cannot set STRIX_MOE_EXPERTS_NVFP4");
+#endif
+}
+
+// Run the native CLI parser and the real service factory up to its decoder
+// construction boundary. The factory needs neither a device nor a listener.
+void profile_parity() {
+    const sv::SerialGenerationFamily family{"mini", "Mini", "MODEL", 8U, 8U, 16U, 0U, nullptr, 8U,
+        true, false, [](const std::string&) -> std::shared_ptr<const sv::BpeTokenizer> { return {}; },
+        true, {}, true};
+    const auto parse_cli = [&](const char* tier, std::initializer_list<const char*> input = {"1", "--generate", "2"}) {
+        std::vector<std::string> args{"mini", "MODEL.safetensors"};
+        args.insert(args.end(), input.begin(), input.end());
+        args.insert(args.end(), {"--profile", tier});
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, true);
+    };
+    const auto refuses = [](const auto& action, std::string_view diagnostic) {
+        try { action(); }
+        catch (const std::invalid_argument& error) {
+            return std::string_view(error.what()).find(diagnostic) != std::string_view::npos;
+        }
+        return false;
+    };
+    constexpr std::string_view exact_error = "forbidden under --profile exact";
+    constexpr std::string_view consumer_error = "requires native resident model execution";
+    std::optional<mini::MiniServeOptions> loaded;
+    const auto create = [&](const mini::MiniServeOptions& options) {
+        loaded = options;
+        return mini::MiniServeCohort{
+            std::make_unique<FixtureCohort>(std::make_unique<FixtureDecoder>(), 32U, 3U, 2U), {}};
+    };
+    sv::ServiceFactories factories;
+    mini::install_mini_service(factories, {create, create},
+        [](const std::string&) {
+            return sv::BpeTokenizer::from_parts({"a"}, {1}, {}, "o200k");
+        }, {});
+    const auto* factory = factories.find("inkling2");
+    require(factory != nullptr, "Inkling service factory was not registered");
+    sv::ServiceSelection selection;
+    selection.model.name = "inkling2-mini";
+    selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", "hip", "--profile", "fast"};
+    set_image_env("1");
+    for (const auto* backend : {"hip", "cuda"}) {
+        selection.arguments[3] = backend;
+        for (const auto* tier : {"fast", "turbo", "exact"}) {
+            const bool exact = std::string_view(tier) == "exact";
+            set_w4a4_env(exact ? nullptr : "mse");
+            selection.arguments.back() = tier;
+            for (const auto* value : {static_cast<const char*>(nullptr), "0", "1"}) {
+                set_expert_env(value);
+                loaded.reset();
+                if (exact && value && std::string_view(value) == "1") {
+                    const bool cli_refused = refuses([&] { (void)parse_cli(tier); }, exact_error);
+                    const bool server_refused = refuses([&] { (void)factory->create(selection); }, exact_error);
+                    require(cli_refused && server_refused && !loaded, "CLI and server must refuse narrow EXACT");
+                    continue;
+                }
+                const auto cli = parse_cli(tier);
+                const auto service = factory->create(selection);
+                const bool narrow = value && std::string_view(value) == "1";
+                require(service && loaded && loaded->checkpoint == "MODEL.safetensors" &&
+                        loaded->tier == cli.tier.profile &&
+                        loaded->experts_nvfp4 == narrow && loaded->experts_nvfp4 == mini::mini_experts_nvfp4(cli.tier) &&
+                        loaded->moe_w4a4 == mini::mini_moe_w4a4_class(cli.tier) &&
+                        loaded->combine_image == mini::mini_combine_image(cli.tier),
+                        "CLI and server selected different decoder inputs");
+            }
+        }
+    }
+    set_expert_env("1");
+    require(refuses([&] { (void)parse_cli("fast", {"--tokenize", "input.txt"}); }, consumer_error),
+            "tokenize-only CLI must refuse the narrow image");
+    require(refuses([&] {
+        (void)parse_cli("exact", {"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "NULL",
+                                "--gate-rows", "2", "--gate-mode", "decode", "--gate-order-null", "--no-step-graph"});
+    }, exact_error), "the evaluation-order null must use the checkpoint image");
+    const auto cuda_route = [](const mini::cli::Options& options) {
+        return mini::cli::resolve_cuda_step_route(options, {}, strix::weight::kBf16WeightStorage, false);
+    };
+    require(refuses([&] { (void)cuda_route(parse_cli("fast")); }, consumer_error),
+            "CUDA step program must refuse an image it cannot load");
+    const auto resident = parse_cli("fast", {"1", "--generate", "2", "--no-step-graph"});
+    require(!cuda_route(resident).program && mini::mini_experts_nvfp4(resident.tier),
+            "CUDA resident replay must keep the explicit narrow image");
+    std::cout << "inkling2-mini-profile-parity: ok\n";
+}
+
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
             W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false) {
     sv::ServiceFactories factories;
@@ -475,6 +572,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (argc == 3 && std::string_view(argv[2]) == "--profile-parity") {
+        profile_parity();
+        return 0;
+    }
     require(argc == 2, "expected repository root");
     set_image_env(nullptr);
     set_round_fold_env(nullptr);

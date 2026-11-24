@@ -86,7 +86,7 @@ cli::Options parse(std::initializer_list<std::string> arguments) {
         8U, 8U, 16U, 0U, nullptr, 8U, true, false,
         [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
         true, [](std::string_view) { return std::string{}; }, true};
-    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
+    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family, true);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
 }

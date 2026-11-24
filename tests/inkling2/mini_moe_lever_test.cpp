@@ -16,15 +16,16 @@ void require(bool passed, const char* detail) {
     if (!passed) throw std::runtime_error(detail);
 }
 
-// Hermetic environment: only the W4A4 expert switch, the down-image switch and the round fold switch, when given.
+// Hermetic environment: only the W4A4 expert switch, the down-image switch the round fold and narrow expert switches, when given.
 profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const char* image = nullptr,
-                       const char* fold = nullptr) {
+                       const char* fold = nullptr, const char* narrow = nullptr) {
     profile::Inputs in;
     in.profile = tier;
-    in.env = [value, image, fold](const char* key) -> const char* {
+    in.env = [value, image, fold, narrow](const char* key) -> const char* {
         if (std::strcmp(key, "STRIX_INK_MOE_W4A4") == 0) return value;
         if (std::strcmp(key, "STRIX_INK_COMBINE_IMAGE") == 0) return image;
-        return std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0 ? fold : nullptr;
+        if (std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0) return fold;
+        return std::strcmp(key, "STRIX_MOE_EXPERTS_NVFP4") == 0 ? narrow : nullptr;
     };
     return in;
 }
@@ -204,6 +205,51 @@ void test_round_fold_admission() {
         require(!mini::mini_prepared_round_fold_admitted(false, arch), "the CUDA backend declines the fold");
 }
 
+// The narrow expert image row: bit-changing, off in EXACT, pending (off) in FAST and TURBO until its gate and served
+// receipt; an explicit STRIX_MOE_EXPERTS_NVFP4=1 opts in (unqualified), 0 is the off switch, other values are refused.
+void test_narrow_experts() {
+    const auto& lever = mini::kMiniProfile.table[3];
+    require(lever.name == mini::kMiniExpertsNvfp4 && lever.name == "moe.experts.mxfp8-nvfp4@1", "narrow identity");
+    require(lever.env == "STRIX_MOE_EXPERTS_NVFP4" && lever.off == "0" && lever.builtin == "0", "narrow off switch");
+    require(lever.kind == profile::Kind::bit_changing && lever.value[0].empty() && lever.value[3] == "1",
+            "narrow: exact off, turbo target on");
+    for (std::size_t column = 0; column < profile::kProfileColumns; ++column)
+        require(!lever.ready[column] && !lever.provisional[column], "narrow row stays opt-in until measured");
+    require(!mini::mini_experts_nvfp4(profile::resolve(mini::kMiniProfile, inputs(profile::Name::standard))),
+            "exact keeps the checkpoint expert image");
+    mini::MiniWeightOptions options;
+    options.tier = inputs(profile::Name::standard, nullptr, nullptr, nullptr, "1");
+    bool exact_refused = false;
+    try {
+        static_cast<void>(mini::resolve_mini_profile(options, true));
+    } catch (const std::invalid_argument& error) {
+        exact_refused = std::string_view(error.what()).find("forbidden under --profile exact") != std::string_view::npos;
+    }
+    require(exact_refused, "EXACT must refuse the explicit narrow image");
+    options.tier = inputs(profile::Name::standard, nullptr, nullptr, nullptr, "0");
+    require(!mini::mini_experts_nvfp4(mini::resolve_mini_profile(options, true)), "EXACT admits explicit off");
+    for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
+        require(!mini::mini_experts_nvfp4(profile::resolve(mini::kMiniProfile, inputs(tier))),
+                "pending row keeps the checkpoint expert image by default");
+        options.tier = inputs(tier, nullptr, nullptr, nullptr, "1");
+        const auto opted = mini::resolve_mini_profile(options, true);
+        require(mini::mini_experts_nvfp4(opted), "explicit opt-in loads the narrow image");
+        require(opted.qualification() == "unqualified: " + std::string(mini::kMiniExpertsNvfp4),
+                "explicit narrow opt-in is unqualified");
+        require(!mini::mini_moe_w4a4(opted), "the narrow switch leaves the W4A4 lever alone");
+        options.tier = inputs(tier, nullptr, nullptr, nullptr, "0");
+        require(!mini::mini_experts_nvfp4(mini::resolve_mini_profile(options, true)), "narrow off switch");
+    }
+    bool refused = false;
+    try {
+        options.tier = inputs(profile::Name::turbo, nullptr, nullptr, nullptr, "yes");
+        static_cast<void>(mini::resolve_mini_profile(options, true));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "malformed narrow switch must be refused");
+}
+
 }  // namespace
 
 int main() {
@@ -213,6 +259,7 @@ int main() {
         test_combine_image();
         test_configure();
         test_round_fold_admission();
+        test_narrow_experts();
     } catch (const std::exception& error) {
         std::cerr << "inkling2-mini-moe-lever: " << error.what() << '\n';
         return 1;

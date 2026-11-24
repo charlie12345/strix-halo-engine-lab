@@ -57,6 +57,22 @@ inline bool mini_prepared_round_fold(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_PREPARED_ROUND_FOLD must be 0 or 1");
 }
 
+// Resolved state of the narrow expert image lever (true: the checkpoint's MXFP8 expert layers load as NVFP4).
+inline bool mini_experts_nvfp4(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniExpertsNvfp4);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4 must be 0 or 1");
+}
+
+inline void require_mini_expert_consumer(const profile::Resolution& tier, bool supports_narrow_experts) {
+    if (!mini_experts_nvfp4(tier)) return;
+    if (tier.profile == profile::Name::standard)
+        throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4=1 is forbidden under --profile exact");
+    if (!supports_narrow_experts)
+        throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4=1 requires native resident model execution");
+}
+
 // Resolved state of the exact down-image lever (true: the HIP resident prefill stores the BF16 down image on the qualified
 // target). 0 or absent = off.
 inline bool mini_combine_image(const profile::Resolution& tier) {
@@ -104,6 +120,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
+    require_mini_expert_consumer(tier, native_execution);
     return tier;
 }
 

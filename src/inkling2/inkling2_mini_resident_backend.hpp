@@ -823,14 +823,23 @@ public:
             return;
         }
 #if defined(__HIPCC__)
-        check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
-                                            matrices, csr, planned, workspace, stream_, gate_route_tap_));
+        if (weights_.narrow_experts())
+            check(enqueue_mini_hip_resident_moe_for<MiniMoeNarrowConfig>(layer, rows, input, logits, bias, output, buffers,
+                                                                         matrices, csr, planned, workspace, stream_,
+                                                                         gate_route_tap_));
+        else
+            check(enqueue_mini_hip_resident_moe(layer, rows, input, logits, bias, output, buffers,
+                                                matrices, csr, planned, workspace, stream_, gate_route_tap_));
 #else
-        check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
-                                                     matrices, csr, planned, workspace, stream_, gate_route_tap_,
-                                                     w4a4 ? moe_w4a4_class_
-                                                          : moe_core::grouped_w4a4::Activations::bf16,
-                                                     moe_schedule_));
+        const auto w4a4_class = w4a4 ? moe_w4a4_class_ : moe_core::grouped_w4a4::Activations::bf16;
+        if (weights_.narrow_experts())
+            check(enqueue_mini_cuda_resident_moe_decoded<MiniMoeNarrowConfig>(
+                moe_decode_, layer, rows, input, logits, bias, output, buffers, matrices, csr, planned, workspace, stream_,
+                gate_route_tap_, w4a4_class, moe_schedule_));
+        else
+            check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
+                                                         matrices, csr, planned, workspace, stream_, gate_route_tap_,
+                                                         w4a4_class, moe_schedule_));
 #endif
     }
 
@@ -859,7 +868,7 @@ private:
                               route.weights.data(), stream_, gate_route_tap_);
 #endif
         using weight::microscaled::MatrixFormat;
-        const auto format = mini_expert_format(layer);
+        const auto format = weights_.expert_format(layer);
 #if defined(__HIPCC__)
         // HIP: one microscaled_r1 rows launch serves the routed rows (row r's bits are those of a one-row launch,
         // ink_hip_dec); the route status words stay one per row, contiguous from failure.

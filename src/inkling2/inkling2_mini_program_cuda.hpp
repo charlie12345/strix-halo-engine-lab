@@ -291,7 +291,11 @@ public:
                 recipe_.host_action(bind_(RouteTapExchange{mode_.tap, layer, 1U, kExpertsPerToken, kExperts,
                                                            storage_.route_ids, storage_.route_weights}));
         };
-        const auto format = weights_.expert_format(layer);
+        // The loaded image says the layer's format (narrow expert image); weights without one keep the checkpoint's.
+        const auto format = [&] {
+            if constexpr (requires { weights_.expert_format(layer); }) return weights_.expert_format(layer);
+            else return mini_expert_format(layer);
+        }();
         if (mode_.key.grouped) {
             const auto [plan, scratch, status] = mode_.grouped.bind(kExperts, kExpertsPerToken,
                 mini_grouped::CudaBackend::rows_per_tile, matrices, storage_.route_ids, storage_.route_weights,

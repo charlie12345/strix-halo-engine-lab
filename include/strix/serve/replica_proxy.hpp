@@ -21,14 +21,9 @@ struct ReplicaEndpoint {
     std::string host;
     std::uint16_t port = 0;
 };
-// "host:port" or "http://host:port[/]". nullopt when malformed.
+// "host:port" or "http://host:port[/]". URI IPv6 zones use "%25"; bare socket hosts use "%".
 [[nodiscard]] std::optional<ReplicaEndpoint> parse_replica_endpoint(std::string_view text);
-// The comparison key of a replica host: a numeric address in one spelling (IPv4 in any inet_aton form -> a.b.c.d;
-// IPv6 -> eight lowercase hex groups, an IPv4-mapped address -> its IPv4 form; a zone id kept, URI "%25" read as "%"),
-// a host name lowercased without a trailing dot. Names are not resolved: two names of one listener still count twice.
-[[nodiscard]] std::string canonical_replica_host(std::string_view host);
-// A policy-validated router counts endpoints as ranks and load slots: the same listener twice is one worker, not two.
-// Hosts compare by canonical_replica_host; std::invalid_argument names the repeated endpoint.
+// Reject unresolved endpoints and overlaps between their resolved TCP destinations.
 void require_distinct_replicas(const std::vector<ReplicaEndpoint>& replicas);
 
 struct ReplicaProxyConfig {
@@ -46,6 +41,10 @@ class ReplicaProxy {
 public:
     explicit ReplicaProxy(ReplicaProxyConfig config);
 
+    // Before serving a policy-validated placement, verify a distinct worker instance per endpoint and
+    // pin the socket address that reported it. Throws if any endpoint cannot establish its own identity.
+    void admit_distinct_workers();
+
     // Reads every replica's status route once (blocking, at most status_timeout_ms each). A replica that stops
     // answering, or reports failed/draining, is skipped until a later refresh sees it healthy again; a replica that
     // was healthy and is not any more loses its recorded sessions and prefixes (it may have restarted).
@@ -62,10 +61,12 @@ public:
 private:
     struct Counters { std::uint64_t forwarded = 0, failed = 0, by_session = 0, by_prefix = 0, by_load = 0; };
     void forward(const HttpRequest& request, HttpResponseWriter& response);
+    ReplicaState probe(std::size_t replica, const std::string& connect_host) const;
 
     ReplicaProxyConfig config_;
     ReplicaRouter router_;
     mutable std::mutex mutex_;
+    std::vector<std::string> connect_hosts_; // populated once by policy admission, before serving
     std::vector<ReplicaState> states_;
     std::vector<Counters> counters_;
     std::atomic<std::uint64_t> retried_{0}, unplaced_{0};

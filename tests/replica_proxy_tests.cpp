@@ -14,6 +14,9 @@
 #include <thread>
 #include <vector>
 
+#ifdef __linux__
+#include <net/if.h>
+#endif
 #ifdef _MSC_VER
 #include <crtdbg.h>
 #include <cstdlib>
@@ -25,10 +28,49 @@ using namespace std::chrono_literals;
 
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 
+void rejects_alias(std::string_view first, std::string_view second) {
+    const auto a = parse_replica_endpoint(first), b = parse_replica_endpoint(second);
+    require(a && b, "alias fixture parses both endpoints");
+    try { require_distinct_replicas({*a, *b}); }
+    catch (const std::invalid_argument& e) {
+        require(std::string_view(e.what()).find("distinct worker") != std::string_view::npos, e.what());
+        return;
+    }
+    throw std::runtime_error("duplicate socket accepted: " + std::string(first) + " / " + std::string(second));
+}
+
+void scoped_alias() {
+#ifdef __linux__
+    const auto index = if_nametoindex("lo");
+    require(index != 0, "loopback interface has an index");
+    rejects_alias("[fe80::1%lo]:18196", "[fe80::1%" + std::to_string(index) + "]:18196");
+#else
+    rejects_alias("[fe80::1%1]:18196", "[fe80::1%01]:18196");
+#endif
+}
+
+void scoped_uri() {
+    const auto uri = parse_replica_endpoint("http://[fe80::1%25eth%30]:18196/");
+    const auto bare = parse_replica_endpoint("[fe80::1%251]:18196");
+    const auto uri_numeric = parse_replica_endpoint("http://[fe80::1%251]:18196");
+    require(uri && uri->host == "fe80::1%eth0", "URI zone is decoded in the client dial host");
+    require(bare && bare->host == "fe80::1%251" && uri_numeric && uri_numeric->host == "fe80::1%1",
+        "bare numeric scope and escaped URI scope have different dial hosts");
+    require(!parse_replica_endpoint("http://[fe80::1%25]:18196") &&
+            !parse_replica_endpoint("http://[fe80::1%25eth%00]:18196"), "malformed URI zones are refused");
+}
+
 bool wait_until(const std::atomic<bool>& flag, std::chrono::milliseconds limit = 10s) {
     const auto deadline = std::chrono::steady_clock::now() + limit;
     while (!flag.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
     return flag.load();
+}
+
+void distinct_numeric_scopes() {
+    const auto bare = parse_replica_endpoint("[fe80::1%251]:18196");
+    const auto uri = parse_replica_endpoint("http://[fe80::1%251]:18196");
+    require(bare && uri, "numeric scope endpoints parse");
+    require_distinct_replicas({*bare, *uri});
 }
 
 const std::string kEventA = "data: {\"t\":\"a\"}\n\n";
@@ -264,56 +306,39 @@ void run() {
         && parse_replica_endpoint("10.0.0.2:9000")->host == "10.0.0.2", "endpoint parsing");
     require(!parse_replica_endpoint("node-b") && !parse_replica_endpoint("node-b:0") && !parse_replica_endpoint("node-b:99999")
         && !parse_replica_endpoint(":80") && !parse_replica_endpoint("http://a/b:80"), "malformed endpoints rejected");
-    {   // Duplicate host:port is one worker: it must not satisfy a replica count (host names compare case-insensitively).
-        const auto endpoints = [](std::initializer_list<const char*> texts) {
-            std::vector<ReplicaEndpoint> list;
-            for (const auto* text : texts) list.push_back(*parse_replica_endpoint(text));
-            return list;
-        };
-        require_distinct_replicas(endpoints({"http://node-a:18196", "http://node-b:18196", "http://node-a:18197"}));
-        // distinct listeners stay distinct: other addresses, other ports, other zones, a zone vs none
-        require_distinct_replicas(endpoints({"http://[::1]:18196", "http://[::2]:18196", "http://[::1]:18197",
-                                             "http://127.0.0.1:18196", "http://[fe80::1%eth0]:18196",
-                                             "http://[fe80::1%eth1]:18196", "http://[fe80::1]:18196"}));
-        for (const auto& repeated : {endpoints({"http://node-a:18196", "http://node-a:18196"}),
-                                     endpoints({"node-a:18196", "http://NODE-A:18196/"}),
-                                     endpoints({"node-a:18196", "node-a.:18196"}),
-                                     // one IPv6 listener in equivalent spellings, bracketed with and without a scheme
-                                     endpoints({"http://[::1]:18196", "http://[0:0:0:0:0:0:0:1]:18196"}),
-                                     endpoints({"[::1]:18196", "http://[0000:0::0001]:18196/"}),
-                                     endpoints({"[2001:DB8::A]:18196", "[2001:db8:0:0:0:0:0:a]:18196"}),
-                                     // zone ids: the URI form %25 names the same interface
-                                     endpoints({"http://[fe80::1%eth0]:18196", "http://[FE80::1%25eth0]:18196"}),
-                                     // an IPv4-mapped address reaches the IPv4 listener
-                                     endpoints({"http://127.0.0.1:18196", "http://[::ffff:127.0.0.1]:18196"}),
-                                     endpoints({"http://[::ffff:7f00:1]:18196", "127.0.0.1:18196"}),
-                                     // numeric IPv4 forms getaddrinfo reads as one address
-                                     endpoints({"127.0.0.1:18196", "127.1:18196"}),
-                                     endpoints({"10.0.0.2:18196", "0x0a.0.0.02:18196"})}) {
-            bool refused = false;
-            try { require_distinct_replicas(repeated); } catch (const std::invalid_argument&) { refused = true; }
-            require(refused, ("a repeated replica endpoint is refused: " + repeated[0].host + " / " + repeated[1].host).c_str());
-        }
-        require(canonical_replica_host("[0:0:0:0:0:0:0:1]") == "0:0:0:0:0:0:0:1" &&
-                    canonical_replica_host("::ffff:10.1.2.3") == "10.1.2.3" &&
-                    canonical_replica_host("fe80::1%25eth0") == "fe80:0:0:0:0:0:0:1%eth0" &&
-                    canonical_replica_host("Node-A.") == "node-a" && canonical_replica_host("1::2::3") == "1::2::3" &&
-                    canonical_replica_host("1:2:3:4:5:6:7:8:9") == "1:2:3:4:5:6:7:8:9" &&
-                    canonical_replica_host("::1.2.3") == "::1.2.3",
-                "canonical replica hosts (malformed IPv6 text stays a name)");
-    }
+    require_distinct_replicas({{"127.0.0.1", 18196}, {"127.0.0.1", 18197}, {"127.0.0.2", 18196}});
+    for (const auto& [first, second] : {
+            std::pair{"127.0.0.1:18196", "http://127.0.0.1:18196/"},
+            std::pair{"http://[::1]:18196", "http://[0:0:0:0:0:0:0:1]:18196"},
+            std::pair{"[::1]:18196", "http://[0000:0::0001]:18196/"},
+            std::pair{"[2001:DB8::A]:18196", "[2001:db8:0:0:0:0:0:a]:18196"},
+            std::pair{"127.0.0.1:18196", "http://[::ffff:127.0.0.1]:18196"},
+            std::pair{"http://[::ffff:7f00:1]:18196", "127.0.0.1:18196"}})
+        rejects_alias(first, second);
+#ifndef _WIN32
+    rejects_alias("127.0.0.1:18196", "127.1:18196");
+    rejects_alias("10.0.0.2:18196", "0x0a.0.0.02:18196");
+#endif
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
     try {
-        run();
+        const auto selected = argc == 2 ? std::string_view(argv[1]) : std::string_view{};
+        if (argc > 2 || (argc == 2 && selected != "scoped-alias" && selected != "scoped-uri" &&
+            selected != "named-alias" && selected != "numeric-scopes"))
+            throw std::invalid_argument("unknown replica proxy test selector");
+        if (selected.empty() || selected == "scoped-alias") scoped_alias();
+        if (selected.empty() || selected == "scoped-uri") scoped_uri();
+        if (selected.empty() || selected == "named-alias") rejects_alias("localhost:18196", "127.0.0.1:18196");
+        if (selected.empty() || selected == "numeric-scopes") distinct_numeric_scopes();
+        if (selected.empty()) run();
     } catch (const std::exception& e) {
         std::cerr << "replica_proxy_tests: " << e.what() << "\n";
         return 1;

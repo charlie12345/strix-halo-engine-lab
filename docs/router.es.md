@@ -21,6 +21,13 @@ Con `--description models/<nombre>.toml` el router resuelve antes la sección `[
 resolver que `strix run|serve --device-count N`: solo arranca si el modelo admite la forma `replica` para ese número de
 endpoints, e imprime `effective-multi-device {...}` (forma, rangos, cable, regla, motivo). Un modelo sin la sección, o
 un solo endpoint, se rechaza con el motivo. `--profile exact|fast|turbo` fija el tier de esa comprobación.
+La admisión por política resuelve cada endpoint, rechaza las direcciones que coinciden (incluidos el ámbito y
+el puerto) y exige un `worker_instance_id` distinto en la ruta de estado de cada worker. El router conserva la
+dirección de socket que devolvió el ID de cada worker. Las consultas posteriores excluyen las entradas con
+IDs duplicados o ausentes. Los workers anteriores que carecen de este campo funcionan sin `--description`.
+
+Para endpoints IPv6 con ámbito, usa `http://[fe80::1%25eth0]:8080` como URI o `[fe80::1%eth0]:8080` como endpoint
+sin esquema. Un ámbito numérico es el índice de la interfaz local.
 
 ## Colocación
 

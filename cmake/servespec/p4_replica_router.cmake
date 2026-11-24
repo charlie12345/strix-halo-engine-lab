@@ -12,6 +12,8 @@ if(TARGET strix_serve)
         target_link_libraries(strix-router PRIVATE ws2_32)
     endif()
     strix_target_warnings(strix-router)
+    strix_servespec_python_test(NAME strix-replica-router-admission
+        SCRIPT tests/replica_router_admission.py ARGS "$<TARGET_FILE:strix-router>" TIMEOUT 30)
 endif()
 
 strix_servespec_host_test(NAME strix-replica-router-tests

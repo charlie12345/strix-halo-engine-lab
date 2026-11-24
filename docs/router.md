@@ -21,6 +21,13 @@ With `--description models/<name>.toml` the router first resolves the model's `[
 same resolver as `strix run|serve --device-count N`: it starts only if the model admits the `replica` form for that many
 endpoints, and prints `effective-multi-device {...}` (form, ranks, wire, rule, reason). A model without the section,
 or with one endpoint, is refused with the reason. `--profile exact|fast|turbo` sets the tier of that check.
+Policy admission resolves each endpoint, refuses overlapping addresses (including scope and port), and requires a
+distinct `worker_instance_id` from each worker's status route. The router keeps the socket address that reported
+the ID for each worker. A later status poll excludes entries that report duplicate or missing IDs. Older workers
+without this field can still be used without `--description`.
+
+For scoped IPv6 endpoints, write `http://[fe80::1%25eth0]:8080` as a URI or `[fe80::1%eth0]:8080` as a bare endpoint.
+A numeric scope is the local interface index.
 
 ## Placement
 

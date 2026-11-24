@@ -89,15 +89,16 @@ int main(int argc, char** argv) {
         if (proxy_config.replicas.empty()) { usage(); return 2; }
         if (proxy_config.replicas.size() > strix::serve::ReplicaRouter::kMaxReplicas)
             throw std::invalid_argument("at most 64 replicas");
+        strix::serve::ReplicaProxy proxy(proxy_config);
         if (!description_path.empty()) {
-            strix::serve::require_distinct_replicas(proxy_config.replicas);
             const auto preset = strix::profile::resolve_replica_router(strix::model_description::load(description_path),
                 tier, static_cast<std::uint32_t>(proxy_config.replicas.size()));
+            proxy.admit_distinct_workers();
             std::cout << "effective-multi-device " << preset.config.find("multi_device")->dump() << std::endl;
-        } else if (tier) throw std::invalid_argument("--profile needs --description");
-
-        strix::serve::ReplicaProxy proxy(proxy_config);
-        proxy.refresh();
+        } else {
+            if (tier) throw std::invalid_argument("--profile needs --description");
+            proxy.refresh();
+        }
         strix::serve::HttpServer server(server_config,
             [&](const strix::serve::HttpRequest& request, strix::serve::HttpResponseWriter& response) {
                 proxy.handle(request, response);

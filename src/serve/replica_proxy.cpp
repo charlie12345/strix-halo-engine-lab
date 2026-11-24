@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <set>
@@ -30,140 +29,42 @@ std::string error_body(std::string_view type, std::string_view message) {
     return out.dump();
 }
 
-std::string lower(std::string_view text) {
-    std::string out(text);
-    for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+// Decode the URI spelling once, before the socket host is used for either resolution or dialing.
+std::optional<std::string> decode_uri_zone(std::string_view zone) {
+    if (zone.empty()) return std::nullopt;
+    constexpr std::string_view unreserved =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    std::string out;
+    for (std::size_t i = 0; i < zone.size(); ++i) {
+        if (zone[i] != '%') {
+            if (unreserved.find(zone[i]) == std::string_view::npos) return std::nullopt;
+            out += zone[i];
+            continue;
+        }
+        if (zone.size() - i < 3) return std::nullopt;
+        unsigned value = 0;
+        const auto* first = zone.data() + i + 1;
+        const auto parsed = std::from_chars(first, first + 2, value, 16);
+        if (parsed.ec != std::errc{} || parsed.ptr != first + 2 || value <= 32 || value == 127)
+            return std::nullopt;
+        const auto ch = static_cast<char>(value);
+        if (std::string_view("/:[]").find(ch) != std::string_view::npos) return std::nullopt;
+        out += ch;
+        i += 2;
+    }
     return out;
 }
 
-// One part of a numeric IPv4 host as inet_aton (and so getaddrinfo) reads it: 0x hex, a leading 0 octal, else decimal.
-std::optional<std::uint64_t> ipv4_part(std::string_view text) {
-    int base = 10;
-    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
-        base = 16;
-        text.remove_prefix(2);
-    } else if (text.size() > 1 && text[0] == '0') {
-        base = 8;
-        text.remove_prefix(1);
-    }
-    std::uint64_t value = 0;
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, base);
-    if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) return std::nullopt;
-    return value;
-}
-
-// A numeric IPv4 host in any form inet_aton accepts (a.b.c.d, a.b.c, a.b, a; the last part fills the rest).
-std::optional<std::uint32_t> parse_ipv4(std::string_view text) {
-    std::array<std::uint64_t, 4> parts{};
-    std::size_t count = 0;
-    for (;;) {
-        if (count == parts.size()) return std::nullopt;
-        const auto dot = text.find('.');
-        const auto part = ipv4_part(text.substr(0, dot));
-        if (!part) return std::nullopt;
-        parts[count++] = *part;
-        if (dot == std::string_view::npos) break;
-        text.remove_prefix(dot + 1);
-    }
-    std::uint64_t value = 0;
-    for (std::size_t i = 0; i + 1 < count; ++i) {
-        if (parts[i] > 0xFFU) return std::nullopt;
-        value |= parts[i] << (8U * (3U - i));
-    }
-    if (parts[count - 1] > (std::uint64_t{0xFFFFFFFFU} >> (8U * (count - 1U)))) return std::nullopt;
-    return static_cast<std::uint32_t>(value | parts[count - 1]);
-}
-
-std::string dotted(std::uint32_t v) {
-    return std::to_string(v >> 24U) + "." + std::to_string((v >> 16U) & 0xFFU) + "." +
-           std::to_string((v >> 8U) & 0xFFU) + "." + std::to_string(v & 0xFFU);
-}
-
-using Ipv6 = std::array<std::uint16_t, 8>;
-
-// The colon-separated groups of one side of an IPv6 literal; a dotted IPv4 tail (strict a.b.c.d) only when allowed.
-bool ipv6_groups(std::string_view part, Ipv6& out, std::size_t& count, bool tail) {
-    if (part.empty()) return true;
-    for (;;) {
-        const auto colon = part.find(':');
-        const auto group = part.substr(0, colon);
-        if (colon == std::string_view::npos && tail && group.find('.') != std::string_view::npos) {
-            if (count + 2U > out.size() || std::count(group.begin(), group.end(), '.') != 3 ||
-                group.find_first_not_of("0123456789.") != std::string_view::npos)
-                return false;
-            const auto v4 = parse_ipv4(group);
-            if (!v4) return false;
-            out[count++] = static_cast<std::uint16_t>(*v4 >> 16U);
-            out[count++] = static_cast<std::uint16_t>(*v4 & 0xFFFFU);
-            return true;
-        }
-        unsigned value = 0;
-        const auto parsed = std::from_chars(group.data(), group.data() + group.size(), value, 16);
-        if (group.empty() || group.size() > 4 || count == out.size() || parsed.ec != std::errc{} ||
-            parsed.ptr != group.data() + group.size())
-            return false;
-        out[count++] = static_cast<std::uint16_t>(value);
-        if (colon == std::string_view::npos) return true;
-        part.remove_prefix(colon + 1);
-    }
-}
-
-// A numeric IPv6 literal (RFC 4291 text forms: one "::" for one or more zero groups, an optional dotted IPv4 tail).
-std::optional<Ipv6> parse_ipv6(std::string_view text) {
-    Ipv6 head{}, tail{};
-    std::size_t heads = 0, tails = 0;
-    const auto gap = text.find("::");
-    if (gap == std::string_view::npos) {
-        if (!ipv6_groups(text, head, heads, true) || heads != head.size()) return std::nullopt;
-        return head;
-    }
-    const auto right = text.substr(gap + 2);
-    if (right.find("::") != std::string_view::npos || !ipv6_groups(text.substr(0, gap), head, heads, false) ||
-        !ipv6_groups(right, tail, tails, true) || heads + tails > head.size() - 1U)
-        return std::nullopt;
-    std::copy_n(tail.begin(), tails, head.end() - static_cast<std::ptrdiff_t>(tails));
-    return head;
+std::string replica_label(const ReplicaEndpoint& replica) {
+    return "--replica " + replica.host + ":" + std::to_string(replica.port);
 }
 
 } // namespace
 
-std::string canonical_replica_host(std::string_view host) {
-    if (host.size() > 2 && host.front() == '[' && host.back() == ']') host = host.substr(1, host.size() - 2);
-    // a zone id (fe80::1%eth0, URI form %25eth0) names an interface: kept and compared as written
-    std::string zone;
-    const auto percent = host.find('%');
-    if (percent != std::string_view::npos && host.find(':') != std::string_view::npos) {
-        zone = std::string(host.substr(percent + 1));
-        if (zone.size() > 2 && zone.starts_with("25")) zone.erase(0, 2);
-        host = host.substr(0, percent);
-    }
-    if (zone.empty()) {
-        if (const auto v4 = parse_ipv4(host)) return dotted(*v4);
-    }
-    if (const auto v6 = parse_ipv6(host)) {
-        const auto& a = *v6;
-        // an IPv4-mapped address (::ffff:a.b.c.d) reaches the IPv4 listener a.b.c.d
-        if (zone.empty() && std::all_of(a.begin(), a.begin() + 5, [](std::uint16_t g) { return g == 0; }) &&
-            a[5] == 0xFFFFU)
-            return dotted((std::uint32_t{a[6]} << 16U) | a[7]);
-        std::string out;
-        for (std::size_t g = 0; g < a.size(); ++g) {
-            std::array<char, 4> digits{};
-            const auto r = std::to_chars(digits.data(), digits.data() + digits.size(), unsigned{a[g]}, 16);
-            if (g != 0) out += ':';
-            out.append(digits.data(), r.ptr);
-        }
-        return zone.empty() ? out : out + "%" + zone;
-    }
-    // a host name: case-insensitive, the root label's trailing dot dropped
-    std::string name = lower(host);
-    if (name.size() > 1 && name.back() == '.') name.pop_back();
-    return zone.empty() ? name : name + "%" + zone;
-}
-
 std::optional<ReplicaEndpoint> parse_replica_endpoint(std::string_view text) {
     constexpr std::string_view scheme = "http://";
-    if (text.starts_with(scheme)) text.remove_prefix(scheme.size());
+    const bool uri = text.starts_with(scheme);
+    if (uri) text.remove_prefix(scheme.size());
     while (!text.empty() && text.back() == '/') text.remove_suffix(1);
     const auto colon = text.rfind(':');
     if (colon == std::string_view::npos || colon == 0 || colon + 1 == text.size()) return std::nullopt;
@@ -173,17 +74,41 @@ std::optional<ReplicaEndpoint> parse_replica_endpoint(std::string_view text) {
     if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size() || port == 0 || port > 65535)
         return std::nullopt;
     auto host = text.substr(0, colon);
-    if (host.find('/') != std::string_view::npos) return std::nullopt;
-    if (host.size() > 2 && host.front() == '[' && host.back() == ']') host = host.substr(1, host.size() - 2);
+    if (host.find_first_of("/ \t\r\n") != std::string_view::npos || host.find('\0') != std::string_view::npos)
+        return std::nullopt;
+    const bool bracketed = host.size() > 2 && host.front() == '[' && host.back() == ']';
+    if (bracketed) host = host.substr(1, host.size() - 2);
+    if (host.find_first_of("[]") != std::string_view::npos) return std::nullopt;
+    if (const auto zone = host.find('%'); uri && zone != std::string_view::npos) {
+        if (!bracketed || host.find(':') >= zone || !host.substr(zone).starts_with("%25")) return std::nullopt;
+        const auto decoded = decode_uri_zone(host.substr(zone + 3));
+        if (!decoded) return std::nullopt;
+        return ReplicaEndpoint{std::string(host.substr(0, zone + 1)) + *decoded, static_cast<std::uint16_t>(port)};
+    }
     return ReplicaEndpoint{std::string(host), static_cast<std::uint16_t>(port)};
 }
 
-void require_distinct_replicas(const std::vector<ReplicaEndpoint>& replicas) {
+namespace {
+
+std::vector<std::vector<std::string>> distinct_replica_hosts(const std::vector<ReplicaEndpoint>& replicas) {
     std::set<std::pair<std::string, std::uint16_t>> seen;
-    for (const auto& replica : replicas)
-        if (!seen.emplace(canonical_replica_host(replica.host), replica.port).second)
-            throw std::invalid_argument("--replica " + replica.host + ":" + std::to_string(replica.port) +
-                                        " is given more than once; each replica must be a distinct worker");
+    std::vector<std::vector<std::string>> resolved;
+    for (const auto& replica : replicas) {
+        auto hosts = resolve_http_hosts(replica.host, replica.port);
+        if (hosts.empty()) throw std::invalid_argument(replica_label(replica) + " cannot be resolved");
+        for (const auto& host : hosts)
+            if (!seen.emplace(host, replica.port).second)
+                throw std::invalid_argument(replica_label(replica) +
+                    " resolves to a repeated socket address; each replica must be a distinct worker");
+        resolved.push_back(std::move(hosts));
+    }
+    return resolved;
+}
+
+} // namespace
+
+void require_distinct_replicas(const std::vector<ReplicaEndpoint>& replicas) {
+    (void)distinct_replica_hosts(replicas);
 }
 
 ReplicaProxy::ReplicaProxy(ReplicaProxyConfig config)
@@ -191,28 +116,76 @@ ReplicaProxy::ReplicaProxy(ReplicaProxyConfig config)
       router_(config_.replicas.size(), config_.affinity_entries, config_.block_bytes),
       states_(config_.replicas.size()), counters_(config_.replicas.size()) {}
 
-void ReplicaProxy::refresh() {
-    for (std::size_t r = 0; r < config_.replicas.size(); ++r) {
-        HttpClientRequest request;
-        request.host = config_.replicas[r].host;
-        request.port = config_.replicas[r].port;
-        request.target = config_.status_target;
-        request.connect_timeout_ms = config_.connect_timeout_ms;
-        request.idle_timeout_ms = config_.status_timeout_ms;
-        std::string body;
-        const auto result = http_fetch(request, body);
-        ReplicaState next;
-        if (result.ok && result.head.status == 200)
-            if (auto parsed = replica_state_from_status(body)) next = *parsed;
-        bool lost = false;
-        {
-            const std::lock_guard lock(mutex_);
-            lost = states_[r].healthy && !next.healthy;
-            next.ewma_ms_per_token = states_[r].ewma_ms_per_token;
-            states_[r] = next;
+ReplicaState ReplicaProxy::probe(std::size_t replica, const std::string& connect_host) const {
+    HttpClientRequest request;
+    request.host = config_.replicas[replica].host;
+    request.port = config_.replicas[replica].port;
+    request.connect_host = connect_host;
+    request.target = config_.status_target;
+    request.connect_timeout_ms = config_.connect_timeout_ms;
+    request.idle_timeout_ms = config_.status_timeout_ms;
+    std::string body;
+    const auto result = http_fetch(request, body);
+    if (result.ok && result.head.status == 200)
+        if (auto parsed = replica_state_from_status(body)) return std::move(*parsed);
+    return {};
+}
+
+void ReplicaProxy::admit_distinct_workers() {
+    const auto resolved = distinct_replica_hosts(config_.replicas);
+    std::set<std::string> instances;
+    std::vector<std::string> connect_hosts;
+    std::vector<ReplicaState> states;
+    for (std::size_t r = 0; r < resolved.size(); ++r) {
+        for (const auto& host : resolved[r]) {
+            auto state = probe(r, host);
+            if (state.worker_instance_id.empty()) continue;
+            if (!instances.insert(state.worker_instance_id).second)
+                throw std::invalid_argument(replica_label(config_.replicas[r]) + " worker instance is already configured");
+            connect_hosts.push_back(host);
+            states.push_back(std::move(state));
+            break;
         }
-        if (lost) router_.forget(r);
+        if (states.size() != r + 1)
+            throw std::invalid_argument(replica_label(config_.replicas[r]) + " did not report worker_instance_id");
     }
+    connect_hosts_ = std::move(connect_hosts);
+    states_ = std::move(states);
+}
+
+void ReplicaProxy::refresh() {
+    const bool pinned = !connect_hosts_.empty();
+    if (!pinned) {
+        for (std::size_t r = 0; r < config_.replicas.size(); ++r) {
+            auto next = probe(r, {});
+            bool lost = false;
+            {
+                const std::lock_guard lock(mutex_);
+                lost = states_[r].healthy && !next.healthy;
+                next.ewma_ms_per_token = states_[r].ewma_ms_per_token;
+                states_[r] = std::move(next);
+            }
+            if (lost) router_.forget(r);
+        }
+        return;
+    }
+
+    std::vector<ReplicaState> next;
+    for (std::size_t r = 0; r < connect_hosts_.size(); ++r) next.push_back(probe(r, connect_hosts_[r]));
+
+    // Publish one sweep together so a changed identity cannot temporarily add a duplicate load slot.
+    const std::lock_guard lock(mutex_);
+    for (std::size_t r = 0; r < next.size(); ++r) {
+        auto& state = next[r];
+        const auto& id = state.worker_instance_id;
+        if (id.empty() || std::count_if(next.begin(), next.end(), [&](const ReplicaState& peer) {
+                return peer.worker_instance_id == id;
+            }) > 1)
+            state.healthy = false;
+        if ((states_[r].healthy && !state.healthy) || states_[r].worker_instance_id != id) router_.forget(r);
+        state.ewma_ms_per_token = states_[r].ewma_ms_per_token;
+    }
+    states_ = std::move(next);
 }
 
 std::vector<ReplicaState> ReplicaProxy::states() const {
@@ -286,6 +259,7 @@ void ReplicaProxy::forward(const HttpRequest& request, HttpResponseWriter& respo
         HttpClientRequest out;
         out.host = config_.replicas[replica].host;
         out.port = config_.replicas[replica].port;
+        if (!connect_hosts_.empty()) out.connect_host = connect_hosts_[replica];
         out.method = request.method;
         out.target = request.target.empty() ? request.path : request.target;
         out.body = request.body;

@@ -109,13 +109,16 @@ el prefill del prompt:
 ```sh
 ./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
 ./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows
-./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --mtp 0 \
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto \
     --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
 ```
 
-Borrador: la mitad de host está probada con ficheros de proyector sintéticos; la mitad de dispositivo está escrita
-pero no compilada ni ejecutada, y no se ha comprobado ninguna respuesta sobre una imagen. Órdenes, estado y límites:
-[entrada de imágenes](../../engine/vision.es.md#glm-53-flash). El servidor no admite partes de imagen.
+El servidor acepta partes `image_url` de las peticiones de chat con `--vision MMPROJ.gguf` en el rank 0; codifica cada
+imagen nueva en su CPU y envía las filas al rank 1 una sola vez.
+
+Borrador: la mitad de host está probada con ficheros de proyector sintéticos y un motor simulado; la mitad de
+dispositivo está escrita pero no compilada ni ejecutada, y no se ha comprobado ninguna respuesta sobre una imagen.
+Órdenes, estado y límites: [entrada de imágenes](../../engine/vision.es.md#glm-53-flash).
 
 <a id="glm-serve"></a>
 

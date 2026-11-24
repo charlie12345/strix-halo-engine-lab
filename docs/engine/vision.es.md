@@ -7,7 +7,7 @@ en el par de dos nodos. Un [runtime de visión compartido](shared-cores.es.md#lo
 | Modelo | Entrada de imágenes |
 |---|---|
 | DeepSeek V4.1 | sí, en el par, con `--vision` |
-| GLM-5.3 Flash | solo línea de órdenes, con `--embed-rows`: torre en CPU, ruta de dispositivo aún sin ejecutar; sin imágenes por HTTP |
+| GLM-5.3 Flash | borrador: `strix-glm5-rank --embed-rows` y `strix-glm5-serve --vision`, torre en CPU; la ruta de dispositivo aún no se ha ejecutado |
 | Qwen, MiniMax, Gemma | todavía no |
 
 ## Uso
@@ -35,12 +35,18 @@ filas proyectadas de una imagen en un fichero de filas y ambos ranks leen ese fi
 ```sh
 ./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
 ./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows   # PROMPT.u32 lleva un <|image|> por imagen
-./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --mtp 0 \
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto \
     --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
+./build/strix-glm5-serve MODEL_DIR --world 2 --rank 0 --transport usb4-auto --vision MMPROJ.gguf   # servidor, rank 0
 ```
 
-Estado: el adaptador y la herramienta están probados en el host con ficheros de proyector sintéticos. La mitad de
-dispositivo (`Engine::set_embed_rows`, `--embed-rows`) se escribió sin toolchain HIP y no está compilada ni ejecutada;
+Con `--vision` el servidor acepta partes `image_url` en las peticiones de chat: el rank 0 codifica cada imagen nueva
+en su CPU y envía las filas al rank 1 una vez por imagen. Los prompts con imagen usan el mismo planificador (trozos,
+MTP), no entran en la caché de prefijos ni en la ruta RTX y rechazan `session_id`.
+
+Estado: el adaptador, la herramienta, la mitad de host del servidor y el protocolo del par (con un motor simulado)
+están probados en el host con ficheros de proyector sintéticos. La mitad de dispositivo (`Engine::set_embed_rows` en
+el prefill normal y en el de MTP, `--embed-rows`, el `main` del servidor) se escribió sin toolchain HIP y no está compilada ni ejecutada;
 el fichero de proyector real no se ha ejecutado. Detalles, coste en CPU y límites: [versión en inglés](vision.md#glm-53-flash).
 
 ## Ruta de datos

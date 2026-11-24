@@ -213,11 +213,15 @@ towers do not implement: it runs on the shared FP32 host reference (`ReferenceEn
 | Rotary angles | `VisionAdapter::positions` hook | the FP32 product chain `pos * s * s ...` per axis |
 | Projector | `DenseOps::linear` for its five linears, `vision::activate` (GELU) | 2x2 merge layout, LayerNorm, clamped SwiGLU |
 | Span | `vision::span_embed_rows`, `session::EmbedRows` | image rows only; begin and end markers are vocabulary tokens |
-| Rows to the engine | `session::EmbedSplice`, `session::enqueue_embed_splice`, embed rows file | `Engine::set_embed_rows`, row ownership under sequence-parallel prefill |
+| Rows to the engine | `session::EmbedSplice`, `session::enqueue_embed_splice`, embed rows file | `Engine::set_embed_rows`, row ownership under sequence-parallel prefill, the drafter's next-row embedding |
+| Serving | `vision::ApiMediaBridge`, `vision::EmbedCache`, virtual ids and `session::resolve_embed_run`, `pair::EmbedFrame` | `--vision`, the frame after a prefill chunk's tokens in the GLM control channel (`kPrefillEmbeds`) |
 
 Files under the model directory and why they are not shared: `src/glm/vision/glm_vision.{hpp,cpp}` (the file
 contract, tensor names and projector of this family), `src/glm/engine/glm_embed_splice.hpp` (which rows a rank of
-the GLM pair embeds, a property of its prefill schedule).
+the GLM pair embeds, a property of its prefill schedule, and the drafter's row shift),
+`src/glm/serve/glm_serve_vision.hpp` (the stack of this family's adapter and the binding of the shared frame and
+resolver to the GLM control channel). Shared pieces this work adds: `EncoderConfig::qk_norm`, the embed rows file,
+`ApiMediaOptions::part_prefix` / `part_suffix` (template text around an item's placeholder).
 
 Read from the file: block count, width, head count, MLP width, projection width, patch size, merge size (2 when
 absent), the pixel bounds of the canvas, the norm epsilon, the SwiGLU clamp, mean and standard deviation, and from
@@ -266,7 +270,9 @@ storage) and the eight images of `images`, on one x86 host, CPU only.
 | FP32 rows against the reference row below, 32 cases | row cosine at least 0.99989, relative L2 at most 5.6e-3 |
 | `--reference-f16-conv` arm against the reference row below, 32 cases | row cosine at least 0.9999999, relative L2 at most 1.2e-4 |
 | The real projector file | **not run** |
-| Device splice into the GLM prefill (`Engine::set_embed_rows`, `--embed-rows`) | **not compiled or run** (written without a HIP toolchain); host tests cover the row ownership only |
+| Server host half (`glm5-serve-vision`): file to bridge to interned rows, embed frame lead to follower, both ranks' chunk resolution | pass: identical tokens and row bytes on both ranks for chunks that cut a span; an image's rows travel once |
+| Pair protocol on a fake engine (`strix-glm5-serve-cpu-tests --image-only`): whole prompt, chunks beside a decoding request, MTP, prefill units | pass: the same tokens in every arm, equal call logs on both ranks, no prefix cache entry, `session_id` refused |
+| Device splice into the GLM prefill (`Engine::set_embed_rows` in `prefill` and `prefill_mtp`, `--embed-rows`, `apps/glm_serve_main.cpp`) | **not compiled or run** (written without a HIP toolchain); host tests cover the row ownership, the drafter's row shift and the protocol only |
 | Language model answers on images | **not run** |
 
 Reference row (same machine): llama.cpp `fd24ee2`, the `mtmd` library built for the CPU backend, `glm5v` projector,
@@ -376,13 +382,25 @@ device splice (`copies = 4`). The engine has no per-row extras: an image row is 
 replaces, and its position is the prompt index. The staging holds the provided rows of one chunk (2 bytes per
 element) and is allocated in `set_embed_rows`, never inside a prefill.
 
-- Chunked prefill only (`Engine::prefill` with a chunked `PrefillPath`): the row-by-row reference prefill and
-  `prefill_mtp` refuse a splice. The slot then decodes without MTP, as after any chunked prefill.
+- Chunked prefill only: the row-by-row reference prefill refuses a splice.
+- MTP bootstrap (`prefill_mtp`, also as a session of layer units): the trunk splice runs in the first layer range
+  of each piece. The drafter joins the hidden row of prompt row i with the embedding of row i + 1, so it takes the
+  provided row there (`glm::engine::mtp_pair_splice`: the run's splice one row later). Decode needs nothing: the
+  drafter embeds generated tokens only. The drafter's rows change drafts, never tokens: MTP on and off must give
+  the same tokens on an image prompt, as on text.
 - Sequence-parallel prefill: a rank embeds only the rows it owns, so it splices only those
   (`glm::engine::embed_pieces`, host test `glm5-embed-splice`: both ranks together write every provided row
   exactly once, for both pipelines and for spans cut by chunks).
 - Both ranks must be given the same rows. `strix-glm5-rank --embed-rows` mixes the rows' checksum into the prompt
   agreement the ranks exchange before the first forward.
+- Serving (`strix-glm5-serve --vision`, rank 0): the API layer expands each image part to
+  `<|begin_of_image|>`, the virtual ids of its rows and `<|end_of_image|>`. The lead flags every prefill command
+  whose tokens hold virtual ids (`kPrefillEmbeds`, control version 10); on the pair the embed frame of the chunk's
+  spans follows the tokens, with the rows only for spans the follower does not hold yet. Each rank resolves the
+  chunk against its own table (`session::resolve_embed_run`: vocabulary ids plus the splice) and calls
+  `set_embed_rows` before the same `prefill` / `prefill_mtp` call it makes for text. A frame the follower cannot
+  apply is a protocol error for the pair. Image prompts take no prefix cache entry (handles are process-local, so
+  a key of virtual ids means nothing on the other rank), no root store, no RTX route and no session.
 
 Status: written without a HIP toolchain; not compiled, not run. Identity for text prompts is by construction (no
 splice: nothing is launched or uploaded and no kernel of the text path is changed) and still has to be shown on

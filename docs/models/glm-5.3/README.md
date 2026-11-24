@@ -103,14 +103,17 @@ tower runs on the CPU ahead of the run and the ranks splice its rows into the pr
 ```sh
 ./build/strix-glm5-vision encode MMPROJ.gguf IMAGE.png IMAGE.rows
 ./build/strix-glm5-vision expand PROMPT.u32 PROMPT.image.u32 IMAGE.rows
-./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --mtp 0 \
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto \
     --prompt PROMPT.image.u32 --embed-rows IMAGE.rows --decode 64
 ```
 
-Draft: the host half is tested on synthetic projector files; the device half is written but not compiled or run,
-and no answer on an image has been checked. Commands, status and limits: [image input](../../engine/vision.md#glm-53-flash);
-the adapter and its gate: [vision adapters](../../engine/vision-adapters.md#glm-53-flash). The server takes no
-image parts.
+The server takes `image_url` parts of chat requests with `--vision MMPROJ.gguf` on rank 0; it encodes each new
+image on its CPU and sends the rows to rank 1 once.
+
+Draft: the host half is tested on synthetic projector files and a fake engine; the device half is written but not
+compiled or run, and no answer on an image has been checked. Commands, status and limits:
+[image input](../../engine/vision.md#glm-53-flash); the adapter and its gate:
+[vision adapters](../../engine/vision-adapters.md#glm-53-flash).
 
 <a id="glm-serve"></a>
 

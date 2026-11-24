@@ -198,7 +198,7 @@ bool GreedyDecoder::cycle() {
     rows.insert(rows.end(), drafts.begin(), drafts.end());
     auto cv = control.next(1);
     const auto tv = Clock::now();
-    const auto v = e.verify(slot, rows, p, cv);
+    auto v = e.verify(slot, rows, p, cv);
     rec.verify = ms(tv, Clock::now());
     control.consume(cv);
     control.observe(rec.k + 1, rec.verify);
@@ -207,6 +207,10 @@ bool GreedyDecoder::cycle() {
     for (unsigned j = 0; j <= rec.k; ++j)
         if (v.flag.at(j) != 0 && first_flag == kNoFlag) first_flag = j;
     if (v.replay_flag) throw std::runtime_error("non-finite committed KDA row (replay)");
+    if (policy.pick_targets) {  // sampled: the rows plain decoding would process are decided by the lead's sampler
+        const unsigned rows_needed = std::min({rec.k + 1U, first_flag, remaining});
+        if (rows_needed > 0) policy.pick_targets(drafts, rows_needed, p + 1, std::span<std::uint32_t>(v.id));
+    }
     const auto acc = accept_greedy(drafts, v.id, first_flag, Terminal{kNoFlag, remaining});
     if (acc.abort) throw std::runtime_error("non-finite required row: request aborted (as plain greedy)");
     for (unsigned d = 1; d <= rec.k; ++d) {

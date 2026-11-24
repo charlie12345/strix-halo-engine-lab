@@ -740,10 +740,55 @@ struct EngineOps {
     // Up to `cycles` verify cycles; the first call opens the decoder from the fresh seed (budget includes the seed's y0,
     // already emitted). Returns the tokens after the ones already returned.
     std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles) {
+        return mtp_run(slot, budget, cycles, gs::SampledRun{});
+    }
+    // Sampled MTP (kRunSample): the decoder's verify rows are decided by the lead's sampler over full rows assembled from
+    // both ranks' slices (strix::serve::decide_pair_window, the round's sampling exchanges). A decoder keeps the flags it
+    // was opened with; the channel and the lead's sampler are this round's.
+    gs::SampledRun sample_run{};
+    std::uint32_t dec_flags = 0;
+    std::uint64_t sample_chunk = 0;
+    std::vector<float> sample_local{};
+    void pick_window(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first, std::span<std::uint32_t> ids) {
+        const bool lead = sample_run.sampler != nullptr;
+        if (lead != (control.rank == 0) || sample_run.ch == nullptr) throw std::logic_error("sampled MTP: the lead holds the sampler");
+        auto& ch = *sample_run.ch;
+        const std::size_t width = eng.vocab_slice();
+        sample_local.resize(width);
+        std::vector<strix::TokenDraft> td(drafts.size());
+        for (std::size_t i = 0; i < drafts.size(); ++i) {
+            td[i].position = first + i;
+            td[i].token = drafts[i];
+        }
+        const auto tokens = sv::decide_pair_window(lead, ch.paired() ? width : 0, sampling_vocab, sample_run.sampler, first,
+            std::span<const strix::TokenDraft>(td), rows,
+            [&](std::size_t row) {
+                const auto status = hipMemcpy(sample_local.data(), eng.last_logits() + row * width,
+                                              width * sizeof(float), hipMemcpyDeviceToHost);
+                if (status != hipSuccess) throw std::runtime_error(std::string("sampling logits: ") + hipGetErrorString(status));
+                return std::span<const float>(sample_local);
+            },
+            [&](std::span<const float> send, std::span<float> receive) { ch.exchange_sampling_logits(send, receive, sample_chunk++); },
+            [&](std::span<const std::uint32_t> send, std::span<std::uint32_t> receive) {
+                ch.exchange_sampling_words(send, receive, sample_chunk++);
+            });
+        if (tokens.empty() || tokens.size() > rows || tokens.size() > ids.size())
+            throw std::logic_error("sampled MTP: the window decided no row or too many");
+        std::copy(tokens.begin(), tokens.end(), ids.begin());
+    }
+    std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles, gs::SampledRun run) {
+        if (dec && dec_flags != run.flags) throw std::logic_error("mtp_run: the open decoder was opened with other sampling flags");
+        if ((run.flags & gs::kRunSampleDrafts) != 0) throw std::logic_error("mtp_run: sampled drafts are not available");
+        sample_run = run;
+        sample_chunk = 0;
         if (!dec) {
             if (!seed || seed_slot != slot) throw std::logic_error("mtp_run without a fresh drafter seed");
             auto pol = policy;
             if (pol.spec_arbiter) pol.context = &context.at(slot);
+            if ((run.flags & gs::kRunSample) != 0)
+                pol.pick_targets = [this](std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first,
+                                          std::span<std::uint32_t> ids) { pick_window(drafts, rows, first, ids); };
+            dec_flags = run.flags;
             dec = std::make_unique<sp::GreedyDecoder>(eng, slot, *seed, pol, budget, control);
             dec_slot = slot;
             seed.reset();
@@ -766,6 +811,8 @@ struct EngineOps {
                 context.at(slot).insert(context.at(slot).end(), emitted.begin(), emitted.end());
             }
             dec->finish();
+            dec_flags = 0;
+            sample_run = {};
             if (control.rank == 0 && !dec->result().spec_stats.empty())
                 std::fprintf(stderr, "strix-spec-stats %s\n", dec->result().spec_stats.c_str());
             dec.reset();
@@ -778,6 +825,8 @@ struct EngineOps {
     // Tentative device state is abandoned with the failing engine, never reused.
     void owner_abandon() {
         dec.reset();
+        dec_flags = 0;
+        sample_run = {};
         seed.reset();
         stager.reset();
     }

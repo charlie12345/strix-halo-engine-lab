@@ -5,6 +5,8 @@
 #include "strix/spec/drafting.hpp"
 #include <array>
 #include <chrono>
+#include <functional>
+#include <span>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,6 +30,12 @@ struct DecodePolicy {
     // (the merged cost table, emitted tokens), so both ranks decide the same. context: the prompt (null: none).
     bool spec_arbiter = false;
     const std::vector<std::uint32_t>* context = nullptr;
+    // Sampled decoding (serve, kRunSample): after each verify both ranks call this with the window's drafts, the rows
+    // plain decoding processes (min(K + 1, first flagged row, tokens left), > 0) and the position row 0 decides (p + 1).
+    // It overwrites ids[0 .. n) with the decided tokens, the same on both ranks; n <= rows (it stops after the first
+    // rejected draft). accept_greedy then accepts a draft exactly when its row decided it. Empty: greedy (merged argmax).
+    std::function<void(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first_position,
+                       std::span<std::uint32_t> ids)> pick_targets{};
 };
 struct CycleRecord {
     std::uint64_t p = 0;

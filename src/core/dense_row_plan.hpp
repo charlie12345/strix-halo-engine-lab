@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <span>
 
-#include "core/weight_certificate.hpp"
+#include "weight_certificate.hpp"
 
 namespace strix::core {
 

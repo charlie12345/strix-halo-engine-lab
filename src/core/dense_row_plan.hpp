@@ -1,11 +1,11 @@
 #pragma once
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <span>
+
+#include "core/weight_certificate.hpp"
 
 namespace strix::core {
 
@@ -51,29 +51,22 @@ void dense_declared(Operations& operations, const float* input, unsigned width, 
         operations.dense(input, width, rows, projections);
 }
 
-// Largest |w| of a weight tensor, +infinity when an element is not finite (host check at weight load).
-inline float finite_magnitude_max(std::span<const float> values) {
-    float top = 0.0F;
-    for (const float value : values) {
-        if (!std::isfinite(value)) return std::numeric_limits<float>::infinity();
-        top = std::max(top, std::fabs(value));
-    }
-    return top;
-}
+// Normalised rows the down projection of a low-rank controller reads as ONE operand: the raw row and one message
+// readout, concatenated. This is the whole operand whatever the number of readout banks.
+constexpr unsigned kLowRankDownRows = 2;
 
-// Admission of a low-rank controller's declared operands (residual_mix::LowRankController: down reads message_count
-// RMS-normalised BF16 rows of `width`, the gates read `rank` latent values) to the one-plane class. For finite residual
-// rows each normalised row has |row|_2 <= sqrt(width) up to rounding, so the down operands have |x|_1 <= 1.01
-// message_count width, |latent| <= that times down_max, and each gate sum is at most rank |latent|max gate_max. With
-// finite weights (maxima from finite_magnitude_max) and both bounds below 2^126, no partial sum, product or BF16
-// rounding of either chain leaves the finite range, so the one-plane bits are the three-plane bits. False keeps the
-// FP32 operand class. Non-finite residual rows are non-finite under either class.
-inline bool low_rank_operands_bounded(unsigned width, unsigned message_count, unsigned rank, float down_max,
-                                      float gate_max) {
-    constexpr float limit = 0x1p126F;
-    if (!std::isfinite(down_max) || !std::isfinite(gate_max)) return false;
-    const float latent = 1.01F * static_cast<float>(message_count) * static_cast<float>(width) * down_max;
-    return latent < limit && static_cast<float>(rank) * latent * gate_max < limit;
+// Admission of a low-rank controller's declared operands to the one-plane class (core/weight_certificate.hpp: down
+// reads kLowRankDownRows RMS-normalised BF16 rows of `width`, the gates read `rank` latent values). Precondition: the
+// residual rows are finite, so each normalised row has |row|_2 <= sqrt(width) up to rounding and the down operand has
+// |x|_1 <= 1.01 kLowRankDownRows width; with the weight maxima (finite_magnitude_max*) the latent is at most that
+// times down_max and each gate sum at most rank times latent times gate_max. With finite weights and both bounds below
+// 2^126, no partial sum, product or BF16 rounding of either chain leaves the finite range, so the one-plane bits are
+// the three-plane bits. False keeps the FP32 operand class. Non-finite residual rows are non-finite under either class.
+inline bool low_rank_operands_bounded(unsigned width, unsigned rank, float down_max, float gate_max) {
+    const float down_l1 = 1.01F * static_cast<float>(kLowRankDownRows) * static_cast<float>(width);
+    if (!one_plane_sum_bounded(down_l1, down_max)) return false;
+    const float latent = down_l1 * down_max;
+    return one_plane_sum_bounded(static_cast<float>(rank) * latent, gate_max);
 }
 
 // Verify step rows of the BF16 -> FP32 dense family: one warp reads its weight row once for a tile of up to

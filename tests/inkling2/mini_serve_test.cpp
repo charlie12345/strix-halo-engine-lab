@@ -436,7 +436,9 @@ int main(int argc, char** argv) try {
     wiring(argv[1], "cuda", false, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
-                                          std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {
+                                          std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up},
+                                          std::pair{"mse-r2-gate-up", W4a4::nvfp4_mse_r2_gate_up},
+                                          std::pair{"mse-r2", W4a4::nvfp4_mse_r2}}) {
         set_w4a4_env(value);
         wiring(argv[1], "cuda", false, false, expected);
     }

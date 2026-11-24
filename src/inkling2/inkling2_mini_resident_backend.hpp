@@ -236,7 +236,8 @@ public:
     // FAST W4A4 expert lever (inkling2-mini-moe-w4a4@1): multi-row prefill chunks run admitted NVFP4 expert layers through
     // the shared grouped W4A4 operand class. The NVFP4 image of the assignment rows is allocated only when the lever is on.
     // `activations` is the shared operand class the lever value selects (moe_core/grouped_w4a4.hpp: nvfp4 = nearest@1 scale
-    // rule, nvfp4_mse = mse@1, nvfp4_mse_gate_up = mse@1 gate-up with the down projection on BF16 activations).
+    // rule, nvfp4_mse = mse@1, nvfp4_mse_gate_up = mse@1 gate-up with the down projection on BF16 activations,
+    // nvfp4_mse_r2_gate_up / nvfp4_mse_r2 = two-term activations on gate-up / on both projections).
     // bf16 = lever off. Every entry point (gate, generation CLI, step program, server) passes the resolved class.
     void set_moe_w4a4(moe_core::grouped_w4a4::Activations activations) {
 #if defined(__HIPCC__)

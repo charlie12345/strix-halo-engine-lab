@@ -5,7 +5,16 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 rows=64
 vocabulary=200058
-weight_policy=inkling2-mini-attention-head-bf16-q8_0@1
+# Candidate weight arm: STRIX_INKLING_GATE_WEIGHTS = shared policy key (default the Q8_0 policy; low-bit mixes
+# weights.attention_head.q6_g64@1, weights.attention_q4_g64.head_q6_g64@1, weights.attention_head.q4_g64@1,
+# weights.head.q6_g64@1, weights.head.q4_g64@1),
+# STRIX_INKLING_GATE_TIER = fast (default) or turbo, STRIX_INKLING_GATE_STORAGE = the expected receipt storage text.
+weight_policy=${STRIX_INKLING_GATE_WEIGHTS:-weights.attention_head.q8_0@1}
+default_policy=weights.attention_head.q8_0@1  # the policy the BF16 arms resolve under (no qualification arm)
+legacy_policy=inkling2-mini-attention-head-bf16-q8_0@1
+cand_tier=${STRIX_INKLING_GATE_TIER:-fast}
+cand_storage=${STRIX_INKLING_GATE_STORAGE:-gguf.q8_0@1}
+case "$cand_tier" in fast|turbo) ;; *) echo "STRIX_INKLING_GATE_TIER must be fast or turbo" >&2; exit 2 ;; esac
 
 usage() {
     echo "usage: $0 arm BIN MODEL MANIFEST OUT REF|REF2|NULL|CAND|CANDF|NULLF prefill|decode [--case NAME ...] [ENGINE_ARGS...]" >&2
@@ -70,8 +79,8 @@ PY
 }
 
 check_outputs() {
-    local arm=$1 case_name dump storage=plain.bf16@1
-    case "$arm" in CAND|CANDF) storage=gguf.q8_0@1 ;; esac
+    local arm=$1 case_name dump storage=plain.bf16@1 policy=$default_policy
+    case "$arm" in CAND|CANDF) storage=$cand_storage policy=$weight_policy ;; esac
     shift
     for case_name in "$@"; do
         dump="$out/$case_name-$arm.f32"
@@ -80,7 +89,8 @@ check_outputs() {
         [[ -f "$out/$case_name-$arm.ids" && $(wc -l < "$out/$case_name-$arm.ids") == "$rows" ]] ||
             fail "missing or wrong-size ID dump: $case_name $arm"
         [[ -s "$out/log/$case_name.$arm.stderr" ]] || fail "missing route receipt for $case_name $arm"
-        grep -Fxq -- "strix-weight-load/v1 $weight_policy $storage" "$out/log/$case_name.$arm.stderr" ||
+        { grep -Fxq -- "strix-weight-load/v1 $policy $storage" "$out/log/$case_name.$arm.stderr" ||
+            grep -Fxq -- "strix-weight-load/v1 $legacy_policy $storage" "$out/log/$case_name.$arm.stderr"; } ||
             fail "missing effective $storage receipt for $case_name $arm"
         case "$arm" in
             NULL|NULLF)
@@ -153,7 +163,7 @@ case "$action" in
         weight_args=(--no-weight-q8)
         for option in "$@"; do
             case "$option" in
-                --case|--profile|--qualify-q8|--no-weight-q8|--gate-*) fail "the gate kit controls $option" ;;
+                --case|--profile|--qualify-q8|--qualify-weights|--no-weight-q8|--gate-*) fail "the gate kit controls $option" ;;
             esac
         done
         case "$arm" in
@@ -161,7 +171,7 @@ case "$action" in
             CAND|NULL) export STRIX_MOE_ROUTES_IN="$out/routes/{case}.REF.rte" ;;
             *) usage ;;
         esac
-        case "$arm" in CAND|CANDF) tier=fast; weight_args=(--qualify-q8) ;; esac
+        case "$arm" in CAND|CANDF) tier=$cand_tier; weight_args=(--qualify-weights "$weight_policy") ;; esac
         case "$arm" in NULL|NULLF) weight_args+=(--gate-order-null) ;; esac
         binary_hash=$(sha256sum < "$binary")
         # Checkpoint identity for this same-machine kit without re-reading the weights.
@@ -195,7 +205,7 @@ case "$action" in
             esac
         done
         reducer=(python3 "$repo/tools/strix-gate/gate_v2.py" qual "$out" --format head --manifest "$manifest"
-            --head-rows "$rows" --ref REF --null NULL --cand CAND --cand-free CANDF --null-free NULLF "$@")
+            --head-rows "$rows" --ref REF --null NULL --cand CAND --cand-free CANDF --null-free NULLF --tier "$cand_tier" "$@")
         "${reducer[@]}" --classes "$(dirname "$manifest")/classes.json" --json "$out/gate-$mode.json"
         if [[ -f "$(dirname "$manifest")/bands.json" ]]; then
             "${reducer[@]}" --classes "$(dirname "$manifest")/bands.json" --json "$out/gate-$mode-bands.json"

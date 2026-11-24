@@ -380,8 +380,39 @@ int bench(unsigned tokens) {
             ms[s] += t / float(reps);
         }
     }
+    // Reference: the dense launch of the same contract at the same shapes, one matrix (expert 0) for all A rows
+    // (no gather, no tiles, column-layout image): what the arithmetic costs without grouping.
+    for (unsigned c = 0; c < k && std::size_t(c + 1U) * tokens <= A; ++c) CHECK(hipMemcpy(dy + std::size_t(c) * tokens * hidden, dx, std::size_t(tokens) * hidden * 4U, hipMemcpyDeviceToDevice));
+    Act dg, dd;
+    dg.alloc(A, hidden);
+    dd.alloc(A, ffn);
+    float* dz = nullptr;
+    CHECK(hipMalloc(&dz, std::size_t(A) * ng * 4U));
+    const ad::Weights wg{gim.codes, gim.steps, hidden, ng}, wd{dim.codes, dim.steps, ffn, hidden};
+    float dms[2] = {0, 0};
+    for (unsigned it = 0; it < reps + 2U; ++it) {
+        CHECK(hipEventRecord(ev[0], nullptr));
+        ad::enqueue_gemm(wg, dg.act, ad::OutCols{dz, ng, ng / 16U}, nullptr);
+        CHECK(hipEventRecord(ev[1], nullptr));
+        ad::enqueue_gemm(wd, dd.act, ad::OutCols{dy, hidden, hidden / 16U}, nullptr);
+        CHECK(hipEventRecord(ev[2], nullptr));
+        CHECK(hipEventSynchronize(ev[2]));
+        if (it == 0U) {  // image of real rows once (the rate does not depend on it after)
+            ad::enqueue_quantise(dy, hidden, dg.act, nullptr);
+            ad::enqueue_quantise(dz, ffn, dd.act, nullptr);
+            CHECK(hipDeviceSynchronize());
+        }
+        if (it < 2U) continue;
+        for (unsigned s = 0; s < 2U; ++s) {
+            float t = 0.0F;
+            CHECK(hipEventElapsedTime(&t, ev[s], ev[s + 1U]));
+            dms[s] += t / float(reps);
+        }
+    }
     CHECK(hipGetLastError());
     const double fg = 2.0 * A * hidden * ng, fd = 2.0 * A * ffn * hidden;
+    std::printf("DENSE-REF rows %u: gate_up %.3f ms %.1f TOPS | down %.3f ms %.1f TOPS\n", A, double(dms[0]), fg / (double(dms[0]) * 1e9),
+                double(dms[1]), fd / (double(dms[1]) * 1e9));
     std::printf("BENCH tokens %u assignments %u tiles %u: quant_tok %.3f ms | gate_up %.3f ms %.1f TOPS | quant_h %.3f ms | down %.3f ms %.1f TOPS | visit %.3f ms\n",
                 tokens, A, tiles, double(ms[0]), double(ms[1]), fg / (double(ms[1]) * 1e9), double(ms[2]), double(ms[3]), fd / (double(ms[3]) * 1e9),
                 double(ms[0] + ms[1] + ms[2] + ms[3]));

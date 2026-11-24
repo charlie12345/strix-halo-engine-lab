@@ -1,79 +1,12 @@
 #pragma once
-// Rotated integer A4W4 operand class of the grouped expert projection (Home: shared moe_core contract; the HIP body is the
-// grouped trait of core/iu4a4_dense.hpp on v_wmma_i32_16x16x16_iu4; a backend without integer 4-bit WMMA declines by
-// name). Sibling of grouped_w4a4.hpp (NVFP4 activations on block-scaled FP4 MMA): same plan (TileRows of routed rows of
-// one expert), same outputs; both operands change:
-//   weights: once at load, each expert matrix (NVFP4 or MXFP8 as stored) is requantised to the rotated IU4 image of
-//     dense-iu4a4-rot-v1 (iu4a4_rot::requantise_values on the EXACT BF16 operand value of every weight); a gate/up matrix
-//     is built in the paired column order (iu4a4_rot::paired_column) so the SwiGLU epilogue meets gate and up in a lane.
-//   activations: the A4 image of dense-iu4a4-rot-v1 (row-major: the grouped launch gathers rows). Gate/up: the TOKEN rows quantised once (not once per assignment),
-//     read through the plan's assignment -> token map. Down: the activated rows h (FP32 [assignment][ffn], the BF16 value
-//     of the incumbent epilogue) quantised in assignment order.
-// Arithmetic identity "grouped-iu4a4-rot-v1": every output is iu4a4_rot::dot of its row and rotated column (the dense
-// contract per tile); h = activate_bf16(gate, up) as the incumbent gate/up epilogue. Bits differ from the BF16 tile:
-// FAST / TURBO class only, behind gate v2.
-#include "core/iu4a4_rot.hpp"
-#include "moe_core/grouped_iu4a4_plan.hpp"
-#include "moe_core/grouped_microscaled_rows.hpp"
-#include "strix/weight/formats/microscaled.hpp"
-#include "strix/weight/formats/scalar_float.hpp"
-
-#include <cstddef>
-#include <cstdint>
-#include <span>
-
+// Native HIP launch binding for the SDK-free grouped IU4A4 contract.
 #if defined(__HIPCC__)
 #include "core/iu4a4_dense.hpp"
 #include "moe_core/expert_activation.hpp"
-#define STRIX_GI4_HD __host__ __device__
-#else
-#define STRIX_GI4_HD
 #endif
+#include "moe_core/grouped_iu4a4_contract.hpp"
 
 namespace strix::moe_core::grouped_iu4a4 {
-
-namespace packed = strix::weight::microscaled;
-namespace rot = strix::core::iu4a4_rot;
-using grouped_microscaled::TileRows;
-inline constexpr unsigned kCtaRows = 128U;  // rows per CTA of the grouped GEMM; taller plan tiles run as row slices
-
-constexpr std::size_t image_code_bytes(unsigned in, unsigned n) { return std::size_t(n) * in / 2U; }
-constexpr std::size_t image_step_floats(unsigned in, unsigned n) { return std::size_t(n) * (in / rot::kBlock); }
-inline bool supported(unsigned in, unsigned n, bool paired) {
-    return in > 0U && in % rot::kBlock == 0U && in <= rot::kMaxInputs && n > 0U && n % (paired ? 32U : 16U) == 0U;
-}
-
-// Weight source of one expert matrix: rotated column n reads stored row paired_column(n, pair_rows) (pair_rows = 0:
-// row n), value = the BF16 operand the EXACT tile decodes (PackedOperand::decode_pair), as FP32.
-template <packed::MatrixFormat Format>
-struct ExpertSource {
-    packed::PackedMatrix matrix;
-    unsigned pair_rows{};
-    STRIX_GI4_HD float value(std::size_t row, unsigned k) const {
-        const packed::PackedOperand<Format> op{matrix};
-        const unsigned k0 = k & ~15U, j = k - k0;
-        const auto address = op.tile16_address(row, k0);
-        const std::uint8_t* codes = address.codes + (packed::PackedOperand<Format>::kNvfp4 ? j / 2U : (j & ~1U));
-        const std::uint32_t pair = op.decode_pair(codes, packed::PackedOperand<Format>::decode_scale(*address.scale_code));
-        const std::uint32_t half = (j & 1U) != 0U ? pair >> 16U : pair & 0xffffU;
-        return weight::scalar_float::u2f(half << 16U);
-    }
-    STRIX_GI4_HD float requantise(unsigned col, unsigned b, unsigned n, std::uint8_t* dst) const {
-        const std::size_t row = pair_rows != 0U ? rot::paired_column(col, pair_rows) : col;
-        const auto v = [&](unsigned i) { return value(row, b * rot::kBlock + i); };
-        return rot::requantise_values(v, b, col, n, dst);
-    }
-};
-
-// Expert index of a tile from its weights' code address (host check before binding: every expert matrix of the layer
-// starts at codes_from + e * codes_stride, so the address is an index; the image then holds expert e at e).
-inline bool expert_codes_strided(std::span<const packed::PackedMatrix> experts, const std::uint8_t* codes_from, std::size_t codes_stride) {
-    for (std::size_t e = 0; e < experts.size(); ++e)
-        if (experts[e].codes != codes_from + e * codes_stride) return false;
-    return codes_stride > 0U;
-}
-
-static_assert(rot::kBlock == kInputBlock, "act_image_bytes assumes the contract's 128-input block");
 
 #if defined(__HIPCC__)
 namespace dense = strix::core::iu4a4_dense;
@@ -166,4 +99,3 @@ inline hipError_t launch(const Pass& p, hipStream_t s) {
 
 }  // namespace strix::moe_core::grouped_iu4a4
 
-#undef STRIX_GI4_HD

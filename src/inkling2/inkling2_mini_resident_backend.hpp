@@ -160,7 +160,7 @@ public:
           descriptors_(2U * tiles_), moe_bf16_(mini_moe_workspace_elements(max_rows_)),
           moe_fp32_(mini_moe_workspace_elements(max_rows_)),
 #if defined(__HIPCC__)
-          moe_activation_(mini_moe_activation_elements(max_rows_)),
+          moe_activation_(mini_moe_activation_elements(max_rows_)), moe_nan_seen_(1U),
 #endif
           flags_((1U + (packed_decode ? std::min(max_rows_, kMiniMaxVerifyRows) : 1U)) * kLogicalVisits),
           zero_padding_(kHeadWidth) {
@@ -186,6 +186,9 @@ public:
             }
             check(bind_mini_convolution_weights(weights_, lag_weights_.data(), stream_));
             mini_gpu::clear(zero_padding_.data(), zero_padding_.span().size_bytes(), stream_);
+#if defined(__HIPCC__)
+            mini_gpu::clear(moe_nan_seen_.data(), moe_nan_seen_.span().size_bytes(), stream_);
+#endif
             start_chunk(0U, MiniAppendKind::prefill);
             mini_gpu::synchronize(stream_);
         } catch (...) {
@@ -739,7 +742,8 @@ public:
                                                     kExperts, kHiddenWidth}, rows, input, logits, stream_));
 #endif
 #if defined(__HIPCC__)
-        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span()};
+        const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span(), {},
+                                         moe_nan_seen_.data()};
 #else
         const bool w4a4 = chunk_w4a4_ && moe_w4a4_layer_[layer];
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), {},
@@ -882,6 +886,8 @@ private:
     mini_gpu::Buffer<float> moe_fp32_;
 #if defined(__HIPCC__)
     mini_gpu::Buffer<std::uint16_t> moe_activation_;  // gate-up epilogue activations (grouped_dispatch)
+    // grouped_dispatch::Workspace::nan_seen: zeroed once; raised (sticky) by a down that stored a NaN sum.
+    mini_gpu::Buffer<unsigned> moe_nan_seen_;
 #endif
     mini_gpu::Buffer<unsigned> flags_;
     mini_gpu::Buffer<std::uint16_t> zero_padding_;

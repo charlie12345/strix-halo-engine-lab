@@ -164,9 +164,11 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
 inline constexpr unsigned kPackedImageMinRows = 4096U;
 
 // The image routes' profitability data (kImageRoutePolicy) is measured on one device class only: gfx1151 with wave32
-// (Strix Halo, 40 CUs). Any other HIP device keeps the incumbent launches of enqueue_bf16_rows.
+// and kMeasuredComputeUnits (40) CUs (Strix Halo). arch is gcnArchName without its feature suffix; compute_units comes
+// from the shared compute_units_from (HIP's multiProcessorCount counts WGPs, 2 CUs each, on RDNA). Any other HIP device
+// keeps the incumbent launches of enqueue_bf16_rows.
 constexpr bool image_routes_measured_device(std::string_view arch, unsigned wave_size, unsigned compute_units) {
-    return wave_size == 32U && compute_units == 40U && (arch == "gfx1151" || arch.starts_with("gfx1151:"));
+    return wave_size == 32U && compute_units == kMeasuredComputeUnits && arch == "gfx1151";
 }
 
 // image_routes_measured_device of the current device (first call per device ordinal, then cached; an unknown device
@@ -181,9 +183,14 @@ inline bool image_routes_device_qualified() {
         if (known != 0U) return known == 1U;
     }
     hipDeviceProp_t prop{};
-    const bool qualified = hipGetDeviceProperties(&prop, dev) == hipSuccess && prop.multiProcessorCount > 0 &&
-                           image_routes_measured_device(prop.gcnArchName, static_cast<unsigned>(prop.warpSize),
-                                                        static_cast<unsigned>(prop.multiProcessorCount));
+    bool qualified = false;
+    if (hipGetDeviceProperties(&prop, dev) == hipSuccess && prop.multiProcessorCount > 0) {
+        std::string_view arch(prop.gcnArchName);
+        arch = arch.substr(0, arch.find(':'));
+        qualified = image_routes_measured_device(
+            arch, static_cast<unsigned>(prop.warpSize),
+            compute_units_from(arch, static_cast<unsigned>(prop.multiProcessorCount)));
+    }
     if (dev < kSlots) cached[dev].store(qualified ? 1U : 2U, std::memory_order_relaxed);
     return qualified;
 }

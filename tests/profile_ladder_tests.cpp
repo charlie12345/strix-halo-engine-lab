@@ -121,7 +121,7 @@ void verdicts() {
             "no ladder rows: lossy cells do not apply");
     constexpr std::array<p::Lever, 1> exact_rows{{
         {"sched", "STRIX_FIXTURE_SCHED", "", {"", "2", "", ""}, "1", p::Kind::exact, {true, true, false, true},
-         {true, true, false, true}},
+         {true, true, false, true}, "", "", "fixture scheduling receipt"},
     }};
     const p::Engine scheduling{"sched", "", exact_rows, false, "sched-turbo-v1"};
     require(p::ladder_value(resolve(scheduling, p::Name::turbo), "sched", {p::Phase::decode, 1, 1, "dev"}).value == "2",

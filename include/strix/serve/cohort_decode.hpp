@@ -41,9 +41,13 @@
 namespace strix::serve {
 
 // One request's rows in a forward: `rows` consecutive rows of one lane (its pending token, then its drafts).
+// reads_scores: the lane's consumer reads its final row through read_final_logits (a host-sampled request, a
+// selection that reads logits). A backend may then score the row in the forward instead of a greedy-only pick form;
+// without it every read must still return the row's exact final logits.
 struct CohortGroup {
     std::uint32_t lane = 0;
     std::uint32_t rows = 1;
+    bool reads_scores = false;
 };
 
 // One member of a grouped prompt pass: `tokens` appended to `lane` as prefill(lane, tokens, first) would.

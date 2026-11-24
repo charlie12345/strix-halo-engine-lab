@@ -586,7 +586,11 @@ void CohortDecoder::step() {
     for (std::size_t k = 0; k < n; ++k) {
         const std::uint32_t rows = std::min(rp.rows.at(k), demands[k].max_rows);
         if (rows == 0) throw std::logic_error("cohort decoder: a running lane was parked (lanes > rows of a forward)");
-        groups[k] = {demands[k].lane, rows};
+        // the lane reads this forward's final logits: its selection reads them, else its host sampler does
+        const Lane& l = *run[k];
+        const bool reads_scores = l.request.selection ? l.request.selection_reads_logits
+                                                      : l.sampler.has_value() && !backend_.samples_on_device();
+        groups[k] = {demands[k].lane, rows, reads_scores};
         tokens.push_back(run[k]->pending);
         tokens.insert(tokens.end(), drafts[k].begin(), drafts[k].begin() + (rows - 1U));
     }

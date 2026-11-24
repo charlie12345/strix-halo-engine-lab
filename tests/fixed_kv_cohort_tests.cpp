@@ -139,6 +139,34 @@ void test_sampled_logits() {
     check(!cohort.supports_final_logits(), "decoder may decline at run time");
 }
 
+// Decoder that takes the window's score-read requirement (CohortGroup::reads_scores of any lane).
+struct ScoreReadDecoder : LogitsDecoder {
+    std::vector<int> reads;  // per decode_slots call: 1 = some lane reads its final scores
+    void decode_slots(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> tokens,
+                      std::span<std::uint32_t> top, bool reads_scores) {
+        reads.push_back(reads_scores ? 1 : 0);
+        LogitsDecoder::decode_slots(slots, tokens, top);
+    }
+};
+
+void test_score_reads() {
+    auto decoder = std::make_unique<ScoreReadDecoder>();
+    auto* raw = decoder.get();
+    FixedKvCohort<ScoreReadDecoder> cohort(std::move(decoder), 64U, 4U, 4U);
+    const std::uint32_t tokens[] = {1U, 2U};
+    const std::uint32_t keep[] = {1U, 1U};
+    std::uint32_t top[2] = {};
+    const CohortGroup greedy[] = {{2U, 1U, false}, {0U, 1U, false}};
+    cohort.verify(greedy, tokens, top);
+    cohort.commit(keep);
+    const CohortGroup mixed[] = {{2U, 1U, false}, {0U, 1U, true}};
+    cohort.verify(mixed, tokens, top);
+    check(cohort.read_final_logits(0U)[1] == 0.0F, "the sampled lane reads its row");
+    cohort.commit(keep);
+    check(raw->reads == std::vector<int>{0, 1}, "decode_slots learns whether any lane of the window reads scores");
+    check(top[0] == 2001U && top[1] == 2U, "the score-read form returns the same picks");
+}
+
 // Emits-first decoder: each prefill call returns id 7000 + 10 * lane + rows; its final scores are row 0 of the window
 // (LogitsDecoder: {0, lane, 0, lane}).
 struct EmitsDecoder : LogitsDecoder {
@@ -230,6 +258,7 @@ int main() {
     test_geometry();
     test_greedy_window();
     test_sampled_logits();
+    test_score_reads();
     test_prefill_emits_first();
     if (failures != 0) {
         std::fprintf(stderr, "fixed-kv-cohort: %d failures\n", failures);

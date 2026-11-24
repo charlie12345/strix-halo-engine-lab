@@ -3,6 +3,8 @@
 //   forward_rows(tokens, rows, LogitRows) -> Out; read_top(Out, rows, host) (synchronizes); commit(k); sync().
 // Greedy verification keeps read_top. Sampled verification optionally reads [rows][vocab()] host floats through
 // read_logits_rows(Out, rows, float*). Both reads synchronize. commit(k) = engine commit + sync.
+// An engine whose LogitRows names `scores` gets it for windows whose scores will be read (sampled verification),
+// `all` for greedy-only windows, so it may serve the latter with a pick form that writes no scores.
 // Optional: decode_committed_row(token, host_logits) -> next token, the engine's plain one-row decode step
 // (committed at once; host_logits empty or [vocab()]). A one-row verify (a serial step of the speculator) then
 // runs as that decode step and the following commit(1) has nothing left to do: a one-row window is always kept.
@@ -60,7 +62,7 @@ public:
                 return;
             }
         }
-        const auto out = e_.forward_rows(tokens.data(), rows, Engine::LogitRows::all);
+        const auto out = e_.forward_rows(tokens.data(), rows, logit_rows());
         read_tokens(out, rows, first, {}, greedy, tokens);
         if (observer_) observer_(out, rows);
     }
@@ -82,7 +84,7 @@ public:
             const auto rows = static_cast<std::uint32_t>(tree.tokens.size());
             if (tree.depth.size() != rows) throw std::logic_error("engine verify target: missing tree row depths");
             const auto first = verify_position();
-            const auto out = e_.forward_tree_rows(tree, Engine::LogitRows::all);
+            const auto out = e_.forward_tree_rows(tree, logit_rows());
             read_tokens(out, rows, first, tree.depth, greedy);
             if (observer_) observer_(out, rows);
         } else {
@@ -100,6 +102,13 @@ public:
     Engine& engine() { return e_; }
 
 private:
+    // Sampled verification reads every row's scores (read_tokens): an engine that names that need gets `scores`.
+    [[nodiscard]] typename Engine::LogitRows logit_rows() const {
+        if constexpr (requires { Engine::LogitRows::scores; }) {
+            if (has_logits && rule_.sampled()) return Engine::LogitRows::scores;
+        }
+        return Engine::LogitRows::all;
+    }
     [[nodiscard]] std::uint64_t verify_position() const {
         if (rule_.sampled()) {
             if constexpr (!has_logits) throw std::logic_error("engine verify target: sampled rows require host logits");

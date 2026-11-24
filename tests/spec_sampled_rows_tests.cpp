@@ -641,10 +641,34 @@ void lazy_sampled_rows() {
           "later rows repeat the differing row's token");
 }
 
+// An engine that names the score-read requirement: sampled windows ask for `scores`, greedy windows for `all`.
+struct ScoredRowsEngine : LazyRowsEngine {
+    enum class LogitRows { all, scores };
+    std::vector<LogitRows> asked;
+    Rows forward_rows(const std::uint32_t* ids, std::uint32_t rows, LogitRows mode) {
+        asked.push_back(mode);
+        return LazyRowsEngine::forward_rows(ids, rows, LazyRowsEngine::LogitRows::all);
+    }
+};
+
+void score_read_requirement() {
+    const std::array<std::uint32_t, 5> window{3, 4, 5, 1, 2};
+    std::vector<std::uint32_t> picks;
+    ScoredRowsEngine engine;
+    sp::EngineVerifyTarget<ScoredRowsEngine> target(engine);
+    target.verify(window, picks);
+    target.set_row_rule(sp::RowRule(TokenSamplingPolicy{.temperature = 0.5F, .seed = 7}, request));
+    target.verify(window, picks);
+    check(engine.asked == std::vector{ScoredRowsEngine::LogitRows::all, ScoredRowsEngine::LogitRows::scores},
+          "greedy windows ask for picks only, sampled windows for their scores");
+    check(picks.size() == window.size() && picks[0] == 4U && picks[1] == 6U, "the scores form reads the same rows");
+}
+
 }  // namespace
 
 int main() {
     lazy_sampled_rows();
+    score_read_requirement();
     identity_and_accounting();
     distribution();
     arbiter();

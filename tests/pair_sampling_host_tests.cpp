@@ -1,7 +1,14 @@
 #include "strix/serve/pair_sampling.hpp"
 
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <random>
+#include <thread>
 
 namespace sv = strix::serve;
 
@@ -76,11 +83,202 @@ void test_selection() {
         diverged |= token != run(*different, pos);
     }
     check(diverged, "different seeds must diverge on this fixture");
+    check(!first->coupled(), "the pair sampler keeps rejection acceptance by default");
+    const auto coupled = sv::make_pair_sampler(job, strix::SampledAcceptance::coupled);
+    check(coupled && coupled->coupled(), "the pair sampler must forward the acceptance rule");
+}
+
+// In-process lock-step duplex: each side posts its message and takes the peer's (sizes must agree), as the control wire.
+struct Duplex {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::vector<std::byte>> q[2];
+    std::size_t float_messages[2]{}, word_messages[2]{};
+    void xchg(int side, std::span<const std::byte> out, std::span<std::byte> in) {
+        std::unique_lock<std::mutex> l(m);
+        q[side].emplace_back(out.begin(), out.end());
+        cv.notify_all();
+        if (!cv.wait_for(l, std::chrono::seconds(10), [&] { return !q[1 - side].empty(); }))
+            throw std::runtime_error("duplex: peer timeout");
+        auto b = std::move(q[1 - side].front());
+        q[1 - side].pop_front();
+        if (b.size() != in.size()) throw std::runtime_error("duplex: message sizes differ");
+        std::memcpy(in.data(), b.data(), b.size());
+    }
+    auto floats(int side) {
+        return [this, side](std::span<const float> out, std::span<float> in) {
+            ++float_messages[side];
+            xchg(side, std::as_bytes(out), std::as_writable_bytes(in));
+        };
+    }
+    auto words(int side) {
+        return [this, side](std::span<const std::uint32_t> out, std::span<std::uint32_t> in) {
+            ++word_messages[side];
+            xchg(side, std::as_bytes(out), std::as_writable_bytes(in));
+        };
+    }
+};
+
+// Rows of a window: the lead's slice is [0, kLead), the follower's [kLead, kLead + kFollow); the vocabulary ends
+// before the follower's padding.
+constexpr std::size_t kLead = 3000, kFollow = 20000, kVocab = kLead + kFollow - 7;
+struct WindowRows {
+    std::vector<std::vector<float>> lead, follow, full;
+    explicit WindowRows(unsigned rows, unsigned seed) {
+        std::mt19937 g(seed);
+        std::normal_distribution<float> n(0.0F, 3.0F);
+        for (unsigned r = 0; r < rows; ++r) {
+            std::vector<float> row(kLead + kFollow);
+            for (auto& x : row) x = n(g);
+            lead.emplace_back(row.begin(), row.begin() + kLead);
+            follow.emplace_back(row.begin() + kLead, row.end());
+            full.emplace_back(row.begin(), row.begin() + kVocab);
+        }
+    }
+};
+
+strix::TokenSamplingPolicy window_policy() {
+    strix::TokenSamplingPolicy p;
+    p.temperature = 0.9F;
+    p.seed = 77;
+    return p;
+}
+strix::TokenSamplerOptions window_options(strix::SampledAcceptance a) {
+    strix::TokenSamplerOptions o;
+    o.acceptance = a;
+    return o;
+}
+
+struct WindowRun {
+    std::vector<std::uint32_t> lead, follow;
+    std::size_t follower_rows = 0;
+};
+// Runs both ranks of one window on two threads.
+WindowRun run_window(strix::TokenSampler& sampler, const WindowRows& rows, std::uint64_t first,
+                     std::span<const strix::TokenDraft> drafts, std::uint32_t max_rows) {
+    Duplex d;
+    WindowRun out;
+    std::exception_ptr error;
+    std::thread follower([&] {
+        try {
+            out.follow = sv::decide_pair_window(false, kFollow, 0, nullptr, 0, {}, 0,
+                [&](std::size_t r) { ++out.follower_rows; return std::span<const float>(rows.follow.at(r)); },
+                d.floats(1), d.words(1));
+        } catch (...) {
+            error = std::current_exception();
+        }
+    });
+    try {
+        out.lead = sv::decide_pair_window(true, kFollow, kVocab, &sampler, first, drafts, max_rows,
+            [&](std::size_t r) { return std::span<const float>(rows.lead.at(r)); }, d.floats(0), d.words(0));
+    } catch (...) {
+        follower.join();
+        throw;
+    }
+    follower.join();
+    if (error) std::rethrow_exception(error);
+    return out;
+}
+
+void test_window_coupled() {
+    const WindowRows rows(4, 5);
+    const std::uint64_t first = 100;
+    strix::TokenSampler oracle(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    std::vector<std::uint32_t> plain;
+    for (unsigned r = 0; r < 4; ++r) plain.push_back(oracle.decide(rows.full[r], first + r, nullptr).token);
+    for (unsigned wrong = 0; wrong <= 3; ++wrong) {  // the draft at this depth is wrong (3: none)
+        std::vector<strix::TokenDraft> drafts;
+        for (unsigned r = 0; r < 3; ++r) {
+            strix::TokenDraft dr;
+            dr.position = first + r;
+            dr.token = r == wrong ? (plain[r] + 1U) % static_cast<std::uint32_t>(kVocab) : plain[r];
+            drafts.push_back(std::move(dr));
+        }
+        strix::TokenSampler sampler(window_policy(), window_options(strix::SampledAcceptance::coupled));
+        const auto run = run_window(sampler, rows, first, drafts, 4);
+        const std::vector<std::uint32_t> expect(plain.begin(), plain.begin() + wrong + 1);
+        check(run.lead == expect, "coupled window: the lead's tokens differ from plain sampling");
+        check(run.follow == expect, "coupled window: the follower's tokens differ from the lead's");
+        check(run.follower_rows == wrong + 1, "coupled window: the follower sent rows the lead never decided");
+        check(sampler.stats().accepted == wrong && sampler.stats().rejected == (wrong < 3 ? 1U : 0U),
+              "coupled window: decisions not counted");
+    }
+}
+
+void test_window_cuts() {
+    const WindowRows rows(4, 6);
+    const std::uint64_t first = 7;
+    strix::TokenSampler oracle(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    std::vector<strix::TokenDraft> drafts;
+    std::vector<std::uint32_t> plain;
+    for (unsigned r = 0; r < 3; ++r) {
+        plain.push_back(oracle.decide(rows.full[r], first + r, nullptr).token);
+        strix::TokenDraft dr;
+        dr.position = first + r;
+        dr.token = plain.back();
+        drafts.push_back(std::move(dr));
+    }
+    strix::TokenSampler sampler(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    const auto run = run_window(sampler, rows, first, drafts, 2);
+    check(run.lead == std::vector<std::uint32_t>(plain.begin(), plain.begin() + 2) && run.follow == run.lead,
+          "max_rows 2: exactly two rows decided on both ranks");
+    check(run.follower_rows == 2, "max_rows 2: the follower sent two rows");
+    bool refused = false;
+    try {
+        (void)sv::decide_pair_window(true, kFollow, kVocab, &sampler, first, drafts, 0,
+            [](std::size_t) -> std::span<const float> { throw std::runtime_error("read"); },
+            [](std::span<const float>, std::span<float>) { throw std::runtime_error("exchange"); },
+            [](std::span<const std::uint32_t>, std::span<std::uint32_t>) { throw std::runtime_error("words"); });
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    check(refused, "max_rows 0 must be refused before any exchange");
+}
+
+void test_window_world1() {
+    const WindowRows rows(4, 8);
+    strix::TokenSampler oracle(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    strix::TokenSampler sampler(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    std::vector<strix::TokenDraft> drafts(1);
+    drafts[0].position = 3;
+    drafts[0].token = oracle.decide(rows.full[0], 3, nullptr).token;
+    const auto expect1 = oracle.decide(rows.full[1], 4, nullptr).token;
+    const auto tokens = sv::decide_pair_window(true, 0, kVocab, &sampler, 3, drafts, 2,
+        [&](std::size_t r) { return std::span<const float>(rows.full.at(r)); },
+        [](std::span<const float>, std::span<float>) { throw std::runtime_error("one node exchanged logits"); },
+        [](std::span<const std::uint32_t>, std::span<std::uint32_t>) { throw std::runtime_error("one node exchanged words"); });
+    check(tokens.size() == 2 && tokens[0] == drafts[0].token && tokens[1] == expect1, "one node: rows decided locally");
+}
+
+void test_window_rejection() {
+    const WindowRows rows(4, 9), draft_rows(3, 10);
+    const std::uint64_t first = 50;
+    unsigned residual = 0;
+    for (std::uint64_t seed = 1; seed <= 24; ++seed) {
+        auto policy = window_policy();
+        policy.seed = seed;
+        strix::TokenSampler sampler(policy, window_options(strix::SampledAcceptance::rejection));
+        strix::TokenSampler oracle(policy, window_options(strix::SampledAcceptance::rejection));
+        std::vector<strix::TokenDraft> drafts;
+        for (unsigned r = 0; r < 3; ++r) drafts.push_back(sampler.draft(draft_rows.full[r], {}, first + r));
+        const auto want = oracle.decide_rows(4, first, drafts, {}, [&](std::uint32_t r) { return std::span<const float>(rows.full.at(r)); });
+        const auto run = run_window(sampler, rows, first, drafts, 4);
+        check(run.lead.size() == want.size() && run.follow == run.lead, "rejection window: row counts");
+        for (std::size_t r = 0; r < want.size() && r < run.lead.size(); ++r)
+            check(run.lead[r] == want[r].token, "rejection window: tokens differ from decide_rows");
+        residual += static_cast<unsigned>(sampler.stats().rejected);
+    }
+    check(residual > 0, "rejection window: the fixture never rejected");
 }
 }  // namespace
 
 int main() try {
     test_selection();
+    test_window_coupled();
+    test_window_cuts();
+    test_window_world1();
+    test_window_rejection();
+    std::puts("pair window: coupled == plain sampling on both ranks, cuts honored, one node local, rejection == decide_rows");
     std::puts("pair sampling: greedy IDs preserved, policy forwarded, same seeds matched, different seeds diverged");
     return 0;
 } catch (const std::exception& error) {

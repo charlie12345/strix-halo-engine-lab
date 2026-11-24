@@ -270,6 +270,65 @@ void test_window_rejection() {
     }
     check(residual > 0, "rejection window: the fixture never rejected");
 }
+
+// Both ranks of one draft pick on two threads; returns {lead token, follower token}.
+std::pair<std::uint32_t, std::uint32_t> run_draft(strix::TokenSampler& sampler, const WindowRows& rows, unsigned row,
+                                                  std::uint64_t position, strix::TokenDraft* kept, std::size_t* exchanges) {
+    Duplex d;
+    std::uint32_t follower_token = 0;
+    std::exception_ptr error;
+    std::thread follower([&] {
+        try {
+            follower_token = sv::pick_pair_draft(false, kFollow, 0, nullptr, 0,
+                [&] { return std::span<const float>(rows.follow.at(row)); }, d.floats(1), d.words(1));
+        } catch (...) {
+            error = std::current_exception();
+        }
+    });
+    std::uint32_t lead_token = 0;
+    try {
+        lead_token = sv::pick_pair_draft(true, kFollow, kVocab, &sampler, position,
+            [&] { return std::span<const float>(rows.lead.at(row)); }, d.floats(0), d.words(0), kept);
+    } catch (...) {
+        follower.join();
+        throw;
+    }
+    follower.join();
+    if (error) std::rethrow_exception(error);
+    if (exchanges) *exchanges = d.float_messages[0] + d.word_messages[0];
+    return {lead_token, follower_token};
+}
+
+void test_draft_pick() {
+    const WindowRows rows(4, 11);
+    for (const auto acceptance : {strix::SampledAcceptance::coupled, strix::SampledAcceptance::rejection}) {
+        strix::TokenSampler sampler(window_policy(), window_options(acceptance));
+        strix::TokenSampler oracle(window_policy(), window_options(acceptance));
+        for (unsigned r = 0; r < 4; ++r) {
+            strix::TokenDraft kept;
+            std::size_t exchanges = 0;
+            const auto [lead, follow] = run_draft(sampler, rows, r, 40 + r, &kept, &exchanges);
+            const auto want = oracle.draft(rows.full[r], {}, 40 + r);
+            check(lead == want.token && follow == lead, "draft pick: both ranks hold the oracle's draft");
+            check(kept.token == lead && kept.position == 40 + r && kept.distribution.probability(lead) == want.distribution.probability(lead),
+                  "draft pick: the lead keeps the draft's distribution");
+            check(exchanges == 3, "draft pick: two slice frames and one decision message");
+        }
+        check(sampler.stats().drafts == 4, "draft pick: drafts counted");
+    }
+    // coupled: a draft drawn from the target's own row is the token that row decides (same uniform)
+    strix::TokenSampler coupled(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    strix::TokenSampler plain(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    for (unsigned r = 0; r < 4; ++r)
+        check(run_draft(coupled, rows, r, 60 + r, nullptr, nullptr).first == plain.decide(rows.full[r], 60 + r, nullptr).token,
+              "coupled draft from the target row differs from the row's decision");
+    // one node: no exchange
+    strix::TokenSampler solo(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    const auto token = sv::pick_pair_draft(true, 0, kVocab, &solo, 9, [&] { return std::span<const float>(rows.full[0]); },
+        [](std::span<const float>, std::span<float>) { throw std::runtime_error("one node exchanged logits"); },
+        [](std::span<const std::uint32_t>, std::span<std::uint32_t>) { throw std::runtime_error("one node exchanged words"); });
+    check(token == plain.decide(rows.full[0], 9, nullptr).token, "one node: draft drawn locally");
+}
 }  // namespace
 
 int main() try {
@@ -278,6 +337,8 @@ int main() try {
     test_window_cuts();
     test_window_world1();
     test_window_rejection();
+    test_draft_pick();
+    std::puts("pair draft: both ranks hold the lead's draft, distribution kept, coupled draft == row decision, one node local");
     std::puts("pair window: coupled == plain sampling on both ranks, cuts honored, one node local, rejection == decide_rows");
     std::puts("pair sampling: greedy IDs preserved, policy forwarded, same seeds matched, different seeds diverged");
     return 0;

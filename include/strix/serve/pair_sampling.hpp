@@ -141,4 +141,39 @@ std::vector<std::uint32_t> decide_pair_window(bool lead, std::size_t follower_wi
     return tokens;
 }
 
+// One sampled draft across the pair: the follower sends its vocabulary slice of the drafter row (`read_row()`), the
+// lead draws TokenSampler::draft over the full row for the token at `position` (the sampler's draft transform and
+// proposal uniform) and sends the token back ([token, 0 ...], kPairWindowWords words). Both ranks return the token; the
+// lead's draft, with the distribution it was drawn from, goes to `kept` when given (rejection acceptance reads it).
+// follower_width 0: one node, no exchange. The follower ignores sampler, position and kept.
+template<class Read, class ExchangeFloats, class ExchangeWords>
+std::uint32_t pick_pair_draft(bool lead, std::size_t follower_width, std::size_t vocabulary, TokenSampler* sampler,
+                              std::uint64_t position, Read&& read_row, ExchangeFloats&& exchange, ExchangeWords&& words,
+                              TokenDraft* kept = nullptr) {
+    const bool paired = follower_width != 0;
+    std::vector<float> scratch, full;
+    std::array<std::uint32_t, kPairWindowWords> send{}, receive{};
+    if (!lead) {
+        if (!paired) throw std::logic_error("pair draft: a follower needs a vocabulary slice");
+        detail::move_pair_slice(false, read_row(), follower_width, full, scratch, exchange);
+        words(std::span<const std::uint32_t>(send), std::span<std::uint32_t>(receive));
+        return receive[0];
+    }
+    if (sampler == nullptr) throw std::logic_error("pair draft: missing lead sampler");
+    const std::span<const float> local = read_row();
+    std::span<const float> row = local;
+    if (paired) {
+        detail::move_pair_slice(true, local, follower_width, full, scratch, exchange);
+        row = full;
+    }
+    auto draft = sampler->draft(row.first(std::min(vocabulary, row.size())), {}, position);
+    const std::uint32_t token = draft.token;
+    if (paired) {
+        send[0] = token;
+        words(std::span<const std::uint32_t>(send), std::span<std::uint32_t>(receive));
+    }
+    if (kept) *kept = std::move(draft);
+    return token;
+}
+
 }  // namespace strix::serve

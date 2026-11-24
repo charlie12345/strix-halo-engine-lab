@@ -41,17 +41,19 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
             missing = true;
             continue;
         }
-        const bool full = !(entry.row->measured_gain == Digest256{});
+        // Ladder rule: a full row needs its timing receipt AND a measured speedup beyond noise over the tier below.
+        const bool full = !(entry.row->measured_gain == Digest256{}) &&
+                          profile::ladder_gain(entry.row->evidence.speedup, entry.row->evidence.noise);
         entry.qualification = full ? RegimeQualification::full : RegimeQualification::gate_only;
+        if (!full) missing = true;  // a gate-only regime would run the lossy image with no measured gain
         if (full && !decision) decision = entry.row;
     }
     if (missing) decision = nullptr;
     plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
     if (plan.status == profile::Status::pending) {
         plan.reason = !runnable ? "shared format consumer unavailable"
-            : missing && regimes.size() > 1U ? "a regime of the image has no matching gate v2 PASS row"
-            : missing ? "no matching gate v2 PASS and measured gain"
-            : "gate v2 PASS without a measured gain in any regime";
+            : regimes.size() > 1U ? "a regime of the image has no gate v2 PASS row with a measured ladder gain"
+            : "no matching gate v2 PASS row with a measured ladder gain";
         return plan;
     }
     plan.storage = policy.target;

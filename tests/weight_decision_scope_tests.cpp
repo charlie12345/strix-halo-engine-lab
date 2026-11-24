@@ -97,8 +97,9 @@ int main() {
     ok &= check(hy4_head, "Hy4 head row names the generic head policy");
     // A decision row recorded under the former model-named key still selects the generic policy; another
     // policy, another revision or another key does not.
-    const std::array renamed{weight::WeightLoadDecision{legacy, scope, gate, gain},
-                             weight::WeightLoadDecision{attention_head.id, scope, gate, gain}};
+    const weight::WeightLoadEvidence timed{"receipts/timing", "2026-11-24", 16, 0, 1.10, 0.02};
+    const std::array renamed{weight::WeightLoadDecision{legacy, scope, gate, gain, timed},
+                             weight::WeightLoadDecision{attention_head.id, scope, gate, gain, timed}};
     ok &= check(weight::find_weight_load_decision(attention_head, scope, renamed) == renamed.data(),
                 "legacy decision row matches the generic policy");
     ok &= check(weight::find_weight_load_decision(attention_head, scope, std::span(renamed).last(1)) == &renamed[1],
@@ -126,7 +127,8 @@ int main() {
                 "EXACT receipt keeps BF16 storage");
 
     // Per-regime rows: one resident image serves prefill and decode. A gate-only row (gate v2 PASS, no measured
-    // gain) never selects the image; a full row selects it only when every regime of the image has a gate row.
+    // gain) never selects the image nor admits its regime (ladder rule); the image needs a full row with a measured
+    // speedup beyond noise in every regime it serves.
     {
         const std::array<std::string_view, 2> regimes{weight::kPrefillRegime, weight::kDecodeRegime};
         auto prefill = scope;
@@ -134,7 +136,9 @@ int main() {
         auto decode = scope;
         decode.regime = weight::kDecodeRegime;
         const weight::WeightLoadEvidence pf_receipt{"receipts/prefill", "2026-11-23", 2457, 0};
-        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536};
+        const weight::WeightLoadEvidence banded{"receipts/decode", "2026-11-23", 2457, 65536, 1.158, 0.02};
+        const weight::WeightLoadEvidence pf_timed{"receipts/prefill", "2026-11-23", 2457, 0, 1.05, 0.02};
+        const weight::WeightLoadEvidence pf_slower{"receipts/prefill", "2026-11-23", 2457, 0, 0.997, 0.02};
         const auto& q8 = weight::kAttentionHeadQ8Policy;
         weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, 32768};
         const auto resolve = [&](std::span<const weight::WeightLoadDecision> table) {
@@ -157,29 +161,50 @@ int main() {
         const std::array both{weight::WeightLoadDecision{q8.id, prefill, gate, {}, pf_receipt},
                               weight::WeightLoadDecision{q8.id, decode, gate, gain, banded}};
         p = resolve(both);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.status == strix::profile::Status::pending &&
+                        p.regimes[0].qualification == weight::RegimeQualification::gate_only &&
+                        p.regimes[1].qualification == weight::RegimeQualification::full,
+                    "ladder: a gate-only prefill row no longer admits prefill onto the decode image");
+        const std::array slower{weight::WeightLoadDecision{q8.id, prefill, gate, gain, pf_slower},
+                                weight::WeightLoadDecision{q8.id, decode, gate, gain, banded}};
+        p = resolve(slower);
+        ok &= check(p.storage == weight::kBf16WeightStorage && p.status == strix::profile::Status::pending &&
+                        p.regimes[0].qualification == weight::RegimeQualification::gate_only,
+                    "ladder: a timed prefill row inside the noise margin (x0.997) keeps the image BF16");
+        const std::array untimed{weight::WeightLoadDecision{q8.id, decode, gate, gain, pf_receipt}};
+        r.regimes = {};
+        r.scope = decode;
+        ok &= check(resolve(untimed).storage == weight::kBf16WeightStorage,
+                    "ladder: a gain digest without a measured speedup never selects");
+        r.regimes = regimes;
+        r.scope = scope;
+        const std::array full_both{weight::WeightLoadDecision{q8.id, prefill, gate, gain, pf_timed},
+                                   weight::WeightLoadDecision{q8.id, decode, gate, gain, banded}};
+        p = resolve(full_both);
         ok &= check(p.storage == weight::kQ8WeightStorage && p.status == strix::profile::Status::set &&
-                        p.measured_gain == gain && p.regimes[1].qualification == weight::RegimeQualification::full,
-                    "gate rows in every regime plus one full row select the image");
+                        p.measured_gain == gain && p.regimes[0].qualification == weight::RegimeQualification::full &&
+                        p.regimes[1].qualification == weight::RegimeQualification::full,
+                    "a measured ladder gain in every regime selects the image");
         r.context = 131072;
-        p = resolve(both);
+        p = resolve(full_both);
         ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == nullptr &&
-                        p.regimes[1].outside_band == &both[1], "a context outside the gate band is refused");
+                        p.regimes[1].outside_band == &full_both[1], "a context outside the gate band is refused");
         ok &= check(weight::weight_load_regime_receipt(p).ends_with("decode=none:outside-band<=65536"),
                     "outside-band receipt");
         r.context = 0;
-        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "unknown context never meets a banded row");
+        ok &= check(resolve(full_both).storage == weight::kBf16WeightStorage, "unknown context never meets a banded row");
         r.context = 32768;
         r.tier = strix::profile::Name::standard;
-        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "EXACT never takes a regime row");
+        ok &= check(resolve(full_both).storage == weight::kBf16WeightStorage, "EXACT never takes a regime row");
         r.tier = strix::profile::Name::fast;
         r.enabled = false;
-        ok &= check(resolve(both).status == strix::profile::Status::off, "off switch");
+        ok &= check(resolve(full_both).status == strix::profile::Status::off, "off switch");
         r.enabled = true;
         r.regimes = {};
         r.scope = decode;
-        ok &= check(resolve(both).storage == weight::kQ8WeightStorage, "single-regime request keeps its old meaning");
+        ok &= check(resolve(full_both).storage == weight::kQ8WeightStorage, "single-regime request keeps its old meaning");
         r.scope = prefill;
-        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
+        ok &= check(resolve(full_both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
     }
     return ok ? 0 : 1;
 }

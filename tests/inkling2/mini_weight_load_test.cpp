@@ -147,7 +147,8 @@ void test_selection() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto backend : {weight::Backend::hip, weight::Backend::cuda}) {
         const weight::WeightLoadScope scope{backend, "test-device", "test-compiler", "decode", digest(1), digest(2)};
-        const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4)}};
+        const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4),
+                                                             {"receipts/t", "2026-11-24", 16, 0, 1.10, 0.02}}};
         weight::WeightLoadRequest request{profile::Name::standard, scope, formats, true, true};
         const auto resolve = [&] {
             return mini::resolve_mini_weight_load(request.tier, request.scope, request.consumer_formats,

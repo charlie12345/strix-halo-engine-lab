@@ -82,6 +82,82 @@ inline unsigned value_column(const Row& lever, Name profile) {
     return column;
 }
 
+// Ladder rule: TURBO is never slower than FAST, FAST never slower than EXACT, in any regime. A lossy cell applies in a
+// regime only where a measured ladder row shows its tier faster than the tier below beyond the row's stated noise
+// margin; in every other regime (no row, a row within noise, a slower row) it resolves to the tier below, and the route
+// line says why. A regime is the phase, the context (prefill: prompt tokens; decode: resident context of the step), the
+// lane count and the device class. Rows are data next to the engine's lever table (Engine::ladder); the same predicate
+// gates weight-load decision rows (strix/weight/levers.hpp WeightLoadEvidence).
+enum class Phase : std::uint8_t { prefill, decode };
+inline constexpr std::uint64_t kNoContextBound = ~std::uint64_t{0};
+inline constexpr std::uint32_t kNoLaneBound = ~std::uint32_t{0};
+// Smallest noise margin a ladder row may state (fraction of throughput); a row's own margin can only be wider.
+inline constexpr double kLadderNoiseFloor = 0.01;
+
+struct Regime {
+    Phase phase = Phase::decode;
+    std::uint64_t context = 0;  // 0: not known (never inside a row's band)
+    std::uint32_t lanes = 1;
+    std::string_view device{};  // device class of the run ("sm_120", "gfx1151")
+};
+
+// One measured regime of one lossy cell: `speedup` = throughput of `tier` / throughput of the tier below on the same
+// build, device and regime (an ABAB receipt), `noise` its stated margin.
+struct LadderRow {
+    std::string_view lever;  // profile row name (or weight-load policy key)
+    std::string_view value;  // the measured value of the cell (empty: every value)
+    Name tier = Name::fast;  // fast | turbo: the column the value runs in
+    Phase phase = Phase::decode;
+    std::string_view device;  // measured device class (never empty)
+    std::uint64_t min_context = 1, max_context = kNoContextBound;
+    std::uint32_t min_lanes = 1, max_lanes = kNoLaneBound;
+    double speedup = 0.0;
+    double noise = 0.0;
+    std::string_view receipt;
+};
+
+[[nodiscard]] constexpr Name tier_below(Name tier) noexcept {
+    return tier == Name::turbo ? Name::fast : Name::standard;
+}
+[[nodiscard]] constexpr double ladder_margin(double noise) noexcept {
+    return noise > kLadderNoiseFloor ? noise : kLadderNoiseFloor;
+}
+// Strictly faster than the tier below beyond the noise margin (a zero or unmeasured speedup never is).
+[[nodiscard]] constexpr bool ladder_gain(double speedup, double noise) noexcept {
+    return speedup > 1.0 + ladder_margin(noise);
+}
+[[nodiscard]] constexpr bool ladder_covers(const LadderRow& row, std::string_view lever, std::string_view value,
+                                           Name tier, const Regime& regime) noexcept {
+    return row.lever == lever && (row.value.empty() || row.value == value) && row.tier == tier &&
+           row.phase == regime.phase && row.device == regime.device && regime.context >= row.min_context &&
+           regime.context <= row.max_context && regime.lanes >= row.min_lanes && regime.lanes <= row.max_lanes;
+}
+
+enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower };
+[[nodiscard]] constexpr std::string_view rung_name(Rung rung) noexcept {
+    return rung == Rung::applies ? "applies" : rung == Rung::unmeasured ? "unmeasured regime"
+        : rung == Rung::within_noise ? "within noise" : "slower";
+}
+struct LadderVerdict {
+    Rung rung = Rung::unmeasured;
+    const LadderRow* row = nullptr;  // the deciding row: the least favourable row covering the regime
+    Name resolved = Name::standard;  // the tier whose cell the regime runs
+};
+
+// The verdict of `value` of `lever` in `tier` for `regime`: applies only when every covering row shows a gain.
+[[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
+                                                   std::string_view value, Name tier, const Regime& regime) noexcept {
+    const LadderRow* worst = nullptr;
+    for (const auto& row : rows)
+        if (ladder_covers(row, lever, value, tier, regime) &&
+            (!worst || row.speedup - ladder_margin(row.noise) < worst->speedup - ladder_margin(worst->noise)))
+            worst = &row;
+    if (!worst) return {Rung::unmeasured, nullptr, tier_below(tier)};
+    if (ladder_gain(worst->speedup, worst->noise)) return {Rung::applies, worst, tier};
+    const bool slower = worst->speedup < 1.0 - ladder_margin(worst->noise);
+    return {slower ? Rung::slower : Rung::within_noise, worst, tier_below(tier)};
+}
+
 // One engine: its receipt tag, the allow-pending variable and the table.
 struct Engine {
     std::string_view tag;                   // "deepseek41-pair", "glm-pair", "minimax-pair"
@@ -90,6 +166,7 @@ struct Engine {
     bool quality_rows = false;              // false: 'quality' runs default with one notice
     std::string_view turbo_version{};       // versioned TURBO name ("ds41-turbo-v1"); empty: turbo refused
     turbo::WeightCaps weight_caps{};        // weight sources / widths this build can load under turbo
+    std::span<const LadderRow> ladder{};    // measured regimes of the lossy cells (ladder rule above)
 };
 
 // Tier words: exact | fast | turbo; `exact` is the default column (spelled "default" in receipts, kept as an alias).
@@ -518,6 +595,119 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
 // The statuses the profile itself applies (an explicit setting is the app's own).
 inline bool applied(Status status) {
     return status == Status::set || status == Status::unqualified || status == Status::provisional;
+}
+
+// The value the profile applies for `lever` in column `tier` (the builtin when the cell is empty, equal to the builtin
+// or pending), as resolve() admits it.
+[[nodiscard]] inline std::string_view column_cell(const Lever& lever, Name tier, bool allow_pending) {
+    const auto column = value_column(lever, tier);
+    const auto wanted = lever.value[column];
+    if (wanted.empty() || wanted == lever.builtin || tier == Name::standard) return lever.builtin;
+    if (admit_column(lever.ready[column], lever.runnable[column], allow_pending, lever.provisional[column]) ==
+        Status::pending)
+        return lever.builtin;
+    return wanted;
+}
+
+// What one lever runs in one regime under the ladder rule.
+struct LadderCell {
+    std::string_view value;          // the cell that runs
+    Name tier = Name::standard;      // the tier whose cell it is
+    std::string route;               // ' <tier>=<value> <rung>[ x<speedup> (<receipt>)]' per refused tier, then ' -> ...'
+};
+
+// The cell of a lossy lever (`kind` bit-changing or pack) for `tier` in `regime`: the tier's cell when a ladder row
+// shows it faster than the tier below beyond noise AND the tier below's own cell runs in this regime (the row was
+// measured against that cell); else the tier below, recursively, down to the builtin. Exact levers keep the tier's cell.
+[[nodiscard]] inline LadderCell ladder_cell(const Lever& lever, std::span<const LadderRow> rows, Name tier,
+                                            bool allow_pending, const Regime& regime) {
+    const auto value = column_cell(lever, tier, allow_pending);
+    if (lever.kind == Kind::exact || tier == Name::standard || value == lever.builtin) return {value, tier, {}};
+    const Name below = tier_below(tier);
+    auto lower = ladder_cell(lever, rows, below, allow_pending, regime);
+    if (value == column_cell(lever, below, allow_pending)) return lower;  // the tier below's cell: same configuration
+    std::string step = " " + std::string(name(tier)) + "=" + std::string(value) + " ";
+    const auto verdict = ladder_judge(rows, lever.name, value, tier, regime);
+    if (verdict.rung == Rung::applies && lower.value != column_cell(lever, below, allow_pending)) {
+        // Measured against the tier below's cell, which does not run here: no measurement against what does.
+        lower.route = step + "measured over " + std::string(name(below)) + "=" +
+                      std::string(column_cell(lever, below, allow_pending)) + ", which does not run here" + lower.route;
+        return lower;
+    }
+    step += rung_name(verdict.rung);
+    if (verdict.row) {
+        char ratio[32];
+        std::snprintf(ratio, sizeof ratio, " x%.3f noise %.3f", verdict.row->speedup, ladder_margin(verdict.row->noise));
+        step += ratio;
+        step += " (" + std::string(verdict.row->receipt) + ")";
+    }
+    if (verdict.rung == Rung::applies) return {value, tier, step};
+    lower.route = step + lower.route;
+    return lower;
+}
+
+// Route line of one lever in one regime: 'strix-ladder/v1 <lever> <phase> ctx=<n> lanes=<n> dev=<device>:<steps>
+// -> <tier>=<value>'. Says which cell runs and why every higher cell does not.
+[[nodiscard]] inline std::string ladder_route(std::string_view lever, const Regime& regime, const LadderCell& cell) {
+    std::string out = "strix-ladder/v1 " + std::string(lever) +
+                      (regime.phase == Phase::prefill ? " prefill ctx=" : " decode ctx=") + std::to_string(regime.context) +
+                      " lanes=" + std::to_string(regime.lanes) + " dev=" + std::string(regime.device) + ":";
+    out += cell.route;
+    out += " -> " + std::string(name(cell.tier)) + "=" + std::string(cell.value);
+    return out;
+}
+
+// The cell `key` runs in `regime` for a resolved profile. An explicit setting (CLI / environment) is the user's own and
+// runs as set; a profile-applied cell goes through the ladder of the resolved engine; anything else runs as resolved.
+[[nodiscard]] inline LadderCell ladder_value(const Resolution& resolution, std::string_view key, const Regime& regime) {
+    const Entry* entry = resolution.find(key);
+    if (entry == nullptr) return {};
+    if (!applied(entry->status) || resolution.quality_fallback())
+        return {entry->value, resolution.profile, " " + std::string(status_name(entry->status))};
+    return ladder_cell(*entry->lever, resolution.engine->ladder, resolution.profile, resolution.allow_pending, regime);
+}
+
+// First defect of an engine's ladder rows (empty: none). Every row names a lossy lever of the table, a fast or turbo
+// column whose cell is the row's value, a device, a receipt, a finite positive speedup, a noise margin in
+// [kLadderNoiseFloor, 1) and ordered bands starting at context >= 1.
+[[nodiscard]] inline std::string ladder_defect(const Engine& engine) {
+    const std::string tag(engine.tag);
+    for (const auto& row : engine.ladder) {
+        const std::string where = tag + "/" + std::string(row.lever) + "=" + std::string(row.value) + " " +
+                                  std::string(name(row.tier)) + " (" + std::string(row.receipt) + ")";
+        const Lever* lever = nullptr;
+        for (const auto& candidate : engine.table)
+            if (candidate.name == row.lever) lever = &candidate;
+        if (lever == nullptr) return where + ": ladder row names no lever of the table";
+        if (lever->kind == Kind::exact) return where + ": ladder row on an exact lever";
+        if (row.tier != Name::fast && row.tier != Name::turbo) return where + ": ladder rows are fast or turbo";
+        const auto cell = lever->value[value_column(*lever, row.tier)];
+        if (cell.empty() || (!row.value.empty() && row.value != cell))
+            return where + ": ladder row value is not the tier's cell";
+        if (row.device.empty() || row.receipt.empty()) return where + ": ladder row without device or receipt";
+        if (!(row.speedup > 0.0) || !(row.speedup < 1e6)) return where + ": ladder row speedup not measured";
+        if (!(row.noise >= kLadderNoiseFloor) || !(row.noise < 1.0))
+            return where + ": ladder row noise margin outside [floor, 1)";
+        if (row.min_context < 1 || row.min_context > row.max_context || row.min_lanes < 1 || row.min_lanes > row.max_lanes)
+            return where + ": ladder row band empty or unordered";
+    }
+    return {};
+}
+
+// Probe regimes of an engine's ladder: every row's band corners and the regime just outside each edge, per device and
+// phase. A walker resolves every lossy lever of every tier there (strix ladder host test).
+[[nodiscard]] inline std::vector<Regime> ladder_probes(const Engine& engine) {
+    std::vector<Regime> out;
+    for (const auto& row : engine.ladder) {
+        const std::uint64_t contexts[] = {row.min_context, row.max_context, row.min_context - 1,
+                                          row.max_context == kNoContextBound ? row.max_context : row.max_context + 1};
+        const std::uint32_t lanes[] = {row.min_lanes, row.max_lanes, row.min_lanes - 1,
+                                       row.max_lanes == kNoLaneBound ? row.max_lanes : row.max_lanes + 1};
+        for (const auto context : contexts)
+            for (const auto lane : lanes)
+                if (lane >= 1) out.push_back({row.phase, context, lane, row.device});
+    }
+    return out;
 }
 
 // FAST gate ledger: one passing FAST quality-gate receipt for one lever value of one engine, kept as data next to the

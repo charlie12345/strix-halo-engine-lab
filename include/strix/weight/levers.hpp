@@ -115,14 +115,18 @@ inline constexpr std::string_view kDecodeRegime = "decode";
 // Where a row's evidence lives. `receipt` is a stable repository-relative id of the gate report (or receipt set),
 // `date` its ISO date, `rows` the scored rows of the regime. `max_context` is the largest context the gate covered
 // when it was banded by context (0: not banded); a banded row applies only to an engine whose resident context is
-// known and inside the band.
+// known and inside the band. `speedup` is the measured throughput of the regime with the policy storage over the tier
+// below (same build, device, regime; the timing receipt behind measured_gain) and `noise` its stated margin: the ladder
+// rule (strix/engine_profile.hpp ladder_gain) admits the row only when the speedup clears 1 + max(noise, floor).
 struct WeightLoadEvidence {
     std::string_view receipt, date;
     std::uint32_t rows = 0, max_context = 0;
+    double speedup = 0.0, noise = 0.0;
 };
 
 // A row with a zero measured_gain records a gate v2 PASS without a speed gain in its regime: it never selects the
-// storage by itself, but admits its regime onto an image another regime's full row selects (see WeightLoadRequest).
+// storage, and under the ladder rule it does not admit its regime onto the policy image either (the regime would run
+// lossy weights with no measured gain); it is reported as gate-only.
 struct WeightLoadDecision {
     Id policy;
     WeightLoadScope scope;
@@ -139,8 +143,9 @@ struct WeightLoadRequest {
     bool enabled = true;
     bool allow_pending = false;  // Explicit, stamped qualification-arm opt-in.
     // Every regime that runs on the one resident image (empty: scope.regime alone). The image takes the policy storage
-    // only when some regime has a full row (gate v2 PASS and measured gain) and every listed regime has a gate v2 PASS
-    // row: a regime the gate did not pass would need a second resident image, which this resolver never selects.
+    // only when every listed regime has a full row (gate v2 PASS and a measured ladder gain): a regime without one would
+    // run lossy weights slower than (or no faster than) the tier below. An engine that keeps a second image asks each
+    // regime alone and routes per regime.
     std::span<const std::string_view> regimes{};
     std::uint32_t context = 0;  // resident context capacity in tokens (0: unknown; banded rows then never apply)
 };

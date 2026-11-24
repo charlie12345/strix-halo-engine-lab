@@ -249,7 +249,10 @@ public:
         if (!moe_w4a4_) return;
         for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
             moe_w4a4_layer_[layer] = mini_grouped::admit_w4a4<MiniMoeConfig>(layer, weights_.experts(layer));
-        if (!moe_nvfp4_) moe_nvfp4_.emplace(mini_grouped::workspace_elements<MiniMoeConfig>(max_rows_).nvfp4);
+        // The image bytes of the selected class (a two-term class needs two terms per row): the dispatch admits W4A4 only
+        // when the image holds the class, so a one-term image would run the two-term classes on the BF16 path.
+        const auto bytes = mini_grouped::workspace_elements<MiniMoeConfig>(max_rows_, activations).nvfp4;
+        if (!moe_nvfp4_ || moe_nvfp4_->span().size() < bytes) moe_nvfp4_.emplace(bytes);
 #endif
     }
 

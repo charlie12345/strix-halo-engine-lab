@@ -69,7 +69,7 @@ FAST cambia la numérica. Úsalo cuando el rendimiento importe más que una sali
 | `STRIX_DS41_FAST_ATTN=2` | deepseek | off | Opcional. Atención dispersa BF16 de una pasada sobre el núcleo flash compartido (`ds41-attn-bf16flash-v1`; `1` = la forma f16 WMMA anterior, más lenta que exacto). Puerta sola (1,280 filas): KL 0.0108, top-1 97.2 %, dNLL +0.0120: pasa el límite relativo al suelo +0.0155, falla el límite fijo de dNLL 0.01. |
 | `STRIX_DS41_FAST_DENSE=1` | deepseek | off | Opcional. Productos densos Q8_0 x A8 (q_b, o_a, o_b; llamadas de al menos `STRIX_DS41_FAST_DENSE_MIN_ROWS`, por defecto 128) en una cadena FP16 WMMA sobre el núcleo denso compartido, política `dense-q8a8-f16-v1`. Puerta sola (1,280 filas): KL 0.0100, top-1 98.1 %, dNLL +0.0146: pasa el límite relativo al suelo +0.0155, falla el límite fijo de dNLL 0.01. |
 | `STRIX_F16_Q8A8_WPACK=0` | compartido (lo enlaza DeepSeek) | on | Decodificación de pesos de la política `dense-q8a8-f16-v1`: on = dos pesos Q8_0 por operación FP16 empaquetada (perm, resta y producto empaquetados); `0` = un producto FP32 por peso, la forma anterior. Mismos bits (las 65.536 escalas x 256 códigos por el stager y todas las formas DS41); denso DS41 rango 0 a 11,6K entre -1,2 % (trozos de 1.024 filas) y -3,3 % (cola de 680). Kit: `ds41/dense-forms` (docs/benchmarking.md). |
-| `STRIX_GLM_PF_WMMA=1` | glm | off (on con `--profile fast` en rank) | Prefill WMMA. Identidad FAST opcional; `=0` la desactiva incluso en `fast`. |
+| `STRIX_GLM_PF_WMMA=1` | glm | off (activación explícita) | Prefill WMMA. Identidad FAST opcional; `=0` la desactiva incluso en `fast`. |
 
 ## La regla de régimen
 

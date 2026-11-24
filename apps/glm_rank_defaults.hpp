@@ -265,10 +265,15 @@ struct Effective {
 inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
     Effective e;
     e.baseline = baseline_requested(r, env);
+    const auto profile_env = [&](const char* key) -> const char* {
+        const char* value = env(key);
+        if (value != nullptr && std::string_view(key) == "STRIX_IDX_WMMA" && std::string_view(value) == "0") return "exact";
+        return value;
+    };
     if (r.product.profile || r.product.allow_pending ||
         strix::profile::turbo::has_weight_request(r.product.weights, env)) {
         auto inputs = r.product;
-        inputs.env = env;
+        inputs.env = profile_env;
         e.product = strix::profile::resolve(product_profile_engine, inputs);
         // Baseline vetoes profile additions; explicit environment values still win.
         if (e.baseline) for (auto& entry : e.product->entries) {

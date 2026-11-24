@@ -144,6 +144,20 @@ void test_glm_product_profiles() {
     CHECK(fast.product->qualification() == "qualified");
     CHECK(rd::print(fast).find("profile lever pf_wmma 1") == std::string::npos);
     CHECK(rd::print(fast) == rd::print(plain) + fast.product->describe());
+    const auto turbo = rd::resolve(rd::scan({"--profile", "turbo", "--allow-pending", "--decode", "64"}), empty);
+    // The incumbent TURBO cell keeps running; the added TURBO candidates stay at their builtin without a timing row.
+    CHECK(turbo.product && turbo.product->find("pf_wmma")->value == "1");
+    const auto* stored = turbo.product->find("stored_i4");
+    CHECK(stored && stored->value == "exl3" && stored->lever->runnable[3]);
+    for (const char* lever : {"mla_wmma", "kda_wmma", "attn_wmma", "idxproj_wmma", "router_wmma"})
+        CHECK(turbo.product->find(lever) && turbo.product->find(lever)->value == "0");
+    CHECK(turbo.product->find("idx_scores") && turbo.product->find("idx_scores")->value == "exact");
+    CHECK(exports(turbo).count("STRIX_GLM_MODEL_FORMAT") == 0);
+    CHECK(exports(turbo).count("STRIX_IDX_WMMA") == 0);
+    const Env explicit_i4{{"STRIX_GLM_MODEL_FORMAT", "fast_i4"}, {"STRIX_GLM_PF_WMMA", "1"}};
+    const auto i4 = rd::resolve(rd::scan({"--profile", "turbo"}), lookup(explicit_i4));
+    CHECK(i4.product->find("stored_i4") && i4.product->find("stored_i4")->value == "fast_i4");
+    CHECK(i4.product->find("pf_wmma")->value == "1");
     for (const char* value : {"0", "1", "", "1tail"}) {
         const Env env{{"STRIX_GLM_PF_WMMA", value}};
         const auto e = rd::resolve(rd::scan({"--profile=fast", "--decode", "64"}), lookup(env));

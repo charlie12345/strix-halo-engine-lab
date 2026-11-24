@@ -108,7 +108,7 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
     query.tier = requested;
     const auto policy = multi_device::parse_policy(description);
     auto decision = multi_device::select(policy, query);
-    decision.legacy = multi_device::legacy_overrides();
+    decision.legacy = multi_device::legacy_overrides(policy);
     config.set("multi_device", decision.json(policy, query));
     return {requested, column, std::move(kv), std::move(config), std::move(decision)};
 }

@@ -36,7 +36,12 @@ launch executes one engine, so it is admitted only when the decision is `single`
 `strix-router`, which holds the endpoints (start each worker with `--device-count 1`, then the router with the
 worker addresses); any other form is refused with its reason until an engine consumes it. A regime may name only
 declared forms, and its `wire` only forms that carry one (`layers`, `tensor`, `speculation`). Engine-local switches (`STRIX_*_PF_PIPE_CUT`, ...)
-still act inside the engine; the effective config lists the ones that are set under `multi_device.legacy_env`.
+still act inside the engine; the effective config lists the ones that are set under `multi_device.legacy_env`. That
+inventory is the model's own data: a model declares the switches its engines read under `[multi_device.legacy_env]`
+(`STRIX_NAME = "forms.layers.cut"`, the key planned to replace it), and only the selected model's entries are listed. A
+section with only `legacy_env` declares no placement policy. A regime `wire` that differs from the form's `wire` replaces it
+in the report (`wire`, `settings.wire`); the form's `declared_wire` is shown beside it, and a bit-changing wire is
+report-only (`wire_status`) until the shared resolver resolves a qualified lever for it (`lever` is parsed, not resolved).
 
 The reader (`src/model_description.cpp`) accepts a TOML subset: bare and dotted keys, tables, inline tables, arrays,
 single-line strings, decimal integers and floats, booleans. Anything else is an error with line and column.

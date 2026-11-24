@@ -90,6 +90,7 @@ int main(int argc, char** argv) {
         if (proxy_config.replicas.size() > strix::serve::ReplicaRouter::kMaxReplicas)
             throw std::invalid_argument("at most 64 replicas");
         if (!description_path.empty()) {
+            strix::serve::require_distinct_replicas(proxy_config.replicas);
             const auto preset = strix::profile::resolve_replica_router(strix::model_description::load(description_path),
                 tier, static_cast<std::uint32_t>(proxy_config.replicas.size()));
             std::cout << "effective-multi-device " << preset.config.find("multi_device")->dump() << std::endl;

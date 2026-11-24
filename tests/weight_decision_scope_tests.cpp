@@ -117,5 +117,10 @@ int main() {
                                                                         renamed)) ==
                     "strix-weight-load/v1 weights.attention_head.q8_0@1 plain.bf16@1 builtin",
                 "EXACT receipt keeps BF16 storage");
+    weight::WeightLoadPlan head_only{{"weights.head.q6_g64", 1}, weight::kBf16WeightStorage, strix::profile::Status::set, ""};
+    head_only.head_storage = weight::kQ6G64WeightStorage;
+    ok &= check(weight::weight_load_receipt(head_only) ==
+                    "strix-weight-load/v1 weights.head.q6_g64@1 plain.bf16@1 head strix.q6_g64@1 profile",
+                "receipt names a head storage that differs");
     return ok ? 0 : 1;
 }

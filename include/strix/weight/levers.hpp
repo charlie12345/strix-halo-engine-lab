@@ -191,8 +191,9 @@ const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy&, con
 WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
                                    const WeightLoadRequest&, std::span<const WeightLoadDecision>);
 
-// Receipt line of a resolved plan: 'strix-weight-load/v1 <policy id> <storage id> <status>'. The policy is
-// always printed under its generic id; a reader resolves older lines through find_weight_load_policy.
+// Receipt line of a resolved plan: 'strix-weight-load/v1 <policy id> <storage id> [head <head storage id>] <status>'
+// (the head part when the head storage differs). The policy is always printed under its generic id; a reader
+// resolves older lines through find_weight_load_policy.
 [[nodiscard]] inline std::string weight_load_receipt(const WeightLoadPlan& plan) {
     const auto put = [](std::string& out, Id id) {
         out += id.name;
@@ -203,6 +204,10 @@ WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
     put(out, plan.policy);
     out += ' ';
     put(out, plan.storage);
+    if (!(plan.head_storage == plan.storage)) {
+        out += " head ";
+        put(out, plan.head_storage);
+    }
     out += ' ';
     out += profile::status_name(plan.status);
     return out;

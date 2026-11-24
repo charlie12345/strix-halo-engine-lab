@@ -358,8 +358,8 @@ public:
 
 #if defined(__HIPCC__)
     // Projections on a BF16 operand image (the shared tile's image rows: same bits as dense on the FP32 rows).
-    static constexpr bool admits_dense_bf16_image(unsigned width, unsigned rows) {
-        return core::fma_rows::admits_bf16_image_rows(width, rows);
+    static bool admits_dense_bf16_image(unsigned width, unsigned rows, std::span<const Projection> projections) {
+        return core::fma_rows::admits_bf16_image_projections(width, rows, projections, kVocabulary);
     }
     void dense_bf16_image(const std::uint16_t* input, unsigned width, unsigned rows,
                           std::span<const Projection> projections) {

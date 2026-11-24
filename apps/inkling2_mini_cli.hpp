@@ -29,9 +29,10 @@ struct Options {
     MiniWeightOptions weights;
     bool gate_order_null{};
     profile::Resolution tier;
+    moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
 };
 
-inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family) {
+inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily& family, std::string_view backend = {}) {
     Options options;
     options.generation = serve::parse_serial_generation_cli(argc, argv, family,
         [&](std::string_view argument, const auto& value) {
@@ -84,6 +85,7 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
     options.tier = resolve_mini_profile(options.weights, !generation.tokenize_file);
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");
+    if (!backend.empty()) options.moe_w4a4 = admit_mini_moe_w4a4(options.tier, backend);
     return options;
 }
 

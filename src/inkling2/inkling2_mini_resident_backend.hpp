@@ -250,12 +250,17 @@ public:
         if (!moe_w4a4_) return;
         for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
             moe_w4a4_layer_[layer] = mini_grouped::admit_w4a4<MiniMoeConfig>(layer, weights_.experts(layer));
-        // The image bytes of the selected class (a two-term class needs two terms per row): the dispatch admits W4A4 only
-        // when the image holds the class, so a one-term image would run the two-term classes on the BF16 path.
-        const auto bytes = mini_grouped::workspace_elements<MiniMoeConfig>(max_rows_, activations).nvfp4;
+        // The shared dispatch refuses an image too small for the selected class.
+        const auto bytes = mini_moe_nvfp4_image_bytes(max_rows_, activations);
         if (!moe_nvfp4_ || moe_nvfp4_->span().size() < bytes) moe_nvfp4_.emplace(bytes);
 #endif
     }
+
+#if !defined(__HIPCC__)
+    [[nodiscard]] moe_core::grouped_w4a4::Activations moe_w4a4_class(unsigned layer) const noexcept {
+        return moe_w4a4_ && moe_w4a4_layer_[layer] ? moe_w4a4_class_ : moe_core::grouped_w4a4::Activations::bf16;
+    }
+#endif
 
     // True while a W4A4 class is bound (CUDA only; HIP refuses a selected class in set_moe_w4a4).
     [[nodiscard]] bool moe_w4a4_bound() const noexcept {
@@ -763,9 +768,10 @@ public:
 #if defined(__HIPCC__)
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span()};
 #else
-        const bool w4a4 = chunk_w4a4_ && moe_w4a4_layer_[layer];
+        using A = moe_core::grouped_w4a4::Activations;
+        const auto activations = chunk_w4a4_ ? moe_w4a4_class(layer) : A::bf16;
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), {},
-                                         w4a4 ? moe_nvfp4_->span() : std::span<std::uint8_t>{}};
+                                         activations != A::bf16 ? moe_nvfp4_->span() : std::span<std::uint8_t>{}};
 #endif
         const MiniMoeResidentRouteBuffers buffers{{ids, assignments}, {status, max_rows_},
                                                   route_scratch_.span(), route_weights};
@@ -780,9 +786,7 @@ public:
 #else
         check(enqueue_mini_cuda_resident_moe_decoded(moe_decode_, layer, rows, input, logits, bias, output, buffers,
                                                      matrices, csr, planned, workspace, stream_, gate_route_tap_,
-                                                     w4a4 ? moe_w4a4_class_
-                                                          : moe_core::grouped_w4a4::Activations::bf16,
-                                                     moe_schedule_));
+                                                     activations, moe_schedule_));
 #endif
     }
 

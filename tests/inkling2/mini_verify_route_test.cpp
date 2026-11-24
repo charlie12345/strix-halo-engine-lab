@@ -1,8 +1,10 @@
 #include "attn_core/prepared_gqa_attention.hpp"
+#include "inkling2/inkling2_mini_moe_dispatch.hpp"
 #include "inkling2/inkling2_mini_resident_route.hpp"
 
 #include <array>
 #include <iostream>
+#include <vector>
 
 namespace {
 
@@ -58,6 +60,22 @@ constexpr bool check_w4a4_rows() {
 
 static_assert(check_w4a4_rows());
 
+bool check_w4a4_reservation() {
+    using namespace strix::inkling2;
+    using A = strix::moe_core::grouped_w4a4::Activations;
+    constexpr unsigned rows = 128U;
+    const auto one_term = mini_moe_nvfp4_image_bytes(rows, A::nvfp4);
+    for (auto activations : {A::nvfp4_mse_r2_gate_up, A::nvfp4_mse_r2, A::nvfp4_r2}) {
+        const auto bytes = mini_moe_nvfp4_image_bytes(rows, activations);
+        if (bytes <= one_term) return false;
+        std::vector<std::uint8_t> storage(bytes + 255U);
+        auto* aligned = storage.data() + (256U - reinterpret_cast<std::uintptr_t>(storage.data()) % 256U) % 256U;
+        if (!mini_grouped::nvfp4_image_fits<MiniMoeConfig>({aligned, bytes}, rows, activations) ||
+            mini_grouped::nvfp4_image_fits<MiniMoeConfig>({aligned, one_term}, rows, activations)) return false;
+    }
+    return true;
+}
+
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;
     static constexpr unsigned kKvWidth = 2U;
@@ -98,6 +116,10 @@ bool check_windows() {
 }  // namespace
 
 int main() {
+    if (!check_w4a4_reservation()) {
+        std::cerr << "FAIL Inkling Mini resident W4A4 reservation\n";
+        return 1;
+    }
     if (!check_windows()) {
         std::cerr << "FAIL Inkling Mini verify attention row views\n";
         return 1;

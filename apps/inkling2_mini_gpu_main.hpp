@@ -121,10 +121,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     const auto load_start = session::CliClock::now();
     MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
-    const auto moe_w4a4 = admit_mini_moe_w4a4(options.tier, kMiniBuildBackend);
-    decoder.set_moe_w4a4(moe_w4a4);
-    if (mini_moe_w4a4(options.tier))
-        std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(moe_w4a4) << '\n';
+    decoder.set_moe_w4a4(options.moe_w4a4);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
     if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
@@ -270,15 +267,15 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const auto program_options = cli::extract_step_program(arguments);
-        auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family);
+        auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family, kMiniBuildBackend);
 #else
-        auto options = cli::parse(argc, argv, family);
+        auto options = cli::parse(argc, argv, family, kMiniBuildBackend);
 #endif
+        // The native parser admits W4A4 before the weight scope can query the device or hash the checkpoint.
         const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
         const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
-        // The W4A4 class admitted for this build's backend (refused before any load when the backend cannot run it).
-        const auto moe_w4a4 = admit_mini_moe_w4a4(options.tier, kMiniBuildBackend);
+        const auto moe_w4a4 = options.moe_w4a4;
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
         const bool resident_k1 = grouped_prepare && std::string_view(grouped_prepare) == "1";

@@ -166,12 +166,12 @@ int main() {
     std::mt19937 random(20261124U);
     std::size_t compared = 0;
     // (rows, width, rank, in place, row-owner expected): the Inkling controller (width 2304, rank 64) with full and
-    // partial 16-row blocks, in place, narrow widths with rank 16 and 48 (a K16 tail in the incumbent tile), and decode
-    // rows that keep the two launches.
+    // partial 16-row blocks, in place, narrow widths with rank 16 and 48 (a K16 tail in the incumbent tile), rows of
+    // 256 values (the separate norm's one-wave form: two launches) and decode rows that keep the two launches.
     const struct { unsigned rows, width, rank; bool in_place, owned; } cases[] = {
-        {1000U, 2304U, 64U, false, true}, {300U, 2304U, 64U, true, true}, {17U, 2304U, 64U, false, true},
-        {129U, 256U, 16U, false, true},   {77U, 256U, 48U, true, true},   {4U, 2304U, 64U, false, false},
-        {16U, 256U, 64U, true, false},
+        {1000U, 2304U, 64U, false, true}, {300U, 2304U, 64U, true, true},  {17U, 2304U, 64U, false, true},
+        {129U, 384U, 16U, false, true},   {77U, 384U, 48U, true, true},    {77U, 256U, 48U, true, false},
+        {129U, 256U, 16U, false, false},  {4U, 2304U, 64U, false, false},  {16U, 256U, 64U, true, false},
     };
     for (const auto& c : cases) {
         if (run(c.rows, c.width, c.rank, c.in_place, c.owned, random, compared) != 1) {

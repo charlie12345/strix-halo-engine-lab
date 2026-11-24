@@ -194,7 +194,8 @@ bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, uns
 // writes or reads: every output [rows][outputs] FP32 shares no byte with the FP32 input rows [rows][input_width], with
 // another projection's output or with another projection's weights [outputs][pitch]. A call with such an ordered alias
 // (for example an FMA group and a later packed group writing the same output buffer) keeps the incumbent sequence.
-// Sizes that do not fit an address count as overlapping.
+// input is null for a call that reads only a producer-stored operand image. Sizes that do not fit an address count as
+// overlapping.
 inline bool image_routes_order_free(const float* input, unsigned input_width, unsigned rows,
                                     std::span<const Bf16RowProjection> projections) noexcept {
     using Address = std::uintptr_t;
@@ -216,7 +217,7 @@ inline bool image_routes_order_free(const float* input, unsigned input_width, un
     const auto in = range(input, Address{rows} * input_width, sizeof(float));
     for (std::size_t i = 0; i < projections.size(); ++i) {
         const auto out = range(projections[i].output, Address{rows} * projections[i].outputs, sizeof(float));
-        if (!apart(out, in)) return false;
+        if (input && !apart(out, in)) return false;
         for (std::size_t j = 0; j < projections.size(); ++j) {
             if (j == i) continue;
             const auto& other = projections[j];

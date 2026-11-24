@@ -14,7 +14,9 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
 
+#include "attn_core/prepared_gqa.hpp"
 #include "core/fma_bf16_rows.hpp"
+#include "core/row_transforms.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,11 +27,58 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
 
 namespace fma_rows = strix::core::fma_rows;
+
+// An admitted plan is opaque: callers cannot build one from fields, aggregate-initialise it or write the route, the
+// descriptors or the span it carries; the one read is a const admission query.
+using Plan = fma_rows::Bf16ImageCallPlan;
+template <class T>
+concept BuildsFromFields = requires(T) {
+    T{{}, {}, static_cast<const std::uint16_t*>(nullptr), std::size_t{1}, 1U, 1U, 1U, std::size_t{1}, true};
+};
+template <class T>
+concept WritesAdmittedFields = requires(T& plan) { plan.admitted = true; } || requires(T& plan) { plan.image_size = 1U; } ||
+                               requires(T& plan) { plan.projections[0].output = nullptr; } ||
+                               requires(T& plan) { plan.routes[0] = strix::core::ImageRoute::fp32_rows; } ||
+                               requires(T& plan) { plan.image = nullptr; };
+static_assert(!std::is_aggregate_v<Plan>, "the plan must not be an aggregate");
+static_assert(!BuildsFromFields<Plan>, "the plan must not be constructible from its fields");
+static_assert(!WritesAdmittedFields<Plan>, "no admitted field may be writable by a caller");
+static_assert(std::is_same_v<decltype(std::declval<const Plan&>().admitted()), bool>, "the admission query is const");
+// Only the checked admission function builds an admitted plan: no caller-visible default or field constructor, no
+// factory function on the type, and copies are the only other way to hold one.
+template <class T>
+concept HasPlanFactory = requires { T::make(); } || requires { T::admit(); } || requires { T::create(); };
+static_assert(!std::is_default_constructible_v<Plan>, "no public default construction");
+static_assert(!std::is_constructible_v<Plan, bool> && !std::is_constructible_v<Plan, const Plan*>);
+static_assert(!HasPlanFactory<Plan>, "no factory on the plan");
+static_assert(std::is_copy_constructible_v<Plan> && !std::is_aggregate_v<Plan>);
+
+// The prepared GQA hook finds the image path of a backend that returns the sealed plan (and not of one that returns the
+// old data-member form).
+struct SealedPlanBackend {
+    using Status = int;
+    fma_rows::Bf16ImageCallPlan output_image_plan(unsigned, unsigned, std::span<const int>, const float*,
+                                                  const float*) const;
+    Status gate_image(const float*, const float*, std::size_t) const;
+    Status linear_image(const fma_rows::Bf16ImageCallPlan&, unsigned, unsigned, std::span<const int>) const;
+};
+struct DataMemberPlan {
+    bool admitted;
+};
+struct DataMemberPlanBackend {
+    DataMemberPlan output_image_plan(unsigned, unsigned, std::span<const int>, const float*, const float*) const;
+    int gate_image(const float*, const float*, std::size_t) const;
+    int linear_image(const DataMemberPlan&, unsigned, unsigned, std::span<const int>) const;
+};
+static_assert(strix::attn_core::detail::PreparedGqaGateImage<SealedPlanBackend, int>);
+static_assert(!strix::attn_core::detail::PreparedGqaGateImage<DataMemberPlanBackend, int>);
 using strix::core::Bf16RowProjection;
 
 constexpr unsigned kMaxOutputs = 1U << 20U;
@@ -494,6 +543,165 @@ int main(int argc, char** argv) {
             for (auto* p : img.outputs) require(hipFree(p), "free");
         }
         for (auto* w : weights) require(hipFree(w), "free");
+    }
+    {  // gate -> image: the gate's own image + enqueue_bf16_rows_from_image == FP32 gated rows + the routed entry
+        namespace rt = strix::core::row_transforms;
+        const unsigned K = 3072U, N = 2304U, ld = 3200U;  // the pitched output projection
+        std::vector<std::uint16_t> w(std::size_t{N} * ld, std::uint16_t{0x7FC0U});
+        for (unsigned o = 0; o < N; ++o)
+            for (unsigned k = 0; k < K; ++k) w[std::size_t{o} * ld + k] = bf16(0.05F * nd(rng));
+        auto* weights = device<std::uint16_t>(w.size());
+        require(hipMemcpy(weights, w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+        std::vector<float> logits(std::size_t{max_rows} * K);
+        for (auto& v : logits) v = 2.0F * nd(rng);
+        logits[5] = INFINITY, logits[6] = -INFINITY, logits[7] = NAN, logits[8] = -0.0F;
+        auto* gate = device<float>(logits.size());
+        require(hipMemcpy(gate, logits.data(), logits.size() * 4U, hipMemcpyHostToDevice), "gate");
+        auto* gated = device<float>(logits.size());
+        auto* out_a = device<float>(std::size_t{max_rows} * N);
+        auto* out_b = device<float>(std::size_t{max_rows} * N);
+        const std::span<std::uint16_t> scratch(image, host_a.size());
+        for (const unsigned rows : {1000U, 1024U, 8192U, 8209U}) {
+            for (const bool rounded : {false, true}) {
+                const Bf16RowProjection pa{weights, N, out_a, rounded, std::size_t{ld} * 2U};
+                const Bf16RowProjection pb{weights, N, out_b, rounded, std::size_t{ld} * 2U};
+                require(hipMemset(out_a, 0xFF, std::size_t{rows} * N * 4U), "seed");
+                require(hipMemset(out_b, 0xFF, std::size_t{rows} * N * 4U), "seed");
+                const std::size_t n = std::size_t{rows} * K;
+                require(rt::elements(n, rt::Bf16SigmoidProduct{a, gate, gated}, nullptr), "gate");
+                require(fma_rows::enqueue_bf16_rows_routed(gated, K, rows, {&pa, 1U}, kMaxOutputs, scratch, nullptr),
+                        "routed");
+                const float* sources[2] = {a, gate};
+                const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch, sources);
+                const bool reads = plan.admitted();
+                bool same = reads == (rows == 8192U || rows == 8209U);  // literal: the measured pitched o shape, 4,096..9,216 rows
+                if (reads) {
+                    require(rt::elements(n, rt::Bf16SigmoidProductImage{a, gate, image}, nullptr), "gate image");
+                    require(fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U}, kMaxOutputs,
+                                                                   nullptr),
+                            "from image");
+                } else {
+                    same = same && fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U},
+                                                                          kMaxOutputs, nullptr) == hipErrorNotSupported;
+                    require(fma_rows::enqueue_bf16_rows_routed(gated, K, rows, {&pb, 1U}, kMaxOutputs, scratch, nullptr),
+                            "routed b");
+                }
+                require(hipDeviceSynchronize(), "sync");
+                std::vector<float> ha(std::size_t{rows} * N), hb(ha.size());
+                require(hipMemcpy(ha.data(), out_a, ha.size() * 4U, hipMemcpyDeviceToHost), "a");
+                require(hipMemcpy(hb.data(), out_b, hb.size() * 4U, hipMemcpyDeviceToHost), "b");
+                same = same && std::memcmp(ha.data(), hb.data(), ha.size() * 4U) == 0;
+                std::cout << "gate_image rows " << rows << " round " << rounded << " reads_image " << reads << ' '
+                          << (same ? "EXACT" : "DIFFER") << '\n';
+                ok = ok && same;
+            }
+        }
+        {  // review r17: an image over a gate input (attended rows a, gate logits) or over a weight is refused before
+           // any launch: the plan is not admitted, the consumer launches nothing, every byte under the image survives.
+            const unsigned rows = 8192U;
+            const std::size_t n = std::size_t{rows} * K;
+            auto* big = device<std::uint16_t>(n + w.size() + 64U);  // weights at 0, an image from byte 16 on
+            require(hipMemcpy(big, w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w big");
+            const Bf16RowProjection pw{big, N, out_b, false, std::size_t{ld} * 2U};
+            const Bf16RowProjection pc{weights, N, out_b, false, std::size_t{ld} * 2U};
+            require(hipMemset(out_b, 0xFF, std::size_t{rows} * N * 4U), "seed");
+            const float* sources[2] = {a, gate};
+            struct Overlap {
+                const char* name;
+                const Bf16RowProjection* projection;
+                std::uint16_t* image;
+            };
+            const Overlap overlaps[] = {{"attended", &pc, reinterpret_cast<std::uint16_t*>(a) + 8U},
+                                        {"gate_logits", &pc, reinterpret_cast<std::uint16_t*>(gate) + 8U},
+                                        {"weight", &pw, big + 8U}};
+            for (const auto& o : overlaps) {
+                const std::span<const std::uint16_t> view(o.image, n);
+                const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {o.projection, 1U}, kMaxOutputs, view,
+                                                                      sources);
+                const bool refused =
+                    !plan.admitted() && fma_rows::enqueue_bf16_rows_from_image(plan, view, K, rows, {o.projection, 1U},
+                                                                             kMaxOutputs, nullptr) == hipErrorNotSupported;
+                require(hipDeviceSynchronize(), "sync");
+                std::vector<float> ha(host_a.size()), hg(logits.size()), ho(std::size_t{rows} * N);
+                std::vector<std::uint16_t> hw(w.size());
+                require(hipMemcpy(ha.data(), a, ha.size() * 4U, hipMemcpyDeviceToHost), "a back");
+                require(hipMemcpy(hg.data(), gate, hg.size() * 4U, hipMemcpyDeviceToHost), "gate back");
+                require(hipMemcpy(hw.data(), big, hw.size() * 2U, hipMemcpyDeviceToHost), "w back");
+                require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
+                const bool guarded = std::memcmp(ha.data(), host_a.data(), ha.size() * 4U) == 0 &&
+                                     std::memcmp(hg.data(), logits.data(), hg.size() * 4U) == 0 &&
+                                     std::memcmp(hw.data(), w.data(), hw.size() * 2U) == 0 &&
+                                     std::all_of(ho.begin(), ho.end(), [](float v) {
+                                         std::uint32_t bits = 0;
+                                         std::memcpy(&bits, &v, 4U);
+                                         return bits == 0xFFFFFFFFU;
+                                     });
+                std::cout << "gate_image_overlap " << o.name << (refused ? " refused" : " ADMITTED")
+                          << (guarded ? " guard-intact" : " GUARD-CHANGED") << (refused && guarded ? " PASS" : " FAIL")
+                          << '\n';
+                ok = ok && refused && guarded;
+            }
+            require(hipFree(big), "free");
+        }
+        {  // review r20: the plan binds the descriptors and the image span it admitted. A consumer call with a substituted
+           // descriptor at the same count (the output moved into the image) or a shorter view of the same image is
+           // refused before any launch: the output rows and the image keep every byte.
+            const unsigned rows = 8192U;
+            const Bf16RowProjection pc{weights, N, out_b, false, std::size_t{ld} * 2U};
+            const float* sources[2] = {a, gate};
+            const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {&pc, 1U}, kMaxOutputs, scratch, sources);
+            auto moved = pc;
+            moved.output = reinterpret_cast<float*>(scratch.data());
+            require(hipMemset(out_b, 0xFF, std::size_t{rows} * N * 4U), "seed");
+            require(hipMemset(scratch.data(), 0x5A, scratch.size() * 2U), "seed image");
+            const bool substituted = fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&moved, 1U},
+                                                                            kMaxOutputs, nullptr) == hipErrorNotSupported;
+            const bool short_view = fma_rows::enqueue_bf16_rows_from_image(plan, scratch.first(1U), K, rows, {&pc, 1U},
+                                                                           kMaxOutputs, nullptr) == hipErrorNotSupported;
+            require(hipDeviceSynchronize(), "sync");
+            std::vector<float> ho(std::size_t{rows} * N);
+            std::vector<std::uint16_t> hi(scratch.size());
+            require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
+            require(hipMemcpy(hi.data(), scratch.data(), hi.size() * 2U, hipMemcpyDeviceToHost), "image back");
+            const bool guarded = std::all_of(ho.begin(), ho.end(), [](float v) {
+                                     std::uint32_t bits = 0;
+                                     std::memcpy(&bits, &v, 4U);
+                                     return bits == 0xFFFFFFFFU;
+                                 }) &&
+                                 std::all_of(hi.begin(), hi.end(), [](std::uint16_t v) { return v == 0x5A5AU; });
+            // a refused admission (a one-element span) is a plan that launches nothing
+            const auto inert = fma_rows::plan_bf16_rows_from_image(K, rows, {&pc, 1U}, kMaxOutputs, scratch.first(1U), sources);
+            const bool inert_refused =
+                !inert.admitted() && fma_rows::enqueue_bf16_rows_from_image(inert, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
+                                                                           nullptr) == hipErrorNotSupported;
+            // device binding: another current device (injected) refuses the plan admitted here, and a plan admitted on
+            // another (injected) device is refused here; nothing is enqueued either way
+            int here = -1;
+            require(hipGetDevice(&here), "device");
+            const fma_rows::ImageDeviceClass elsewhere{"gfx1151", 32U, 40U, here + 1};
+            bool device_bound = false;
+            {
+                const fma_rows::ScopedImageDeviceClass scoped(elsewhere);
+                device_bound = fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
+                                                                     nullptr) == hipErrorNotSupported;
+            }
+            Plan remote = inert;
+            {
+                const fma_rows::ScopedImageDeviceClass scoped(elsewhere);
+                remote = fma_rows::plan_bf16_rows_from_image(K, rows, {&pc, 1U}, kMaxOutputs, scratch, sources);
+            }
+            device_bound = device_bound && remote.admitted() &&
+                           fma_rows::enqueue_bf16_rows_from_image(remote, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
+                                                                  nullptr) == hipErrorNotSupported;
+            const bool pass = plan.admitted() && substituted && short_view && inert_refused && device_bound && guarded;
+            std::cout << "gate_image_plan_binding admitted " << plan.admitted() << " substituted "
+                      << (substituted ? "refused" : "ADMITTED") << " short_view " << (short_view ? "refused" : "ADMITTED") << " device_bound " << (device_bound ? "refused" : "LAUNCHED")
+                      << (guarded ? " guard-intact" : " GUARD-CHANGED") << (pass ? " PASS" : " FAIL") << '\n';
+            ok = ok && pass;
+        }
+        for (void* p : {static_cast<void*>(weights), static_cast<void*>(gate), static_cast<void*>(gated),
+                        static_cast<void*>(out_a), static_cast<void*>(out_b)})
+            require(hipFree(p), "free");
     }
     std::cout << (ok ? "ALL PASS" : "FAILED") << '\n';
     return ok ? 0 : 1;

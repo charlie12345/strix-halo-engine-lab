@@ -327,9 +327,9 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
         } else if (wanted.empty()) {
             continue;
         } else {
-            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit);
+            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit, out.allow_pending);
             entry.ladder = std::move(cell.route);
-            const auto admission = admit(column);
+            const auto admission = cell.benchmark ? strix::profile::Status::unqualified : admit(column);
             if ((!entry.ladder.empty() && cell.value == lever.builtin) ||
                 admission == strix::profile::Status::pending) {
                 if (lever.builtin_unqualified)

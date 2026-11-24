@@ -3826,8 +3826,8 @@ inline Options parse_options(
         options.tokens.empty() ? options.context_tokens : static_cast<std::uint64_t>(options.tokens.size());
     options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
     // A serving capacity is not a request's actual prompt length.
-    options.product_profile_inputs.regime = {strix::profile::Phase::prefill,
-        options.http_serve ? 0 : options.tokens.size(), 1, device_class};
+    options.product_profile_inputs.regime = options.http_serve ? strix::profile::startup_prefill_regime(device_class)
+        : strix::profile::Regime{strix::profile::Phase::prefill, options.tokens.size(), 1, device_class};
     options.product_profile = strix::qwen::profile::resolve(
         options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
     // KV precision: native BF16 in every tier (no FP8 here, so turbo keeps BF16 with a note); only --kv changes it.

@@ -47,6 +47,8 @@ struct Regime {
     bool drafter = false;
     bool linear_session = true;
     bool uniform_prompt_length = true;
+    std::string_view cost_device{};
+    sp::JointWorkload workload{};
 };
 inline const char* weights_name(Weights w) {
     return w == Weights::nvfp4_rtn ? "nvfp4-rtn (onfly/converted)" : w == Weights::nvfp4_native ? "nvfp4-native" : "exact-pack";
@@ -115,14 +117,14 @@ struct Qualified {
     sp::RegimeGate gate;
 };
 inline constexpr Qualified qualified[] = {
-    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_arith", "", 0, sp::kNoPromptBound,
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_arith", "fast4", 0, sp::kNoPromptBound,
      "52dd7d1f0: FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack); 8K 13,437-13,714 tok/s"}},
     // chunk16tc (gdn-chunk16-tf32-v2) gated in the FAST compositions on the converted NVFP4 pack, RTX PRO 6000 at 600 W:
     // 8K (fast4) 2/2 windows PASS pooled KL 0.01243 top-1 0.9727 dNLL -0.0108; 32K (fast4 + attn8) 2/2 windows PASS pooled
     // KL 0.00761 top-1 0.9727 dNLL -0.0047. The earlier chunk16 receipt (52dd7d1f0) stays valid for --prefill-gdn chunk16.
-    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_gdn", "", 0, sp::kNoPromptBound,
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_gdn", "chunk16tc", 0, sp::kNoPromptBound,
      "gdn-chunk16-tf32-v2 with fast4: 8K gate 2/2 windows PASS (KL 0.01243); with fast4 + attn8: 32K gate 2/2 windows PASS (KL 0.00761)"}},
-    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_attn8", "", 8192, sp::kNoPromptBound,
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_attn8", "on", 8192, sp::kNoPromptBound,
      "with fast4 + chunk16: 8K gate 2/2 windows PASS (KL 0.01498); 32K gate 2/2 windows PASS (KL 0.00589); "
      "with fast4 + chunk16tc: 32K gate 2/2 windows PASS (KL 0.00761)"}},
     // nvfp4-splitk-fast-v1 on the spec CLI (converted NVFP4 pack, RTX PRO 6000 at 600 W, greedy, sub15d): quality gate
@@ -131,7 +133,7 @@ inline constexpr Qualified qualified[] = {
     // 14.068 / 14.079 -> 13.993 / 13.980 ms per step (think), 14.936 / 14.937 -> 14.849 / 14.812 (code); tok/s think
     // 262.02 / 261.66 -> 263.83 / 263.90, code 334.32 / 333.94 -> 335.53 / 336.18. No other lever is offered on this
     // route, so FAST-before == EXACT.
-    {Weights::nvfp4_rtn, Route::windows, {"split_k", "", 0, sp::kNoPromptBound,
+    {Weights::nvfp4_rtn, Route::windows, {"split_k", "fast", 0, sp::kNoPromptBound,
      "gate EXACT -> FAST pooled KL 0.00000 top-1 0.9990; spec ids == FAST serial x1200 (4 contents); "
      "verify -0.6 % think, -0.7 % code (RTX PRO 6000, 600 W)"}},
     // Decode CLI (large prefill) row: NOT added. There `fast` already applies fast4 + chunk16tc and the composition
@@ -143,15 +145,23 @@ inline constexpr Qualified qualified[] = {
 // identities and prompt bands they ran in (same shape as `qualified`). A grant keeps the cell applying where no timing
 // row covers the regime; it is NOT derived from `qualified`, so a new quality row (a pending cell such as prefill_hid, or
 // a wider band) leaves its cell at the tier below until a matching timing row is registered. Do not add rows here.
-inline constexpr Qualified incumbent_grants[] = {
-    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_arith", "", 0, sp::kNoPromptBound,
+struct IncumbentGrant {
+    Qualified qualified;
+    std::string_view identity;
+};
+inline constexpr IncumbentGrant incumbent_grants[] = {
+    {{Weights::nvfp4_rtn, Route::large_prefill, {"prefill_arith", "fast4", 0, sp::kNoPromptBound,
      "frozen incumbent: 52dd7d1f0 FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack)"}},
-    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_gdn", "", 0, sp::kNoPromptBound,
+     "fast4 (nvfp4-tile-mma-f32-v1, identity -pf-fast4)"},
+    {{Weights::nvfp4_rtn, Route::large_prefill, {"prefill_gdn", "chunk16tc", 0, sp::kNoPromptBound,
      "frozen incumbent: gdn-chunk16-tf32-v2 with fast4 gate 8K / 32K PASS"}},
-    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_attn8", "", 8192, sp::kNoPromptBound,
+     "chunk16tc (gdn-chunk16-tf32-v2: split-TF32 tensor-core chunk scan, identity -gdnc16t2)"},
+    {{Weights::nvfp4_rtn, Route::large_prefill, {"prefill_attn8", "on", 8192, sp::kNoPromptBound,
      "frozen incumbent: with fast4 + chunk16 / chunk16tc gate 8K / 32K 2/2 windows PASS"}},
-    {Weights::nvfp4_rtn, Route::windows, {"split_k", "", 0, sp::kNoPromptBound,
+     "on (e4m3 flash over an e4m3 KV shadow, identity -a8)"},
+    {{Weights::nvfp4_rtn, Route::windows, {"split_k", "fast", 0, sp::kNoPromptBound,
      "frozen incumbent: nvfp4-splitk-fast-v1 gate EXACT -> FAST pooled KL 0.00000 top-1 0.9990, spec ids == FAST serial x1200"}},
+     "fast (nvfp4-splitk-fast-v1, identity -skf1)"},
 };
 
 inline bool offered(std::string_view lever, Route route, bool drafter = false) {
@@ -160,11 +170,29 @@ inline bool offered(std::string_view lever, Route route, bool drafter = false) {
     for (const auto windowed : kWindowsLevers) if (windowed == lever) return true;
     return false;
 }
-inline const Qualified* qualification(std::string_view lever, const Regime& regime, std::span<const Qualified> rows) {
+inline const Qualified* qualification(std::string_view lever, std::string_view value, const Regime& regime, std::span<const Qualified> rows) {
     for (const auto& q : rows)
-        if (q.weights == regime.weights && q.route == regime.route && sp::regime_covers(q.gate, lever, "", regime.prompt_tokens))
+        if (q.weights == regime.weights && q.route == regime.route && sp::regime_covers(q.gate, lever, value, regime.prompt_tokens))
             return &q;
     return nullptr;
+}
+
+inline const IncumbentGrant* incumbent_grant(const Lever& lever, const Regime& regime,
+                                             std::span<const IncumbentGrant> grants) {
+    for (const auto& grant : grants)
+        if (lever.target == grant.identity && qualification(lever.name, lever.value[static_cast<unsigned>(Name::fast)],
+                                                          regime, std::span(&grant.qualified, 1)))
+            return &grant;
+    return nullptr;
+}
+
+// Version of the builtin CUDA execution bound by joint receipts. The resolved options below include all per-lever
+// overrides of this execution; the caller supplies the device and complete workload of the supported launch form.
+inline std::string joint_execution(const sp::Resolution& resolution) {
+    std::string identity = "qwen35-cuda-dense-run@1";
+    for (const auto& entry : resolution.entries)
+        identity += " " + std::string(entry.lever->name) + "=" + entry.value;
+    return identity;
 }
 
 // Qualification records are scoped to the exact weight form, prefill route and linear session.
@@ -215,7 +243,7 @@ struct Resolved {
 inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regime& regime, const sp::Pairs& cli,
                                          std::span<const Qualified> rows = qualified,
                                          std::span<const TurboEvidence> evidence = turbo_evidence,
-                                         std::span<const Qualified> grants = incumbent_grants) {
+                                         std::span<const IncumbentGrant> grants = incumbent_grants) {
     auto out = std::make_unique<Resolved>();
     out->regime = regime;
     const bool turbo = profile == Name::turbo;
@@ -231,24 +259,6 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
                 if (!paired_half(row)) out->ladder.push_back(row);
     const sp::Regime timing_regime{
         sp::Phase::prefill, regime.uniform_prompt_length && regime.linear_session ? regime.prompt_tokens : 0, 1, regime.arch};
-    // One shared admission of the pair: a joint receipt on the shadow lever, scoped to the measured device and run shape.
-    const Lever* kv_row = nullptr;
-    const Lever* attn_row = nullptr;
-    for (const auto& lever : table) {
-        if (lever.name == "kv_fp8") kv_row = &lever;
-        if (lever.name == "decode_attn8") attn_row = &lever;
-    }
-    const auto joint = sp::ladder_judge(out->ladder, "kv_fp8", kv_row->value[kTurboColumn], Name::turbo, timing_regime,
-                                        "decode_attn8");
-    const bool joint_receipt = joint.rung == sp::Rung::applies && joint.row != nullptr;
-    if (joint_receipt) {  // the plain rows the resolver reads for each half, derived from the one joint receipt
-        auto half = *joint.row;
-        half.joint = {};
-        out->ladder.push_back(half);
-        half.lever = "decode_attn8";
-        half.value = attn_row->value[kTurboColumn];
-        out->ladder.push_back(half);
-    }
     const auto cuda_admission = [&](std::string_view identity) -> TurboAdmission {
         if (regime.arch != "sm_120") return {false, "requires CUDA sm_120"};
         return turbo_admission(identity, regime, evidence);
@@ -272,32 +282,33 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
         return opt.first == "kv_fp8" || opt.first == "decode_attn8";
     });
     std::vector<TurboAdmission> admissions;
+    std::size_t kv_index = 0, reader_index = 0;
+    std::string_view kv_value, reader_value;
     for (const auto& lever : table) {
         if (!offered(lever.name, regime.route, regime.drafter)) continue;
         Lever row = lever;
-        const auto* q = qualification(lever.name, regime, rows);
+        const auto* q = qualification(lever.name, lever.value[static_cast<unsigned>(Name::fast)], regime, rows);
         row.ready[static_cast<unsigned>(Name::fast)] = q != nullptr;
         // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
-        if (const auto* grant = qualification(lever.name, regime, grants); grant != nullptr && lever.kind != Kind::exact)
+        if (const auto* grant = incumbent_grant(lever, regime, grants); grant != nullptr && lever.kind != Kind::exact)
             out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[static_cast<unsigned>(Name::fast)], Name::fast,
-                                                     grant->gate.receipt));
+                                                     grant->qualified.gate.receipt));
         TurboAdmission result;
         if (turbo && !row.value[kTurboColumn].empty()) {
             result = admission(row);
             if (row.name == "decode_attn8" || row.name == "kv_fp8") {
-                // The current CUDA body reads the shadow and runs both E4M3 products as one operation.
-                const auto& peer = row.name == "kv_fp8" ? attn_admit : kv_admit;
-                if (result.ready && !peer.ready) result = {false, "paired arm: " + peer.reason};
-                if (result.ready && !joint_receipt)
-                    result = {false, "paired arm: no joint timing receipt for the shadow and its reader in this regime"};
-                if (kv_override) result = {false, "controlled explicitly by --kv or --decode-attn8"};
-                // A half whose FAST cell is admitted reads that cell when the pair is refused: the FAST resolution
-                // stands as if no TURBO cell existed for it.
-                if (!result.ready && row.ready[static_cast<unsigned>(Name::fast)] &&
-                    !row.value[static_cast<unsigned>(Name::fast)].empty())
-                    row.value[kTurboColumn] = {};
+                // Start from the ordinary FAST cell in both halves. An admitted pair is installed atomically below.
+                if (row.name == "kv_fp8") {
+                    kv_index = out->rows.size();
+                    kv_value = row.value[kTurboColumn];
+                } else {
+                    reader_index = out->rows.size();
+                    reader_value = row.value[kTurboColumn];
+                }
+                row.ready[kTurboColumn] = false;
+            } else {
+                row.ready[kTurboColumn] = result.ready;
             }
-            row.ready[kTurboColumn] = result.ready && !row.value[kTurboColumn].empty();
         }
         admissions.push_back(std::move(result));
         out->rows.push_back(row);
@@ -316,6 +327,43 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
     inputs.regime = timing_regime;
     inputs.env = [](const char*) -> const char* { return nullptr; };  // CLI-only levers: the environment selects nothing
     out->resolution = sp::resolve(out->engine, inputs);
+    if (turbo) {
+        inputs.profile = Name::fast;
+        auto fast = sp::resolve(out->engine, inputs);
+        const auto reference = joint_execution(fast);
+        auto& kv = out->resolution.entries[kv_index];
+        auto& reader = out->resolution.entries[reader_index];
+        kv = std::move(fast.entries[kv_index]);
+        reader = std::move(fast.entries[reader_index]);
+        if (!kv_override && kv_admit.ready && attn_admit.ready) {
+            const auto candidate_base = joint_execution(out->resolution);
+            const auto work = regime.workload.prompt_tokens == regime.prompt_tokens
+                ? regime.workload : sp::JointWorkload{};
+            const sp::JointLadderScope scope{regime.cost_device, reference, candidate_base, kKvIdentity, kAttnIdentity, work, reader_value};
+            const auto joint = sp::ladder_judge(out->ladder, "kv_fp8", kv_value, Name::turbo, timing_regime,
+                                                "decode_attn8", scope);
+            if (joint.rung == sp::Rung::applies) {
+                const auto apply_pair = [&](sp::Entry& entry, std::string_view value) {
+                    entry.requested = entry.value = value;
+                    entry.status = sp::Status::set;
+                    entry.target.clear();
+                    entry.ladder = sp::ladder_route(entry.lever->name, timing_regime,
+                        {value, Name::turbo, " joint timing (" + std::string(joint.row->receipt) + ")"});
+                    entry.ladder_lowered = false;
+                };
+                out->rows[kv_index].ready[kTurboColumn] = true;
+                out->rows[reader_index].ready[kTurboColumn] = true;
+                apply_pair(kv, kv_value);
+                apply_pair(reader, reader_value);
+            } else {
+                kv.reason = reader.reason = "paired arm: no winning joint receipt for this FAST execution and workload";
+            }
+        } else {
+            const auto why = kv_override ? "controlled explicitly by --kv or --decode-attn8"
+                                         : !kv_admit.ready ? kv_admit.reason : attn_admit.reason;
+            kv.reason = reader.reason = "paired arm: " + why;
+        }
+    }
     for (std::size_t i = 0; i < out->resolution.entries.size(); ++i) {
         auto& entry = out->resolution.entries[i];
         if (entry.reason.empty() && !admissions[i].reason.empty() &&

@@ -138,11 +138,17 @@ inline constexpr Qualified incumbent_grants[] = {
     return e;
 }
 
+struct Measured {
+    Topology topology;
+    sp::LadderRow timing;
+};
+inline constexpr std::span<const Measured> measured{};
+
 // Owns the per-regime rows the resolution points into (non-movable: entries hold pointers).
 struct Resolved {
     Regime regime;
     std::vector<sp::Lever> rows;
-    std::vector<sp::LadderRow> ladder;  // incumbent grants of the cells granted in this regime
+    std::vector<sp::LadderRow> ladder;
     sp::Engine engine;
     sp::Resolution resolution;
     Resolved() = default;
@@ -154,9 +160,13 @@ struct Resolved {
 // The CLI and the server call this one function with the same Inputs and Regime (ONE RESOLVER).
 [[nodiscard]] inline std::unique_ptr<Resolved> resolve(const Regime& regime, const sp::Inputs& inputs,
                                                        std::span<const Qualified> rows = qualified,
-                                                       std::span<const Qualified> grants = incumbent_grants) {
+                                                       std::span<const Qualified> grants = incumbent_grants,
+                                                       std::span<const Measured> timings = measured) {
     auto out = std::make_unique<Resolved>();
     out->regime = regime;
+    for (const auto& row : timings)
+        if (row.topology == regime.topology && !row.timing.incumbent)
+            out->ladder.push_back(row.timing);
     constexpr auto fast = static_cast<unsigned>(sp::Name::fast);
     for (const auto& lever : table) {
         sp::Lever row = lever;

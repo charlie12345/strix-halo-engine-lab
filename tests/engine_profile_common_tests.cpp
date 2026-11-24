@@ -19,7 +19,7 @@ void require(bool value, const char* message) {
 }
 }
 
-int main() {
+int main() try {
     using namespace strix::profile;
     static_assert(strix::host_fnv::text("") == 0xcbf29ce484222325ULL);
     static_assert(strix::host_fnv::text("hello") == 0xa430d84680aabd0bULL);
@@ -137,9 +137,10 @@ int main() {
     require(legacy.fingerprint() == hash, "legacy fingerprint bytes");
     const Engine shipped{"deepseek41-pair", "ALLOW", strix::deepseek41::pair_defaults::profile_table};
     inputs.profile = Name::fast;
+    inputs.allow_pending = false;
     const auto shipped_fast = resolve(shipped, inputs);
     require(shipped_fast.find("moe_relaxed")->status == Status::pending &&
-            !shipped_fast.find("moe_relaxed")->ladder.empty(), "unscoped shipped candidate declines");
+            shipped_fast.find("moe_relaxed")->value == "0", "unscoped shipped candidate declines");
     check_peer(legacy, [](auto out, auto in) { std::memcpy(in.data(), out.data(), out.size()); });
     bool mismatch = false;
     try {
@@ -288,4 +289,7 @@ int main() {
                 "no false EXACT equivalence when TURBO changes weights");
     }
     std::cout << "common profile/receipt tests passed\n";
+} catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
 }

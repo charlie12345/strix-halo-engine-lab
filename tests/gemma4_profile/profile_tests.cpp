@@ -67,12 +67,22 @@ void synthetic_table() {
     check(status(r, "named") == pr::Status::pending && value(r, "named") == "x0" && r.find("named")->target == "x8",
           "pending required row runs the builtin");
     {
-        unsigned named = 0, pending = 0;
+        unsigned named = 0, pending = 0, ladder = 0;
         for (const auto& line : r.notices()) named += line == "profile fast: named pending x8 (x0 runs)";
-        for (const auto& e : r.entries) pending += e.status == pr::Status::pending;
-        check(named == 1 && r.notices().size() == pending, "one notice per pending row");
+        for (const auto& e : r.entries) {
+            pending += e.status == pr::Status::pending;
+            ladder += !e.ladder.empty();
+        }
+        check(named == 1 && r.notices().size() == pending + ladder, "pending notices and ladder diagnostics");
     }
-    r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, in(), synthetic);
+    check(status(r, "route") == pr::Status::pending && value(r, "route") == "a",
+          "ready route declines outside a measured regime");
+    const strix::profile::LadderRow route_timing{"route", "b", pr::Name::fast, strix::profile::Phase::prefill,
+                                                "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/route"};
+    auto measured = in();
+    measured.regime = {strix::profile::Phase::prefill, 4096, 1, "fixture"};
+    measured.ladder = std::span(&route_timing, 1);
+    r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic);
     check(status(r, "route") == pr::Status::set && value(r, "route") == "b" && r.active("route"), "fast sets ready lever");
     // An explicit request for a value whose code is not in the build is refused (it would otherwise be ignored).
     refuses([] { (void)pr::resolve(pr::Name::fast, pr::App::engine, in({}, {}, lookup({{"TEST_NAMED", "x8"}})), synthetic); },
@@ -287,9 +297,12 @@ void product_table() {
     }
     {
         const auto lines = r.notices();
-        unsigned pending = 0;
-        for (const auto& e : r.entries) pending += e.status == pr::Status::pending;
-        check(lines.size() == pending, "one stderr line per pending row, no more");
+        unsigned pending = 0, ladder = 0;
+        for (const auto& e : r.entries) {
+            pending += e.status == pr::Status::pending;
+            ladder += !e.ladder.empty();
+        }
+        check(lines.size() == pending + ladder, "one stderr line per pending row and ladder diagnostic");
     }
     // FAST decode attention at depth: pending until its receipt (exact runs), runnable with --allow-pending,
     // never in DEFAULT/QUALITY, STRIX_G4_DECODE_ATTN=exact switches it off.
@@ -302,6 +315,15 @@ void product_table() {
         r = pr::resolve(pr::Name::fast, app, pending_ok);
         check(status(r, "decode_attention") == pr::Status::unqualified && value(r, "decode_attention") == "g4-dattn-f2",
               "allow-pending runs g4-dattn-f2 unqualified");
+        namespace shared = strix::profile;
+        const shared::LadderRow timing{"decode_attention", "g4-dattn-f2", shared::Name::fast, shared::Phase::decode,
+                                        "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture timing"};
+        pending_ok.regime = {shared::Phase::decode, 4096, 1, "fixture"};
+        pending_ok.ladder = std::span(&timing, 1);
+        r = pr::resolve(pr::Name::fast, app, pending_ok);
+        check(status(r, "decode_attention") == pr::Status::unqualified &&
+              r.find("decode_attention")->ladder.find("applies x1.100") != std::string::npos,
+              "measured candidate remains unqualified until its quality gate passes");
         r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
         check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
         r = pr::resolve(pr::Name::standard, app, in());

@@ -221,7 +221,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
         }
         if (!cli && (!env || inherited))
-            ::strix::profile::apply_ladder(entry, ladder, profile, inputs.regime, admit);
+            ::strix::profile::apply_ladder(entry, ladder, profile, inputs.regime, admit, allow_pending);
         out.entries.push_back(std::move(entry));
     }
     return out;

@@ -319,9 +319,9 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
             namespace shared = strix::profile;
             const auto admit = [&](unsigned c) { return shared::column_admission(lever, c, allow_pending, false); };
             auto cell = shared::select_profile_cell(lever, inputs.ladder, static_cast<shared::Name>(profile),
-                                                    inputs.regime, admit);
+                                                    inputs.regime, admit, allow_pending);
             entry.ladder = std::move(cell.route);
-            const auto admission = admit(column);
+            const auto admission = cell.benchmark ? shared::Status::unqualified : admit(column);
             if (admission == shared::Status::pending || (!entry.ladder.empty() && cell.value == lever.builtin)) {
                 entry.wanted = wanted;
                 entry.value = lever.builtin;

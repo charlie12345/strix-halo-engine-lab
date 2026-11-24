@@ -198,7 +198,12 @@ void test_common_profile_admission() {
         rows[4].provisional[1] = true;
         return rows;
     }();
-    const profile::Engine engine{"glm-host-test", "ALLOW_PENDING", levers};
+    constexpr std::array timing{
+        profile::LadderRow{"qualified", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
+                           1, 4096, 1, 1, 1.10, 0.02, "fixture/qualified"},
+        profile::LadderRow{"provisional", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
+                           1, 4096, 1, 1, 1.10, 0.02, "fixture/provisional"}};
+    const profile::Engine engine{"glm-host-test", "ALLOW_PENDING", levers, false, {}, {}, {}, timing};
     const Env absent;
     profile::Inputs input;
     input.env = lookup(absent);
@@ -213,6 +218,10 @@ void test_common_profile_admission() {
         CHECK(entry.value == "0" && entry.status == profile::Status::builtin);
     }
     input.profile = profile::Name::fast;
+    const auto unmeasured = profile::resolve(engine, input);
+    CHECK(unmeasured.find("qualified")->status == profile::Status::pending);
+    CHECK(unmeasured.find("provisional")->status == profile::Status::pending);
+    input.regime = {profile::Phase::prefill, 4096, 1, "fixture"};
     auto fast = profile::resolve(engine, input);
     CHECK(fast.find("qualified")->status == profile::Status::set);
     CHECK(fast.find("pending")->status == profile::Status::pending);
@@ -232,6 +241,7 @@ void test_common_profile_admission() {
         CHECK(allowed.allow_pending);
         CHECK(allowed.find("pending")->value == "1");
         CHECK(allowed.find("pending")->status == profile::Status::unqualified);
+        CHECK(allowed.find("pending")->ladder.find("unqualified benchmark opt-in") != std::string::npos);
         CHECK(allowed.find("unavailable")->status == profile::Status::pending);
         CHECK(allowed.find("provisional")->status == profile::Status::provisional);
         CHECK(allowed.find("provisional-unavailable")->status == profile::Status::pending);

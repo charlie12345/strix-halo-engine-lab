@@ -95,12 +95,21 @@ std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {
         if (entry.row && !entry.row->evidence.receipt.empty()) {
             out += ':';
             out += entry.row->evidence.receipt;
+        }
+        if (entry.row && entry.gain_outside_lanes) {
+            const auto& evidence = entry.row->evidence;
+            if (evidence.min_lanes == 1U && evidence.max_lanes != 0U) {
+                out += ":gain-lanes<=" + std::to_string(evidence.max_lanes);
+            } else {
+                out += ":gain-lanes=" + std::to_string(evidence.min_lanes) + ".." +
+                       (evidence.max_lanes ? std::to_string(evidence.max_lanes) : "*");
+            }
         } else if (!entry.row && entry.outside_band) {
             const auto& evidence = entry.outside_band->evidence;
             out += ":outside-band context=" + std::to_string(evidence.min_context) + ".." +
                    (evidence.max_context ? std::to_string(evidence.max_context) : "*") +
                    " lanes=" + std::to_string(evidence.min_lanes) + ".." +
-                   (evidence.max_lanes == profile::kNoLaneBound ? "*" : std::to_string(evidence.max_lanes));
+                   (evidence.max_lanes ? std::to_string(evidence.max_lanes) : "*");
         }
     }
     return out;

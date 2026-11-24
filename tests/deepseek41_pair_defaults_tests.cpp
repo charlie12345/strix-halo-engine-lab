@@ -539,7 +539,11 @@ void test_profile() {
             {"env_pending", "X_PENDING", "", {"", "1", ""}, "0", pr::Kind::bit_changing, {true, false, true}, {true, true, true}, "big", "0", "p"},
             {"cli_ready", "", "--rows", {"", "8192", ""}, "4096", pr::Kind::bit_changing, {true, true, true}, {true, true, true}, "", "", "r2"},
         }};
-        const pr::Engine engine{"test-pair", "X_ALLOW", table, false};
+        constexpr pr::Regime measured{pr::Phase::prefill, 4096, 1, "fixture"};
+        constexpr std::array timing{
+            pr::LadderRow{"env_ready", "1", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/env"},
+            pr::LadderRow{"cli_ready", "8192", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/cli"}};
+        const pr::Engine engine{"test-pair", "X_ALLOW", table, false, {}, {}, {}, timing};
         std::map<std::string, std::string> env;
         const auto lookup = [&](const char* n) -> const char* { const auto it = env.find(n); return it == env.end() ? nullptr : it->second.c_str(); };
         std::vector<std::string> args{"m.gguf", "--profile", "fast", "--rows", "2048", "--other"};
@@ -548,6 +552,9 @@ void test_profile() {
         pr::take_options(engine, args, in);
         check((args == std::vector<std::string>{"m.gguf", "--rows", "2048", "--other"}), "take_options keeps app options, drops --profile");
         auto r = pr::resolve(engine, in);
+        check(r.find("env_ready")->status == pr::Status::pending, "ready env row declines with no known timing regime");
+        in.regime = measured;
+        r = pr::resolve(engine, in);
         check(r.find("env_ready")->status == pr::Status::set && r.find("env_ready")->value == "1", "ready env row applied");
         check(r.find("env_pending")->status == pr::Status::pending && r.find("env_pending")->target == "big", "pending row listed");
         check(r.find("cli_ready")->status == pr::Status::explicit_cli && pr::profile_args(r).empty(), "CLI wins; no profile arg added");
@@ -582,6 +589,7 @@ void test_profile() {
         pr::Inputs fast_in, default_in, allow_in, explicit_in;
         fast_in.env = default_in.env = allow_in.env = explicit_in.env = lookup;
         fast_in.profile = allow_in.profile = explicit_in.profile = pr::Name::fast;
+        fast_in.regime = allow_in.regime = explicit_in.regime = measured;
         allow_in.allow_pending = true;
         explicit_in.cli = {{"cli_ready", "8192"}};
         const auto rf = pr::resolve(engine, fast_in), rd0 = pr::resolve(engine, default_in), ra = pr::resolve(engine, allow_in),

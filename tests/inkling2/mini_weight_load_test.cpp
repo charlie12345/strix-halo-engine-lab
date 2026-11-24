@@ -151,7 +151,7 @@ void test_selection() {
             auto at = scope;
             at.regime = regime;
             return weight::WeightLoadDecision{policy.id, at, digest(3), digest(4),
-                                              {"receipts/t", "2026-11-24", 16, 0, speedup, 0.02}};
+                                              {"receipts/t", "2026-11-24", 16, 0, 0, speedup, 0.02}};
         };
         // The resident image is consumed by prefill and decode: the production adapter asks both phases.
         const std::array receipts{phase(weight::kPrefillRegime), phase(weight::kDecodeRegime)};

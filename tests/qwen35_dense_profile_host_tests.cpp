@@ -281,7 +281,9 @@ int main() {
     {
         namespace p = strix::profile;
         using V = p::GateVerdict;
-        const qp::Regime regime{qp::Weights::nvfp4_rtn, qp::Route::windows, 8192, "fixture GPU", "sm_120", true};
+        qp::Regime regime{qp::Weights::nvfp4_rtn, qp::Route::windows, 8192, "fixture GPU", "sm_120", true};
+        regime.cost_device = "fixture-cost-device";
+        regime.workload = {8192, 16384, 1, 2048, 32, 1, 4, 100};
         const auto fast = qp::resolve(Name::fast, regime, {});
         const auto pending = qp::resolve(Name::turbo, regime, {});
         check(pending->find("split_k")->value == fast->find("split_k")->value, "TURBO keeps split_k FAST");
@@ -314,11 +316,16 @@ int main() {
             gains[i] = {keys[i], "", Name::turbo, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
                         1.1, 0.01, "fixture gain"};
         }
+        gains[0].value = "fp8";
         gains[0].joint = "decode_attn8";  // the pair is admitted by one joint receipt on the shadow lever
         const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, "fixture", gates, gains}};
         const auto resolve = [&](const qp::Regime& r, const Pairs& opts = {}) {
             return qp::resolve(Name::turbo, r, opts, qp::qualified, evidence);
         };
+        const auto reference = qp::joint_execution(fast->resolution);
+        const auto candidate_base = qp::joint_execution(resolve(regime)->resolution);
+        gains[0].joint_scope = {regime.cost_device, reference, candidate_base, qp::kKvIdentity, qp::kAttnIdentity,
+                                regime.workload, "on"};
         const auto admitted = resolve(regime);
         qp::apply(options, *admitted);
         kv = qp::resolve_kv(Name::turbo, {}, regime.route, explicit_arms);
@@ -327,6 +334,18 @@ int main() {
                   options.decode_attn8 && options.dense_activation && kv.source == qp::kvp::Source::tier,
               "matching receipts enable all four TURBO cells on top of FAST");
         check(resolve(regime, {{"decode_attn8", "off"}})->find("kv_fp8")->value == "native", "off switch disables the paired default");
+        auto different_work = regime;
+        different_work.cost_device = "another product with the same sm_120";
+        check(resolve(different_work)->find("kv_fp8")->value == "native", "joint receipt binds the measured product");
+        different_work = regime;
+        ++different_work.workload.decode_rows;
+        check(resolve(different_work)->find("kv_fp8")->value == "native", "joint receipt binds decode width");
+        different_work = regime;
+        ++different_work.workload.verify_rows;
+        check(resolve(different_work)->find("kv_fp8")->value == "native", "joint receipt binds verify width");
+        gains[0].joint_scope.second_identity = "different-reader@2";
+        check(resolve(regime)->find("kv_fp8")->value == "native", "joint receipt binds both versioned candidates");
+        gains[0].joint_scope.second_identity = qp::kAttnIdentity;
         gains[0].max_lanes = 0;
         check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs the joint receipt in the run shape");
         gains[0].max_lanes = 1;
@@ -367,7 +386,7 @@ int main() {
                     const auto* got = run->find(lever);
                     const auto* want = standalone->find(lever);
                     check(got->value == want->value && p::applied(got->status) == p::applied(want->status), what);
-                    if (std::string_view(lever) == "decode_attn8") check(got->status == want->status, what);
+                    check(got->status == want->status, what);
                 }
                 Options pair_options;
                 qp::apply(pair_options, *run);
@@ -375,6 +394,11 @@ int main() {
                 check(pair_options.decode_attn8 && pair_options.decode_attn8 == expected.decode_attn8 &&
                           pair_options.nvfp4_split == expected.nvfp4_split, what);
             };
+            same_as_fast("receipt measured over FAST without the reader cannot promote the pair");
+            const auto reader_reference = qp::joint_execution(standalone->resolution);
+            const auto reader_candidate = qp::joint_execution(turbo()->resolution);
+            gains[0].joint_scope.reference = reader_reference;
+            gains[0].joint_scope.candidate_base = reader_candidate;
             const auto with_pair = turbo();
             check(with_pair->find("kv_fp8")->value == "fp8" && with_pair->find("decode_attn8")->value == "on",
                   "joint receipt: the pair runs on TURBO over the qualified FAST reader");
@@ -390,6 +414,26 @@ int main() {
             gates[1].tier = Name::fast;
             same_as_fast("reader gate missing: standalone FAST");
             gates[1].tier = Name::turbo;
+            gains[0].joint_scope.reference = reference;
+            gains[0].joint_scope.candidate_base = candidate_base;
+        }
+        {
+            auto large = regime;
+            large.route = qp::Route::large_prefill;
+            const qp::TurboEvidence ledger[] = {{large.weights, large.route, "fixture", gates, gains}};
+            const auto run = [&](Name tier, const Pairs& opts = {}) {
+                return qp::resolve(tier, large, opts, qp::qualified, ledger);
+            };
+            const auto large_reference = qp::joint_execution(run(Name::fast)->resolution);
+            const auto large_candidate = qp::joint_execution(run(Name::turbo)->resolution);
+            gains[0].joint_scope.reference = large_reference;
+            gains[0].joint_scope.candidate_base = large_candidate;
+            check(run(Name::turbo)->find("kv_fp8")->value == "fp8", "joint large-prefill fixture wins over its FAST arm");
+            const auto changed = run(Name::turbo, {{"prefill_attn8", "off"}});
+            check(changed->find("kv_fp8")->value == "native" && changed->find("decode_attn8")->value == "off",
+                  "switching off FAST prefill attention refuses both TURBO halves");
+            gains[0].joint_scope.reference = reference;
+            gains[0].joint_scope.candidate_base = candidate_base;
         }
         {   // r32 P2-e: the launcher's native route `--profile fast --kv fp8` forces both FP8 readers, with missing and with
             // valid pair evidence alike (the TURBO ledger neither admits nor removes it).
@@ -436,6 +480,15 @@ int main() {
         namespace p = strix::profile;
         const qp::Regime regime{qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 8192, "fixture GPU", "sm_120", true};
         const auto lever_value = [](const qp::Resolved& r, const char* lever) { return r.find(lever)->value; };
+        auto changed = qp::table[0];
+        check(qp::incumbent_grant(changed, regime, qp::incumbent_grants) != nullptr, "fixture incumbent grant exists");
+        changed.value[static_cast<unsigned>(Name::fast)] = "fast8";
+        check(qp::incumbent_grant(changed, regime, qp::incumbent_grants) == nullptr,
+              "a replacement FAST value cannot inherit the incumbent grant");
+        changed = qp::table[0];
+        changed.target = "fast4 (nvfp4-tile-mma-f32-v2)";
+        check(qp::incumbent_grant(changed, regime, qp::incumbent_grants) == nullptr,
+              "a revised FAST identity cannot inherit the incumbent grant");
         const auto shipped = qp::resolve(Name::fast, regime, {});
         check(lever_value(*shipped, "prefill_arith") == "fast4" && lever_value(*shipped, "prefill_gdn") == "chunk16tc" &&
                   lever_value(*shipped, "prefill_attn8") == "on" && lever_value(*shipped, "prefill_hid") == "f32",

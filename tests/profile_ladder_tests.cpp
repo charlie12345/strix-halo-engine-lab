@@ -102,6 +102,31 @@ void verdicts() {
     check(p::Name::fast, {p::Phase::prefill, 4096, 1, "dev"}, "a8", "-> fast=a8");
     check(p::Name::standard, {p::Phase::prefill, 4096, 1, "dev"}, "off", "");
 
+    // A refused nonempty TURBO cell leaves the measured FAST cell and its exported status intact.
+    auto refused_rows = kRows;
+    refused_rows[0].ready[3] = false;
+    const p::Engine refused{"refused", "", refused_rows, false, "refused-v1", {}, {}, rows};
+    const p::Regime measured{p::Phase::prefill, 4096, 1, "dev"};
+    const auto fast_run = resolve(refused, p::Name::fast, measured);
+    const auto exported = [](const p::Resolution& run) {
+        const auto env = p::exports(run, std::set<std::string>{});
+        return std::ranges::find(env, std::pair<std::string, std::string>{"STRIX_FIXTURE_W4A4", "a8"}) != env.end();
+    };
+    require(exported(fast_run), "measured FAST fixture exports a8");
+    for (const bool runnable : {true, false}) {
+        refused_rows[0].runnable[3] = runnable;
+        const auto turbo_run = resolve(refused, p::Name::turbo, measured);
+        require(turbo_run.find(kLever)->value == "a8" &&
+                    turbo_run.find(kLever)->status == fast_run.find(kLever)->status &&
+                    turbo_run.find(kLever)->ladder.find("turbo=a4 refused") != std::string::npos &&
+                    exported(turbo_run),
+                "pending/unavailable TURBO replacement keeps the FAST export and records the refusal");
+    }
+
+    refused_rows[0].value[3] = "a8";
+    require(resolve(refused, p::Name::turbo, measured).find(kLever)->status == p::Status::pending,
+            "a same-value TURBO binding explicitly unavailable in this composition remains pending");
+
     // An explicit setting is the user's own: it runs as set in every regime.
     p::Inputs in;
     in.profile = p::Name::turbo;
@@ -224,6 +249,29 @@ void cuda_cli_server() {
                     server.resolution.json().find("strix-ladder/v1 qsa_mma") != std::string::npos,
                 "Qwen CUDA CLI and server emit the same decision");
     }
+    // Provide evidence for a non-incumbent row through the native options adapter.
+    const p::RegimeGate gate{"moe_route_bf16", "1", 4096, 4097, "fixture gate"};
+    const p::LadderRow candidate{"moe_route_bf16", "1", p::Name::fast, p::Phase::prefill, "fixture", 4096, 4096,
+                                  1, 1, 1.02, 0.005, "fixture route storage"};
+    request.inputs.cli = {{"expert_fast", "off"}};
+    request.inputs.regimes = std::span(&gate, 1);
+    request.inputs.ladder = std::span(&candidate, 1);
+    request.inputs.max_prompt_tokens = 4096;
+    request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture"};
+    const auto profile_selects_storage = [](const qo::Resolved& r) {
+        const auto* entry = r.resolution.find("moe_route_bf16");
+        return entry && entry->value == "1" && entry->status == p::Status::set;
+    };
+    require(profile_selects_storage(qo::resolve(request, qo::Entry::cli)) &&
+            profile_selects_storage(qo::resolve(request, qo::Entry::serve)),
+            "a measured non-incumbent candidate runs with the same known prompt on both entries");
+    ++request.inputs.regime.context;
+    require(!profile_selects_storage(qo::resolve(request, qo::Entry::cli)),
+            "the neighboring context declines the candidate");
+    request.inputs.regime = p::startup_prefill_regime("fixture");
+    const auto startup = qo::resolve(request, qo::Entry::serve);
+    require(!profile_selects_storage(startup) && startup.choice.qsa_mma,
+            "startup declines the non-incumbent timing row and retains the incumbent form");
 }
 
 void custom_adapters() {
@@ -270,9 +318,9 @@ void custom_adapters() {
 
 // Incumbent preservation: every production entry point resolves FAST / TURBO (and refuses) exactly as before the
 // ladder rule. One line per resolved entry: "<entry point> <tier> <regime> <lever>=<value> s<status>". The golden
-// (tests/golden/profile_selections.txt) holds the lines of the tree before the ladder rule; a change that moves a
-// default selection rewrites it on purpose (strix-profile-ladder-tests REGISTRY GOLDEN --write) and says why.
-// --allow-pending is outside it: an unqualified cell needs a timing row since the ladder rule.
+// (tests/golden/profile_selections.txt) pins incumbent execution values and their receipt statuses.
+// Additions and intended receipt changes are reviewed when the golden is updated.
+// The individual adapter suites exercise --allow-pending separately.
 template <class Res>
 void lines(std::vector<std::string>& out, const std::string& where, const Res& res) {
     for (const auto& e : res.entries)
@@ -459,21 +507,24 @@ void paired_rows() {
     const p::Regime regime{p::Phase::prefill, 8192, 1, "dev"};
     p::LadderRow joint{"shadow", "fp8", p::Name::turbo, p::Phase::prefill, "dev", 8192, 8192, 1, 1, 1.10, 0.01, "pair receipt"};
     joint.joint = "reader";
+    const p::JointLadderScope scope{"device-id", "fast@1", "candidate-base@1", "shadow@1", "reader@1",
+                                    {8192, 32768, 1, 2048, 16, 1, 0, 128}, "on"};
+    joint.joint_scope = scope;
     p::LadderRow plain = joint;
     plain.joint = {};
     plain.receipt = "shadow alone";
     const p::LadderRow both[] = {joint, plain};
-    require(p::ladder_judge(std::span(&plain, 1), "shadow", "fp8", p::Name::turbo, regime, "reader").rung !=
+    require(p::ladder_judge(std::span(&plain, 1), "shadow", "fp8", p::Name::turbo, regime, "reader", scope).rung !=
                 p::Rung::applies, "a single-cell row admitted the pair");
     require(p::ladder_judge(std::span(&joint, 1), "shadow", "fp8", p::Name::turbo, regime).rung != p::Rung::applies,
             "a joint row decided the plain cell");
-    const auto verdict = p::ladder_judge(both, "shadow", "fp8", p::Name::turbo, regime, "reader");
+    const auto verdict = p::ladder_judge(both, "shadow", "fp8", p::Name::turbo, regime, "reader", scope);
     require(verdict.rung == p::Rung::applies && verdict.row == &both[0], "the joint row decides the pair");
-    require(p::ladder_judge(both, "shadow", "fp8", p::Name::turbo, regime, "other").rung != p::Rung::applies,
+    require(p::ladder_judge(both, "shadow", "fp8", p::Name::turbo, regime, "other", scope).rung != p::Rung::applies,
             "a joint row decided another partner");
     p::LadderRow slow = joint;
     slow.speedup = 0.97;
-    require(p::ladder_judge(std::span(&slow, 1), "shadow", "fp8", p::Name::turbo, regime, "reader").rung == p::Rung::slower,
+    require(p::ladder_judge(std::span(&slow, 1), "shadow", "fp8", p::Name::turbo, regime, "reader", scope).rung == p::Rung::slower,
             "a losing joint row must not admit the pair");
 }
 // A new gate row (a wider prompt band for a qualified cell) is not an incumbent grant: the cell keeps the tier below
@@ -494,20 +545,25 @@ void hy4_new_quality_rows() {
     require(wide->find("prompt_rows")->value == "0" && wide->find("pf_mha")->value == "0",
             "a new quality row beyond the frozen band must leave the cell at the lower tier without a timing row");
     require(h::resolve(inside, in, rows)->find("prompt_rows")->value == "4096", "the frozen band keeps its cell");
-    // the matching timing row admits it
-    p::LadderRow timing{"prompt_rows", "4096", p::Name::fast, p::Phase::prefill, "gfx1151", 32569, 65536, 1, 1, 1.05, 0.01,
-                        "fixture timing"};
-    auto timed = h::resolve(beyond, in, rows);
-    std::vector<p::LadderRow> ladder(timed->ladder);
-    ladder.push_back(timing);
-    timed->engine.ladder = std::span<const p::LadderRow>(ladder);
-    in.regime = {p::Phase::prefill, 40000, 1, "gfx1151"};
-    const auto resolved = p::resolve(timed->engine, in);
-    require(resolved.find("prompt_rows")->value == "4096", "a matching timing row admits the new band");
+    // Exercise the same adapter as CLI and serve, including its input shape and topology checks.
+    const h::Measured timings[]{{h::Topology::one_node,
+        {"prompt_rows", "4096", p::Name::fast, p::Phase::prefill, "gfx1151", 40000, 65536, 1, 1, 1.05, 0.01,
+         "fixture timing"}}};
+    const auto resolved = h::resolve(beyond, in, rows, h::incumbent_grants, timings);
+    require(resolved->find("prompt_rows")->value == "4096", "a matching timing row admits the new band");
+    auto other = beyond;
+    --other.prompt_tokens;
+    require(h::resolve(other, in, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "0",
+            "neighboring prompt declines the same measured row");
+    other = beyond;
+    other.topology = h::Topology::pair;
+    rows.push_back({h::Device::gfx1151, h::Topology::pair, {"prompt_rows", "4096", 0, 65536, "fixture wider pair gate"}});
+    require(h::resolve(other, in, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "0",
+            "pair topology declines the one-node measured row");
 }
 }  // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     if (argc < 3) return 2;
     if (argc > 3 && std::string_view(argv[3]) == "--write") {
         incumbents(argv[2], true);
@@ -548,4 +604,7 @@ int main(int argc, char** argv) {
     if (failures) return 1;
     std::puts("profile ladder tests: PASS");
     return 0;
+} catch (const std::exception& error) {
+    std::fprintf(stderr, "FAIL: %s\n", error.what());
+    return 1;
 }

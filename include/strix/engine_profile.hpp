@@ -103,6 +103,32 @@ struct Regime {
     std::string_view device{};  // device class of the run ("sm_120", "gfx1151")
 };
 
+// At startup a server often knows its capacity but cannot resolve per request before a real prompt arrives.
+[[nodiscard]] constexpr Regime startup_prefill_regime(std::string_view device = {}) {
+    return {Phase::prefill, 0, 1, device};
+}
+
+// Joint receipts bind the complete workload and both executions, beyond a timing band's coarse bounds.
+struct JointWorkload {
+    std::uint64_t prompt_tokens = 0, context_capacity = 0;
+    std::uint32_t lanes = 0, prefill_chunk = 0, prefill_rows = 0, decode_rows = 0,
+                  verify_rows = 0, generated_tokens = 0;
+    bool operator==(const JointWorkload&) const = default;
+};
+
+struct JointLadderScope {
+    std::string_view device{}, reference{}, candidate_base{}, first_identity{}, second_identity{};
+    JointWorkload workload{};
+    std::string_view partner_value{};
+    bool operator==(const JointLadderScope&) const = default;
+    [[nodiscard]] constexpr bool complete() const {
+        return !device.empty() && !reference.empty() && !candidate_base.empty() &&
+               !first_identity.empty() && !second_identity.empty() && !partner_value.empty() &&
+               workload.prompt_tokens != 0 && workload.context_capacity != 0 && workload.lanes != 0 &&
+               workload.prefill_chunk != 0 && workload.prefill_rows != 0 && workload.decode_rows != 0;
+    }
+};
+
 // One measured regime of one lossy cell: `speedup` = throughput of `tier` / throughput of the tier below on the same
 // build, device and regime (an ABAB receipt), `noise` its stated margin.
 struct LadderRow {
@@ -126,6 +152,7 @@ struct LadderRow {
     // (ladder_judge with the same `joint`). A plain judge never reads it, so two separately timed cells cannot admit
     // a pair. Empty: an ordinary single-cell row.
     std::string_view joint{};
+    JointLadderScope joint_scope{};
 };
 
 // Receipts of incumbent grants for cells that ran before the ladder rule without a quality gate of their own.
@@ -195,11 +222,13 @@ struct LadderVerdict {
 // with no timing row covering the regime, an incumbent grant with a receipt keeps the cell (Rung::incumbent).
 [[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
                                                    std::string_view value, Name tier, const Regime& regime,
-                                                   std::string_view joint = {}) noexcept {
+                                                   std::string_view joint = {},
+                                                   const JointLadderScope& joint_scope = {}) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
     for (const auto& row : rows) {
         if (row.joint != joint) continue;  // a paired receipt is read only by the pair's own judge
+        if (!joint.empty() && (!joint_scope.complete() || row.value.empty() || row.joint_scope != joint_scope)) continue;
         if (row.incumbent) {
             if (!grant && !row.receipt.empty() && ladder_names(row, lever, value, tier)) grant = &row;
             continue;
@@ -812,11 +841,12 @@ struct LadderCell {
     std::string_view value;
     Name tier = Name::standard;
     std::string route;
+    bool benchmark = false;
 };
 
 template <class Row, class Admission>
 [[nodiscard]] inline LadderCell ladder_cell(const Row& lever, std::span<const LadderRow> rows, Name tier,
-                                            const Regime& regime, const Admission& admit) {
+                                            const Regime& regime, const Admission& admit, bool allow_pending) {
     const auto column = value_column(lever, tier);
     const auto wanted = lever.value[column];
     // A cell spelling the builtin runs without a qualification of its own (resolve() treats it as builtin).
@@ -825,10 +855,17 @@ template <class Row, class Admission>
         return {eligible ? wanted : lever.builtin, tier, {}};
 
     const auto below = tier_below(tier);
-    // A cell its column does not admit (pending) leaves the lever at the builtin, as resolve() does: the ladder never
-    // runs the cell below in its place.
-    if (!wanted.empty() && !eligible) return {lever.builtin, Name::standard, {}};
-    auto lower = ladder_cell(lever, rows, below, regime, admit);
+    auto lower = ladder_cell(lever, rows, below, regime, admit, false);
+    if (!wanted.empty() && !eligible) {
+        // An unavailable binding for the same value can represent a different tier-specific composition
+        // (for example a required companion layer set). Only an actual replacement can bypass that refusal.
+        if (tier == Name::turbo && column == static_cast<unsigned>(Name::turbo) && lower.value != lever.builtin &&
+            (wanted != lower.value || lever.runnable[column])) {
+            lower.route = " turbo=" + std::string(wanted) + " refused by column admission" + lower.route;
+            return lower;
+        }
+        return {lever.builtin, Name::standard, {}};
+    }
     if (!eligible || (tier == Name::turbo && column == static_cast<unsigned>(Name::fast)) ||
         wanted == lower.value) return lower;
     std::string step = " " + std::string(name(tier)) + "=" + std::string(wanted) + " ";
@@ -851,6 +888,9 @@ template <class Row, class Admission>
         step += " (" + std::string(verdict.row->receipt) + ")";
     }
     if (rung_runs(verdict.rung)) return {wanted, tier, step};
+    // The explicit benchmark arm can collect the evidence the default needs. It never claims qualification.
+    if (tier == Name::fast && allow_pending && lever.runnable[column])
+        return {wanted, tier, step + " (unqualified benchmark opt-in)", true};
     lower.route = step + lower.route;
     return lower;
 }
@@ -869,21 +909,27 @@ template <class Row, class Admission>
 // Resolve a profile-owned FAST/TURBO cell before any adapter can export it.
 template <class Row, class Admission>
 inline LadderCell select_profile_cell(const Row& lever, std::span<const LadderRow> rows, Name tier,
-                                      const Regime& regime, const Admission& admit) {
+                                      const Regime& regime, const Admission& admit, bool allow_pending = false) {
     if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo))
         return {lever.value[value_column(lever, tier)], tier, {}};
-    auto cell = ladder_cell(lever, rows, tier, regime, admit);
+    auto cell = ladder_cell(lever, rows, tier, regime, admit, allow_pending);
     if (!cell.route.empty()) cell.route = ladder_route(lever.name, regime, cell);
     return cell;
 }
 
 inline void apply_ladder(Entry& entry, std::span<const LadderRow> rows, Name tier, const Regime& regime,
-                         const auto& admit) {
+                         const auto& admit, bool allow_pending) {
     const auto& lever = *entry.lever;
     if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo)) return;
-    auto cell = select_profile_cell(lever, rows, tier, regime, admit);
+    auto cell = select_profile_cell(lever, rows, tier, regime, admit, allow_pending);
     entry.ladder = std::move(cell.route);
     entry.ladder_lowered = !entry.ladder.empty() && cell.tier != tier;
+    if (cell.benchmark) {
+        entry.value = cell.value;
+        entry.status = Status::unqualified;
+        entry.target.clear();
+        return;
+    }
     // The ladder kept the value the profile column resolved: its admission status stands as resolved.
     if (cell.value == entry.value) return;
     entry.value = cell.value;
@@ -979,7 +1025,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         if (cli == nullptr && env == nullptr)
             apply_ladder(entry, engine.ladder, profile_column, inputs.regime, [&](unsigned c) {
                 return column_admission(lever, c, out.allow_pending, preset);
-            });
+            }, out.allow_pending);
         out.entries.push_back(std::move(entry));
     }
     out.admitted_ = Resolution::resolve_variants(engine, inputs, out);
@@ -1011,6 +1057,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             continue;
         }
         if (!row.joint.empty()) {
+            if (row.value.empty() || !row.joint_scope.complete()) return where + ": paired row requires a complete execution scope";
             const auto same = [&](const Lever& candidate) { return candidate.name == row.joint; };
             const auto partner = std::find_if(engine.table.begin(), engine.table.end(), same);
             if (partner == engine.table.end() || partner->kind == Kind::exact || row.joint == row.lever)

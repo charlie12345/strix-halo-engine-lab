@@ -90,7 +90,9 @@ A hy4-hip fast head_q8=0 s4
 A hy4-hip fast pf_mha=0 s4
 A hy4-hip turbo throws hy4-hip: --profile turbo is not declared for this engine
 A inkling2-mini fast inkling2-mini-moe-w4a4@1=0 s4
+A inkling2-mini fast inkling2-mini-combine-down-image@1=0 s3
 A inkling2-mini turbo inkling2-mini-moe-w4a4@1=0 s4
+A inkling2-mini turbo inkling2-mini-combine-down-image@1=0 s3
 B qwen-hip fast ctx=0 qsa_budget=1536 s7
 B qwen-hip fast ctx=0 moe_route_bf16=1 s7
 B qwen-hip fast ctx=0 gdn_fp16_chunk=1 s7
@@ -469,7 +471,7 @@ C qwen35-cuda-dense turbo w0 r0 ctx=0 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w0 r0 ctx=0 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=0 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=0 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r0 ctx=0 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r0 ctx=0 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r0 ctx=0 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=4096 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=4096 prefill_gdn=serial s4
@@ -477,7 +479,7 @@ C qwen35-cuda-dense turbo w0 r0 ctx=4096 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w0 r0 ctx=4096 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=4096 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=4096 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r0 ctx=4096 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r0 ctx=4096 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r0 ctx=4096 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8191 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8191 prefill_gdn=serial s4
@@ -485,7 +487,7 @@ C qwen35-cuda-dense turbo w0 r0 ctx=8191 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8191 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8191 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8191 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r0 ctx=8191 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8191 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r0 ctx=8191 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8192 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8192 prefill_gdn=serial s4
@@ -493,7 +495,7 @@ C qwen35-cuda-dense turbo w0 r0 ctx=8192 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8192 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8192 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=8192 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r0 ctx=8192 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r0 ctx=8192 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r0 ctx=8192 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=32768 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=32768 prefill_gdn=serial s4
@@ -501,27 +503,27 @@ C qwen35-cuda-dense turbo w0 r0 ctx=32768 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w0 r0 ctx=32768 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w0 r0 ctx=32768 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r0 ctx=32768 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r0 ctx=32768 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r0 ctx=32768 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r0 ctx=32768 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r1 ctx=0 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r1 ctx=0 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r1 ctx=0 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r1 ctx=0 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r1 ctx=0 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r1 ctx=4096 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r1 ctx=4096 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r1 ctx=4096 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r1 ctx=4096 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r1 ctx=4096 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r1 ctx=8191 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r1 ctx=8191 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r1 ctx=8191 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r1 ctx=8191 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r1 ctx=8191 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r1 ctx=8192 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r1 ctx=8192 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r1 ctx=8192 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r1 ctx=8192 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r1 ctx=8192 dense_activation=off s4
 C qwen35-cuda-dense turbo w0 r1 ctx=32768 split_k=exact s4
 C qwen35-cuda-dense turbo w0 r1 ctx=32768 decode_attn8=off s4
-C qwen35-cuda-dense turbo w0 r1 ctx=32768 kv_fp8=native s4
+C qwen35-cuda-dense turbo w0 r1 ctx=32768 kv_fp8=native s3
 C qwen35-cuda-dense turbo w0 r1 ctx=32768 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=0 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=0 prefill_gdn=serial s4
@@ -529,7 +531,7 @@ C qwen35-cuda-dense turbo w1 r0 ctx=0 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w1 r0 ctx=0 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=0 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=0 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r0 ctx=0 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r0 ctx=0 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r0 ctx=0 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=4096 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=4096 prefill_gdn=serial s4
@@ -537,7 +539,7 @@ C qwen35-cuda-dense turbo w1 r0 ctx=4096 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w1 r0 ctx=4096 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=4096 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=4096 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r0 ctx=4096 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r0 ctx=4096 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r0 ctx=4096 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8191 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8191 prefill_gdn=serial s4
@@ -545,7 +547,7 @@ C qwen35-cuda-dense turbo w1 r0 ctx=8191 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8191 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8191 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8191 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r0 ctx=8191 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8191 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r0 ctx=8191 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8192 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8192 prefill_gdn=serial s4
@@ -553,7 +555,7 @@ C qwen35-cuda-dense turbo w1 r0 ctx=8192 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8192 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8192 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=8192 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r0 ctx=8192 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r0 ctx=8192 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r0 ctx=8192 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=32768 prefill_arith=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=32768 prefill_gdn=serial s4
@@ -561,27 +563,27 @@ C qwen35-cuda-dense turbo w1 r0 ctx=32768 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w1 r0 ctx=32768 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w1 r0 ctx=32768 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r0 ctx=32768 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r0 ctx=32768 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r0 ctx=32768 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r0 ctx=32768 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r1 ctx=0 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r1 ctx=0 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r1 ctx=0 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r1 ctx=0 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r1 ctx=0 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r1 ctx=4096 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r1 ctx=4096 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r1 ctx=4096 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r1 ctx=4096 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r1 ctx=4096 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r1 ctx=8191 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r1 ctx=8191 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r1 ctx=8191 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r1 ctx=8191 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r1 ctx=8191 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r1 ctx=8192 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r1 ctx=8192 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r1 ctx=8192 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r1 ctx=8192 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r1 ctx=8192 dense_activation=off s4
 C qwen35-cuda-dense turbo w1 r1 ctx=32768 split_k=exact s4
 C qwen35-cuda-dense turbo w1 r1 ctx=32768 decode_attn8=off s4
-C qwen35-cuda-dense turbo w1 r1 ctx=32768 kv_fp8=native s4
+C qwen35-cuda-dense turbo w1 r1 ctx=32768 kv_fp8=native s3
 C qwen35-cuda-dense turbo w1 r1 ctx=32768 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r0 ctx=0 prefill_arith=fast4 s0
 C qwen35-cuda-dense turbo w2 r0 ctx=0 prefill_gdn=chunk16tc s0
@@ -589,7 +591,7 @@ C qwen35-cuda-dense turbo w2 r0 ctx=0 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w2 r0 ctx=0 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w2 r0 ctx=0 split_k=exact s4
 C qwen35-cuda-dense turbo w2 r0 ctx=0 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r0 ctx=0 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r0 ctx=0 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r0 ctx=0 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r0 ctx=4096 prefill_arith=fast4 s0
 C qwen35-cuda-dense turbo w2 r0 ctx=4096 prefill_gdn=chunk16tc s0
@@ -597,7 +599,7 @@ C qwen35-cuda-dense turbo w2 r0 ctx=4096 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w2 r0 ctx=4096 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w2 r0 ctx=4096 split_k=exact s4
 C qwen35-cuda-dense turbo w2 r0 ctx=4096 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r0 ctx=4096 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r0 ctx=4096 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r0 ctx=4096 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r0 ctx=8191 prefill_arith=fast4 s0
 C qwen35-cuda-dense turbo w2 r0 ctx=8191 prefill_gdn=chunk16tc s0
@@ -605,7 +607,7 @@ C qwen35-cuda-dense turbo w2 r0 ctx=8191 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w2 r0 ctx=8191 prefill_attn8=off s4
 C qwen35-cuda-dense turbo w2 r0 ctx=8191 split_k=exact s4
 C qwen35-cuda-dense turbo w2 r0 ctx=8191 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r0 ctx=8191 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8191 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r0 ctx=8191 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r0 ctx=8192 prefill_arith=fast4 s0
 C qwen35-cuda-dense turbo w2 r0 ctx=8192 prefill_gdn=chunk16tc s0
@@ -613,7 +615,7 @@ C qwen35-cuda-dense turbo w2 r0 ctx=8192 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w2 r0 ctx=8192 prefill_attn8=on s0
 C qwen35-cuda-dense turbo w2 r0 ctx=8192 split_k=exact s4
 C qwen35-cuda-dense turbo w2 r0 ctx=8192 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r0 ctx=8192 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r0 ctx=8192 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r0 ctx=8192 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r0 ctx=32768 prefill_arith=fast4 s0
 C qwen35-cuda-dense turbo w2 r0 ctx=32768 prefill_gdn=chunk16tc s0
@@ -621,27 +623,27 @@ C qwen35-cuda-dense turbo w2 r0 ctx=32768 prefill_hid=f32 s4
 C qwen35-cuda-dense turbo w2 r0 ctx=32768 prefill_attn8=on s0
 C qwen35-cuda-dense turbo w2 r0 ctx=32768 split_k=exact s4
 C qwen35-cuda-dense turbo w2 r0 ctx=32768 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r0 ctx=32768 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r0 ctx=32768 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r0 ctx=32768 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r1 ctx=0 split_k=fast s0
 C qwen35-cuda-dense turbo w2 r1 ctx=0 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r1 ctx=0 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r1 ctx=0 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r1 ctx=0 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r1 ctx=4096 split_k=fast s0
 C qwen35-cuda-dense turbo w2 r1 ctx=4096 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r1 ctx=4096 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r1 ctx=4096 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r1 ctx=4096 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r1 ctx=8191 split_k=fast s0
 C qwen35-cuda-dense turbo w2 r1 ctx=8191 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r1 ctx=8191 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r1 ctx=8191 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r1 ctx=8191 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r1 ctx=8192 split_k=fast s0
 C qwen35-cuda-dense turbo w2 r1 ctx=8192 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r1 ctx=8192 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r1 ctx=8192 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r1 ctx=8192 dense_activation=off s4
 C qwen35-cuda-dense turbo w2 r1 ctx=32768 split_k=fast s0
 C qwen35-cuda-dense turbo w2 r1 ctx=32768 decode_attn8=off s4
-C qwen35-cuda-dense turbo w2 r1 ctx=32768 kv_fp8=native s4
+C qwen35-cuda-dense turbo w2 r1 ctx=32768 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r1 ctx=32768 dense_activation=off s4
 D gemma4 fast app1 decode_identity=g4-a8-v1 s0
 D gemma4 fast app1 decode_attention=exact s4

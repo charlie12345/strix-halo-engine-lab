@@ -32,68 +32,99 @@ Digest256 implementation_identity(std::span<const ArithmeticId> consumers) {
 }
 
 namespace {
+// The one scope rule of every lookup: a complete request scope, and a row of the same backend, device, toolkit,
+// regime, consumer identity and checkpoint with a gate v2 PASS.
+bool complete_scope(const WeightLoadScope& scope) {
+    return !scope.device_class.empty() && !scope.compiler_id.empty() && !scope.regime.empty() &&
+           !(scope.build == Digest256{}) && !(scope.checkpoint == Digest256{});
+}
+
+bool same_scope_pass(const WeightLoadDecision& row, const WeightLoadScope& scope) {
+    const auto& s = row.scope;
+    return s.backend == scope.backend && s.device_class == scope.device_class && s.compiler_id == scope.compiler_id &&
+           s.regime == scope.regime && s.build == scope.build && s.checkpoint == scope.checkpoint &&
+           !(row.gate_v2_pass == Digest256{});
+}
+
 template <class SamePolicy>
 const WeightLoadDecision* find_decision(SamePolicy same_policy, const WeightLoadScope& scope,
-                                        std::span<const WeightLoadDecision> decisions) {
-    if (scope.device_class.empty() || scope.compiler_id.empty() || scope.regime.empty() ||
-        scope.build == Digest256{} || scope.checkpoint == Digest256{}) return nullptr;
-    for (const auto& row : decisions) {
-        const auto& s = row.scope;
-        if (same_policy(row.policy) && s.backend == scope.backend && s.device_class == scope.device_class &&
-            s.compiler_id == scope.compiler_id && s.regime == scope.regime && s.build == scope.build &&
-            s.checkpoint == scope.checkpoint && !(row.gate_v2_pass == Digest256{}) &&
-            !(row.measured_gain == Digest256{})) return &row;
-    }
+                                        std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
+    if (!complete_scope(scope)) return nullptr;
+    for (const auto& row : decisions)
+        if (same_policy(row.policy) && same_scope_pass(row, scope) && weight_load_gain_selects(row, extent)) return &row;
     return nullptr;
 }
 }  // namespace
 
 const WeightLoadDecision* find_weight_load_decision(Id policy, const WeightLoadScope& scope,
-                                                  std::span<const WeightLoadDecision> decisions) {
-    return find_decision([policy](Id stored) { return stored == policy; }, scope, decisions);
+                                                  std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
+    return find_decision([policy](Id stored) { return stored == policy; }, scope, decisions, extent);
 }
 
 const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
-                                                  std::span<const WeightLoadDecision> decisions) {
-    return find_decision([&policy](Id stored) { return policy_has_id(policy, stored); }, scope, decisions);
+                                                  std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
+    return find_decision([&policy](Id stored) { return policy_has_id(policy, stored); }, scope, decisions, extent);
+}
+
+const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
+                                                std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent,
+                                                const WeightLoadDecision** outside_band) {
+    if (outside_band) *outside_band = nullptr;
+    if (!complete_scope(scope)) return nullptr;
+    const WeightLoadDecision* gate_only = nullptr;
+    for (const auto& row : decisions) {
+        if (!policy_has_id(policy, row.policy) || !same_scope_pass(row, scope)) continue;
+        if (!weight_load_context_in_band(row.evidence, extent.context)) {
+            if (outside_band && !*outside_band) *outside_band = &row;
+            continue;
+        }
+        if (!(row.measured_gain == Digest256{}) && weight_load_gain_covers_lanes(row.evidence, extent.lanes))
+            return &row;
+        if (!gate_only) gate_only = &row;
+    }
+    return gate_only;
 }
 
 void match_weight_load_evidence(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
                                 std::span<const WeightLoadDecision> decisions, const WeightLoadRequest& request,
                                 FormatId reference, RegimeWeightLoad& entry) {
-    if (scope.device_class.empty() || scope.compiler_id.empty() || scope.regime.empty() ||
-        scope.build == Digest256{} || scope.checkpoint == Digest256{}) return;
-    const auto first_context = request.first_context ? request.first_context : request.context;
-    const auto first_lanes = request.first_lanes ? request.first_lanes : request.lanes;
-    if (first_context == 0 || first_lanes == 0 || first_context > request.context || first_lanes > request.lanes) return;
+    if (!complete_scope(scope)) return;
+    const auto last = request.extent;
+    const auto first = WeightLoadExtent{request.first.context ? request.first.context : last.context,
+                                        request.first.lanes ? request.first.lanes : last.lanes};
+    if (first.context > last.context || first.lanes > last.lanes) return;
     const WeightLoadDecision* blocking = nullptr;
     for (const auto& row : decisions) {
-        const auto& s = row.scope;
         const auto& e = row.evidence;
-        if (!policy_has_id(policy, row.policy) || s.backend != scope.backend || s.device_class != scope.device_class ||
-            s.compiler_id != scope.compiler_id || s.regime != scope.regime || !(s.build == scope.build) ||
-            !(s.checkpoint == scope.checkpoint) || row.gate_v2_pass == Digest256{} ||
-            e.tier != request.tier || !(e.reference == reference)) continue;
-        const auto max_context = e.max_context == 0 ? std::numeric_limits<std::uint32_t>::max() : e.max_context;
-        const bool covers = profile::ladder_band(first_context, e.min_context, max_context, first_lanes, e.min_lanes, e.max_lanes) &&
-                            profile::ladder_band(request.context, e.min_context, max_context, request.lanes, e.min_lanes, e.max_lanes);
-        const bool timed = !(row.measured_gain == Digest256{});
+        if (!policy_has_id(policy, row.policy) || !same_scope_pass(row, scope) ||
+            e.tier != request.tier || e.reference != reference) continue;
+        const bool contexts = weight_load_context_in_band(e, first.context) &&
+                              weight_load_context_in_band(e, last.context);
+        const bool lanes = weight_load_gain_covers_lanes(e, first.lanes) &&
+                           weight_load_gain_covers_lanes(e, last.lanes);
+        const bool timed = row.measured_gain != Digest256{};
         const bool faster = timed && !e.receipt.empty() && profile::ladder_gain(e.speedup, e.noise);
-        if (!covers) {
+        // A measured losing sub-band vetoes a covering win for the same fixed image.
+        const auto max_context = e.max_context ? e.max_context : std::numeric_limits<std::uint32_t>::max();
+        const auto max_lanes = e.max_lanes ? e.max_lanes : profile::kNoLaneBound;
+        const bool overlaps = profile::ladder_band(std::max(first.context, e.min_context), e.min_context,
+            std::min(last.context, max_context), std::max(first.lanes, e.min_lanes), e.min_lanes,
+            std::min(last.lanes, max_lanes));
+        if (timed && !faster && overlaps) blocking = &row;
+        if (!contexts) {
             if (!entry.outside_band) entry.outside_band = &row;
-            // A negative sub-band vetoes a covering positive receipt for a shared resident image.
-            if (timed && !faster &&
-                profile::ladder_band(std::max(first_context, e.min_context), e.min_context, std::min(request.context, max_context),
-                                     std::max(first_lanes, e.min_lanes), e.min_lanes, std::min(request.lanes, e.max_lanes)))
-                blocking = &row;
             continue;
         }
-        if (!entry.row || (faster && !entry.faster)) entry.row = &row;
-        entry.faster |= faster;
-        if (timed && !faster) blocking = &row;
+        const bool selects = faster && lanes && first.context != 0U && first.lanes != 0U;
+        if (!entry.row || (selects && !entry.faster)) {
+            entry.row = &row;
+            entry.gain_outside_lanes = timed && !lanes;
+        }
+        entry.faster |= selects;
     }
-    if (blocking) {
+    if (blocking && entry.faster) {
         entry.row = blocking;
+        entry.gain_outside_lanes = false;
         entry.faster = false;
     }
 }

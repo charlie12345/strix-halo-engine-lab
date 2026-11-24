@@ -36,15 +36,24 @@ struct GroupAccumulator {
         sum = Mma{}(a, b, sum);
     }
 
-    STRIX_LOWBIT_GROUP_INLINE void apply(float scale, Accumulator& acc) const {
+    template <class Scale>
+    STRIX_LOWBIT_GROUP_INLINE void apply(Scale scale, Accumulator& acc) const {
 #if defined(__HIPCC__)
 #pragma unroll
 #endif
         for (unsigned i = 0; i < 8U; ++i) {
+            float partial = sum[i];
+            float multiplier;
+            if constexpr (requires { scale.partial_multiplier; }) {
+                partial *= scale.partial_multiplier;
+                multiplier = scale.multiplier;
+            } else {
+                multiplier = scale;
+            }
 #if defined(__HIPCC__)
-            acc[i] = __builtin_fmaf(sum[i], scale, acc[i]);
+            acc[i] = __builtin_fmaf(partial, multiplier, acc[i]);
 #else
-            acc[i] = std::fma(sum[i], scale, acc[i]);
+            acc[i] = std::fma(partial, multiplier, acc[i]);
 #endif
         }
     }

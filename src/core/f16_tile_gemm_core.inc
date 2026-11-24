@@ -4,11 +4,17 @@
 #define STRIX_F16_TILE_PROJECTIONS
 #endif
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
+// A binding can reuse the packed tile inside a grid with different row and column origins.
+struct PackedTileOrigin {
+    unsigned row, column;
+};
+
 template <Layout L, class Store, bool kA16, class Weights, class Pair = UnpairedColumns, class Rows = DirectRows,
-          class Sched = IncumbentSchedule>
+          class Sched = IncumbentSchedule, bool kBoundOrigin = false>
 __device__ __forceinline__ void core(const Args& p, typename Sched::Storage& lds, const Store& store,
-                                     const Weights& weights, const Pair& pair = {}, const Rows& source = {}) {
-    static_assert(kA16 && L == Layout::NK);
+                                     const Weights& weights, const Pair& pair = {}, const Rows& source = {},
+                                     PackedTileOrigin origin = {}) {
+    static_assert(kA16 && L == Layout::NK && (!kBoundOrigin || !Pair::kPaired));
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
 // kA16: A arrives as BF16 bits (Args::a16), loaded as is: the operand bits the FP32 staging (pack2<bf16>, RNE) makes of
 // the values the image was encoded from. No K16 tail form.
@@ -52,13 +58,16 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     const RawStore store{projection.output + (left != 0U ? col0 : 0U), projection.outputs, 0U};
 #else
     const unsigned nt = p.N / kBN;
-    const unsigned n0 = (p.order == 2U ? blockIdx.x % nt : blockIdx.x) * kBN;
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
-    const unsigned r0 = (p.order == 1U ? blockIdx.z : blockIdx.y) * Sched::kRows;
+    const unsigned n0 = kBoundOrigin ? origin.column : (p.order == 2U ? blockIdx.x % nt : blockIdx.x) * kBN;
+    const unsigned r0 = kBoundOrigin ? origin.row : (p.order == 1U ? blockIdx.z : blockIdx.y) * Sched::kRows;
+    const unsigned b = kBoundOrigin ? 0U : p.order == 0U ? blockIdx.z : p.order == 1U ? blockIdx.y :
+                       blockIdx.z * p.group + blockIdx.x / nt;
 #else
+    const unsigned n0 = (p.order == 2U ? blockIdx.x % nt : blockIdx.x) * kBN;
     const unsigned r0 = (p.order == 1U ? blockIdx.z : blockIdx.y) * kBM;
-#endif
     const unsigned b = p.order == 0U ? blockIdx.z : p.order == 1U ? blockIdx.y : blockIdx.z * p.group + blockIdx.x / nt;
+#endif
 #endif
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS)
     // Live 16-row WMMA tiles of this wave (rows past `rows` are never multiplied or stored).
@@ -98,6 +107,9 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     for (unsigned j = 0; j < kWC; ++j) {
         const unsigned wl = ar + kRowStep * j;
         wcol[j] = Pair::kPaired ? (wl < 64U ? 64U * blockIdx.x + wl : pair.half + 64U * blockIdx.x + (wl - 64U)) : n0 + wl;
+        if constexpr (kBoundOrigin) {
+            if (wcol[j] >= p.N) wcol[j] = n0;  // pad a partial output tile with a valid weight row
+        }
     }
 #elif defined(STRIX_F16_TILE_Q8)
     const unsigned wc = (tid >> 1U) % kProjectionPanel;

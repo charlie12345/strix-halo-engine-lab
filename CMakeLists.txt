@@ -3946,6 +3946,19 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-inkling2-mini-gemv-test tests/inkling2/mini_gemv_hip.hip)
         add_executable(strix-hip-inkling2-mini-residual-test tests/inkling2/mini_residual_device.hip)
         add_executable(strix-hip-inkling2-mini-attention-test tests/inkling2/mini_attention_policy_hip.hip)
+        # No-model fixture of the FAST small-M form of the grouped microscaled tile: checks + ms / GB/s vs R1, the tile and
+        # the full route (GPU).
+        add_executable(strix-hip-grouped-small-microscaled-bench tests/moe_core/grouped_small_microscaled_hip.hip)
+        set_target_properties(strix-hip-grouped-small-microscaled-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-grouped-small-microscaled-bench PRIVATE include src "${STRIX_HIP_INCLUDE_DIR}")
+        target_compile_options(strix-hip-grouped-small-microscaled-bench PRIVATE
+            -O3 ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-grouped-small-microscaled-bench PRIVATE strix_core strix-weight "${STRIX_HIP_RUNTIME_LIBRARY}")
+        strix_target_warnings(strix-hip-grouped-small-microscaled-bench)
+        # GPU check of the form (no timings): finite outputs, tile rows 1..64 per position, full route batch invariance.
+        add_test(NAME strix-hip-grouped-small-microscaled-check COMMAND strix-hip-grouped-small-microscaled-bench --check-only)
+        set_tests_properties(strix-hip-grouped-small-microscaled-check PROPERTIES LABELS "gpu;moe;fast")
         add_executable(strix-hip-inkling2-mini-attention-keysplit-test tests/inkling2/mini_attention_keysplit_hip.hip)
         add_executable(strix-hip-inkling2-mini-short-conv-test tests/inkling2/mini_short_conv_hip.hip)
         add_executable(strix-hip-inkling2-mini-grouped-test tests/inkling2/mini_grouped_microscaled_hip.hip)

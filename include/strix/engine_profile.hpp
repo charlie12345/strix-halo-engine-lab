@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/env_flags.hpp"
 #include "strix/fnv.hpp"
 #include "strix/turbo.hpp"
 
@@ -62,6 +63,8 @@ struct Lever {
     // a window-invariant prefill: choosing among them is scheduling, so an explicit member shares the qualification of a
     // ready column whose value is in the list. Empty: every value is its own class. Not part of the fingerprint.
     std::string_view same_bits{};
+    // For 0/1 environment switches, match the runtime flag parser with `builtin` as its default.
+    std::optional<EnvFlagMatch> env_flag_match{};
 };
 
 // True when `value` is one whole item of the comma list `list`.
@@ -954,7 +957,9 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
         if (cli != nullptr || env != nullptr) {  // a set variable is explicit even when empty (the app judges it)
             entry.requested = cli != nullptr ? *cli : std::string(env);
-            entry.value = cli != nullptr ? *cli : std::string(env);
+            entry.value = entry.requested;
+            if (cli == nullptr && lever.env_flag_match)
+                entry.value = envcfg::parse_flag(env, lever.builtin == "1", *lever.env_flag_match) ? "1" : "0";
             entry.status = cli != nullptr ? Status::explicit_cli : Status::explicit_env;
             if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
         } else if (wanted.empty() || wanted == lever.builtin) {

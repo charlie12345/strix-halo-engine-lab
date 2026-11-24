@@ -51,13 +51,13 @@ inline constexpr sp::Lever table[] = {
      .source = "pending the GPTQ pack and the production IU4 loader/dispatch binding", .omit_builtin_fingerprint = true},
     {.name = "pf_a8_producer", .env = "STRIX_HY4_PF_A8_PRODUCER", .option = "", .value = {}, .builtin = "1",
      .kind = sp::Kind::exact, .target = "", .off = "0", .source = "produce identical A8 rows in the prefill epilogue",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true, .env_flag_match = EnvFlagMatch::first_character},
     {.name = "q8_store_epilogue", .env = "STRIX_HY4_Q8_STORE_EPILOGUE", .option = "", .value = {}, .builtin = "1",
      .kind = sp::Kind::exact, .target = "", .off = "0", .source = "fuse the decode store epilogue",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true, .env_flag_match = EnvFlagMatch::first_character},
     {.name = "pf_store_epilogue", .env = "STRIX_HY4_PF_STORE_EPILOGUE", .option = "", .value = {}, .builtin = "1",
      .kind = sp::Kind::exact, .target = "", .off = "0", .source = "fuse the prefill BF16 store epilogue",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true, .env_flag_match = EnvFlagMatch::first_character},
 };
 
 // Regime of a run, known before the forward loads. An unknown device resolves every FAST cell to pending.

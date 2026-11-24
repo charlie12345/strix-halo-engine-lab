@@ -135,7 +135,7 @@ request at a time; `--api-key-file F` requires a bearer key.
 Sampled requests (`temperature > 0`) decode by plain steps unless `STRIX_GLM_SERVE_SAMPLED_MTP=1` is set on rank 0
 (opt-in until its pair gates pass, see [glm-serve-sampled-mtp](../../optimizations.md#glm-serve-sampled-mtp)): then one
 sampled request in flight decodes through MTP, and rank 0 decides every verify row with the request's sampler over the
-row's full vocabulary (rank 1 sends its half), accepting a draft only when it equals that sampled token. From temperature 0.7 the drafts are drawn from the drafter's rows the same way; `STRIX_GLM_SERVE_SAMPLED_ACCEPT=rejection` selects rejection sampling (exact in distribution, not the tokens of plain sampling). `--selftest N` on rank 0 (no HTTP) runs N built-in
+row's full vocabulary (rank 1 sends its half), accepting a draft only when it equals that sampled token. From temperature 0.7 the drafts are drawn from the drafter's rows the same way; `STRIX_GLM_SERVE_SAMPLED_ACCEPT=rejection` selects rejection sampling (exact in distribution, not the tokens of plain sampling). Measured on one cable: 30-34 tok/s at T 1.0 against 24 by plain steps ([gain](../../optimizations.md#glm-serve-sampled-mtp)). Draft counts are in `strix.sampling_receipt`; the response's `strix.mtp_*` fields read 0 on this server, greedy or sampled. `--selftest N` on rank 0 (no HTTP) runs N built-in
 prompts together and each alone and reports EXACT/FAIL with tok/s per concurrency level.
 
 `--prefix-cache-gib G` sets the host-RAM prompt snapshot LRU to G GiB per rank (default 4;

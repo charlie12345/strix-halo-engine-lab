@@ -4935,7 +4935,16 @@ then depend on the drafts and are not those of plain sampling.
 - **Fallback notice:** every sampled response carries `sampling_receipt`: its acceptance rule (`coupled` / `rejection`), drafted rows accepted and rejected (both zero when it decoded by plain steps) and drafts drawn from the drafter rows.
 - **Exactness evidence:** host fake pair: three sampled requests x 40 tokens equal plain sampling of the same seeds, with greedy drafts (T 0.5) and with drafts drawn from the drafter rows (T 0.9), also beside a greedy request with G2 on; rejection completes with accepted and rejected rows (not token-compared); shared tests: coupled windows equal plain sampling on both ranks, cut windows send no extra rows, rejection windows equal `decide_rows`, drafts picked across the pair equal the sampler's own draft. Pair gates pending: SP1a (`strix-glm5-rank --spec-oracle`, committed-row logits bitwise equal plain steps) on the current build, and the same sampled requests served with the switch on and off with equal token vectors on both ranks.
 - **Off switch:** unset or `STRIX_GLM_SERVE_SAMPLED_MTP=0` (plain steps); `STRIX_GLM_SERVE_SAMPLED_ACCEPT=coupled` (default) restores coupled acceptance; `STRIX_GLM_SERVE_MTP=0` turns off MTP for every request
-- **Measured gain:** not measured yet (prediction only: with greedy drafts acceptance falls with temperature; each decided row and each drawn draft moves one vocabulary half, about 310 KB, over the pair link). Bench matrix to run on the pair, interleaved against plain steps: coupled at T 0.6 (greedy drafts), coupled at T 0.8 / 1.0 (drawn drafts), rejection at T 0.8 / 1.0.
+- **Measured gain:** 2026-11-24, build `c1f5686e`, a pair with **one** USB4 cable shared with `thunderbolt_net` (one host stream), `--slots 2 --capacity 131072`; agent-style bench: a 29,167-token code prompt, then 1,024-token answers on top of it (prefix cache hits of 28,672), 3 answers per cell, arms one after another in fresh processes (not ABAB-interleaved), `top_p` 1. Decode tok/s:
+
+  | Arm | T 0.6 | T 1.0 |
+  |---|---|---|
+  | plain steps (switch off) | 24.2-24.3 | 24.0 |
+  | coupled (default acceptance) | 33.5-38.3 | 30.1-34.3 |
+  | rejection | not run | 30.1-34.5 |
+
+  Rejection is no faster than coupled at T 1.0. Prompt prefill is unchanged (527-553 tok/s for the cold 29K prompt). Served through llama-swap at T 1.0 / `top_p` 0.95, one 1,327-token coding answer: 34.9 tok/s. Rank 0's `strix-spec-stats` for coupled T 1.0 answers: 2.14-2.97 tokens per pass, 71-79 % of drafts accepted. Token equality with switch-off plain sampling was not checked on this pair (pair gates above still pending).
+- **Draft counters:** on the GLM pair server `strix.mtp_cycles`, `strix.mtp_accepted` and `strix.mtp_proposed` in responses read 0 for every request, greedy and sampled, while MTP runs. Sampled requests report their drafts in `strix.sampling_receipt` (`drafts`, `accepted`, `rejected`; e.g. 260 / 199 / 40); greedy requests report none in the response. Every request's counts are on rank 0's stderr as one `strix-spec-stats` line.
 - **Implementation / evidence:** [lead loop](../src/glm/serve/glm_serve_lead.hpp), [server adapter](../apps/glm_serve_main.cpp), [decoder hook](../src/glm/spec/glm_spec_run.cpp), [tests](../tests/glm_serve_cpu_tests.cpp)
 
 <a id="glm-serve-prefill-chunk"></a>

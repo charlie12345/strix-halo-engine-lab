@@ -4,6 +4,7 @@
 #include "core/dense_row_plan.hpp"
 #include "core/f16_tile_gemm.hpp"
 #include "core/fma_rows.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -130,6 +131,10 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
     });
 }
 
+// Image rows from this height up take the K64 packed schedule where the shape admits it (measured faster than the K32
+// image tile at 4,096 and 8,192 rows on every wide shape; lower heights keep the K32 image tile).
+inline constexpr unsigned kPackedImageMinRows = 1024U;
+
 inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned input_width, unsigned rows,
                                           std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                           hipStream_t stream) {
@@ -139,7 +144,41 @@ inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned i
     f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> group{};
     for (const auto& projection : projections)
         group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
+    // Prefill heights on whole 128-column projections take the packed-operand core's K64 schedule (same bits).
+    if (rows >= kPackedImageMinRows && f16_tile_gemm::admits_packed_image_projections(input_width, group))
+        return f16_tile_gemm::gemm_bf16_projections_image_packed(input, rows, input_width, group, stream);
     f16_tile_gemm::gemm_bf16_projections_image(input, rows, input_width, group, stream);
+    return hipGetLastError();
+}
+
+namespace detail {
+// One thread per 8 values: image[i] = bf16_encode(input[i]) (RNE, a NaN stays NaN), the operand bits the projection
+// tile's FP32 staging (pack2<bf16>) makes of the same values.
+static __global__ __launch_bounds__(256) void bf16_operand_image_kernel(const float* input, std::uint16_t* image,
+                                                                 std::size_t groups) {
+    const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (g >= groups) return;
+    const auto* in = reinterpret_cast<const float4*>(input) + 2U * g;
+    const float4 x = in[0], y = in[1];
+    const auto pack = [](float lo, float hi) {
+        return std::uint32_t{::strix::weight::scalar_float::bf16_encode(lo)} |
+               (std::uint32_t{::strix::weight::scalar_float::bf16_encode(hi)} << 16U);
+    };
+    reinterpret_cast<uint4*>(image)[g] = make_uint4(pack(x.x, x.y), pack(x.z, x.w), pack(y.x, y.y), pack(y.z, y.w));
+}
+}  // namespace detail
+
+// The BF16 operand image of contiguous FP32 rows ([rows][width] -> [rows][width] u16) for enqueue_bf16_image_rows,
+// which then stores the bits enqueue_bf16_rows stores on the FP32 rows. Both pointers 16-byte aligned, width % 8 == 0.
+inline hipError_t enqueue_bf16_operand_image(const float* input, unsigned width, unsigned rows, std::uint16_t* image,
+                                             hipStream_t stream) {
+    if (!input || !image || width % 8U != 0U || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
+        reinterpret_cast<std::uintptr_t>(image) % 16U != 0U)
+        return hipErrorInvalidValue;
+    const std::size_t groups = std::size_t{rows} * width / 8U;
+    if (groups == 0U) return hipSuccess;
+    const auto blocks = static_cast<unsigned>((groups + 255U) / 256U);
+    detail::bf16_operand_image_kernel<<<blocks, 256, 0, stream>>>(input, image, groups);
     return hipGetLastError();
 }
 

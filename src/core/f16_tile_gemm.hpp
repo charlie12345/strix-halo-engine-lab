@@ -354,6 +354,95 @@ inline hipError_t gemm_packed_bf16(const typename Binding::Args& descriptors, un
     return hipGetLastError();
 }
 
+// BF16 weight rows [outputs][w_ld] as an operand of the packed-operand core: a 16-value tile is 32 bytes of one row and
+// decoding is the identity. With a BF16 operand image for A the core computes what bf16_projection_kernel computes for
+// the FP32 rows the image stands for (same pack2<bf16> operands, one K16 chain from +0 per output) under any schedule.
+struct Bf16RowsOperand {
+    static constexpr bool kNvfp4 = false;
+    const std::uint16_t* weights;
+    std::size_t w_ld;
+    struct Tile16 {
+        U4 low, high;
+    };
+    template <bool>
+    __device__ __forceinline__ Tile16 load_tile16(unsigned column, unsigned k) const {
+        const auto* tile = reinterpret_cast<const U4*>(weights + std::size_t{column} * w_ld + k);
+        return {tile[0], tile[1]};
+    }
+    __device__ __forceinline__ void decode_bf16(const Tile16& tile, std::uint32_t (&out)[8]) const {
+#pragma unroll
+        for (unsigned i = 0; i < 4U; ++i) {
+            out[i] = tile.low[i];
+            out[4U + i] = tile.high[i];
+        }
+    }
+};
+
+// A projection group on a BF16 operand image ([rows][K] u16) through the packed-operand core: grid z = projection, x =
+// 128-column tile (a tile past its projection's outputs leaves before any barrier), y = row slices of the schedule.
+// Every output has the bits bf16_projection_image_kernel stores, round_bf16 included.
+template <unsigned Capacity>
+struct Bf16ImageProjections {
+    struct Args {
+        const std::uint16_t* a16;
+        std::size_t w_ld;
+        unsigned rows, K;
+        Bf16ProjectionGroup<Capacity> group;
+    };
+    struct Store {
+        float* y;
+        std::size_t y_row;
+        bool round_bf16;
+        __device__ __forceinline__ void put(unsigned, unsigned r, unsigned n, float v) const {
+            y[std::size_t{r} * y_row + n] = round_bf16 ? strix::attn::group_indexer::bf16_round(v) : v;
+        }
+    };
+    struct Tile {
+        f16_tile_gemm::Args shape;
+        Store store;
+        Bf16RowsOperand weights;
+    };
+
+    __device__ static __forceinline__ bool active(const Args& args, unsigned z) {
+        return z < args.group.count && blockIdx.x * kBN < args.group.projections[z].outputs;
+    }
+    __device__ static __forceinline__ Tile bind(const Args& args, unsigned z) {
+        const auto& projection = args.group.projections[z];
+        f16_tile_gemm::Args shape{};
+        shape.a16 = args.a16;
+        shape.a_row = args.K;
+        shape.rows = args.rows;
+        shape.K = args.K;
+        shape.N = projection.outputs;
+        return {shape, {projection.output, projection.outputs, projection.round_bf16}, {projection.weights, args.w_ld}};
+    }
+};
+
+// Schedule of image projections at prefill heights: 128 x 128 CTA, K64 stage (same bits as every schedule).
+using ImageProjectionSchedule = TileSchedule<2, 4, 64>;
+
+// Shapes the packed image route takes: K a multiple of the K64 stage and whole 128-column tiles in every projection.
+template <unsigned Capacity>
+constexpr bool admits_packed_image_projections(unsigned K, const Bf16ProjectionGroup<Capacity>& group) {
+    if (group.count == 0U || !ImageProjectionSchedule::admits(K, kBN)) return false;
+    for (unsigned p = 0; p < group.count; ++p)
+        if (group.projections[p].outputs == 0U || group.projections[p].outputs % kBN != 0U) return false;
+    return true;
+}
+
+// gemm_bf16_projections_image through the packed-operand core under ImageProjectionSchedule (contiguous weights).
+template <unsigned Capacity>
+inline hipError_t gemm_bf16_projections_image_packed(const std::uint16_t* a16, unsigned rows, unsigned K,
+                                                     const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream) {
+    if (rows == 0U || !admits_packed_image_projections(K, group)) return hipErrorInvalidValue;
+    unsigned outputs = 0U;
+    for (unsigned p = 0; p < group.count; ++p) outputs = std::max(outputs, group.projections[p].outputs);
+    using Binding = Bf16ImageProjections<Capacity>;
+    const typename Binding::Args args{a16, K, rows, K, group};
+    const unsigned slices = (rows + ImageProjectionSchedule::kRows - 1U) / ImageProjectionSchedule::kRows;
+    return gemm_packed_bf16<Binding, ImageProjectionSchedule>(args, K, outputs, group.count, stream, slices);
+}
+
 inline dim3 grid(const Args& p) {
     const unsigned rb = (p.rows + kBM - 1U) / kBM;
     if (p.order == 2U) return dim3(p.N / kBN * p.group, rb, p.batches / p.group);

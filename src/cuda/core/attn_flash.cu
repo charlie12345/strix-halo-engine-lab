@@ -21,6 +21,7 @@ namespace strix::cuda_core {
 namespace {
 
 constexpr int QB = 128, KT = 32;
+static_assert(QB == static_cast<int>(kPrefillFlashRowsPerTile) && KT == static_cast<int>(kPrefillFlashKeysPerTile));
 constexpr auto step_position_limit = std::numeric_limits<unsigned>::max() - QB - KT;
 
 // Shared-memory layouts of one K/V tile stage (byte offsets inside a stage). Both give conflict-free K LDS.64 and V ldmatrix;
@@ -148,7 +149,8 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
     // Prepared forms: a warp whose 16 rows all lie at or past `rows` (the one-row step, verify-row and lane forms, planned
     // calls, a prompt's last tile) has every score masked and stores nothing, and no other warp reads its registers: it only
     // copies K/V and meets the barriers, so each stored row runs the same instructions on the same tiles while the tile's
-    // mma work shrinks (one row: 1/8). The plain prompt flash keeps every warp (its code is unchanged).
+    // mma work shrinks (one row: 1/8). This live-row predicate is prepared-only: the plain prompt flash keeps every warp
+    // active, but its pad2 machine code still changed, because every pad2 tile now ends on one unconditional barrier.
     const bool act = static_cast<std::uint32_t>(warp) - wlo < wn && (!Prepared || wrow0 < rows);  // warp-uniform
     const auto fixed = attn_core::mask::block_range(pos0, rows, prepared.window);
     const std::uint32_t nkeys = Bidirectional ? fixed.end : pos0 + min(rows, row_base + QB);

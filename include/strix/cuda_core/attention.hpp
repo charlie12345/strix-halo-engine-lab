@@ -77,12 +77,22 @@ cudaError_t attention_decode_row_phase(const AttentionDims& d, const float* q, c
 // Live slices of the prepared / planned forms (scheduling only, SAME bits): a warp whose 16 rows all lie at or past `rows`
 // (one-row step, verify-row, lane and planned calls; a prompt's last tile) only copies K/V and meets the barriers, so a one-row
 // call does 1/8 of the tile's mma work.
-inline constexpr std::uint32_t kPrefillFlashHeadDim = 256;  // the plain prompt flash (both pipes); the prepared forms serve 128
-// Host-only admission of attention_prefill_flash (no CUDA call, overflow-safe): the launch returns cudaErrorInvalidValue exactly
-// when this is false, so a caller or a harness can refuse a wrong argument before any device work.
+inline constexpr std::uint32_t kPrefillFlashHeadDim = 256;     // the plain prompt flash (both pipes); the prepared forms serve 128
+inline constexpr std::uint32_t kPrefillFlashRowsPerTile = 128;  // query rows per CTA tile (8 warps x 16 rows)
+inline constexpr std::uint32_t kPrefillFlashKeysPerTile = 32;   // keys per K/V tile
+// Host shape validation of attention_prefill_flash (no CUDA call, overflow-safe). The launch returns cudaErrorInvalidValue
+// before any CUDA call exactly when this is false, so a caller or a harness can refuse a wrong shape before any device work;
+// it does not cover pointers or the CUDA calls of the launch itself (device attribute, function attribute, launch), which
+// can still fail after it passes. Admitted: head_dim 256, at least one query head, GQA group 1..8, a non-empty row range
+// inside the cache, row and key tile ceilings that stay inside 32 bits (pos0 + rows <= 2^32 - 1 - 128 - 32, the prepared
+// forms' step limit), and a grid whose largest tail plan (8 jobs per tile) fits grid.x (<= 2^31 - 1).
 [[nodiscard]] inline bool can_launch_prefill_flash(const AttentionDims& d, std::uint32_t pos0, std::uint32_t rows) {
-    return d.head_dim == kPrefillFlashHeadDim && rows != 0 && d.kv_heads != 0 && d.heads % d.kv_heads == 0 &&
-           d.heads / d.kv_heads <= 8 && pos0 <= d.max_positions && rows <= d.max_positions - pos0;
+    constexpr std::uint32_t limit = 0xFFFFFFFFu - kPrefillFlashRowsPerTile - kPrefillFlashKeysPerTile;
+    if (d.head_dim != kPrefillFlashHeadDim || d.heads == 0 || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 ||
+        d.heads / d.kv_heads > 8 || pos0 > d.max_positions || rows > d.max_positions - pos0 || pos0 > limit || rows > limit - pos0)
+        return false;
+    const std::uint64_t tiles = (static_cast<std::uint64_t>(rows) + kPrefillFlashRowsPerTile - 1) / kPrefillFlashRowsPerTile * d.heads;
+    return tiles * 8 <= 0x7FFFFFFFull;
 }
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,

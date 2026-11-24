@@ -169,6 +169,13 @@ unsigned check_args(unsigned& launches) {
         for (int tail = 0; tail < 2; ++tail) admit(cc::can_launch_prefill_flash(plain_dims(), p.pos0, p.rows), "plain", p.pos0, p.rows);
     // control: the predicate refuses the prepared forms' head_dim on the plain flash (the argument t3 passed)
     admit(!cc::can_launch_prefill_flash({kHeads, kKv, kDim, kScale, kPlainCapacity}, 0U, 17U), "plain control d128", 0U, 17U);
+    // controls: no query head (a zero-job grid), and a row range whose 32-bit tile ceiling would wrap to zero
+    admit(!cc::can_launch_prefill_flash({0U, 1U, cc::kPrefillFlashHeadDim, kScale, 1U}, 0U, 1U), "plain control heads 0", 0U, 1U);
+    constexpr std::uint32_t kAll = 0xFFFFFFFFu;
+    admit(!cc::can_launch_prefill_flash({1U, 1U, cc::kPrefillFlashHeadDim, kScale, kAll}, 0U, kAll), "plain control rows 2^32-1", 0U,
+          kAll);
+    admit(!cc::can_launch_prefill_flash({1U, 1U, cc::kPrefillFlashHeadDim, kScale, kAll}, kAll - 100U, 50U), "plain control key ceiling",
+          kAll - 100U, 50U);
     return refused;
 }
 

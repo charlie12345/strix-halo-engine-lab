@@ -15,6 +15,10 @@
 //   b80 b64  the vision encoder's own one-term geometry (src/vision/encoder.hip BidirPolicy): bidirectional over n
 //            keys (row r at logical position n - 1 + r, window n, logical key p backed by key p % n, mask:: bidir
 //            functions), its scales 1/sqrt(80) and 1/8, n off the 64-row and 16-key tiles (1000, 1031, 37 rows)
+//   b64-s    the 37-row tail of b64 alone (own selector)
+//   b72 b72-s  the encoder's D72 heads: padded to 80 (the last eight Q/K/V components zero), scale 1/sqrt(72), n 1013 / 37
+//   xp       pinned rescale-boundary cases of the lane-score form (Special::pin_*): deterministic Q/K/V, the expected
+//            output bits asserted literally in addition to the cross-build digest
 // Usage: strix-dense-flash-bench [REPS] [CASE]   (CASE: one name above; default all)
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
@@ -24,6 +28,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -74,11 +79,15 @@ struct Classic2 : Classic<D, 1U, 64U, tile::Operand::f16> {
     __device__ static const std::uint16_t* key_lo(const Args& a, unsigned p, unsigned h) { return a.k + (std::size_t(p - a.k0) * a.kv_heads + h) * D; }
     __device__ static const std::uint16_t* value_t_lo(const Args& a, unsigned h, unsigned d) { return a.vt + std::size_t(h * D + d) * a.vstride - a.k0; }
 };
-template <unsigned D>  // one-term vision encoder policy: its scale (the bench's Classic uses 1/16 for every D < 512)
-struct Vision1 : Classic<D, 1U, 64U, tile::Operand::f16> {
+// One-term vision encoder policy: its scale (src/vision/encoder.hip BidirPolicy<D, DP, 1>; the bench's Classic uses 1/16
+// for every D < 512). D 72 runs padded to DP 80.
+template <unsigned D, unsigned DP = D>
+struct Vision1 : Classic<DP, 1U, 64U, tile::Operand::f16> {
     using Args = BArgs;
-    static constexpr float kScaleLog2 = (D == 64U ? 0.125F : 0.11180339887498948F) * 1.44269504088896341F;
-    static_assert(D == 64U || D == 80U);
+    static constexpr float kScaleLog2 =
+        (D == 64U ? 0.125F : D == 72U ? 0.11785113019775792F : 0.11180339887498948F) * 1.44269504088896341F;
+    static_assert(D == 64U || D == 72U || D == 80U);
+    static_assert(DP == D || (D == 72U && DP == 80U));
 };
 template <unsigned D, unsigned G>  // one-slice form with the relative bias projected in the flash
 struct Rel : Classic<D, G, 64U, tile::Operand::bf16> {
@@ -118,8 +127,24 @@ template <class T> T* up(const std::vector<T>& h) {
 //             dominates the scores (alpha underflows to 0: Inf * 0 = NaN accumulators) and the following tiles keep
 //             that maximum (alpha exactly 1 across the wave: the shortcut's case);
 //   tiny      V holds operands whose products are FP32 subnormals, and signed zeros.
+// Pinned rescale-boundary cases (deterministic data, expected output asserted literally; apply_pin / check_pin):
+// Q is 1.0 everywhere and K is 0 except one dominating key, so every row of a wave sees the same score sequence: tile 0
+// (keys 0-15) alpha 0 (maximum from -Inf), tile 1 alpha exactly 1 for the whole wave (rescale skipped), tile 2 (key 40)
+// the maximum jumps (alpha 0, or 2^-115.4), tiles 3.. alpha exactly 1 for the whole wave again. V is 0 except tile 0:
+//   pin_ovf_nan   BF16: V = +-largest finite, the FP32 PV sum overflows to +-Inf (tile 0), survives tile 1 at alpha 1, meets
+//                 alpha 0 (Inf * 0) and is a live NaN at every later alpha 1: every output is a quiet NaN, failure bit 1;
+//   pin_inf_nan   the same with V = +-Inf operands (reachable in FP16 too);
+//   pin_ovf_hold  BF16 without the dominating key: the accumulator holds +-Inf at every alpha 1: outputs +-Inf bits;
+//   pin_inf_hold  the same with V = +-Inf operands;
+//   pin_sub       V = a tiny operand (FP16 2^-24, BF16 2^-30): tile 0 accumulates 16 V exactly, tile 2 rescales it by
+//                 2^-115.4 (the multiply yields an FP32 subnormal), tiles 3.. keep alpha 1: the matrix accumulate that
+//                 follows the multiply flushes the subnormal, the output is +0 (a kernel that never rescales outputs
+//                 16 V, nonzero), so no FP32 subnormal accumulator reaches the next boundary;
+//   pin_subop     BF16 without the dominating key and V = the smallest BF16 subnormal: the PV accumulator of tile 0 would
+//                 be the FP32 subnormal 16 * 2^-133 at every alpha 1; the matrix unit gives +0 (same bits as the
+//                 incumbent kernel), asserted.
 // Ordinary cases (none) must leave the failure word 0; exceptional cases report it for the cross-build comparison.
-enum class Special : unsigned { none, nan, overflow, tiny };
+enum class Special : unsigned { none, nan, overflow, tiny, pin_ovf_nan, pin_inf_nan, pin_ovf_hold, pin_inf_hold, pin_sub, pin_subop };
 
 struct Case {
     const char* name;
@@ -127,6 +152,7 @@ struct Case {
     bool f16;
     Special special = Special::none;
     bool bidir = false;  // rows = n keys, p0 = bidir_position(n), window = bidir_window(n), key p holds key p % n
+    unsigned valid_dim = 0U;  // components >= valid_dim of Q / K / V are zero (the encoder's D72 padded to 80); 0 = all
 };
 
 bool g_flag_failed = false;
@@ -163,6 +189,77 @@ void apply_special(const Case& c, unsigned keys, unsigned KH, std::vector<std::u
     }
 }
 
+constexpr unsigned kPinRowsFrom = 64U;  // rows at or after this position: every wave of them sees tiles 0..2 whole
+
+constexpr bool is_pin(Special s) { return s >= Special::pin_ovf_nan; }
+
+void apply_pin(const Case& c, unsigned keys, unsigned KH, std::vector<float>& q, std::vector<std::uint16_t>& kfull,
+               std::vector<std::uint16_t>& vrows) {
+    const unsigned D = c.D;
+    std::fill(q.begin(), q.end(), 1.0F);
+    std::fill(kfull.begin(), kfull.end(), std::uint16_t{0U});
+    std::fill(vrows.begin(), vrows.end(), std::uint16_t{0U});
+    const bool ovf = c.special == Special::pin_ovf_nan || c.special == Special::pin_ovf_hold;
+    const bool inf = c.special == Special::pin_inf_nan || c.special == Special::pin_inf_hold;
+    const bool hold = c.special == Special::pin_ovf_hold || c.special == Special::pin_inf_hold || c.special == Special::pin_subop;
+    const std::uint16_t mag = ovf ? (c.f16 ? std::uint16_t{0x7BFFU} : std::uint16_t{0x7F7FU})
+                                  : (c.f16 ? std::uint16_t{0x7C00U} : std::uint16_t{0x7F80U});
+    const std::uint16_t tiny = c.f16 || c.special == Special::pin_subop ? std::uint16_t{0x0001U} : round_op(0x1p-30F, false);
+    for (unsigned p = 0; p < 16U; ++p)
+        for (unsigned h = 0; h < KH; ++h)
+            for (unsigned d = 0; d < D; ++d) {
+                std::uint16_t v = tiny;
+                if (ovf || inf) v = d % 3U == 2U ? static_cast<std::uint16_t>(mag | 0x8000U) : mag;
+                vrows[(std::size_t(p) * KH + h) * D + d] = v;
+            }
+    if (hold) return;
+    // Dominating key at position 40: score 1280 * scale, ~346 (alpha 0: exp2 underflows) or ~115.4 (alpha 2^-115.4).
+    const float kd = c.special == Special::pin_sub ? (c.f16 ? 16.0F : 10.0F) : (c.f16 ? 48.0F : 30.0F);
+    if (keys > 40U)
+        for (unsigned h = 0; h < KH; ++h)
+            for (unsigned d = 0; d < D; ++d) kfull[(std::size_t(40U) * KH + h) * D + d] = round_op(kd, c.f16);
+}
+
+// The literal expectation from the analysis above: every row at or after kPinRowsFrom, every head, every column.
+bool check_pin(const Case& c, const std::vector<float>& host, unsigned H, unsigned failure) {
+    const unsigned D = c.D;
+    bool good = true;
+    unsigned shown = 0U, bad_n = 0U;
+    for (unsigned r = 0; r < c.rows; ++r) {
+        if (c.p0 + r < kPinRowsFrom) continue;
+        for (unsigned h = 0; h < H; ++h)
+            for (unsigned d = 0; d < D; ++d) {
+                const float x = host[(std::size_t(r) * H + h) * D + d];
+                std::uint32_t b;
+                std::memcpy(&b, &x, 4);
+                bool ok_bits = false;
+                switch (c.special) {
+                case Special::pin_ovf_nan:
+                case Special::pin_inf_nan: ok_bits = (b & 0x7fc00000U) == 0x7fc00000U; break;  // quiet NaN
+                case Special::pin_ovf_hold:
+                case Special::pin_inf_hold: ok_bits = b == (d % 3U == 2U ? 0xff800000U : 0x7f800000U); break;
+                case Special::pin_sub:
+                case Special::pin_subop: ok_bits = b == 0U; break;
+                default: break;
+                }
+                if (!ok_bits) {
+                    ++bad_n;
+                    good = false;
+                    if (shown++ < 3U)
+                        std::printf("FAIL pin %s row %u head %u col %u: bits %08x (expected %s)\n", c.name, r, h, d, b,
+                                    c.special == Special::pin_sub || c.special == Special::pin_subop ? "+0" : "quiet NaN / signed Inf");
+                }
+            }
+    }
+    const bool want_failure = c.special != Special::pin_sub && c.special != Special::pin_subop;
+    if ((failure & 1U) != (want_failure ? 1U : 0U)) {
+        std::printf("FAIL pin %s: failure word %u, bit 1 expected %s\n", c.name, failure, want_failure ? "set" : "clear");
+        good = false;
+    }
+    if (bad_n) std::printf("FAIL pin %s: %u outputs differ from the literal expectation\n", c.name, bad_n);
+    return good;
+}
+
 template <class P> void run(const Case& c, unsigned reps) {
     const unsigned D = c.D, H = c.heads, KH = c.kv_heads;
     const unsigned k0 = (c.window && c.p0 >= c.window ? c.p0 - c.window + 1U : 0U) & ~15U, keys = c.p0 + c.rows - k0 + 16U, vstride = keys + 16U;
@@ -179,6 +276,12 @@ template <class P> void run(const Case& c, unsigned reps) {
     std::vector<std::uint16_t> vrows(std::size_t(keys) * KH * D);
     for (auto& x : vrows) x = round_op(u(g), c.f16);
     apply_special(c, keys, KH, kfull, vrows);
+    if (is_pin(c.special)) apply_pin(c, keys, KH, q, kfull, vrows);
+    if (c.valid_dim)  // padded heads: components >= valid_dim are zero in Q, K and V
+        for (unsigned d = c.valid_dim; d < D; ++d) {
+            for (std::size_t i = d; i < q.size(); i += D) q[i] = 0.0F;
+            for (std::size_t i = d; i < kfull.size(); i += D) kfull[i] = 0U, vrows[i] = 0U;
+        }
     if (c.bidir) {  // the encoder's wrapped storage: logical key p (up to 2 n - 2) is backed by key bidir_key(p, n)
         const unsigned n = c.rows;
         if (c.p0 != strix::attn_core::mask::bidir_position(n) || c.window != strix::attn_core::mask::bidir_window(n) ||
@@ -261,8 +364,10 @@ template <class P> void run(const Case& c, unsigned reps) {
         std::printf("FAIL flag case %s: failure %u on ordinary data\n", c.name, failure);
         g_flag_failed = true;
     }
+    if (is_pin(c.special) && !check_pin(c, host, H, failure)) g_flag_failed = true;
     for (const void* p : {static_cast<const void*>(a.q), static_cast<const void*>(a.k), static_cast<const void*>(a.vt),
-                          static_cast<const void*>(a.failure), static_cast<const void*>(out)})
+                          static_cast<const void*>(a.failure), static_cast<const void*>(out), static_cast<const void*>(a.feat),
+                          static_cast<const void*>(a.rw)})
         if (p) ok(hipFree(const_cast<void*>(p)), "free");
     ok(hipEventDestroy(e0), "event");
     ok(hipEventDestroy(e1), "event");
@@ -291,10 +396,11 @@ int main(int argc, char** argv) {
         if (want("o64")) run<Classic<64U, 1U, 64U, tile::Operand::f16>>({"o64", 64U, 16U, 16U, 1024U, 4095U, 0U, true}, reps);
         // The encoder's bidirectional one-term geometry and scales; n off the row and key tiles.
         if (want("b80")) run<Vision1<80U>>({"b80", 80U, 16U, 16U, 1000U, 999U, 1000U, true, Special::none, true}, reps);
-        if (want("b64")) {
-            run<Vision1<64U>>({"b64", 64U, 16U, 16U, 1031U, 1030U, 1031U, true, Special::none, true}, reps);
-            run<Vision1<64U>>({"b64-s", 64U, 16U, 16U, 37U, 36U, 37U, true, Special::none, true}, reps);
-        }
+        if (want("b64")) run<Vision1<64U>>({"b64", 64U, 16U, 16U, 1031U, 1030U, 1031U, true, Special::none, true}, reps);
+        if (want("b64-s")) run<Vision1<64U>>({"b64-s", 64U, 16U, 16U, 37U, 36U, 37U, true, Special::none, true}, reps);
+        // D72 heads padded to 80 (last eight components zero, scale 1/sqrt(72)), wrapped and off the tiles.
+        if (want("b72")) run<Vision1<72U, 80U>>({"b72", 80U, 16U, 16U, 1013U, 1012U, 1013U, true, Special::none, true, 72U}, reps);
+        if (want("b72-s")) run<Vision1<72U, 80U>>({"b72-s", 80U, 16U, 16U, 37U, 36U, 37U, true, Special::none, true, 72U}, reps);
         // Exceptional values on the lane-score forms (BF16 Inkling local / full / projected bias, FP16 one-term vision)
         // and on the two-term vision comparison form.
         using S = Special;
@@ -316,6 +422,20 @@ int main(int argc, char** argv) {
             run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikl-t", 128U, 24U, 8U, 2048U, 0U, 1024U, false, S::tiny}, reps);
             run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikf-t", 128U, 24U, 8U, 2048U, 0U, 0U, false, S::tiny}, reps);
             run<Classic<80U, 1U, 64U, tile::Operand::f16>>({"o80-t", 80U, 16U, 16U, 512U, 1023U, 0U, true, S::tiny}, reps);
+        }
+        // Pinned rescale-boundary cases (deterministic data, literal expected bits): BF16 Inkling form, FP16 vision form.
+        if (want("xp")) {
+            using B = Classic<128U, 3U, 64U, tile::Operand::bf16>;
+            using F = Classic<80U, 1U, 64U, tile::Operand::f16>;
+            run<B>({"pb-ovn", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_ovf_nan}, reps);
+            run<B>({"pb-inn", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_inf_nan}, reps);
+            run<B>({"pb-ovh", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_ovf_hold}, reps);
+            run<B>({"pb-inh", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_inf_hold}, reps);
+            run<B>({"pb-sub", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_sub}, reps);
+            run<F>({"pf-inn", 80U, 16U, 16U, 256U, 0U, 0U, true, S::pin_inf_nan}, reps);
+            run<F>({"pf-inh", 80U, 16U, 16U, 256U, 0U, 0U, true, S::pin_inf_hold}, reps);
+            run<B>({"pb-sbo", 128U, 24U, 8U, 256U, 0U, 0U, false, S::pin_subop}, reps);
+            run<F>({"pf-sub", 80U, 16U, 16U, 256U, 0U, 0U, true, S::pin_sub}, reps);
         }
     } catch (const std::exception& e) {
         std::printf("FAIL exception: %s\n", e.what());

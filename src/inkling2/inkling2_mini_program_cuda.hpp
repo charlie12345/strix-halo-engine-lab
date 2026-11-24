@@ -291,7 +291,7 @@ public:
                 recipe_.host_action(bind_(RouteTapExchange{mode_.tap, layer, 1U, kExpertsPerToken, kExperts,
                                                            storage_.route_ids, storage_.route_weights}));
         };
-        const auto format = mini_expert_format(layer);
+        const auto format = weights_.expert_format(layer);
         if (mode_.key.grouped) {
             const auto [plan, scratch, status] = mode_.grouped.bind(kExperts, kExpertsPerToken,
                 mini_grouped::CudaBackend::rows_per_tile, matrices, storage_.route_ids, storage_.route_weights,

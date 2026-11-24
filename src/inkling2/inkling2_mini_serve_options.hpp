@@ -24,6 +24,8 @@ struct MiniServeOptions {
     // Resolved operand class of the FAST W4A4 expert lever (mini_moe_w4a4_class; bf16 = off): the served prefill runs
     // the class the profile line reports, as the CLI and the gate do.
     moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16;
+    // Resolved narrow expert image lever (mini_experts_nvfp4): the MXFP8 expert layers load as NVFP4.
+    bool experts_nvfp4 = false;
 };
 
 struct MiniServeCohort {

@@ -4,6 +4,7 @@
 #include "inkling2_mini_moe_dispatch.hpp"
 #include "attn_core/prepared_gqa.hpp"
 
+#include "strix/weight/formats/microscaled_encode.hpp"
 #include "strix/weight/resident_slices.hpp"
 #include "strix/weight/row_pitch.hpp"
 
@@ -22,16 +23,37 @@ public:
     // rule: channel-safe pitch for the BF16 attention-output rows (0 = packed); Q8_0 compact rows stay packed.
     [[nodiscard]] static MiniResidentWeightPlan make(
         const MiniTextWeights& weights, weight::FormatId storage = weight::kBf16WeightStorage,
-        weight::RowPitchRule rule = {});
+        weight::RowPitchRule rule = {}, bool narrow_experts = false);
     [[nodiscard]] const weight::ResidentSlicePlan& slices() const { return slices_; }
     [[nodiscard]] std::size_t bytes() const { return slices_.bytes(); }
     [[nodiscard]] std::span<const MiniResidentRange> ranges() const { return slices_.ranges(); }
+
+    // Narrow expert image (lever moe.experts.mxfp8-nvfp4@1): the checkpoint's MXFP8 expert slabs stay out of the resident
+    // slices; the load transcodes each one to NVFP4 (expert_slab is its source) into one separate device allocation of
+    // narrow_bytes(), at narrow_range(). EXACT and every load without the lever keep the checkpoint slabs.
+    struct NarrowRange {
+        std::size_t codes{}, scales{};
+    };
+    [[nodiscard]] bool narrow_experts() const { return narrow_experts_; }
+    [[nodiscard]] static bool narrowed(unsigned physical) {
+        return mini_expert_format(physical) != weight::microscaled::MatrixFormat::nvfp4;
+    }
+    [[nodiscard]] const MiniExpertLayerView& expert_slab(unsigned physical, MiniExpertProjection projection) const {
+        return slabs_.at(physical).at(projection == MiniExpertProjection::gate_up ? 0U : 1U);
+    }
+    [[nodiscard]] NarrowRange narrow_range(unsigned physical, MiniExpertProjection projection) const {
+        return narrow_ranges_.at(physical).at(projection == MiniExpertProjection::gate_up ? 0U : 1U);
+    }
+    [[nodiscard]] std::size_t narrow_bytes() const { return narrow_bytes_; }
 
 private:
     friend class MiniResidentWeights;
     weight::ResidentSlicePlan slices_;
     weight::FormatId storage_ = weight::kBf16WeightStorage;
     std::array<std::array<MiniExpertLayerView, 2>, kPhysicalLayers> slabs_;
+    bool narrow_experts_ = false;
+    std::array<std::array<NarrowRange, 2>, kPhysicalLayers> narrow_ranges_{};
+    std::size_t narrow_bytes_ = 0;
 };
 
 // Borrow immutable resident bytes. Once bound, the views are independent of
@@ -45,6 +67,15 @@ public:
     [[nodiscard]] std::span<const float> f32(std::string_view name) const;
     [[nodiscard]] std::span<const MiniMoeExpert> experts(unsigned physical) const;
     [[nodiscard]] bool compact() const { return head_.has_value(); }
+    // True when the expert bank is the narrow image: every physical layer is NVFP4 (expert_format) and the MXFP8
+    // layers are bound by attach_narrow, never from the resident slices.
+    [[nodiscard]] bool narrow_experts() const { return narrow_; }
+    [[nodiscard]] weight::microscaled::MatrixFormat expert_format(unsigned physical) const {
+        return narrow_ ? weight::microscaled::MatrixFormat::nvfp4 : mini_expert_format(physical);
+    }
+    // Binds the device copy (`codes`, `scales`: the bytes of `slab`) of a narrowed layer's projection.
+    void attach_narrow(unsigned physical, MiniExpertProjection projection, const weight::microscaled::Nvfp4Slab& slab,
+                       std::span<const std::uint8_t> codes, std::span<const std::uint8_t> scales);
     [[nodiscard]] const weight::ResidentMatrixView& compact_head() const { return head_.value(); }
     [[nodiscard]] const attn_core::ResidentPreparedGqaWeights& compact_attention(unsigned physical) const {
         return attention_.at(physical);
@@ -56,6 +87,7 @@ private:
     weight::ResidentSlices slices_;
     std::vector<MiniMoeExpert> experts_;
     std::optional<weight::ResidentMatrixView> head_;
+    bool narrow_ = false;
     std::array<attn_core::ResidentPreparedGqaWeights, kPhysicalLayers> attention_{};
 };
 

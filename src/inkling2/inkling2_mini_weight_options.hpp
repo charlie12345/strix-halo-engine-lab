@@ -47,12 +47,21 @@ inline bool mini_moe_w4a4(const profile::Resolution& tier) {
     return mini_moe_w4a4_class(tier) != moe_core::grouped_w4a4::Activations::bf16;
 }
 
+// Resolved state of the narrow expert image lever (true: the checkpoint's MXFP8 expert layers load as NVFP4).
+inline bool mini_experts_nvfp4(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniExpertsNvfp4);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_MOE_EXPERTS_NVFP4 must be 0 or 1");
+}
+
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
+    static_cast<void>(mini_experts_nvfp4(tier));
     return tier;
 }
 

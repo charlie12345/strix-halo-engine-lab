@@ -35,10 +35,20 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 // one-row calls keep the BF16 tile. CUDA sm_120 only (HIP ignores it). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
-inline constexpr std::array<profile::Lever, 1> kMiniLevers{{
+// Narrow expert image: the checkpoint's MXFP8 expert layers are transcoded to NVFP4 at load (shared
+// weight/formats/microscaled_encode.hpp, mse@2 block scales, one outer scale per expert) and every expert consumer
+// reads them as NVFP4 (4.5 instead of 8.25 bits per weight). The checkpoint's NVFP4 layers are untouched. Bit-changing,
+// every regime (prefill, decode, verify, served), HIP and the CUDA resident route (the CUDA step program refuses it).
+// Pending: gate v2 quality against BF16 and a served receipt decide FAST or TURBO. Off switch: STRIX_MOE_EXPERTS_NVFP4=0.
+inline constexpr std::string_view kMiniExpertsNvfp4 = "moe.experts.mxfp8-nvfp4@1";
+inline constexpr std::array<profile::Lever, 2> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
+     false, {}, true},
+    {kMiniExpertsNvfp4, "STRIX_MOE_EXPERTS_NVFP4", "", {"", "", "", "1"}, "0", profile::Kind::bit_changing,
+     {}, {false, true, false, true}, "1", "0",
+     "waits for gate v2 (decode and prefill, quality against BF16) and a served B=1 / C8 / C16 receipt",
      false, {}, true},
 }};
 

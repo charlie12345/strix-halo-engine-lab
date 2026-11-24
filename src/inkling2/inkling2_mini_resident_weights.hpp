@@ -3,6 +3,7 @@
 #include "inkling2_mini_checkpoint.hpp"
 #include "inkling2_mini_moe_dispatch.hpp"
 #include "inkling2_mini_attention_operands.hpp"
+#include "inkling2_mini_controller_operands.hpp"
 #include "attn_core/prepared_gqa.hpp"
 
 #include "strix/weight/formats/microscaled_encode.hpp"
@@ -16,6 +17,11 @@
 namespace strix::inkling2 {
 
 using MiniResidentRange = weight::ResidentSliceRange;
+using MiniReadControllerBits = std::function<void(std::span<const std::uint16_t>, std::span<std::uint16_t>)>;
+
+// The certificate describes the exact BF16 bytes of these resident slices. The reader transfers those slices to host.
+[[nodiscard]] MiniControllerCertificate read_mini_controller_certificate(const weight::ResidentSlices& slices,
+                                                                         const MiniReadControllerBits& read);
 
 class MiniResidentWeightPlan {
 public:
@@ -64,7 +70,8 @@ private:
 class MiniResidentWeights {
 public:
     [[nodiscard]] static MiniResidentWeights bind(const MiniResidentWeightPlan& plan,
-                                                  std::span<const std::uint8_t> storage);
+                                                  std::span<const std::uint8_t> storage,
+                                                  const MiniReadControllerBits& read_controller_bits = {});
     [[nodiscard]] std::span<const std::uint16_t> bf16(std::string_view name) const;
     [[nodiscard]] weight::ResidentBf16Rows bf16_rows(std::string_view name) const;
     [[nodiscard]] std::span<const float> f32(std::string_view name) const;
@@ -85,6 +92,8 @@ public:
     // Binds the device copy (`codes`, `scales`: the bytes of `slab`) of a narrowed layer's projection.
     void attach_narrow(unsigned physical, MiniExpertProjection projection, const weight::microscaled::Nvfp4Slab& slab,
                        std::span<const std::uint8_t> codes, std::span<const std::uint8_t> scales);
+    void certify_controller(const MiniReadControllerBits& read);
+    [[nodiscard]] const MiniControllerCertificate& controller_certificate() const { return controller_certificate_; }
     [[nodiscard]] const weight::ResidentMatrixView& compact_head() const { return head_.value(); }
     [[nodiscard]] const attn_core::ResidentPreparedGqaWeights& compact_attention(unsigned physical) const {
         return attention_.at(physical);
@@ -99,6 +108,7 @@ private:
     bool narrow_ = false;
     std::array<attn_core::ResidentPreparedGqaWeights, kPhysicalLayers> attention_{};
     MiniAttentionCertificate attention_certificate_;
+    MiniControllerCertificate controller_certificate_;
 };
 
 }  // namespace strix::inkling2

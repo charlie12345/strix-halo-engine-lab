@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace strix::inkling2 {
 namespace {
@@ -69,9 +70,12 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
 }
 
 MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan,
-                                              std::span<const std::uint8_t> storage) {
+                                              std::span<const std::uint8_t> storage,
+                                              const MiniReadControllerBits& read_controller_bits) {
     MiniResidentWeights bound(weight::ResidentSlices::bind(plan.slices_, storage));
     bound.narrow_ = plan.narrow_experts_;
+    if (read_controller_bits)
+        bound.certify_controller(read_controller_bits);
     if (plan.storage_ == weight::kQ8WeightStorage)
         bound.head_ = bound.slices_.matrix("unembed.weight");
     bound.experts_.resize(kPhysicalLayers * kExperts);
@@ -151,6 +155,28 @@ void MiniResidentWeights::attach_narrow(unsigned physical, MiniExpertProjection 
         auto& pair = experts_[physical * kExperts + expert];
         (projection == MiniExpertProjection::gate_up ? pair.gate_up : pair.down) = matrices[expert];
     }
+}
+
+MiniControllerCertificate read_mini_controller_certificate(const weight::ResidentSlices& slices,
+                                                          const MiniReadControllerBits& read) {
+    MiniControllerCertificate certificate;
+    std::vector<std::uint16_t> host;
+    for (const auto& spec : mini_text_tensor_schema()) {
+        const std::string_view name(spec.name);
+        if (name.find(".controllers.") == std::string_view::npos) continue;
+        const bool down = name.ends_with("down_weight");
+        if (!down && !name.ends_with("forget_weight") && !name.ends_with("gain_weight")) continue;
+        const auto staged = slices.bf16(name.substr(kMiniTextTensorPrefix.size()));
+        host.resize(staged.size());
+        read(staged, host);
+        if (down) certificate.add_down(host);
+        else certificate.add_gate(host);
+    }
+    return certificate;
+}
+
+void MiniResidentWeights::certify_controller(const MiniReadControllerBits& read) {
+    controller_certificate_ = read_mini_controller_certificate(slices_, read);
 }
 
 std::span<const std::uint16_t> MiniResidentWeights::bf16(std::string_view name) const {

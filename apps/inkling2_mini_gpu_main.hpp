@@ -49,9 +49,10 @@ public:
     DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
                      const char* dspark,
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
-                     bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false)
+                     bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
+                     bool controller_one_plane = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
-                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts) {
+                   load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane) {
         const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold);
         std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, combine_image) << '\n';
         std::cerr << "Inkling prepared_round_fold " << mini_round_fold_name(levers.prepared_round_fold, prepared_round_fold)
@@ -123,7 +124,8 @@ inline void run_gate(const char* checkpoint, const Options& options, std::span<c
     const auto load_start = session::CliClock::now();
     MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
                                  options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage,
-                                 0U, false, 1U, 0U, mini_experts_nvfp4(options.tier));
+                                 0U, false, 1U, 0U, mini_experts_nvfp4(options.tier),
+                                 mini_controller_one_plane(options.tier));
     const auto levers = configure_mini_decoder(decoder, options.tier);
     std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, mini_combine_image(options.tier)) << '\n';
     std::cerr << "Inkling prepared_round_fold "
@@ -198,7 +200,7 @@ static_assert(kLatencyFormsMix == kMiniFormsMix && kLatencyFormsMoe == kMiniForm
               kLatencyFormsAll == kMiniFormsAll && kMiniDefaultForms == kMiniFormsMix);
 
 using MiniCudaProgramLoad = std::unique_ptr<serve::SerialGenerationDecoder> (*)(const serve::SerialGenerationLoad&,
-                                                                                moe_core::grouped_w4a4::Activations);
+                                                                                moe_core::grouped_w4a4::Activations, bool);
 
 // The exact R1 latency forms are a template parameter of the loader; map the CLI mask to its instance.
 inline MiniCudaProgramLoad select_mini_cuda_program(bool fuse, unsigned forms) {
@@ -252,7 +254,8 @@ int main(int argc, char** argv) {
 #endif
                      "\n"
                      "       MODEL.safetensors --tokenize FILE [--tokenizer FILE]\n"
-                     "       --profile exact|fast|turbo (default exact) [--qualify-q8 | --no-weight-q8]\n";
+                     "       --profile exact|fast|turbo (default exact) [--qualify-q8 | --no-weight-q8]\n"
+                     "       --controller-planes 3|1 (default 3; 1 is a CUDA FAST/TURBO candidate)\n";
         return 2;
     }
     try {
@@ -308,8 +311,10 @@ int main(int argc, char** argv) {
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
-                           moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {
-                return program_load(load, moe_w4a4);
+                           moe_w4a4 = mini_moe_w4a4_class(options.tier),
+                           controller_one_plane = mini_controller_one_plane(options.tier)](
+                              const serve::SerialGenerationLoad& load) {
+                return program_load(load, moe_w4a4, controller_one_plane);
             };
         else
 #endif
@@ -317,10 +322,11 @@ int main(int argc, char** argv) {
                        moe_w4a4 = mini_moe_w4a4_class(options.tier),
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier),
-                       narrow = mini_experts_nvfp4(options.tier)](const serve::SerialGenerationLoad& load) {
+                       narrow = mini_experts_nvfp4(options.tier),
+                       controller_one_plane = mini_controller_one_plane(options.tier)](const serve::SerialGenerationLoad& load) {
             loaded = resolve_weights({load.positions, 1U});
             return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.storage, dspark, moe_w4a4,
-                                                           combine_image, round_fold, narrow);
+                                                           combine_image, round_fold, narrow, controller_one_plane);
         };
         const auto write_profile = [&] {
             const auto& resolved = loaded ? *loaded : early;

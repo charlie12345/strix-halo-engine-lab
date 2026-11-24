@@ -70,7 +70,9 @@ inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-dow
 // (core::RoundStore::separate). Opt-in: off in every profile column (all cells empty, builtin 0); select it with
 // STRIX_INK_PREPARED_ROUND_FOLD=1 (any profile), through the one resolver the CLI, the gate and the server share.
 inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
-inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
+// Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
+inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
+inline constexpr std::array<profile::Lever, 5> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -91,6 +93,9 @@ inline constexpr std::array<profile::Lever, 4> kMiniLevers{{
      {}, {false, true, false, true}, "1", "0",
      "waits for gate v2 (decode and prefill, quality against BF16) and a served B=1 / C8 / C16 receipt",
      false, {}, true},
+    {kMiniControllerPlanes, "STRIX_INK_CONTROLLER_PLANES", "--controller-planes", {}, "3", profile::Kind::bit_changing,
+     {}, {false, true, false, true}, "1", "3", "awaits CUDA device identity and model qualification",
+     true, {}, true},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

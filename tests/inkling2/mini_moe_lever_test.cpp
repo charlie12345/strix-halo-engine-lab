@@ -16,24 +16,50 @@ void require(bool passed, const char* detail) {
     if (!passed) throw std::runtime_error(detail);
 }
 
-// Hermetic environment: only the W4A4 expert switch, the down-image switch the round fold and narrow expert switches, when given.
+// Hermetic environment: only the Inkling switches under test, when given.
 profile::Inputs inputs(profile::Name tier, const char* value = nullptr, const char* image = nullptr,
-                       const char* fold = nullptr, const char* narrow = nullptr) {
+                       const char* fold = nullptr, const char* narrow = nullptr,
+                       const char* controller = nullptr) {
     profile::Inputs in;
     in.profile = tier;
-    in.env = [value, image, fold, narrow](const char* key) -> const char* {
+    in.env = [value, image, fold, narrow, controller](const char* key) -> const char* {
         if (std::strcmp(key, "STRIX_INK_MOE_W4A4") == 0) return value;
         if (std::strcmp(key, "STRIX_INK_COMBINE_IMAGE") == 0) return image;
         if (std::strcmp(key, "STRIX_INK_PREPARED_ROUND_FOLD") == 0) return fold;
-        return std::strcmp(key, "STRIX_MOE_EXPERTS_NVFP4") == 0 ? narrow : nullptr;
+        if (std::strcmp(key, "STRIX_MOE_EXPERTS_NVFP4") == 0) return narrow;
+        return std::strcmp(key, "STRIX_INK_CONTROLLER_PLANES") == 0 ? controller : nullptr;
     };
     return in;
+}
+
+void test_controller_planes() {
+    constexpr std::string_view id = "inkling2-mini-controller-planes@1";
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        options.tier = inputs(tier);
+        const auto incumbent = mini::resolve_mini_profile(options, true);
+        const auto* entry = incumbent.find(id);
+        require(entry && entry->value == "3", "controller must keep three planes by default");
+        options.tier = inputs(tier, nullptr, nullptr, nullptr, nullptr, "3");
+        require(mini::resolve_mini_profile(options, true).fingerprint() == incumbent.fingerprint(),
+                "explicit three planes preserves the incumbent identity");
+        options.tier = inputs(tier, nullptr, nullptr, nullptr, nullptr, "1");
+        bool refused = false;
+        try {
+            const auto candidate = mini::resolve_mini_profile(options, true);
+            require(candidate.find(id)->value == "1" && candidate.fingerprint() != incumbent.fingerprint(),
+                    "one plane carries its own candidate identity");
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused == (tier == profile::Name::standard), "EXACT refuses the unqualified one-plane route");
+    }
 }
 
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 4U, "W4A4, down image, prepared round fold and narrow experts");
+    require(mini::kMiniProfile.table.size() == 5U, "W4A4, down image, prepared round fold, narrow experts and controller planes");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -257,6 +283,7 @@ int main() {
         test_row();
         test_resolution();
         test_combine_image();
+        test_controller_planes();
         test_configure();
         test_round_fold_admission();
         test_narrow_experts();

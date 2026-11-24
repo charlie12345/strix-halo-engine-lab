@@ -7,6 +7,9 @@
 #include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_residual_device.hpp"
+#if !defined(__HIPCC__)
+#include "inkling2_mini_controller_operands_cuda.hpp"
+#endif
 #include "moe_core/microscaled_r1.hpp"
 
 #include <algorithm>
@@ -405,6 +408,15 @@ public:
                                           cuda_core::DenseArith::mma3, big_context_.get()));
 #endif
     }
+
+#if !defined(__HIPCC__)
+    // The opt-in CUDA schedule uses one plane for declared BF16 operands with certified resident weights.
+    void dense(const float* input, unsigned width, unsigned rows, std::span<const Projection> projections,
+               core::Bf16Operand operand) {
+        check(enqueue_controller_dense(weights_.controller_certificate(), input, width, rows, projections, stream_,
+                                       big_context_.get(), operand).status);
+    }
+#endif
 
 #if defined(__HIPCC__)
     // Projections on a BF16 operand image (the shared tile's image rows: same bits as dense on the FP32 rows).

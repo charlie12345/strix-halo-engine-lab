@@ -19,6 +19,8 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         if (tier != "exact" && tier != "fast" && tier != "turbo")
             throw std::invalid_argument("--profile must be exact, fast or turbo");
         options.tier.profile = profile::parse(tier);
+    } else if (native && argument == "--controller-planes") {
+        options.tier.cli.emplace_back(kMiniControllerPlanes, value());
     } else if (native && argument == "--qualify-q8") {
         options.qualify_q8 = true;
     } else if (native && argument == "--no-weight-q8") {
@@ -82,6 +84,15 @@ inline bool mini_combine_image(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_COMBINE_IMAGE must be 0 or 1");
 }
 
+inline bool mini_controller_one_plane(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniControllerPlanes);
+    if (entry == nullptr || entry->value == "3") return false;
+    if (entry->value != "1") throw std::invalid_argument("controller planes must be 1 or 3");
+    if (tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo)
+        throw std::invalid_argument("one controller plane requires --profile fast or turbo");
+    return true;
+}
+
 // "on", "off" or "declined" (selected, but the target does not run it): the state name of a lever in the startup lines
 // (down_image, prepared_round_fold), the same text in the CLI, the gate and the server.
 inline const char* mini_down_image_name(bool active, bool selected) { return active ? "on" : selected ? "declined" : "off"; }
@@ -121,6 +132,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
     require_mini_expert_consumer(tier, native_execution);
+    static_cast<void>(mini_controller_one_plane(tier));
     return tier;
 }
 

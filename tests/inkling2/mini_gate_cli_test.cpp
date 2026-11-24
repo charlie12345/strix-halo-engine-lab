@@ -222,6 +222,12 @@ void test_options() {
     for (const auto* tier : {"exact", "fast", "turbo"})
         require(strix::inkling2::mini_prepared_round_fold(parse({"1", "--profile", tier}).tier), "explicit round fold");
     set_round_fold_env(nullptr);
+    require(strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "1"}).tier),
+            "CLI must resolve the explicit one-plane candidate");
+    require(!strix::inkling2::mini_controller_one_plane(parse({"1", "--profile", "fast", "--controller-planes", "3"}).tier),
+            "CLI must resolve the three-plane incumbent");
+    expect_invalid([] { (void)parse({"1", "--profile", "exact", "--controller-planes", "1"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--controller-planes", "2"}); });
     require(parse({"1", "--profile", "fast", "--qualify-q8"}).weights.qualify_q8, "expected Q8 qualification arm");
     require(parse({"1", "--profile", "fast", "--no-weight-q8"}).weights.disable_q8, "expected Q8 off switch");
     expect_invalid([] { (void)parse({"1", "--qualify-q8"}); });

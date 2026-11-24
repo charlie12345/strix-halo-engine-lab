@@ -123,6 +123,46 @@ bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, uns
     return false;
 }
 
+// A routed call launches its projections by route (every packed run, then image, then FP32 rows), not in the
+// incumbent's group order. That keeps the incumbent's bytes only while no projection writes a byte another projection
+// writes or reads: every output [rows][outputs] FP32 shares no byte with the FP32 input rows [rows][input_width], with
+// another projection's output or with another projection's weights [outputs][pitch]. A call with such an ordered alias
+// (for example an FMA group and a later packed group writing the same output buffer) keeps the incumbent sequence.
+// Sizes that do not fit an address count as overlapping.
+inline bool image_routes_order_free(const float* input, unsigned input_width, unsigned rows,
+                                    std::span<const Bf16RowProjection> projections) noexcept {
+    using Address = std::uintptr_t;
+    constexpr Address kMax = std::numeric_limits<Address>::max();
+    struct Range {
+        Address lo, hi;
+        bool valid;
+    };
+    const auto range = [](const void* p, Address count, Address size) {
+        const auto lo = reinterpret_cast<Address>(p);
+        if (count != 0U && size > kMax / count) return Range{0U, 0U, false};
+        const Address bytes = count * size;
+        return bytes > kMax - lo ? Range{0U, 0U, false} : Range{lo, lo + bytes, true};
+    };
+    const auto apart = [](const Range& a, const Range& b) {
+        return a.valid && b.valid && (a.hi <= b.lo || b.hi <= a.lo);
+    };
+    const auto natural = Address{input_width} * sizeof(std::uint16_t);
+    const auto in = range(input, Address{rows} * input_width, sizeof(float));
+    for (std::size_t i = 0; i < projections.size(); ++i) {
+        const auto out = range(projections[i].output, Address{rows} * projections[i].outputs, sizeof(float));
+        if (!apart(out, in)) return false;
+        for (std::size_t j = 0; j < projections.size(); ++j) {
+            if (j == i) continue;
+            const auto& other = projections[j];
+            const auto pitch = other.row_bytes != 0U ? Address{other.row_bytes} : natural;
+            if (!apart(out, range(other.output, Address{rows} * other.outputs, sizeof(float))) ||
+                !apart(out, range(other.weights, other.outputs, pitch)))
+                return false;
+        }
+    }
+    return true;
+}
+
 // The launches of a routed call: for each route (packed, image, fp32_rows) the projections of that route in call order,
 // in runs of at most Limit that share the rounding class and the row pitch; launch(route, run). An fp32_rows run stays
 // inside one incumbent group (Limit consecutive projections, as plan_image_routes groups them), so it never joins a

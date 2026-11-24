@@ -1,6 +1,7 @@
 #include "glm_profile_overrides.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
+#include "strix/profiles/hy4.hpp"
 
 #include <iostream>
 #include <map>
@@ -286,6 +287,20 @@ int main() {
         require(weighted.weights.effective == turbo::Source::onfly, "onfly weights admitted");
         require(weighted.tier_notice().find("uses onfly-int4-rtn-g32 weights (not the exact column)") != std::string::npos,
                 "no false EXACT equivalence when TURBO changes weights");
+    }
+    {
+        namespace hy = strix::hy4::profile;
+        strix::profile::Inputs in;
+        in.env = [](const char*) -> const char* { return nullptr; };
+        for (const auto regime : {hy::Regime{}, hy::Regime{hy::Device::gfx1151, hy::Topology::one_node, 8192},
+                                  hy::Regime{hy::Device::gfx1151, hy::Topology::pair, 8192}}) {
+            in.profile = strix::profile::Name::fast;
+            const auto fast = hy::resolve(regime, in);
+            in.profile = strix::profile::Name::turbo;
+            const auto turbo = hy::resolve(regime, in);
+            for (const auto& entry : fast->resolution.entries)
+                require(turbo->find(entry.lever->name)->value == entry.value, "Hy4 TURBO inherits FAST");
+        }
     }
     std::cout << "common profile/receipt tests passed\n";
 }

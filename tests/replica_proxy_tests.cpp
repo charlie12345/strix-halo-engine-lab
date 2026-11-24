@@ -283,6 +283,55 @@ void late_connect_failure() {
     require(a_status.find("failed")->as_double() == 0, "stale connect failure counted against recovered worker");
 }
 
+void unpinned_affinity_invalidation(bool connect_failure) {
+    FakeReplica a("A"), b("B");
+    if (!connect_failure) a.worker_id = "first";
+    ReplicaProxyConfig config;
+    config.replicas = {{"127.0.0.1", a.served.port}, {"127.0.0.1", b.served.port}};
+    config.block_bytes = 64;
+    ReplicaProxy proxy(config);
+    proxy.refresh();
+    std::unique_ptr<Served> recovered;
+    Served front([&](const HttpRequest& q, HttpResponseWriter& r) { proxy.handle(q, r); });
+
+    const std::string prefix(128, 'p');
+    auto q = to(front.port, "POST", "/v1/chat/completions", prefix);
+    q.headers = {{"X-Session-Id", "legacy-session"}};
+    std::string body;
+    const auto seed = http_fetch(q, body);
+    require(seed.ok && seed.head.status == 200 && seed.head.header("x-strix-replica") == "0",
+        "seed both unpinned affinities on A");
+
+    a.busy = 1;
+    if (connect_failure) {
+        a.served.stop();
+        const auto retried = http_fetch(to(front.port, "POST", q.target, "{}"), body);
+        require(retried.ok && retried.head.status == 200 && retried.head.header("x-strix-replica") == "1"
+            && !proxy.states()[0].healthy && a.generations == 1 && b.generations == 1,
+            "current connect failure marks A unhealthy and retries an unrelated request on B");
+        recovered = std::make_unique<Served>([&](const HttpRequest& request, HttpResponseWriter& response) {
+            a.handle(request, response);
+        }, a.served.port);
+    } else {
+        a.worker_id = "replacement";
+    }
+    proxy.refresh();
+    const auto states = proxy.states();
+    require(states[0].healthy && states[1].healthy && states[0].capacity.slots_busy == 1
+        && states[1].capacity.slots_busy == 0, "both replicas healthy and B has lower reported load");
+
+    // A one-slot difference still allows a prefix hit. Probe each affinity independently.
+    const auto prefix_route = http_fetch(to(front.port, "POST", q.target, prefix), body);
+    q.body = "{}";
+    const auto session_route = http_fetch(q, body);
+    const auto prefix_replica = prefix_route.head.header("x-strix-replica");
+    const auto session_replica = session_route.head.header("x-strix-replica");
+    if (!prefix_route.ok || prefix_route.head.status != 200 || !session_route.ok || session_route.head.status != 200
+        || prefix_replica != "1" || session_replica != "1")
+        throw std::runtime_error(std::string(connect_failure ? "unpinned recovery" : "unpinned replacement")
+            + ": prefix replica=" + prefix_replica + " session replica=" + session_replica);
+}
+
 void client_basics(FakeReplica& a) {
     std::string body;
     auto r = http_fetch(to(a.served.port, "GET", "/api/status"), body);
@@ -449,7 +498,7 @@ int main(int argc, char** argv) {
         const auto selected = argc == 2 ? std::string_view(argv[1]) : std::string_view{};
         if (argc > 2 || (argc == 2 && selected != "scoped-alias" && selected != "scoped-uri" &&
             selected != "named-alias" && selected != "numeric-scopes" && selected != "quarantine-placement" &&
-            selected != "late-connect-failure"))
+            selected != "late-connect-failure" && selected != "unpinned-recovery" && selected != "unpinned-replacement"))
             throw std::invalid_argument("unknown replica proxy test selector");
         if (selected.empty() || selected == "scoped-alias") scoped_alias();
         if (selected.empty() || selected == "scoped-uri") scoped_uri();
@@ -457,6 +506,8 @@ int main(int argc, char** argv) {
         if (selected.empty() || selected == "numeric-scopes") distinct_numeric_scopes();
         if (selected.empty() || selected == "quarantine-placement") quarantine_during_placement();
         if (selected.empty() || selected == "late-connect-failure") late_connect_failure();
+        if (selected.empty() || selected == "unpinned-recovery") unpinned_affinity_invalidation(true);
+        if (selected.empty() || selected == "unpinned-replacement") unpinned_affinity_invalidation(false);
         if (selected.empty()) run();
     } catch (const std::exception& e) {
         std::cerr << "replica_proxy_tests: " << e.what() << "\n";

@@ -159,8 +159,9 @@ void ReplicaProxy::refresh() {
         for (std::size_t r = 0; r < config_.replicas.size(); ++r) {
             auto next = probe(r, {});
             const std::lock_guard lock(mutex_);
-            if (states_[r].healthy && !next.healthy) router_.forget(r);
-            if (states_[r].healthy != next.healthy || states_[r].worker_instance_id != next.worker_instance_id)
+            const bool replaced = states_[r].worker_instance_id != next.worker_instance_id;
+            if ((states_[r].healthy && !next.healthy) || replaced) router_.forget(r);
+            if (states_[r].healthy != next.healthy || replaced)
                 ++generations_[r];
             next.ewma_ms_per_token = states_[r].ewma_ms_per_token;
             states_[r] = std::move(next);
@@ -322,7 +323,7 @@ void ReplicaProxy::forward(const HttpRequest& request, HttpResponseWriter& respo
                 if (generations_[replica] == generation) {
                     states_[replica].healthy = false;
                     ++generations_[replica];
-                    if (!connect_hosts_.empty()) router_.forget(replica);
+                    router_.forget(replica);
                     ++counters_[replica].failed;
                 }
             }

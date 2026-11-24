@@ -287,6 +287,17 @@ inline core::ResidentRowProjection bind_projection(const core::ResidentRowWeight
     return {matrix, outputs, output};
 }
 
+// A backend whose output projection can read the gated rows as the BF16 operand image the gate stores itself
+// (output_reads_image: the projection's plan reads every projection of the call from that image; gate_image: the gate's
+// BF16-valued output stored as that image; linear_image: the projection from it). Same bits as gate + linear.
+template <class Backend, class Linear>
+concept PreparedGqaGateImage = requires(const Backend& backend, const float* rows, unsigned count,
+                                        std::span<const Linear> projection) {
+    { backend.output_reads_image(count, count, projection) } -> std::same_as<bool>;
+    backend.gate_image(rows, rows, std::size_t{});
+    backend.linear_image(count, count, projection);
+};
+
 // Opt-in (static constexpr bool kFoldRounds = true, runtime fold_rounds() = its off switch): the backend folds the stage's plain BF16 rounds into their
 // producers or consumers with the same bits. Its convolve<RoundOutput, RoundInput> rounds the input rows, the dynamic
 // taps and the stored output with round()'s bf16 round, and store_round(rows) is true only when linear() rounds each
@@ -550,9 +561,20 @@ typename Backend::Status enqueue_prepared_gqa_output(
         rounded = detail::folds_rounds(backend) && backend.store_round(rows);
         linear.round_bf16 = rounded;
     }
+    const std::array projection{linear};
+    if constexpr (detail::PreparedGqaGateImage<Backend, decltype(linear)>) {
+        const std::span<const decltype(linear)> call(projection);
+        if (backend.output_reads_image(Shape::kQueryWidth, rows, call)) {
+            if (auto status = backend.gate_image(attended, gate_logits, std::size_t{rows} * Shape::kQueryWidth);
+                status != Backend::success) return status;
+            if (auto status = backend.linear_image(Shape::kQueryWidth, rows, call); status != Backend::success)
+                return status;
+            if (rounded) return Backend::success;
+            return backend.round(output, std::size_t{rows} * Shape::kHiddenWidth);
+        }
+    }
     if (auto status = backend.gate(attended, gate_logits, gated, std::size_t{rows} * Shape::kQueryWidth);
         status != Backend::success) return status;
-    const std::array projection{linear};
     if (auto status = backend.linear(gated, Shape::kQueryWidth, rows, projection); status != Backend::success) return status;
     if (rounded) return Backend::success;
     return backend.round(output, std::size_t{rows} * Shape::kHiddenWidth);

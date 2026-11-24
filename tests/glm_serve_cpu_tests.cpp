@@ -726,6 +726,266 @@ void queued_successor_interleave() {
 }
 
 
+
+// FakeEng with logits for sampled requests: a row's logits are a function of the chain state after its input (both
+// ranks hold the same states), over a 64-id vocabulary split 32 / 32 between the ranks, with one strong peak (the
+// row's argmax). Plain sampled rows go through sample_pair_rows, sampled MTP windows through decide_pair_window, so
+// a sampled request's tokens must not depend on the route.
+constexpr std::uint32_t kFakeVocab = 64, kFakeSlice = 32;
+struct SampledFake : FakeEng {
+    using FakeEng::FakeEng;
+    using FakeEng::mtp_run;
+    struct RowAt { std::uint32_t slot; std::uint32_t token; std::uint64_t pos; std::uint64_t x; };
+    std::vector<RowAt> last_sampled;  // rows of the last step / prefill call (sample_outputs reads them)
+    bool last_prefill = false;
+    std::uint64_t sampled_runs = 0, window_rows = 0;
+    std::uint32_t dec_flags = 0;
+    static std::uint32_t peak(std::uint64_t x) { return static_cast<std::uint32_t>((x >> 13) % kFakeVocab); }
+    static float logit(std::uint64_t x, std::uint32_t t) {
+        if (t == peak(x)) return 7.0F;
+        const std::uint64_t m = (x ^ (std::uint64_t{t} * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL;
+        return static_cast<float>((m >> 40) % 1000U) / 400.0F;
+    }
+    std::vector<float> slice(std::uint64_t x, bool paired) const {
+        const std::uint32_t lo = paired ? rank * kFakeSlice : 0U, n = paired ? kFakeSlice : kFakeVocab;
+        std::vector<float> v(n);
+        for (std::uint32_t i = 0; i < n; ++i) v[i] = logit(x, lo + i);
+        return v;
+    }
+    std::vector<std::uint32_t> step(std::span<const gs::WireRow> rows) {
+        auto out = FakeEng::step(rows);
+        last_sampled.clear();
+        for (std::size_t i = 0; i < rows.size(); ++i) last_sampled.push_back({rows[i].slot, rows[i].token, rows[i].pos, h[rows[i].slot]});
+        last_prefill = false;
+        return out;
+    }
+    std::uint32_t prefill(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0) {
+        const auto y = FakeEng::prefill(s, t, pos0);
+        last_sampled = {{s, t.empty() ? 0U : t.back(), pos0 + t.size() - 1, h[s]}};
+        last_prefill = true;
+        return y;
+    }
+    std::uint32_t prefill_mtp(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0, bool last) {
+        const auto y0 = prefill(s, t, pos0);
+        log.back() += last ? " mtp last" : " mtp";
+        if (last) {
+            seed = Seed{s, y0, pos0 + t.size()};
+            seed_spec(s);
+        }
+        return y0;
+    }
+    void sample_outputs(gs::Channel& ch, std::uint32_t mask, std::span<const sv::PairSamplingRow> choices,
+                        std::span<std::uint32_t> out) {
+        std::uint64_t chunk = 0;
+        std::vector<float> local;
+        sv::sample_pair_rows(mask, ch.rank() == 0, ch.paired() ? kFakeSlice : 0U, kFakeVocab, choices, out,
+            [&](std::size_t r) { local = slice(last_sampled.at(r).x, ch.paired()); return std::span<const float>(local); },
+            [&](std::span<const float> a, std::span<float> b) { ch.exchange_sampling_logits(a, b, chunk++); });
+        // the sampled token is what the row produced (mtp_enter seeds from it); the follower learns it from the lead's
+        // next command, so only the lead's record can hold it here: both records are rebuilt from mtp_enter's row
+        if (ch.rank() != 0) return;
+        if (last_prefill) {
+            last_rows = {gs::WireRow{last_sampled[0].slot, last_sampled[0].token, last_sampled[0].pos}};
+            last_out = {out[0]};
+        } else {
+            for (std::size_t r = 0; r < out.size() && r < last_out.size(); ++r) last_out[r] = out[r];
+        }
+    }
+    // mtp_enter from a sampled row: the follower's record does not hold the sampled token, so the row is checked
+    // against the state (slot, position) only; the token is taken from the command.
+    void mtp_enter(std::uint32_t r, const gs::WireRow& w, bool from_seed) {
+        if (!from_seed && r < last_sampled.size() && last_sampled[r].slot == w.slot && last_sampled[r].pos == w.pos &&
+            frontier[w.slot] == w.pos + 1) {
+            last_rows = {gs::WireRow{w.slot, last_sampled[r].token, w.pos}};
+            last_out.assign(r + 1, 0);
+            last_rows.resize(r + 1, last_rows[0]);
+            last_rows[r] = gs::WireRow{w.slot, last_sampled[r].token, w.pos};
+            last_out[r] = w.token;
+        }
+        FakeEng::mtp_enter(r, w, from_seed);
+    }
+    std::vector<std::uint32_t> mtp_run(std::uint32_t s, std::uint32_t budget, std::uint32_t n, gs::SampledRun run) {
+        if (dec && dec_flags != run.flags) throw std::runtime_error("fake sampled mtp_run: flags changed under an open decoder");
+        if (!dec) {
+            if (!seed || seed->slot != s || frontier[s] != seed->p) throw std::runtime_error("fake sampled mtp_run without a fresh seed");
+            dec = Dec{s, seed->y0, budget, 1};
+            dec_flags = run.flags;
+            seed.reset();
+            spec[s] = {};
+        } else if (dec->slot != s) {
+            throw std::runtime_error("fake sampled mtp_run: other slot");
+        }
+        const bool paired = run.ch->paired();
+        std::uint64_t chunk = 0;
+        std::vector<std::uint32_t> out;
+        for (std::uint32_t c = 0; c < n && dec->emitted < dec->budget; ++c) {
+            const unsigned remaining = dec->budget - dec->emitted;
+            const unsigned k = std::min(1U + static_cast<unsigned>(h[s] % 3U), remaining - 1U);
+            std::vector<std::uint32_t> inputs{dec->last}, drafts, ids;
+            std::vector<std::uint64_t> xs{fold(h[s], dec->last)};
+            for (unsigned i = 0; i < k; ++i) {  // the fake drafter: the row's argmax, wrong for a quarter of the states
+                const auto x = xs.back();
+                const std::uint32_t d = ((x >> 17) % 4U) != 0 ? peak(x) : (peak(x) + 1U) % kFakeVocab;
+                drafts.push_back(d);
+                inputs.push_back(d);
+                xs.push_back(fold(x, d));
+            }
+            for (const auto x : xs) ids.push_back(peak(x));
+            std::vector<strix::TokenDraft> td(drafts.size());
+            const std::uint64_t first = frontier[s] + 1;
+            for (std::size_t i = 0; i < drafts.size(); ++i) {
+                td[i].position = first + i;
+                td[i].token = drafts[i];
+            }
+            std::vector<float> local;
+            const auto tokens = sv::decide_pair_window(run.sampler != nullptr, paired ? kFakeSlice : 0U, kFakeVocab, run.sampler,
+                first, td, std::min(k + 1U, remaining),
+                [&](std::size_t r) { local = slice(xs.at(r), paired); return std::span<const float>(local); },
+                [&](std::span<const float> a, std::span<float> b) { run.ch->exchange_sampling_logits(a, b, chunk++); },
+                [&](std::span<const std::uint32_t> a, std::span<std::uint32_t> b) { run.ch->exchange_sampling_words(a, b, chunk++); });
+            window_rows += tokens.size();
+            std::copy(tokens.begin(), tokens.end(), ids.begin());
+            const auto acc = strix::glm::spec::accept_greedy(drafts, ids, strix::glm::spec::kNoFlag,
+                                                             strix::glm::spec::Terminal{strix::glm::spec::kNoFlag, remaining});
+            for (unsigned j = 0; j < acc.rows; ++j) (void)row(s, inputs[j]);
+            for (unsigned j = 0; j < acc.m; ++j) out.push_back(drafts[j]);
+            if (acc.has_bonus) out.push_back(acc.bonus);
+            dec->emitted += acc.m + (acc.has_bonus ? 1U : 0U);
+            dec->last = out.back();
+            ++cycles;
+            ++sampled_runs;
+        }
+        anchor[s] = dec->last;
+        log.push_back("sampled run " + std::to_string(s) + " -> " + std::to_string(out.size()));
+        return out;
+    }
+    void mtp_leave(std::uint32_t s) {
+        FakeEng::mtp_leave(s);
+        dec_flags = 0;
+    }
+};
+
+struct SampledServe {
+    std::vector<std::vector<std::uint32_t>> tokens;
+    std::vector<std::string> log0;
+    std::uint64_t mtp_rounds = 0, sampled_runs = 0, steps = 0, g2_cycles = 0;
+    std::string error;
+};
+// One pair (loopback) serving `jobs`; sequential = one request at a time (the C1 route), otherwise all queued at once.
+SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool sampled_mtp, bool sequential, bool g2 = false) {
+    SampledServe out;
+    Loopback lb;
+    SampledFake e0(4), e1(4);
+    e1.rank = 1;
+    e0.stops = e1.stops = false;
+    gs::Channel c0(lb.side(0), 0), c1(lb.side(1), 1);
+    const gs::Hello h = hello_for(4, 4096, 2);
+    std::thread follower([&] {
+        try {
+            gs::follow(e1, c1, h, 4, 4096, true);
+        } catch (const std::exception& e) {
+            out.error += std::string("follower: ") + e.what();
+        }
+    });
+    std::atomic<bool> stop{false};
+    sv::GenerationQueue queue(16);
+    gs::LeadConfig lc;
+    lc.slots = 4;
+    lc.capacity = 4096;
+    lc.heartbeat_seconds = 0.01;
+    lc.mtp = true;
+    lc.mtp_cycles = 2;
+    lc.prefill_chunk = 0;
+    lc.g2 = g2;
+    lc.sampling = c0.hello(h, true);
+    lc.sampled_mtp = sampled_mtp;
+    try {
+        gs::Lead<SampledFake> lead(e0, c0, queue, lc, stop);
+        std::thread runner([&] {
+            try {
+                lead.loop();
+            } catch (const std::exception& e) {
+                out.error += std::string("lead: ") + e.what();
+                queue.shutdown();
+            }
+        });
+        std::vector<std::shared_ptr<sv::GenerationTicket>> tickets;
+        out.tokens.resize(jobs.size());
+        const auto drain = [&](std::size_t i) {
+            if (!tickets[i]) {
+                out.error += " request " + std::to_string(i) + " not queued";
+                return;
+            }
+            bool done = false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+            while (!done && std::chrono::steady_clock::now() < deadline) {
+                const auto t = tickets[i]->wait(std::chrono::milliseconds(100), done);
+                out.tokens[i].insert(out.tokens[i].end(), t.begin(), t.end());
+            }
+            if (!done) out.error += " request " + std::to_string(i) + " timed out";
+        };
+        for (std::size_t i = 0; i < jobs.size(); ++i) {
+            tickets.push_back(queue.submit(sv::GenerationJob(jobs[i])));
+            if (sequential) drain(i);
+        }
+        if (!sequential)
+            for (std::size_t i = 0; i < jobs.size(); ++i) drain(i);
+        stop.store(true);
+        runner.join();
+        out.mtp_rounds = lead.stats().mtp_rounds;
+        out.steps = lead.stats().steps;
+        out.g2_cycles = lead.stats().g2_cycles;
+    } catch (const std::exception& e) {
+        out.error += std::string("setup: ") + e.what();
+    }
+    follower.join();
+    out.log0 = e0.log;
+    out.sampled_runs = e0.sampled_runs;
+    return out;
+}
+
+sv::GenerationJob sampled_job(unsigned i, double temperature, std::uint32_t max_tokens) {
+    sv::GenerationJob j;
+    for (unsigned k = 0; k < 9 + 5 * i; ++k) j.prompt.push_back(100U + 13U * i + k);
+    j.max_tokens = max_tokens;
+    j.sampling.temperature = temperature;
+    j.sampling.seed = 1000U + i;
+    j.sampling.seeded = true;
+    return j;
+}
+
+void test_sampled_mtp_serve() {
+    std::vector<sv::GenerationJob> jobs;
+    for (unsigned i = 0; i < 3; ++i) jobs.push_back(sampled_job(i, 0.9, 40));
+    const auto plain = serve_sampled(jobs, false, true);
+    const auto spec = serve_sampled(jobs, true, true);
+    CHECK(plain.error.empty() && spec.error.empty());
+    if (!plain.error.empty() || !spec.error.empty()) std::fprintf(stderr, "sampled serve errors: %s | %s\n", plain.error.c_str(), spec.error.c_str());
+    CHECK(plain.tokens == spec.tokens);
+    for (const auto& t : spec.tokens) CHECK(t.size() == 40);
+    CHECK(plain.mtp_rounds == 0 && plain.sampled_runs == 0);  // switch off: sampled requests decode by plain steps
+    CHECK(spec.mtp_rounds > 0 && spec.sampled_runs > 0);
+    // the sampled prefill's seed (drawn from its greedy first token) is never used: the decoder opens from mtp_enter
+    unsigned enters = 0, seed_enters = 0;
+    for (const auto& l : spec.log0) {
+        enters += l.rfind("enter ", 0) == 0;
+        seed_enters += l.rfind("enter-seed", 0) == 0;
+    }
+    CHECK(enters >= 3 && seed_enters == 0);
+    // a greedy request beside sampled ones with batched verify on: the sampled tokens stay those of plain sampling
+    std::vector<sv::GenerationJob> mixed = jobs;
+    sv::GenerationJob greedy = sampled_job(5, 0.0, 40);
+    mixed.insert(mixed.begin() + 1, greedy);
+    const auto both = serve_sampled(mixed, true, false, true);
+    CHECK(both.error.empty());
+    if (!both.error.empty()) std::fprintf(stderr, "mixed serve error: %s\n", both.error.c_str());
+    CHECK(both.tokens.size() == 4 && both.tokens[0] == plain.tokens[0] && both.tokens[2] == plain.tokens[1] && both.tokens[3] == plain.tokens[2]);
+    std::printf("sampled MTP serve: tokens == plain sampling (3 x 40), %llu MTP rounds / %llu sampled cycles, %u re-seeds; "
+                "mixed with greedy + G2: sampled tokens unchanged (%llu G2 cycles)\n",
+                static_cast<unsigned long long>(spec.mtp_rounds), static_cast<unsigned long long>(spec.sampled_runs), enters,
+                static_cast<unsigned long long>(both.g2_cycles));
+}
+
 // FakeEng with the sampled MTP entry points: records what replay hands them.
 struct SampledProbe : FakeEng {
     using FakeEng::FakeEng;
@@ -1234,6 +1494,7 @@ void prefix_root_sibling() {
 
 int main(int argc, char** argv) {
     test_sampled_mtp_replay();
+    test_sampled_mtp_serve();
     if (argc == 2 && std::string(argv[1]) == "--prefix-root") {
         prefix_root_sibling();
         return failures == 0 ? 0 : 1;

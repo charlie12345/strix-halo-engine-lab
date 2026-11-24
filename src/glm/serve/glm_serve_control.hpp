@@ -36,7 +36,7 @@ inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt
 // kPrefillStart begins it over the plen tokens that follow at ppos; later calls carry no tokens.
 inline constexpr std::uint32_t kPrefillUnits = 32U;
 inline constexpr std::uint32_t kPrefillStart = 64U;
-inline constexpr std::uint32_t kPrefillSample = 128U;  // final plain prefill chunk
+inline constexpr std::uint32_t kPrefillSample = 128U;  // final prefill chunk (plain or MTP bootstrap)
 // prefill pflags: the chunk's tokens hold virtual ids (strix/session/embed_rows.hpp, image input). On the pair the
 // embed frame of its spans (strix/pair/embed_frame.hpp) follows the tokens: one message with its byte length, then
 // the bytes as 32-bit words. The follower re-interns the rows and remaps the ids to its own handles.
@@ -578,8 +578,10 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             return out;
         }
         case Cmd::prefill: {
-            if (sample_mask && (c.pflags & (kPrefillLast | kPrefillMtp | kPrefillUnits)) != kPrefillLast)
-                throw ProtocolError("control channel: sampling requires the final plain prefill chunk");
+            // The MTP bootstrap (whole or in layer units) restores the prompt's last-row logits after seeding its
+            // drafter, so the call that completes the prompt can be sampled on either route.
+            if (sample_mask && (c.pflags & kPrefillLast) == 0U)
+                throw ProtocolError("control channel: sampling requires the final prefill chunk");
             if ((c.pflags & kPrefillUnits) != 0U && (c.pflags & kPrefillStart) == 0U) {  // resume / cancel: no tokens
                 if (c.pslot >= slots || (c.pflags & kPrefillMtp) == 0U || c.plen != 0)
                     throw ProtocolError("control channel: prefill units resume out of range");

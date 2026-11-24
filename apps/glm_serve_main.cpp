@@ -1119,6 +1119,9 @@ int main(int argc, char** argv) {
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
                         prefill_chunk_mtp ? 1 : 0,
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
+            // Sampled requests through MTP at C1 (coupled acceptance; opt-in until its pair gates pass).
+            std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP)\n",
+                        strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP") ? (mtp_on ? "on" : "off (MTP off)") : "off");
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
             // prefill; off unless --rtx-prefill / --import-listen are given).
             std::printf("serve import-route=%s import-listen=%s wire=v%u index-rows=%s identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
@@ -1415,6 +1418,7 @@ int main(int argc, char** argv) {
         lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
         lc.sampling = sampling;
+        lc.sampled_mtp = strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP");
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;
         lc.kmax = eff.kmax;
@@ -1771,7 +1775,8 @@ int main(int argc, char** argv) {
                                     " slots, " + (serial ? "serial" : "batched") + " decode" +
                                     (mtp_on ? ", MTP self-speculation at C1" : "") +
                                     (g2_on ? " and in the batch" : "") + ", greedy, exact per request" +
-                                    (lead.supports_sampling() ? "; sampling-v1 uses plain decode" : "") +
+                                    (lead.supports_sampling() ? (lc.sampled_mtp && mtp_on ? "; sampling-v1 through MTP at C1 (coupled, "
+                                                                 "tokens of plain sampling)" : "; sampling-v1 uses plain decode") : "") +
                                     (rtx_prefill.empty() ? std::string()
                                                          : std::string("; prompts of >= ") + std::to_string(import_min_tokens) +
                                                                " tokens may take the RTX prefill route (FAST identity glm-pf-rtx-native-v1, wire v" +

@@ -166,6 +166,10 @@ struct LeadConfig {
     // to rank 1 over the pair link before the restore.
     bool import_dsa_once = false;
     bool sampling = false;
+    // Sampled requests (temperature > 0) decode through MTP at one request (C1): the lead's sampler decides every verify
+    // row with coupled acceptance (strix::serve::decide_pair_window), so the tokens equal plain sampling of the same seed
+    // when verify rows equal plain-step rows bit for bit (gate SP1a). Never in batched verify (G2). Off: plain steps.
+    bool sampled_mtp = false;
 };
 
 
@@ -486,7 +490,8 @@ private:
             return reject(400, "context_length_exceeded",
                           "prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(cfg_.capacity) + " positions");
         std::optional<strix::TokenSampler> sampler;
-        try { sampler = strix::serve::make_pair_sampler(job); }
+        // Coupled acceptance: a drafted row is decided as without its draft, so sampled MTP keeps plain sampling's tokens.
+        try { sampler = strix::serve::make_pair_sampler(job, strix::SampledAcceptance::coupled); }
         catch (const std::invalid_argument& error) { return reject(400, "invalid_request", error.what()); }
         auto lease = runtime().activate(0, true); // retain original queue take timestamp
         const auto slot = table_.alloc();
@@ -503,8 +508,9 @@ private:
             if (std::find(p.a.stops.begin(), p.a.stops.end(), t) == p.a.stops.end()) p.a.stops.push_back(t);
         p.a.t_admit = Clock::now();
         p.a.sampler = std::move(sampler);
-        // MTP prefill and verify produce greedy choices. Sampled requests use plain forwards throughout.
-        p.a.mtp_ok = !p.a.sampler && mtp_on_.load();
+        // MTP prefill and verify produce greedy choices; a sampled request decodes through MTP only with sampled_mtp
+        // (its verify rows are then decided by its sampler), otherwise by plain forwards throughout.
+        p.a.mtp_ok = (!p.a.sampler || cfg_.sampled_mtp) && mtp_on_.load();
         p.chunk = p.a.mtp_ok && !cfg_.prefill_chunk_mtp ? 0U : chunk_.load();
         runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, 0, 0, n});
         // Preserve the optional FAST import route's identity selection; native snapshots never replace an eligible import.
@@ -730,9 +736,13 @@ private:
         active_[slot] = std::move(a);
         if (cfg_.state_digest) digest_state(slot, n);
         if (request(*active_[slot]).max_tokens == 0) return finish(slot, "length");
+        const bool sampled = active_[slot]->sampler.has_value();
         emit(slot, out.at(0));
         trace(key, TraceEvent::first);  // after its first token: the steady window counts decode tokens only
-        if (mtp_ok) seed_slot_ = static_cast<int>(slot);
+        // A sampled first token differs from the greedy one the MTP prefill seeded its drafter with: the decoder opens
+        // from mtp_enter on the prompt's last row (it produced the sampled token) instead of that seed.
+        if (mtp_ok && !sampled) seed_slot_ = static_cast<int>(slot);
+        else if (mtp_ok && active_[slot]) last_rows_ = {WireRow{slot, out.at(0), n - 1}};
     }
 
     void sync_prefix_stats() {
@@ -1144,7 +1154,7 @@ private:
         if (!a.mtp_ok) return false;
         if (mtp_slot_ != static_cast<int>(s)) {
             const SlotSpec& st = eng_.spec_state(s);
-            if (seed_slot_ != static_cast<int>(s) && st.seeded && !st.disabled && st.drafts.size() == 1 && st.p == a.pos) {
+            if (!a.sampler && seed_slot_ != static_cast<int>(s) && st.seeded && !st.disabled && st.drafts.size() == 1 && st.p == a.pos) {
                 // from batched self-speculation: the slot's drafter seed of its last window
                 Control e;
                 e.cmd = static_cast<std::uint32_t>(Cmd::mtp_enter);
@@ -1177,8 +1187,14 @@ private:
         c.pslot = s;
         c.budget = mtp_budget_;
         c.cycles = std::clamp(cfg_.mtp_cycles, 1U, kMaxMtpCycles);
+        strix::serve::PairSamplingRow choice;
+        if (a.sampler) {
+            c.pflags = kRunSample;
+            choice.sampler = &*a.sampler;
+        }
         const auto t0 = Clock::now();
-        const auto out = engine_round(c);
+        const auto out = engine_round(c, nullptr, choice.sampler ? std::span(&choice, 1) :
+                                      std::span<strix::serve::PairSamplingRow>{});
         {
             std::lock_guard<std::mutex> l(m_);
             ++stats_.mtp_rounds;
@@ -1200,7 +1216,7 @@ private:
         if (!g2_on_.load() || !mtp_on_.load()) return false;
         unsigned n = 0;
         for (const auto& a : active_) {
-            if (a && !a->mtp_ok) return false;
+            if (a && (!a->mtp_ok || a->sampler)) return false;  // batched verify decides greedily
             n += a ? 1U : 0U;
         }
         return n > 0;

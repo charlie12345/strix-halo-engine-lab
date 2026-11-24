@@ -68,6 +68,18 @@ profile::multi_device::Query placement_query(const Request& req) {
     return query;
 }
 
+bool native_profile_arguments(const std::vector<std::string>& args) {
+    return std::ranges::any_of(args, [](std::string_view arg) { return arg == "--profile" || arg.starts_with("--profile="); });
+}
+
+std::string_view native_profile_word(const std::vector<std::string>& args) {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i].starts_with("--profile=")) return std::string_view(args[i]).substr(10);
+        if (args[i] == "--profile" && i + 1 < args.size()) return args[i + 1];
+    }
+    return {};
+}
+
 std::uint32_t number(std::string_view value, std::string_view name, std::uint32_t lo, std::uint32_t hi) {
     std::uint32_t result = 0;
     const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
@@ -288,8 +300,19 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
         }
         cmd.args.insert(cmd.args.end(), rest.begin(), rest.end());
         if (description) {
-            cmd.preset = profile::resolve_model_preset(*description, req.profile, route.backend, placement_query(req));
-            cmd.preset->append_options(cmd.args);
+            // A native --profile in the engine arguments (or a model without [presets]) keeps its passthrough (no preset injection), but the explicit
+            // placement is still validated: the description stays available independently of argument injection.
+            if (!req.profile && !req.print_effective_config && (native_profile_arguments(rest) || !description->find("presets"))) {
+                auto query = placement_query(req);
+                if (const auto word = native_profile_word(rest); !word.empty()) {
+                    try { query.tier = profile::parse_tier(word); } catch (const std::invalid_argument&) {}   // the engine rejects it
+                }
+                cmd.placement = profile::multi_device::resolve(*description, query);
+            } else {
+                cmd.preset = profile::resolve_model_preset(*description, req.profile, route.backend, placement_query(req));
+                cmd.preset->append_options(cmd.args);
+                cmd.placement = cmd.preset->placement;
+            }
         }
         if (req.print_effective_config) cmd.args.emplace_back("--print-effective-config");
         return cmd;
@@ -321,13 +344,22 @@ int launch(const Request& request, const std::vector<model_registry::Entry>& ent
     if (command.preset && req.print_effective_config)
         out << command.preset->config.dump() << '\n' << std::flush;
     if (req.dry_run) {
+        // Inspection reports the placement and its executor; a command that cannot implement it is the worker command.
+        if (command.placement) {
+            const auto form = command.placement->form;
+            out << "# placement: " << profile::multi_device::form_name(form) << " (" << command.placement->rule
+                << ") ranks=" << command.placement->ranks << " executor="
+                << profile::multi_device::executed_by(form) << '\n';
+            if (profile::multi_device::executed_by(form) != "engine")
+                out << "# worker command (this entry point cannot execute the placement):\n";
+        }
         out << command_line(command) << '\n';
         return 0;
     }
     // Inspection (--print-effective-config: the engine prints and exits, --dry-run) reports any placement; a launch
     // executes one engine, so it is admitted only for the form one engine executes.
-    if (command.preset && !req.print_effective_config)
-        profile::multi_device::admit(command.preset->placement, profile::multi_device::Executor::engine);
+    if (command.placement && !req.print_effective_config)
+        profile::multi_device::admit(*command.placement, profile::multi_device::Executor::engine);
     std::optional<profile::PresetScope> scope;
     if (command.preset) scope.emplace();
     return execute(command);
@@ -387,11 +419,8 @@ int dispatch(const Request& req, const std::filesystem::path& bin, const std::fi
     const auto* name = description.find("name");
     if (!name || std::get_if<std::string>(&name->data) == nullptr || std::get<std::string>(name->data) != entry.name)
         invalid("description name disagrees with the registry for " + entry.name);
-    const bool native_profile = std::ranges::any_of(req.args, [](std::string_view arg) {
-        return arg == "--profile" || arg.starts_with("--profile=");
-    });
-    return launch(req, entries, req.profile || req.print_effective_config || (description.find("presets") && !native_profile)
-                  ? &description : nullptr, bin, data, probes, exists, out);
+    // The description always reaches launch: placement validation does not depend on preset argument injection.
+    return launch(req, entries, &description, bin, data, probes, exists, out);
 }
 
 } // namespace strix::cli

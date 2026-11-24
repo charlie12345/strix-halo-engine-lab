@@ -52,6 +52,7 @@ struct Command {
     std::filesystem::path executable;
     std::vector<std::string> args;
     std::optional<profile::ModelPreset> preset = {};
+    std::optional<profile::multi_device::Decision> placement = {};   // also set when a native --profile skips the preset
 };
 using ExecutableExists = std::function<bool(const std::filesystem::path&)>;
 

@@ -222,14 +222,19 @@ void validation() {
     require(bound.regimes.size() == 1 && bound.regimes[0].wire == "fp16", "a wire bound to a tensor regime parses");
 }
 
-void legacy_environment() {
+void legacy_environment(const std::filesystem::path& root) {
     const std::map<std::string, std::string> env{{"STRIX_QWEN_PF_PIPE_CUT", "20"}, {"STRIX_HY4_TP_DRAFT", "both"},
-                                                 {"STRIX_UNRELATED", "1"}, {"STRIX_G4_PAIR", ""}};
+                                                 {"STRIX_HY4_TP_JOIN_BF16", "1"}, {"STRIX_UNRELATED", "1"},
+                                                 {"STRIX_G4_PAIR", ""}};
     const strix::profile::Lookup lookup = [&](const char* key) -> const char* {
         const auto it = env.find(key);
         return it == env.end() ? nullptr : it->second.c_str();
     };
-    const auto found = md::legacy_overrides(lookup);
+    // The inventory is the selected model's own data ([multi_device.legacy_env]): a model that declares none reports none.
+    const char* inventory =
+        "name = 'x'\n[multi_device.legacy_env]\nSTRIX_QWEN_PF_PIPE_CUT = 'forms.layers.cut'\n"
+        "STRIX_HY4_TP_DRAFT = 'forms.tensor.draft_placement'\nSTRIX_G4_PAIR = 'forms.layers'\n";
+    const auto found = md::legacy_overrides(policy(inventory), lookup);
     require(found.size() == 2, "set legacy switches are reported, empty and unrelated ones are not");
     bool cut = false, draft = false;
     for (const auto& o : found) {
@@ -237,14 +242,71 @@ void legacy_environment() {
         draft |= o.env == "STRIX_HY4_TP_DRAFT" && o.key == "multi_device.forms.tensor.draft_placement";
     }
     require(cut && draft, "legacy switches map to their [multi_device] keys");
+    require(md::legacy_overrides(policy("name = 'x'\n"), lookup).empty(), "a model with no inventory reports none");
+    // An inventory-only section declares no placement policy: the model still resolves like one without [multi_device].
+    require(policy(inventory).version == 0 &&
+            md::select(policy(inventory), query(Name::standard, 2)).rule == "absent", "inventory alone is not a placement policy");
+    refuses([] { (void)policy("[multi_device.legacy_env]\nOTHER = 'forms.layers'\n"); }, "must map a STRIX_* switch");
     // Reports never change the decision: engines still read their switches.
-    const auto d = md::resolve(strix::model_description::parse("name = 'x'\n"), query(Name::standard, 1), lookup);
+    const auto described = strix::model_description::parse(inventory);
+    const auto d = md::resolve(described, query(Name::standard, 1), lookup);
     require(d.form == md::Form::single && d.legacy.size() == 2, "legacy reports ride on the decision");
-    const auto json = d.json(policy("name = 'x'\n"), query(Name::standard, 1)).dump();
+    const auto json = d.json(policy(inventory), query(Name::standard, 1)).dump();
     require(json.find("\"legacy_env\":[{") != std::string::npos, "effective JSON lists legacy switches");
     // No resolver reads the planned keys yet: the report names the env and its reader, never a key or a deprecation.
     require(json.find("\"read_by\":\"engine\"") != std::string::npos && json.find("deprecated") == std::string::npos &&
             json.find("multi_device.forms") == std::string::npos, "legacy report names no unread key");
+    // Regression (review r5): another family's switch never appears in this model's report.
+    const auto qwen = strix::model_description::load((root / "models/qwen3.8-27b.toml").string());
+    const auto hy4 = strix::model_description::load((root / "models/hy4-flash.toml").string());
+    require(md::resolve(qwen, query(Name::standard, 1), lookup).legacy.empty(),
+            "a Hy4 switch is not engine-read for the Qwen model");
+    const auto own = md::resolve(hy4, query(Name::standard, 1), lookup).legacy;
+    require(own.size() == 2, "the Hy4 model lists its own two set switches");
+    const strix::profile::Lookup qwen_env = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_TP_F16_GATHER" ? "1" : nullptr;
+    };
+    require(md::resolve(qwen, query(Name::standard, 1), qwen_env).legacy.size() == 1 &&
+            md::resolve(hy4, query(Name::standard, 1), qwen_env).legacy.empty(), "each model lists only its own switches");
+}
+
+// Regression (review r5): the form's declared wire never contradicts the regime's effective wire in the report.
+std::string word(const strix::serve::Json* value) { return value ? value->as_string() : "<absent>"; }
+
+void effective_wire_report() {
+    const auto p = policy(R"(
+[multi_device]
+version = 1
+[multi_device.forms.tensor]
+wire = "fp16"
+[multi_device.regimes.exact_long]
+min_prompt_rows = 1024
+wire = "reference"
+prefer = ["tensor"]
+)");
+    const auto q = query(Name::standard, 2, md::Phase::request, 2048);
+    const auto d = md::select(p, q);
+    require(d.form == md::Form::tensor && d.wire == "reference", "an EXACT regime picks tensor on the reference wire");
+    const auto json = d.json(p, q);
+    const auto* settings = json.find("settings");
+    require(settings && word(json.find("wire")) == "reference" && word(settings->find("wire")) == "reference",
+            "settings.wire agrees with the effective wire");
+    require(settings && word(settings->find("declared_wire")) == "fp16", "the form's declared wire stays visible, labelled");
+    require(word(json.find("wire_status")) == "exact", "an exact wire is reported exact");
+    const auto fast = policy(R"(
+[multi_device]
+version = 1
+[multi_device.forms.tensor]
+wire = "fp16"
+[multi_device.regimes.long]
+min_tier = "fast"
+prefer = ["tensor"]
+)");
+    const auto fq = query(Name::fast, 2);
+    const auto fj = md::select(fast, fq).json(fast, fq);
+    require(word(fj.find("wire")) == "fp16" && word(fj.find("settings")->find("wire")) == "fp16" &&
+            !fj.find("settings")->find("declared_wire") &&
+            word(fj.find("wire_status")).find("report-only") == 0, "a bit-changing wire is report-only");
 }
 
 // A launch applies single and replica only; any other resolved form is refused with its reason, never printed.
@@ -308,7 +370,8 @@ int main(int argc, char** argv) {
     regimes();
     wire_tiers();
     validation();
-    legacy_environment();
+    legacy_environment(argv[1]);
+    effective_wire_report();
     launch_applies_single_and_replica();
     registered_models(argv[1]);
     if (failures) {

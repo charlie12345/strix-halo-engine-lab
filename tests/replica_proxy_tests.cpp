@@ -264,6 +264,20 @@ void run() {
         && parse_replica_endpoint("10.0.0.2:9000")->host == "10.0.0.2", "endpoint parsing");
     require(!parse_replica_endpoint("node-b") && !parse_replica_endpoint("node-b:0") && !parse_replica_endpoint("node-b:99999")
         && !parse_replica_endpoint(":80") && !parse_replica_endpoint("http://a/b:80"), "malformed endpoints rejected");
+    {   // Duplicate host:port is one worker: it must not satisfy a replica count (host names compare case-insensitively).
+        const auto endpoints = [](std::initializer_list<const char*> texts) {
+            std::vector<ReplicaEndpoint> list;
+            for (const auto* text : texts) list.push_back(*parse_replica_endpoint(text));
+            return list;
+        };
+        require_distinct_replicas(endpoints({"http://node-a:18196", "http://node-b:18196", "http://node-a:18197"}));
+        for (const auto& repeated : {endpoints({"http://node-a:18196", "http://node-a:18196"}),
+                                     endpoints({"node-a:18196", "http://NODE-A:18196/"})}) {
+            bool refused = false;
+            try { require_distinct_replicas(repeated); } catch (const std::invalid_argument&) { refused = true; }
+            require(refused, "a repeated replica endpoint is refused");
+        }
+    }
 }
 
 } // namespace

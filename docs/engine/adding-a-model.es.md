@@ -38,7 +38,7 @@ después el router con las direcciones de los workers); cualquier otra forma se 
 motor la consuma. Un régimen solo puede nombrar formas declaradas, y su `wire` solo formas que lo llevan (`layers`,
 `tensor`, `speculation`). Los interruptores
 locales de los motores (`STRIX_*_PF_PIPE_CUT`, ...) siguen actuando dentro del motor; la config efectiva lista los que
-están puestos en `multi_device.legacy_env`.
+están puestos en `multi_device.legacy_env`. Ese inventario son datos del propio modelo: cada modelo declara los interruptores que sus motores leen bajo `[multi_device.legacy_env]` (`STRIX_NOMBRE = "forms.layers.cut"`, la clave prevista para sustituirlo) y solo se listan los del modelo elegido. Una sección con solo `legacy_env` no declara política de colocación. El `wire` de un régimen que difiere del de la forma lo sustituye en el informe (`wire`, `settings.wire`); el de la forma se muestra al lado como `declared_wire`, y un wire que cambia bits es solo informe (`wire_status`) hasta que el resolvedor compartido resuelva una palanca cualificada (`lever` se lee, no se resuelve).
 
 El lector (`src/model_description.cpp`) acepta un subconjunto de TOML: claves simples y con puntos, tablas, tablas en
 línea, arrays, cadenas de una línea, enteros y decimales, booleanos. Cualquier otra cosa es un error con línea y

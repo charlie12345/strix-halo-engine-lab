@@ -59,8 +59,12 @@ struct Regime {
     Name min_tier = Name::standard;
     std::vector<Form> prefer;
     std::string wire;                     // "" = the form's wire
-    std::string lever;
+    std::string lever;                    // parsed for the receipt, not resolved: a bit-changing wire stays report-only
     bool enabled = true;
+};
+
+struct LegacySwitch {
+    std::string env, key;
 };
 
 struct Policy {
@@ -69,6 +73,7 @@ struct Policy {
     Form fallback = Form::single;
     std::map<Form, FormSpec> forms;       // always holds single
     std::vector<Regime> regimes;          // evaluation order
+    std::vector<LegacySwitch> legacy;     // [multi_device.legacy_env]: this model's engine-read switches
 };
 
 // Throws std::invalid_argument naming the offending key.
@@ -101,15 +106,11 @@ struct Decision {
 // > single. An explicit placement that cannot run throws std::invalid_argument with the reason.
 [[nodiscard]] Decision select(const Policy&, const Query&);
 
-// Legacy switches with the [multi_device] key planned to replace each. They still act inside the engines that read
-// them (no kit breaks) and no resolver reads the planned keys yet, so the resolver only lists the set ones in the
-// effective JSON (env, value, read by the engine); it prints nothing and names no key until the key is read.
-struct LegacySwitch {
-    const char* env;
-    const char* key;
-};
-[[nodiscard]] const std::vector<LegacySwitch>& legacy_switches();
-[[nodiscard]] std::vector<LegacyOverride> legacy_overrides(const Lookup& env = {});
+// The model's legacy inventory: its own engine-read switches, each with the [multi_device] key planned to replace it
+// (declared by the model under [multi_device.legacy_env]; no model's names live in this code). They still act inside the
+// engines that read them (no kit breaks) and no resolver reads the planned keys yet, so the resolver only lists the set
+// ones of the selected model in the effective JSON (env, value, read by the engine); it names no key until it is read.
+[[nodiscard]] std::vector<LegacyOverride> legacy_overrides(const Policy&, const Lookup& env = {});
 
 // Inspection and execution are distinct. Inspection (--print-effective-config, --dry-run) reports any selected form
 // (Decision::json names who executes it). A launch is admitted only for the form its entry point executes:

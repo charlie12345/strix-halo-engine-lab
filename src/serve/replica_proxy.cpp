@@ -3,7 +3,9 @@
 #include "strix/serve/http_client.hpp"
 
 #include <array>
+#include <cctype>
 #include <charconv>
+#include <set>
 #include <stdexcept>
 
 namespace strix::serve {
@@ -43,6 +45,18 @@ std::optional<ReplicaEndpoint> parse_replica_endpoint(std::string_view text) {
     if (host.find('/') != std::string_view::npos) return std::nullopt;
     if (host.size() > 2 && host.front() == '[' && host.back() == ']') host = host.substr(1, host.size() - 2);
     return ReplicaEndpoint{std::string(host), static_cast<std::uint16_t>(port)};
+}
+
+void require_distinct_replicas(const std::vector<ReplicaEndpoint>& replicas) {
+    const auto lower = [](std::string text) {
+        for (auto& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return text;
+    };
+    std::set<std::pair<std::string, std::uint16_t>> seen;
+    for (const auto& replica : replicas)
+        if (!seen.emplace(lower(replica.host), replica.port).second)
+            throw std::invalid_argument("--replica " + replica.host + ":" + std::to_string(replica.port) +
+                                        " is given more than once; each replica must be a distinct worker");
 }
 
 ReplicaProxy::ReplicaProxy(ReplicaProxyConfig config)

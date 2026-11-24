@@ -293,6 +293,55 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         refuses([&] { std::ostringstream sink;
                       (void)strix::cli::launch(replica_run, entries, &replicated, "bin", data, probes, exists, sink); },
                 "runs behind strix-router");
+
+        // Review r5: the description reaches placement validation through dispatch even when the engine arguments carry
+        // a native --profile (no preset injection), and a dry-run states the placement and its executor.
+        const auto through_dispatch = [&](const fs::path& root, std::vector<std::string> args) {
+            std::ostringstream sink;
+            const auto status = strix::cli::dispatch(parse(args), "bin", root, probes, exists, sink);
+            return std::pair{status, sink.str()};
+        };
+        const std::vector<std::string> native{"run", "qwen3.8-27b", "--backend", "cuda", "--asset", "model.gguf"};
+        const auto with = [&](std::vector<std::string> extra, std::vector<std::string> tail) {
+            auto args = native;
+            args.insert(args.end(), extra.begin(), extra.end());
+            args.emplace_back("--");
+            args.insert(args.end(), tail.begin(), tail.end());
+            return args;
+        };
+        const auto count = [](const std::string& haystack, std::string_view needle) {
+            std::size_t n = 0;
+            for (auto at = haystack.find(needle); at != std::string::npos; at = haystack.find(needle, at + 1)) ++n;
+            return n;
+        };
+        refuses([&] { (void)through_dispatch(data, with({"--device-count", "2", "--placement", "replica"},
+                                                        {"--profile", "fast", "--n-gen", "32"})); },
+                "replica is not declared");
+        refuses([&] { (void)through_dispatch(data, with({"--device-count", "2", "--placement", "replica", "--dry-run"},
+                                                        {"--profile=fast"})); }, "replica is not declared");
+        const auto passthrough = through_dispatch(data, with({"--dry-run"}, {"--profile", "fast", "--n-gen", "32"}));
+        require(passthrough.first == 0 && count(passthrough.second, "--profile") == 1 &&
+                passthrough.second.find("# placement: single") != std::string::npos &&
+                passthrough.second.find("executor=engine") != std::string::npos,
+                "a native --profile keeps its passthrough and the dry-run states the placement");
+        const auto root = fs::temp_directory_path() / "strix-cli-tests-replica-data";
+        fs::remove_all(root);
+        fs::create_directories(root / "models");
+        fs::create_directories(root / "support");
+        fs::copy_file(data / "support/matrix.toml", root / "support/matrix.toml");
+        for (const auto& item : fs::directory_iterator(data / "models"))
+            if (item.path().filename() != "qwen3.8-27b.toml") fs::copy_file(item.path(), root / "models" / item.path().filename());
+        std::ofstream(root / "models/qwen3.8-27b.toml") << text.str();
+        refuses([&] { (void)through_dispatch(root, with({"--device-count", "2"}, {"--profile", "fast", "--n-gen", "32"})); },
+                "runs behind strix-router");
+        const auto shown_replica = through_dispatch(root, with({"--device-count", "2", "--dry-run"},
+                                                               {"--profile", "fast", "--n-gen", "32"}));
+        require(shown_replica.first == 0 && shown_replica.second.find("# placement: replica") == 0 &&
+                shown_replica.second.find("executor=router") != std::string::npos &&
+                shown_replica.second.find("worker command") != std::string::npos &&
+                shown_replica.second.find("strix-cuda-qwen35-decode") != std::string::npos,
+                "a replica dry-run names the placement, its executor and labels the worker command");
+        fs::remove_all(root);
     }
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};

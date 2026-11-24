@@ -287,12 +287,23 @@ Policy parse_policy(const model_description::ModelDescription& description) {
     std::optional<Form> declared_default, declared_fallback;
     std::vector<std::string> order;
     const Value::Table* regimes = nullptr;
+    bool placement_keys = false;   // a section that only carries the model's legacy inventory declares no placement policy
     for (const auto& [key, item] : table(*section, "multi_device")) {
         const auto at = "multi_device." + key;
+        placement_keys |= key != "legacy_env";
         if (key == "version") policy.version = integer(item, at, 1, 1);
         else if (key == "default") declared_default = form_word(item, at);
         else if (key == "fallback") declared_fallback = form_word(item, at);
         else if (key == "order") order = words(item, at);
+        else if (key == "legacy_env") {
+            for (const auto& [env, target] : table(item, at)) {
+                const auto path = text(target, at + "." + env);
+                if (!env.starts_with("STRIX_") || !path.starts_with("forms."))
+                    refuse(at + "." + env + " must map a STRIX_* switch to a forms.* key");
+                policy.legacy.push_back({env, path});
+            }
+            continue;
+        }
         else if (key == "forms") {
             for (const auto& [name, spec] : table(item, at)) {
                 const auto form = parse_form(name);
@@ -302,6 +313,7 @@ Policy parse_policy(const model_description::ModelDescription& description) {
         } else if (key == "regimes") regimes = &table(item, at);
         else refuse("unknown key " + at);
     }
+    if (!placement_keys) return policy;
     if (policy.version != 1) refuse("multi_device.version = 1 is required");
     policy.default_form = declared_default.value_or(Form::single);
     policy.fallback = declared_fallback.value_or(Form::single);
@@ -353,33 +365,11 @@ Decision select(const Policy& policy, const Query& q) {
     return decided(policy, policy.fallback, q, form_wire(policy, policy.fallback), "fallback", why);
 }
 
-const std::vector<LegacySwitch>& legacy_switches() {
-    // Study inventory (placement, cut, rows, wire, drafter); transport tuning stays with the transport.
-    static const std::vector<LegacySwitch> rows{
-        {"STRIX_QWEN_PF_PIPE", "forms.layers"}, {"STRIX_G4_PAIR", "forms.layers"}, {"STRIX_SPLIT", "forms.layers"},
-        {"STRIX_GLM_PF_PIPELINE", "forms.layers"}, {"STRIX_GLM_PF_STAGED", "forms.layers"},
-        {"STRIX_MMX_PREFILL_PIPE_PAIR", "forms.layers"},
-        {"STRIX_QWEN_PF_PIPE_CUT", "forms.layers.cut"}, {"STRIX_G4_PAIR_CUT", "forms.layers.cut"},
-        {"STRIX_SPLIT_CUT", "forms.layers.cut"}, {"STRIX_PAIR_STAGE_MAP", "forms.layers.cut"},
-        {"STRIX_QWEN_PAIR_HALF_CUT", "forms.layers.cut"},
-        {"STRIX_QWEN_PF_PIPE_CHUNK", "forms.layers.window_rows"}, {"STRIX_QWEN_PAIR_CHUNK_POLICY", "forms.layers.window_rows"},
-        {"STRIX_SPLIT_BLOCK", "forms.layers.window_rows"}, {"STRIX_MM_PF_GROUP", "forms.layers.window_rows"},
-        {"STRIX_MM_PF_MOE_GROUP", "forms.layers.window_rows"},
-        {"STRIX_TP_F16_GATHER", "forms.tensor.wire"}, {"STRIX_HY4_TP_JOIN_BF16", "forms.tensor.wire"},
-        {"STRIX_TP2_EXCHANGE_FMT", "forms.tensor.wire"}, {"STRIX_DS41_F16_PAIR", "forms.tensor.wire"},
-        {"STRIX_TP_SPLIT_DRAFT", "forms.tensor.draft_placement"}, {"STRIX_HY4_TP_DRAFT", "forms.tensor.draft_placement"},
-        {"STRIX_DS41_EXPERT_TP", "forms.tensor.expert_partition"},
-        {"STRIX_DS41_EXPERT_TP_LAYOUT", "forms.tensor.expert_partition"},
-        {"STRIX_DS41_EXPERT_SLOTS", "forms.tensor.expert_partition"},
-    };
-    return rows;
-}
-
-std::vector<LegacyOverride> legacy_overrides(const Lookup& env) {
+std::vector<LegacyOverride> legacy_overrides(const Policy& policy, const Lookup& env) {
     std::vector<LegacyOverride> out;
-    for (const auto& row : legacy_switches())
-        if (const char* value = environment(env, row.env); value && *value)
-            out.push_back({row.env, value, std::string("multi_device.") + row.key});
+    for (const auto& row : policy.legacy)
+        if (const char* value = environment(env, row.env.c_str()); value && *value)
+            out.push_back({row.env, value, "multi_device." + row.key});
     return out;
 }
 
@@ -402,8 +392,9 @@ void admit(const Decision& d, Executor executor) {
 }
 
 Decision resolve(const model_description::ModelDescription& description, const Query& q, const Lookup& env) {
-    auto d = select(parse_policy(description), q);
-    d.legacy = legacy_overrides(env);
+    const auto policy = parse_policy(description);
+    auto d = select(policy, q);
+    d.legacy = legacy_overrides(policy, env);
     return d;
 }
 
@@ -412,11 +403,18 @@ serve::Json Decision::json(const Policy& policy, const Query& q) const {
     for (const auto& entry : policy.forms) declared.push(form_name(entry.first));
     Json out = Json::Object{{"version", policy.version}, {"form", form_name(form)},
         {"ranks", static_cast<std::int64_t>(ranks)}, {"devices", static_cast<std::int64_t>(q.devices)},
-        {"phase", phase_name(q.phase)}, {"wire", wire}, {"rule", rule}, {"reason", reason}, {"declared", declared},
+        {"phase", phase_name(q.phase)}, {"wire", wire},
+        {"wire_status", exact_wire(wire) ? "exact" : "report-only: changes bits and no executor resolves a qualified lever yet"}, {"rule", rule}, {"reason", reason}, {"declared", declared},
         {"executed_by", executed_by(form)}};
     if (const auto it = policy.forms.find(form); it != policy.forms.end() && !it->second.fields.empty()) {
+        // The form block is the form's declared defaults; a regime's wire replaces the form's, so the effective wire
+        // is reported once (top-level `wire`) and `settings.wire` agrees with it; the declared one stays visible.
         Json fields = Json::object();
         for (const auto& [key, value] : it->second.fields) fields.set(key, value);
+        if (it->second.fields.contains("wire") && it->second.wire != wire) {
+            fields.set("wire", wire);
+            fields.set("declared_wire", it->second.wire);
+        }
         out.set("settings", std::move(fields));
     }
     Json legacy_json = Json::array();

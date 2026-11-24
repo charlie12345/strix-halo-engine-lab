@@ -266,8 +266,7 @@ int main(int argc, char** argv) {
             }
             ok = ok && same;
             std::cout << "route alias_fma_first rows " << rows << (same ? " entry-same-bits PASS" : " ENTRY-DIFFER FAIL")
-                      << '
-';
+                      << '\n';
             for (auto* p : outs) require(hipFree(p), "free");
             for (auto* p : {shared_ref, shared_got}) require(hipFree(p), "free");
             for (auto* w : bases) require(hipFree(w), "free");

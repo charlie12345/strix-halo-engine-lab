@@ -149,8 +149,8 @@ constexpr WorkspaceElements workspace_requirement(unsigned rows) {
     }
     const auto count = static_cast<std::size_t>(assignments);
     return {count * std::max(Config::hidden, Config::intermediate), count * fp32_width, count * Config::intermediate,
-            std::max(grouped_w4a4::image_layout(count, Config::hidden).bytes,
-                     grouped_w4a4::image_layout(count, Config::intermediate).bytes)};
+            std::max(grouped_w4a4::image_layout(count, Config::hidden, grouped_w4a4::kMaxTerms).bytes,
+                     grouped_w4a4::image_layout(count, Config::intermediate, grouped_w4a4::kMaxTerms).bytes)};
 }
 
 template<class Config>
@@ -380,11 +380,14 @@ inline typename Backend::Status enqueue(
             // Token image: each token row is quantised once (plan.rows <= assignments rows, so the class's image bytes hold
             // it) and the gate/up projection reads it through the assignment -> token map; the rows of a token's
             // assignments are equal, so the image rows they read are the ones a per-assignment image would hold.
-            const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), plan.rows, Config::hidden);
+            const unsigned gate_up_terms = grouped_w4a4::terms_gate_up(plan.activations);
+            const auto hidden_image = grouped_w4a4::make_image(workspace.nvfp4.data(), plan.rows, Config::hidden, gate_up_terms);
             status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<float>{input.data(), Config::hidden, nullptr,
-                                                plan.rows, Config::hidden, hidden_image, plan.failure}, stream, rule);
+                                                plan.rows, Config::hidden, hidden_image, plan.failure, gate_up_terms},
+                                            stream, rule);
             if (status != Backend::success) return status;
-            status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image, plan.assignment_rows.data()}, stream);
+            status = Backend::launch_w4a4({gate_up, workspace.bf16.data(), hidden_image, plan.assignment_rows.data(),
+                                           gate_up_terms}, stream);
             if (status != Backend::success) return status;
             status = Config::Activation::launch({workspace.fp32.data(), workspace.bf16.data(), assignments,
                                                 Config::intermediate, gate_width, Config::intermediate, plan.failure}, stream);
@@ -396,12 +399,14 @@ inline typename Backend::Status enqueue(
                     {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
                      plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
             }
-            const auto inner_image = grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate);
+            const unsigned down_terms = grouped_w4a4::terms_down(plan.activations);
+            const auto inner_image =
+                grouped_w4a4::make_image(workspace.nvfp4.data(), assignments, Config::intermediate, down_terms);
             status = Backend::quantize_w4a4(grouped_w4a4::QuantizeArgs<std::uint16_t>{workspace.bf16.data(),
                                                 Config::intermediate, nullptr, assignments, Config::intermediate,
-                                                inner_image, plan.failure}, stream, rule);
+                                                inner_image, plan.failure, down_terms}, stream, rule);
             if (status != Backend::success) return status;
-            status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image, nullptr}, stream);
+            status = Backend::launch_w4a4({down, workspace.bf16.data(), inner_image, nullptr, down_terms}, stream);
             if (status != Backend::success) return status;
             return Config::Combine::launch(
                 {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),

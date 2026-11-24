@@ -160,7 +160,7 @@ public:
           descriptors_(2U * tiles_), moe_bf16_(mini_moe_workspace_elements(max_rows_)),
           moe_fp32_(mini_moe_workspace_elements(max_rows_)),
 #if defined(__HIPCC__)
-          moe_activation_(mini_moe_activation_elements(max_rows_)), moe_nan_seen_(1U),
+          moe_activation_(mini_moe_activation_elements(max_rows_)),
 #endif
           flags_((1U + (packed_decode ? std::min(max_rows_, kMiniMaxVerifyRows) : 1U)) * kLogicalVisits),
           zero_padding_(kHeadWidth) {
@@ -186,9 +186,6 @@ public:
             }
             check(bind_mini_convolution_weights(weights_, lag_weights_.data(), stream_));
             mini_gpu::clear(zero_padding_.data(), zero_padding_.span().size_bytes(), stream_);
-#if defined(__HIPCC__)
-            mini_gpu::clear(moe_nan_seen_.data(), moe_nan_seen_.span().size_bytes(), stream_);
-#endif
             start_chunk(0U, MiniAppendKind::prefill);
             mini_gpu::synchronize(stream_);
         } catch (...) {
@@ -251,6 +248,27 @@ public:
         for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
             moe_w4a4_layer_[layer] = mini_grouped::admit_w4a4<MiniMoeConfig>(layer, weights_.experts(layer));
         if (!moe_nvfp4_) moe_nvfp4_.emplace(mini_grouped::workspace_elements<MiniMoeConfig>(max_rows_).nvfp4);
+#endif
+    }
+
+    // Exact down-image lever (inkling2-mini-combine-down-image@1; mini_combine_image resolves it): on the qualified HIP
+    // target (mini_combine_image_arch) the grouped MoE down stores a BF16 image the combine reads, with the NaN side-channel
+    // word allocated here, zeroed once. Unselected, or on any other target, no word exists and the dispatch keeps the
+    // FP32 down rows (null pointer). Returns whether the image route is active. CUDA ignores it.
+    bool set_combine_image(bool selected) {
+#if defined(__HIPCC__)
+        if (!selected || moe_nan_seen_) return moe_nan_seen_.has_value();
+        hipDeviceProp_t properties{};
+        mini_gpu::check(hipGetDeviceProperties(&properties, mini_gpu::current_device()), "read HIP device properties");
+        const std::string_view target(properties.gcnArchName);
+        if (!mini_combine_image_arch(target.substr(0, target.find(':')))) return false;
+        moe_nan_seen_.emplace(1U);
+        mini_gpu::clear(moe_nan_seen_->data(), moe_nan_seen_->span().size_bytes(), stream_);
+        mini_gpu::synchronize(stream_);
+        return true;
+#else
+        static_cast<void>(selected);
+        return false;
 #endif
     }
 
@@ -743,7 +761,7 @@ public:
 #endif
 #if defined(__HIPCC__)
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), moe_activation_.span(), {},
-                                         moe_nan_seen_.data()};
+                                         moe_nan_seen_ ? moe_nan_seen_->data() : nullptr};
 #else
         const bool w4a4 = chunk_w4a4_ && moe_w4a4_layer_[layer];
         const MiniMoeWorkspace workspace{moe_bf16_.span(), moe_fp32_.span(), {},
@@ -887,7 +905,8 @@ private:
 #if defined(__HIPCC__)
     mini_gpu::Buffer<std::uint16_t> moe_activation_;  // gate-up epilogue activations (grouped_dispatch)
     // grouped_dispatch::Workspace::nan_seen: zeroed once; raised (sticky) by a down that stored a NaN sum.
-    mini_gpu::Buffer<unsigned> moe_nan_seen_;
+    // Allocated by set_combine_image; no word, no image route.
+    std::optional<mini_gpu::Buffer<unsigned>> moe_nan_seen_;  // only while the down-image lever is active
 #endif
     mini_gpu::Buffer<unsigned> flags_;
     mini_gpu::Buffer<std::uint16_t> zero_padding_;

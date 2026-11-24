@@ -302,6 +302,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(options.checkpoint == "MODEL.safetensors", "checkpoint did not reach native adapter");
         // The served prefill runs the operand class the profile resolved, never a class-less on/off.
         require(options.moe_w4a4 == w4a4, "W4A4 operand class did not reach native adapter");
+        // The served prefill resolves the down-image lever like the CLI profile does (the fast row selects it).
+        require(options.combine_image, "down-image selection did not reach native adapter");
         require(options.tier == strix::profile::Name::fast && options.weight_options.qualify_q8 == qualify_q8,
                 "FAST request did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;

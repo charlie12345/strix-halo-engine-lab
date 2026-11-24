@@ -1,14 +1,21 @@
 // No-model fixture of the FAST small-M form of the grouped microscaled tile (grouped_microscaled::Form::small_f16) at the
 // Inkling 2 Mini expert shapes (gate_up 2304 x 2304 interleaved halves, down 2304 x 1152; 128 experts, top 8), NVFP4 and
-// MXFP8. Checks: (1) every output of a routed 8-row visit against a double reference of the decoded weights and the BF16
-// inputs (normalised by sum |x w|), for the small form and the incumbent BF16 tile; (2) row invariance: the first row of
-// each tile run alone gives the same bits. Then ms per visit (gate_up + down projections) of R1 rows (8-row chunks,
-// activation and combine included), the incumbent tile and the small form, over rows 1..40, uniform and skewed routes,
-// and GB/s over the distinct expert bytes. Exit 1 on a failed check.
+// MXFP8. Every output buffer is seeded with NaN bytes and every checked output must be finite. Checks: (1) every output
+// of a routed 8-row visit against a double reference of the decoded weights and the BF16 inputs (normalised by
+// sum |x w|), for the small form and the incumbent BF16 tile; (2) tile launches of 1 / 16 / 17 / 32 / 33 / 48 / 64 rows:
+// the small form against the BF16 tile, and EVERY row of every tile run alone (a one-row tile) gives the same bits as in
+// its tile, whatever its position; (3) the full route (grouped_dispatch::enqueue: token rows, the in-place gate-up
+// launch_indirect, activation, down, combine) of 1 / 8 / 16 / 17 / 33 / 64 token rows: the small form against the
+// BF16 tile, and every token row enqueued alone gives the same bits as in its batch (batch invariance of the form).
+// Then ms per visit (gate_up + down projections) of R1 rows (8-row chunks, activation and combine included), the
+// incumbent tile and the small form, over rows 1..40, uniform and skewed routes, and GB/s over the distinct expert
+// bytes; and ms per full route (enqueue) beside R1 at rows 1 / 8 / 16. Exit 1 on a failed check. --check-only skips the
+// timings (ctest), --bench-only the checks.
 #include <hip/hip_runtime.h>
 
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "moe_core/grouped_dispatch.hpp"
 #include "moe_core/grouped_microscaled.hpp"
 #include "moe_core/microscaled_r1.hpp"
 
@@ -20,6 +27,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -29,10 +37,12 @@ namespace packed = strix::weight::microscaled;
 namespace sf = strix::weight::scalar_float;
 namespace grouped = strix::moe_core::grouped_microscaled;
 namespace r1 = strix::moe_core::microscaled_r1;
+namespace dispatch = strix::moe_core::grouped_dispatch;
 using strix::moe_core::device_grouped::ExpertWeights;
 using Format = packed::MatrixFormat;
 
 constexpr unsigned kExperts = 128U, kTopK = 8U, kHidden = 2304U, kInter = 1152U, kGate = 2U * kInter;
+constexpr unsigned kMaxRows = 64U;  // token rows of the largest checked launch
 constexpr unsigned kVariants = 6U;  // route draws cycled per timed rep (distinct experts per rep, cold weights)
 
 void require_hip(hipError_t status, const char* what) {
@@ -53,6 +63,14 @@ float widen(std::uint16_t h) {
     float x;
     std::memcpy(&x, &u, 4);
     return x;
+}
+
+// NaN-propagating maximum (std::max keeps the old value against a NaN) and an all-finite check of host outputs.
+void worse(double& max, double value) {
+    if (!(value <= max)) max = value;
+}
+bool finite(const std::vector<float>& v) {
+    return std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); });
 }
 
 template <class T>
@@ -191,7 +209,7 @@ struct Device {
     unsigned* failure{};
 };
 
-constexpr unsigned kMaxAssign = 48U * kTopK;
+constexpr unsigned kMaxAssign = kMaxRows * kTopK;
 
 Device make_device() {
     Device d;
@@ -199,15 +217,15 @@ Device make_device() {
     require_hip(hipMalloc(&d.dn_in, std::size_t{kMaxAssign} * kInter * 2U), "m");
     require_hip(hipMalloc(&d.gu_out, std::size_t{kMaxAssign} * kGate * 4U), "m");
     require_hip(hipMalloc(&d.dn_out, std::size_t{kMaxAssign} * kHidden * 4U), "m");
-    require_hip(hipMalloc(&d.gu_tiles, kExperts * sizeof(grouped::TileRows)), "m");
-    require_hip(hipMalloc(&d.dn_tiles, kExperts * sizeof(grouped::TileRows)), "m");
+    require_hip(hipMalloc(&d.gu_tiles, kMaxAssign * sizeof(grouped::TileRows)), "m");  // one-row tiles: one per assignment
+    require_hip(hipMalloc(&d.dn_tiles, kMaxAssign * sizeof(grouped::TileRows)), "m");
     require_hip(hipMalloc(&d.ids, kMaxAssign * 4U), "m");
     require_hip(hipMalloc(&d.weights, kMaxAssign * 4U), "m");
-    require_hip(hipMalloc(&d.x, std::size_t{48U} * kHidden * 4U), "m");
-    require_hip(hipMalloc(&d.y, std::size_t{48U} * kHidden * 4U), "m");
+    require_hip(hipMalloc(&d.x, std::size_t{kMaxRows} * kHidden * 4U), "m");
+    require_hip(hipMalloc(&d.y, std::size_t{kMaxRows} * kHidden * 4U), "m");
     require_hip(hipMalloc(&d.act, std::size_t{kMaxAssign} * kInter * 2U), "m");
-    require_hip(hipMalloc(&d.failure, 48U * 4U), "m");
-    require_hip(hipMemset(d.failure, 0, 48U * 4U), "m");
+    require_hip(hipMalloc(&d.failure, kMaxRows * 4U), "m");
+    require_hip(hipMemset(d.failure, 0, kMaxRows * 4U), "m");
     return d;
 }
 
@@ -301,9 +319,10 @@ bool check(const Format_& Fm, const Device& d, std::mt19937& rng) {
         require_hip(hipMemcpy(gu.data(), d.gu_out, gu.size() * 4U, hipMemcpyDeviceToHost), "y");
         require_hip(hipMemcpy(dn.data(), d.dn_out, dn.size() * 4U, hipMemcpyDeviceToHost), "y");
         double eg = 0.0, ed = 0.0;
-        for (std::size_t i = 0; i < gu.size(); ++i) eg = std::max(eg, std::fabs(double(gu[i]) - ref_gu[i]) / (mag_gu[i] + 1e-30));
-        for (std::size_t i = 0; i < dn.size(); ++i) ed = std::max(ed, std::fabs(double(dn[i]) - ref_dn[i]) / (mag_dn[i] + 1e-30));
+        for (std::size_t i = 0; i < gu.size(); ++i) worse(eg, std::fabs(double(gu[i]) - ref_gu[i]) / (mag_gu[i] + 1e-30));
+        for (std::size_t i = 0; i < dn.size(); ++i) worse(ed, std::fabs(double(dn[i]) - ref_dn[i]) / (mag_dn[i] + 1e-30));
         const bool small = form == grouped::Form::small_f16;
+        if (!finite(gu) || !finite(dn)) ok = false;
         if (small) small_err = std::max(eg, ed);
         std::cout << (F == Format::nvfp4 ? "nvfp4" : "mxfp8") << (small ? " small_f16" : " bf16_tile")
                   << " vs double: max |err| / sum|xw| gate_up " << eg << " down " << ed << '\n';
@@ -345,7 +364,7 @@ void bench(const Format_& Fm, const Device& d, std::mt19937& rng) {
         for (auto& v : xd) v = bf16(nd(rng));
         require_hip(hipMemcpy(d.gu_in, xg.data(), xg.size() * 2U, hipMemcpyHostToDevice), "x");
         require_hip(hipMemcpy(d.dn_in, xd.data(), xd.size() * 2U, hipMemcpyHostToDevice), "x");
-        std::vector<float> x(std::size_t{48U} * kHidden);
+        std::vector<float> x(std::size_t{kMaxRows} * kHidden);
         for (auto& v : x) v = nd(rng);
         require_hip(hipMemcpy(d.x, x.data(), x.size() * 4U, hipMemcpyHostToDevice), "x");
     }
@@ -395,22 +414,305 @@ void bench(const Format_& Fm, const Device& d, std::mt19937& rng) {
     }
 }
 
+// Largest |a - b| over the row's root mean square of b (b: the BF16 tile), across all rows of width n.
+double max_rel(const std::vector<float>& a, const std::vector<float>& b, std::size_t n) {
+    double worst = 0.0;
+    for (std::size_t row = 0; row < b.size() / n; ++row) {
+        double ss = 0.0;
+        for (std::size_t i = 0; i < n; ++i) ss += double(b[row * n + i]) * double(b[row * n + i]);
+        const double rms = std::sqrt(ss / double(n)) + 1e-30;
+        for (std::size_t i = 0; i < n; ++i) worse(worst, std::fabs(double(a[row * n + i]) - double(b[row * n + i])) / rms);
+    }
+    return worst;
+}
+
+// Rows of width n whose bytes differ between a and b.
+unsigned rows_differ(const std::vector<float>& a, const std::vector<float>& b, std::size_t n) {
+    unsigned diff = 0U;
+    for (std::size_t row = 0; row < a.size() / n; ++row) diff += std::memcmp(&a[row * n], &b[row * n], n * 4U) != 0;
+    return diff;
+}
+
+// (2) Tile launches over `rows` token rows: the small form against the BF16 tile, and every row of every tile run alone
+// as a one-row tile at its own input / output rows: the same bits as in its tile, whatever its position.
+template <Format F>
+bool tile_rows_check(const Format_& Fm, const Device& d, std::mt19937& rng, unsigned rows) {
+    const char* name = F == Format::nvfp4 ? "nvfp4" : "mxfp8";
+    const auto routes = draw(rows, false, rng);
+    const auto p = plan_of(Fm, routes, rows, d.gu_in, d.gu_out, d.dn_in, d.dn_out);
+    const unsigned A = unsigned(p.token.size());
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::vector<std::uint16_t> xg(std::size_t{A} * kHidden), xd(std::size_t{A} * kInter);
+    for (auto& v : xg) v = bf16(nd(rng));
+    for (auto& v : xd) v = bf16(nd(rng));
+    require_hip(hipMemcpy(d.gu_in, xg.data(), xg.size() * 2U, hipMemcpyHostToDevice), "x");
+    require_hip(hipMemcpy(d.dn_in, xd.data(), xd.size() * 2U, hipMemcpyHostToDevice), "x");
+    Plan one;
+    one.max_rows = 1U;
+    for (std::size_t t = 0; t < p.gu.size(); ++t) {
+        for (unsigned r = 0; r < p.gu[t].rows; ++r) {
+            auto g = p.gu[t];
+            auto n = p.dn[t];
+            g.input += std::size_t{r} * g.input_row;
+            g.output += std::size_t{r} * g.output_row;
+            n.input += std::size_t{r} * n.input_row;
+            n.output += std::size_t{r} * n.output_row;
+            g.rows = n.rows = 1U;
+            one.gu.push_back(g);
+            one.dn.push_back(n);
+        }
+    }
+    const auto run = [&](const Plan& plan, grouped::Form form, std::vector<float>& gu, std::vector<float>& dn) {
+        gu.assign(std::size_t{A} * kGate, 0.0F);
+        dn.assign(std::size_t{A} * kHidden, 0.0F);
+        require_hip(hipMemset(d.gu_out, 0xFF, gu.size() * 4U), "m");  // NaN sentinel: an unwritten output fails
+        require_hip(hipMemset(d.dn_out, 0xFF, dn.size() * 4U), "m");
+        upload_plan(plan, d);
+        run_tiles<F>(plan, d, form);
+        require_hip(hipDeviceSynchronize(), "sync");
+        require_hip(hipMemcpy(gu.data(), d.gu_out, gu.size() * 4U, hipMemcpyDeviceToHost), "y");
+        require_hip(hipMemcpy(dn.data(), d.dn_out, dn.size() * 4U, hipMemcpyDeviceToHost), "y");
+    };
+    std::vector<float> gs, ds, gt, dt, g1, d1;
+    run(p, grouped::Form::small_f16, gs, ds);
+    run(p, grouped::Form::bf16_tile, gt, dt);
+    run(one, grouped::Form::small_f16, g1, d1);
+    const bool all_finite = finite(gs) && finite(ds) && finite(gt) && finite(dt) && finite(g1) && finite(d1);
+    const double eg = max_rel(gs, gt, kGate), ed = max_rel(ds, dt, kHidden);
+    const unsigned diff = rows_differ(gs, g1, kGate) + rows_differ(ds, d1, kHidden);
+    // Against the BF16 tile, not a reference: for NVFP4 the tile rounds decoded weights to BF16 (about 1 % of a row's rms
+    // here); the accuracy of the small form is judged against the double reference in check().
+    const bool ok = all_finite && eg < 5e-2 && ed < 5e-2 && diff == 0U;
+    std::cout << name << " tile rows " << rows << " (" << A << " assignments, " << p.gu.size() << " tiles, max tile "
+              << p.max_rows << "): finite " << (all_finite ? "yes" : "NO") << "; small vs bf16_tile max |d|/rms gate_up "
+              << eg << " down " << ed << "; every row alone vs in its tile: " << (diff == 0U ? "SAME" : "DIFF") << " ("
+              << diff << " of " << 2U * A << " rows differ) " << (ok ? "PASS" : "FAIL") << '\n';
+    return ok;
+}
+
+// (3) The full route through the shared dispatcher (grouped_dispatch::enqueue) at the fixture's expert shapes.
+enum class Proj : std::uint8_t { gate_up, down };
+template <Format F>
+struct RouteConfig {
+    using Projection = Proj;
+    static constexpr unsigned hidden = kHidden;
+    static constexpr unsigned intermediate = kInter;
+    static constexpr unsigned experts = kExperts;
+    static constexpr unsigned top_k = kTopK;
+    static constexpr unsigned layers = 1U;
+    static constexpr unsigned max_rows = kMaxRows;
+    static constexpr Format format(unsigned) { return F; }
+    static constexpr packed::RowOrder row_order(Proj projection) {
+        return projection == Proj::gate_up ? packed::RowOrder::interleaved_halves : packed::RowOrder::contiguous;
+    }
+    struct Caps {
+        static constexpr float gate = 4.0F;
+        static constexpr float up = 25.0F;
+    };
+    using Activation = dispatch::SoftcappedSwigluBf16<Caps>;
+    using Combine = dispatch::Bf16Combine;
+};
+
+struct RouteDevice {
+    float *input{}, *output{}, *alone{}, *fp32{}, *assignment_weights{};
+    std::uint16_t *bf16{}, *activation{};
+    std::uint32_t *assignment_rows{}, *combine_rows{};
+    grouped::TileRows *gate_up{}, *down{};
+    unsigned* failure{};
+};
+
+RouteDevice make_route_device() {
+    const auto need = dispatch::workspace_requirement<RouteConfig<Format::nvfp4>>(kMaxRows);  // shape only
+    RouteDevice d;
+    const auto rows_bytes = std::size_t{kMaxRows} * kHidden * 4U;
+    require_hip(hipMalloc(&d.input, rows_bytes), "m");
+    require_hip(hipMalloc(&d.output, rows_bytes), "m");
+    require_hip(hipMalloc(&d.alone, rows_bytes), "m");
+    require_hip(hipMalloc(&d.fp32, need.fp32 * 4U), "m");
+    require_hip(hipMalloc(&d.bf16, need.bf16 * 2U), "m");
+    require_hip(hipMalloc(&d.activation, need.activation * 2U), "m");
+    require_hip(hipMalloc(&d.assignment_rows, kMaxAssign * 4U), "m");
+    require_hip(hipMalloc(&d.combine_rows, kMaxAssign * 4U), "m");
+    require_hip(hipMalloc(&d.assignment_weights, kMaxAssign * 4U), "m");
+    require_hip(hipMalloc(&d.gate_up, kMaxAssign * sizeof(grouped::TileRows)), "m");
+    require_hip(hipMalloc(&d.down, kMaxAssign * sizeof(grouped::TileRows)), "m");
+    require_hip(hipMalloc(&d.failure, 4U), "m");
+    require_hip(hipMemset(d.failure, 0, 4U), "m");
+    return d;
+}
+
+template <Format F>
+dispatch::Workspace route_workspace(const RouteDevice& d, unsigned rows) {
+    const auto need = dispatch::workspace_requirement<RouteConfig<F>>(rows);
+    return {{d.bf16, need.bf16}, {d.fp32, need.fp32}, {d.activation, need.activation}};
+}
+
+// Host plan of `rows` token rows (the shared expert-major planner), uploaded as the device plan of one enqueue.
+template <Format F>
+dispatch::DevicePlan upload_route(const Format_& Fm, const RouteDevice& d, unsigned rows,
+                                  std::span<const std::uint32_t> ids, std::span<const float> weights, grouped::Form form) {
+    const auto plan = dispatch::prepare<RouteConfig<F>, dispatch::HipBackend>(
+        0U, rows, ids, weights, std::span<const ExpertWeights>(Fm.host), route_workspace<F>(d, rows));
+    const std::size_t A = std::size_t{rows} * kTopK;
+    require_hip(hipMemcpy(d.assignment_rows, plan.routes.grouping.assignment_rows.data(), A * 4U, hipMemcpyHostToDevice), "p");
+    require_hip(hipMemcpy(d.combine_rows, plan.routes.combine_rows.data(), A * 4U, hipMemcpyHostToDevice), "p");
+    require_hip(hipMemcpy(d.assignment_weights, plan.routes.assignment_weights.data(), A * 4U, hipMemcpyHostToDevice), "p");
+    require_hip(hipMemcpy(d.gate_up, plan.gate_up.data(), plan.gate_up.size() * sizeof(grouped::TileRows),
+                          hipMemcpyHostToDevice), "p");
+    require_hip(hipMemcpy(d.down, plan.down.data(), plan.down.size() * sizeof(grouped::TileRows), hipMemcpyHostToDevice),
+                "p");
+    dispatch::DevicePlan device{0U, rows, {d.assignment_rows, A}, {d.combine_rows, A}, {d.assignment_weights, A},
+                                {d.gate_up, plan.gate_up.size()}, {d.down, plan.down.size()}, nullptr, d.failure};
+    device.form = form;
+    return device;
+}
+
+template <Format F>
+void enqueue_route(const dispatch::DevicePlan& plan, const RouteDevice& d, unsigned rows, const float* input,
+                   float* output) {
+    const std::size_t n = std::size_t{rows} * kHidden;
+    require_hip(dispatch::enqueue<RouteConfig<F>, dispatch::HipBackend>(plan, {input, n}, {output, n},
+                                                                        route_workspace<F>(d, rows), nullptr),
+                "enqueue");
+}
+
+template <Format F>
+bool route_check(const Format_& Fm, const RouteDevice& d, std::mt19937& rng) {
+    const char* name = F == Format::nvfp4 ? "nvfp4" : "mxfp8";
+    bool ok = true;
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::uniform_real_distribution<float> ud(0.05F, 0.3F);
+    for (unsigned rows : {1U, 8U, 16U, 17U, 33U, 64U}) {
+        const auto routes = draw(rows, false, rng);
+        const std::vector<std::uint32_t> ids(routes.ids.begin(), routes.ids.end());
+        std::vector<float> weights(ids.size()), x(std::size_t{rows} * kHidden);
+        for (auto& w : weights) w = ud(rng);
+        for (auto& v : x) v = nd(rng);
+        require_hip(hipMemcpy(d.input, x.data(), x.size() * 4U, hipMemcpyHostToDevice), "x");
+        const auto run = [&](grouped::Form form, std::vector<float>& batch, std::vector<float>& alone) {
+            batch.assign(x.size(), 0.0F);
+            alone.assign(x.size(), 0.0F);
+            require_hip(hipMemset(d.output, 0xFF, x.size() * 4U), "m");  // NaN sentinel
+            require_hip(hipMemset(d.alone, 0xFF, x.size() * 4U), "m");
+            enqueue_route<F>(upload_route<F>(Fm, d, rows, ids, weights, form), d, rows, d.input, d.output);
+            require_hip(hipDeviceSynchronize(), "sync");
+            for (unsigned r = 0; r < rows; ++r) {
+                const auto one = upload_route<F>(Fm, d, 1U, std::span(ids).subspan(r * kTopK, kTopK),
+                                                 std::span(weights).subspan(r * kTopK, kTopK), form);
+                enqueue_route<F>(one, d, 1U, d.input + std::size_t{r} * kHidden, d.alone + std::size_t{r} * kHidden);
+                require_hip(hipDeviceSynchronize(), "sync");
+            }
+            require_hip(hipMemcpy(batch.data(), d.output, x.size() * 4U, hipMemcpyDeviceToHost), "y");
+            require_hip(hipMemcpy(alone.data(), d.alone, x.size() * 4U, hipMemcpyDeviceToHost), "y");
+        };
+        std::vector<float> sb, sa, tb, ta;
+        run(grouped::Form::small_f16, sb, sa);
+        run(grouped::Form::bf16_tile, tb, ta);
+        unsigned failure = 1U;
+        require_hip(hipMemcpy(&failure, d.failure, 4U, hipMemcpyDeviceToHost), "f");
+        const bool all_finite = finite(sb) && finite(sa) && finite(tb) && finite(ta);
+        const double err = max_rel(sb, tb, kHidden);
+        const unsigned small_diff = rows_differ(sb, sa, kHidden), tile_diff = rows_differ(tb, ta, kHidden);
+        const bool pass = all_finite && failure == 0U && err < 5e-2 && small_diff == 0U;
+        ok = ok && pass;
+        std::cout << name << " route rows " << rows << ": finite " << (all_finite ? "yes" : "NO") << ", failure word "
+                  << failure << "; small vs bf16_tile max |d|/rms " << err << "; each row alone vs in its batch: small "
+                  << (small_diff == 0U ? "SAME" : "DIFF") << " (" << small_diff << " rows differ), bf16_tile "
+                  << (tile_diff == 0U ? "SAME" : "DIFF") << " (" << tile_diff << ") " << (pass ? "PASS" : "FAIL") << '\n';
+    }
+    return ok;
+}
+
+// ms of one full route (enqueue from an uploaded plan: token rows, gate-up, activation, down, combine; the device-side
+// routing of a served step is not included) for the BF16 tile and the small form, beside R1 (activation and combine
+// included), uniform routes.
+template <Format F>
+void route_bench(const Format_& Fm, const Device& d, const RouteDevice& rd, std::mt19937& rng) {
+    const char* name = F == Format::nvfp4 ? "nvfp4" : "mxfp8";
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    {
+        std::vector<float> x(std::size_t{kMaxRows} * kHidden);
+        for (auto& v : x) v = nd(rng);
+        require_hip(hipMemcpy(rd.input, x.data(), x.size() * 4U, hipMemcpyHostToDevice), "x");
+    }
+    hipEvent_t e0, e1;
+    require_hip(hipEventCreate(&e0), "e");
+    require_hip(hipEventCreate(&e1), "e");
+    for (unsigned rows : {1U, 8U, 16U}) {
+        std::vector<std::vector<std::uint32_t>> ids;
+        double distinct = 0.0;
+        for (unsigned v = 0; v < kVariants; ++v) {
+            const auto r = draw(rows, false, rng);
+            ids.emplace_back(r.ids.begin(), r.ids.end());
+            distinct += r.distinct;
+        }
+        distinct /= kVariants;
+        const std::vector<float> wts(std::size_t{rows} * kTopK, 0.125F);
+        const auto time = [&](auto&& body) {
+            std::vector<float> ms;
+            for (unsigned rep = 0; rep < 4U * kVariants; ++rep) {
+                const unsigned v = rep % kVariants;
+                require_hip(hipMemcpy(d.ids, ids[v].data(), ids[v].size() * 4U, hipMemcpyHostToDevice), "ids");
+                require_hip(hipMemcpy(d.weights, wts.data(), wts.size() * 4U, hipMemcpyHostToDevice), "w");
+                const auto small = upload_route<F>(Fm, rd, rows, ids[v], wts, grouped::Form::small_f16);
+                auto tile = small;
+                tile.form = grouped::Form::bf16_tile;
+                require_hip(hipDeviceSynchronize(), "sync");
+                require_hip(hipEventRecord(e0, nullptr), "rec");
+                body(small, tile);
+                require_hip(hipEventRecord(e1, nullptr), "rec");
+                require_hip(hipEventSynchronize(e1), "sync");
+                float t = 0.0F;
+                require_hip(hipEventElapsedTime(&t, e0, e1), "el");
+                if (rep >= kVariants) ms.push_back(t);  // first round warms up
+            }
+            std::sort(ms.begin(), ms.end());
+            return double(ms[ms.size() / 2U]);
+        };
+        using DP = dispatch::DevicePlan;
+        const double t_r1 = time([&](const DP&, const DP&) { run_r1<F>(Fm, d, rows); });
+        const double t_tile = time([&](const DP&, const DP& t) { enqueue_route<F>(t, rd, rows, rd.input, rd.output); });
+        const double t_small = time([&](const DP& s, const DP&) { enqueue_route<F>(s, rd, rows, rd.input, rd.output); });
+        std::cout << name << " route rows " << rows << " uniform U " << distinct << " ms r1 " << t_r1 << " bf16_tile "
+                  << t_tile << " small " << t_small << " | small/r1 " << t_small / t_r1 << " small/bf16_tile "
+                  << t_small / t_tile << '\n';
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    const bool bench_only = argc > 1 && std::string(argv[1]) == "--bench-only";
+    const std::string mode = argc > 1 ? std::string(argv[1]) : std::string();
+    const bool bench_only = mode == "--bench-only", check_only = mode == "--check-only";
     std::mt19937 rng(20261123U);
     const auto dev = make_device();
+    const auto route = make_route_device();
     bool ok = true;
     {
         auto nv = make_format(Format::nvfp4, rng);
-        if (!bench_only) ok = check<Format::nvfp4>(nv, dev, rng) && ok;
-        bench<Format::nvfp4>(nv, dev, rng);
+        if (!bench_only) {
+            ok = check<Format::nvfp4>(nv, dev, rng) && ok;
+            for (unsigned rows : {1U, 16U, 17U, 32U, 33U, 48U, 64U})
+                ok = tile_rows_check<Format::nvfp4>(nv, dev, rng, rows) && ok;
+            ok = route_check<Format::nvfp4>(nv, route, rng) && ok;
+        }
+        if (!check_only) {
+            bench<Format::nvfp4>(nv, dev, rng);
+            route_bench<Format::nvfp4>(nv, dev, route, rng);
+        }
     }
     {
         auto mx = make_format(Format::mxfp8, rng);
-        if (!bench_only) ok = check<Format::mxfp8>(mx, dev, rng) && ok;
-        bench<Format::mxfp8>(mx, dev, rng);
+        if (!bench_only) {
+            ok = check<Format::mxfp8>(mx, dev, rng) && ok;
+            for (unsigned rows : {1U, 16U, 17U, 32U, 33U, 48U, 64U})
+                ok = tile_rows_check<Format::mxfp8>(mx, dev, rng, rows) && ok;
+            ok = route_check<Format::mxfp8>(mx, route, rng) && ok;
+        }
+        if (!check_only) {
+            bench<Format::mxfp8>(mx, dev, rng);
+            route_bench<Format::mxfp8>(mx, dev, route, rng);
+        }
     }
     std::cout << (ok ? "ALL PASS" : "FAILED") << '\n';
     return ok ? 0 : 1;

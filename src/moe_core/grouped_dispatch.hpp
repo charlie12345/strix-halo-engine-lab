@@ -285,7 +285,8 @@ struct DevicePlan {
     // Schedule of both BF16 projections (never changes bits): automatic = the backend's tall slab schedule where it fits.
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic;
     // Operand form of both projections (FAST trait, grouped_microscaled::Form): small_f16 needs a backend with the small
-    // form (Backend::small_form) and plan rows <= kSmallMaxRows; it runs gate-up without the activation epilogue.
+    // form (Backend::small_form) and BF16 activations; it runs gate-up without the activation epilogue. A row's bits are
+    // the same at every plan row count, so a binder selects it per launch class, never per row count.
     grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile;
 };
 
@@ -363,8 +364,7 @@ inline typename Backend::Status enqueue(
     gate_up.form = down.form = plan.form;
     if (plan.form != grouped_microscaled::Form::bf16_tile) {
         if constexpr (!requires { Backend::small_form; }) return Backend::invalid_value;
-        if (plan.rows > grouped_microscaled::kSmallMaxRows || plan.activations != grouped_w4a4::Activations::bf16)
-            return Backend::invalid_value;
+        if (plan.activations != grouped_w4a4::Activations::bf16) return Backend::invalid_value;
     }
     if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
     // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at

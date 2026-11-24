@@ -41,24 +41,27 @@ enum class Decode : std::uint8_t { reference, shift };
 enum class Schedule : std::uint8_t { automatic, staged, tall };
 
 // Operand form of a tile launch (backend-neutral trait). bf16_tile: the tile family above (Decode / Schedule). small_f16
-// (FAST, bit-changing): tiles of at most kSmallMaxRows rows on the small-M schedule of the f16 tile family
+// (FAST, bit-changing): tiles of any row count on the small-M schedule of the f16 tile family
 // (core/f16_tile_gemm_small.hpp with core/microscaled_f16_staging.hpp): the codes are FP16 WMMA operands held in
-// registers (one weight read per tile, no LDS stage for B), one FP32 multiplier per scale group on the accumulator, the
-// outer scale at the store. Row r's bits depend on its own inputs and the shape only (not on the tile's other rows or
-// the row tile count). Needs max_tile_rows in 1..kSmallMaxRows, inputs % 128 == 0, outputs % 64 == 0, 4-byte aligned
-// scale rows; the activated (epilogue) launches refuse it.
+// registers (one weight read per row block, no LDS stage for B), one FP32 multiplier per scale group on the accumulator,
+// the outer scale at the store. Row r's bits depend on its own inputs and the shape only (not on the tile's other rows,
+// its position in the tile, the row tile count or the row block count), so one form serves every row count of a launch
+// class (a lone decode row, a cohort, a verify window) with the same bits per row. Needs max_tile_rows >= 1, inputs %
+// 128 == 0, outputs % 64 == 0, 4-byte aligned scale rows, tiles x row blocks within the y grid; the activated
+// (epilogue) launches refuse it. Each row block reads the tile's weights again, so a tall tile (prefill) belongs to the
+// BF16 tile: the caller selects the form per launch class.
 enum class Form : std::uint8_t { bf16_tile, small_f16 };
-inline constexpr unsigned kSmallMaxRows = 48U;
 
 // Row plan of the small form: CTAs of 16 row_tiles rows (row_tiles 1 for tiles of <= 16 rows, else 2), row_blocks of them
-// per tile (y grid = tiles x row_blocks); {0, 0} refuses (unknown or too many rows).
+// per tile (y grid = tiles x row_blocks); {0, 0} refuses (no rows).
 struct SmallRows {
     unsigned row_tiles, row_blocks;
 };
 STRIX_GROUPED_ROWS_HD constexpr SmallRows small_rows(unsigned max_tile_rows) {
-    if (max_tile_rows == 0U || max_tile_rows > kSmallMaxRows) return {0U, 0U};
+    if (max_tile_rows == 0U) return {0U, 0U};
     const unsigned row_tiles = max_tile_rows <= 16U ? 1U : 2U;
-    return {row_tiles, (max_tile_rows + 16U * row_tiles - 1U) / (16U * row_tiles)};
+    const unsigned block = 16U * row_tiles;
+    return {row_tiles, max_tile_rows / block + (max_tile_rows % block != 0U ? 1U : 0U)};
 }
 
 struct Args {

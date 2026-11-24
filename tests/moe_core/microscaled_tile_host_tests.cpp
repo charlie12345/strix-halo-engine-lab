@@ -170,6 +170,28 @@ bool admission() {
 }  // namespace
 
 int main() {
+    // Small form row plan: one form for any tile height (no row cap); 16-row blocks up to 16 rows, then 32-row blocks.
+    {
+        namespace gm = moe::grouped_microscaled;
+        constexpr auto plan = [](unsigned rows) { return gm::small_rows(rows); };
+        static_assert(plan(0U).row_tiles == 0U && plan(0U).row_blocks == 0U);
+        static_assert(plan(1U).row_tiles == 1U && plan(1U).row_blocks == 1U);
+        static_assert(plan(16U).row_tiles == 1U && plan(16U).row_blocks == 1U);
+        static_assert(plan(17U).row_tiles == 2U && plan(17U).row_blocks == 1U);
+        static_assert(plan(32U).row_tiles == 2U && plan(32U).row_blocks == 1U);
+        static_assert(plan(33U).row_tiles == 2U && plan(33U).row_blocks == 2U);
+        static_assert(plan(48U).row_blocks == 2U && plan(49U).row_blocks == 2U && plan(64U).row_blocks == 2U);
+        static_assert(plan(65U).row_blocks == 3U && plan(256U).row_blocks == 8U);
+        static_assert(plan(0xFFFFFFFFU).row_tiles == 2U && plan(0xFFFFFFFFU).row_blocks == 0x8000000U);
+        for (unsigned rows = 1U; rows <= 300U; ++rows) {
+            const auto p = plan(rows);
+            const unsigned block = 16U * p.row_tiles;
+            if (p.row_blocks * block < rows || (p.row_blocks - 1U) * block >= rows) {
+                std::cout << "small_rows: rows " << rows << " not covered exactly once\n";
+                return 1;
+            }
+        }
+    }
     constexpr unsigned outputs = model::kHiddenWidth;
     static_assert(tile::kRowsPerTile == 128U && tile::kDecodeRows == 16U);
     static_assert(tile::output_tile(outputs, 0U) == tile::kTileOutputs);

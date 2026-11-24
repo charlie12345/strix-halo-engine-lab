@@ -79,11 +79,13 @@ struct OutCols {
 // or rows already in tile order). The CTA stores rows r < rows only.
 struct GroupCta {
     Weights w;                      // the group's rotated image (in = Act::in, n = the launch's n)
-    const std::uint32_t* map;       // optional image row map
+    const std::uint32_t* map;       // optional image row map (an entry >= Act::rows reads the last row and faults)
     unsigned first, rows;
     float* y;                       // output row r at y + r * y_row
     std::size_t y_row;
+    unsigned* fault;                // optional: kBoundsFault is OR-ed in on a map entry past the image
 };
+inline constexpr unsigned kBoundsFault = 1U << 30U;
 // Epilogues: PlainOut y[r][o] = acc * base (the dense rounding). A paired epilogue (kPaired = true, float operator()(gate,
 // up)) reads W tiles 2 c and 2 c + 1 as the two halves of output columns 16 c .. 16 c + 15 and stores h[r][16 c + j] =
 // epi(gate, up) (the weight image is built in that column order: iu4a4_rot::paired_column), n / 2 outputs per row.
@@ -536,7 +538,11 @@ __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsig
     const bool live = mt0 < mtiles;  // a wave without a live x tile still copies and meets the barriers
     const auto image_row = [&](unsigned r) __attribute__((always_inline)) {
         const unsigned c = g.first + (r < rows ? r : rows - 1U);  // rows past the tile re-read its last row (never stored)
-        return g.map ? g.map[c] : c;
+        if (!g.map) return c;
+        const unsigned m = g.map[c];
+        if (m < a.rows) return m;
+        if (g.fault) atomicOr(g.fault, kBoundsFault);  // a map entry past the image: read its last row, report
+        return a.rows - 1U;
     };
     // W copy (waves 0-1 / 4-5, as the dense launch): piece q of a block = unit 2 q + (tid >> 7).
     const unsigned side = (tid >> 6U) & 1U, piece = tid & 63U, cu = tid >> 7U;

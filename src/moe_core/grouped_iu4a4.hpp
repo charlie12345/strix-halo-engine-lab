@@ -14,7 +14,10 @@ namespace dense = strix::core::iu4a4_dense;
 // GroupCta source of a TileRows plan. Tile t: weights / rows / outputs of tiles[t]; its first assignment row is
 // (index_tiles[t].input - index_base) / index_tiles[t].input_row (the gate/up tiles locate the assignment rows of both
 // projections: the down tiles are the same rows, row for row); image row = map ? map[a] : a. Paired (h != nullptr):
-// outputs go to h + a * h_row (assignment order) instead of the tile's output.
+// outputs go to h + a * h_row (assignment order) instead of the tile's output. A tile whose weights are not an expert
+// slot of the image (address off the base + e * stride rule, or e >= experts), whose index row is not a whole row of
+// the base, whose rows differ from its index tile's or exceed max_rows, or whose rows run past index_rows binds no rows
+// (stores nothing) and sets kFaultBounds in fault.
 struct TileSource {
     const TileRows* tiles{};
     const TileRows* index_tiles{};
@@ -28,16 +31,30 @@ struct TileSource {
     unsigned in{}, n{};
     float* h{};
     std::size_t h_row{};
+    unsigned index_rows{}, max_rows{};
+    unsigned* fault{};
     __device__ __forceinline__ bool active(unsigned t) const {
         return (!failure || *failure == 0U) && (!tile_count || t < *tile_count);
     }
     __device__ __forceinline__ dense::GroupCta bind(unsigned t) const {
         const TileRows tile = tiles[t], index = index_tiles[t];
-        const auto e = static_cast<std::size_t>(tile.weights.codes - codes_from) / codes_stride;
-        const auto first = static_cast<unsigned>(static_cast<std::size_t>(index.input - index_base) / index.input_row);
+        const auto wa = reinterpret_cast<std::uintptr_t>(tile.weights.codes), wb = reinterpret_cast<std::uintptr_t>(codes_from);
+        const auto ia = reinterpret_cast<std::uintptr_t>(index.input), ib = reinterpret_cast<std::uintptr_t>(index_base);
+        const std::size_t e = wa >= wb ? (wa - wb) / codes_stride : ~std::size_t{0};
+        const std::size_t at = ia >= ib ? (ia - ib) / sizeof(std::uint16_t) : ~std::size_t{0};
+        const std::size_t first = index.input_row != 0U ? at / index.input_row : ~std::size_t{0};
+        const bool bound = wa >= wb && (wa - wb) % codes_stride == 0U && e < image.experts && ia >= ib &&
+                           (ia - ib) % sizeof(std::uint16_t) == 0U && index.input_row != 0U && at % index.input_row == 0U &&
+                           tile.rows == index.rows && tile.rows <= max_rows && first <= index_rows &&
+                           tile.rows <= index_rows - first;
+        if (!bound) {
+            if (fault && threadIdx.x == 0U) atomicOr(fault, kFaultBounds);
+            return {};  // no rows: the CTA leaves before its first barrier
+        }
         const dense::Weights w{image.codes + e * image.code_bytes, image.steps + e * image.step_floats, in, n};
-        if (h) return {w, map, first, tile.rows, h + std::size_t(first) * h_row, h_row};
-        return {w, map, first, tile.rows, tile.output, tile.output_row};
+        const auto row0 = static_cast<unsigned>(first);
+        if (h) return {w, map, row0, tile.rows, h + first * h_row, h_row, fault};
+        return {w, map, row0, tile.rows, tile.output, tile.output_row, fault};
     }
 };
 
@@ -61,15 +78,15 @@ inline void enqueue_requantise_expert(const packed::PackedMatrix& matrix, unsign
     dense::enqueue_requantise_source(ExpertSource<Format>{matrix, pair_rows}, in, n, codes, steps, s);
 }
 
-// The pass (see Pass) on stream s: four launches. Refuses (hipErrorInvalidValue, nothing enqueued) shapes the class
-// does not take, a missing image or a workspace below act_bytes.
+static_assert(kFaultBounds == dense::kBoundsFault, "one fault bit for the class and its core");
+
+// The pass (see Pass) on stream s: four launches, each submitted only after the previous one was accepted. Refuses
+// (hipErrorInvalidValue, nothing enqueued) what refusal() names and grids the grouped launch cannot take. After a planner
+// failure or a bounds fault of the gate/up launch no later tile stores (the quantiser of h reads rows no tile consumes).
 inline hipError_t launch(const Pass& p, hipStream_t s) {
     const unsigned gate_width = 2U * p.intermediate;
-    if (!p.images || !p.tokens || !p.h || !p.act || !p.assignment_rows || !p.gate_up || !p.down || p.tiles == 0U ||
-        !dense::grouped_supported(p.hidden, gate_width, true, p.tiles, p.max_tile_rows) ||
-        !dense::grouped_supported(p.intermediate, p.hidden, false, p.tiles, p.max_tile_rows) ||
-        reinterpret_cast<std::uintptr_t>(p.act) % 256U != 0U ||
-        p.act_size < act_bytes(p.rows, p.assignments, p.hidden, p.intermediate))
+    if (refusal(p) != nullptr || !dense::grouped_supported(p.hidden, gate_width, true, p.tiles, p.max_tile_rows) ||
+        !dense::grouped_supported(p.intermediate, p.hidden, false, p.tiles, p.max_tile_rows))
         return hipErrorInvalidValue;
     const auto carve = [](std::uint8_t*& at, unsigned rows, unsigned in) {
         dense::Act a{};
@@ -86,12 +103,17 @@ inline hipError_t launch(const Pass& p, hipStream_t s) {
     std::uint8_t* at = p.act;
     const dense::Act tokens = carve(at, p.rows, p.hidden), inner = carve(at, p.assignments, p.intermediate);
     TileSource gate{p.gate_up, p.gate_up, p.index_base, p.assignment_rows, p.tile_count, p.failure,
-                    p.images->gate_up_codes, p.images->gate_up_stride, p.images->gate_up, p.hidden, gate_width, p.h, p.intermediate};
+                    p.images->gate_up_codes, p.images->gate_up_stride, p.images->gate_up, p.hidden, gate_width, p.h, p.intermediate,
+                    p.assignments, p.max_tile_rows, p.fault};
     TileSource down{p.down, p.gate_up, p.index_base, nullptr, p.tile_count, p.failure,
-                    p.images->down_codes, p.images->down_stride, p.images->down, p.intermediate, p.hidden, nullptr, 0U};
+                    p.images->down_codes, p.images->down_stride, p.images->down, p.intermediate, p.hidden, nullptr, 0U,
+                    p.assignments, p.max_tile_rows, p.fault};
     dense::enqueue_quantise_rows(p.tokens, p.hidden, tokens, s);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     dense::enqueue_grouped_gemm(gate, p.tiles, p.max_tile_rows, gate_width, tokens, s, SwigluOut{p.gate_cap, p.up_cap});
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     dense::enqueue_quantise_rows(p.h, p.intermediate, inner, s);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     dense::enqueue_grouped_gemm(down, p.tiles, p.max_tile_rows, p.hidden, inner, s);
     return hipGetLastError();
 }

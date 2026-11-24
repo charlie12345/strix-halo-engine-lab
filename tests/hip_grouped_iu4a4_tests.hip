@@ -89,6 +89,7 @@ struct Image {
 Image requantise(const Bank& b, unsigned pair_rows) {
     const unsigned n = b.rows;
     Image im;
+    im.view.experts = b.experts;
     im.view.code_bytes = gi::image_code_bytes(b.in, n);
     im.view.step_floats = gi::image_step_floats(b.in, n);
     CHECK(hipMalloc(&im.codes, im.view.code_bytes * b.experts));
@@ -176,6 +177,8 @@ struct Launch {
     std::uint16_t* index_base = nullptr;
     std::uint32_t* dmap = nullptr;
     unsigned* dcount = nullptr;
+    unsigned* dfault = nullptr;  // the pass's fault word (kFaultBounds), zeroed
+    unsigned rows = 0, max_rows = 0;
 };
 Launch make_launch(const Plan& p, const Bank& gate, const Bank& down, float* y, unsigned n_down, unsigned count) {
     Launch l;
@@ -190,6 +193,9 @@ Launch make_launch(const Plan& p, const Bank& gate, const Bank& down, float* y, 
     l.ddown = upload(l.down_tiles);
     l.dmap = upload(p.token);
     l.dcount = upload(std::vector<unsigned>{count});
+    l.dfault = upload(std::vector<unsigned>{0U});
+    l.rows = static_cast<unsigned>(p.token.size());
+    l.max_rows = *std::max_element(p.tile_rows.begin(), p.tile_rows.end());
     return l;
 }
 gi::TileSource source(const Launch& l, const Bank& bank, const Image& im, bool gate_side, unsigned n, float* h, std::size_t h_row) {
@@ -206,6 +212,9 @@ gi::TileSource source(const Launch& l, const Bank& bank, const Image& im, bool g
     s.n = n;
     s.h = h;
     s.h_row = h_row;
+    s.index_rows = l.rows;
+    s.max_rows = l.max_rows;
+    s.fault = l.dfault;
     return s;
 }
 
@@ -330,6 +339,7 @@ int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsi
     for (unsigned c = 0; c < ng; ++c) bad_guard += bits(plain[std::size_t(A) * ng + c]) != 0xffffffffU;
     for (unsigned c = 0; c < ffn; ++c) bad_guard += bits(h[std::size_t(A) * ffn + c]) != 0xffffffffU;
     for (unsigned c = 0; c < hidden; ++c) bad_guard += bits(y[std::size_t(A) * hidden + c]) != 0xffffffffU;
+    bad_guard += download(l.dfault, 1U)[0] != 0U;  // a clean pass faults nothing
     const bool ok = !(bad_img | bad_plain | bad_pair | bad_down | bad_guard);
     std::printf("%s %s %s%s%s tokens %u experts %u k %u hidden %u ffn %u tiles %u (run %u): image %u plain %u paired %u down %u guard %u differ\n",
                 ok ? "PASS" : "FAIL", f == packed::MatrixFormat::nvfp4 ? "nvfp4" : "mxfp8", order == packed::RowOrder::contiguous ? "contig" : "interleaved",
@@ -420,6 +430,85 @@ int bench(unsigned tokens) {
 }
 }  // namespace
 
+// Bounds faults of the grouped launch. Each case corrupts one operand of a clean gate/up launch (plain rows to h in
+// assignment order): the bad tile binds no rows (its h rows keep the NaN pattern), the fault word gets kFaultBounds, the
+// other tiles still store and the guard row past the end stays untouched. A map entry past the image is the exception: its
+// tile reads the image's last row (stores) and faults. The clean launch faults nothing.
+int faults() {
+    std::mt19937 g(11U);
+    const unsigned tokens = 97U, experts = 5U, k = 3U, hidden = 256U, ffn = 128U, ng = 2U * ffn;
+    const Bank gate = make_bank(packed::MatrixFormat::nvfp4, experts, ng, hidden, packed::RowOrder::contiguous, g);
+    const Plan p = route(tokens, experts, k, g, false, 128U);
+    const unsigned A = static_cast<unsigned>(p.token.size()), tiles = static_cast<unsigned>(p.tile_first.size());
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::vector<float> x(std::size_t(tokens) * hidden);
+    for (auto& v : x) v = nd(g);
+    Act tok;
+    tok.alloc(tokens, hidden);
+    ad::enqueue_quantise_rows(upload(x), hidden, tok.act, nullptr);
+    const Image gim = requantise(gate, ffn);
+    const Launch l = make_launch(p, gate, gate, nullptr, 0U, tiles);
+    float* dh = nullptr;
+    CHECK(hipMalloc(&dh, std::size_t(A + 1U) * ng * 4U));
+    unsigned bad_tile = 1U;  // the corrupted tile; the last expert's tile for the expert case
+    for (unsigned t = 0; t < tiles; ++t)
+        if (p.tile_expert[t] == experts - 1U) bad_tile = t;
+    enum Case { clean, map_past, off_stride, expert_past, rows_differ, rows_over_max, index_past, cases };
+    const char* names[cases] = {"clean", "map entry past the image", "weights off the slot stride", "expert past the image",
+                                "tile rows differ from the index tile", "tile rows above max_rows", "index rows past index_rows"};
+    int fails = 0;
+    for (int c = 0; c < cases; ++c) {
+        CHECK(hipMemset(dh, 0xff, std::size_t(A + 1U) * ng * 4U));
+        CHECK(hipMemset(l.dfault, 0, 4U));
+        gi::TileSource s = source(l, gate, gim, true, ng, dh, ng);
+        std::vector<TileRows> tl = l.gate_tiles;
+        std::vector<std::uint32_t> map = p.token;
+        unsigned victim = c == expert_past ? bad_tile : 1U;
+        if (c == map_past) map[p.tile_first[1]] = tokens;
+        if (c == off_stride) tl[1].weights.codes += 16;
+        if (c == expert_past) s.image.experts = experts - 1U;
+        if (c == rows_differ) tl[1].rows -= 1U;
+        if (c == rows_over_max) {
+            victim = static_cast<unsigned>(std::max_element(p.tile_rows.begin(), p.tile_rows.end()) - p.tile_rows.begin());
+            s.max_rows = p.tile_rows[victim] - 1U;
+        }
+        if (c == index_past) {
+            victim = tiles - 1U;
+            s.index_rows = A - 1U;
+        }
+        TileRows* dt = upload(tl);
+        std::uint32_t* dm = upload(map);
+        s.tiles = dt;
+        s.map = dm;
+        ad::enqueue_grouped_gemm(s, tiles, l.max_rows, ng, tok.act, nullptr);
+        CHECK(hipGetLastError());
+        CHECK(hipDeviceSynchronize());
+        const auto h = download(dh, std::size_t(A + 1U) * ng);
+        const unsigned fault = download(l.dfault, 1U)[0];
+        unsigned untouched_bad = 0, written_bad = 0, guard = 0;
+        for (unsigned t = 0; t < tiles; ++t) {
+            const bool refused = c != clean && c != map_past && (t == victim || (c == rows_over_max && p.tile_rows[t] > s.max_rows));
+            for (unsigned r = 0; r < p.tile_rows[t]; ++r) {
+                const float* row = h.data() + std::size_t(p.tile_first[t] + r) * ng;
+                unsigned nan_pattern = 0;
+                for (unsigned col = 0; col < ng; ++col) nan_pattern += bits(row[col]) == 0xffffffffU;
+                if (refused) untouched_bad += nan_pattern != ng;
+                else written_bad += nan_pattern != 0U;
+            }
+        }
+        for (unsigned col = 0; col < ng; ++col) guard += bits(h[std::size_t(A) * ng + col]) != 0xffffffffU;
+        const bool want_fault = c != clean;
+        const bool ok = (fault == (want_fault ? gi::kFaultBounds : 0U)) && !untouched_bad && !written_bad && !guard;
+        std::printf("%s fault case '%s' (tile %u): fault 0x%08x stored-in-refused %u unwritten-live %u guard %u\n", ok ? "PASS" : "FAIL",
+                    names[c], victim, fault, untouched_bad, written_bad, guard);
+        fails += ok ? 0 : 1;
+        CHECK(hipFree(dt));
+        CHECK(hipFree(dm));
+    }
+    CHECK(hipFree(dh));
+    return fails;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return bench(argc > 2 ? static_cast<unsigned>(std::strtoul(argv[2], nullptr, 10)) : 8237U);
     int fails = 0;
@@ -430,6 +519,7 @@ int main(int argc, char** argv) {
     fails += fixture(150U, 6U, 4U, 256U, 128U, F::mxfp8, O::contiguous, false, 3U, false);
     fails += fixture(200U, 3U, 2U, 128U, 256U, F::nvfp4, O::contiguous, true, 4U, true);  // device tile count cuts the last tile
     fails += fixture(700U, 3U, 2U, 256U, 128U, F::nvfp4, O::contiguous, true, 5U, false, 256U);  // 256-row tiles: row slices
+    fails += faults();
     std::printf("%s\n", fails ? "FAIL" : "ALL PASS");
     return fails ? 1 : 0;
 }

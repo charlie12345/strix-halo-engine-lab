@@ -82,9 +82,76 @@ void decode_and_pair(packed::RowOrder order, unsigned seed) {
         }
     expect(bad_pair == 0U, "paired image column == plain image column");
 }
+
+// Host admission of a pass (refusal): a valid pass is admitted; each defect alone refuses it. Addresses are never read.
+void admission() {
+    const auto at = [](std::uintptr_t a) { return reinterpret_cast<std::uint8_t*>(a); };
+    const unsigned hidden = 256U, inter = 128U, rows = 97U, assignments = 291U;
+    gi::LayerImages images;
+    const auto view = [&](gi::ExpertImage& v, unsigned in, unsigned n) {
+        v.codes = at(0x100000U);
+        v.steps = reinterpret_cast<float*>(at(0x200000U));
+        v.code_bytes = gi::image_code_bytes(in, n);
+        v.step_floats = gi::image_step_floats(in, n);
+        v.experts = 5U;
+    };
+    view(images.gate_up, hidden, 2U * inter);
+    view(images.down, inter, hidden);
+    images.gate_up_codes = at(0x300000U);
+    images.gate_up_stride = 4096U;
+    images.down_codes = at(0x400000U);
+    images.down_stride = 4096U;
+    gi::Pass ok;
+    ok.tokens = reinterpret_cast<const float*>(at(0x500000U));
+    ok.rows = rows;
+    ok.assignments = assignments;
+    ok.hidden = hidden;
+    ok.intermediate = inter;
+    ok.assignment_rows = reinterpret_cast<const std::uint32_t*>(at(0x600000U));
+    ok.gate_up = reinterpret_cast<const gi::TileRows*>(at(0x700000U));
+    ok.down = reinterpret_cast<const gi::TileRows*>(at(0x800000U));
+    ok.tiles = 7U;
+    ok.max_tile_rows = 128U;
+    ok.index_base = reinterpret_cast<const std::uint16_t*>(at(0x900000U));
+    ok.h = reinterpret_cast<float*>(at(0xa00000U));
+    ok.act = at(0xb00000U);
+    ok.act_size = gi::act_bytes(rows, assignments, hidden, inter);
+    ok.images = &images;
+    expect(gi::refusal(ok) == nullptr, "a valid pass is admitted");
+    const auto refused = [&](const char* what, auto&& defect) {
+        gi::Pass p = ok;
+        gi::LayerImages im = images;
+        p.images = &im;
+        defect(p, im);
+        expect(gi::refusal(p) != nullptr, what);
+    };
+    using P = gi::Pass&;
+    using I = gi::LayerImages&;
+    refused("zero rows", [](P p, I) { p.rows = 0U; });
+    refused("fewer assignments than rows", [](P p, I) { p.assignments = p.rows - 1U; });
+    refused("assignments past the quantiser grid", [](P p, I) { p.assignments = 0x7ffffff8U; });
+    refused("missing tokens", [](P p, I) { p.tokens = nullptr; });
+    refused("missing index base", [](P p, I) { p.index_base = nullptr; });
+    refused("missing images", [](P p, I) { p.images = nullptr; });
+    refused("zero tiles", [](P p, I) { p.tiles = 0U; });
+    refused("zero max tile rows", [](P p, I) { p.max_tile_rows = 0U; });
+    refused("max tile rows above assignments", [](P p, I) { p.max_tile_rows = p.assignments + 1U; });
+    refused("hidden off the 128-input block", [](P p, I) { p.hidden = 200U; });
+    refused("unaligned activation workspace", [](P p, I) { p.act += 128; });
+    refused("activation workspace one byte short", [](P p, I) { --p.act_size; });
+    refused("default (empty) images", [](P, I im) { im = gi::LayerImages{}; });
+    refused("gate/up image without codes", [](P, I im) { im.gate_up.codes = nullptr; });
+    refused("down image without steps", [](P, I im) { im.down.steps = nullptr; });
+    refused("image without expert slots", [](P, I im) { im.down.experts = 0U; });
+    refused("gate/up code span one byte short", [](P, I im) { --im.gate_up.code_bytes; });
+    refused("down step span one float short", [](P, I im) { --im.down.step_floats; });
+    refused("missing code base", [](P, I im) { im.down_codes = nullptr; });
+    refused("zero code stride", [](P, I im) { im.gate_up_stride = 0U; });
+}
 }  // namespace
 
 int main() {
+    admission();
     paired_order(16U);
     paired_order(64U);
     paired_order(1152U);

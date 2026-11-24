@@ -73,6 +73,33 @@ inline bool expert_codes_strided(std::span<const packed::PackedMatrix> experts, 
 
 static_assert(rot::kBlock == kInputBlock, "act_image_bytes assumes the contract's 128-input block");
 
+// Host admission of a pass: nullptr, or why nothing may be enqueued. Rows (none, fewer assignments than rows, past the
+// quantiser grid), operands, shapes the class takes, the activation workspace, and both image views: present, one or more
+// expert slots, a per-expert extent no smaller than the shape's image, and the code-address rule (base, stride) the
+// tiles' experts are located by.
+inline const char* refusal(const Pass& p) {
+    const unsigned gate_width = 2U * p.intermediate;
+    if (p.rows == 0U || p.assignments < p.rows || std::size_t(p.assignments) + 15U > 0x7fffffffU)
+        return "rows: none, fewer assignments than rows, or past the quantiser grid";
+    if (!p.tokens || !p.h || !p.act || !p.assignment_rows || !p.gate_up || !p.down || !p.index_base) return "missing operand";
+    if (p.tiles == 0U || p.max_tile_rows == 0U || p.max_tile_rows > p.assignments || !supported(p.hidden, gate_width, true) ||
+        !supported(p.intermediate, p.hidden, false))
+        return "shape the class does not take";
+    if (reinterpret_cast<std::uintptr_t>(p.act) % 256U != 0U ||
+        p.act_size < act_bytes(p.rows, p.assignments, p.hidden, p.intermediate))
+        return "activation workspace unaligned or below act_bytes";
+    if (!p.images) return "missing images";
+    const auto image = [](const ExpertImage& i, unsigned in, unsigned n) {
+        return i.codes && i.steps && i.experts > 0U && i.code_bytes >= image_code_bytes(in, n) &&
+               i.step_floats >= image_step_floats(in, n);
+    };
+    if (!image(p.images->gate_up, p.hidden, gate_width) || !image(p.images->down, p.intermediate, p.hidden))
+        return "image view missing, without experts or below the shape's extent";
+    if (!p.images->gate_up_codes || !p.images->down_codes || p.images->gate_up_stride == 0U || p.images->down_stride == 0U)
+        return "missing code-address rule";
+    return nullptr;
+}
+
 }  // namespace strix::moe_core::grouped_iu4a4
 
 #undef STRIX_GI4_HD

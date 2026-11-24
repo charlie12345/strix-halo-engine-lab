@@ -16,8 +16,9 @@ inline constexpr unsigned kInputBlock = 128U;  // rotation block / weight group 
 struct ExpertImage {
     std::uint8_t* codes{};
     float* steps{};
-    std::size_t code_bytes{};
-    std::size_t step_floats{};
+    std::size_t code_bytes{};   // per expert, >= image_code_bytes(in, n)
+    std::size_t step_floats{};  // per expert, >= image_step_floats(in, n)
+    unsigned experts{};         // expert slots in the image (a tile's expert index must be below it)
 };
 // Rotated images of one layer's experts (both projections; gate/up in the paired column order) and the code address
 // rule of the resident matrices they were built from (expert_codes_strided).
@@ -60,6 +61,12 @@ struct Pass {
     std::size_t act_size{};
     const LayerImages* images{};
     float gate_cap{}, up_cap{};
+    // Device word the pass sets (kFaultBounds) when a tile names an expert outside its image or an assignment range past
+    // `assignments` (that tile stores nothing), or when a map entry names a token past the token image (that row reads
+    // the image's last row). The dispatcher passes the plan's failure word, so later consumers skip and the step fails
+    // as on a planner failure. nullptr: no report (still no access past the images).
+    unsigned* fault{};
 };
+inline constexpr unsigned kFaultBounds = 1U << 30U;
 
 }  // namespace strix::moe_core::grouped_iu4a4

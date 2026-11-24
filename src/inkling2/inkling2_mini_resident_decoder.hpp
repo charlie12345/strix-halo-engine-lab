@@ -535,9 +535,7 @@ private:
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
-        auto plan = MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule());
-        plan.admit_controller_operands(source);
-        return plan;
+        return MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule());
     }
 
     [[nodiscard]] MiniResidentWeights upload_weights() {
@@ -549,6 +547,14 @@ private:
         core::WeightSliceLoader loader(uploader, {});
         auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
         loader.load_resident(weight_plan_.slices(), weight_storage_.span());
+#if !defined(__HIPCC__)
+        // Only the CUDA dense route consumes the controller certificate: it reads the staged controller tensors back
+        // (a few MiB) instead of re-reading the checkpoint, so the HIP load path is unchanged.
+        weights.certify_controllers([&](std::span<const std::uint16_t> staged, std::span<std::uint16_t> host) {
+            mini_gpu::copy(host.data(), staged.data(), staged.size_bytes(), mini_gpu::device_to_host, stream_.get());
+            mini_gpu::synchronize(stream_.get());
+        });
+#endif
         return weights;
     }
 

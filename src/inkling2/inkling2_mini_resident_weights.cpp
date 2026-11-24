@@ -1,12 +1,9 @@
 #include "inkling2_mini_resident_weights.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
-#include "core/dense_row_plan.hpp"
-
-#include <algorithm>
-#include <string_view>
-#include <vector>
 
 #include <stdexcept>
+#include <string_view>
+#include <vector>
 
 namespace strix::inkling2 {
 namespace {
@@ -44,34 +41,9 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
     return plan;
 }
 
-void MiniResidentWeightPlan::admit_controller_operands(const MiniTextWeights& weights) {
-    float down_max = 0.0F, gate_max = 0.0F;
-    std::vector<float> values;
-    unsigned tensors = 0;
-    for (const auto& spec : mini_text_tensor_schema()) {
-        const std::string_view name(spec.name);
-        if (name.find(".controllers.") == std::string_view::npos) continue;
-        const bool down = name.ends_with("down_weight");
-        if (!down && !name.ends_with("forget_weight") && !name.ends_with("gain_weight")) continue;
-        const auto* tensor = weights.find(name);
-        if (tensor == nullptr || tensor->opaque() || tensor->shape.rank == 0U)
-            throw std::runtime_error("Inkling 2 Mini: missing or opaque controller tensor");
-        std::size_t elements = 1;
-        for (unsigned i = 0; i < tensor->shape.rank; ++i) elements *= static_cast<std::size_t>(tensor->shape.dims[i]);
-        values.resize(elements);
-        check(weights.read(name, values));
-        auto& top = down ? down_max : gate_max;
-        top = std::max(top, core::finite_magnitude_max(values));
-        ++tensors;
-    }
-    controller_operands_bounded_ =
-        tensors != 0 && core::low_rank_operands_bounded(kHiddenWidth, 2U, kControllerRank, down_max, gate_max);
-}
-
 MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan,
                                               std::span<const std::uint8_t> storage) {
     MiniResidentWeights bound(weight::ResidentSlices::bind(plan.slices_, storage));
-    bound.controller_operands_bounded_ = plan.controller_operands_bounded_;
     if (plan.storage_ == weight::kQ8WeightStorage)
         bound.head_ = bound.slices_.matrix("unembed.weight");
     bound.experts_.resize(kPhysicalLayers * kExperts);
@@ -109,6 +81,24 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
         }
     }
     return bound;
+}
+
+void MiniResidentWeights::certify_controllers(
+    const std::function<void(std::span<const std::uint16_t>, std::span<std::uint16_t>)>& read) {
+    MiniControllerCertificate certificate;
+    std::vector<std::uint16_t> host;
+    for (const auto& spec : mini_text_tensor_schema()) {
+        const std::string_view name(spec.name);
+        if (name.find(".controllers.") == std::string_view::npos) continue;
+        const bool down = name.ends_with("down_weight");
+        if (!down && !name.ends_with("forget_weight") && !name.ends_with("gain_weight")) continue;
+        const auto staged = bf16(name.substr(kMiniTextTensorPrefix.size()));
+        host.resize(staged.size());
+        read(staged, host);
+        if (down) certificate.add_down(host);
+        else certificate.add_gate(host);
+    }
+    controller_certificate_ = certificate;
 }
 
 std::span<const std::uint16_t> MiniResidentWeights::bf16(std::string_view name) const {

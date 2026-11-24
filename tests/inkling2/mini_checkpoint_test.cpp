@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <vector>
 
 namespace {
 
@@ -317,9 +318,27 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
            source.payload_reads() == 8;
 }
 
+// The controller certificate is a function of the bytes added to it: a checkpoint with an infinite forget coefficient
+// and one with finite weights give different routes, an oversized finite down weight is refused, and an empty
+// certificate (no controller tensor seen) never admits the one-plane class.
+bool check_controller_certificate() {
+    const std::vector<std::uint16_t> finite(64, 0x3F80U), infinite{0x3F80U, 0x7F80U}, oversized(64, 0x7F00U);
+    const auto route = [&finite](const std::vector<std::uint16_t>& down, const std::vector<std::uint16_t>& forget) {
+        mini::MiniControllerCertificate certificate;
+        certificate.add_down(down);
+        certificate.add_gate(forget);
+        certificate.add_gate(finite);
+        return certificate.route(strix::core::Bf16Operand::bf16_exact);
+    };
+    constexpr auto one = strix::core::Bf16Operand::bf16_exact, three = strix::core::Bf16Operand::fp32;
+    return route(finite, finite) == one && route(finite, infinite) == three && route(oversized, finite) == three &&
+           route(finite, finite) == one && mini::MiniControllerCertificate{}.route(one) == three;
+}
+
 }  // namespace
 
 int main() {
+    if (!check_controller_certificate()) return 90;
     Fixture fixture;
     for (const auto& tensor : mini::mini_text_tensor_schema()) fixture.add(tensor);
     fixture.add({"model.visual.test.weight", "BF16", {4, 4}});

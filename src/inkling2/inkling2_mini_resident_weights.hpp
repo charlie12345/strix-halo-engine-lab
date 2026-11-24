@@ -2,11 +2,14 @@
 
 #include "inkling2_mini_checkpoint.hpp"
 #include "inkling2_mini_moe_dispatch.hpp"
+#include "inkling2_mini_controller_operands.hpp"
 #include "attn_core/prepared_gqa.hpp"
 
 #include "strix/weight/resident_slices.hpp"
 #include "strix/weight/row_pitch.hpp"
 
+#include <functional>
+#include <span>
 #include <utility>
 
 namespace strix::inkling2 {
@@ -26,16 +29,11 @@ public:
     [[nodiscard]] const weight::ResidentSlicePlan& slices() const { return slices_; }
     [[nodiscard]] std::size_t bytes() const { return slices_.bytes(); }
     [[nodiscard]] std::span<const MiniResidentRange> ranges() const { return slices_.ranges(); }
-    // Reads every controller down / forget / gain tensor once (host) and records whether the controller's declared
-    // BF16 operands are admitted to the one-plane chain (core::low_rank_operands_bounded). Without this call, or when
-    // the bound fails, the controller keeps FP32 operands.
-    void admit_controller_operands(const MiniTextWeights& weights);
 
 private:
     friend class MiniResidentWeights;
     weight::ResidentSlicePlan slices_;
     weight::FormatId storage_ = weight::kBf16WeightStorage;
-    bool controller_operands_bounded_ = false;
     std::array<std::array<MiniExpertLayerView, 2>, kPhysicalLayers> slabs_;
 };
 
@@ -50,8 +48,11 @@ public:
     [[nodiscard]] std::span<const float> f32(std::string_view name) const;
     [[nodiscard]] std::span<const MiniMoeExpert> experts(unsigned physical) const;
     [[nodiscard]] bool compact() const { return head_.has_value(); }
-    // The plan proved the controller's one-plane admission bound (MiniResidentWeightPlan::admit_controller_operands).
-    [[nodiscard]] bool controller_operands_bounded() const { return controller_operands_bounded_; }
+    // Certifies the controller operand class from the controller tensors this object holds: `read` copies a staged
+    // BF16 tensor to host memory (a device copy on CUDA). The certificate is a function of these bytes only.
+    void certify_controllers(const std::function<void(std::span<const std::uint16_t> staged,
+                                                      std::span<std::uint16_t> host)>& read);
+    [[nodiscard]] const MiniControllerCertificate& controller_certificate() const { return controller_certificate_; }
     [[nodiscard]] const weight::ResidentMatrixView& compact_head() const { return head_.value(); }
     [[nodiscard]] const attn_core::ResidentPreparedGqaWeights& compact_attention(unsigned physical) const {
         return attention_.at(physical);
@@ -64,7 +65,7 @@ private:
     std::vector<MiniMoeExpert> experts_;
     std::optional<weight::ResidentMatrixView> head_;
     std::array<attn_core::ResidentPreparedGqaWeights, kPhysicalLayers> attention_{};
-    bool controller_operands_bounded_ = false;
+    MiniControllerCertificate controller_certificate_;
 };
 
 }  // namespace strix::inkling2

@@ -7,6 +7,9 @@
 #include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_residual_device.hpp"
+#if !defined(__HIPCC__)
+#include "inkling2_mini_controller_operands_cuda.hpp"
+#endif
 #include "moe_core/microscaled_r1.hpp"
 
 #include <algorithm>
@@ -358,12 +361,11 @@ public:
 
 #if !defined(__HIPCC__)
     // The shared controller declares its BF16-rounded operands: the tall chain runs one activation plane (same bits)
-    // where the weight load proved the controller's bound (finite weights, sums kept finite); otherwise FP32 operands.
+    // where the staged controller weights are certified (finite weights, sums kept finite); otherwise FP32 operands.
     void dense(const float* input, unsigned width, unsigned rows, std::span<const Projection> projections,
                core::Bf16Operand operand) {
-        if (!weights_.controller_operands_bounded()) operand = core::Bf16Operand::fp32;
-        check(cuda_core::enqueue_bf16_dense_rows(input, width, rows, projections, stream_, cuda_core::DenseArith::mma3,
-                                                 big_context_.get(), nullptr, operand));
+        check(enqueue_controller_dense(weights_.controller_certificate(), input, width, rows, projections, stream_,
+                                       big_context_.get(), operand));
     }
 #endif
 

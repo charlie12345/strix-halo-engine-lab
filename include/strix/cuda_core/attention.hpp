@@ -110,10 +110,13 @@ struct PreparedBf16Flash {
 
 // Schedule trait of the one-row prepared step with a device position (scheduling only, SAME bits): the relative bias of
 // the next 32-key tile is loaded while the current tile computes, instead of after its scores. Chosen per launch from the
-// shape alone: a sliding window that lies inside the bias extent, so every visible key reads a bias value. Elsewhere
-// (full causal prefix, a window wider than the extent, no bias table) the incumbent instance runs unchanged.
+// shape alone: a sliding window of at least kPreparedFlashBiasAheadMinWindow keys that lies inside the bias extent, so
+// every visible key reads a bias value and a full window walks 8+ key tiles. Elsewhere (full causal prefix, a short
+// window, a window wider than the extent, no bias table) the incumbent instance runs unchanged.
+inline constexpr std::uint32_t kPreparedFlashBiasAheadMinWindow = 256;
 [[nodiscard]] inline bool prepared_flash_bias_ahead(const PreparedBf16Flash& p) {
-    return p.relative_bias != nullptr && !p.bidirectional && p.window != 0 && p.window <= p.relative_extent;
+    return p.relative_bias != nullptr && !p.bidirectional && p.window >= kPreparedFlashBiasAheadMinWindow &&
+           p.window <= p.relative_extent;
 }
 
 // Cache append for the prepared slot-major layout. K/V inputs are contiguous

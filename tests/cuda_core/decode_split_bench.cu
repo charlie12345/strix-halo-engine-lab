@@ -176,9 +176,10 @@ unsigned check_args(unsigned& launches) {
           kAll);
     admit(!cc::can_launch_prefill_flash({1U, 1U, cc::kPrefillFlashHeadDim, kScale, kAll}, kAll - 100U, 50U), "plain control key ceiling",
           kAll - 100U, 50U);
-    // the bias look-ahead instance of the one-row step: a sliding window inside the bias extent only
+    // the bias look-ahead instance of the one-row step: a sliding window of 256+ keys inside the bias extent only
     admit(cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 1024U, true, false}), "bias-ahead window = extent", 1024U, kExtent);
-    admit(cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 200U, true, false}), "bias-ahead window < extent", 200U, kExtent);
+    admit(cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 256U, true, false}), "bias-ahead window = minimum", 256U, kExtent);
+    admit(!cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 255U, true, false}), "incumbent window < minimum", 255U, kExtent);
     admit(!cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 0U, false, false}), "incumbent full prefix", 0U, kExtent);
     admit(!cc::prepared_flash_bias_ahead({bias, sinks, kExtent, 1025U, true, false}), "incumbent window > extent", 1025U, kExtent);
     admit(!cc::prepared_flash_bias_ahead({nullptr, sinks, kExtent, 1024U, true, false}), "incumbent no bias table", 1024U, kExtent);

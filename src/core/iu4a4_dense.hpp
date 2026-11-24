@@ -330,7 +330,7 @@ static_assert(kCtaTilesN == 8U && kCtaTilesM == 8U, "a staged unit holds 8 W til
 // The contract arithmetic of one staged 128-input block `buf` (codes, then side data) for a wave's kTw x kTm tiles,
 // added to acc (shared by the dense and the grouped launch: same operations, same order).
 // SplitC (the grouped trait): the integer accumulator c holds one x tile at a time (kTw x 8 registers instead of
-// kTw x kTm x 8; the gathered launch spilled its staging registers in the K loop). Every t is the same exact integer
+// kTw x kTm x 8; the grouped launch spilled 38-40 VGPRs, its copy staging, in the K loop). Every t is the same exact integer
 // sum in the same group order, so acc is the same bits; the dense launch keeps the default form.
 template <bool SplitC = false>
 __device__ __forceinline__ void block_dot(const std::uint8_t* buf, unsigned wn, unsigned wm, unsigned l16, unsigned hi, float (&acc)[kTw][kTm][8]) {
@@ -645,20 +645,6 @@ __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsig
         }
     }
 }
-// Row copy of a row-major A4 image (enqueue_quantise_rows layout): dst row a = src row map[a] (codes, u, base), bit for
-// bit; a map entry past src.rows leaves dst row a unwritten. One wave per row, 16 B per lane.
-__global__ __launch_bounds__(256) void gather_rows_kernel(Act src, const std::uint32_t* __restrict__ map, Act dst) {
-    const unsigned row = blockIdx.x * 8U + (threadIdx.x >> 5U), lane = threadIdx.x & 31U;
-    if (row >= dst.rows) return;
-    const unsigned from = map[row];
-    if (from >= src.rows) return;
-    const unsigned in = dst.in, pieces = in / 32U, blocks = in / rot::kBlock;
-    const GI4* sc = (const GI4*)(src.codes + std::size_t(from) * (in / 2U));
-    I4* dc = reinterpret_cast<I4*>(dst.codes + std::size_t(row) * (in / 2U));
-    for (unsigned q = lane; q < pieces; q += 32U) dc[q] = sc[q];
-    for (unsigned q = lane; q < blocks; q += 32U) dst.u[std::size_t(row) * blocks + q] = src.u[std::size_t(from) * blocks + q];
-    if (lane == 0U) dst.base[row] = src.base[from];
-}
 }  // namespace detail
 
 // Host side (stream-ordered; callers check supported() and hipGetLastError()).
@@ -676,12 +662,6 @@ inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hi
 // The row-major image of the grouped launch (same values as enqueue_quantise; byte sizes act_*_bytes).
 inline void enqueue_quantise_rows(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
     enqueue_quantise_map2<detail::Ident, true>(x, nullptr, x_stride, a, s);
-}
-// dst row a = src row map[a] of a row-major image (same in; dst.rows rows): a grouped launch over dst reads contiguous rows
-// (map = nullptr) instead of gathering src rows; the values are the same bits.
-inline void enqueue_gather_rows(const Act& src, const std::uint32_t* map, const Act& dst, hipStream_t s) {
-    if (dst.rows == 0U) return;
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::gather_rows_kernel, dim3((dst.rows + 7U) / 8U), dim3(256), 0, s, src, map, dst);
 }
 // Requantisation from a weight source (Src::requantise(col, b, n, dst) -> step, see detail::requantise_kernel).
 template <class Src>

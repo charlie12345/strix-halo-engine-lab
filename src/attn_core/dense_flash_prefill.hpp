@@ -507,8 +507,13 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 maximum = m;
             }
             if constexpr (kLaneScores) {
-                // Tiles where no row of the wave moved its maximum: every factor is 1.0F and c * 1.0F is c
-                // (IEEE denormals, WMMA results are never signalling), so the rescale and its shuffles are skipped.
+                // Tiles where no row of the wave moved its maximum: every factor is exactly 1.0F (a NaN alpha votes
+                // for the rescale) and c * 1.0F is c bit for bit: finite c including subnormals (IEEE denormal mode),
+                // +-0, +-Inf, and a quiet NaN (gfx11 v_mul_f32 in IEEE mode returns the NaN operand quieted, sign and
+                // payload kept); an accumulator only holds WMMA / FMA results, never a signalling NaN. So the rescale
+                // and its shuffles are skipped. Native evidence against the incumbent kernel, the same output bytes
+                // and failure word: hip_dense_flash_bench cases xn / xo / xt (NaN payloads in V, an FP32 PV overflow
+                // followed by alpha 0 and tied maxima, subnormal products and signed zeros).
                 const bool rescale = __any(alpha != 1.0F);
                 float scale[8] = {};
                 if (rescale) {

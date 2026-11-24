@@ -101,11 +101,55 @@ template <class T> T* up(const std::vector<T>& h) {
     return d;
 }
 
+// Exceptional operand values (review r17: bit identity of the lane-score form against the incumbent kernel):
+//   nan       V holds NaN operands of several payloads, quiet and signalling encodings, both signs;
+//   overflow  the first key tile's V is the largest finite operand (the FP32 PV sum overflows to Inf), a later key
+//             dominates the scores (alpha underflows to 0: Inf * 0 = NaN accumulators) and the following tiles keep
+//             that maximum (alpha exactly 1 across the wave: the shortcut's case);
+//   tiny      V holds operands whose products are FP32 subnormals, and signed zeros.
+// Ordinary cases (none) must leave the failure word 0; exceptional cases report it for the cross-build comparison.
+enum class Special : unsigned { none, nan, overflow, tiny };
+
 struct Case {
     const char* name;
     unsigned D, heads, kv_heads, rows, p0, window;
     bool f16;
+    Special special = Special::none;
 };
+
+bool g_flag_failed = false;
+
+void apply_special(const Case& c, unsigned keys, unsigned KH, std::vector<std::uint16_t>& kfull,
+                   std::vector<std::uint16_t>& vrows) {
+    const unsigned D = c.D;
+    const auto v_at = [&](unsigned p, unsigned h, unsigned d) -> std::uint16_t& {
+        return vrows[(std::size_t(p) * KH + h) * D + d];
+    };
+    if (c.special == Special::nan) {
+        const std::uint16_t bf[5] = {0x7FC1U, 0x7F81U, 0xFFC5U, 0xFF8AU, 0x7FFFU};  // quiet, signalling, both signs
+        const std::uint16_t hf[5] = {0x7E01U, 0x7C01U, 0xFE05U, 0xFC0AU, 0x7FFFU};
+        for (unsigned p = 5U; p < keys; p += 97U)
+            for (unsigned h = 0; h < KH; ++h)
+                for (unsigned d = 3U; d < D; d += 7U) v_at(p, h, d) = (c.f16 ? hf : bf)[(p + d) % 5U];
+    } else if (c.special == Special::overflow) {
+        const std::uint16_t big = c.f16 ? std::uint16_t{0x7BFFU} : std::uint16_t{0x7F7FU};
+        const std::uint16_t nbig = static_cast<std::uint16_t>(big | 0x8000U);
+        for (unsigned p = 0; p < 16U && p < keys; ++p)
+            for (unsigned h = 0; h < KH; ++h)
+                for (unsigned d = 0; d < D; ++d) v_at(p, h, d) = d % 3U == 2U ? nbig : big;
+        const std::uint16_t dom = round_op(30.0F, c.f16);  // a dominating key at position 40
+        if (keys > 40U)
+            for (unsigned h = 0; h < KH; ++h)
+                for (unsigned d = 0; d < D; ++d) kfull[(std::size_t(40U) * KH + h) * D + d] = dom;
+    } else if (c.special == Special::tiny) {
+        for (unsigned p = 0; p < keys; ++p)
+            for (unsigned h = 0; h < KH; ++h)
+                for (unsigned d = 0; d < D; ++d)
+                    if ((p + 3U * d) % 5U == 0U)
+                        v_at(p, h, d) = (p + d) % 4U == 0U ? std::uint16_t{0x8000U}
+                                                           : static_cast<std::uint16_t>(1U + (p * 7U + d) % 127U);
+    }
+}
 
 template <class P> void run(const Case& c, unsigned reps) {
     const unsigned D = c.D, H = c.heads, KH = c.kv_heads;
@@ -118,6 +162,7 @@ template <class P> void run(const Case& c, unsigned reps) {
     for (auto& x : kfull) x = round_op(u(g), c.f16);
     std::vector<std::uint16_t> vrows(std::size_t(keys) * KH * D);
     for (auto& x : vrows) x = round_op(u(g), c.f16);
+    apply_special(c, keys, KH, kfull, vrows);
     for (unsigned p = 0; p < keys; ++p)
         for (unsigned h = 0; h < KH; ++h)
             for (unsigned d = 0; d < D; ++d) vt[std::size_t(h * D + d) * vstride + p] = vrows[(std::size_t(p) * KH + h) * D + d];
@@ -184,6 +229,10 @@ template <class P> void run(const Case& c, unsigned reps) {
     std::printf("case %-5s D %u heads %u/%u rows %u p0 %u window %u: median %.3f ms min %.3f max %.3f  %.2f TF/s  digest %016llx failure %u\n",
                 c.name, D, H, KH, c.rows, c.p0, c.window, double(med), double(ms.front()), double(ms.back()), work / (double(med) * 1e9),
                 static_cast<unsigned long long>(h), failure);
+    if (c.special == Special::none && failure != 0U) {
+        std::printf("FAIL flag case %s: failure %u on ordinary data\n", c.name, failure);
+        g_flag_failed = true;
+    }
     for (const void* p : {static_cast<const void*>(a.q), static_cast<const void*>(a.k), static_cast<const void*>(a.vt),
                           static_cast<const void*>(a.failure), static_cast<const void*>(out)})
         if (p) ok(hipFree(const_cast<void*>(p)), "free");
@@ -209,9 +258,34 @@ int main(int argc, char** argv) {
         if (want("ikf")) run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikf", 128U, 24U, 8U, 8192U, 0U, 0U, false}, reps);
         if (want("ibl")) run<Rel<128U, 3U>>({"ibl", 128U, 24U, 8U, 8192U, 0U, 1024U, false}, reps);
         if (want("ibf")) run<Rel<128U, 3U>>({"ibf", 128U, 24U, 8U, 8192U, 0U, 0U, false}, reps);
+        // One-term FP16 vision encoder forms (the FAST route's lane-score body; bidirectional: every row sees every key).
+        if (want("o80")) run<Classic<80U, 1U, 64U, tile::Operand::f16>>({"o80", 80U, 16U, 16U, 1024U, 4095U, 0U, true}, reps);
+        if (want("o64")) run<Classic<64U, 1U, 64U, tile::Operand::f16>>({"o64", 64U, 16U, 16U, 1024U, 4095U, 0U, true}, reps);
+        // Exceptional values on the lane-score forms (BF16 Inkling local / full / projected bias, FP16 one-term vision)
+        // and on the two-term vision comparison form.
+        using S = Special;
+        if (want("xn")) {
+            run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikl-n", 128U, 24U, 8U, 2048U, 0U, 1024U, false, S::nan}, reps);
+            run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikf-n", 128U, 24U, 8U, 2048U, 0U, 0U, false, S::nan}, reps);
+            run<Rel<128U, 3U>>({"ibf-n", 128U, 24U, 8U, 2048U, 0U, 0U, false, S::nan}, reps);
+            run<Classic<80U, 1U, 64U, tile::Operand::f16>>({"o80-n", 80U, 16U, 16U, 512U, 1023U, 0U, true, S::nan}, reps);
+            run<Classic2<80U>>({"v80-n", 80U, 16U, 16U, 512U, 1023U, 0U, true, S::nan}, reps);
+        }
+        if (want("xo")) {
+            run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikl-o", 128U, 24U, 8U, 2048U, 0U, 1024U, false, S::overflow}, reps);
+            run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikf-o", 128U, 24U, 8U, 2048U, 0U, 0U, false, S::overflow}, reps);
+            run<Rel<128U, 3U>>({"ibf-o", 128U, 24U, 8U, 2048U, 0U, 0U, false, S::overflow}, reps);
+            run<Classic<80U, 1U, 64U, tile::Operand::f16>>({"o80-o", 80U, 16U, 16U, 512U, 1023U, 0U, true, S::overflow}, reps);
+            run<Classic2<80U>>({"v80-o", 80U, 16U, 16U, 512U, 1023U, 0U, true, S::overflow}, reps);
+        }
+        if (want("xt")) {
+            run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikl-t", 128U, 24U, 8U, 2048U, 0U, 1024U, false, S::tiny}, reps);
+            run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikf-t", 128U, 24U, 8U, 2048U, 0U, 0U, false, S::tiny}, reps);
+            run<Classic<80U, 1U, 64U, tile::Operand::f16>>({"o80-t", 80U, 16U, 16U, 512U, 1023U, 0U, true, S::tiny}, reps);
+        }
     } catch (const std::exception& e) {
         std::printf("FAIL exception: %s\n", e.what());
         return 1;
     }
-    return 0;
+    return g_flag_failed ? 1 : 0;
 }

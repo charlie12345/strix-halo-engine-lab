@@ -79,6 +79,9 @@ struct Lever {
 template <class Row>
 inline unsigned value_column(const Row& lever, Name profile) {
     const auto column = static_cast<unsigned>(profile);
+    // Legacy adapters have only default/fast/quality columns and refuse TURBO.
+    // Reject absent columns before indexing, including calls through the shared ladder.
+    if (column >= lever.value.size()) throw std::invalid_argument("profile column is not available on this adapter");
     if (profile == Name::turbo && lever.value[column].empty()) return static_cast<unsigned>(Name::fast);
     return column;
 }

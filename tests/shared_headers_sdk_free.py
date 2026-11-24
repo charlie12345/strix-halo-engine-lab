@@ -94,6 +94,7 @@ NATIVE_HEADERS = {
     "src/core/pointwise.hpp",
     "src/core/q8_f16_staging.hpp",
     "src/core/residual_mix.hpp",
+    "src/core/residual_transition_hip.hpp",  # Only the HIP kernel and launcher.
     "src/core/resident_greedy.hpp",  # Native HIP/CUDA buffers, pinned replies and selector binding.
     "src/core/short_convolution.hpp",
     "src/core/tp_join.hpp",

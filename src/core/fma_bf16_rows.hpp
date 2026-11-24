@@ -9,6 +9,21 @@
 #include <algorithm>
 #include <limits>
 
+// HIP launch boundary: the row-owner body remains in the shared core header.
+namespace strix::core::controller_rms_rows {
+inline hipError_t enqueue(const Args& a, hipStream_t stream) {
+    const dim3 grid((a.rows + kRows - 1U) / kRows);
+    switch (a.rank / 16U) {
+    case 1U: detail::controller_rms_kernel<1U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 2U: detail::controller_rms_kernel<2U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 3U: detail::controller_rms_kernel<3U><<<grid, kThreads, 0, stream>>>(a); break;
+    case 4U: detail::controller_rms_kernel<4U><<<grid, kThreads, 0, stream>>>(a); break;
+    default: return hipErrorInvalidValue;
+    }
+    return hipGetLastError();
+}
+}  // namespace strix::core::controller_rms_rows
+
 namespace strix::core::fma_rows {
 
 // Small NK projections use the decode sweep. Wide projections stage RNE BF16

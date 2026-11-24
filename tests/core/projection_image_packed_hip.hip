@@ -113,6 +113,17 @@ int main(int argc, char** argv) {
     require(hipMemcpy(a, host_a.data(), host_a.size() * 4U, hipMemcpyHostToDevice), "a");
     auto* image = device<std::uint16_t>(host_a.size());
     bool ok = true;
+    {  // refused before a launch: an image over its own input (whole or partial) and a grid past the launch limit
+        auto* over = reinterpret_cast<std::uint16_t*>(a);
+        const bool refused =
+            fma_rows::enqueue_bf16_operand_image(a, 2048U, 2U, over, nullptr) == hipErrorInvalidValue &&
+            fma_rows::enqueue_bf16_operand_image(a, 2048U, 2U, over + 2048U, nullptr) == hipErrorInvalidValue &&
+            fma_rows::enqueue_bf16_operand_image(a + 8U, 2048U, 2U, over, nullptr) == hipErrorInvalidValue &&
+            fma_rows::enqueue_bf16_operand_image(a, 8192U, (1U << 30U) + 1U, image, nullptr) == hipErrorInvalidValue &&
+            hipGetLastError() == hipSuccess;
+        std::cout << "rejected_arguments " << (refused ? "PASS" : "FAIL") << '\n';
+        ok = ok && refused;
+    }
     for (const auto& c : cases) {
         std::vector<std::uint16_t*> weights;
         const unsigned ld = c.pitch != 0U ? c.pitch : c.K;

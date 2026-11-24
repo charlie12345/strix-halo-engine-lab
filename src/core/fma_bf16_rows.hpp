@@ -169,16 +169,26 @@ static __global__ __launch_bounds__(256) void bf16_operand_image_kernel(const fl
 }  // namespace detail
 
 // The BF16 operand image of contiguous FP32 rows ([rows][width] -> [rows][width] u16) for enqueue_bf16_image_rows,
-// which then stores the bits enqueue_bf16_rows stores on the FP32 rows. Both pointers 16-byte aligned, width % 8 == 0.
+// which then stores the bits enqueue_bf16_rows stores on the FP32 rows. Both pointers 16-byte aligned, width % 8 == 0,
+// the two byte ranges disjoint (blocks run in no order: an image over its own input would depend on the schedule) and
+// the grid within the launch limit; anything else is refused before a launch.
 inline hipError_t enqueue_bf16_operand_image(const float* input, unsigned width, unsigned rows, std::uint16_t* image,
                                              hipStream_t stream) {
     if (!input || !image || width % 8U != 0U || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
         reinterpret_cast<std::uintptr_t>(image) % 16U != 0U)
         return hipErrorInvalidValue;
-    const std::size_t groups = std::size_t{rows} * width / 8U;
+    const std::uint64_t values = std::uint64_t{rows} * width;  // both factors < 2^32: no wrap
+    const std::uint64_t groups = values / 8U;
     if (groups == 0U) return hipSuccess;
-    const auto blocks = static_cast<unsigned>((groups + 255U) / 256U);
-    detail::bf16_operand_image_kernel<<<blocks, 256, 0, stream>>>(input, image, groups);
+    const std::uint64_t blocks = (groups + 255U) / 256U;
+    if (blocks > std::uint64_t{std::numeric_limits<int>::max()} ||
+        values > std::uint64_t{std::numeric_limits<std::uintptr_t>::max() / 4U})
+        return hipErrorInvalidValue;
+    const auto in_lo = reinterpret_cast<std::uintptr_t>(input), out_lo = reinterpret_cast<std::uintptr_t>(image);
+    const auto in_bytes = static_cast<std::uintptr_t>(values) * 4U, out_bytes = static_cast<std::uintptr_t>(values) * 2U;
+    if (in_lo < out_lo + out_bytes && out_lo < in_lo + in_bytes) return hipErrorInvalidValue;
+    detail::bf16_operand_image_kernel<<<static_cast<unsigned>(blocks), 256, 0, stream>>>(input, image,
+                                                                                       static_cast<std::size_t>(groups));
     return hipGetLastError();
 }
 

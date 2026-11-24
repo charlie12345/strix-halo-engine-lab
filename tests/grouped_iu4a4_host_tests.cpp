@@ -1,9 +1,9 @@
-// Host invariants of the grouped rotated A4W4 expert class (moe_core/grouped_iu4a4.hpp):
+// Host invariants of the grouped rotated A4W4 expert class (moe_core/grouped_iu4a4_contract.hpp):
 //  1. iu4a4_rot::paired_column is a bijection of [0, 2 rows) and tiles 2 c / 2 c + 1 are gate / up of outputs 16 c ..;
 //  2. ExpertSource::value == the BF16 operand of the EXACT tile (PackedOperand::load_tile16 + decode_bf16), NVFP4 and
 //     MXFP8, contiguous and interleaved row order;
 //  3. a paired image column n == the plain image column paired_column(n) of the same matrix (codes and step).
-#include "moe_core/grouped_iu4a4.hpp"
+#include "moe_core/grouped_iu4a4_contract.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +15,9 @@ namespace {
 namespace gi = strix::moe_core::grouped_iu4a4;
 namespace rot = strix::core::iu4a4_rot;
 namespace packed = strix::weight::microscaled;
+
+static_assert(gi::image_code_bytes(128U, 32U) == 2048U);
+static_assert(gi::image_step_floats(128U, 32U) == 32U);
 
 int fails = 0;
 void expect(bool ok, const char* what) {

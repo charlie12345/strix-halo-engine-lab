@@ -8,6 +8,9 @@
 //   qw       Qwen3.5 27B wide-window form (dense_decode_flash.hpp <256, 6>): D 256, bf16, group 6 (12 waves)
 //   v80 v64  vision encoder form: D 80 / 64, f16 two-term (hi + lo) operands, 64 positions, 1024 rows from position
 //            4095 (each row sees 4096-5119 keys, the size of a bidirectional encoder row)
+//   ikl ikf  one-slice lane-score form: D 128, bf16, GQA group 3 (12 waves), 64 positions, 8192 rows from position 0,
+//            window 1024 (ikl) / full causal (ikf)
+//   ibl ibf  the same with a relative bias projected inside the flash (width 16, extent 1024)
 // Usage: strix-dense-flash-bench [REPS] [CASE]   (CASE: one name above; default all)
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
@@ -34,6 +37,9 @@ struct BArgs {
     const std::uint16_t *k, *vt;
     unsigned* failure;
     unsigned rows, p0, k0, window, vstride, heads, kv_heads;
+    const float* feat = nullptr;          // projected relative bias (Rel policies only): [row][head][16] FP32
+    const std::uint16_t* rw = nullptr;    // [16][extent] BF16
+    unsigned extent = 0U;
 };
 template <unsigned D, unsigned G, unsigned Pos, tile::Operand Op>
 struct Common {
@@ -62,6 +68,14 @@ struct Classic2 : Classic<D, 1U, 64U, tile::Operand::f16> {
     static constexpr unsigned kTerms = 2U;
     __device__ static const std::uint16_t* key_lo(const Args& a, unsigned p, unsigned h) { return a.k + (std::size_t(p - a.k0) * a.kv_heads + h) * D; }
     __device__ static const std::uint16_t* value_t_lo(const Args& a, unsigned h, unsigned d) { return a.vt + std::size_t(h * D + d) * a.vstride - a.k0; }
+};
+template <unsigned D, unsigned G>  // one-slice form with the relative bias projected in the flash
+struct Rel : Classic<D, G, 64U, tile::Operand::bf16> {
+    using Args = BArgs;
+    static constexpr unsigned kBiasWidth = 16U, kBiasMaxExtent = 1024U;
+    __device__ static strix::attn_core::RelativeBiasProjection bias_projection(const Args& a) {
+        return {a.feat, a.rw, a.heads, a.extent};
+    }
 };
 constexpr unsigned kN = 192U;  // MHA case: own columns per head before the shared 64
 
@@ -123,6 +137,15 @@ template <class P> void run(const Case& c, unsigned reps) {
     a.vstride = vstride;
     a.heads = H;
     a.kv_heads = KH;
+    if constexpr (dense::DenseProjectedBias<P>) {
+        std::vector<float> feat(std::size_t(c.rows) * H * 16U);
+        for (auto& x : feat) x = 0.25F * u(g);
+        std::vector<std::uint16_t> rw(16U * 1024U);
+        for (auto& x : rw) x = round_op(0.25F * u(g), false);
+        a.feat = up(feat);
+        a.rw = up(rw);
+        a.extent = 1024U;
+    }
     const std::size_t n = std::size_t(c.rows) * H * D;
     float* out = nullptr;
     ok(hipMalloc(&out, n * 4U), "malloc out");
@@ -182,6 +205,10 @@ int main(int argc, char** argv) {
         if (want("qw")) run<Classic<256U, 6U, 16U, tile::Operand::bf16>>({"qw", 256U, 24U, 4U, 2048U, 2048U, 0U, false}, reps);
         if (want("v80")) run<Classic2<80U>>({"v80", 80U, 16U, 16U, 1024U, 4095U, 0U, true}, reps);
         if (want("v64")) run<Classic2<64U>>({"v64", 64U, 16U, 16U, 1024U, 4095U, 0U, true}, reps);
+        if (want("ikl")) run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikl", 128U, 24U, 8U, 8192U, 0U, 1024U, false}, reps);
+        if (want("ikf")) run<Classic<128U, 3U, 64U, tile::Operand::bf16>>({"ikf", 128U, 24U, 8U, 8192U, 0U, 0U, false}, reps);
+        if (want("ibl")) run<Rel<128U, 3U>>({"ibl", 128U, 24U, 8U, 8192U, 0U, 1024U, false}, reps);
+        if (want("ibf")) run<Rel<128U, 3U>>({"ibf", 128U, 24U, 8U, 8192U, 0U, 0U, false}, reps);
     } catch (const std::exception& e) {
         std::printf("FAIL exception: %s\n", e.what());
         return 1;

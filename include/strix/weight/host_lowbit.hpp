@@ -114,9 +114,10 @@ inline int quantise(float w, float s) {
     return detail::quantise<Storage>(w, sd, 1.0 / sd);
 }
 
-// One 64-element group of finite inputs: the FP16 scale bits and the codes (an all-zero group gets scale 0, codes 0).
-// The FP32 error sums choose the clip step, so every target that compiles this header builds without floating-point
-// contraction (strix-weight: -ffp-contract=off, /fp:strict on MSVC); a contracting host build stores other bytes.
+namespace detail {
+// One 64-element group of finite inputs, with round-to-nearest installed by encode_block.
+// An all-zero group gets scale 0 and codes 0. The FP32 error sums choose the clip step, so callers must
+// build without FP contraction (strix-weight: -ffp-contract=off or /fp:strict).
 template <class Storage>
 inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& scale) {
     float pos = 0.0F, neg = 0.0F;
@@ -138,7 +139,7 @@ inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& sc
         const auto sd = static_cast<double>(s), inv = 1.0 / sd;
         float err = 0.0F;
         for (unsigned j = 0; j < Storage::group; ++j) {
-            const float d = w[j] - s * static_cast<float>(detail::quantise<Storage>(w[j], sd, inv));
+            const float d = w[j] - s * static_cast<float>(quantise<Storage>(w[j], sd, inv));
             err += d * d;
         }
         if (best < 0.0F || err < best) {
@@ -147,9 +148,10 @@ inline EncodeStatus::Code encode_group(const float* w, int* q, std::uint16_t& sc
         }
     }
     const auto sd = static_cast<double>(f16_bits_to_f32(scale)), inv = 1.0 / sd;
-    for (unsigned j = 0; j < Storage::group; ++j) q[j] = detail::quantise<Storage>(w[j], sd, inv);
+    for (unsigned j = 0; j < Storage::group; ++j) q[j] = quantise<Storage>(w[j], sd, inv);
     return EncodeStatus::ok;
 }
+}  // namespace detail
 
 // One superblock of Storage::elements floats -> Storage::bytes. On a non-finite input or a scale overflow the output
 // is left untouched and the status says which.
@@ -161,7 +163,7 @@ inline EncodeStatus encode_block(const float* w, std::uint8_t* out) {
     int q[Storage::elements];
     std::uint16_t scales[Storage::groups];
     for (unsigned g = 0; g < Storage::groups; ++g)
-        if (const auto code = encode_group<Storage>(w + g * Storage::group, q + g * Storage::group, scales[g]);
+        if (const auto code = detail::encode_group<Storage>(w + g * Storage::group, q + g * Storage::group, scales[g]);
             code != EncodeStatus::ok)
             return {code};
     std::memset(out, 0, Storage::bytes);

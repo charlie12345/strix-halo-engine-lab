@@ -123,7 +123,7 @@ void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_
             if (t + kDepth < stages) ring[p] = load_block<Storage>(wrow, t + kDepth);
 #pragma unroll
             for (unsigned gi = 0; gi < kGroups; ++gi) {
-                Float8 sum[RowTiles] = {};  // the group chain starts from +0
+                detail::LowBitGroup sum[RowTiles] = {};
 #pragma unroll
                 for (unsigned u = 0; u < 4U; ++u) {
                     // Unit u of group gi: code words 8 gi + 2 u and + 1 (8 elements each), 2-bit plane word 4 gi + u.
@@ -137,15 +137,13 @@ void lowbit_kernel(const float* a, unsigned rows, unsigned K, std::size_t w_row_
                     for (unsigned m = 0; m < RowTiles; ++m)
                         if (m < live_tiles) {
                             const Frag fa = detail::fragment(&lds.a[16U * m + c][32U * gi + 8U * u]);
-                            sum[m] = STRIX_HIP_WMMA_F16(__builtin_bit_cast(Half16, fa), __builtin_bit_cast(Half16, fb), sum[m]);
+                            sum[m].add(fa, fb);
                         }
                 }
                 const float d = lowbit_f16::scale_value(w.scale >> (16U * gi));
 #pragma unroll
                 for (unsigned m = 0; m < RowTiles; ++m)
-                    if (m < live_tiles)
-#pragma unroll
-                        for (unsigned j = 0; j < 8U; ++j) acc[m][j] = __builtin_fmaf(sum[m][j], d, acc[m][j]);
+                    if (m < live_tiles) sum[m].apply(d, acc[m]);
             }
         }
     }

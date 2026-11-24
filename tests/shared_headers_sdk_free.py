@@ -75,6 +75,7 @@ NATIVE_HEADERS = {
     "src/core/f16_dense_tall.hpp",
     "src/core/f16_dense_tall_hilo.hpp",
     "src/core/f16_tile_gemm.hpp",
+    "src/core/f16_tile_gemm_small.hpp",  # HIP launch for the small-M schedule.
     "src/core/fma_bf16_rows.hpp",
     "src/core/fma_rows.hpp",
     "src/core/gemv_rows.hpp",
@@ -87,6 +88,7 @@ NATIVE_HEADERS = {
     "src/core/hip_weight_uploader.hpp",
     "src/core/i4_shadow.hpp",
     "src/core/iu4a4_dense.hpp",
+    "src/core/lowbit_f16_staging.hpp",  # HIP FP16 staging and packed-code operands.
     "src/core/moe_i4_chain.hpp",
     "src/core/ordered_reduce.hpp",
     "src/core/pointwise.hpp",
@@ -108,6 +110,7 @@ NATIVE_HEADERS = {
     "src/moe_core/grouped_a8_f16.hpp",
     "src/moe_core/grouped_dispatch.hpp",
     "src/moe_core/grouped_integer_decode.hpp",
+    "src/moe_core/grouped_iu4a4.hpp",  # Native launch binding; grouped_iu4a4_contract.hpp and plan remain checked.
     "src/moe_core/grouped_microscaled.hpp",
     "src/moe_core/grouped_rows.hpp",
     "src/moe_core/microscaled_r1.hpp",

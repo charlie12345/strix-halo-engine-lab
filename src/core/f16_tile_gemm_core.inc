@@ -12,7 +12,8 @@ __device__ __forceinline__ void core(const Args& p, typename Sched::Storage& lds
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
 // kA16: A arrives as BF16 bits (Args::a16), loaded as is: the operand bits the FP32 staging (pack2<bf16>, RNE) makes of
 // the values the image was encoded from. No K16 tail form.
-template <bool kHalfTail, unsigned Capacity, bool kGated = false, bool kA16 = false>
+template <bool kHalfTail, unsigned Capacity, bool kGated = false, bool kA16 = false,
+          RoundStore Round = RoundStore::incumbent>
 __device__ __forceinline__ void core(const Args& p, Storage& lds, const Bf16ProjectionGroup<Capacity>& group,
                                      const ControllerRows& gate = {}) {
     static_assert(!(kA16 && (kHalfTail || kGated)));
@@ -251,7 +252,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
     // Group-scaled staging (low-bit codes): each kGroupK group is a WMMA chain from +0 into sum, then
     // acc = fma(sum, d, acc) with the column's group scale (the small-M schedule's arithmetic).
     constexpr bool kGroupScaled = detail::group_scaled<Staging>;
-    [[maybe_unused]] Float8 sum[2][4] = {};
+    [[maybe_unused]] detail::LowBitGroup sum[2][4] = {};
 #endif
     load(0U);
     for (unsigned k0 = 0; k0 < p.K; k0 += kBK) {
@@ -269,7 +270,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #pragma unroll
                 for (unsigned m = 0; m < 2U; ++m)
 #pragma unroll
-                    for (unsigned t = 0; t < 4U; ++t) sum[m][t] = Float8{};
+                    for (unsigned t = 0; t < 4U; ++t) sum[m][t] = {};
         }
 #endif
 #pragma unroll
@@ -305,8 +306,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_Q8)
                     {
                         if constexpr (kGroupScaled)
-                            sum[m][t] = STRIX_HIP_WMMA_F16(
-                                __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), sum[m][t]);
+                            sum[m][t].add(fa[m], fb[t]);
                         else
                             acc[m][t] = STRIX_HIP_WMMA_F16(
                                 __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
@@ -325,9 +325,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
                     const float d = Staging::scale(&lds.b[64U * wn + 16U * t + c][0]);
 #pragma unroll
                     for (unsigned m = 0; m < 2U; ++m)
-                        if (m < live_tiles)
-#pragma unroll
-                            for (unsigned j = 0; j < 8U; ++j) acc[m][t][j] = __builtin_fmaf(sum[m][t][j], d, acc[m][t][j]);
+                        if (m < live_tiles) sum[m][t].apply(d, acc[m][t]);
                 }
             }
         }
@@ -424,10 +422,9 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_Q8)
                     if (col < left) store.put(b, r, col, acc[m][t][j]);
 #else
-                    // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows).
+                    // Projections with round_bf16 store the BF16-rounded FP32 sum (same rounding as fma_rows; Round selects the function).
                     if (col < left)
-                        store.put(b, r, col, projection.round_bf16 ? strix::attn::group_indexer::bf16_round(acc[m][t][j])
-                                                                   : acc[m][t][j]);
+                        store.put(b, r, col, projection.round_bf16 ? round_stored<Round>(acc[m][t][j]) : acc[m][t][j]);
 #endif
                 }
 #else

@@ -10,6 +10,7 @@
 
 #include "strix/weight/host_lowbit.hpp"
 
+#include <cmath>
 #include <cstdint>
 
 #if defined(__HIPCC__)
@@ -17,6 +18,39 @@
 #endif
 
 namespace strix::core::lowbit_f16 {
+
+#if defined(__HIPCC__)
+#define STRIX_LOWBIT_GROUP_INLINE __device__ __forceinline__
+#else
+#define STRIX_LOWBIT_GROUP_INLINE inline
+#endif
+
+// One WMMA output fragment for a scale group. A schedule controls operand staging and
+// supplies the K16 units in order, then applies the scale once per lane to the running sum.
+template <class Accumulator, class Mma>
+struct GroupAccumulator {
+    Accumulator sum{};
+
+    template <class Fragment>
+    STRIX_LOWBIT_GROUP_INLINE void add(Fragment a, Fragment b) {
+        sum = Mma{}(a, b, sum);
+    }
+
+    STRIX_LOWBIT_GROUP_INLINE void apply(float scale, Accumulator& acc) const {
+#if defined(__HIPCC__)
+#pragma unroll
+#endif
+        for (unsigned i = 0; i < 8U; ++i) {
+#if defined(__HIPCC__)
+            acc[i] = __builtin_fmaf(sum[i], scale, acc[i]);
+#else
+            acc[i] = std::fma(sum[i], scale, acc[i]);
+#endif
+        }
+    }
+};
+
+#undef STRIX_LOWBIT_GROUP_INLINE
 
 // FP16 integer bias of a biased code: 1024 + 2^(bits - 1).
 template <class Storage> inline constexpr float kBias = Storage::high_bytes == 0U ? 1032.0F : 1056.0F;

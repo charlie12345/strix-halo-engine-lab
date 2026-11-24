@@ -223,6 +223,11 @@ void classes() {
     check(std::strcmp(gw::identity(gw::Activations::nvfp4_mse_r2_gate_up), "nvfp4-mse-r2-gate-up@1") == 0 &&
               std::strcmp(gw::identity(gw::Activations::nvfp4_mse_r2), "nvfp4-mse-r2@1") == 0 &&
               std::strcmp(gw::identity(gw::Activations::nvfp4_mse_gate_up), "nvfp4-mse-gate-up@1") == 0, "r2 identities");
+    check(gw::w4a4_gate_up(gw::Activations::nvfp4_r2) && gw::w4a4_down(gw::Activations::nvfp4_r2) &&
+              gw::terms_gate_up(gw::Activations::nvfp4_r2) == 2U && gw::terms_down(gw::Activations::nvfp4_r2) == 2U &&
+              gw::scale_rule(gw::Activations::nvfp4_r2) == gw::ScaleRule::nearest &&
+              std::strcmp(gw::identity(gw::Activations::nvfp4_r2), "nvfp4-r2@1") == 0,
+          "nvfp4_r2: two nearest@1 terms on both projections");
     check(!gw::valid_terms(0U) && gw::valid_terms(1U) && gw::valid_terms(2U) && !gw::valid_terms(3U), "terms 1 or 2");
     alignas(256) static std::uint8_t buf[gw::image_layout(64, 2304, 2).bytes];
     static_assert(gw::image_layout(64, 2304, 1).bytes == gw::image_layout(64, 2304).bytes, "one term: unchanged layout");

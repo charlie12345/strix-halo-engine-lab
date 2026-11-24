@@ -42,22 +42,27 @@ inline constexpr unsigned kGroup = 16U;
 //                  down input one term (mse@1); both projections on the FP4 MMA. Two terms cost two FP4 passes of that
 //                  projection.
 //   nvfp4_mse_r2   both projection inputs as two NVFP4 terms (mse@1 each).
+//   nvfp4_r2       both projection inputs as two NVFP4 terms, scale rule nearest@1 for each term (no scale search).
 // Two terms: the image row holds [term 1 | term 2] (codes 2 x K/2 bytes, scales 2 x K/16, one row scale), and the projection
-// runs the K-concatenation [q1 | q2] against [W | W]: same instruction, same stored weights, 2 x K/128 pipeline stages.
-enum class Activations : std::uint8_t { bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up, nvfp4_mse_r2_gate_up, nvfp4_mse_r2 };
+// sums q1 W + q2 W in one K sweep (each stored weight fragment is loaded once and feeds both terms' MMAs): same instruction,
+// same stored weights, K/128 pipeline stages.
+enum class Activations : std::uint8_t { bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up, nvfp4_mse_r2_gate_up, nvfp4_mse_r2, nvfp4_r2 };
 using ScaleRule = nvfp4_act::ScaleRule;
 inline constexpr unsigned kMaxTerms = 2U;
 constexpr bool w4a4_gate_up(Activations a) { return a != Activations::bf16; }
 constexpr bool w4a4_down(Activations a) { return a != Activations::bf16 && a != Activations::nvfp4_mse_gate_up; }
-constexpr ScaleRule scale_rule(Activations a) { return a == Activations::nvfp4 ? ScaleRule::nearest : ScaleRule::mse; }
-constexpr unsigned terms_gate_up(Activations a) {
-    return a == Activations::nvfp4_mse_r2_gate_up || a == Activations::nvfp4_mse_r2 ? 2U : 1U;
+constexpr ScaleRule scale_rule(Activations a) {
+    return a == Activations::nvfp4 || a == Activations::nvfp4_r2 ? ScaleRule::nearest : ScaleRule::mse;
 }
-constexpr unsigned terms_down(Activations a) { return a == Activations::nvfp4_mse_r2 ? 2U : 1U; }
+constexpr unsigned terms_gate_up(Activations a) {
+    return a == Activations::nvfp4_mse_r2_gate_up || a == Activations::nvfp4_mse_r2 || a == Activations::nvfp4_r2 ? 2U : 1U;
+}
+constexpr unsigned terms_down(Activations a) { return a == Activations::nvfp4_mse_r2 || a == Activations::nvfp4_r2 ? 2U : 1U; }
 constexpr const char* identity(Activations a) {
     return a == Activations::bf16 ? "bf16" : a == Activations::nvfp4 ? "nvfp4-nearest@1"
          : a == Activations::nvfp4_mse ? "nvfp4-mse@1" : a == Activations::nvfp4_mse_gate_up ? "nvfp4-mse-gate-up@1"
-         : a == Activations::nvfp4_mse_r2_gate_up ? "nvfp4-mse-r2-gate-up@1" : "nvfp4-mse-r2@1";
+         : a == Activations::nvfp4_mse_r2_gate_up ? "nvfp4-mse-r2-gate-up@1" : a == Activations::nvfp4_mse_r2 ? "nvfp4-mse-r2@1"
+                                                                                                      : "nvfp4-r2@1";
 }
 
 // NVFP4 image of assignment rows (device addresses). Row a holds assignment a of the plan.

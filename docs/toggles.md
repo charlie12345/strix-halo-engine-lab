@@ -198,6 +198,7 @@ the shared tiled core (`src/core`) landed, with the same bits.
 | `STRIX_GLM_PF_SCORE_SEQ=1`, `STRIX_GLM_PF_SCORE_BLOCK=<1..8>` | glm | off, `1` | Quality harness (`STRIX_GLM_PF_SCORE_LAST`): one score file per prefill call, and rows per head call. Measurement only. |
 | `STRIX_GLM_PF_STREAMS=1` | glm | off | Single compute stream for the seqpar TP2 prefill schedule. Same bits; not faster in the first samples. |
 | `STRIX_MMX_MODEL_FORMAT=fast_i4` | minimax | `exl3` | Draft lossy prefill: each MoE layer is converted to INT4 during prefill in two reusable buffers (+3.6 GiB); decode stays on EXL3. See [MiniMax grouped prefill](minimax-grouped-prefill.md#draft-fast_i4). |
+| `STRIX_MM_IU4_LAYERS` | minimax | unset | Explicit absolute MoE layers for transient IU4 prefill, for example `38-59`. This selection overrides `STRIX_MMX_FAST_I4_EXL3_LAYERS`. `none` disables IU4. An explicit `STRIX_MMX_MODEL_FORMAT=exl3` takes precedence. |
 | `STRIX_DS41_PREFILL_LEASE=1`, `STRIX_DS41_ENGRAM_DEVICE_READY=1`, `STRIX_DS41_SEED_EARLY=1` | deepseek | off | Prefill structure options (lease-fenced exchange, per-layer Engram readiness, early draft seed). Same bits; no gain measured yet. |
 
 ### Debug only

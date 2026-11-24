@@ -103,7 +103,8 @@ void families() {
     const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1", {}, {},
                        strix::minimax::defaults::ladder_rows};  // the production engine (its incumbent grants)
     generic(mm, p::Name::turbo, none, r);
-    require(strix::minimax::defaults::profile_table.size() == 9, "minimax retains six base rows, the FAST router rows and explicit-only TP2 exchange row");
+    require(strix::minimax::defaults::profile_table.size() == 10,
+            "minimax: five base rows, the IU4 format / layer set / A8 rows, the FAST router rows and explicit-only TP2 exchange row");
     for (const char* lever : {"idx_wmma", "idx_wmma_layers", "router_wmma", "router_wmma_layers"}) {
         const auto* e = find(r, lever);
         // turbo cell empty or the builtin (router_wmma: "0", so turbo does not inherit its fast cell)
@@ -114,7 +115,9 @@ void families() {
     }
     require(find(r, "msa_flash")->status == p::Status::pending && find(r, "msa_flash_layers")->status == p::Status::pending,
             "minimax turbo flash waits for adapter admission/export");
-    require(find(r, "moe_invariant")->status == p::Status::pending, "minimax moe invariant pending");
+    require(find(r, "iu4_layers")->status == p::Status::pending && find(r, "iu4_layers")->value == "none",
+            "minimax IU4 layer set pending (TURBO candidate without a timing row)");
+    require(find(r, "model_format")->value == "exl3" && find(r, "iu4_a8")->value == "0", "minimax IU4 format rows explicit-only");
     generic(mm, p::Name::fast, none, r);
     // fast = the qualified bundle mm-fast-pf-v2: its two members' cells (the index rows stay explicit-only, above).
     require(find(r, "msa_flash")->status == p::Status::set && find(r, "msa_flash")->value == "1" &&

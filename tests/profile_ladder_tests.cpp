@@ -423,6 +423,49 @@ void incumbents(const char* golden, bool write) {
     for (std::size_t i = 0; i < before.size() && i < now.size(); ++i)
         require(before[i] == now[i], "selection moved: '" + before[i] + "' -> '" + now[i] + "'");
 }
+// MiniMax IU4 layer set: the TURBO cell is a candidate (no timing row: the builtin runs, also under --allow-pending);
+// an explicit positive layer set reaches the prefill identity; the legacy format keeps its layers 38-59.
+void minimax_i4_binding() {
+    namespace mm = strix::minimax::defaults;
+    p::Inputs in;
+    in.profile = p::Name::turbo;
+    in.allow_pending = true;
+    in.regime = {p::Phase::prefill, 8192, 1, "gfx1151"};
+    in.env = [](const char*) -> const char* { return nullptr; };
+    const auto r = p::resolve(mm::profile_engine(), in);
+    const auto* layers = r.find("iu4_layers");
+    require(layers && layers->lever->runnable[3], "MiniMax IU4 mask has a runnable TURBO binding");
+    require(layers && layers->value == "none", "MiniMax IU4 remains off in the unmeasured regime");
+    const auto explicit_layers = [](const char* k) -> const char* {
+        return std::string_view(k) == "STRIX_MM_IU4_LAYERS" ? "43-59" : nullptr;
+    };
+    require(mm::prefill_identity(explicit_layers).find("moe_prefill_format=fast_i4:layers=43-59") != std::string::npos,
+            "an explicit MiniMax IU4 mask reaches the execution identity");
+    const auto run = [](const std::map<std::string, std::string>& env) {
+        return mm::prefill_policy([&](const char* k) -> const char* {
+            const auto it = env.find(k);
+            return it == env.end() ? nullptr : it->second.c_str();
+        });
+    };
+    const auto legacy = run({{"STRIX_MMX_MODEL_FORMAT", "fast_i4"}});
+    require(legacy.fast_i4 && legacy.iu4_layers.count() == 22 && !legacy.iu4_layers.test(37) && legacy.iu4_layers.test(38),
+            "MiniMax legacy IU4 mask retains layers 38-59");
+    require(mm::prefill_identity([](const char* k) -> const char* {
+                return std::string_view(k) == "STRIX_MMX_MODEL_FORMAT" ? "fast_i4" : nullptr;
+            }).find("moe_prefill_format=fast_i4") != std::string::npos,
+            "the legacy format keeps its identity");
+    const auto selected = run({{"STRIX_MMX_MODEL_FORMAT", "fast_i4"}, {"STRIX_MMX_FAST_I4_EXL3_LAYERS", "none"},
+                               {"STRIX_MM_IU4_LAYERS", "43,58-59"}});
+    require(selected.fast_i4 && selected.iu4_layers.count() == 3 && selected.iu4_layers.test(43) && selected.iu4_layers.test(59),
+            "MiniMax explicit positive mask overrides the legacy exclusion mask");
+    const auto off = run({{"STRIX_MMX_MODEL_FORMAT", "exl3"}, {"STRIX_MM_IU4_LAYERS", "38-59"}});
+    require(!off.fast_i4 && off.iu4_layers.count() == 0, "MiniMax explicit EXL3 refuses an IU4 mask");
+    require(!run({{"STRIX_MM_IU4_LAYERS", "none"}}).fast_i4, "an empty explicit mask leaves EXL3 selected");
+    require(!run({{"STRIX_MMX_MODEL_FORMAT", "fast_i4"}, {"STRIX_MM_IU4_LAYERS", "none"}}).fast_i4,
+            "an empty explicit mask also disables the legacy IU4 format");
+    require(!run({}).fast_i4 && run({}).iu4_layers.count() == 0, "no setting: EXL3");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -434,6 +477,7 @@ int main(int argc, char** argv) {
     incumbents(argv[2], false);
     verdicts();
     defects();
+    minimax_i4_binding();
     custom_adapters();
     cuda_cli_server();
     namespace q = strix::qwen;

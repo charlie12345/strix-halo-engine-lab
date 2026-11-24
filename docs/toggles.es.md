@@ -193,6 +193,7 @@ llegar el núcleo en mosaico compartido (`src/core`), con los mismos bits.
 | `STRIX_GLM_PF_SCORE_SEQ=1`, `STRIX_GLM_PF_SCORE_BLOCK=<1..8>` | glm | off, `1` | Arnés de calidad (`STRIX_GLM_PF_SCORE_LAST`): un fichero de puntuación por llamada de prefill y filas por llamada de la cabeza. Solo medición. |
 | `STRIX_GLM_PF_STREAMS=1` | glm | off | Un solo stream de cómputo para el prefill seqpar TP2. Mismos bits; no fue más rápido en las primeras muestras. |
 | `STRIX_MMX_MODEL_FORMAT=fast_i4` | minimax | `exl3` | Prefill borrador con pérdida: cada capa MoE se convierte a INT4 durante el prefill en dos buffers reutilizables (+3,6 GiB); el decode sigue en EXL3. Ver [prefill agrupado de MiniMax](minimax-grouped-prefill.md#draft-fast_i4). |
+| `STRIX_MM_IU4_LAYERS` | minimax | sin fijar | Capas MoE absolutas para prefill IU4 temporal, por ejemplo `38-59`. Esta selección prevalece sobre `STRIX_MMX_FAST_I4_EXL3_LAYERS`. `none` desactiva IU4. Un `STRIX_MMX_MODEL_FORMAT=exl3` explícito tiene prioridad. |
 | `STRIX_DS41_PREFILL_LEASE=1`, `STRIX_DS41_ENGRAM_DEVICE_READY=1`, `STRIX_DS41_SEED_EARLY=1` | deepseek | off | Opciones de estructura del prefill (intercambio con lease, Engram listo por capa, semilla temprana del draft). Mismos bits; sin ganancia medida todavía. |
 
 ### Solo depuración

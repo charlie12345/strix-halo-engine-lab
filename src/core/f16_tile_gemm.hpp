@@ -88,8 +88,9 @@ inline bool fits(const Args& p) {
 // k at (k % 16) of each fragment, so all forms store the same bits.
 template <unsigned RowTiles = 2, unsigned WavesM = 4, unsigned StageK = kBK>
 struct TileSchedule {
-    static_assert((RowTiles == 2U || RowTiles == 4U) && (WavesM == 4U || WavesM == 8U) &&
-                  (StageK == 32U || StageK == 64U));
+    // 1-tile rows and 1..2 row waves serve decode-height expert tiles (grouped_microscaled::NarrowSchedule).
+    static_assert((RowTiles == 1U || RowTiles == 2U || RowTiles == 4U) &&
+                  (WavesM == 1U || WavesM == 2U || WavesM == 4U || WavesM == 8U) && (StageK == 32U || StageK == 64U));
     static constexpr unsigned kRowTiles = RowTiles, kWavesM = WavesM, kStageK = StageK;
     static constexpr unsigned kRows = 16U * RowTiles * WavesM, kThreads = 64U * WavesM, kUnits = StageK / 16U;
     static constexpr unsigned kPitch = StageK / 2U + 4U;  // dwords per LDS row: data + 4 pad
@@ -441,11 +442,19 @@ inline hipError_t gemm_bf16_projections_image_packed(const std::uint16_t* a16, u
     if (rows == 0U || !admits_packed_image_projections(K, group) || w_ld < K || w_ld % 8U != 0U)
         return hipErrorInvalidValue;
     unsigned outputs = 0U;
-    for (unsigned p = 0; p < group.count; ++p) outputs = std::max(outputs, group.projections[p].outputs);
+    for (unsigned p = 0; p < group.count; ++p) {
+        // Every weight row address (outputs x w_ld elements) stays representable.
+        if (group.projections[p].outputs > SIZE_MAX / sizeof(std::uint16_t) / w_ld) return hipErrorInvalidValue;
+        outputs = std::max(outputs, group.projections[p].outputs);
+    }
     using Binding = Bf16ImageProjections<Capacity>;
     const typename Binding::Args args{a16, w_ld, rows, K, group};
-    const unsigned slices = (rows + ImageProjectionSchedule::kRows - 1U) / ImageProjectionSchedule::kRows;
-    return gemm_packed_bf16<Binding, ImageProjectionSchedule>(args, K, outputs, group.count, stream, slices);
+    // Row slices in a wide type: the launch check below sees the true count, never a wrapped one.
+    const std::uint64_t slices =
+        (std::uint64_t{rows} + ImageProjectionSchedule::kRows - 1U) / ImageProjectionSchedule::kRows;
+    if (slices > 65535U) return hipErrorInvalidValue;
+    return gemm_packed_bf16<Binding, ImageProjectionSchedule>(args, K, outputs, group.count, stream,
+                                                              static_cast<unsigned>(slices));
 }
 
 inline dim3 grid(const Args& p) {

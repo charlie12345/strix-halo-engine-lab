@@ -79,14 +79,19 @@ struct ImageRoutePolicy {
     unsigned min_packed_columns{};
 };
 
-// Routes of the projections of one call on FP32 rows [rows][input_width] (routes.size() >= projections.size()):
-// packed = whole tiles within max_outputs, 16-byte aligned weights, a row pitch of whole 16-byte units no shorter than the row;
-// image = what image_admits(projection) accepts; fp32_rows otherwise. Returns false, every route fp32_rows, when the
-// call keeps its FP32 rows: below min_rows, K not a multiple of the stage, or fewer packed columns than min_packed_columns.
-template <class ImageAdmits>
+// Routes of the projections of one call on FP32 rows [rows][input_width] (routes.size() >= projections.size()).
+// The incumbent launches the call in groups of GroupMax consecutive projections; group_admits(group) tells whether
+// that launch runs the BF16 operand arithmetic the image routes keep (the WMMA tile). A group it refuses keeps every
+// projection on the FP32 rows, so its launch is the incumbent one. Inside an admitted group: packed = whole tiles
+// within max_outputs, 16-byte aligned weights, a row pitch of whole 16-byte units no shorter than the row and
+// outputs x pitch addressable; image = what image_admits(projection) accepts; fp32_rows otherwise. Returns false,
+// every route fp32_rows, when the call keeps its FP32 rows: below min_rows, K not a multiple of the stage, or fewer
+// packed columns than min_packed_columns.
+template <std::size_t GroupMax, class GroupAdmits, class ImageAdmits>
 bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, unsigned rows,
                        std::span<const Bf16RowProjection> projections, unsigned max_outputs,
-                       std::span<ImageRoute> routes, const ImageAdmits& image_admits) {
+                       std::span<ImageRoute> routes, const GroupAdmits& group_admits, const ImageAdmits& image_admits) {
+    static_assert(GroupMax > 0);
     if (routes.size() < projections.size()) return false;
     std::fill_n(routes.begin(), projections.size(), ImageRoute::fp32_rows);
     if (policy.k_step == 0U || policy.tile_columns == 0U || rows == 0U || rows < policy.min_rows || input_width == 0U ||
@@ -94,17 +99,23 @@ bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, uns
         return false;
     const auto natural = std::size_t{input_width} * sizeof(std::uint16_t);
     std::size_t packed_columns = 0;
-    for (std::size_t p = 0; p < projections.size(); ++p) {
-        const auto& projection = projections[p];
-        const auto pitch = projection.row_bytes != 0U ? projection.row_bytes : natural;
-        if (projection.weights && projection.output && projection.outputs != 0U && projection.outputs <= max_outputs &&
-            projection.outputs <= std::numeric_limits<std::size_t>::max() / sizeof(float) / rows &&
-            projection.outputs % policy.tile_columns == 0U && pitch >= natural && pitch % 16U == 0U &&
-            reinterpret_cast<std::uintptr_t>(projection.weights) % 16U == 0U) {
-            routes[p] = ImageRoute::packed;
-            packed_columns += projection.outputs;
-        } else if (image_admits(projection)) {
-            routes[p] = ImageRoute::image;
+    for (std::size_t first = 0; first < projections.size(); first += GroupMax) {
+        const auto group = projections.subspan(first, std::min(projections.size() - first, GroupMax));
+        if (!group_admits(group)) continue;
+        for (std::size_t p = first; p < first + group.size(); ++p) {
+            const auto& projection = projections[p];
+            const auto pitch = projection.row_bytes != 0U ? projection.row_bytes : natural;
+            if (projection.weights && projection.output && projection.outputs != 0U &&
+                projection.outputs <= max_outputs &&
+                projection.outputs <= std::numeric_limits<std::size_t>::max() / sizeof(float) / rows &&
+                projection.outputs % policy.tile_columns == 0U && pitch >= natural && pitch % 16U == 0U &&
+                projection.outputs <= std::numeric_limits<std::size_t>::max() / pitch &&
+                reinterpret_cast<std::uintptr_t>(projection.weights) % 16U == 0U) {
+                routes[p] = ImageRoute::packed;
+                packed_columns += projection.outputs;
+            } else if (image_admits(projection)) {
+                routes[p] = ImageRoute::image;
+            }
         }
     }
     if (packed_columns >= policy.min_packed_columns) return true;
@@ -113,7 +124,9 @@ bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, uns
 }
 
 // The launches of a routed call: for each route (packed, image, fp32_rows) the projections of that route in call order,
-// in runs of at most Limit that share the rounding class and the row pitch; launch(route, run).
+// in runs of at most Limit that share the rounding class and the row pitch; launch(route, run). An fp32_rows run stays
+// inside one incumbent group (Limit consecutive projections, as plan_image_routes groups them), so it never joins a
+// projection of a group the incumbent runs on the WMMA tile with one of a group it runs elsewhere.
 template <std::size_t Limit, class Status, class Launch>
 Status for_each_image_route_run(std::span<const Bf16RowProjection> projections, std::span<const ImageRoute> routes,
                                 unsigned input_width, Status success, const Launch& launch) {
@@ -122,7 +135,7 @@ Status for_each_image_route_run(std::span<const Bf16RowProjection> projections, 
     const auto pitch = [natural](const Bf16RowProjection& p) { return p.row_bytes != 0U ? p.row_bytes : natural; };
     for (const auto route : {ImageRoute::packed, ImageRoute::image, ImageRoute::fp32_rows}) {
         Bf16RowProjection run[Limit]{};
-        std::size_t count = 0;
+        std::size_t count = 0, group = 0;
         const auto flush = [&]() {
             const auto status = count == 0U ? success : launch(route, std::span<const Bf16RowProjection>(run, count));
             count = 0;
@@ -131,8 +144,10 @@ Status for_each_image_route_run(std::span<const Bf16RowProjection> projections, 
         for (std::size_t p = 0; p < projections.size(); ++p) {
             if (routes[p] != route) continue;
             if (count != 0U && (count == Limit || run[0].round_bf16 != projections[p].round_bf16 ||
-                                pitch(run[0]) != pitch(projections[p])))
+                                pitch(run[0]) != pitch(projections[p]) ||
+                                (route == ImageRoute::fp32_rows && p / Limit != group)))
                 if (const auto status = flush(); status != success) return status;
+            if (count == 0U) group = p / Limit;
             run[count++] = projections[p];
         }
         if (const auto status = flush(); status != success) return status;

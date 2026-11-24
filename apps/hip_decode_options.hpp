@@ -2398,6 +2398,7 @@ inline Options parse_options(
             if (value.empty() || value.starts_with("--"))
                 throw std::invalid_argument("dense Q6P32 pack requires a nonempty path");
             options.dense_q6p_pack_path = value;
+            options.product_profile_inputs.cli.emplace_back("dense_q6p_pack", "selected");
             continue;
         }
         if (argument == "--dense-trellis-pack" || argument.starts_with("--dense-trellis-pack=")) {
@@ -2406,6 +2407,7 @@ inline Options parse_options(
                 (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{}) : argument.substr(std::string_view("--dense-trellis-pack=").size());
             if (value.empty() || value.starts_with("--")) throw std::invalid_argument("dense trellis pack requires a nonempty path");
             options.dense_trellis_pack_path = value;
+            options.product_profile_inputs.cli.emplace_back("dense_trellis_pack", "selected");
             continue;
         }
         if (argument == "--teacher-logits-file" || argument.starts_with("--teacher-logits-file=")) {
@@ -2453,6 +2455,7 @@ inline Options parse_options(
                 throw std::invalid_argument("--numerical-profile requires a supported numerical recipe");
             options.numerical_profile = *parsed;
             options.numerical_profile_explicit = true;
+            options.product_profile_inputs.cli.emplace_back("decode_numerical_profile", value);
             continue;
         }
         if (argument == "--prefill-numerical-profile" || argument.starts_with("--prefill-numerical-profile=")) {

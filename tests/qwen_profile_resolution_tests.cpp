@@ -151,6 +151,47 @@ void defaults_matrix() {
     }
     strix::qpf2k::baseline=saved;
 }
+// Registered native controls (decode numerical recipe, GSQ pack, MoE prefill schedules, dense packs) and the TURBO
+// candidates without a speed row change no resolved value: every tier, with or without --allow-pending, runs the
+// builtin until a ladder row shows the TURBO cell faster than FAST in the regime.
+void registered_controls_resolve_builtin() {
+    const char* registered[] = {"decode_numerical_profile", "gsq_expert_pack", "hc_output_wmma", "moe_small", "moe_tile64",
+        "moe_direct_b", "moe_tiers", "moe_down_lds_epi", "moe_route_ctrl", "gsq_prefill_f16", "dense_q6p_pack",
+        "dense_trellis_pack"};
+    for (const char* key : registered) {
+        const pr::Lever* row = nullptr;
+        for (const auto& lever : pr::levers()) if (lever.name == key) row = &lever;
+        check(row != nullptr, "registered control has a profile row");
+        check(row->value[0].empty() && row->value[1].empty(), "registered control sets no exact or fast cell");
+    }
+    for (const bool allow : {false, true}) {
+        Env env;
+        if (allow) env["STRIX_QWEN_PROFILE_ALLOW_PENDING"] = "1";
+        for (const auto tier : {pr::Name::standard, pr::Name::fast, pr::Name::turbo}) {
+            pr::Inputs input{{}, lookup(env), false};
+            input.ladder = pr::ladder_rows;
+            input.regime = {strix::profile::Phase::prefill, 8192, 1, "gfx1151"};
+            const auto r = pr::resolve(tier, input);
+            for (const char* key : registered) {
+                const auto* entry = r.find(key);
+                check(!entry || !strix::profile::applied(entry->status) || entry->value == entry->lever->builtin,
+                    "a registered control without a speed row keeps its builtin");
+            }
+            if (const auto* prune = r.find("moe_route_prune"))
+                check(!strix::profile::applied(prune->status) || prune->value == "off", "unmeasured prune candidate stays off");
+        }
+    }
+    const pr::Lever* recipe = nullptr;
+    for (const auto& lever : pr::levers()) if (lever.name == "decode_numerical_profile") recipe = &lever;
+    check(recipe && recipe->value[3].empty() && strix::parse_decode_numerical_profile(recipe->builtin).has_value(),
+          "the decode recipe row is explicit-only and its builtin names a parsed recipe");
+    // An explicit recipe resolves as set on the command line (the option parser records it in the resolution).
+    constexpr const char* a8 = "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1";
+    check(strix::parse_decode_numerical_profile(a8).has_value(), "the explicit recipe parses");
+    pr::Inputs explicit_input{{{"decode_numerical_profile", a8}}, {}, false};
+    const auto r = pr::resolve(pr::Name::standard, explicit_input);
+    check(r.find("decode_numerical_profile")->status == pr::Status::explicit_cli, "an explicit recipe stays explicit");
+}
 void pending_weights_inspection() {
     const auto o = options({"decoder", "model.gguf", "1", "--profile", "turbo", "--turbo-weights", "converted",
                             "--print-effective-config"});
@@ -256,6 +297,7 @@ void common_adapters() {
 int main(int argc,char** argv) try {
     emit=argc==2 && std::string_view(argv[1])=="--fixtures";
     pending_weights_inspection();
+    registered_controls_resolve_builtin();
     product_matrix(); admission_matrix(); defaults_matrix(); config_matrix(); identities();
 #ifndef STRIX_STEP1_ORIGINAL
     common_adapters();

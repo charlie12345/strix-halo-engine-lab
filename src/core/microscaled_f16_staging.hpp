@@ -8,16 +8,16 @@
 //   MXFP8: operand = E4M3 value x 2^-8 (exact in FP16, small values as FP16 subnormals). Compensate in the scale
 //   when it fits in FP32, otherwise compensate in the group partial and use the unshifted E8M0 scale.
 // Malformed scales follow PackedOperand::decode_scale: an NVFP4 scale byte above 0x7e and the E8M0 byte 0xff give NaN.
-// MXFP8 NaN codes (0x7f / 0xff) are not reproduced (finite operand); the load-time row check rejects them.
+// Reserved MXFP8 weight codes follow the packed E4M3 decoder and stage as signed quiet NaNs.
 #include "strix/weight/formats/microscaled.hpp"
 
 #include <cstddef>
 #include <cstdint>
 
 #if defined(__HIPCC__)
-#define STRIX_SMALL_SCALE_HD __host__ __device__
+#define STRIX_MICROSCALED_F16_HD __host__ __device__
 #else
-#define STRIX_SMALL_SCALE_HD
+#define STRIX_MICROSCALED_F16_HD
 #endif
 
 namespace strix::core::microscaled_f16 {
@@ -27,14 +27,23 @@ struct Mxfp8GroupScale {
     float partial_multiplier;
 };
 
-STRIX_SMALL_SCALE_HD inline Mxfp8GroupScale mxfp8_group_scale(std::uint8_t byte) {
+STRIX_MICROSCALED_F16_HD inline Mxfp8GroupScale mxfp8_group_scale(std::uint8_t byte) {
     namespace sf = strix::weight::scalar_float;
     if (byte <= 246U) return {sf::u2f((std::uint32_t{byte} + 8U) << 23U), 1.0F};
     return {sf::e8m0(byte), 256.0F};
 }
 
+// Each E4M3 byte is in the high byte of its FP16 lane after the permutation.
+STRIX_MICROSCALED_F16_HD inline std::uint32_t e4m3_f16_pair(std::uint32_t x) {
+    using weight::scalar_float::e4m3_is_nan;
+    const std::uint32_t magnitude = (x >> 1U) & 0x3F803F80U;
+    const auto lo = e4m3_is_nan(static_cast<std::uint8_t>(x >> 8U)) ? 0x00007E00U : (magnitude & 0x0000FFFFU);
+    const auto hi = e4m3_is_nan(static_cast<std::uint8_t>(x >> 24U)) ? 0x7E000000U : (magnitude & 0xFFFF0000U);
+    return (x & 0x80008000U) | lo | hi;
+}
+
 }  // namespace strix::core::microscaled_f16
-#undef STRIX_SMALL_SCALE_HD
+#undef STRIX_MICROSCALED_F16_HD
 
 #if defined(__HIPCC__)
 #include "core/lowbit_f16_staging.hpp"
@@ -68,14 +77,13 @@ __device__ __forceinline__ void e2m1_pairs(std::uint32_t w, std::uint32_t* out) 
     }
 }
 
-// FP16 pairs of the 4 E4M3 codes of one word, each scaled by 2^-8: the 7 magnitude bits shift into bits 7..13 (the E4M3
-// exponent becomes the FP16 exponent field, so subnormals stay exact), the sign into bit 15.
+// FP16 pairs of the 4 E4M3 codes of one word, each finite value scaled exactly by 2^-8.
 __device__ __forceinline__ void e4m3_pairs(std::uint32_t w, std::uint32_t* out) {
 #pragma unroll
     for (unsigned j = 0; j < 2U; ++j) {
         // [0, byte 2 j, 0, byte 2 j + 1]
         const std::uint32_t x = __builtin_amdgcn_perm(0U, w, ((2U * j + 1U) << 24U) | 0x000C0000U | ((2U * j) << 8U) | 0x0CU);
-        out[j] = (x & 0x80008000U) | ((x >> 1U) & 0x3F803F80U);
+        out[j] = e4m3_f16_pair(x);
     }
 }
 
@@ -129,7 +137,7 @@ struct Operand {
     __device__ __forceinline__ static auto scale(const Words<Groups>& w, unsigned gi) {
         const auto byte = static_cast<std::uint8_t>(w.scale[gi / 4U] >> (8U * (gi % 4U)));
         if constexpr (kNvfp4) {
-            // E4M3 scale x 2^-8 as FP16 bits (the shift of e4m3_pairs), widened exactly and scaled back by 2^8.
+            // E4M3 scale x 2^-8 as FP16 bits, widened exactly and scaled back by 2^8.
             const float value = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(byte << 7U)));
             return byte <= 0x7EU ? value * 256.0F : __builtin_bit_cast(float, 0x7FC00000U);
         } else {

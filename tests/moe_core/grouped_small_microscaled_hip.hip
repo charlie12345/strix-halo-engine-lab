@@ -1,6 +1,6 @@
 // No-model fixture of the FAST small-M form of the grouped microscaled tile (grouped_microscaled::Form::small_f16) at the
 // Inkling 2 Mini expert shapes (gate_up 2304 x 2304 interleaved halves, down 2304 x 1152; 128 experts, top 8), NVFP4 and
-// MXFP8. Every output buffer is seeded with NaN bytes and every checked output must be finite. Checks: (1) every output
+// MXFP8. Finite-data checks seed output buffers with NaN bytes and require finite outputs. Checks: (1) every output
 // of a routed 8-row visit against a double reference of the decoded weights and the BF16 inputs (normalised by
 // sum |x w|), for the small form and the incumbent BF16 tile; (2) tile launches of 1 / 16 / 17 / 32 / 33 / 48 / 64 rows:
 // the small form against the BF16 tile, and EVERY row of every tile run alone (a one-row tile) gives the same bits as in
@@ -258,16 +258,20 @@ std::vector<float> edge_projection(const Device& d, const grouped::TileRows& til
     return out;
 }
 
-bool scale_range_check(const Device& d) {
+bool mxfp8_edge_check(const Device& d) {
     constexpr unsigned k = 128U, n = 128U;
     const std::vector<unsigned> bytes{246U, 247U, 254U, 255U};
+    constexpr unsigned positive_nan_col = 4U, negative_nan_col = 5U;
     std::vector<std::uint8_t> codes(k * n), scales(k * n / 32U, 127U);
     for (unsigned c = 0; c < bytes.size(); ++c) {
         codes[c * k] = 0x38U;  // E4M3 1
         scales[c * (k / 32U)] = static_cast<std::uint8_t>(bytes[c]);
     }
+    // Unit scales isolate the two reserved codes, in opposite halves of an FP16 pair.
+    codes[positive_nan_col * k] = 0x7FU;
+    codes[negative_nan_col * k + 1U] = 0xFFU;
     std::vector<std::uint16_t> input(2U * k, 0U);
-    input[0] = bf16(1.0F);  // second row is the all-zero dot
+    input[0] = input[1] = bf16(1.0F);  // one unit contribution per column; second row is all zero
     require_hip(hipMemcpy(d.gu_in, input.data(), input.size() * sizeof(input[0]), hipMemcpyHostToDevice), "scale input");
     auto* device_codes = device_copy(codes);
     auto* device_scales = device_copy(scales);
@@ -286,6 +290,13 @@ bool scale_range_check(const Device& d) {
         if (!matches) {
             std::cerr << "MXFP8 scale " << bytes[c] << ": small " << out[c] << ", " << out[n + c]
                       << " incumbent " << ref[c] << ", " << ref[n + c] << '\n';
+            ok = false;
+        }
+    }
+    for (unsigned c : {positive_nan_col, negative_nan_col}) {
+        if (!std::isnan(out[c]) || !std::isnan(out[n + c]) || !std::isnan(ref[c]) || !std::isnan(ref[n + c])) {
+            std::cerr << "MXFP8 reserved weight code " << (c == positive_nan_col ? "0x7f" : "0xff")
+                      << ": small " << out[c] << ", " << out[n + c] << ", incumbent " << ref[c] << ", " << ref[n + c] << '\n';
             ok = false;
         }
     }
@@ -317,6 +328,7 @@ bool activation_range_check(const Device& d) {
     }
     input[k] = bf16(65536.0F);
     input[16U * k] = bf16(-65536.0F);
+    input[31U * k + k - 1U] = bf16(-65536.0F);
     input[32U * k + k - 1U] = bf16(65536.0F);
     require_hip(hipMemcpy(d.gu_in, input.data(), input.size() * sizeof(input[0]), hipMemcpyHostToDevice), "range input");
     auto* device_codes = device_copy(codes);
@@ -330,7 +342,7 @@ bool activation_range_check(const Device& d) {
         const auto ref = edge_projection<F>(d, tile, grouped::Form::bf16_tile, indices);
         for (unsigned r = 0; r < rows; ++r) {
             const unsigned source = indices ? reverse[r] : r;
-            const bool outside = source == 1U || source == 16U || source == 32U;
+            const bool outside = source == 1U || source == 16U || source == 31U || source == 32U;
             const float expected = widen(input[source * k]) + widen(input[(source + 1U) * k - 1U]);
             if (out[r * n] != expected ||
                 (outside ? std::memcmp(out.data() + r * n, ref.data() + r * n, n * sizeof(float)) != 0
@@ -795,11 +807,11 @@ int main(int argc, char** argv) {
     const auto route = make_route_device();
     bool ok = true;
     if (!bench_only) {
-        const bool mxfp8_scales = scale_range_check(dev);
+        const bool mxfp8_edges = mxfp8_edge_check(dev);
         const bool nvfp4_activations = activation_range_check<Format::nvfp4>(dev);
         const bool mxfp8_activations = activation_range_check<Format::mxfp8>(dev);
-        ok = mxfp8_scales && nvfp4_activations && mxfp8_activations;
-        std::cout << "small-form scale and activation edges: " << (ok ? "PASS" : "FAIL") << '\n';
+        ok = mxfp8_edges && nvfp4_activations && mxfp8_activations;
+        std::cout << "small-form weight code, scale and activation edges: " << (ok ? "PASS" : "FAIL") << '\n';
     }
     {
         auto nv = make_format(Format::nvfp4, rng);

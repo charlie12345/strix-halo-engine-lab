@@ -2,6 +2,7 @@
 #include "core/microscaled_f16_staging.hpp"
 #include "inkling2/inkling2_mini_config.hpp"
 #include "moe_core/grouped_dispatch.hpp"
+#include "strix/weight/host_lowbit.hpp"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,28 @@ namespace model = strix::inkling2;
 namespace packed = strix::weight::microscaled;
 using Small = tile::TileShape<native::kDecodeMBlocks, tile::kDecodeOutputs>;
 using Wide = tile::TileShape<native::kTileMBlocks, tile::kTileOutputs>;
+
+bool small_mxfp8_weight_codes() {
+    using strix::core::microscaled_f16::e4m3_f16_pair;
+    namespace sf = strix::weight::scalar_float;
+    const auto matches = [](std::uint32_t code, std::uint16_t bits) {
+        const float expected = sf::e4m3(static_cast<std::uint8_t>(code)) / 256.0F;
+        const float actual = strix::weight::lowbit::f16_bits_to_f32(bits);
+        return std::isnan(expected) ? std::isnan(actual) && std::signbit(actual) == std::signbit(expected)
+                                    : sf::f2u(actual) == sf::f2u(expected);
+    };
+    for (std::uint32_t lo = 0; lo <= 255U; ++lo) {
+        for (std::uint32_t hi = 0; hi <= 255U; ++hi) {
+            const auto pair = e4m3_f16_pair((lo << 8U) | (hi << 24U));
+            if (!matches(lo, static_cast<std::uint16_t>(pair)) ||
+                !matches(hi, static_cast<std::uint16_t>(pair >> 16U))) {
+                std::cerr << "MXFP8 weight codes " << lo << ", " << hi << ": wrong FP16 operands\n";
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 bool small_scale_range() {
     using strix::core::microscaled_f16::mxfp8_group_scale;
@@ -329,8 +352,10 @@ bool small_scale_admission() {
 }  // namespace
 
 int main() {
+    const bool weight_codes = small_mxfp8_weight_codes();
     const bool scale_range = small_scale_range(), activation_range = small_activation_range();
-    if (!scale_range || !activation_range) return 1;
+    if (!weight_codes || !scale_range || !activation_range) return 1;
+    std::cout << "small-form MXFP8 weight codes: PASS\n";
     std::cout << "small-form MXFP8 scale range and BF16 activation range: PASS\n";
     // Small form row plan: one form for any tile height (no row cap); 16-row blocks up to 16 rows, then 32-row blocks.
     {

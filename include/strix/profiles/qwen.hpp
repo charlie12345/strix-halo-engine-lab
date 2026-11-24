@@ -168,8 +168,12 @@ inline std::string marker_key(const Lever& lever) { return "STRIX_QWEN_PROFILE_O
 inline std::string marker(Name profile, Status status, std::string_view value) {
     return std::string(name(profile)) + ":" + status_name(status) + ":" + std::string(value);
 }
-inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<const Lever> rows = levers()) {
+// `registered`: the ladder rows of `rows` (timing receipts and incumbent grants), always read; inputs.ladder adds rows.
+inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<const Lever> rows = levers(),
+                          std::span<const ::strix::profile::LadderRow> registered = ladder_rows) {
     Resolution out{profile, {}, {}, {}};
+    std::vector<::strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
+    ladder.insert(ladder.end(), registered.begin(), registered.end());
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     const bool preset = ::strix::profile::model_preset();
@@ -217,7 +221,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             if (entry.status == Status::set && wanted == lever.builtin) entry.status = Status::builtin;
         }
         if (!cli && (!env || inherited))
-            ::strix::profile::apply_ladder(entry, inputs.ladder, profile, inputs.regime, admit);
+            ::strix::profile::apply_ladder(entry, ladder, profile, inputs.regime, admit);
         out.entries.push_back(std::move(entry));
     }
     return out;

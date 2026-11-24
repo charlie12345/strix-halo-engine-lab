@@ -18,7 +18,9 @@
 #include "cuda/models/glm/producer/profile.hpp"
 
 #include <cstdio>
+#include <fstream>
 #include <limits>
+#include <map>
 #include <span>
 #include <set>
 #include <string>
@@ -191,7 +193,8 @@ void walk(const p::Engine& registered) {
             const auto actual = resolve(engine, tier, regime);
             for (const auto& entry : actual.entries) {
                 if (entry.lever->kind == p::Kind::exact || (entry.value == entry.lever->builtin && !p::applied(entry.status))) continue;
-                require(entry.ladder.find("applies") != std::string::npos,
+                require(entry.ladder.find("applies") != std::string::npos ||
+                            entry.ladder.find("incumbent") != std::string::npos,
                         std::string(engine.tag) + "/" + std::string(entry.lever->name) + " applied without the ladder");
             }
         }
@@ -213,8 +216,10 @@ void cuda_cli_server() {
         request.inputs.regime = {p::Phase::prefill, context, 1, "fixture"};
         const auto cli = qo::resolve(request, qo::Entry::cli);
         const auto server = qo::resolve(request, qo::Entry::serve);
-        require(cli.choice.qsa_mma == (context == 4096U) && server.choice.qsa_mma == cli.choice.qsa_mma,
-                "Qwen CUDA CLI and server select the same measured or fallback kernel form");
+        // Inside the timing band the row decides; outside it the incumbent grant keeps the cell main selected.
+        require(cli.choice.qsa_mma && server.choice.qsa_mma == cli.choice.qsa_mma &&
+                    cli.resolution.json().find(context == 4096U ? "applies x1.020" : "incumbent") != std::string::npos,
+                "Qwen CUDA CLI and server select the same measured or incumbent kernel form");
         require(cli.resolution.json() == server.resolution.json() &&
                     server.resolution.json().find("strix-ladder/v1 qsa_mma") != std::string::npos,
                 "Qwen CUDA CLI and server emit the same decision");
@@ -262,10 +267,171 @@ void custom_adapters() {
     const auto gpu = glm::resolve(glm::Name::fast, false, glm::App::decode_service, {}, std::span(&candidate, 1));
     require(gpu.find(kLever)->value == "off", "GLM RTX cannot select a lossy unmeasured row");
 }
+
+// Incumbent preservation: every production entry point resolves FAST / TURBO (and refuses) exactly as before the
+// ladder rule. One line per resolved entry: "<entry point> <tier> <regime> <lever>=<value> s<status>". The golden
+// (tests/golden/profile_selections.txt) holds the lines of the tree before the ladder rule; a change that moves a
+// default selection rewrites it on purpose (strix-profile-ladder-tests REGISTRY GOLDEN --write) and says why.
+// --allow-pending is outside it: an unqualified cell needs a timing row since the ladder rule.
+template <class Res>
+void lines(std::vector<std::string>& out, const std::string& where, const Res& res) {
+    for (const auto& e : res.entries)
+        if (e.lever != nullptr)
+            out.push_back(where + " " + std::string(e.lever->name) + "=" + std::string(e.value) + " s" +
+                          std::to_string(static_cast<int>(e.status)));
+}
+template <class F>
+void guarded(std::vector<std::string>& out, const std::string& where, F&& f) {
+    try {
+        f();
+    } catch (const std::exception& error) {
+        out.push_back(where + " throws " + error.what());
+    }
+}
+
+std::vector<std::string> selections() {
+    namespace q = strix::qwen;
+    namespace qd = strix::qwen35;
+    namespace mm = strix::minimax::defaults;
+    const auto none = [](const char*) -> const char* { return nullptr; };
+    const auto tier = [](int t) { return std::string(t == 1 ? "fast" : "turbo"); };
+    std::vector<std::string> out;
+    const p::Engine engines[] = {
+        {"deepseek41-pair", "", strix::deepseek41::pair_defaults::profile_table, false, "ds41-turbo-v1", {},
+         strix::deepseek41::pair_defaults::ladder_rows},
+        {"deepseek41-rtx", "", strix::ds41::rtx::profile::shared_rows()},
+        strix::glm::rank_defaults::product_profile_engine,
+        mm::profile_engine(),
+        {"qwen35", "", qd::profile::table, false, qd::profile::kTurboVersion},
+        qd::hip_profile::engine(qd::hip_profile::App::decode),
+        qd::hip_profile::engine(qd::hip_profile::App::spec),
+        strix::hy4::profile::engine(),
+        strix::inkling2::kMiniProfile,
+    };
+    for (const auto& engine : engines)
+        for (int t : {1, 3}) {
+            const auto where = "A " + std::string(engine.tag) + " " + tier(t);
+            guarded(out, where, [&] {
+                p::Inputs in;
+                in.profile = static_cast<p::Name>(t);
+                in.env = none;
+                lines(out, where, p::resolve(engine, in));
+            });
+        }
+    for (int t : {1, 3})
+        for (std::uint64_t tokens : {0ULL, 1ULL, 4096ULL, 8192ULL, 8193ULL, 32768ULL}) {
+            const auto where = "B qwen-hip " + tier(t) + " ctx=" + std::to_string(tokens);
+            guarded(out, where, [&] {
+                q::profile::Inputs in;
+                in.env = none;
+                in.max_prompt_tokens = tokens;
+                in.regimes = q::profile::fast_regimes;
+                in.regime = {p::Phase::prefill, tokens, 1, "gfx1151"};
+                lines(out, where, q::profile::resolve(static_cast<p::Name>(t), in));
+            });
+            const auto cuda = "B qwen-cuda " + tier(t);
+            guarded(out, cuda, [&] {
+                q::profile::Inputs in;
+                in.env = none;
+                lines(out, cuda, q::cuda_profile::resolve(static_cast<p::Name>(t), in));
+            });
+        }
+    for (int t : {1, 3})
+        for (int w = 0; w < 3; ++w)
+            for (int r = 0; r < 2; ++r)
+                for (std::uint64_t tokens : {0ULL, 4096ULL, 8191ULL, 8192ULL, 32768ULL}) {
+                    const auto where = "C qwen35-cuda-dense " + tier(t) + " w" + std::to_string(w) + " r" +
+                                       std::to_string(r) + " ctx=" + std::to_string(tokens);
+                    guarded(out, where, [&] {
+                        qd::profile::Regime regime;
+                        regime.weights = static_cast<qd::profile::Weights>(w);
+                        regime.route = static_cast<qd::profile::Route>(r);
+                        regime.prompt_tokens = tokens;
+                        regime.device = "sm_120";
+                        regime.arch = "sm_120";
+                        lines(out, where, qd::profile::resolve(static_cast<p::Name>(t), regime, {})->resolution);
+                    });
+                }
+    for (int t : {1, 3}) {
+        namespace g = strix::gemma4::profile;
+        for (auto app : {g::App::engine, g::App::decode_bench, g::App::prefill_bench}) {
+            const auto where = "D gemma4 " + tier(t) + " app" + std::to_string(static_cast<unsigned>(app));
+            guarded(out, where, [&] { lines(out, where, g::resolve(static_cast<p::Name>(t), app, {})); });
+        }
+        namespace r = strix::ds41::rtx::profile;
+        for (auto app : {r::App::replica, r::App::prefill_service}) {
+            const auto where = "E ds41-rtx " + tier(t) + " app" + std::to_string(static_cast<unsigned>(app));
+            guarded(out, where, [&] { lines(out, where, r::resolve(static_cast<p::Name>(t), false, app, {})); });
+        }
+    }
+    {
+        namespace gl = strix::glm::rtxpf::profile;
+        guarded(out, "F glm-rtx fast", [&] {
+            lines(out, "F glm-rtx fast", gl::resolve(gl::Name::fast, false, gl::App::decode_service, {}));
+        });
+    }
+    for (int t : {1, 3})
+        for (int d = 0; d < 2; ++d)
+            for (int topo = 0; topo < 2; ++topo)
+                for (std::uint64_t tokens : {0ULL, 4096ULL, 8192ULL, 32768ULL}) {
+                    const auto where = "G hy4 " + tier(t) + " d" + std::to_string(d) + " t" + std::to_string(topo) +
+                                       " ctx=" + std::to_string(tokens);
+                    guarded(out, where, [&] {
+                        const strix::hy4::profile::Regime regime{static_cast<strix::hy4::profile::Device>(d),
+                                                                 static_cast<strix::hy4::profile::Topology>(topo), tokens};
+                        p::Inputs in;
+                        in.profile = static_cast<p::Name>(t);
+                        in.env = none;
+                        lines(out, where, strix::hy4::profile::resolve(regime, in)->resolution);
+                    });
+                }
+    for (const char* word : {"fast", "turbo"}) {
+        const auto where = std::string("H minimax ") + word;
+        guarded(out, where, [&] {
+            std::map<std::string, std::string> env{{mm::kProductProfileEnv, word}};
+            const auto lookup = [&env](const char* k) -> const char* {
+                const auto it = env.find(k);
+                return it == env.end() ? nullptr : it->second.c_str();
+            };
+            const auto policy = mm::prefill_policy(lookup);
+            out.push_back(where + " msa_flash=" + std::to_string(policy.msa_flash) + " router_wmma=" +
+                          std::to_string(int(policy.router_wmma)) + " bundle=" +
+                          std::to_string(int(mm::fast_profile_selects_bundle(lookup))) + " id=" +
+                          mm::prefill_identity(lookup));
+            lines(out, where, mm::profile_resolution(lookup));
+        });
+    }
+    return out;
+}
+
+void incumbents(const char* golden, bool write) {
+    const auto now = selections();
+    if (write) {
+        std::ofstream file(golden, std::ios::binary);
+        for (const auto& line : now) file << line << '\n';
+        return;
+    }
+    std::ifstream file(golden, std::ios::binary);
+    require(static_cast<bool>(file), std::string("golden selections not readable: ") + golden);
+    std::vector<std::string> before;
+    for (std::string line; std::getline(file, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) before.push_back(line);
+    }
+    require(before.size() == now.size(),
+            "selection count " + std::to_string(now.size()) + " != golden " + std::to_string(before.size()));
+    for (std::size_t i = 0; i < before.size() && i < now.size(); ++i)
+        require(before[i] == now[i], "selection moved: '" + before[i] + "' -> '" + now[i] + "'");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc < 3) return 2;
+    if (argc > 3 && std::string_view(argv[3]) == "--write") {
+        incumbents(argv[2], true);
+        return 0;
+    }
+    incumbents(argv[2], false);
     verdicts();
     defects();
     custom_adapters();
@@ -274,9 +440,10 @@ int main(int argc, char** argv) {
     namespace qd = strix::qwen35;
     namespace mm = strix::minimax::defaults;
     const p::Engine engines[] = {
-        {"qwen", "", q::profile::levers(), false, q::profile::kTurboVersion},
-        {"qwen-cuda", "", q::cuda_profile::levers(), false, q::profile::kTurboVersion},
-        {"deepseek41-pair", "", strix::deepseek41::pair_defaults::profile_table, false, "ds41-turbo-v1"},
+        {"qwen", "", q::profile::levers(), false, q::profile::kTurboVersion, {}, q::profile::ladder_rows},
+        {"qwen-cuda", "", q::cuda_profile::levers(), false, q::profile::kTurboVersion, {}, q::cuda_profile::ladder_rows},
+        {"deepseek41-pair", "", strix::deepseek41::pair_defaults::profile_table, false, "ds41-turbo-v1", {},
+         strix::deepseek41::pair_defaults::ladder_rows},
         {"deepseek41-rtx", "", strix::ds41::rtx::profile::shared_rows()},
         strix::glm::rank_defaults::product_profile_engine,
         mm::profile_engine(),

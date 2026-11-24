@@ -152,6 +152,17 @@ inline constexpr Lever table[] = {
      .source = "wide 128-row tile form of the tensor-core GSQ experts: exact by construction (bitwise the tile form); timing pending"},
 };
 inline std::span<const Lever> levers() { return table; }
+// Ladder rows of this table: incumbent grants of the cells the resolver ran (provisional) before the ladder rule.
+inline constexpr ::strix::profile::LadderRow ladder_rows[] = {
+    ::strix::profile::incumbent_cell("expert_fast", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("hc_mma", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("qsa_mma", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("expert_fast", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("expert_turbo", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("expert_turbo_rows", "512", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("hc_mma", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("qsa_mma", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+};
 
 // The RTX Qwen FAST bundle = the fast column above: its members are the rows the fast profile selects, qualified TOGETHER
 // by one logit gate (KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01 against the exact reference). The id names that set; any
@@ -347,7 +358,7 @@ inline ::strix::profile::ExecutionReceipt receipt(const Choice& c, std::string_v
     return out;
 }
 inline pr::Resolution resolve(pr::Name profile, const pr::Inputs& inputs = {}) {
-    auto out = pr::resolve(profile, inputs, levers());
+    auto out = pr::resolve(profile, inputs, levers(), ladder_rows);
     (void)choose(out);  // refuses malformed explicit values here, not at first use
     return out;
 }

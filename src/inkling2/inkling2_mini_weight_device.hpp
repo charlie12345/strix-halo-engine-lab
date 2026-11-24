@@ -18,13 +18,15 @@ namespace strix::inkling2 {
 // checkpoint SHA-256 (shared persistent stat-keyed cache: only the first FAST run of a checkpoint reads it whole).
 // Hash only for explicit qualification or when a default decision row can match.
 // Owns the strings; view() builds the scope on use, so copies and moves never leave a view dangling.
+// device_class: the architecture (the profile ladder's device class); weight_device_class: the weight-load key
+// (weight::device_class_key: architecture, compute units, memory), so a residency receipt never crosses cards.
 struct MiniWeightScope {
     weight::Backend backend{};
-    std::string device_class, compiler_id;
+    std::string device_class, weight_device_class, compiler_id;
     std::string_view regime;
     weight::Digest256 build{}, checkpoint{};
     [[nodiscard]] weight::WeightLoadScope view() const {
-        return {backend, device_class, compiler_id, regime, build, checkpoint};
+        return {backend, weight_device_class, compiler_id, regime, build, checkpoint};
     }
 };
 
@@ -54,8 +56,17 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     out.compiler_id = "cuda-" + std::to_string(CUDART_VERSION / 1000) + "." + std::to_string(CUDART_VERSION % 1000 / 10);
     const auto identity = weight::implementation_identity(core::kResidentQ8ArithmeticCuda);
 #endif
+    int units = 0;
+#if defined(__HIPCC__)
+    if (hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount, ordinal) != hipSuccess) return out;
+#else
+    if (cudaDeviceGetAttribute(&units, cudaDevAttrMultiProcessorCount, ordinal) != cudaSuccess) return out;
+#endif
     for (const auto& device : visible)
-        if (device.ordinal == ordinal) out.device_class = device.arch;
+        if (device.ordinal == ordinal) {
+            out.device_class = device.arch;
+            out.weight_device_class = weight::device_class_key(device.arch, units, device.memory_bytes);
+        }
     if (!needed) return out;
     out.regime = kMiniResidentRegime;
     out.build = identity;

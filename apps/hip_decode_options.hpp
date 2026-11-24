@@ -3825,7 +3825,6 @@ inline Options parse_options(
     options.product_profile_inputs.max_prompt_tokens =
         options.tokens.empty() ? options.context_tokens : static_cast<std::uint64_t>(options.tokens.size());
     options.product_profile_inputs.regimes = strix::qwen::profile::fast_regimes;
-    options.product_profile_inputs.ladder = strix::qwen::profile::ladder_rows;
     // A serving capacity is not a request's actual prompt length.
     options.product_profile_inputs.regime = {strix::profile::Phase::prefill,
         options.http_serve ? 0 : options.tokens.size(), 1, device_class};

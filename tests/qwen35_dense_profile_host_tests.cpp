@@ -137,11 +137,10 @@ int main() {
             Options want;
             want.turbo_weights = w;
             Options fast_want = want;
-            if (t != 0) fast_want.nvfp4_split = Split::fast;
+            fast_want.nvfp4_split = Split::fast;
             check(run(Name::fast, w, qp::Route::windows, t, {}, &text) == fast_want, "FAST windows: split_k fast only");
-            check(text.find(t == 0 ? "split_k = exact [pending]" :
-                           "split_k = fast [profile] fast (nvfp4-splitk-fast-v1, identity -skf1)") != std::string::npos,
-                  "FAST windows text names the effective split-K schedule");
+            check(text.find("split_k = fast [profile] fast (nvfp4-splitk-fast-v1, identity -skf1)") != std::string::npos,
+                  "FAST windows text names nvfp4-splitk-fast-v1 (incumbent grant where no timing row covers)");
             check(text.find("prefill_") == std::string::npos, "FAST windows text lists a lever not offered there");
             std::string off_text;
             check(run(Name::fast, w, qp::Route::windows, t, {{"split_k", "exact"}}, &off_text) == want, "--split-k exact under fast != EXACT");
@@ -323,9 +322,9 @@ int main() {
         qp::apply(options, *admitted);
         kv = qp::resolve_kv(Name::turbo, {}, regime.route, explicit_arms);
         qp::observe_kv(kv, *admitted);
-        check(admitted->find("split_k")->value == "exact" && admitted->find("drafter_window")->value == "15" &&
+        check(admitted->find("split_k")->value == "fast" && admitted->find("drafter_window")->value == "15" &&
                   options.decode_attn8 && options.dense_activation && kv.source == qp::kvp::Source::tier,
-              "matching receipts enable all four TURBO cells over the effective FAST fallback");
+              "matching receipts enable all four TURBO cells on top of FAST");
         check(resolve(regime, {{"decode_attn8", "off"}})->find("kv_fp8")->value == "native", "off switch disables the paired default");
         gains[1].max_lanes = 0;
         check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs both timing records");
@@ -333,6 +332,22 @@ int main() {
         gates[1].tier = Name::fast;
         check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs both TURBO records");
         gates[1].tier = Name::turbo;
+        {   // Equal spelling on the two rungs: a FAST-qualified reader ("on" in both columns) does not stand in for the
+            // TURBO reader's own timing; either half missing from the TURBO timing evidence keeps the pair off.
+            std::vector<qp::Qualified> reader(std::begin(qp::qualified), std::end(qp::qualified));
+            reader.push_back({regime.weights, regime.route,
+                              {"decode_attn8", "", 0, p::kNoPromptBound, "fixture FAST reader receipt"}});
+            const auto with_reader = [&] { return qp::resolve(Name::turbo, regime, {}, reader, evidence); };
+            check(with_reader()->find("kv_fp8")->value == "fp8", "both halves timed: the pair runs on TURBO");
+            for (const std::size_t half : {std::size_t{0}, std::size_t{1}}) {
+                gains[half].max_lanes = 0;
+                const auto run = with_reader();
+                check(run->find("kv_fp8")->value == "native",
+                      half == 0 ? "TURBO pair without the shadow timing row keeps the FP8 shadow off"
+                                : "TURBO pair without the reader timing row keeps the FP8 shadow off");
+                gains[half].max_lanes = 1;
+            }
+        }
         classes[1].rows = 799;
         check(resolve(regime)->find("dense_activation")->status == p::Status::pending, "all classes need final evidence");
         classes[1].rows = 800;

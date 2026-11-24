@@ -52,12 +52,17 @@ inline constexpr std::string_view kAllowEnv = "STRIX_QWEN35_HIP_PROFILE_ALLOW_PE
 inline constexpr sp::FastGate kFastGates[] = {
     {"a4w4_layers", "48-63", "docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast"},
 };
+// Ladder rows: incumbent grant of the qualified fast cell the resolver ran before the ladder rule.
+inline constexpr sp::LadderRow kLadderRows[] = {
+    sp::incumbent_cell("a4w4_layers", "48-63", sp::Name::fast,
+                       "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)"),
+};
 
 // One engine per app: each app owns only its own spelling of the window lever; both take the A4W4 layer table.
 inline sp::Engine engine(App app) {
     const std::span<const sp::Lever> rows(table);
     return {app == App::spec ? "qwen35-hip-spec" : "qwen35-hip-decode", kAllowEnv,
-            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U)};
+            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U), false, {}, {}, kLadderRows};
 }
 
 struct Result {

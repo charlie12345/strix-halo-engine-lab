@@ -2573,7 +2573,8 @@ if(BUILD_TESTING)
     target_link_libraries(strix-profile-ladder-tests PRIVATE strix_core strix_serve_json strix-weight strix_model_registry)
     target_include_directories(strix-profile-ladder-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     strix_target_warnings(strix-profile-ladder-tests)
-    add_test(NAME strix-profile-ladder-tests COMMAND strix-profile-ladder-tests "${CMAKE_CURRENT_SOURCE_DIR}/models/registry.toml")
+    add_test(NAME strix-profile-ladder-tests COMMAND strix-profile-ladder-tests "${CMAKE_CURRENT_SOURCE_DIR}/models/registry.toml"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/profile_selections.txt")
     set_tests_properties(strix-profile-ladder-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
 
     # FAST gate v2, engine side: shared MoE route record / replay / one-ulp null tap.

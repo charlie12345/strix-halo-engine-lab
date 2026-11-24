@@ -81,8 +81,10 @@ bool fast_cell_live(const p::Lever& l) {
 }
 
 // extra_fast: the engine's fast profile also selects a FAST bundle outside these rows (checked by the caller).
-void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extra_fast = false) {
-    const p::Engine engine{tag, "", rows};
+// `ladder`: the engine's ladder rows (incumbent grants keep the cells that ran before the ladder rule).
+void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extra_fast = false,
+                 std::span<const p::LadderRow> ladder = {}) {
+    const p::Engine engine{tag, "", rows, false, {}, {}, ladder};
     const auto exact = run(engine, p::Name::standard);
     const auto fast = run(engine, p::Name::fast);
     bool any = extra_fast;
@@ -94,15 +96,10 @@ void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extr
             require(!l.value[kFast].empty() || !l.runnable[kFast],
                     where + ": marked qualified for fast but the fast cell is empty (the lever never runs under fast)");
         if (!fast_cell_live(l)) continue;
+        any = true;
         const auto* entry = fast.find(l.name);
-        if (l.kind == p::Kind::exact) {
-            any = true;
-            require(entry && p::applied(entry->status) && entry->value == l.value[kFast],
-                    where + ": exact FAST schedule is not in the resolved fast set");
-        } else {
-            require(entry && entry->value == l.builtin && entry->ladder.find("unmeasured regime") != std::string::npos,
-                    where + ": unscoped lossy FAST cell must decline");
-        }
+        require(entry != nullptr && p::applied(entry->status) && entry->value == l.value[kFast],
+                where + ": qualified/selected FAST cell is not in the resolved fast set");
         if (l.ready[kFast]) require(!l.source.empty(), where + ": qualified FAST cell without a receipt");
     }
     for (const auto& e : exact.entries)
@@ -116,12 +113,13 @@ void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extr
 
 // A FAST bundle qualified for the word: each member is a qualified fast cell carrying the member's value, and the
 // resolved fast set applies it. A bundle without profile_receipt is a switch only (nothing to check here).
-void check_bundle(std::string_view tag, std::span<const p::Lever> rows, const strix::fast_profile::Bundle& bundle) {
+void check_bundle(std::string_view tag, std::span<const p::Lever> rows, const strix::fast_profile::Bundle& bundle,
+                  std::span<const p::LadderRow> ladder = {}) {
     if (bundle.profile_receipt == nullptr) {
         if (!fixture) std::printf("%-22s bundle %s: switch only (no profile receipt)\n", std::string(tag).c_str(), bundle.profile);
         return;
     }
-    const p::Engine engine{tag, "", rows};
+    const p::Engine engine{tag, "", rows, false, {}, {}, ladder};
     const auto fast = run(engine, p::Name::fast);
     for (const auto& m : bundle.members) {
         const std::string where = std::string(tag) + "/" + bundle.profile + "/" + m.env;
@@ -134,8 +132,8 @@ void check_bundle(std::string_view tag, std::span<const p::Lever> rows, const st
                 where + ": gated member's fast cell is empty or not qualified with the bundle value (never runs under the word)");
         const p::Entry* entry = nullptr;
         for (const auto& e : fast.entries) if (e.lever == row) entry = &e;
-        require(entry && entry->value == row->builtin && !p::applied(entry->status),
-                where + ": a quality receipt alone lets the bundle member run");
+        require(entry != nullptr && p::applied(entry->status) && entry->value == m.value,
+                where + ": gated member is not in the resolved fast set");
     }
     if (!fixture) std::printf("%-22s bundle %s: word-qualified (%s)\n", std::string(tag).c_str(), bundle.profile, bundle.profile_receipt);
 }
@@ -216,24 +214,52 @@ void minimax_bundle() {
         const auto* e = r.find(lever);
         return e == nullptr ? std::string("absent") : std::string(p::status_name(e->status)) + ":" + e->value;
     };
-    require(!md::fast_profile_selects_bundle(lookup), "MiniMax bundle needs matching timing evidence");
+    // The word alone (no switch exported anywhere): the resolver runs the bundle.
+    require(md::fast_profile_selects_bundle(lookup), "minimax: fast selects the qualified bundle mm-fast-pf-v2");
     const auto pf = md::prefill_policy(lookup);
+    require(pf.msa_flash == 1 && pf.router_wmma && pf.bundle_from_profile,
+            "minimax: STRIX_MM_PRODUCT_PROFILE=fast alone runs msa_flash=1 + router_wmma (resolver, not an export)");
     const auto fast_id = md::prefill_identity(lookup);
-    require(pf.msa_flash == 0 && !pf.router_wmma, "MiniMax execution follows the unmeasured fallback");
     const auto fast_res = md::profile_resolution(lookup);
-    require(status(fast_res, "msa_flash") == "pending:0" && status(fast_res, "router_wmma") == "pending:0",
-            "MiniMax receipt agrees with execution");
-    env[md::kFastBundle.env] = "1";
-    const auto selected = md::prefill_policy(lookup);
-    require(selected.msa_flash == 1 && selected.router_wmma && md::prefill_identity(lookup) != fast_id,
-            "MiniMax explicit bundle still wins");
+    require(status(fast_res, "msa_flash") == "profile:1" && status(fast_res, "router_wmma") == "profile:1",
+            "minimax: the word's members keep the profile status (got " + status(fast_res, "msa_flash") + ", " +
+                status(fast_res, "router_wmma") + ")");
+    {   // the same run and prefill identity as the switch
+        std::map<std::string, std::string> sw{{md::kFastBundle.env, "1"}};
+        const auto sw_lookup = [&sw](const char* k) -> const char* {
+            const auto it = sw.find(k);
+            return it == sw.end() ? nullptr : it->second.c_str();
+        };
+        auto spf = md::prefill_policy(sw_lookup);
+        spf.canonical.erase(md::kFastBundle.env);  // the switch itself is the only difference (requested provenance)
+        require(md::prefill_identity(sw_lookup) == fast_id && spf.policies == pf.policies && spf.canonical == pf.canonical,
+                "minimax: --profile fast = STRIX_MM_FAST_PREFILL=1 (identity " + fast_id + ")");
+    }
+    // An explicit switch 0 wins: nothing runs and the resolution says so (no applied member).
     env[md::kFastBundle.env] = "0";
-    require(md::prefill_policy(lookup).msa_flash == 0 && !md::prefill_policy(lookup).router_wmma,
-            "MiniMax explicit off wins");
+    require(!md::fast_profile_selects_bundle(lookup), "minimax: an explicit bundle switch 0 wins");
+    const auto off = md::prefill_policy(lookup);
+    const auto off_res = md::profile_resolution(lookup);
+    require(off.msa_flash == 0 && !off.router_wmma && status(off_res, "msa_flash") == "off:0" &&
+                status(off_res, "router_wmma") == "off:0",
+            "minimax: switch 0 under fast resolves the members off (got " + status(off_res, "msa_flash") + ", " +
+                status(off_res, "router_wmma") + ")");
     env.erase(md::kFastBundle.env);
+    // FAST_I4 admission: the flash member is not admitted; the resolution must not claim it.
+    env["STRIX_MMX_MODEL_FORMAT"] = "fast_i4";
+    const auto i4 = md::prefill_policy(lookup);
+    require(i4.msa_flash == 0 && !i4.router_wmma && status(md::profile_resolution(lookup), "msa_flash") == "off:0",
+            "minimax: fast on fast_i4 keeps the bundle's admission (flash and router not run, resolved off)");
+    env.erase("STRIX_MMX_MODEL_FORMAT");
+    // The exact baseline refuses the word (before the word selected the bundle this combination ran exact).
+    env[md::kBaselineEnv] = "1";
+    bool refused = false;
+    try { (void)md::prefill_policy(lookup); } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "minimax: --baseline --profile fast is refused");
+    env.erase(md::kBaselineEnv);
     // exact / no word: no bundle, the legacy identity.
     env[md::kProductProfileEnv] = "exact";
-    require(!md::fast_profile_selects_bundle(lookup) && md::prefill_identity(lookup) == fast_id &&
+    require(!md::fast_profile_selects_bundle(lookup) && md::prefill_identity(lookup) != fast_id &&
                 md::prefill_policy(lookup).msa_flash == 0,
             "minimax: exact selects no bundle");
     const auto exact_fp = md::profile_resolution(lookup).fingerprint();
@@ -249,9 +275,7 @@ void qwen_dense_regimes() {
         const qd::Regime regime{q.weights, q.route, q.gate.min_prompt_tokens};
         const auto fast = qd::resolve(p::Name::fast, regime, {});
         const auto* e = fast->find(q.gate.lever);
-        require(e && (e->lever->kind == p::Kind::exact ? p::applied(e->status)
-                                                       : e->value == e->lever->builtin && !e->ladder.empty()),
-                "Qwen dense uses the ladder for the qualified regime");
+        require(e != nullptr && p::applied(e->status), "qwen35-cuda-dense/" + std::string(q.gate.lever) + ": qualified regime not in the fast set");
         const auto exact = qd::resolve(p::Name::standard, regime, {});
         for (const auto& x : exact->resolution.entries)
             require(!p::applied(x.status), "qwen35-cuda-dense/" + std::string(x.lever->name) + ": exact applies a lever");
@@ -278,7 +302,9 @@ void regime_gate_rows() {
             "regime ledger: range text");
 }
 
-// Qwen Flash-Next HIP has quality evidence for these ranges. Automatic selection also needs timing evidence.
+// Qwen Flash-Next HIP regime ledger (strix::qwen::profile::fast_regimes): inside a row's prompt range the fast cell is
+// qualified (status set, same value); outside it (and with the prompt unknown) the table's provisional flag is
+// unchanged; exact applies nothing; an explicit off switch still wins inside the regime.
 void qwen_hip_regimes() {
     namespace qh = strix::qwen::profile;
     const std::span<const p::RegimeGate> rows(qh::fast_regimes);
@@ -303,11 +329,11 @@ void qwen_hip_regimes() {
         require(q.value == lever->value[kFast], where + ": regime row value is not the fast cell");
         for (const auto tokens : {q.min_prompt_tokens, q.max_prompt_tokens}) {
             const auto [status, value] = status_at(p::Name::fast, tokens, q.lever);
-            require(status == p::Status::pending && value == lever->builtin, where + ": a quality receipt alone activated the cell");
+            require(status == p::Status::set && value == lever->value[kFast], where + ": not qualified inside its regime");
             require(!p::applied(status_at(p::Name::standard, tokens, q.lever).first), where + ": exact applies it in the regime");
         }
         for (const std::uint64_t tokens : {std::uint64_t{0}, q.max_prompt_tokens + 1U, std::uint64_t{32460}})
-            require(status_at(p::Name::fast, tokens, q.lever).first == p::Status::pending,
+            require(status_at(p::Name::fast, tokens, q.lever).first == (lever->provisional[kFast] ? p::Status::provisional : p::Status::pending),
                     where + ": outside its regime the table flags changed");
         if (!lever->env.empty() && !lever->off.empty()) {
             const std::string key(lever->env), off(lever->off);
@@ -323,16 +349,20 @@ void qwen_hip_regimes() {
 int main() {
     tier_words();
     negative_fixtures();
-    check_table("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table);
-    check_bundle("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, strix::ds41::fast_profile::kBundle);
-    check_table("glm-pair", strix::glm::rank_defaults::product_profile_table);
+    check_table("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, false,
+                strix::deepseek41::pair_defaults::ladder_rows);
+    check_bundle("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, strix::ds41::fast_profile::kBundle,
+                 strix::deepseek41::pair_defaults::ladder_rows);
+    check_table("glm-pair", strix::glm::rank_defaults::product_profile_table, false,
+                strix::glm::rank_defaults::product_ladder_rows);
     check_table("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows());
     minimax_bundle();
-    check_table("minimax-pair", strix::minimax::defaults::profile_table);
-    check_bundle("minimax-pair", strix::minimax::defaults::profile_table, strix::minimax::defaults::kFastBundle);
-    check_table("qwen-hip", strix::qwen::profile::table);
-    check_table("qwen-cuda", strix::qwen::cuda_profile::table);
-    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table);
+    check_table("minimax-pair", strix::minimax::defaults::profile_table, false, strix::minimax::defaults::ladder_rows);
+    check_bundle("minimax-pair", strix::minimax::defaults::profile_table, strix::minimax::defaults::kFastBundle,
+                 strix::minimax::defaults::ladder_rows);
+    check_table("qwen-hip", strix::qwen::profile::table, false, strix::qwen::profile::ladder_rows);
+    check_table("qwen-cuda", strix::qwen::cuda_profile::table, false, strix::qwen::cuda_profile::ladder_rows);
+    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table, false, strix::qwen35::hip_profile::kLadderRows);
     qwen_dense_regimes();
     regime_gate_rows();
     qwen_hip_regimes();

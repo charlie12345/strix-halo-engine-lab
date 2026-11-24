@@ -173,7 +173,12 @@ explicit or off; explicit off prevents profile application. An explicit request
 for unavailable code is refused. `--allow-pending` (or
 `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) is for benchmarking: only runnable genuinely
 pending rows execute, with `unqualified: <rows>` in the qualification stamp and
-an `unqualified` list. If both types apply, the stamp lists qualification in
+an `unqualified` list. Under the ladder rule a lossy cell runs in a regime only
+where a timing row shows its tier faster than the tier below, or where its table
+grants it as incumbent (the cells that ran before the rule, each with its
+receipt). An unqualified cell has neither, so with `--allow-pending` it stays at
+the tier below until a timing row covers the regime; to time it, set its lever
+explicitly (explicit settings run as set). If both types apply, the stamp lists qualification in
 progress first, then `; unqualified: <rows>`. The three pending rows currently
 remain pending even with this flag. The existing `--prefill-moe-route-bf16 on|off`
 contract is unchanged. On YaRN, proposed exports are checked against rotary

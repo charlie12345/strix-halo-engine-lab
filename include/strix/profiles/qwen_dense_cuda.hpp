@@ -234,7 +234,12 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
     for (const auto& lever : table) {
         if (!offered(lever.name, regime.route, regime.drafter)) continue;
         Lever row = lever;
-        row.ready[static_cast<unsigned>(Name::fast)] = qualification(lever.name, regime, rows) != nullptr;
+        const auto* q = qualification(lever.name, regime, rows);
+        row.ready[static_cast<unsigned>(Name::fast)] = q != nullptr;
+        // A cell qualified for this regime ran before the ladder rule: its qualification receipt is its incumbent grant.
+        if (q != nullptr && lever.kind != Kind::exact)
+            out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[static_cast<unsigned>(Name::fast)], Name::fast,
+                                                     q->gate.receipt));
         TurboAdmission result;
         if (turbo && !row.value[kTurboColumn].empty()) {
             result = admission(row);
@@ -265,11 +270,20 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
     inputs.regime = timing_regime;
     inputs.env = [](const char*) -> const char* { return nullptr; };  // CLI-only levers: the environment selects nothing
     out->resolution = sp::resolve(out->engine, inputs);
+    // A half runs its TURBO cell only on its own TURBO decision (a timing row of the TURBO rung), never because the
+    // value it inherits from FAST is spelled like the TURBO cell (decode_attn8 is "on" in both columns).
     const auto selected_turbo = [&](std::string_view name) {
+        const auto* entry = out->resolution.find(name);
+        if (!entry || !sp::applied(entry->status) || entry->value != entry->lever->value[kTurboColumn]) return false;
+        return sp::rung_runs(sp::ladder_judge(out->ladder, name, entry->value, Name::turbo, timing_regime).rung);
+    };
+    const bool kv_turbo = selected_turbo("kv_fp8"), attn_turbo = selected_turbo("decode_attn8");
+    const auto ran_turbo_value = [&](std::string_view name) {
         const auto* entry = out->resolution.find(name);
         return entry && sp::applied(entry->status) && entry->value == entry->lever->value[kTurboColumn];
     };
-    if (turbo && !kv_override && selected_turbo("kv_fp8") != selected_turbo("decode_attn8")) {
+    // The pair runs on TURBO only when both halves carry their own TURBO decision.
+    if (turbo && !kv_override && (ran_turbo_value("kv_fp8") || attn_turbo) && !(kv_turbo && attn_turbo)) {
         // The shadow and its reader are one operation. Select the lower tier
         // for both if either half failed the shared decision.
         const auto unpaired = out->resolution;

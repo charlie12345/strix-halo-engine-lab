@@ -108,4 +108,13 @@ inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST router layer set (read only while router_wmma is on)", false, {}, true},
 }};
 
+// Ladder rows (strix::profile::LadderRow): incumbent grants for the mm-fast-pf-v2 bundle members the resolver ran before
+// the ladder rule, and the turbo cell that keeps the router member off.
+inline constexpr strix::profile::LadderRow ladder_rows[] = {
+    strix::profile::incumbent_cell("msa_flash", "1", strix::profile::Name::fast,
+                                   "bundle mm-fast-pf-v2: EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029"),
+    strix::profile::incumbent_cell("router_wmma", "1", strix::profile::Name::fast,
+                                   "bundle mm-fast-pf-v2: gate PASS 8K KL 0.0020 and 32K with the bundle"),
+    strix::profile::incumbent_cell("router_wmma", "0", strix::profile::Name::turbo, strix::profile::kTurboOffBeforeLadder)};
+
 }  // namespace strix::minimax::defaults

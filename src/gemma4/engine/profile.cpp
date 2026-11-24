@@ -155,6 +155,15 @@ const std::string* lookup(const Pairs& pairs, std::string_view key) {
     for (const auto& [k, v] : pairs) if (k == key) found = &v;
     return found;
 }
+// Ladder rows of this table (resolve() always reads them): incumbent grants of the qualified fast cells the resolver ran
+// before the ladder rule.
+constexpr strix::profile::LadderRow ladder_rows[] = {
+    strix::profile::incumbent_cell("decode_identity", "g4-a8-v1", strix::profile::Name::fast,
+                                   "g4-a8-v1: held-out fidelity bands met"),
+    strix::profile::incumbent_cell("prefill_route", "fast", strix::profile::Name::fast, fast_prefill_receipt),
+    strix::profile::incumbent_cell("prefill_route_attention", "flash", strix::profile::Name::fast,
+                                   fast_prefill_attention_receipt),
+};
 } // namespace
 
 std::span<const Lever> levers() { return table; }
@@ -280,6 +289,8 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
     Resolution out;
     out.name = profile;
     out.app = app;
+    std::vector<strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
+    ladder.insert(ladder.end(), std::begin(ladder_rows), std::end(ladder_rows));
     const auto* allow = environment(inputs.env, "STRIX_G4_PROFILE_ALLOW_PENDING");
     out.allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     const auto column = unsigned(profile);
@@ -316,7 +327,7 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
         } else if (wanted.empty()) {
             continue;
         } else {
-            auto cell = strix::profile::select_profile_cell(lever, inputs.ladder, profile, inputs.regime, admit);
+            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit);
             entry.ladder = std::move(cell.route);
             const auto admission = admit(column);
             if ((!entry.ladder.empty() && cell.value == lever.builtin) ||

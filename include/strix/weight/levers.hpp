@@ -103,9 +103,16 @@ static_assert(valid_weight_load_policies());
 // `checkpoint` is the raw SHA-256 of the checkpoint content the gate and timing receipts ran on.
 struct WeightLoadScope {
     Backend backend;
-    std::string_view device_class, compiler_id, regime;
+    std::string_view device_class, compiler_id, regime;  // device_class: device_class_key below
     Digest256 build, checkpoint;
 };
+
+// Device class of a weight-load scope and of the decision rows measured on it: the architecture plus the counts that
+// change residency and timing (compute units / multiprocessors, device memory). Two cards of one architecture with
+// different counts never share a receipt by the architecture name alone.
+[[nodiscard]] inline std::string device_class_key(std::string_view arch, long long units, unsigned long long memory_bytes) {
+    return std::string(arch) + "|cu" + std::to_string(units) + "|mem" + std::to_string(memory_bytes);
+}
 
 // Regimes a decision row is qualified for (WeightLoadScope::regime): the gate v2 regime of its quality receipt.
 // Prompt rows of a prefill chunk are the prefill regime; one-row steps (and their verify rows) the decode regime.

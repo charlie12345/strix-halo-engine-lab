@@ -22,6 +22,11 @@ inline constexpr std::array<strix::profile::Lever, 3> product_profile_table{{
      {true, false, true, false}, {false, false, false, false}, "", "0",
      "pending: KDA recurrent state in 16-bit (not covered by STRIX_GLM_PF_WMMA)"},
 }};
-inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1"};
+// Ladder rows (strix::profile::LadderRow): incumbent grant for the turbo cell the resolver ran before the ladder rule.
+inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
+    strix::profile::incumbent_cell("pf_wmma", "1", strix::profile::Name::turbo,
+                                   "glm-pf-wmma-x turbo cell ready before the ladder rule (docs/optimizations.md#glm-pf-wmma-x)")};
+inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
+                                                           {}, product_ladder_rows};
 
 }  // namespace strix::glm::rank_defaults

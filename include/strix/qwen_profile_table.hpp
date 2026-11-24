@@ -65,5 +65,21 @@ inline constexpr ::strix::profile::RegimeGate fast_regimes[] = {
     {"gdn_fp16_chunk", "1", 1, 8192, "gated in the same FAST bundle (identity fp16-v1+hcout16+gdnchunk16+qsab1536)"},
 };
 
-// Workload speed receipts for automatic profile cells. Quality gates above also apply.
-inline constexpr std::span<const ::strix::profile::LadderRow> ladder_rows{};
+// Ladder rows of this table (resolve() always reads them): workload speed receipts for automatic profile cells, and the
+// incumbent grants of the cells the resolver ran before the ladder rule (inside fast_regimes they are qualified, outside
+// provisional, as before). Quality gates above also apply.
+inline constexpr ::strix::profile::LadderRow ladder_rows[] = {
+    ::strix::profile::incumbent_cell("qsa_budget", "1536", Name::fast,
+        "FAST bundle: 8K gate per window PASS (fast_regimes, prompts <= 8,192); provisional above"),
+    ::strix::profile::incumbent_cell("moe_route_bf16", "1", Name::fast,
+        "FAST bundle: 8K gate per window PASS (fast_regimes, prompts <= 8,192); provisional above"),
+    ::strix::profile::incumbent_cell("gdn_fp16_chunk", "1", Name::fast,
+        "FAST bundle: 8K gate per window PASS (fast_regimes, prompts <= 8,192); provisional above"),
+    ::strix::profile::incumbent_cell("qsa_budget", "1536", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("moe_route_bf16", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("gdn_fp16_chunk", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("gdn_gates_f16", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("index_proj_wmma", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("index_score_wmma", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("ple_rows_f16", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+};

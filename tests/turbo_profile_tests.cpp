@@ -102,7 +102,8 @@ void turbo_column() {
     const auto r = through({"--profile", "turbo"}, vars);
     require(entry(r, "flash").value == "1" && entry(r, "flash").status == p::Status::set, "empty turbo cell takes the fast cell");
     require(entry(r, "replay").value == "128" && entry(r, "replay").status == p::Status::provisional, "turbo-only provisional lever runs");
-    require(entry(r, "dense").value == "0" && entry(r, "dense").status == p::Status::set, "measured TURBO can select the builtin over FAST");
+    require(entry(r, "dense").value == "0" && entry(r, "dense").status == p::Status::builtin,
+            "measured TURBO can select the builtin over FAST (stamped builtin, as resolve() does)");
     require(entry(r, "head").status == p::Status::pending && entry(r, "head").value == "default", "unrunnable turbo cell is pending");
     require(r.describe().find("profile version fixture-turbo-v1") != std::string::npos, "describe prints the versioned name");
     require(r.describe().find("requested fp16") != std::string::npos, "describe prints requested beside effective");
@@ -274,8 +275,8 @@ void qwen_adapter() {
     require(turbo.cache_namespace().find("turbo=qwen-turbo-v1") == 0, "qwen namespace names qwen-turbo-v1");
     const auto fast = q::resolve(p::Name::fast, in);
     const auto* qsa = turbo.find("qsa_budget");
-    require(qsa && qsa->value == fast.find("qsa_budget")->value && qsa->value == qsa->lever->builtin,
-            "Qwen TURBO inherits the effective FAST fallback when neither tier is measured");
+    require(qsa && qsa->value == fast.find("qsa_budget")->value && qsa->value == "1536",
+            "qwen turbo inherits the FAST lever cells (incumbent grant)");
     // Every Qwen lever off: still a turbo namespace, never the default's.
     std::map<std::string, std::string> off;
     for (const auto& row : q::levers()) if (!row.env.empty() && !row.off.empty()) off[std::string(row.env)] = std::string(row.off);

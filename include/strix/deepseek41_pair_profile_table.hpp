@@ -73,4 +73,24 @@ inline constexpr strix::profile::FastGate fast_gates[] = {
     {"fast_prefill", "1", kFastGateD1}, {"engram_f16wmma", "1", kFastGateD1},
     {"shared_f16", "1", kFastGateD1},   {"moe_f16wmma", "1", kFastGateD1}};
 
+// Ladder rows (strix::profile::LadderRow): incumbent grants for the cells the resolver ran before the ladder rule.
+namespace ladder_detail {
+namespace sp = ::strix::profile;
+inline constexpr auto kFast = sp::Name::fast;
+inline constexpr auto kTurbo = sp::Name::turbo;
+}  // namespace ladder_detail
+inline constexpr strix::profile::LadderRow ladder_rows[] = {
+    strix::profile::incumbent_cell("fast_prefill", "1", ladder_detail::kFast, kFastGateD1),
+    strix::profile::incumbent_cell("engram_f16wmma", "1", ladder_detail::kFast, kFastGateD1),
+    strix::profile::incumbent_cell("shared_f16", "1", ladder_detail::kFast, kFastGateD1),
+    strix::profile::incumbent_cell("moe_f16wmma", "1", ladder_detail::kFast, kFastGateD1),
+    strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kFast, strix::profile::kProvisionalBeforeLadder),
+    strix::profile::incumbent_cell("attention_f16wmma", "2", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder),
+    strix::profile::incumbent_cell("dense_f16", "1", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder),
+    strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder),
+    strix::profile::incumbent_cell("fast_prefill", "0", ladder_detail::kTurbo, strix::profile::kTurboOffBeforeLadder),
+    strix::profile::incumbent_cell("engram_f16wmma", "0", ladder_detail::kTurbo, strix::profile::kTurboOffBeforeLadder),
+    strix::profile::incumbent_cell("shared_f16", "0", ladder_detail::kTurbo, strix::profile::kTurboOffBeforeLadder),
+    strix::profile::incumbent_cell("moe_f16wmma", "0", ladder_detail::kTurbo, strix::profile::kTurboOffBeforeLadder)};
+
 }  // namespace strix::deepseek41::pair_defaults

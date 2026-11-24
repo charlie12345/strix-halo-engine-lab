@@ -125,6 +125,7 @@ inline constexpr Qualified qualified[] = {
 struct Resolved {
     Regime regime;
     std::vector<sp::Lever> rows;
+    std::vector<sp::LadderRow> ladder;  // incumbent grants: the qualification receipt of each cell qualified here
     sp::Engine engine;
     sp::Resolution resolution;
     Resolved() = default;
@@ -141,11 +142,16 @@ struct Resolved {
     constexpr auto fast = static_cast<unsigned>(sp::Name::fast);
     for (const auto& lever : table) {
         sp::Lever row = lever;
-        row.ready[fast] = qualification(lever.name, lever.value[fast], regime, rows) != nullptr;
+        const auto* q = qualification(lever.name, lever.value[fast], regime, rows);
+        row.ready[fast] = q != nullptr;
+        // A cell qualified for this regime ran before the ladder rule: its qualification receipt is its incumbent grant.
+        if (q != nullptr && lever.kind != sp::Kind::exact)
+            out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[fast], sp::Name::fast, q->gate.receipt));
         out->rows.push_back(row);
     }
     out->engine = engine();
     out->engine.table = std::span<const sp::Lever>(out->rows);
+    out->engine.ladder = std::span<const sp::LadderRow>(out->ladder);
     auto scoped = inputs;
     scoped.regime = {sp::Phase::prefill, regime.prompt_tokens, 1,
                      regime.device == Device::unknown ? std::string_view{} : device_name(regime.device)};

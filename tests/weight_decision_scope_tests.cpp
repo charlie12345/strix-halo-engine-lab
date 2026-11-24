@@ -234,6 +234,21 @@ int main() {
     auto other_device = request;
     other_device.scope.device_class = "other";
     ok &= check(selected(other_device, narrow) == weight::kBf16WeightStorage, "other device declines");
+    {   // One architecture, two cards with different resource counts: a row measured on one never serves the other.
+        const auto card_a = weight::device_class_key("gfx1151", 20, 128ULL << 30);
+        const auto card_b = weight::device_class_key("gfx1151", 40, 128ULL << 30);
+        const auto card_c = weight::device_class_key("gfx1151", 20, 96ULL << 30);
+        ok &= check(card_a != card_b && card_a != card_c, "device class keys separate units and memory");
+        auto measured = narrow;
+        measured.scope.device_class = card_a;
+        auto run_a = request, run_b = request, run_c = request;
+        run_a.scope.device_class = card_a;
+        run_b.scope.device_class = card_b;
+        run_c.scope.device_class = card_c;
+        ok &= check(selected(run_a, measured) == weight::kQ8WeightStorage, "the measured card selects its row");
+        ok &= check(selected(run_b, measured) == weight::kBf16WeightStorage, "same architecture, other unit count declines");
+        ok &= check(selected(run_c, measured) == weight::kBf16WeightStorage, "same architecture, other memory declines");
+    }
     auto malformed = narrow;
     malformed.evidence.receipt = {};
     ok &= check(selected(request, malformed) == weight::kBf16WeightStorage, "missing receipt declines");

@@ -3,6 +3,7 @@
 #include "strix/fnv.hpp"
 #include "strix/turbo.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -75,11 +76,13 @@ struct Lever {
 }
 
 // Column of `lever` that `profile` reads: an empty turbo cell takes the fast cell (TURBO includes every FAST lever
-// unless its turbo cell says otherwise). Shared by every adapter whose rows carry `value` per profile.
+// unless its turbo cell says otherwise); a table without a turbo column reads its fast cell the same way. Shared by
+// every adapter whose rows carry `value` per profile.
 template <class Row>
 inline unsigned value_column(const Row& lever, Name profile) {
     const auto column = static_cast<unsigned>(profile);
-    if (profile == Name::turbo && lever.value[column].empty()) return static_cast<unsigned>(Name::fast);
+    if (column >= std::size(lever.value) || (profile == Name::turbo && lever.value[column].empty()))
+        return static_cast<unsigned>(Name::fast);
     return column;
 }
 
@@ -113,7 +116,30 @@ struct LadderRow {
     double speedup = 0.0;
     double noise = 0.0;
     std::string_view receipt;
+    // Incumbent grant: a cell a resolver already applied before the ladder rule, kept with the receipt that qualified
+    // it (or made it provisional). It covers every regime, so the cell keeps running exactly where its own readiness
+    // (unchanged by the ladder) admits it; where a timing row covers the regime, the timing row decides. Phase, device,
+    // bands, speedup and noise are unused.
+    bool incumbent = false;
 };
+
+// Receipts of incumbent grants for cells that ran before the ladder rule without a quality gate of their own.
+inline constexpr std::string_view kProvisionalBeforeLadder =
+    "provisional cell selected before the ladder rule; the row's source names the qualification in progress";
+inline constexpr std::string_view kTurboOffBeforeLadder =
+    "turbo cell that leaves the fast cell off, selected before the ladder rule";
+
+// An incumbent grant row (LadderRow::incumbent). `value` empty: the tier's cell.
+[[nodiscard]] constexpr LadderRow incumbent_cell(std::string_view lever, std::string_view value, Name tier,
+                                                 std::string_view receipt) noexcept {
+    LadderRow row{};
+    row.lever = lever;
+    row.value = value;
+    row.tier = tier;
+    row.receipt = receipt;
+    row.incumbent = true;
+    return row;
+}
 
 [[nodiscard]] constexpr Name tier_below(Name tier) noexcept {
     return tier == Name::turbo ? Name::fast : Name::standard;
@@ -131,35 +157,48 @@ template <class Context, class Lanes>
 [[nodiscard]] constexpr bool ladder_gain(double speedup, double noise) noexcept {
     return valid_ladder_measurement(speedup, noise) && speedup > 1.0 + noise;
 }
+[[nodiscard]] constexpr bool ladder_names(const LadderRow& row, std::string_view lever, std::string_view value,
+                                          Name tier) noexcept {
+    return row.lever == lever && (row.value.empty() || row.value == value) && row.tier == tier;
+}
+// A timing row covering the regime (incumbent grants are not timing rows).
 [[nodiscard]] constexpr bool ladder_covers(const LadderRow& row, std::string_view lever, std::string_view value,
                                            Name tier, const Regime& regime) noexcept {
-    return row.lever == lever && (row.value.empty() || row.value == value) && row.tier == tier &&
+    return !row.incumbent && ladder_names(row, lever, value, tier) &&
            row.phase == regime.phase && !row.device.empty() && row.device == regime.device &&
            ladder_band(regime.context, row.min_context, row.max_context, regime.lanes, row.min_lanes, row.max_lanes);
 }
 
-enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower };
+enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower, incumbent };
 [[nodiscard]] constexpr std::string_view rung_name(Rung rung) noexcept {
     return rung == Rung::applies ? "applies" : rung == Rung::unmeasured ? "unmeasured regime"
-        : rung == Rung::within_noise ? "within noise" : "slower";
+        : rung == Rung::within_noise ? "within noise" : rung == Rung::slower ? "slower" : "incumbent";
 }
+// The cell runs in its own tier (a measured gain or an incumbent grant).
+[[nodiscard]] constexpr bool rung_runs(Rung rung) noexcept { return rung == Rung::applies || rung == Rung::incumbent; }
 struct LadderVerdict {
     Rung rung = Rung::unmeasured;
     const LadderRow* row = nullptr;  // the deciding row: the least favourable row covering the regime
     Name resolved = Name::standard;  // the tier whose cell the regime runs
 };
 
-// The verdict of `value` of `lever` in `tier` for `regime`: applies only when every covering row shows a gain.
+// The verdict of `value` of `lever` in `tier` for `regime`: applies only when every covering timing row shows a gain;
+// with no timing row covering the regime, an incumbent grant with a receipt keeps the cell (Rung::incumbent).
 [[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
                                                    std::string_view value, Name tier, const Regime& regime) noexcept {
     const LadderRow* worst = nullptr;
+    const LadderRow* grant = nullptr;
     for (const auto& row : rows) {
+        if (row.incumbent) {
+            if (!grant && !row.receipt.empty() && ladder_names(row, lever, value, tier)) grant = &row;
+            continue;
+        }
         if (!ladder_covers(row, lever, value, tier, regime)) continue;
         if (row.receipt.empty() || !valid_ladder_measurement(row.speedup, row.noise))
             return {Rung::unmeasured, nullptr, tier_below(tier)};
         if (!worst || row.speedup - row.noise < worst->speedup - worst->noise) worst = &row;
     }
-    if (!worst) return {Rung::unmeasured, nullptr, tier_below(tier)};
+    if (!worst) return grant ? LadderVerdict{Rung::incumbent, grant, tier} : LadderVerdict{Rung::unmeasured, nullptr, tier_below(tier)};
     if (ladder_gain(worst->speedup, worst->noise)) return {Rung::applies, worst, tier};
     const bool slower = worst->speedup < 1.0 - worst->noise;
     return {slower ? Rung::slower : Rung::within_noise, worst, tier_below(tier)};
@@ -591,11 +630,15 @@ template <class Row, class Admission>
                                             const Regime& regime, const Admission& admit) {
     const auto column = value_column(lever, tier);
     const auto wanted = lever.value[column];
-    const bool eligible = !wanted.empty() && applied(admit(column));
+    // A cell spelling the builtin runs without a qualification of its own (resolve() treats it as builtin).
+    const bool eligible = !wanted.empty() && (wanted == lever.builtin || applied(admit(column)));
     if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo))
         return {eligible ? wanted : lever.builtin, tier, {}};
 
     const auto below = tier_below(tier);
+    // A cell its column does not admit (pending) leaves the lever at the builtin, as resolve() does: the ladder never
+    // runs the cell below in its place.
+    if (!wanted.empty() && !eligible) return {lever.builtin, Name::standard, {}};
     auto lower = ladder_cell(lever, rows, below, regime, admit);
     if (!eligible || (tier == Name::turbo && column == static_cast<unsigned>(Name::fast)) ||
         wanted == lower.value) return lower;
@@ -611,12 +654,14 @@ template <class Row, class Admission>
     }
     step += rung_name(verdict.rung);
     if (verdict.row) {
-        char ratio[64];
-        std::snprintf(ratio, sizeof ratio, " x%.3f noise %.3f", verdict.row->speedup, verdict.row->noise);
-        step += ratio;
+        if (!verdict.row->incumbent) {
+            char ratio[64];
+            std::snprintf(ratio, sizeof ratio, " x%.3f noise %.3f", verdict.row->speedup, verdict.row->noise);
+            step += ratio;
+        }
         step += " (" + std::string(verdict.row->receipt) + ")";
     }
-    if (verdict.rung == Rung::applies) return {wanted, tier, step};
+    if (rung_runs(verdict.rung)) return {wanted, tier, step};
     lower.route = step + lower.route;
     return lower;
 }
@@ -649,6 +694,8 @@ inline void apply_ladder(Entry& entry, std::span<const LadderRow> rows, Name tie
     if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo)) return;
     auto cell = select_profile_cell(lever, rows, tier, regime, admit);
     entry.ladder = std::move(cell.route);
+    // The ladder kept the value the profile column resolved: its admission status stands as resolved.
+    if (cell.value == entry.value) return;
     entry.value = cell.value;
     if (cell.value != lever.builtin || (cell.tier == Name::turbo && !entry.ladder.empty())) {
         entry.status = admit(value_column(lever, cell.tier));
@@ -720,6 +767,10 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         const auto cell = lever->value[value_column(*lever, row.tier)];
         if (cell.empty() || (!row.value.empty() && row.value != cell))
             return where + ": ladder row value is not the tier's cell";
+        if (row.incumbent) {
+            if (row.receipt.empty()) return where + ": incumbent grant without a receipt";
+            continue;
+        }
         if (row.device.empty() || row.receipt.empty()) return where + ": ladder row without device or receipt";
         if (!valid_ladder_measurement(row.speedup, row.noise)) return where + ": invalid speedup or noise";
         if (row.min_context < 1 || row.min_context > row.max_context || row.min_lanes < 1 || row.min_lanes > row.max_lanes)
@@ -729,10 +780,20 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
 }
 
 // Probe regimes of an engine's ladder: every row's band corners and the regime just outside each edge, per device and
-// phase. A walker resolves every lossy lever of every tier there (strix ladder host test).
+// phase. A walker resolves every lossy lever of every tier there (strix ladder host test). Incumbent grants cover every
+// regime: they add a fixed grid (both phases, unknown / short / long contexts, one and eight lanes, unknown device and
+// the two device classes of this repository).
 [[nodiscard]] inline std::vector<Regime> ladder_probes(const Engine& engine) {
     std::vector<Regime> out;
+    if (std::any_of(engine.ladder.begin(), engine.ladder.end(), [](const LadderRow& row) { return row.incumbent; }))
+        for (const auto phase : {Phase::prefill, Phase::decode})
+            for (const std::uint64_t context : {0ULL, 1ULL, 4096ULL, 8192ULL, 8193ULL, 32768ULL, 131072ULL})
+                for (const std::uint32_t lanes : {1U, 8U})
+                    for (const std::string_view device : {std::string_view{}, std::string_view{"gfx1151"},
+                                                          std::string_view{"sm_120"}})
+                        out.push_back({phase, context, lanes, device});
     for (const auto& row : engine.ladder) {
+        if (row.incumbent) continue;
         const std::uint64_t contexts[] = {row.min_context, row.max_context, row.min_context - 1,
                                           row.max_context == kNoContextBound ? row.max_context : row.max_context + 1};
         const std::uint32_t lanes[] = {row.min_lanes, row.max_lanes, row.min_lanes - 1,

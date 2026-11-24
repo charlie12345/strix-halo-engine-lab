@@ -54,13 +54,17 @@ int main() {
                 "fast: the wide cell is pending, effective value equals exact");
         require(win(fast, app).target == "64-row FAST wide windows (dense-q8a8-f16-v1)", "pending target reported");
         require(!sp::applied(win(fast, app).status), "fast applies no window lever without allow-pending");
-        require(!sp::applied(a4(fast).status) && a4(fast).value == a4(exact).value &&
-                    !a4(fast).ladder.empty(), "A4W4 declines at unknown context and device");
+        // The qualified layer table ran before the ladder rule: its incumbent grant keeps it in every regime.
+        require(sp::applied(a4(fast).status) && a4(fast).value == "48-63" &&
+                    a4(fast).ladder.find("incumbent") != std::string::npos,
+                "fast keeps the qualified A4W4 layer table (incumbent grant)");
         require(!sp::applied(a4(exact).status) && !sp::applied(a4(dflt).status) && !sp::applied(a4(none).status),
                 "exact / default / no word leave the A4W4 layer table alone");
         std::vector<std::pair<std::string, std::string>> put;
         sp::apply(fast.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });
-        require(put.empty(), "unknown regime exports no lossy switch");
+        require(put == std::vector<std::pair<std::string, std::string>>{{"STRIX_DENSE_A4W4_LAYERS", "48-63"}},
+                "fast exports exactly STRIX_DENSE_A4W4_LAYERS=48-63");
+        put.clear();
         const sp::LadderRow timing{"a4w4_layers", "48-63", sp::Name::fast, sp::Phase::prefill, "fixture",
                                    8192, 8192, 1, 1, 1.04, 0.01, "fixture"};
         auto engine = hp::engine(app);

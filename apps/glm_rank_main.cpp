@@ -14,8 +14,9 @@
 //                                    token to --out (raw f32 [T][4][4096]) and prints its FNV-1a + the state hash
 //   --decode N --prompt TOKENS.u32   prefill (default auto = exact chunked gemv identity when admissible; --prefill ref = decode row by row)
 //   --embed-rows A.rows[,B.rows,...] image input of that one prompt (strix-glm5-vision encode / expand): the n-th run of
-//                                    image tokens takes the rows of the n-th file instead of the embedding table. Plain
-//                                    decode (--mtp 0), chunked prefill; give both ranks the same files.
+//                                    image tokens takes the rows of the n-th file instead of the embedding table.
+//                                    Chunked prefill only (with MTP speculation: --prefill gemv); give both ranks the
+//                                    same files.
 //                                    then N greedy steps; prints tokens, ms/token
 //   --batch R --steps N              R slots decoding together (one row each) for N steps; aggregate tok/s
 //   --spec-oracle K --pattern M,M,.. --decode N --prompt T.u32   gate SP1a (needs --spec 1): plain greedy run of N tokens,
@@ -320,9 +321,6 @@ int main(int argc, char** argv) {
         opt.auto_rows = rd::max_rows_auto(eff);
         opt.spec = eff.spec.value == "1";
         bool mtp_spec_on = eff.mtp_spec.value == "1";
-        // Image rows take the plain chunked prefill; the slot then decodes without MTP (Engine::set_embed_rows).
-        if (!embed_rows_arg.empty() && mtp_spec_on)
-            throw std::invalid_argument("--embed-rows runs plain decode: pass --mtp 0");
         if (!mtp_prefill_gate.empty() && (!opt.spec || !opt.mtp))
             throw std::invalid_argument("--mtp-prefill-gate requires --spec 1 --mtp 1");
         if (eff.identity.source == "baseline") opt.identity = ge::IdentityMode::kR1;
@@ -351,6 +349,10 @@ int main(int argc, char** argv) {
         if (prefill_mode != eff.prefill) throw std::logic_error("prefill resolution differs from --print-effective-config");
         if (!embed_rows_arg.empty() && prefill_mode == "ref")
             throw std::invalid_argument("--embed-rows needs a chunked prefill (--prefill gemv|wmma), not the row-by-row reference");
+        // With MTP speculation the prompt runs through the chunked bootstrap (prefill_mtp), which is the gemv identity;
+        // any other prefill bootstraps row by row, where no row can be provided.
+        if (!embed_rows_arg.empty() && mtp_spec_on && prefill_mode != "gemv")
+            throw std::invalid_argument("--embed-rows with MTP speculation needs --prefill gemv (or --mtp 0 for plain decode)");
         if (batch_r > opt.slots) opt.slots = batch_r;
         for (unsigned r : split_ab_rs) opt.slots = std::max<std::uint32_t>(opt.slots, r);
         if (g4_rmax > opt.slots) opt.slots = g4_rmax;

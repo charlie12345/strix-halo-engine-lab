@@ -644,6 +644,7 @@ struct Engine::Impl {
         unsigned layer = 0;                  // next layer of the current piece (0: the piece has not started)
         std::size_t c0 = 0;                  // first prompt row of the current piece
         std::vector<Row> rows;               // the current piece
+        strix::session::EmbedSplice embeds;  // provided rows of the whole run (Engine::set_embed_rows); owns the host rows
         unsigned last = 0, interior_flag = 0;
         RowSet saved{};
     } units;
@@ -2273,20 +2274,20 @@ struct Engine::Impl {
         check_flag("seqpar layers");
     }
 
-    // Provided rows of the chunk in progress (embed_chunk, run rows relative to the chunk) replace the table rows the
-    // embed kernel wrote, in every residual stream copy. With sequence parallelism a rank embeds only the rows it
-    // owns, so it splices only those. The host rows stay alive in the caller's splice until the prefill has synchronized.
-    void splice_embed_rows(unsigned R, bool seqpar) {
-        embed_chunk.validate(R, kHidden);
-        if (embed_chunk.rows() > embed_stage_rows) throw std::logic_error("embed rows: the staging is smaller than the chunk's rows");
+    // Provided rows of a chunk (run rows relative to the chunk) replace the table rows an embed kernel wrote into
+    // dst, in each of its `copies` stream copies per row. With sequence parallelism a rank embeds only the rows it
+    // owns, so it splices only those. The host rows stay alive in the caller's splice until the stream has synchronized.
+    void splice_embed_rows(const strix::session::EmbedSplice& chunk, float* dst, unsigned copies, unsigned R, bool seqpar) {
+        chunk.validate(R, kHidden);
+        if (chunk.rows() > embed_stage_rows) throw std::logic_error("embed rows: the staging is smaller than the chunk's rows");
         std::size_t at = 0;  // first staged row of the segment: segments lie back to back in the staging
-        for (const auto& seg : embed_chunk.segments) {
+        for (const auto& seg : chunk.segments) {
             hip_ok(hipMemcpyAsync(embed_stage + at * kHidden, seg.data, static_cast<std::size_t>(seg.rows) * kHidden * 2, hipMemcpyHostToDevice, stream),
                    "embed rows");
             at += seg.rows;
         }
-        for (const EmbedPiece& piece : embed_pieces(embed_chunk, R, seqpar, opt.pf_pipeline, opt.rank))
-            strix::session::enqueue_embed_splice(X, kHc, embed_stage + piece.staged_row * kHidden, kHidden, embed_chunk.format, piece.run_row,
+        for (const EmbedPiece& piece : embed_pieces(chunk, R, seqpar, opt.pf_pipeline, opt.rank))
+            strix::session::enqueue_embed_splice(dst, copies, embed_stage + piece.staged_row * kHidden, kHidden, chunk.format, piece.run_row,
                                                  piece.rows, stream);
     }
 
@@ -2350,7 +2351,7 @@ struct Engine::Impl {
             STRIX_HIP_LAUNCH(Rdna3Layout, embed4_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, X));
         }
         hip_ok(hipGetLastError(), "embed");
-        if (pfc && l0 == 0 && !embed_chunk.empty()) splice_embed_rows(R, seqpar);
+        if (pfc && l0 == 0 && !embed_chunk.empty()) splice_embed_rows(embed_chunk, X, kHc, R, seqpar);
         mark(segEmbed);
         if (!pfc && R > 8) throw std::invalid_argument("layers_forward: decode calls take 1..8 rows");
         if (R > std::max<unsigned>(8U, opt.max_rows)) throw std::invalid_argument("layers_forward: rows > max_rows");
@@ -2703,16 +2704,19 @@ struct Engine::Impl {
     }
     void prefill_mtp_cancel() {
         unit_resume();
+        if (!units.embeds.empty()) (void)hipStreamSynchronize(stream);  // pending uploads read the splice's host rows
         units = UnitSession{};  // the slot stays poisoned (no_mtp) until its next prefill resets it
     }
     void prefill_mtp_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
+        // The splice of this session: taken first, so a refused call does not leave it for a later one.
+        strix::session::EmbedSplice embeds = std::exchange(embed_next, {});
+        embeds.validate(tokens.size(), kHidden);
         if (units.active) throw std::logic_error("prefill_mtp: another prompt's prefill units are in progress");
         if (load_test) throw std::logic_error("STRIX_GLM_LOAD_TEST: load only");
         if (!opt.mtp || layers.empty() || !layers.back().mtp || opt.layers != kLayers || final_norm == nullptr)
             throw std::logic_error("prefill_mtp needs all 45 trunk layers and MTP");
         if (!pf->exact_linears() || reference_prefill_installed())
             throw std::logic_error("prefill_mtp requires an exact chunked PrefillPath (gemv)");
-        if (!embed_next.empty()) throw std::logic_error("prefill_mtp: embedding rows take the plain chunked prefill (Engine::prefill)");
         if (tokens.empty()) throw std::invalid_argument("prefill_mtp: no tokens");
         if (slot >= opt.slots || pos0 > opt.capacity || tokens.size() > opt.capacity - pos0)
             throw std::out_of_range("prefill_mtp: slot / capacity");
@@ -2725,6 +2729,7 @@ struct Engine::Impl {
         units.slot = slot;
         units.pos0 = pos0;
         units.tokens.assign(tokens.begin(), tokens.end());
+        units.embeds = std::move(embeds);
         const strix::session::LayerUnits lu{tokens.size(), static_cast<std::uint32_t>(std::max<std::size_t>(1, opt.max_rows)), opt.layers};
         units.total = static_cast<std::uint32_t>(lu.total());
     }
@@ -2756,7 +2761,15 @@ struct Engine::Impl {
                 }
                 const unsigned l0 = units.layer;
                 const unsigned l1 = unit_pausable(R) ? l0 + std::min<std::uint32_t>(budget, opt.layers - l0) : opt.layers;
-                layers_forward(rows, opt.layers, ForwardKind::Prefill, nullptr, l0, l1);
+                // The embed stage runs in the piece's first layer range only: the chunk splice lives for that call.
+                if (l0 == 0 && !units.embeds.empty()) embed_chunk = units.embeds.slice(c0, c0 + R);
+                try {
+                    layers_forward(rows, opt.layers, ForwardKind::Prefill, nullptr, l0, l1);
+                } catch (...) {
+                    embed_chunk = {};
+                    throw;
+                }
+                embed_chunk = {};
                 units.done += l1 - l0;
                 units.layer = l1;
                 budget = l1 - l0 >= budget ? 0U : budget - (l1 - l0);
@@ -2793,7 +2806,9 @@ struct Engine::Impl {
                 // Only the final prompt row waits for the trunk head's y0.
                 const auto pairs = static_cast<unsigned>(std::min<std::size_t>(R, tokens.size() - c0 - 1));
                 if (pairs != 0) {
-                    mtp_cache(slot, hidden, tokens.subspan(c0 + 1, pairs), pos0 + c0, true);
+                    // The drafter embeds the NEXT prompt row: its provided rows are the run's, one row later.
+                    const strix::session::EmbedSplice next_rows = mtp_pair_splice(units.embeds, c0, pairs);
+                    mtp_cache(slot, hidden, tokens.subspan(c0 + 1, pairs), pos0 + c0, true, &next_rows);
                     unsigned f = 0;
                     hip_ok(hipGetLastError(), "MTP prefill kernels");
                     hip_ok(hipMemcpyAsync(&f, mtp_flag, 4, hipMemcpyDeviceToHost, stream), "MTP prefill flag");
@@ -2870,8 +2885,9 @@ struct Engine::Impl {
 
     // Shared layer-45 body: chunked teacher forcing and the single-row drafter use the same weights/state.
     // Only the caller runs the LM head; no chunk-sized vocabulary scratch is needed.
+    // embeds (prefill only): provided rows among `tokens` (run row j = tokens[j]); they replace the table rows in m_e.
     void mtp_cache(std::uint32_t slot, const float* h, std::span<const std::uint32_t> tokens,
-                   std::uint64_t pos0, bool pfc) {
+                   std::uint64_t pos0, bool pfc, const strix::session::EmbedSplice* embeds = nullptr) {
         const auto R = static_cast<unsigned>(tokens.size());
         select_exchange(pfc ? ForwardKind::Prefill : ForwardKind::Mtp, R);
         LayerW& w = layers.back();
@@ -2893,6 +2909,7 @@ struct Engine::Impl {
         hip_ok(hipMemcpyAsync(pos_d, ps.data(), R * 8, hipMemcpyHostToDevice, stream), "mtp pos");
         const CallCtx c{&lib, rows, slot_d, pos_d, mtp_flag, stream, !pfc, nullptr};
         STRIX_HIP_LAUNCH(Rdna3Layout, embed1_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(embed, tok_d, m_e));
+        if (embeds != nullptr && !embeds->empty()) splice_embed_rows(*embeds, m_e, 1U, R, false);  // every rank holds all drafter rows
         D::GlmNorm::run(m_e, w.enorm, D::WType::BF16, kHidden, kEps, m_en, R, stream);
         D::GlmNorm::run(h, w.hnorm, D::WType::BF16, kHidden, kEps, m_hn, R, stream);
         STRIX_HIP_LAUNCH(Rdna3Layout, cat2_kernel<<<dim3(kHidden / 256, R), 256, 0, stream>>>(m_en, m_hn, m_cat));

@@ -148,6 +148,37 @@ void test_prompt_splice() {
     CHECK(refused(prompt, {axes, span_of(2, I, 200)}, "plain content rows"));
 }
 
+// MTP teacher forcing: drafter pair j of the piece at c0 embeds prompt row c0 + j + 1. Over every piece of a chunked
+// prompt, each prompt row but the first is embedded once, with the provided row where the run has one; the last
+// piece has one pair fewer (its last row pairs with the generated token).
+void test_mtp_pairs() {
+    using Spans = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    for (const auto& [total, spans] : std::vector<std::pair<std::uint32_t, Spans>>{
+             {64, {{5, 20}}}, {64, {{0, 64}}}, {64, {{0, 1}, {63, 1}}}, {61, {{7, 30}, {50, 11}}}, {200, {{10, 150}}}, {40, {}}}) {
+        const Prompt p(total, spans);
+        for (const std::uint32_t max_rows : {8U, 16U, 20U, 64U, 256U}) {
+            std::vector<std::int64_t> embedded(total, kUnwritten);
+            for (std::uint32_t c0 = 0; c0 < total; c0 += max_rows) {
+                const std::uint32_t R = std::min(max_rows, total - c0), pairs = std::min(R, total - c0 - 1U);
+                if (pairs == 0) continue;
+                const session::EmbedSplice next = glm::engine::mtp_pair_splice(p.splice, c0, pairs);
+                next.validate(pairs, kWidth);
+                std::vector<std::int64_t> e(pairs, kTable);
+                std::vector<std::uint16_t> staging;
+                for (const auto& seg : next.segments) staging.insert(staging.end(), seg.data, seg.data + std::size_t{seg.rows} * kWidth);
+                for (const auto& piece : embed_pieces(next, pairs, false, 1, 0))
+                    for (std::uint32_t j = 0; j < piece.rows; ++j) e[piece.run_row + j] = staging[(piece.staged_row + j) * kWidth];
+                for (std::uint32_t j = 0; j < pairs; ++j) {
+                    CHECK(embedded[c0 + 1U + j] == kUnwritten);
+                    embedded[c0 + 1U + j] = e[j];
+                }
+            }
+            CHECK(embedded[0] == kUnwritten);
+            for (std::uint32_t r = 1; r < total; ++r) CHECK(embedded[r] == p.want[r]);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -180,6 +211,7 @@ int main() {
         CHECK(r1.size() == 1 && r1[0].run_row == 20 && r1[0].rows == 3 && r1[0].staged_row == 5);
         CHECK(embed_pieces(session::EmbedSplice{}, 32, true, 2, 1).empty());
         test_prompt_splice();
+        test_mtp_pairs();
     } catch (const std::exception& e) {
         std::printf("FAIL exception: %s\n", e.what());
         return 1;

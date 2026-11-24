@@ -46,6 +46,13 @@ struct EmbedPiece {
     return out;
 }
 
+// MTP teacher forcing over prompt rows [c0, c0 + pairs): drafter pair j joins the trunk hidden of row c0 + j with
+// the embedding of row c0 + j + 1. The provided rows of those embeddings, with pair j as run row j.
+[[nodiscard]] inline session::EmbedSplice mtp_pair_splice(const session::EmbedSplice& run, std::size_t c0, std::size_t pairs) {
+    if (run.empty()) return {};
+    return run.slice(c0 + 1U, c0 + 1U + pairs);
+}
+
 // The splice of a tokenized prompt whose image spans are runs of the spans' image token: the n-th run takes spans[n]
 // and must be exactly as long as it has rows (two images are separated by their end and begin markers, so each is
 // its own run). The splice owns the spans. Throws std::invalid_argument naming the mismatch.

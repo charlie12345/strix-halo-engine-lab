@@ -290,8 +290,9 @@ struct DevicePlan {
     const unsigned* tile_count = nullptr;
     const unsigned* failure = nullptr;
     grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference;  // weight decode form of both projections
-    // Activation operand class (FAST trait): nvfp4 runs NVFP4 layers through the W4A4 tile when the backend has it and
-    // Workspace::nvfp4 holds the image; the caller admits the expert matrices once (admit_w4a4). Other layers: BF16 tile.
+    // Activation operand class (FAST trait): a W4A4 class runs NVFP4 layers through the W4A4 tile when the backend has it;
+    // Workspace::nvfp4 must hold the class's image (else enqueue refuses, invalid value, nothing enqueued); the caller
+    // admits the expert matrices once (admit_w4a4) and passes bf16 for layers it did not admit. MXFP8 layers: BF16 tile.
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16;
     // Schedule of both BF16 projections (never changes bits): automatic = the backend's tall slab schedule where it fits.
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic;
@@ -385,8 +386,11 @@ inline typename Backend::Status enqueue(
         // tile (nvfp4_mse_gate_up: the down projection reads the BF16 activation rows as the bf16 class does); plan, tiles
         // and outputs unchanged.
         if (grouped_w4a4::w4a4_gate_up(plan.activations) &&
-            Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4 &&
-            nvfp4_image_fits<Config>(workspace.nvfp4, plan.rows, plan.activations)) {
+            Config::format(plan.physical_layer) == weight::microscaled::MatrixFormat::nvfp4) {
+            // A selected W4A4 class on an NVFP4 layer binds or is refused before any work is enqueued: a workspace that
+            // cannot hold the class's image (a two-term class on a one-term reservation, say) never runs the BF16 tile
+            // under the class's name. MXFP8 layers take the deliberate BF16 route below.
+            if (!nvfp4_image_fits<Config>(workspace.nvfp4, plan.rows, plan.activations)) return Backend::invalid_value;
             const auto rule = grouped_w4a4::scale_rule(plan.activations);
             // Token image: each token row is quantised once (plan.rows <= assignments rows, so the class's image bytes hold
             // it) and the gate/up projection reads it through the assignment -> token map; the rows of a token's

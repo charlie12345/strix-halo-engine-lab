@@ -149,8 +149,12 @@ std::uint8_t encode_group(const float (&v)[16], float ts, bool mse, std::uint32_
 void two_term_rule() {
     const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
     bool table = true;
-    for (unsigned n = 0; n < 16U; ++n) table = table && act::e2m1_value(n) == ((n & 8U) ? -grid[n & 7U] : grid[n & 7U]);
-    check(table, "e2m1_value decodes the 16 codes (bit 3 sign)");
+    for (unsigned n = 0; n < 16U; ++n) {
+        const float want = (n & 8U) ? -grid[n & 7U] : grid[n & 7U];
+        const float got = strix::weight::scalar_float::e2m1(static_cast<std::uint8_t>(n));
+        table = table && got == want && std::signbit(got) == ((n & 8U) != 0U);
+    }
+    check(table, "the shared E2M1 decoder the residual uses gives the 16 codes (bit 3 sign, code 8 = -0)");
     const float ts = 0.0078125F;
     float exact[16];
     for (unsigned i = 0; i < 16U; ++i) exact[i] = (i & 1U ? -1.F : 1.F) * grid[i % 8U] * act::e4m3_value(0x38U) * ts;
@@ -313,6 +317,105 @@ void magnitudes() {
     for (int i = 0; i < 16; ++i) unit[i] = static_cast<float>(i % 5) * 0.37F - 0.6F;
     check(act::score_normalizer(unit) == 1.F, "in-band group: normalizer is exactly 1 (plain FP32 scores)");
 }
+
+// Host stand-ins for the dispatch (#1247 r27 P2): a backend and a configuration that count every submission, so the test sees
+// whether enqueue binds the selected class, refuses it, or runs the BF16 tile.
+struct Submissions {
+    unsigned quantize = 0U, w4a4 = 0U, gather = 0U, bf16 = 0U, activation = 0U, combine = 0U;
+    [[nodiscard]] unsigned total() const { return quantize + w4a4 + gather + bf16 + activation + combine; }
+};
+Submissions submitted;
+
+struct CountingBackend {
+    using Status = int;
+    using Stream = int;
+    static constexpr Status success = 0, invalid_value = 1;
+    static constexpr unsigned rows_per_tile = 128U;
+    static bool fits(const strix::moe_core::grouped_microscaled::Args&) { return true; }
+    static Status gather(const strix::moe_core::grouped_rows::GatherArgs&, Stream) {
+        ++submitted.gather;
+        return success;
+    }
+    template<strix::weight::microscaled::MatrixFormat>
+    static Status launch_projection(const strix::moe_core::grouped_microscaled::Args&, Stream) {
+        ++submitted.bf16;
+        return success;
+    }
+    static Status quantize_w4a4(const gw::QuantizeArgs<float>&, Stream, gw::ScaleRule) {
+        ++submitted.quantize;
+        return success;
+    }
+    static Status quantize_w4a4(const gw::QuantizeArgs<std::uint16_t>&, Stream, gw::ScaleRule) {
+        ++submitted.quantize;
+        return success;
+    }
+    static Status launch_w4a4(const gw::Args&, Stream) {
+        ++submitted.w4a4;
+        return success;
+    }
+};
+
+struct CountingConfig {
+    static constexpr unsigned hidden = 256U, intermediate = 128U, top_k = 2U, experts = 4U, layers = 2U, max_rows = 16U;
+    // Layer 0 NVFP4, layer 1 MXFP8.
+    static constexpr strix::weight::microscaled::MatrixFormat format(unsigned layer) {
+        return layer == 0U ? strix::weight::microscaled::MatrixFormat::nvfp4 : strix::weight::microscaled::MatrixFormat::mxfp8;
+    }
+    struct Activation {
+        static constexpr float gate_cap = 0.F, up_cap = 0.F;  // read by enqueue's epilogue form (this backend has none)
+        static int launch(const strix::moe_core::expert_activation::Args&, int) {
+            ++submitted.activation;
+            return 0;
+        }
+    };
+    struct Combine {
+        static int launch(const strix::moe_core::grouped_rows::CombineArgs&, int) {
+            ++submitted.combine;
+            return 0;
+        }
+    };
+};
+
+// A selected W4A4 class on an NVFP4 layer binds or is refused before any submission; it never runs the BF16 tile silently.
+void selected_class_binds_or_refuses() {
+    constexpr unsigned rows = 4U, assignments = rows * CountingConfig::top_k;
+    const std::vector<std::uint32_t> assignment_rows{0U, 1U, 2U, 3U, 3U, 2U, 1U, 0U};
+    const std::vector<std::uint32_t> combine_rows{0U, 7U, 1U, 6U, 2U, 5U, 3U, 4U};
+    const std::vector<float> weights(assignments, 0.5F);
+    const std::vector<gd::TileRows> tiles(1U);
+    const unsigned tile_count = 1U, failure = 0U;
+    std::vector<float> input(std::size_t{rows} * CountingConfig::hidden), output(input.size());
+    const auto need = gd::workspace_requirement<CountingConfig>(rows, gw::Activations::nvfp4_r2);
+    const auto one_term = gd::workspace_requirement<CountingConfig>(rows).nvfp4;
+    std::vector<std::uint16_t> bf16(need.bf16);
+    std::vector<float> fp32(need.fp32);
+    std::vector<std::uint8_t> storage(need.nvfp4 + 256U);
+    auto* base = storage.data() + (256U - reinterpret_cast<std::uintptr_t>(storage.data()) % 256U) % 256U;
+    check(one_term < need.nvfp4, "the two-term class needs more image bytes than the one-term reservation");
+    const auto run = [&](unsigned layer, gw::Activations activations, std::size_t image_bytes) {
+        submitted = {};
+        gd::DevicePlan plan{layer, rows, assignment_rows, combine_rows, weights, tiles, tiles, &tile_count, &failure};
+        plan.activations = activations;
+        const gd::Workspace workspace{bf16, fp32, {}, std::span<std::uint8_t>(base, image_bytes)};
+        return gd::enqueue<CountingConfig, CountingBackend>(plan, input, output, workspace, 0);
+    };
+    for (const auto a : {gw::Activations::nvfp4_r2, gw::Activations::nvfp4_mse_r2, gw::Activations::nvfp4_mse_r2_gate_up}) {
+        check(run(0U, a, one_term) == CountingBackend::invalid_value && submitted.total() == 0U,
+              "a two-term class on a one-term image is refused before any submission (no silent BF16 tile)");
+        check(run(0U, a, need.nvfp4) == CountingBackend::success && submitted.w4a4 >= 1U && submitted.gather == 0U,
+              "a two-term class on its own image runs the W4A4 tile");
+    }
+    check(run(0U, gw::Activations::nvfp4, one_term) == CountingBackend::success && submitted.quantize == 2U &&
+              submitted.w4a4 == 2U && submitted.bf16 == 0U && submitted.gather == 0U,
+          "the one-term class binds on the one-term image (both projections W4A4)");
+    check(run(0U, gw::Activations::nvfp4, 0U) == CountingBackend::invalid_value && submitted.total() == 0U,
+          "a W4A4 class with no image is refused on an NVFP4 layer");
+    check(run(1U, gw::Activations::nvfp4_r2, 0U) == CountingBackend::success && submitted.w4a4 == 0U &&
+              submitted.gather == 1U && submitted.bf16 == 2U,
+          "an MXFP8 layer keeps the deliberate BF16 route under a W4A4 class");
+    check(run(0U, gw::Activations::bf16, 0U) == CountingBackend::success && submitted.w4a4 == 0U && submitted.bf16 == 2U,
+          "the BF16 class runs the BF16 tile");
+}
 }  // namespace
 
 int main() {
@@ -321,6 +424,7 @@ int main() {
     magnitudes();
     classes();
     workspace_images();
+    selected_class_binds_or_refuses();
     pooled([](Rng& r) { return r.gauss(); }, "gaussian rows: mse@1 cuts the group error by >= 15 %", 0.15);
     pooled([](Rng& r) { return r.laplace(); }, "laplace rows: mse@1 cuts the group error by >= 10 %", 0.10);
     two_term_rule();

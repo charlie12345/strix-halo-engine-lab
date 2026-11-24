@@ -155,6 +155,26 @@ void two_term_rule() {
         table = table && got == want && std::signbit(got) == ((n & 8U) != 0U);
     }
     check(table, "the shared E2M1 decoder the residual uses gives the 16 codes (bit 3 sign, code 8 = -0)");
+    {  // act::residual against an independent expectation: literal code values and one FP32 FMA, fixed packed vectors
+        const float lit[16] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F, -0.F, -0.5F, -1.F, -1.5F, -2.F, -3.F, -4.F, -6.F};
+        const std::uint32_t words[3][2] = {{0x76543210U, 0xFEDCBA98U}, {0x89ABCDEFU, 0x01234567U}, {0x80808080U, 0x08080808U}};
+        const float scales[3] = {0.0078125F, 1.25F, 3.0e-3F};
+        bool same = true;
+        for (unsigned w = 0; w < 3U; ++w)
+            for (const float scale : scales) {
+                float v[16], r[16];
+                for (unsigned i = 0; i < 16U; ++i) v[i] = (i % 3U == 0U ? -0.F : 0.37F * static_cast<float>(i) - 2.F) * scale * 2.F;
+                act::residual(v, scale, words[w], r);
+                for (unsigned i = 0; i < 16U; ++i) {
+                    const float want = -std::fma(lit[(words[w][i / 8U] >> (4U * (i % 8U))) & 15U], scale, -v[i]);
+                    std::uint32_t a, b;
+                    std::memcpy(&a, &r[i], 4);
+                    std::memcpy(&b, &want, 4);
+                    same = same && a == b;
+                }
+            }
+        check(same, "residual bitwise (sign of zero included) the literal-value FP32 FMA on fixed packed vectors");
+    }
     const float ts = 0.0078125F;
     float exact[16];
     for (unsigned i = 0; i < 16U; ++i) exact[i] = (i & 1U ? -1.F : 1.F) * grid[i % 8U] * act::e4m3_value(0x38U) * ts;

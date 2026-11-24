@@ -72,7 +72,7 @@ public:
     // greedy chunks.
     MiniResidentDecoder(const std::string& checkpoint, unsigned max_positions, unsigned max_chunk_rows,
                         bool packed_decode = false, bool step_graphs = MiniResidentBackend::default_step_graphs,
-                        weight::FormatId storage = weight::kBf16WeightStorage, unsigned verify_rows = 0U,
+                        weight::RoleStorage storage = {}, unsigned verify_rows = 0U,
                         bool capture_draft_taps = false, unsigned decode_rows = 1U, unsigned tail_rows = 0U)
         : prefill_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           tail_rows_(admitted_tail_rows(prefill_rows_, tail_rows <= std::numeric_limits<unsigned>::max() - prefill_rows_
@@ -94,8 +94,8 @@ public:
           greedy_(decode_rows_, kOutputVocabulary) {
 #if defined(__HIPCC__)
         // EXACT screened greedy head (core/hip_screened_head.hpp) over the BF16 head: same token and status as the
-        // full head. The compact (Q8_0) head keeps its own full head.
-        if (!weights_.compact() && core::hip_screened_head::enabled()) {
+        // full head. A compact head keeps its own full head.
+        if (!weights_.compact_head_bound() && core::hip_screened_head::enabled()) {
             screen_.emplace(weights_.bf16("unembed.weight").data(), kOutputVocabulary, kHiddenWidth, kLogitSoftcap,
                             stream_.get());
             if (!screen_->usable()) screen_.reset();
@@ -195,6 +195,7 @@ public:
             throw std::invalid_argument("Inkling 2 Mini: invalid decode batch size");
 
         last_logit_rows_ = 0U;
+        pending_scores_ = {};  // every forward below rewrites hidden_
         groups_.clear();
         for (std::size_t row = 0; row < slots.size(); ++row) {
             auto& state = slots_.at(slots[row])->state();
@@ -251,7 +252,11 @@ public:
     // output softcap). Lane `row` follows the slot order of that call. Valid until the next decode_slots().
     [[nodiscard]] bool final_logits_supported() const { return draft_taps_.span().empty(); }
     [[nodiscard]] std::uint32_t logit_width() const { return kOutputVocabulary; }
+    // The last pick was screened and its score row waits for the first score read (materialize_scores): a greedy
+    // caller that never reads scores never pays the full head projection.
+    [[nodiscard]] bool scores_deferred() const noexcept { return pending_scores_.input != nullptr; }
     void read_slot_logits(std::uint32_t row, std::span<float> output) {
+        materialize_scores();
         if (row >= last_logit_rows_ || output.size() != kOutputVocabulary)
             throw std::logic_error("Inkling 2 Mini: no final logits for that decode lane");
         reserve_staged_logits(kOutputVocabulary);
@@ -259,6 +264,19 @@ public:
                        std::size_t{kOutputVocabulary} * sizeof(float), mini_gpu::device_to_host, stream_.get());
         mini_gpu::synchronize(stream_.get());
         std::copy_n(staged_logits_.get(), kOutputVocabulary, output.data());
+    }
+
+    // Read-only view of one lane's device state for state digests (tests, receipts): its cache plan, K and V
+    // planes, recurrent histories and committed frontier. Slots never move; the view holds no copy.
+    struct SlotView {
+        const MiniSessionStatePlan& plan;
+        session::KvRowPlanes kv;
+        std::span<const float> history;
+        unsigned committed;
+    };
+    [[nodiscard]] SlotView slot_view(unsigned slot) {
+        auto& owner = *slots_.at(slot);
+        return {layout_, owner.planes(), owner.history(), owner.state().committed()};
     }
 
     [[nodiscard]] unsigned max_verify_rows() const { return std::min(max_rows_, kMaxVerifyRows); }
@@ -323,6 +341,7 @@ public:
 
     void prefill_gate_rows(std::span<const unsigned> prompt, std::span<float> logits) {
         backend_.abandon_capture();
+        pending_scores_ = {};
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, {});
         const auto rows = logits.size() / kOutputVocabulary;
@@ -512,7 +531,7 @@ private:
         }
     }
 
-    [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::FormatId storage) {
+    [[nodiscard]] static MiniResidentWeightPlan read_plan(const std::string& path, weight::RoleStorage storage) {
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
@@ -548,7 +567,7 @@ private:
         const auto stream = stream_.get();
         if (rows == 0U || (softcap && rows != 1U) || row_scores.size() / kOutputVocabulary < rows)
             throw std::invalid_argument("invalid head projection rows");
-        if (weights_.compact()) {
+        if (weights_.compact_head_bound()) {
             const auto& head = weights_.compact_head();
             if (softcap)
                 backend_.check(core::enqueue_resident_q8_softcap_head(head, kOutputVocabulary, input, 1U,
@@ -595,6 +614,7 @@ private:
         const auto elements = ids.size() * kHiddenWidth;
         const auto embeddings = embeddings_.span().first(elements);
         reserve_staged_logits(host_logits.size());
+        pending_scores_ = {};
         const bool multi_pick = verify_top.size() > 1U;
         if (multi_pick && !verify_greedy_) {
             if (!verify_logits_) verify_logits_.emplace(std::size_t{max_verify_rows()} * kLogitPitch);
@@ -672,7 +692,21 @@ private:
             throw;
         }
         if (!host_logits.empty()) std::copy_n(staged_logits_.get(), host_logits.size(), host_logits.data());
+#if defined(__HIPCC__)
+        // The screened pick skipped the score row; a later score read recomputes it from this head input.
+        if (screened) pending_scores_ = {hidden_.data() + elements - kHiddenWidth, logits_.data()};
+#endif
         return token;
+    }
+
+    // The score row a screened pick skipped: recomputed on the first score read (read_slot_logits, e.g. a sampled
+    // served lane) from the head input that pick used (still in hidden_: no forward ran since), through the same
+    // project_head the unscreened pick runs, so the reader gets the scores of this step, never those of an earlier one.
+    void materialize_scores() {
+        if (pending_scores_.input == nullptr) return;
+        const auto pending = pending_scores_;
+        pending_scores_ = {};
+        project_head(pending.input, std::span<float>(pending.scores, kOutputVocabulary), true);
     }
 
     static unsigned admitted_tail_rows(unsigned chunk_rows, unsigned tail_rows) noexcept {
@@ -706,6 +740,11 @@ private:
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
     std::optional<core::ResidentGreedy> verify_greedy_;
+    // Head input and score row of the last pick that skipped its scores (materialize_scores).
+    struct PendingScores {
+        const float* input = nullptr;
+        float* scores = nullptr;
+    } pending_scores_;
 #if defined(__HIPCC__)
     std::optional<core::hip_screened_head::ResidentScreen> screen_;
     bool screened_graph_{false};

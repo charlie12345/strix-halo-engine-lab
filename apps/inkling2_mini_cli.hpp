@@ -185,11 +185,14 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {
     output << tier.summary() << (device ? " reference BASE\n" : "\n");
     if (const auto notice = tier.tier_notice(); !notice.empty()) output << notice << '\n';
+    for (const auto& entry : tier.entries)
+        if (!entry.ladder.empty()) output << entry.ladder << '\n';
 }
 
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {
     output << "strix-weight-load/v1 " << plan.policy.name << '@' << plan.policy.revision
            << ' ' << plan.storage.name << '@' << plan.storage.revision << '\n';
+    if (!plan.regime_rows().empty()) output << weight::weight_load_regime_receipt(plan) << '\n';
 }
 
 // The evaluation-order null receipt of one gate window. A null arm whose window

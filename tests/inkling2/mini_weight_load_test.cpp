@@ -152,7 +152,7 @@ void test_selection() {
         weight::WeightLoadRequest request{profile::Name::standard, scope, formats, true, true};
         const auto resolve = [&] {
             return mini::resolve_mini_weight_load(request.tier, request.scope, request.consumer_formats,
-                                                  request.enabled, request.allow_pending, receipts);
+                                                  request.enabled, request.allow_pending, receipts, 4096, 1);
         };
         require(resolve().storage == weight::kBf16WeightStorage, "explicit qualification opt-in changed EXACT");
         request.tier = profile::Name::fast;
@@ -196,7 +196,9 @@ void test_committed_rows() {
         require(row.policy.name == mini::kMiniWeightLoadPolicy.id.name &&
                     row.policy.revision == mini::kMiniWeightLoadPolicy.id.revision &&
                     row.scope.regime == mini::kMiniResidentRegime, "decision row policy/regime");
-        auto plan = mini::resolve_mini_weight_load(profile::Name::fast, row.scope, formats, true, false);
+        auto plan = mini::resolve_mini_weight_load(row.evidence.tier, row.scope, formats, true, false,
+                                                  mini::kMiniWeightLoadDecisions, row.evidence.min_context,
+                                                  row.evidence.min_lanes);
         require(plan.status == profile::Status::set && plan.storage == weight::kQ8WeightStorage &&
                     plan.gate_v2_pass == row.gate_v2_pass, "FAST default did not select the qualified Q8_0 row");
         require(mini::resolve_mini_weight_load(profile::Name::standard, row.scope, formats, true, false).storage ==

@@ -76,6 +76,7 @@ struct SerialGenerationLoad {
     // Rows the final prefill chunk takes beyond prefill_chunk (prompt_windows::append_chunks tail_rows); the decoder's
     // chunk capacity is prefill_chunk + prefill_tail. Zero unless the family opts in (prefill_tail_divisor).
     std::uint32_t prefill_tail = 0;
+    std::uint32_t prompt_tokens = 0;
 };
 
 // Image input of --messages: owns the family's media adapter (e.g. vision::ApiMediaBridge over its VisionAdapter,

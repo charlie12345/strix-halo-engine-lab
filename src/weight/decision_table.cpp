@@ -58,27 +58,44 @@ const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy& poli
     return find_decision([&policy](Id stored) { return policy_has_id(policy, stored); }, scope, decisions);
 }
 
-const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
-                                                std::span<const WeightLoadDecision> decisions, std::uint32_t context,
-                                                const WeightLoadDecision** outside_band) {
-    if (outside_band) *outside_band = nullptr;
+void match_weight_load_evidence(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
+                                std::span<const WeightLoadDecision> decisions, const WeightLoadRequest& request,
+                                FormatId reference, RegimeWeightLoad& entry) {
     if (scope.device_class.empty() || scope.compiler_id.empty() || scope.regime.empty() ||
-        scope.build == Digest256{} || scope.checkpoint == Digest256{}) return nullptr;
-    const WeightLoadDecision* gate_only = nullptr;
+        scope.build == Digest256{} || scope.checkpoint == Digest256{}) return;
+    const auto first_context = request.first_context ? request.first_context : request.context;
+    const auto first_lanes = request.first_lanes ? request.first_lanes : request.lanes;
+    if (first_context == 0 || first_lanes == 0 || first_context > request.context || first_lanes > request.lanes) return;
+    const WeightLoadDecision* blocking = nullptr;
     for (const auto& row : decisions) {
         const auto& s = row.scope;
+        const auto& e = row.evidence;
         if (!policy_has_id(policy, row.policy) || s.backend != scope.backend || s.device_class != scope.device_class ||
             s.compiler_id != scope.compiler_id || s.regime != scope.regime || !(s.build == scope.build) ||
-            !(s.checkpoint == scope.checkpoint) || row.gate_v2_pass == Digest256{}) continue;
-        const auto band = row.evidence.max_context;
-        if (band != 0U && (context == 0U || context > band)) {
-            if (outside_band && !*outside_band) *outside_band = &row;
+            !(s.checkpoint == scope.checkpoint) || row.gate_v2_pass == Digest256{} ||
+            e.tier != request.tier || !(e.reference == reference)) continue;
+        const auto max_context = e.max_context == 0 ? std::numeric_limits<std::uint32_t>::max() : e.max_context;
+        const bool covers = profile::ladder_band(first_context, e.min_context, max_context, first_lanes, e.min_lanes, e.max_lanes) &&
+                            profile::ladder_band(request.context, e.min_context, max_context, request.lanes, e.min_lanes, e.max_lanes);
+        const bool timed = !(row.measured_gain == Digest256{});
+        const bool faster = timed && !e.receipt.empty() && profile::ladder_gain(e.speedup, e.noise);
+        if (!covers) {
+            if (!entry.outside_band) entry.outside_band = &row;
+            // A negative sub-band vetoes a covering positive receipt for a shared resident image.
+            if (timed && !faster &&
+                profile::ladder_band(std::max(first_context, e.min_context), e.min_context, std::min(request.context, max_context),
+                                     std::max(first_lanes, e.min_lanes), e.min_lanes, std::min(request.lanes, e.max_lanes)))
+                blocking = &row;
             continue;
         }
-        if (!(row.measured_gain == Digest256{})) return &row;
-        if (!gate_only) gate_only = &row;
+        if (!entry.row || (faster && !entry.faster)) entry.row = &row;
+        entry.faster |= faster;
+        if (timed && !faster) blocking = &row;
     }
-    return gate_only;
+    if (blocking) {
+        entry.row = blocking;
+        entry.faster = false;
+    }
 }
 
 Status validate_qualification(const Qualification& q) {

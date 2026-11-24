@@ -64,3 +64,6 @@ inline constexpr ::strix::profile::RegimeGate fast_regimes[] = {
     {"moe_route_bf16", "1", 1, 8192, "gated in the same FAST bundle (route value 1 captured in every FAST run)"},
     {"gdn_fp16_chunk", "1", 1, 8192, "gated in the same FAST bundle (identity fp16-v1+hcout16+gdnchunk16+qsab1536)"},
 };
+
+// Workload speed receipts for automatic profile cells. Quality gates above also apply.
+inline constexpr std::span<const ::strix::profile::LadderRow> ladder_rows{};

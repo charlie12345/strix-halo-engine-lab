@@ -1316,10 +1316,9 @@ static int run_decode_entry(
         // the rank is required only when the pair pipe runs.
         pair_arguments = strix::pair::strip_flags(argc, argv, "STRIX_QWEN_PF_PIPE", strix::qwen_pp::pipe_enabled());
     }
-    auto options =
-        parse_options(
-            argc,
-            argv, true);
+    const auto* bound = strix::device::hip_bound();
+    auto options = parse_options(argc, argv, true, {}, strix::decode_cli::DecodeAssets::verify,
+                                 bound ? std::string_view(bound->visible.arch) : std::string_view{});
     QwenDeployment deployment;
     if (options.deployment_spec && options.deployment_spec->topology == "pipeline") {
         const char* r = std::getenv("STRIX_QWEN_PF_PIPE_RANK");

@@ -20,7 +20,17 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     const bool runnable = !policy.id.name.empty() && policy.id.revision &&
         policy.target == kQ8WeightStorage && find_format(registry, policy.target) &&
         std::ranges::find(request.consumer_formats, policy.target) != request.consumer_formats.end();
-    // One image serves every listed regime: a full row in some regime selects it, and every regime needs a gate row.
+    // TURBO inherits the actual FAST image. The current policy has one alternative storage,
+    // so when FAST already chose it there is no further storage change to qualify.
+    auto lower = plan;
+    if (request.tier == profile::Name::turbo) {
+        auto fast = request;
+        fast.tier = profile::Name::fast;
+        fast.allow_pending = false;
+        lower = resolve_weight_load(registry, policy, fast, decisions);
+        if (lower.storage == policy.target) return lower;
+    }
+    // A fixed image must be faster in every regime that will consume it.
     const std::string_view single[] = {request.scope.regime};
     const auto regimes = request.regimes.empty() ? std::span<const std::string_view>(single) : request.regimes;
     const WeightLoadDecision* decision = nullptr;
@@ -36,14 +46,12 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         if (!runnable) continue;
         auto scope = request.scope;
         scope.regime = regime;
-        entry.row = find_weight_load_gate(policy, scope, decisions, request.context, &entry.outside_band);
+        match_weight_load_evidence(policy, scope, decisions, request, lower.storage, entry);
         if (!entry.row) {
             missing = true;
             continue;
         }
-        // Ladder rule: a full row needs its timing receipt AND a measured speedup beyond noise over the tier below.
-        const bool full = !(entry.row->measured_gain == Digest256{}) &&
-                          profile::ladder_gain(entry.row->evidence.speedup, entry.row->evidence.noise);
+        const bool full = entry.faster;
         entry.qualification = full ? RegimeQualification::full : RegimeQualification::gate_only;
         if (!full) missing = true;  // a gate-only regime would run the lossy image with no measured gain
         if (full && !decision) decision = entry.row;
@@ -88,8 +96,11 @@ std::string weight_load_regime_receipt(const WeightLoadPlan& plan) {
             out += ':';
             out += entry.row->evidence.receipt;
         } else if (!entry.row && entry.outside_band) {
-            out += ":outside-band<=";
-            out += std::to_string(entry.outside_band->evidence.max_context);
+            const auto& evidence = entry.outside_band->evidence;
+            out += ":outside-band context=" + std::to_string(evidence.min_context) + ".." +
+                   (evidence.max_context ? std::to_string(evidence.max_context) : "*") +
+                   " lanes=" + std::to_string(evidence.min_lanes) + ".." +
+                   (evidence.max_lanes == profile::kNoLaneBound ? "*" : std::to_string(evidence.max_lanes));
         }
     }
     return out;

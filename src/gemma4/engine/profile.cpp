@@ -251,6 +251,10 @@ std::string Resolution::json() const {
         escape(out, kind_name(entry.lever->kind));
         out += ",\"source\":";
         escape(out, entry.lever->source);
+        if (!entry.ladder.empty()) {
+            out += ",\"ladder\":";
+            escape(out, entry.ladder);
+        }
         out += '}';
         if (entry.status == Status::pending) {
             if (!pending.empty()) pending += ',';
@@ -282,6 +286,9 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
     for (const auto& lever : levers) {
         if (!(lever.apps & unsigned(app))) continue;
         const auto& wanted = lever.value[column];
+        const auto admit = [&](unsigned c) {
+            return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
+        };
         const bool required = lever.required[column] && !wanted.empty();
         const auto refuse = [&](std::string_view why) {
             throw std::invalid_argument(std::string("profile '") + profile::name(profile) + "' requires " +
@@ -308,33 +315,30 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
             else { entry.value = std::string(lever.builtin); entry.status = Status::absent; }
         } else if (wanted.empty()) {
             continue;
-        } else if (const auto admission = strix::profile::admit_column(
-                       lever.ready[column], lever.runnable[column], out.allow_pending);
-                   admission != strix::profile::Status::set) {
-            if (admission == strix::profile::Status::unqualified) {
-                // Benchmarking only: run the pending implementation and stamp the receipt.
-                entry.status = Status::unqualified;
+        } else {
+            auto cell = strix::profile::select_profile_cell(lever, inputs.ladder, profile, inputs.regime, admit);
+            entry.ladder = std::move(cell.route);
+            const auto admission = admit(column);
+            if ((!entry.ladder.empty() && cell.value == lever.builtin) ||
+                admission == strix::profile::Status::pending) {
+                if (lever.builtin_unqualified)
+                    refuse(std::string(lever.source) + (entry.ladder.empty()
+                        ? (lever.runnable[column] ? " (--allow-pending runs the unqualified implementation, benchmarking only)" : "")
+                        : ": " + entry.ladder));
+                entry.target = lever.target.empty() ? wanted : lever.target;
+                entry.value = lever.builtin;
+                entry.status = Status::pending;
+            } else if (admission == strix::profile::Status::set && wanted == lever.builtin) {
+                entry.status = Status::builtin;
+            } else {
+                if (admission == strix::profile::Status::unqualified) entry.status = Status::unqualified;
                 if (lever.asset) {
                     if (asset) entry.value = *asset;
-                    else { entry.value = std::string(lever.builtin); entry.status = Status::absent; }
+                    else if (required && admission == strix::profile::Status::set)
+                        refuse("pass " + std::string(lever.option) + (app == App::engine ? "" : " (not available in this app)"));
+                    else { entry.value = lever.builtin; entry.status = Status::absent; }
                 }
-            } else if (lever.builtin_unqualified) {
-                // A bench tool whose fallback is itself unqualified: refuse rather than run it silently.
-                refuse(std::string(lever.source) + (lever.runnable[column] ?
-                    " (--allow-pending runs the unqualified implementation, benchmarking only)" : ""));
-            } else {
-                // Never refuse for a pending row: it is not applied, the builtin keeps running, the
-                // receipt lists the declared target and apply() prints one stderr line.
-                entry.target = std::string(lever.target.empty() ? wanted : lever.target);
-                entry.value = std::string(lever.builtin);
-                entry.status = Status::pending;
             }
-        } else if (wanted == lever.builtin) {
-            entry.status = Status::builtin;
-        } else if (lever.asset) {
-            if (asset) entry.value = *asset;
-            else if (required) refuse("pass " + std::string(lever.option) + (app == App::engine ? "" : " (not available in this app)"));
-            else { entry.value = std::string(lever.builtin); entry.status = Status::absent; }
         }
         if ((entry.status == Status::explicit_env || entry.status == Status::explicit_cli) && !lever.asset &&
             entry.value != lever.builtin) {
@@ -357,6 +361,7 @@ std::vector<std::string> Resolution::notices() const {
         if (entry.status == Status::pending)
             out.push_back(std::string("profile ") + profile::name(name) + ": " + std::string(entry.lever->name) + " pending " +
                           entry.target + " (" + entry.value + " runs)");
+    for (const auto& entry : entries) if (!entry.ladder.empty()) out.push_back(entry.ladder);
     return out;
 }
 

@@ -271,7 +271,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     const auto chunk = std::min(options.prefill_chunk, prompt_size);
     auto decoder = family.load({checkpoint, positions, chunk, options.packed_decode, verify_rows,
                                 verify_rows ? options.speculation : CliSpeculation::off,
-                                prefill_tail_rows(prompt_size, chunk, family.prefill_tail_divisor)});
+                                prefill_tail_rows(prompt_size, chunk, family.prefill_tail_divisor), prompt_size});
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 

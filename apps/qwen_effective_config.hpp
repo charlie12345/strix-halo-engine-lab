@@ -603,6 +603,7 @@ inline void admit_product_profile(Options& o) {
         entry.target = std::string(entry.lever->target);
         entry.value = std::string(entry.lever->builtin);
         entry.reason = reason;
+        if (!entry.ladder.empty()) entry.ladder += " / declined by route: " + reason + " -> default=" + entry.value;
     }
 }
 
@@ -1893,6 +1894,7 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
             entry.target = std::string(entry.lever->target);
             entry.value = std::string(entry.lever->builtin);
             entry.reason = o.prefill_moe_route_bf16_reason;
+            if (!entry.ladder.empty()) entry.ladder += " / declined by route: " + entry.reason + " -> default=" + entry.value;
             result.environment.erase(std::string(entry.lever->env));
         }
     } else if (!route_error.empty()) result.error = std::move(route_error);

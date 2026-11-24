@@ -54,28 +54,35 @@ int main() {
                 "fast: the wide cell is pending, effective value equals exact");
         require(win(fast, app).target == "64-row FAST wide windows (dense-q8a8-f16-v1)", "pending target reported");
         require(!sp::applied(win(fast, app).status), "fast applies no window lever without allow-pending");
-        // the A4W4 layer table: qualified fast cell (environment lever, no argument), left alone by exact / default
-        require(sp::applied(a4(fast).status) && a4(fast).value == "48-63", "fast applies the qualified A4W4 layer table");
+        require(!sp::applied(a4(fast).status) && a4(fast).value == a4(exact).value &&
+                    !a4(fast).ladder.empty(), "A4W4 declines at unknown context and device");
         require(!sp::applied(a4(exact).status) && !sp::applied(a4(dflt).status) && !sp::applied(a4(none).status),
                 "exact / default / no word leave the A4W4 layer table alone");
         std::vector<std::pair<std::string, std::string>> put;
         sp::apply(fast.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });
+        require(put.empty(), "unknown regime exports no lossy switch");
+        const sp::LadderRow timing{"a4w4_layers", "48-63", sp::Name::fast, sp::Phase::prefill, "fixture",
+                                   8192, 8192, 1, 1, 1.04, 0.01, "fixture"};
+        auto engine = hp::engine(app);
+        engine.ladder = std::span(&timing, 1);
+        const auto measured = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture"});
+        sp::apply(measured.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });
         require(put == std::vector<std::pair<std::string, std::string>>{{"STRIX_DENSE_A4W4_LAYERS", "48-63"}},
-                "fast exports exactly STRIX_DENSE_A4W4_LAYERS=48-63");
+                "a matching measured run exports the FAST layer table");
         const sp::Lookup user_env = [](const char* key) -> const char* {
             return std::string(key) == "STRIX_DENSE_A4W4_LAYERS" ? "none" : nullptr;
         };
         const auto off = run(app, with_fast, user_env);
         require(a4(off).value == "none" && !sp::applied(a4(off).status), "an explicit STRIX_DENSE_A4W4_LAYERS wins over fast");
-        // allow-pending (flag and env) applies the runnable pending cell, in front of the user's options.
+        // Allow-pending authorizes a quality experiment; a profile-owned cell still needs timing evidence.
         Args allow{"--profile", "fast", "--allow-pending"};
         const auto applied = run(app, allow);
-        require(applied.args == Args{opt, "64"}, "fast --allow-pending adds the 64-row option in front");
-        require(win(applied, app).status == sp::Status::unqualified, "allow-pending is stamped unqualified");
+        require(applied.args.empty(), "allow-pending does not invent timing evidence");
+        require(win(applied, app).status == sp::Status::pending, "unmeasured window remains pending");
         const sp::Lookup allow_env = [](const char* key) -> const char* {
             return std::string(key) == std::string(hp::kAllowEnv) ? "1" : nullptr;
         };
-        require(run(app, with_fast, allow_env).args.size() == user.size() + 2U, "allow-pending env applies the cell");
+        require(run(app, with_fast, allow_env).args.size() == user.size(), "allow-pending env still needs a timing receipt");
         // explicit option wins over the word and stays in the user's arguments.
         Args explicit_args{"--profile", "fast", "--allow-pending", opt, "16", "--gen", "8"};
         const auto won = run(app, explicit_args);

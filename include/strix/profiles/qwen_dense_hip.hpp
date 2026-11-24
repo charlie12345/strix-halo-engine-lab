@@ -67,9 +67,10 @@ struct Result {
 
 // Pure form (host-testable): args without argv[0]. The word and --allow-pending are consumed; the options the
 // profile applies are put in front, so the app's own parser sees the user's explicit option last.
-inline Result resolve_args(const sp::Engine& eng, std::vector<std::string> args, const sp::Lookup& env = {}) {
+inline Result resolve_args(const sp::Engine& eng, std::vector<std::string> args, const sp::Lookup& env = {}, const sp::Regime& regime = {}) {
     sp::Inputs in;
     in.env = env;
+    in.regime = regime;
     sp::take_options(eng, args, in);
     if (in.profile == sp::Name::turbo)
         throw std::invalid_argument(std::string(eng.tag) +
@@ -96,10 +97,12 @@ inline bool take(App app, int& argc, char**& argv) {
         return true;
     }
     sp::apply(result.resolution);
-    for (const auto& entry : result.resolution.entries)
+    for (const auto& entry : result.resolution.entries) {
+        if (!entry.ladder.empty()) std::fprintf(stderr, "%s\n", entry.ladder.c_str());
         if (entry.status == sp::Status::pending)
             std::fprintf(stderr, "profile %s: %s pending %s (%s runs)\n", sp::name(result.resolution.profile),
                          std::string(entry.lever->name).c_str(), entry.target.c_str(), entry.value.c_str());
+    }
     storage.assign(1U, argc > 0 ? argv[0] : "");
     storage.insert(storage.end(), result.args.begin(), result.args.end());
     pointers.clear();

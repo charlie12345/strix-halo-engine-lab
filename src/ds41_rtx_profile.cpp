@@ -210,6 +210,10 @@ std::string Resolution::json(const std::function<std::string(std::string_view)>&
         escape(out, kind_name(e.lever->kind));
         out += ",\"source\":";
         escape(out, e.lever->source);
+        if (!e.ladder.empty()) {
+            out += ",\"ladder\":";
+            escape(out, e.ladder);
+        }
         out += '}';
         std::string& list = e.status == Status::pending ? pend : unq;
         if (e.status == Status::pending || e.status == Status::unqualified) {
@@ -322,10 +326,17 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
         } else if (wanted.empty()) {
             continue;  // the profile leaves it alone
         } else {
-            const auto admission = strix::profile::admit_column(lever.ready[column], lever.runnable[column], allow_pending);
-            if (admission != strix::profile::Status::set) {
+            const auto admit = [&](unsigned c) {
+                return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
+            };
+            const auto admission = admit(column);
+            auto cell = strix::profile::select_profile_cell(lever, inputs.ladder, profile, inputs.regime, admit);
+            entry.ladder = std::move(cell.route);
+            if (!entry.ladder.empty()) entry.value = cell.value;
+            if (admission != strix::profile::Status::set || (!entry.ladder.empty() && entry.value == lever.builtin)) {
                 entry.wanted = std::string(wanted);
-                entry.status = admission == strix::profile::Status::pending ? Status::pending : Status::unqualified;
+                entry.status = admission == strix::profile::Status::unqualified && entry.value != lever.builtin
+                    ? Status::unqualified : Status::pending;
                 if (entry.status == Status::pending) entry.value = std::string(lever.builtin);
             }
         }

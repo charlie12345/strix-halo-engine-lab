@@ -49,9 +49,12 @@ int main() {
     const Lever pending{"item", "SWITCH", "--item", {"0", "1", ""}, "0",
         Kind::bit_changing, {}, {false, true, false}, "candidate", "0", "pending"};
     const std::array table{pending};
-    const Engine engine{"test", "ALLOW", table};
+    constexpr Regime measured{Phase::prefill, 8, 1, "fixture"};
+    const LadderRow timing{"item", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
+    const Engine engine{"test", "ALLOW", table, false, {}, {}, std::span(&timing, 1)};
     Inputs inputs;
     inputs.env = env;
+    inputs.regime = measured;
     inputs.profile = Name::fast;
     const auto refused = resolve(engine, inputs);
     require(refused.entries[0].status == Status::pending, "FAST pending refusal");
@@ -135,7 +138,8 @@ int main() {
     const Engine shipped{"deepseek41-pair", "ALLOW", strix::deepseek41::pair_defaults::profile_table};
     inputs.profile = Name::fast;
     const auto shipped_fast = resolve(shipped, inputs);
-    require(shipped_fast.find("moe_relaxed")->status == Status::provisional, "shipped table positional compatibility");
+    require(shipped_fast.find("moe_relaxed")->status == Status::pending &&
+            !shipped_fast.find("moe_relaxed")->ladder.empty(), "unscoped shipped candidate declines");
     check_peer(legacy, [](auto out, auto in) { std::memcpy(in.data(), out.data(), out.size()); });
     bool mismatch = false;
     try {
@@ -202,8 +206,10 @@ int main() {
                   .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false}, .target = "x",
                   .off = "", .source = "gate pending"},
         };
+        static constexpr LadderRow applied_timing{"applied", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
+        in.regime = measured;
         static constexpr Engine two{.tag = "two-engine", .allow_env = "STRIX_TEST_ALLOW", .table = rows,
-                                    .quality_rows = false, .turbo_version = "two-turbo-v1"};
+                                    .quality_rows = false, .turbo_version = "two-turbo-v1", .ladder = std::span(&applied_timing, 1)};
         const auto applied = resolve(two, in);
         require(applied.summary() == "profile fast levers applied=1", "applied lever listed, pending one not");
         require(applied.tier_notice().empty() && applied.receipt_lines().size() == 1U, "no loud line once applied");
@@ -254,8 +260,9 @@ int main() {
                       .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false},
                       .runnable = {true, true, true, true}, .target = "x", .off = "", .source = "gate pending"},
             };
+            static constexpr LadderRow candidate_timing{"runnable", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
             static constexpr Engine unqualified{.tag = "unq-engine", .allow_env = "STRIX_TEST_ALLOW",
-                                                .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1"};
+                                                .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1", .ladder = std::span(&candidate_timing, 1)};
             Inputs pending_in = in;
             pending_in.allow_pending = true;
             const auto unq = resolve(unqualified, pending_in);

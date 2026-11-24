@@ -2568,11 +2568,12 @@ if(BUILD_TESTING)
     add_test(NAME strix-profile-fast-set-tests COMMAND strix-profile-fast-set-tests)
     set_tests_properties(strix-profile-fast-set-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
     # Ladder rule over every engine table: no regime resolves to a cell not measured faster than the cell below it.
-    add_executable(strix-profile-ladder-tests tests/profile_ladder_tests.cpp src/minimax/engine/mm_defaults.cpp)
-    target_link_libraries(strix-profile-ladder-tests PRIVATE strix_core strix_serve_json strix-weight)
+    add_executable(strix-profile-ladder-tests tests/profile_ladder_tests.cpp src/minimax/engine/mm_defaults.cpp
+        src/ds41_rtx_profile.cpp src/gemma4/engine/profile.cpp src/cuda/models/glm/producer/profile.cpp)
+    target_link_libraries(strix-profile-ladder-tests PRIVATE strix_core strix_serve_json strix-weight strix_model_registry)
     target_include_directories(strix-profile-ladder-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     strix_target_warnings(strix-profile-ladder-tests)
-    add_test(NAME strix-profile-ladder-tests COMMAND strix-profile-ladder-tests)
+    add_test(NAME strix-profile-ladder-tests COMMAND strix-profile-ladder-tests "${CMAKE_CURRENT_SOURCE_DIR}/models/registry.toml")
     set_tests_properties(strix-profile-ladder-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
 
     # FAST gate v2, engine side: shared MoE route record / replay / one-ulp null tap.

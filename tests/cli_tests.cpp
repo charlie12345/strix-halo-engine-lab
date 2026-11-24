@@ -256,7 +256,7 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     auto command = resolve(req, entries, matrix, probes, "bin", exists, &dense);
     require(command.executable.stem() == "strix-cuda-qwen35-decode", "launches the qualified backend route");
     require(command.args == std::vector<std::string>{"--model", "model.gguf", "--n-gen", "32", "--profile",
-        "fast", "--kv", "fp8", "--print-effective-config"}, "TURBO and native config arguments");
+        "turbo", "--print-effective-config"}, "TURBO and native config arguments");
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};
     refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "requires the turbo preset");
@@ -289,7 +289,10 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         .provisional = {false, true, false, false}};
     profile::Inputs inputs;
     inputs.profile = Name::fast;
-    const profile::Engine engine{"preset-test", "", std::span(&candidate, 1)};
+    const profile::LadderRow timing{candidate.name, candidate.value[1], Name::fast, profile::Phase::prefill,
+                                    "fixture", 8, 8, 1, 1, 1.02, 0.001, "fixture timing"};
+    const profile::Engine engine{"preset-test", "", std::span(&candidate, 1), false, {}, {}, std::span(&timing, 1)};
+    inputs.regime = {profile::Phase::prefill, 8, 1, "fixture"};
     require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::provisional,
             "legacy native profiles retain experimental admission");
     const bool preset_before_scope = profile::model_preset();

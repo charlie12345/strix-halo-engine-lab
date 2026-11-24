@@ -201,6 +201,7 @@ std::vector<std::string> Resolution::notices() const {
         if (e.status == Status::pending)
             out.push_back("profile " + p + ": " + std::string(e.lever->name) + " pending, not used (" + std::string(e.lever->source) + ")");
     if (qualification() != "qualified") out.push_back("profile " + p + ": " + qualification() + " (--allow-pending: benchmarks only)");
+    for (const auto& entry : entries) if (!entry.ladder.empty()) out.push_back(entry.ladder);
     return out;
 }
 std::string Resolution::json(const std::function<std::string(std::string_view)>& effective) const {
@@ -240,6 +241,10 @@ std::string Resolution::json(const std::function<std::string(std::string_view)>&
         escape(out, kind_name(e.lever->kind));
         out += ",\"source\":";
         escape(out, e.lever->source);
+        if (!e.ladder.empty()) {
+            out += ",\"ladder\":";
+            escape(out, e.ladder);
+        }
         out += '}';
         std::string& list = e.status == Status::pending ? pend : unq;
         if (e.status == Status::pending || e.status == Status::unqualified) {
@@ -310,18 +315,24 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
             entry.status = Status::explicit_env;
         } else if (wanted.empty()) {
             continue;  // the profile leaves it alone
-        } else if (!lever.ready[column]) {
-            entry.wanted = std::string(wanted);
-            if (allow_pending && lever.runnable[column]) {
-                entry.value = std::string(wanted);  // benchmarks only: the receipt is stamped unqualified
-                entry.status = Status::unqualified;
-            } else {
-                entry.value = std::string(lever.builtin);  // refused: the builtin form runs
-                entry.status = Status::pending;
-            }
         } else {
-            entry.value = std::string(wanted);
-            entry.status = Status::profile;
+            namespace shared = strix::profile;
+            const auto admit = [&](unsigned c) { return shared::column_admission(lever, c, allow_pending, false); };
+            auto cell = shared::select_profile_cell(lever, inputs.ladder, static_cast<shared::Name>(profile),
+                                                    inputs.regime, admit);
+            entry.ladder = std::move(cell.route);
+            const auto admission = admit(column);
+            if (admission == shared::Status::pending || (!entry.ladder.empty() && cell.value == lever.builtin)) {
+                entry.wanted = wanted;
+                entry.value = lever.builtin;
+                entry.status = Status::pending;
+            } else {
+                entry.value = cell.value;
+                if (admission == shared::Status::unqualified) {
+                    entry.wanted = wanted;
+                    entry.status = Status::unqualified;
+                }
+            }
         }
         out.entries.push_back(std::move(entry));
     }

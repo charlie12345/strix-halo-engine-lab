@@ -23,7 +23,7 @@ inline MiniServeCohort make_mini_device_cohort(
     unsigned row_limit = std::numeric_limits<unsigned>::max()) {
     const auto rows = std::min(opt.slots ? opt.slots : opt.prefill_rows, row_limit);
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options);
-    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view());
+    const auto weights = resolve_mini_resident_weight_load(opt.tier, opt.weight_options, scope.view(), opt.context, rows);
     auto decoder = std::make_unique<MiniResidentDecoder>(opt.checkpoint, opt.context, opt.prefill_rows,
         false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows);
     decoder->set_moe_w4a4(opt.moe_w4a4);
@@ -35,7 +35,14 @@ inline MiniServeCohort make_mini_device_cohort(
 #if !defined(__HIPCC__)
     const auto programs = decoder->cohort_programs();
 #endif
-    auto cohort = std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(std::move(decoder), opt.context, rows, lanes);
+    using Cohort = serve::FixedKvCohort<MiniResidentDecoder>;
+    Cohort::PrefillPolicy policy;
+    if (!kMiniProfile.ladder.empty())
+        policy = [options = opt.weight_options, device = scope.device_class](MiniResidentDecoder& resident,
+                                                                            std::uint64_t tokens, bool first) {
+            resident.set_moe_w4a4(mini_prompt_moe(options, device, tokens, first));
+        };
+    auto cohort = std::make_unique<Cohort>(std::move(decoder), opt.context, rows, lanes, std::move(policy));
     std::cerr << "Inkling " << backend << " slots " << lanes << " context " << opt.context
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
@@ -46,6 +53,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " widths " << exec::cohort_widths_name(programs.widths)
 #endif
               << " weight_status " << profile::status_name(weights.status) << " (" << weights.reason << ")\n";
+    if (!weights.regime_rows().empty()) std::cerr << weight::weight_load_regime_receipt(weights) << '\n';
     return {std::move(cohort), weights};
 }
 

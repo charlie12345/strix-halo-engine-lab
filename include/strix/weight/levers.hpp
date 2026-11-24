@@ -117,11 +117,14 @@ inline constexpr std::string_view kDecodeRegime = "decode";
 // when it was banded by context (0: not banded); a banded row applies only to an engine whose resident context is
 // known and inside the band. `speedup` is the measured throughput of the regime with the policy storage over the tier
 // below (same build, device, regime; the timing receipt behind measured_gain) and `noise` its stated margin: the ladder
-// rule (strix/engine_profile.hpp ladder_gain) admits the row only when the speedup clears 1 + max(noise, floor).
+// rule admits the row only when the speedup clears 1 + noise for the matched band and reference.
 struct WeightLoadEvidence {
     std::string_view receipt, date;
     std::uint32_t rows = 0, max_context = 0;
     double speedup = 0.0, noise = 0.0;
+    std::uint32_t min_context = 1, min_lanes = 1, max_lanes = profile::kNoLaneBound;
+    profile::Name tier = profile::Name::fast;
+    FormatId reference = kBf16WeightStorage;  // effective storage of the measured tier below
 };
 
 // A row with a zero measured_gain records a gate v2 PASS without a speed gain in its regime: it never selects the
@@ -147,7 +150,10 @@ struct WeightLoadRequest {
     // run lossy weights slower than (or no faster than) the tier below. An engine that keeps a second image asks each
     // regime alone and routes per regime.
     std::span<const std::string_view> regimes{};
-    std::uint32_t context = 0;  // resident context capacity in tokens (0: unknown; banded rows then never apply)
+    std::uint32_t context = 0;  // actual context (0: unknown)
+    std::uint32_t lanes = 0;    // actual lane count (0: unknown)
+    // With a fixed image, the upper and lower endpoints must fit the same measured band.
+    std::uint32_t first_context = 0, first_lanes = 0;  // 0: single point at context/lanes
 };
 
 // What one regime contributed to a plan: a full row (gate v2 PASS + measured gain), a gate-only row, or nothing.
@@ -161,7 +167,8 @@ struct RegimeWeightLoad {
     std::string_view regime;
     RegimeQualification qualification = RegimeQualification::none;
     const WeightLoadDecision* row = nullptr;          // matched row (nullptr: none)
-    const WeightLoadDecision* outside_band = nullptr;  // a row of this regime whose context band misses the request
+    const WeightLoadDecision* outside_band = nullptr;
+    bool faster = false;  // every matching timing row must establish a gain
 };
 
 inline constexpr std::size_t kMaxWeightLoadRegimes = 4;
@@ -209,18 +216,15 @@ const WeightLoadDecision* find_weight_load_decision(Id, const WeightLoadScope&,
 // As above, also matching rows recorded under the policy's legacy id.
 const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy&, const WeightLoadScope&,
                                                   std::span<const WeightLoadDecision>);
-// The gate v2 PASS row of `scope.regime` (full rows first, then gate-only), matched like the above and inside its
-// context band for `context` (0: unknown). `outside_band` (optional) receives a row that matched but whose band
-// misses `context`.
-const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy&, const WeightLoadScope&,
-                                                std::span<const WeightLoadDecision>, std::uint32_t context,
-                                                const WeightLoadDecision** outside_band = nullptr);
+// Gate and timing evidence for this exact execution scope and lower-tier storage.
+void match_weight_load_evidence(const WeightLoadPolicy&, const WeightLoadScope&,
+                                std::span<const WeightLoadDecision>, const WeightLoadRequest&,
+                                FormatId reference, RegimeWeightLoad&);
 WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
                                    const WeightLoadRequest&, std::span<const WeightLoadDecision>);
 
 // Per-regime receipt line of a plan: 'strix-weight-load-regimes/v1 <policy id> <storage id> <status> <regime>=<q>'
-// per regime, <q> = full | gate-only | none, then ':<receipt id>' of the matched row, or 'none:outside-band<=N' when
-// a row's context band misses the engine's context. Says which regime rows are active and why the others are not.
+// per regime, <q> = full | gate-only | none, followed by the matching receipt or the missed context/lane band.
 [[nodiscard]] std::string weight_load_regime_receipt(const WeightLoadPlan& plan);
 
 // Before a device is known (a route description): the committed rows of `policy` for `backend`, per regime,

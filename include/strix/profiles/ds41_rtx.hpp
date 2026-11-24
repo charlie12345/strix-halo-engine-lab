@@ -76,6 +76,7 @@ struct Entry {
     std::string value;   // the value the resolution asks for ("on", "off", an option's argument, ...)
     Status status = Status::profile;
     std::string wanted;  // pending / unqualified: the profile's value
+    std::string ladder{};
 };
 
 struct Resolution {
@@ -103,6 +104,8 @@ using strix::profile::Lookup;
 struct Inputs {
     std::vector<std::string> args;  // the launch options (argv[2..])
     Lookup env;                     // environment lookup; empty: the process environment
+    strix::profile::Regime regime{};
+    std::span<const strix::profile::LadderRow> ladder{};
 };
 // --profile NAME (else STRIX_DS41_PROFILE, else default) and --allow-pending (or STRIX_DS41_PROFILE_ALLOW_PENDING=1) out
 // of the options; throws std::invalid_argument on a bad name or a missing value.

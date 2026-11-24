@@ -41,7 +41,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
         (options.qualify_q8 || !kMiniWeightLoadDecisions.empty());
     MiniWeightScope out;
     out.backend = kMiniWeightBackend;
-    if (!needed) return out;
+    if (!needed && (!compact_tier || kMiniProfile.ladder.empty())) return out;
     int ordinal = 0;
 #if defined(__HIPCC__)
     if (hipGetDevice(&ordinal) != hipSuccess) return out;
@@ -56,6 +56,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 #endif
     for (const auto& device : visible)
         if (device.ordinal == ordinal) out.device_class = device.arch;
+    if (!needed) return out;
     out.regime = kMiniResidentRegime;
     out.build = identity;
     out.checkpoint = weight::Digest256{sha256_file_content(model).bytes};

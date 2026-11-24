@@ -61,6 +61,7 @@ struct Entry {
     std::string value{};  // effective value (explicit, profile, discovered asset or builtin)
     Status status = Status::set;
     std::string target{}; // pending: the declared target that is not applied yet
+    std::string ladder{};
 };
 struct Resolution {
     Name name = Name::standard;
@@ -90,6 +91,8 @@ struct Inputs {
     Pairs assets;               // discovered assets for asset levers: {lever name, path}
     Lookup env;                 // environment lookup; empty: the process environment
     bool allow_pending = false; // --allow-pending; STRIX_G4_PROFILE_ALLOW_PENDING=1 also enables it
+    strix::profile::Regime regime{};
+    std::span<const strix::profile::LadderRow> ladder{};
 };
 // Throws std::invalid_argument naming the pending piece when a required column is unavailable.
 [[nodiscard]] Resolution resolve(Name profile, App app, const Inputs& inputs = {}, std::span<const Lever> table = levers());

@@ -482,8 +482,9 @@ void CohortDecoder::step() {
             ? prompt_slice_rows(want, units[0], l.prompt_left(), backend_.prompt_tail_rows())
             : piece_rows(l, want, full_slice);
         const double t0 = now_ms();
-        backend_.prefill(plan.prompt.front().lane,
-                         std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows), l.prompt_read == 0);
+        backend_.prefill_scoped(plan.prompt.front().lane,
+                                std::span<const std::uint32_t>(l.request.prompt.data() + l.prompt_read, prompt_rows),
+                                l.prompt_read == 0, l.request.prompt.size());
         prompt_ms = now_ms() - t0;
         prompt_ms_ += prompt_ms;
         l.prompt_read += prompt_rows;

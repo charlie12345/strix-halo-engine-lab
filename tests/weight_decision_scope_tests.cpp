@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdio>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -113,7 +114,7 @@ int main() {
 
     // The resolver and its receipt line use the generic id, whatever key the decision row was stored under.
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
-    weight::WeightLoadRequest request{strix::profile::Name::fast, scope, formats, true, false};
+    weight::WeightLoadRequest request{strix::profile::Name::fast, scope, formats, true, false, {}, 4096, 1};
     const auto plan = weight::resolve_weight_load(weight::builtin_registry(), attention_head, request,
                                                   std::span(renamed).first(1));
     ok &= check(plan.status == strix::profile::Status::set && plan.storage == weight::kQ8WeightStorage,
@@ -140,7 +141,7 @@ int main() {
         const weight::WeightLoadEvidence pf_timed{"receipts/prefill", "2026-11-23", 2457, 0, 1.05, 0.02};
         const weight::WeightLoadEvidence pf_slower{"receipts/prefill", "2026-11-23", 2457, 0, 0.997, 0.02};
         const auto& q8 = weight::kAttentionHeadQ8Policy;
-        weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, 32768};
+        weight::WeightLoadRequest r{strix::profile::Name::fast, scope, formats, true, false, regimes, 32768, 1};
         const auto resolve = [&](std::span<const weight::WeightLoadDecision> table) {
             return weight::resolve_weight_load(weight::builtin_registry(), q8, r, table);
         };
@@ -189,7 +190,7 @@ int main() {
         p = resolve(full_both);
         ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == nullptr &&
                         p.regimes[1].outside_band == &full_both[1], "a context outside the gate band is refused");
-        ok &= check(weight::weight_load_regime_receipt(p).ends_with("decode=none:outside-band<=65536"),
+        ok &= check(weight::weight_load_regime_receipt(p).ends_with("decode=none:outside-band context=1..65536 lanes=1..*"),
                     "outside-band receipt");
         r.context = 0;
         ok &= check(resolve(full_both).storage == weight::kBf16WeightStorage, "unknown context never meets a banded row");
@@ -206,5 +207,62 @@ int main() {
         r.scope = prefill;
         ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
     }
+    request.tier = strix::profile::Name::fast;
+    auto narrow = renamed.front();
+    narrow.evidence.min_context = 4096;
+    narrow.evidence.max_context = 8192;
+    narrow.evidence.min_lanes = 2;
+    narrow.evidence.max_lanes = 4;
+    narrow.evidence.speedup = 1.008;
+    narrow.evidence.noise = 0.002;
+    const auto selected = [&](const weight::WeightLoadRequest& run, const weight::WeightLoadDecision& row) {
+        return weight::resolve_weight_load(weight::builtin_registry(), attention_head, run, std::span(&row, 1)).storage;
+    };
+    request.lanes = 2;
+    ok &= check(selected(request, narrow) == weight::kQ8WeightStorage, "lower band edge and small measured gain");
+    request.lanes = 4;
+    request.context = 8192;
+    ok &= check(selected(request, narrow) == weight::kQ8WeightStorage, "upper band edge");
+    request.lanes = 5;
+    ok &= check(selected(request, narrow) == weight::kBf16WeightStorage, "lane above band declines");
+    request.lanes = 1;
+    ok &= check(selected(request, narrow) == weight::kBf16WeightStorage, "lane below band declines");
+    request.lanes = 2;
+    request.context = 4095;
+    ok &= check(selected(request, narrow) == weight::kBf16WeightStorage, "context below band declines");
+    request.context = 4096;
+    auto other_device = request;
+    other_device.scope.device_class = "other";
+    ok &= check(selected(other_device, narrow) == weight::kBf16WeightStorage, "other device declines");
+    auto malformed = narrow;
+    malformed.evidence.receipt = {};
+    ok &= check(selected(request, malformed) == weight::kBf16WeightStorage, "missing receipt declines");
+    malformed = narrow;
+    malformed.evidence.noise = std::numeric_limits<double>::quiet_NaN();
+    ok &= check(selected(request, malformed) == weight::kBf16WeightStorage, "NaN noise declines");
+    malformed = narrow;
+    malformed.evidence.speedup = std::numeric_limits<double>::infinity();
+    ok &= check(selected(request, malformed) == weight::kBf16WeightStorage, "infinite speedup declines");
+    auto envelope = request;
+    envelope.lanes = 4;
+    envelope.first_lanes = 1;
+    ok &= check(selected(envelope, narrow) == weight::kBf16WeightStorage, "an image needs the entire lane envelope");
+    envelope.first_lanes = 2;
+    ok &= check(selected(envelope, narrow) == weight::kQ8WeightStorage, "covering image receipt applies");
+    auto slower_subset = narrow;
+    slower_subset.evidence.min_lanes = slower_subset.evidence.max_lanes = 3;
+    slower_subset.evidence.speedup = 0.95;
+    const std::array overlapping{narrow, slower_subset};
+    ok &= check(weight::resolve_weight_load(weight::builtin_registry(), attention_head, envelope, overlapping).storage ==
+                    weight::kBf16WeightStorage, "a measured losing sub-band vetoes the image");
+    request.tier = strix::profile::Name::turbo;
+    ok &= check(selected(request, narrow) == weight::kQ8WeightStorage, "TURBO inherits the effective FAST storage");
+    auto upper = narrow;
+    upper.evidence.tier = strix::profile::Name::turbo;
+    upper.evidence.reference = weight::kQ8WeightStorage;
+    ok &= check(selected(request, upper) == weight::kBf16WeightStorage, "wrong FAST reference declines");
+    upper.evidence.reference = weight::kBf16WeightStorage;
+    ok &= check(selected(request, upper) == weight::kQ8WeightStorage, "correct effective FAST reference applies");
+    if (ok) std::puts("weight decision scope tests: PASS");
     return ok ? 0 : 1;
 }

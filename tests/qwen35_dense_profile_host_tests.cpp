@@ -60,7 +60,16 @@ Options run(std::optional<Name> profile, TurboWeights w, qp::Route route, std::u
             std::string* text = nullptr, std::span<const qp::Qualified> rows = qp::qualified) {
     Options o;
     o.turbo_weights = w;
-    const auto r = qp::resolve(profile, qp::regime_of(o, route, tokens), cli, rows);
+    auto regime = qp::regime_of(o, route, tokens);
+    regime.arch = "fixture";
+    std::vector<strix::profile::LadderRow> ladder;
+    for (const auto& row : rows)
+        if (row.weights == regime.weights && row.route == route)
+            ladder.push_back({row.gate.lever, row.gate.value, Name::fast, strix::profile::Phase::prefill, regime.arch,
+                              std::max<std::uint64_t>(1, row.gate.min_prompt_tokens), row.gate.max_prompt_tokens,
+                              1, 1, 1.1, 0.02, "fixture timing"});
+    const qp::TurboEvidence evidence[] = {{regime.weights, route, {}, {}, ladder}};
+    const auto r = qp::resolve(profile, regime, cli, rows, evidence);
     qp::apply(o, *r);
     if (text) *text = qp::describe(*r);
     return o;
@@ -128,10 +137,11 @@ int main() {
             Options want;
             want.turbo_weights = w;
             Options fast_want = want;
-            fast_want.nvfp4_split = Split::fast;
+            if (t != 0) fast_want.nvfp4_split = Split::fast;
             check(run(Name::fast, w, qp::Route::windows, t, {}, &text) == fast_want, "FAST windows: split_k fast only");
-            check(text.find("split_k = fast [profile] fast (nvfp4-splitk-fast-v1, identity -skf1)") != std::string::npos,
-                  "FAST windows text names nvfp4-splitk-fast-v1");
+            check(text.find(t == 0 ? "split_k = exact [pending]" :
+                           "split_k = fast [profile] fast (nvfp4-splitk-fast-v1, identity -skf1)") != std::string::npos,
+                  "FAST windows text names the effective split-K schedule");
             check(text.find("prefill_") == std::string::npos, "FAST windows text lists a lever not offered there");
             std::string off_text;
             check(run(Name::fast, w, qp::Route::windows, t, {{"split_k", "exact"}}, &off_text) == want, "--split-k exact under fast != EXACT");
@@ -298,10 +308,12 @@ int main() {
         constexpr std::array identities{qp::kKvIdentity, qp::kAttnIdentity,
                                        qp::kDenseIdentity, qp::kDraftIdentity};
         std::array<p::GateRecord, identities.size()> gates{};
-        std::array<p::RegimeRecord, identities.size()> gains{};
+        constexpr std::array keys{"kv_fp8", "decode_attn8", "dense_activation", "drafter_window"};
+        std::array<p::LadderRow, identities.size()> gains{};
         for (std::size_t i = 0; i < identities.size(); ++i) {
             gates[i] = {identities[i], qp::model::name, "fixture", V::pass, classes, Name::turbo};
-            gains[i] = {identities[i], regime.device, {strix::lever::Axis::context, 8192, false, true}, 0.1, "fixture gain"};
+            gains[i] = {keys[i], "", Name::turbo, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
+                        1.1, 0.01, "fixture gain"};
         }
         const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, "fixture", gates, gains}};
         const auto resolve = [&](const qp::Regime& r, const Pairs& opts = {}) {
@@ -311,10 +323,13 @@ int main() {
         qp::apply(options, *admitted);
         kv = qp::resolve_kv(Name::turbo, {}, regime.route, explicit_arms);
         qp::observe_kv(kv, *admitted);
-        check(admitted->find("split_k")->value == "fast" && admitted->find("drafter_window")->value == "15" &&
+        check(admitted->find("split_k")->value == "exact" && admitted->find("drafter_window")->value == "15" &&
                   options.decode_attn8 && options.dense_activation && kv.source == qp::kvp::Source::tier,
-              "matching TURBO and speed receipts enable all four defaults on top of FAST");
+              "matching receipts enable all four TURBO cells over the effective FAST fallback");
         check(resolve(regime, {{"decode_attn8", "off"}})->find("kv_fp8")->value == "native", "off switch disables the paired default");
+        gains[1].max_lanes = 0;
+        check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs both timing records");
+        gains[1].max_lanes = 1;
         gates[1].tier = Name::fast;
         check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs both TURBO records");
         gates[1].tier = Name::turbo;

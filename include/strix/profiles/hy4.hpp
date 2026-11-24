@@ -146,7 +146,10 @@ struct Resolved {
     }
     out->engine = engine();
     out->engine.table = std::span<const sp::Lever>(out->rows);
-    out->resolution = sp::resolve(out->engine, inputs);
+    auto scoped = inputs;
+    scoped.regime = {sp::Phase::prefill, regime.prompt_tokens, 1,
+                     regime.device == Device::unknown ? std::string_view{} : device_name(regime.device)};
+    out->resolution = sp::resolve(out->engine, scoped);
     for (auto& entry : out->resolution.entries) {
         if (entry.status != sp::Status::pending && entry.status != sp::Status::unqualified) continue;
         std::string where;

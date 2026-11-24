@@ -45,7 +45,14 @@ constexpr p::Lever kRows[] = {
      .kind = p::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, false},
      .target = "fp16 head", .off = "off", .source = "pending fixture"},
 };
-const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1"};
+constexpr p::Regime kRegime{p::Phase::prefill, 8, 1, "fixture"};
+constexpr p::LadderRow kTiming[] = {
+    {"flash", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
+    {"replay", "128", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
+    {"dense", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
+    {"dense", "0", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
+};
+const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1", {}, kTiming};
 const p::Engine kNoTurbo{"no-turbo-fixture", "", kRows, false};
 
 p::Lookup env_of(const std::map<std::string, std::string>& vars) {
@@ -63,6 +70,7 @@ const p::Entry& entry(const p::Resolution& r, const char* name) {
 p::Resolution through(std::vector<std::string> args, const std::map<std::string, std::string>& vars) {
     p::Inputs in;
     in.env = env_of(vars);
+    in.regime = kRegime;
     p::take_options(kEngine, args, in);
     return p::resolve(kEngine, in);
 }
@@ -94,7 +102,7 @@ void turbo_column() {
     const auto r = through({"--profile", "turbo"}, vars);
     require(entry(r, "flash").value == "1" && entry(r, "flash").status == p::Status::set, "empty turbo cell takes the fast cell");
     require(entry(r, "replay").value == "128" && entry(r, "replay").status == p::Status::provisional, "turbo-only provisional lever runs");
-    require(entry(r, "dense").value == "0" && entry(r, "dense").status == p::Status::builtin, "turbo cell = off keeps a FAST lever out");
+    require(entry(r, "dense").value == "0" && entry(r, "dense").status == p::Status::set, "measured TURBO can select the builtin over FAST");
     require(entry(r, "head").status == p::Status::pending && entry(r, "head").value == "default", "unrunnable turbo cell is pending");
     require(r.describe().find("profile version fixture-turbo-v1") != std::string::npos, "describe prints the versioned name");
     require(r.describe().find("requested fp16") != std::string::npos, "describe prints requested beside effective");
@@ -264,8 +272,10 @@ void qwen_adapter() {
     const auto def = q::resolve(p::Name::standard, in);
     require(!turbo.cache_namespace().empty() && def.cache_namespace().empty(), "qwen turbo has its own cache space");
     require(turbo.cache_namespace().find("turbo=qwen-turbo-v1") == 0, "qwen namespace names qwen-turbo-v1");
+    const auto fast = q::resolve(p::Name::fast, in);
     const auto* qsa = turbo.find("qsa_budget");
-    require(qsa != nullptr && qsa->value == "1536", "qwen turbo inherits the FAST lever cells");
+    require(qsa && qsa->value == fast.find("qsa_budget")->value && qsa->value == qsa->lever->builtin,
+            "Qwen TURBO inherits the effective FAST fallback when neither tier is measured");
     // Every Qwen lever off: still a turbo namespace, never the default's.
     std::map<std::string, std::string> off;
     for (const auto& row : q::levers()) if (!row.env.empty() && !row.off.empty()) off[std::string(row.env)] = std::string(row.off);

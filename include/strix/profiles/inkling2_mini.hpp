@@ -24,9 +24,11 @@ inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDeci
 inline weight::WeightLoadPlan resolve_mini_weight_load(
     profile::Name tier, const weight::WeightLoadScope& scope,
     std::span<const weight::FormatId> consumer_formats, bool enabled, bool qualify,
-    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions) {
+    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions,
+    std::uint32_t context = 0, std::uint32_t lanes = 0, std::uint32_t first_context = 0,
+    std::uint32_t first_lanes = 0) {
     return weight::resolve_weight_load(weight::builtin_registry(), kMiniWeightLoadPolicy,
-        {tier, scope, consumer_formats, enabled, qualify}, decisions);
+        {tier, scope, consumer_formats, enabled, qualify, {}, context, lanes, first_context, first_lanes}, decisions);
 }
 
 // FAST lever: W4A4 experts. Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4

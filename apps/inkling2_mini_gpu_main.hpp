@@ -86,7 +86,8 @@ private:
     std::optional<MiniResidentDSpark> drafter_;
 };
 
-inline void run_gate(const char* checkpoint, const Options& options, const weight::WeightLoadPlan& weights
+inline void run_gate(const char* checkpoint, const Options& options, const weight::WeightLoadPlan& weights,
+                     std::string_view device
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      , bool step_program, bool epilogue_fusion, unsigned latency_forms
 #endif
@@ -131,6 +132,10 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     session::write_load_timing(std::cout, load_start);
     std::vector<float> logits(std::size_t{options.gate_rows} * kOutputVocabulary);
     for (const auto& window : windows) {
+        if (!kMiniProfile.ladder.empty()) {
+            const auto prompt_tokens = mode == session::HeadGateMode::decode ? window.ids.size() - options.gate_rows : window.ids.size();
+            decoder.set_moe_w4a4(mini_prompt_moe(options.weights, device, prompt_tokens));
+        }
         const auto dump = out / (window.name + "-" + options.gate_arm + ".f32");
         const auto ids_dump = out / (window.name + "-" + options.gate_arm + ".ids");
         const auto log = out / "log" / (window.name + "." + options.gate_arm + ".stderr");
@@ -274,7 +279,7 @@ int main(int argc, char** argv) {
         auto options = cli::parse(argc, argv, family);
 #endif
         const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
-        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
+        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), kMaxContext, 1);
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
@@ -285,14 +290,15 @@ int main(int argc, char** argv) {
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,
                                                                         program_options.latency_forms),
-                           moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {
-                return program_load(load, moe_w4a4);
+                           &options, device = scope.device_class](const serve::SerialGenerationLoad& load) {
+                return program_load(load, mini_prompt_moe(options.weights, device, load.prompt_tokens, false, &options.tier));
             };
         else
 #endif
         family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
-                       moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4);
+                       &options, device = scope.device_class](const serve::SerialGenerationLoad& load) {
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark,
+                                                            mini_prompt_moe(options.weights, device, load.prompt_tokens, false, &options.tier));
         };
         const auto write_profile = [&] {
             cli::write_profile(options.tier, std::cerr, true);
@@ -313,7 +319,7 @@ int main(int argc, char** argv) {
         };
         if (options.gate_manifest) {
             write_profile();
-            cli::run_gate(argv[1], options, weights
+            cli::run_gate(argv[1], options, weights, scope.device_class
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                           , step_program, program_options.epilogue_fusion, program_options.latency_forms
 #endif

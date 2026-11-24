@@ -3,6 +3,8 @@
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <iostream>
+
 namespace strix::inkling2 {
 
 struct MiniWeightOptions {
@@ -56,14 +58,32 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     return tier;
 }
 
+// One scoped selection for serial CLI, the gate and each served prompt. Explicit
+// selection was already validated during parsing and keeps its precedence.
+inline moe_core::grouped_w4a4::Activations mini_prompt_moe(const MiniWeightOptions& options,
+                                                         std::string_view device, std::uint64_t tokens,
+                                                         bool print = true, profile::Resolution* receipt = nullptr) {
+    auto inputs = options.tier;
+    inputs.regime = {profile::Phase::prefill, tokens, 1, device};
+    auto selected = profile::resolve(kMiniProfile, inputs);
+    if (print)
+        for (const auto& entry : selected.entries)
+            if (!entry.ladder.empty()) std::cerr << entry.ladder << '\n';
+    const auto arithmetic = mini_moe_w4a4_class(selected);
+    if (receipt) *receipt = std::move(selected);
+    return arithmetic;
+}
+
 inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }
 
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
-                                                              const weight::WeightLoadScope& scope) {
+                                                              const weight::WeightLoadScope& scope,
+                                                              std::uint32_t context = 0, std::uint32_t lanes = 0) {
     constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
-    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8);
+    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8,
+                                                kMiniWeightLoadDecisions, context, lanes, 1, 1);
     if (options.qualify_q8 && plan.storage != weight::kQ8WeightStorage)
         throw std::invalid_argument("native Q8_0 weights were not admitted");
     return plan;

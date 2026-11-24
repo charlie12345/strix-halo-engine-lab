@@ -444,8 +444,12 @@ void catalogue() {
     // Only the fixture has a catalogue-to-native binding. Exercise both arms
     // with today's effective profile function and verify an untouched row too.
     constexpr std::array bindings{p::CatalogBinding{fast_name, "index_proj_wmma", "1", "0"}};
+    const p::LadderRow fixture_timing{"index_proj_wmma", "1", p::Name::fast, p::Phase::prefill, "fixture",
+                                      8, 8, 1, 1, 1.01, 0.005, "fixture"};
     q::Inputs native_inputs;
     native_inputs.env = env();
+    native_inputs.regime = {p::Phase::prefill, 8, 1, "fixture"};
+    native_inputs.ladder = std::span(&fixture_timing, 1);
     const auto native = [&](auto rows) { return q::resolve(p::Name::fast, native_inputs, rows); };
     std::vector<q::Lever> storage;
     const auto off_cells = p::effective_cells(cli_result, bindings);

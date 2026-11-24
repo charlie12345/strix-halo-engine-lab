@@ -3,13 +3,24 @@
 // at every probe regime of its ladder rows and fails when a regime would run a cell that is not measured faster than
 // the cell below it (or a ladder row is malformed).
 #include "strix/engine_profile.hpp"
+#include "strix/cuda/qwen_options.hpp"
 #include "strix/glm_pair_profile_table.hpp"
+#include "strix/deepseek41_pair_profile_table.hpp"
+#include "strix/model_registry.hpp"
+#include "strix/profiles/ds41_rtx.hpp"
+#include "strix/profiles/gemma4.hpp"
+#include "strix/profiles/qwen_cuda.hpp"
+#include "strix/profiles/qwen_dense_cuda.hpp"
+#include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/profiles/hy4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "minimax/engine/mm_defaults.hpp"
+#include "cuda/models/glm/producer/profile.hpp"
 
 #include <cstdio>
+#include <limits>
 #include <span>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,9 +44,10 @@ constexpr std::array<p::Lever, 1> kRows{{
      {true, true, false, true}, {true, true, false, true}, "", "off", "fixture receipts"},
 }};
 
-p::Resolution resolve(const p::Engine& engine, p::Name tier) {
+p::Resolution resolve(const p::Engine& engine, p::Name tier, p::Regime regime = {}) {
     p::Inputs in;
     in.profile = tier;
+    in.regime = regime;
     in.env = [](const char*) -> const char* { return nullptr; };
     return p::resolve(engine, in);
 }
@@ -56,54 +68,37 @@ void verdicts() {
     const p::Engine engine{"fixture", "", kRows, false, "fixture-turbo-v1", {}, rows};
     require(p::ladder_defect(engine).empty(), "fixture ladder is well formed: " + p::ladder_defect(engine));
 
-    // Predicate.
-    static_assert(!p::ladder_gain(1.005, 0.0) && p::ladder_gain(1.011, 0.0), "noise floor 1 %");
+    static_assert(p::ladder_gain(1.008, 0.002), "a measured sub-percent gain is enough");
     static_assert(!p::ladder_gain(1.015, 0.02) && p::ladder_gain(1.021, 0.02), "stated margin");
-    static_assert(!p::ladder_gain(0.0, 0.02), "unmeasured is never a gain");
-    static_assert(p::tier_below(p::Name::turbo) == p::Name::fast && p::tier_below(p::Name::fast) == p::Name::standard);
-
-    const auto turbo = resolve(engine, p::Name::turbo);
-    const auto fast = resolve(engine, p::Name::fast);
-    const auto exact = resolve(engine, p::Name::standard);
-    const auto at = [](const p::Resolution& r, p::Phase phase, std::uint64_t ctx, std::uint32_t lanes,
-                       std::string_view device = "dev") { return p::ladder_value(r, kLever, {phase, ctx, lanes, device}); };
-
-    // Measured gain in band: TURBO runs its cell.
-    auto cell = at(turbo, p::Phase::prefill, 4096, 1);
-    require(cell.value == "a4" && cell.tier == p::Name::turbo, "turbo applies at 4K prefill (x1.30)");
-    require(p::ladder_route(kLever, {p::Phase::prefill, 4096, 1, "dev"}, cell) ==
-                "strix-ladder/v1 fixture-w4a4@1 prefill ctx=4096 lanes=1 dev=dev: turbo=a4 applies x1.300 noise 0.020 "
-                "(r/turbo-pf-4k) -> turbo=a4",
-            "route line of an applied cell: " + p::ladder_route(kLever, {p::Phase::prefill, 4096, 1, "dev"}, cell));
-    // Within noise at 8K: TURBO resolves to FAST (FAST measured faster than EXACT there).
-    cell = at(turbo, p::Phase::prefill, 8192, 1);
-    require(cell.value == "a8" && cell.tier == p::Name::fast, "turbo within noise at 8K resolves to fast");
-    require(cell.route.find("turbo=a4 within noise x1.003") != std::string::npos, "route says within noise: " + cell.route);
-    // Unmeasured context: no TURBO row past 8K, no FAST row either -> EXACT (the builtin).
-    cell = at(turbo, p::Phase::prefill, 16384, 1);
-    require(cell.value == "off" && cell.tier == p::Name::standard, "unmeasured 16K prefill resolves to exact");
-    require(cell.route.find("turbo=a4 unmeasured regime") != std::string::npos &&
-                cell.route.find("fast=a8 unmeasured regime") != std::string::npos,
-            "route names both unmeasured rungs: " + cell.route);
-    // Unknown context (0) is outside every band.
-    require(at(turbo, p::Phase::prefill, 0, 1).value == "off", "unknown prompt length never meets a band");
-    // Another device never matches.
-    require(at(turbo, p::Phase::prefill, 4096, 1, "other").value == "off", "a row of another device never applies");
-    // Slower decode at C8..C16: TURBO resolves to FAST; FAST has only a B=1 decode row (slower) -> EXACT.
-    cell = at(turbo, p::Phase::decode, 4096, 8);
-    require(cell.value == "off" && cell.route.find("turbo=a4 slower x0.950") != std::string::npos,
-            "slower turbo decode resolves down: " + cell.route);
-    // B=1 decode: TURBO measured faster than FAST, but FAST is slower than EXACT there, so FAST does not run and the
-    // TURBO row (measured over FAST) has no measurement against what runs: EXACT.
-    cell = at(turbo, p::Phase::decode, 4096, 1);
-    require(cell.value == "off" && cell.tier == p::Name::standard,
-            "turbo measured over a fast cell that does not run resolves to exact");
-    require(cell.route.find("measured over fast=a8, which does not run here") != std::string::npos,
-            "route says why: " + cell.route);
-    // FAST and EXACT tiers.
-    require(at(fast, p::Phase::prefill, 8192, 1).value == "a8", "fast applies inside its band");
-    require(at(fast, p::Phase::decode, 4096, 1).value == "off", "fast slower at B=1 decode resolves to exact");
-    require(at(exact, p::Phase::prefill, 4096, 1).value == "off", "exact runs the builtin");
+    static_assert(!p::ladder_gain(std::numeric_limits<double>::infinity(), 0.02));
+    static_assert(!p::ladder_gain(1.2, std::numeric_limits<double>::quiet_NaN()));
+    const auto check = [&](p::Name tier, p::Regime regime, std::string_view value, std::string_view route) {
+        const auto actual = resolve(engine, tier, regime);
+        const auto* entry = actual.find(kLever);
+        require(entry && entry->value == value, "effective production value " + std::string(value));
+        if (route.empty()) return;
+        require(entry && entry->ladder.find(route) != std::string::npos &&
+                    actual.describe().find(entry->ladder) != std::string::npos &&
+                    actual.json().find(entry->ladder) != std::string::npos, "route in CLI and server receipts");
+        const auto exported = p::exports(actual, std::set<std::string>{});
+        const auto setting = std::ranges::find_if(exported, [](const auto& item) {
+            return item.first == "STRIX_FIXTURE_W4A4";
+        });
+        require(value == "off" ? setting == exported.end() : setting != exported.end() && setting->second == value,
+                "only the effective value is exported");
+    };
+    check(p::Name::turbo, {p::Phase::prefill, 4096, 1, "dev"}, "a4", "applies x1.300");
+    check(p::Name::turbo, {p::Phase::prefill, 2049, 1, "dev"}, "a4", "-> turbo=a4");
+    check(p::Name::turbo, {p::Phase::prefill, 2048, 1, "dev"}, "a8", "-> fast=a8");
+    check(p::Name::turbo, {p::Phase::prefill, 4097, 1, "dev"}, "a8", "within noise");
+    check(p::Name::turbo, {p::Phase::prefill, 8193, 1, "dev"}, "off", "unmeasured regime");
+    check(p::Name::turbo, {p::Phase::prefill, 4096, 1, "other"}, "off", "unmeasured regime");
+    check(p::Name::turbo, {p::Phase::prefill, 4096, 2, "dev"}, "off", "unmeasured regime");
+    check(p::Name::turbo, {p::Phase::prefill, 0, 1, "dev"}, "off", "unmeasured regime");
+    check(p::Name::turbo, {p::Phase::decode, 4096, 8, "dev"}, "off", "slower");
+    check(p::Name::turbo, {p::Phase::decode, 4096, 1, "dev"}, "off", "measured over fast=a8");
+    check(p::Name::fast, {p::Phase::prefill, 4096, 1, "dev"}, "a8", "-> fast=a8");
+    check(p::Name::standard, {p::Phase::prefill, 4096, 1, "dev"}, "off", "");
 
     // An explicit setting is the user's own: it runs as set in every regime.
     p::Inputs in;
@@ -112,19 +107,20 @@ void verdicts() {
         return std::string_view(key) == "STRIX_FIXTURE_W4A4" ? "a4" : nullptr;
     };
     const auto opted = p::resolve(engine, in);
-    require(p::ladder_value(opted, kLever, {p::Phase::prefill, 16384, 1, "dev"}).value == "a4",
-            "explicit setting bypasses the ladder (qualification and timing arms)");
+    require(opted.find(kLever)->value == "a4", "explicit environment wins in an unmeasured regime");
+    in.cli.emplace_back(kLever, "a8");
+    require(p::resolve(engine, in).find(kLever)->value == "a8", "explicit CLI beats explicit environment");
 
     // An engine without ladder rows: every lossy cell resolves to the builtin; an exact lever keeps its cell.
     const p::Engine bare{"bare", "", kRows, false, "bare-turbo-v1"};
-    require(p::ladder_value(resolve(bare, p::Name::turbo), kLever, {p::Phase::prefill, 4096, 1, "dev"}).value == "off",
+    require(resolve(bare, p::Name::turbo).find(kLever)->value == "off",
             "no ladder rows: lossy cells do not apply");
     constexpr std::array<p::Lever, 1> exact_rows{{
         {"sched", "STRIX_FIXTURE_SCHED", "", {"", "2", "", ""}, "1", p::Kind::exact, {true, true, false, true},
          {true, true, false, true}, "", "", "fixture scheduling receipt"},
     }};
     const p::Engine scheduling{"sched", "", exact_rows, false, "sched-turbo-v1"};
-    require(p::ladder_value(resolve(scheduling, p::Name::turbo), "sched", {p::Phase::decode, 1, 1, "dev"}).value == "2",
+    require(resolve(scheduling, p::Name::turbo).find("sched")->value == "2",
             "exact (scheduling) levers are outside the ladder");
 }
 
@@ -155,8 +151,8 @@ void defects() {
     row.speedup = 0.0;
     require(!defect(row).empty(), "unmeasured speedup");
     row = good;
-    row.noise = 0.001;
-    require(!defect(row).empty(), "noise below the floor");
+    row.noise = std::numeric_limits<double>::quiet_NaN();
+    require(!defect(row).empty(), "NaN noise");
     row = good;
     row.min_context = 0;
     require(!defect(row).empty(), "band covering the unknown context");
@@ -166,40 +162,137 @@ void defects() {
     require(!defect(row).empty(), "unordered lane band");
 }
 
-// Walk: every registered engine, every lossy lever, every tier, every probe regime of its ladder. A cell other than
-// the tier-below's cell may run only through an `applies` rung whose row shows a gain and whose tier-below cell runs.
-void walk(const p::Engine& engine) {
-    const auto where = std::string(engine.tag);
-    require(p::ladder_defect(engine).empty(), where + ": " + p::ladder_defect(engine));
+// Walk all declared rows, including currently pending candidates. Marking the candidate ready here makes this
+// test fail if a first binding can export the value before a timing receipt is registered.
+void walk(const p::Engine& registered) {
+    require(p::ladder_defect(registered).empty(), p::ladder_defect(registered));
+    std::vector<p::Lever> rows(registered.table.begin(), registered.table.end());
+    auto engine = registered;
+    engine.table = rows;
+    p::Inputs implicit;
+    implicit.env = [](const char*) -> const char* { return nullptr; };
+    const auto exact = resolve(engine, p::Name::standard);
+    require(p::resolve(engine, implicit).fingerprint() == exact.fingerprint(), "implicit native default equals EXACT");
+    for (const auto& entry : exact.entries) {
+        const auto wanted = entry.lever->value[0];
+        const auto baseline = !wanted.empty() && entry.lever->ready[0] ? wanted : entry.lever->builtin;
+        require(entry.value == baseline && entry.ladder.empty(), "EXACT retains the registered value");
+    }
+    for (auto& row : rows) {
+        if (row.kind == p::Kind::exact) continue;
+        row.ready.fill(true);
+        row.provisional.fill(false);
+    }
     auto probes = p::ladder_probes(engine);
-    probes.push_back({p::Phase::prefill, 0, 1, {}});  // no row: every lossy cell must resolve to its builtin
-    for (const auto& lever : engine.table) {
-        if (lever.kind == p::Kind::exact) continue;
+    probes.push_back({p::Phase::prefill, 0, 1, {}});
+    for (const auto& regime : probes) {
         for (const auto tier : {p::Name::fast, p::Name::turbo}) {
-            for (const auto& regime : probes) {
-                const auto cell = p::ladder_cell(lever, engine.ladder, tier, false, regime);
-                if (cell.value == lever.builtin) continue;
-                const auto below = p::ladder_cell(lever, engine.ladder, p::tier_below(cell.tier), false, regime);
-                if (cell.value == below.value) continue;
-                const auto verdict = p::ladder_judge(engine.ladder, lever.name, cell.value, cell.tier, regime);
-                require(verdict.rung == p::Rung::applies && verdict.row &&
-                            p::ladder_gain(verdict.row->speedup, verdict.row->noise) &&
-                            below.value == p::column_cell(lever, p::tier_below(cell.tier), false),
-                        where + "/" + std::string(lever.name) + ": " + p::ladder_route(lever.name, regime, cell));
+            if (tier == p::Name::turbo && engine.turbo_version.empty()) continue;
+            const auto actual = resolve(engine, tier, regime);
+            for (const auto& entry : actual.entries) {
+                if (entry.lever->kind == p::Kind::exact || (entry.value == entry.lever->builtin && !p::applied(entry.status))) continue;
+                require(entry.ladder.find("applies") != std::string::npos,
+                        std::string(engine.tag) + "/" + std::string(entry.lever->name) + " applied without the ladder");
             }
         }
     }
 }
 
+void cuda_cli_server() {
+    namespace qo = strix::cuda::qwen_options;
+    const p::LadderRow timing{"qsa_mma", "1", p::Name::fast, p::Phase::prefill, "fixture", 4096, 4096,
+                              1, 1, 1.02, 0.005, "fixture-qsa"};
+    qo::Request request;
+    request.engine.model_gguf = "model.gguf";
+    request.engine.tables_dir = "tables";
+    request.engine.rope_table = "rope";
+    request.inputs.env = [](const char*) -> const char* { return nullptr; };
+    request.inputs.ladder = std::span(&timing, 1);
+    request.profile = p::Name::fast;
+    for (const auto context : {4096U, 4097U}) {
+        request.inputs.regime = {p::Phase::prefill, context, 1, "fixture"};
+        const auto cli = qo::resolve(request, qo::Entry::cli);
+        const auto server = qo::resolve(request, qo::Entry::serve);
+        require(cli.choice.qsa_mma == (context == 4096U) && server.choice.qsa_mma == cli.choice.qsa_mma,
+                "Qwen CUDA CLI and server select the same measured or fallback kernel form");
+        require(cli.resolution.json() == server.resolution.json() &&
+                    server.resolution.json().find("strix-ladder/v1 qsa_mma") != std::string::npos,
+                "Qwen CUDA CLI and server emit the same decision");
+    }
+}
+
+void custom_adapters() {
+    constexpr p::Regime regime{p::Phase::prefill, 4096, 1, "dev"};
+    constexpr p::LadderRow sample{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
+                                 1.008, 0.002, "r/fast"};
+    for (unsigned probe = 0; probe < 4; ++probe) {
+        auto row = sample;
+        switch (probe) {
+        case 1: row.receipt = {}; break;
+        case 2: row.speedup = std::numeric_limits<double>::infinity(); break;
+        case 3: row.noise = std::numeric_limits<double>::quiet_NaN(); break;
+        default: break;
+        }
+        strix::qwen::profile::Inputs in;
+        in.env = [](const char*) -> const char* { return nullptr; };
+        in.regime = regime;
+        in.ladder = std::span(&row, 1);
+        const auto qwen = strix::qwen::profile::resolve(p::Name::fast, in, kRows);
+        const auto* cell = qwen.find(kLever);
+        require(cell && cell->value == (probe == 0 ? "a8" : "off") &&
+                    qwen.json().find("strix-ladder/v1") != std::string::npos, "Qwen native selection checks timing");
+    }
+
+    namespace g = strix::gemma4::profile;
+    g::Lever gemma{.name = kLever, .value = {"", "a8", ""}, .builtin = "off", .ready = {true, true, true},
+                   .kind = p::Kind::bit_changing, .apps = unsigned(g::App::engine)};
+    const auto g4 = g::resolve(p::Name::fast, g::App::engine, {}, std::span(&gemma, 1));
+    require(g4.find(kLever)->value == "off", "Gemma cannot select a lossy unmeasured row");
+
+    namespace r = strix::ds41::rtx::profile;
+    r::Lever rtx{.name = kLever, .value = {"", "a8", ""}, .builtin = "off", .ready = {true, true, true},
+                 .kind = p::Kind::bit_changing, .apps = unsigned(r::App::replica), .source = "fixture"};
+    const auto ds = r::resolve(p::Name::fast, false, r::App::replica, {}, std::span(&rtx, 1));
+    require(ds.find(kLever)->value == "off", "DeepSeek RTX cannot select a lossy unmeasured row");
+
+    namespace glm = strix::glm::rtxpf::profile;
+    glm::Lever candidate{.name = kLever, .env = "", .value = {"", "a8", ""}, .builtin = "off",
+                         .ready = {true, true, true}, .kind = glm::Kind::bit_changing,
+                         .apps = unsigned(glm::App::decode_service), .source = "fixture"};
+    const auto gpu = glm::resolve(glm::Name::fast, false, glm::App::decode_service, {}, std::span(&candidate, 1));
+    require(gpu.find(kLever)->value == "off", "GLM RTX cannot select a lossy unmeasured row");
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 2) return 2;
     verdicts();
     defects();
-    walk(strix::glm::rank_defaults::product_profile_engine);
-    walk(strix::hy4::profile::engine());
-    walk(strix::inkling2::kMiniProfile);
-    walk(strix::minimax::defaults::profile_engine());
+    custom_adapters();
+    cuda_cli_server();
+    namespace q = strix::qwen;
+    namespace qd = strix::qwen35;
+    namespace mm = strix::minimax::defaults;
+    const p::Engine engines[] = {
+        {"qwen", "", q::profile::levers(), false, q::profile::kTurboVersion},
+        {"qwen-cuda", "", q::cuda_profile::levers(), false, q::profile::kTurboVersion},
+        {"deepseek41-pair", "", strix::deepseek41::pair_defaults::profile_table, false, "ds41-turbo-v1"},
+        {"deepseek41-rtx", "", strix::ds41::rtx::profile::shared_rows()},
+        strix::glm::rank_defaults::product_profile_engine,
+        mm::profile_engine(),
+        {"qwen35", "", qd::profile::table, false, qd::profile::kTurboVersion},
+        qd::hip_profile::engine(qd::hip_profile::App::decode),
+        qd::hip_profile::engine(qd::hip_profile::App::spec),
+        strix::hy4::profile::engine(),
+        strix::inkling2::kMiniProfile,
+    };
+    for (const auto& registered : strix::model_registry::load(argv[1])) {
+        const auto tag = registered.profile_tag;
+        require(tag == "gemma4" || std::ranges::any_of(engines, [&](const auto& engine) {
+                    return engine.tag == tag || (tag == "hy4" && engine.tag == "hy4-hip");
+                }), "profile registry entry must be covered: " + tag);
+    }
+    for (const auto& engine : engines) walk(engine);
     if (failures) return 1;
     std::puts("profile ladder tests: PASS");
     return 0;

@@ -158,7 +158,7 @@ struct TurboEvidence {
     Route route;
     std::string_view gate_set;
     std::span<const sp::GateRecord> gates;
-    std::span<const sp::RegimeRecord> regimes;
+    std::span<const sp::LadderRow> ladder;
 };
 inline constexpr std::span<const TurboEvidence> turbo_evidence{};
 
@@ -178,10 +178,7 @@ inline TurboAdmission turbo_admission(std::string_view identity, const Regime& r
         if (*gate == sp::GateVerdict::fail) return {false, "TURBO gate FAIL"};
         if (*gate == sp::GateVerdict::hold) return {false, "TURBO gate HOLD"};
         if (*gate == sp::GateVerdict::unresolved) return {false, "TURBO gate UNRESOLVED"};
-        const auto* receipt = sp::measured_regime(identity, run.device, {.context = run.prompt_tokens}, record.regimes);
-        if (receipt) return {true, "TURBO gate PASS (" + std::string(record.gate_set) + "), gain over FAST: " +
-                                    std::string(receipt->receipt)};
-        return {false, "TURBO gate PASS; no gain over FAST recorded for this regime"};
+        return {true, "TURBO gate PASS (" + std::string(record.gate_set) + ")"};
     }
     return {false, "TURBO gate not run (qual --tier turbo)"};
 }
@@ -190,6 +187,7 @@ inline TurboAdmission turbo_admission(std::string_view identity, const Regime& r
 struct Resolved {
     Regime regime;
     std::vector<Lever> rows;
+    std::vector<sp::LadderRow> ladder;
     sp::Engine engine;
     sp::Resolution resolution;
     Resolved() = default;
@@ -205,6 +203,11 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
     auto out = std::make_unique<Resolved>();
     out->regime = regime;
     const bool turbo = profile == Name::turbo;
+    for (const auto& record : evidence)
+        if (record.weights == regime.weights && record.route == regime.route)
+            out->ladder.insert(out->ladder.end(), record.ladder.begin(), record.ladder.end());
+    const sp::Regime timing_regime{
+        sp::Phase::prefill, regime.uniform_prompt_length && regime.linear_session ? regime.prompt_tokens : 0, 1, regime.arch};
     const auto cuda_admission = [&](std::string_view identity) -> TurboAdmission {
         if (regime.arch != "sm_120") return {false, "requires CUDA sm_120"};
         return turbo_admission(identity, regime, evidence);
@@ -218,7 +221,11 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
             if (regime.weights == Weights::exact_pack) return {false, "requires NVFP4 projection weights"};
             return cuda_admission(kDenseIdentity);
         }
-        return turbo_admission(row.target, regime, evidence);
+        auto gate = turbo_admission(row.target, regime, evidence);
+        if (gate.ready && row.kind == Kind::exact &&
+            sp::ladder_judge(out->ladder, row.name, row.value[kTurboColumn], Name::turbo, timing_regime).rung != sp::Rung::applies)
+            return {false, "no timing gain for the schedule in this regime"};
+        return gate;
     };
     const bool kv_override = std::ranges::any_of(cli, [](const auto& opt) {
         return opt.first == "kv_fp8" || opt.first == "decode_attn8";
@@ -249,21 +256,43 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
         for (const auto& row : out->rows) known |= row.name == key;
         if (!known) throw std::invalid_argument("qwen35-cuda-dense: " + key + " is not offered on route " + route_name(regime.route));
     }
-    out->engine = sp::Engine{"qwen35-cuda-dense", "", std::span<const Lever>(out->rows), false, kTurboVersion, {}};
+    out->engine = sp::Engine{"qwen35-cuda-dense", "", out->rows, false, kTurboVersion, {}, out->ladder};
     sp::Inputs inputs;
     inputs.profile = profile;
     inputs.cli = cli;
+    // This startup policy applies to a complete single-prompt run. Multi-prompt
+    // and nonlinear workloads stay outside the timing bands.
+    inputs.regime = timing_regime;
     inputs.env = [](const char*) -> const char* { return nullptr; };  // CLI-only levers: the environment selects nothing
     out->resolution = sp::resolve(out->engine, inputs);
+    const auto selected_turbo = [&](std::string_view name) {
+        const auto* entry = out->resolution.find(name);
+        return entry && sp::applied(entry->status) && entry->value == entry->lever->value[kTurboColumn];
+    };
+    if (turbo && !kv_override && selected_turbo("kv_fp8") != selected_turbo("decode_attn8")) {
+        // The shadow and its reader are one operation. Select the lower tier
+        // for both if either half failed the shared decision.
+        const auto unpaired = out->resolution;
+        for (auto& row : out->rows)
+            if (row.name == "kv_fp8" || row.name == "decode_attn8") row.ready[kTurboColumn] = false;
+        out->resolution = sp::resolve(out->engine, inputs);
+        for (auto& entry : out->resolution.entries)
+            if (entry.lever->name == "kv_fp8" || entry.lever->name == "decode_attn8") {
+                const auto* attempted = unpaired.find(entry.lever->name);
+                entry.reason = "paired FP8 shadow/reader did not both pass the ladder";
+                if (attempted && !attempted->ladder.empty() && !sp::applied(attempted->status))
+                    entry.ladder = attempted->ladder;
+            }
+    }
     for (std::size_t i = 0; i < out->resolution.entries.size(); ++i) {
         auto& entry = out->resolution.entries[i];
-        if (!admissions[i].reason.empty() &&
+        if (entry.reason.empty() && !admissions[i].reason.empty() &&
             (entry.status == sp::Status::pending || entry.status == sp::Status::explicit_cli ||
              (entry.status == sp::Status::set && admissions[i].ready))) {
             entry.reason = admissions[i].reason;
             continue;
         }
-        if (entry.status != sp::Status::pending) continue;
+        if (entry.status != sp::Status::pending || !entry.reason.empty()) continue;
         std::string where;
         for (const auto& q : rows)
             if (q.gate.lever == entry.lever->name)
@@ -363,6 +392,7 @@ inline std::string describe(const Resolved& r) {
         if (e.status == sp::Status::pending) out += " pending " + e.target;
         if (!e.reason.empty()) out += ": " + e.reason;
         out += "\n";
+        if (!e.ladder.empty()) out += e.ladder + "\n";
     }
     out += "  profile-fingerprint: " + sp::hex_identity(res.fingerprint()) + "\n";
     return out;

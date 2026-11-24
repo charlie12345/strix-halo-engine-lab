@@ -82,14 +82,27 @@ Status for_each_bf16_projection_group(std::span<const Bf16RowProjection> project
 enum class ImageRoute : unsigned char { fp32_rows, packed, image };
 
 // Backend tile data of the image routes (not model data): the height from which the packed schedule is faster, its K
-// stage and tile width, and the packed columns one call needs to pay for its image pass (the image costs rows x K x 6
-// bytes; the packed schedule saves a share of each whole tile's FP32-route time; both scale with rows x K).
+// stage and tile width, the packed columns one call needs to pay for its image pass (the image costs rows x K x 6
+// bytes; the packed schedule saves a share of each whole tile's FP32-route time; both scale with rows x K) and the
+// greatest height the data covers (heights outside [min_rows, max_rows] keep the incumbent launches).
 struct ImageRoutePolicy {
     unsigned min_rows{};
     unsigned k_step{};
     unsigned tile_columns{};
     unsigned min_packed_columns{};
+    unsigned max_rows{};
 };
+
+// Whether the policy's measurements cover a call of this height.
+constexpr bool image_rows_measured(const ImageRoutePolicy& policy, unsigned rows) noexcept {
+    return rows != 0U && rows >= policy.min_rows && rows <= policy.max_rows;
+}
+
+// Whether a call on an existing BF16 image takes the packed schedule instead of the image tile: only on the device
+// class the policy was measured on and inside its measured heights.
+constexpr bool image_packed_schedule(const ImageRoutePolicy& policy, bool measured_device, unsigned rows) noexcept {
+    return measured_device && image_rows_measured(policy, rows);
+}
 
 // Routes of the projections of one call on FP32 rows [rows][input_width] (routes.size() >= projections.size()).
 // The incumbent launches the call in groups of GroupMax consecutive projections; group_admits(group) tells whether
@@ -97,8 +110,8 @@ struct ImageRoutePolicy {
 // projection on the FP32 rows, so its launch is the incumbent one. Inside an admitted group: packed = whole tiles
 // within max_outputs, 16-byte aligned weights, a row pitch of whole 16-byte units no shorter than the row and
 // outputs x pitch addressable; image = what image_admits(projection) accepts; fp32_rows otherwise. Returns false,
-// every route fp32_rows, when the call keeps its FP32 rows: below min_rows, K not a multiple of the stage, or fewer
-// packed columns than min_packed_columns.
+// every route fp32_rows, when the call keeps its FP32 rows: a height outside [min_rows, max_rows], K not a multiple
+// of the stage, or fewer packed columns than min_packed_columns.
 template <std::size_t GroupMax, class GroupAdmits, class ImageAdmits>
 bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, unsigned rows,
                        std::span<const Bf16RowProjection> projections, unsigned max_outputs,
@@ -106,7 +119,7 @@ bool plan_image_routes(const ImageRoutePolicy& policy, unsigned input_width, uns
     static_assert(GroupMax > 0);
     if (routes.size() < projections.size()) return false;
     std::fill_n(routes.begin(), projections.size(), ImageRoute::fp32_rows);
-    if (policy.k_step == 0U || policy.tile_columns == 0U || rows == 0U || rows < policy.min_rows || input_width == 0U ||
+    if (policy.k_step == 0U || policy.tile_columns == 0U || !image_rows_measured(policy, rows) || input_width == 0U ||
         input_width % policy.k_step != 0U)
         return false;
     const auto natural = std::size_t{input_width} * sizeof(std::uint16_t);

@@ -208,7 +208,7 @@ static bool check_image_routes() {
     using strix::core::Bf16RowProjection;
     using strix::core::ImageRoute;
     using R = ImageRoute;
-    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U};
+    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U, 9216U};
     constexpr unsigned K = 2304U;
     constexpr unsigned kWide = 1U << 20U;
     const auto* w = std::bit_cast<const std::uint16_t*>(std::uintptr_t{0x10000U});
@@ -302,6 +302,23 @@ static bool check_image_routes() {
         return false;
     if (strix::core::plan_image_routes<3U>(policy, K, 8192U, call, 2048U, routes, group_admits, image_admits) ||
         !all_fp32(6U))
+        return false;
+    // Above the measured band (9,216 rows): the call keeps its FP32 rows; its top edge still routes.
+    if (strix::core::plan_image_routes<3U>(policy, K, 16384U, aligned, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(5U) ||
+        strix::core::plan_image_routes<3U>(policy, K, 9217U, aligned, kWide, routes, group_admits, image_admits) ||
+        !strix::core::plan_image_routes<3U>(policy, K, 9216U, aligned, kWide, routes, group_admits, image_admits))
+        return false;
+    // A call on an existing image takes the packed schedule only on the measured device class and heights.
+    using strix::core::image_packed_schedule;
+    if (!image_packed_schedule(policy, true, 1024U) || !image_packed_schedule(policy, true, 9216U) ||
+        image_packed_schedule(policy, false, 4096U) || image_packed_schedule(policy, false, 8192U) ||
+        image_packed_schedule(policy, true, 1023U) || image_packed_schedule(policy, true, 9217U) ||
+        image_packed_schedule(policy, true, 16384U) || image_packed_schedule(policy, true, 0U))
+        return false;
+    constexpr strix::core::ImageRoutePolicy unbounded{1024U, 64U, 128U, 2048U, 0U};  // no measured height: none routes
+    if (image_packed_schedule(unbounded, true, 4096U) ||
+        strix::core::plan_image_routes<3U>(unbounded, K, 8192U, aligned, kWide, routes, group_admits, image_admits))
         return false;
     std::array<ImageRoute, 2> few{};
     return !strix::core::plan_image_routes<3U>(policy, K, 8192U, call, kWide, few, group_admits, image_admits);

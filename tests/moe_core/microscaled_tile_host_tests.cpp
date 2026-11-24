@@ -1,9 +1,11 @@
 #include "cuda/core/mma_tile.cuh"
+#include "core/microscaled_f16_staging.hpp"
 #include "inkling2/inkling2_mini_config.hpp"
 #include "moe_core/grouped_dispatch.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <numeric>
@@ -21,6 +23,37 @@ namespace model = strix::inkling2;
 namespace packed = strix::weight::microscaled;
 using Small = tile::TileShape<native::kDecodeMBlocks, tile::kDecodeOutputs>;
 using Wide = tile::TileShape<native::kTileMBlocks, tile::kTileOutputs>;
+
+bool small_scale_range() {
+    using strix::core::microscaled_f16::mxfp8_group_scale;
+    using Operand = packed::PackedOperand<packed::MatrixFormat::mxfp8>;
+    for (unsigned byte = 0; byte <= 255U; ++byte) {
+        const auto code = static_cast<std::uint8_t>(byte);
+        const auto scale = mxfp8_group_scale(code);
+        for (float dot : {0.0F, 1.0F, -1.0F}) {
+            const float actual = std::fma((dot / 256.0F) * scale.partial_multiplier, scale.multiplier, 0.0F);
+            const float expected = dot * Operand::decode_scale(code);
+            if (byte == 255U ? !std::isnan(actual) : !std::isfinite(actual) || actual != expected) {
+                std::cerr << "MXFP8 scale byte " << byte << ", dot " << dot << ": " << actual << " vs " << expected << '\n';
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool small_activation_range() {
+    namespace gm = moe::grouped_microscaled;
+    for (unsigned i = 0; i <= 0xFFFFU; ++i) {
+        const float value = strix::weight::scalar_float::u2f(i << 16U);
+        const bool fits_fp16 = std::fabs(value) <= 65504.0F;
+        if (gm::small_f16_needs_bf16(static_cast<std::uint16_t>(i)) == fits_fp16) {
+            std::cerr << "Wrong FP16 admission for BF16 bits " << i << '\n';
+            return false;
+        }
+    }
+    return true;
+}
 
 // Model a shared K16 stage and the routing of each ldmatrix register using the
 // non-transposed m8n8 map: address lane = 8 * matrix + row, word = lane % 4.
@@ -296,6 +329,9 @@ bool small_scale_admission() {
 }  // namespace
 
 int main() {
+    const bool scale_range = small_scale_range(), activation_range = small_activation_range();
+    if (!scale_range || !activation_range) return 1;
+    std::cout << "small-form MXFP8 scale range and BF16 activation range: PASS\n";
     // Small form row plan: one form for any tile height (no row cap); 16-row blocks up to 16 rows, then 32-row blocks.
     {
         namespace gm = moe::grouped_microscaled;

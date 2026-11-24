@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <span>
@@ -239,6 +240,111 @@ grouped::Args args_of(const grouped::TileRows* tiles, unsigned count, unsigned i
     a.max_tile_rows = max_rows;
     a.form = form;
     return a;
+}
+
+template <Format F>
+std::vector<float> edge_projection(const Device& d, const grouped::TileRows& tile, grouped::Form form,
+                                   const std::uint32_t* map = nullptr) {
+    std::vector<float> out(tile.rows * tile.output_row, std::numeric_limits<float>::infinity());
+    require_hip(hipMemcpy(d.gu_out, out.data(), out.size() * sizeof(float), hipMemcpyHostToDevice), "edge output sentinel");
+    require_hip(hipMemcpy(d.gu_tiles, &tile, sizeof(tile), hipMemcpyHostToDevice), "edge tile");
+    const auto args = args_of(d.gu_tiles, 1U, static_cast<unsigned>(tile.input_row),
+                              static_cast<unsigned>(tile.output_row), tile.rows, form);
+    if (map)
+        require_hip(grouped::launch_indirect<F>({args, map, tile.input}, nullptr), "edge indirect");
+    else
+        require_hip(grouped::launch<F>(args, nullptr), "edge direct");
+    require_hip(hipMemcpy(out.data(), d.gu_out, out.size() * sizeof(float), hipMemcpyDeviceToHost), "edge read");
+    return out;
+}
+
+bool scale_range_check(const Device& d) {
+    constexpr unsigned k = 128U, n = 128U;
+    const std::vector<unsigned> bytes{246U, 247U, 254U, 255U};
+    std::vector<std::uint8_t> codes(k * n), scales(k * n / 32U, 127U);
+    for (unsigned c = 0; c < bytes.size(); ++c) {
+        codes[c * k] = 0x38U;  // E4M3 1
+        scales[c * (k / 32U)] = static_cast<std::uint8_t>(bytes[c]);
+    }
+    std::vector<std::uint16_t> input(2U * k, 0U);
+    input[0] = bf16(1.0F);  // second row is the all-zero dot
+    require_hip(hipMemcpy(d.gu_in, input.data(), input.size() * sizeof(input[0]), hipMemcpyHostToDevice), "scale input");
+    auto* device_codes = device_copy(codes);
+    auto* device_scales = device_copy(scales);
+    const packed::PackedMatrix w{device_codes, device_scales, n, k, 1.0F};
+    const grouped::TileRows tile{w, d.gu_in, d.gu_out, k, n, 2U};
+    const auto out = edge_projection<Format::mxfp8>(d, tile, grouped::Form::small_f16);
+    const auto ref = edge_projection<Format::mxfp8>(d, tile, grouped::Form::bf16_tile);
+    require_hip(hipFree(device_codes), "free edge codes");
+    require_hip(hipFree(device_scales), "free edge scales");
+    bool ok = true;
+    for (unsigned c = 0; c < bytes.size(); ++c) {
+        const bool matches = bytes[c] == 255U
+            ? std::isnan(out[c]) && std::isnan(out[n + c]) && std::isnan(ref[c]) && std::isnan(ref[n + c])
+            : out[c] == std::ldexp(1.0F, static_cast<int>(bytes[c]) - 127) && out[n + c] == 0.0F &&
+              out[c] == ref[c] && out[n + c] == ref[n + c];
+        if (!matches) {
+            std::cerr << "MXFP8 scale " << bytes[c] << ": small " << out[c] << ", " << out[n + c]
+                      << " incumbent " << ref[c] << ", " << ref[n + c] << '\n';
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+template <Format F>
+bool activation_range_check(const Device& d) {
+    constexpr unsigned k = 256U, n = 256U, rows = 33U;
+    constexpr bool nv = F == Format::nvfp4;
+    constexpr unsigned code_stride = nv ? k / 2U : k, scale_stride = k / (nv ? 16U : 32U);
+    constexpr std::uint8_t one = nv ? 0x02U : 0x38U;
+    std::vector<std::uint8_t> codes(n * code_stride), scales(n * scale_stride, nv ? 0x38U : 127U);
+    for (unsigned c = 0; c < n; ++c) {
+        codes[c * code_stride] = one;
+        codes[(c + 1U) * code_stride - 1U] = nv ? 0x20U : one;
+    }
+    // The final column reads only a sub-FP16 value, distinguishing small from BF16 for ordinary rows.
+    codes[(n - 1U) * code_stride] = nv ? 0x20U : 0U;
+    if constexpr (!nv) codes[(n - 1U) * code_stride + 1U] = one;
+    codes[n * code_stride - 1U] = 0U;
+
+    std::vector<std::uint16_t> input(rows * k, 0U);
+    std::vector<std::uint32_t> reverse(rows);
+    for (unsigned r = 0; r < rows; ++r) {
+        input[r * k] = bf16((r & 1U) ? -65280.0F : 65280.0F);
+        input[r * k + 1U] = bf16(0x1p-30F);
+        reverse[r] = rows - 1U - r;
+    }
+    input[k] = bf16(65536.0F);
+    input[16U * k] = bf16(-65536.0F);
+    input[32U * k + k - 1U] = bf16(65536.0F);
+    require_hip(hipMemcpy(d.gu_in, input.data(), input.size() * sizeof(input[0]), hipMemcpyHostToDevice), "range input");
+    auto* device_codes = device_copy(codes);
+    auto* device_scales = device_copy(scales);
+    auto* map = device_copy(reverse);
+    const packed::PackedMatrix w{device_codes, device_scales, n, k, 1.0F};
+    const grouped::TileRows tile{w, d.gu_in, d.gu_out, k, n, rows};
+    bool ok = true;
+    for (const auto* indices : {static_cast<std::uint32_t*>(nullptr), map}) {
+        const auto out = edge_projection<F>(d, tile, grouped::Form::small_f16, indices);
+        const auto ref = edge_projection<F>(d, tile, grouped::Form::bf16_tile, indices);
+        for (unsigned r = 0; r < rows; ++r) {
+            const unsigned source = indices ? reverse[r] : r;
+            const bool outside = source == 1U || source == 16U || source == 32U;
+            const float expected = widen(input[source * k]) + widen(input[(source + 1U) * k - 1U]);
+            if (out[r * n] != expected ||
+                (outside ? std::memcmp(out.data() + r * n, ref.data() + r * n, n * sizeof(float)) != 0
+                         : out[(r + 1U) * n - 1U] != 0.0F || ref[(r + 1U) * n - 1U] != 0x1p-30F)) {
+                std::cerr << "BF16 activation range (" << (nv ? "NVFP4" : "MXFP8") << ", "
+                          << (indices ? "indirect" : "direct") << "), input row " << source << '\n';
+                ok = false;
+            }
+        }
+    }
+    require_hip(hipFree(map), "free edge map");
+    require_hip(hipFree(device_codes), "free edge codes");
+    require_hip(hipFree(device_scales), "free edge scales");
+    return ok;
 }
 
 template <Format F>
@@ -688,6 +794,13 @@ int main(int argc, char** argv) {
     const auto dev = make_device();
     const auto route = make_route_device();
     bool ok = true;
+    if (!bench_only) {
+        const bool mxfp8_scales = scale_range_check(dev);
+        const bool nvfp4_activations = activation_range_check<Format::nvfp4>(dev);
+        const bool mxfp8_activations = activation_range_check<Format::mxfp8>(dev);
+        ok = mxfp8_scales && nvfp4_activations && mxfp8_activations;
+        std::cout << "small-form scale and activation edges: " << (ok ? "PASS" : "FAIL") << '\n';
+    }
     {
         auto nv = make_format(Format::nvfp4, rng);
         if (!bench_only) {

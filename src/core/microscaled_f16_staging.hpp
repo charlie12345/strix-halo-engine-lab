@@ -5,13 +5,36 @@
 // operands, the group multiplier is applied once per group to the FP32 accumulator, so only the summation order differs
 // from a decoded-weight dot product.
 //   NVFP4: operand = E2M1 value (exact in FP16), multiplier = E4M3 scale (exact), the outer scale is the binding's (store).
-//   MXFP8: operand = E4M3 value x 2^-8 (exact in FP16, small values as FP16 subnormals), multiplier = 2^(e - 127 + 8).
+//   MXFP8: operand = E4M3 value x 2^-8 (exact in FP16, small values as FP16 subnormals). Compensate in the scale
+//   when it fits in FP32, otherwise compensate in the group partial and use the unshifted E8M0 scale.
 // Malformed scales follow PackedOperand::decode_scale: an NVFP4 scale byte above 0x7e and the E8M0 byte 0xff give NaN.
 // MXFP8 NaN codes (0x7f / 0xff) are not reproduced (finite operand); the load-time row check rejects them.
 #include "strix/weight/formats/microscaled.hpp"
 
 #include <cstddef>
 #include <cstdint>
+
+#if defined(__HIPCC__)
+#define STRIX_SMALL_SCALE_HD __host__ __device__
+#else
+#define STRIX_SMALL_SCALE_HD
+#endif
+
+namespace strix::core::microscaled_f16 {
+
+struct Mxfp8GroupScale {
+    float multiplier;
+    float partial_multiplier;
+};
+
+STRIX_SMALL_SCALE_HD inline Mxfp8GroupScale mxfp8_group_scale(std::uint8_t byte) {
+    namespace sf = strix::weight::scalar_float;
+    if (byte <= 246U) return {sf::u2f((std::uint32_t{byte} + 8U) << 23U), 1.0F};
+    return {sf::e8m0(byte), 256.0F};
+}
+
+}  // namespace strix::core::microscaled_f16
+#undef STRIX_SMALL_SCALE_HD
 
 #if defined(__HIPCC__)
 #include "core/lowbit_f16_staging.hpp"
@@ -103,16 +126,14 @@ struct Operand {
     }
 
     template <unsigned Groups>
-    __device__ __forceinline__ static float scale(const Words<Groups>& w, unsigned gi) {
-        const std::uint32_t byte = (w.scale[gi / 4U] >> (8U * (gi % 4U))) & 0xFFU;
+    __device__ __forceinline__ static auto scale(const Words<Groups>& w, unsigned gi) {
+        const auto byte = static_cast<std::uint8_t>(w.scale[gi / 4U] >> (8U * (gi % 4U)));
         if constexpr (kNvfp4) {
             // E4M3 scale x 2^-8 as FP16 bits (the shift of e4m3_pairs), widened exactly and scaled back by 2^8.
             const float value = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(byte << 7U)));
             return byte <= 0x7EU ? value * 256.0F : __builtin_bit_cast(float, 0x7FC00000U);
         } else {
-            // 2^(e - 127) x 2^8 (the operands carry 2^-8): exponent field e + 8, infinity from e = 247, NaN for e = 255.
-            const std::uint32_t bits = byte == 0xFFU ? 0x7FC00000U : byte >= 247U ? 0x7F800000U : (byte + 8U) << 23U;
-            return __builtin_bit_cast(float, bits);
+            return mxfp8_group_scale(byte);
         }
     }
 

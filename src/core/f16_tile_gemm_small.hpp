@@ -149,7 +149,10 @@ __device__ __forceinline__ void run(const Tile& t, unsigned r0, unsigned col0) {
         for (unsigned j = 0; j < Sched::kAChunks; ++j) {
             const unsigned q = tid + Sched::kThreads * j, row = q / Sched::kChunksPerRow;
             const unsigned dword = 4U * (q % Sched::kChunksPerRow);
-            *reinterpret_cast<U4*>(&lds.a[row][dword]) = Tile::pack_a(ra[j]);
+            if constexpr (requires { t.pack_a(ra[j], row); })
+                *reinterpret_cast<U4*>(&lds.a[row][dword]) = t.pack_a(ra[j], row);
+            else
+                *reinterpret_cast<U4*>(&lds.a[row][dword]) = Tile::pack_a(ra[j]);
         }
     };
 
@@ -190,12 +193,17 @@ __device__ __forceinline__ void run(const Tile& t, unsigned r0, unsigned col0) {
                         }
                     if constexpr (RowTiles >= 3U) __builtin_amdgcn_sched_barrier(0);  // bound the live A fragments
                 }
-                const float d = Operand::template scale<kGroups>(w, gi);
+                const auto d = Operand::template scale<kGroups>(w, gi);
 #pragma unroll
                 for (unsigned m = 0; m < RowTiles; ++m)
                     if (m < live_tiles)
 #pragma unroll
-                        for (unsigned j = 0; j < 8U; ++j) acc[m][j] = __builtin_fmaf(sum[m][j], d, acc[m][j]);
+                        for (unsigned j = 0; j < 8U; ++j) {
+                            if constexpr (requires { d.partial_multiplier; })
+                                acc[m][j] = __builtin_fmaf(sum[m][j] * d.partial_multiplier, d.multiplier, acc[m][j]);
+                            else
+                                acc[m][j] = __builtin_fmaf(sum[m][j], d, acc[m][j]);
+                        }
             }
         }
     }
@@ -217,6 +225,7 @@ __device__ __forceinline__ void run(const Tile& t, unsigned r0, unsigned col0) {
                     for (unsigned j = 0; j < 8U; ++j) acc[m][j] += exchange[((wn * RowTiles + m) * 8U + j) * 32U + lane];
         }
     }
+    if constexpr (requires { t.before_store(); }) t.before_store();
     if (split != 0U || !live) return;
     // acc[m][j] -> row r0 + 16 m + 2 j + lane / 16, column col.
 #pragma unroll

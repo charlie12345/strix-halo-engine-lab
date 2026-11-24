@@ -61,7 +61,8 @@ STRIX_GROUPED_ROWS_HD constexpr Schedule resolve_schedule(Schedule requested, un
 // (FAST, bit-changing): tiles of any row count on the small-M schedule of the f16 tile family
 // (core/f16_tile_gemm_small.hpp with core/microscaled_f16_staging.hpp): the codes are FP16 WMMA operands held in
 // registers (one weight read per row block, no LDS stage for B), one FP32 multiplier per scale group on the accumulator,
-// the outer scale at the store. Row r's bits depend on its own inputs and the shape only (not on the tile's other rows,
+// the outer scale at the store. Rows with any |BF16 input| > 65280 (or nonfinite input) use packed BF16 WMMA.
+// Row r's bits depend on its own inputs and the shape only (not on the tile's other rows,
 // its position in the tile, the row tile count or the row block count), so one form serves every row count of a launch
 // class (a lone decode row, a cohort, a verify window) with the same bits per row. Needs max_tile_rows >= 1, inputs %
 // 128 == 0, outputs % 64 == 0, tiles x row blocks within the y grid (fits_small, checked for both legs of a visit
@@ -70,6 +71,9 @@ STRIX_GROUPED_ROWS_HD constexpr Schedule resolve_schedule(Schedule requested, un
 // refuse it. Each row block reads the tile's weights again, so a tall tile (prefill) belongs to the
 // BF16 tile: the caller selects the form per launch class.
 enum class Form : std::uint8_t { bf16_tile, small_f16 };
+
+// FP16 overflows at 65520 (RNE). BF16's adjacent magnitudes are 65280 (0x477f) and 65536 (0x4780).
+STRIX_GROUPED_ROWS_HD constexpr bool small_f16_needs_bf16(std::uint16_t bits) { return (bits & 0x7FFFU) >= 0x4780U; }
 
 // Row plan of the small form: CTAs of 16 row_tiles rows (row_tiles 1 for tiles of <= 16 rows, else 2), row_blocks of them
 // per tile (y grid = tiles x row_blocks); {0, 0} refuses (no rows).

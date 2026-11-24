@@ -143,31 +143,61 @@ struct SmallTile {
     struct AChunk {
         gemm::U4 v;
     };
-    unsigned K, rows, outputs;
+    unsigned K, rows, outputs, first_row;
     packed::PackedMatrix weights;
     const std::uint16_t* input;
     std::size_t input_row;
     const std::uint32_t* map;
     float* output;
     std::size_t output_row;
+    unsigned* bf16_rows;
+    mutable unsigned range_mask{};
 
     __device__ __forceinline__ typename Operand::Row row(unsigned column) const { return Operand::row(weights, column); }
     __device__ __forceinline__ AChunk load_a(unsigned r, unsigned k, bool in) const {
         const std::size_t base = (map ? std::size_t{map[r]} : std::size_t{r}) * input_row;
         return {in ? *reinterpret_cast<const gemm::U4*>(input + base + k) : gemm::U4{}};
     }
-    // Eight BF16 elements to FP16 pairs (exact for |x| in the FP16 normal range).
-    __device__ __forceinline__ static gemm::U4 pack_a(const AChunk& x) {
+    // Record rows that need the original BF16 operands while staging the small form.
+    __device__ __forceinline__ gemm::U4 pack_a(const AChunk& x, unsigned row) const {
         gemm::U4 out;
+        bool needs_bf16 = false;
 #pragma unroll
-        for (unsigned i = 0; i < 4U; ++i)
+        for (unsigned i = 0; i < 4U; ++i) {
+            needs_bf16 |= small_f16_needs_bf16(static_cast<std::uint16_t>(x.v[i])) |
+                          small_f16_needs_bf16(static_cast<std::uint16_t>(x.v[i] >> 16U));
             out[i] = gemm::detail::pack(__builtin_bit_cast(float, x.v[i] << 16U),
                                         __builtin_bit_cast(float, x.v[i] & 0xFFFF0000U));
+        }
+        if (needs_bf16) {
+            if (row < rows - first_row) atomicOr(bf16_rows, 1U << row);
+            return {};
+        }
         return out;
     }
-    __device__ __forceinline__ void store(unsigned r, unsigned column, float sum) const {
-        output[std::size_t{r} * output_row + column] = sum * weights.outer_scale;
+    __device__ __forceinline__ void before_store() const {
+        __syncthreads();
+        range_mask = *bf16_rows;
     }
+    __device__ __forceinline__ void store(unsigned r, unsigned column, float sum) const {
+        if ((range_mask & (1U << (r - first_row))) == 0U)
+            output[std::size_t{r} * output_row + column] = sum * weights.outer_scale;
+    }
+};
+
+// Only the exceptional rows of this 64-column panel store from the packed BF16 tile.
+struct SmallBf16Store {
+    gemm::RawStore raw;
+    unsigned mask, first_row, first_column;
+    __device__ __forceinline__ void put(unsigned b, unsigned r, unsigned column, float sum) const {
+        if (column - first_column < kSmallOutputs && (mask & (1U << (r - first_row))) != 0U)
+            raw.put(b, r, column, sum);
+    }
+};
+
+struct SmallInputRows {
+    const std::uint32_t* map;
+    __device__ unsigned operator()(unsigned row) const { return map ? map[row] : row; }
 };
 
 template <packed::MatrixFormat Format, unsigned RowTiles>
@@ -177,15 +207,35 @@ __global__ __launch_bounds__(128) void small_kernel(Args args, const std::uint32
     if (!TileBinding<Format>::active(args, tile)) return;
     const TileRows rows = args.tiles[tile];
     if (r0 >= rows.rows) return;
-    SmallTile<Format> t{args.inputs, rows.rows, args.outputs, rows.weights, rows.input, rows.input_row, nullptr,
-                        rows.output, rows.output_row};
+    __shared__ unsigned bf16_rows;
+    if (threadIdx.x == 0U) bf16_rows = 0U;  // published by the small loop's first stage barrier
+    SmallTile<Format> t{args.inputs, rows.rows, args.outputs, r0, rows.weights, rows.input, rows.input_row, nullptr,
+                        rows.output, rows.output_row, &bf16_rows};
     if (gather_rows) {
         t.map = gather_rows + static_cast<std::size_t>(rows.input - gather_from) / rows.input_row;
         t.input = gather_from;
     } else if (args.rebase_to) {
         t.input = args.rebase_to + (rows.input - args.rebase_from);
     }
-    gemm::small_m::run<typename SmallTile<Format>::Operand, RowTiles, 1U>(t, r0, blockIdx.x * gemm::kProjectionPanel);
+    const unsigned col0 = blockIdx.x * kSmallOutputs;
+    gemm::small_m::run<typename SmallTile<Format>::Operand, RowTiles, 1U>(t, r0, col0);
+    const unsigned mask = t.range_mask;
+    if (mask != 0U) {
+        static_assert(NarrowSchedule::kThreads == 128U && NarrowSchedule::kRows >= 16U * RowTiles);
+        __shared__ NarrowSchedule::Storage lds;
+        gemm::Args shape{};
+        shape.a16 = t.input;
+        shape.a_row = t.input_row;
+        const unsigned end = r0 + 16U * RowTiles;
+        shape.rows = t.rows < end ? t.rows : end;
+        shape.K = t.K;
+        shape.N = t.outputs;
+        const SmallBf16Store store{{t.output, t.output_row, 0U}, mask, r0, col0};
+        using Weights = packed::PackedOperand<Format>;
+        gemm::core<gemm::Layout::NK, SmallBf16Store, true, Weights, gemm::UnpairedColumns, SmallInputRows,
+                   NarrowSchedule, true>(shape, lds, store, Weights{t.weights}, {}, {t.map},
+                                         {r0, col0 / gemm::kBN * gemm::kBN});
+    }
 }
 
 template <packed::MatrixFormat Format>

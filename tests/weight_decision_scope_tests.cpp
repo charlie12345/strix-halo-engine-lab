@@ -204,7 +204,7 @@ int main() {
         r.scope = decode;
         ok &= check(resolve(full_both).storage == weight::kQ8WeightStorage, "single-regime request keeps its old meaning");
         r.scope = prefill;
-        ok &= check(resolve(full_both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
+        ok &= check(resolve(both).storage == weight::kBf16WeightStorage, "single gate-only regime never selects");
     }
     return ok ? 0 : 1;
 }

@@ -120,8 +120,10 @@ __global__ __launch_bounds__(kThreads) void controller_rms_kernel(Args a) {
 }  // namespace detail
 
 // The shapes the row-owner form takes: prefill rows (decode rows keep their gemv gates), rank a multiple of 16 up to
-// 64, width a multiple of 16, 16-byte aligned latent rows and weights, output either the current rows or disjoint
-// from current, message and latent.
+// 64, width a multiple of 16 above 256, 16-byte aligned latent rows and weights, output either the current rows or
+// disjoint from current, message and latent. Rows of at most 256 values keep the two launches: there the separate
+// norm runs its one-wave form (ops/norm/rms_bf16_rows.hpp), the same bits for finite rows but not always the same
+// NaN payload as the block form this kernel shares with rmsnorm_strided_kernel.
 inline bool admits(const Args& a, unsigned decode_rows) noexcept {
     const auto aligned = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16U == 0U; };
     const auto disjoint = [](const void* p, std::size_t p_bytes, const void* q, std::size_t q_bytes) {
@@ -129,7 +131,7 @@ inline bool admits(const Args& a, unsigned decode_rows) noexcept {
         return p0 + p_bytes <= q0 || q0 + q_bytes <= p0;
     };
     if (!a.latent || !a.forget || !a.gain || !a.current || !a.message || !a.output || a.rows <= decode_rows ||
-        a.rank == 0U || a.rank % 16U != 0U || a.rank > 16U * kMaxUnits || a.width == 0U || a.width % 16U != 0U ||
+        a.rank == 0U || a.rank % 16U != 0U || a.rank > 16U * kMaxUnits || a.width <= kThreads || a.width % 16U != 0U ||
         a.width > std::numeric_limits<unsigned>::max() - 256U ||
         std::size_t{a.rows} > std::numeric_limits<std::size_t>::max() / sizeof(float) / a.width ||
         !aligned(a.latent) || !aligned(a.forget) || !aligned(a.gain) || !(a.epsilon > 0.0F))

@@ -37,14 +37,20 @@ inline constexpr unsigned kGroup = 16U;
 //   nvfp4_mse      both projections on the NVFP4 image, scale rule mse@1 (moe_core/nvfp4_act_rule.hpp); same GEMM identity.
 //   nvfp4_mse_gate_up W4A4 gate-up (mse@1) and the down projection on BF16 activations (the grouped_microscaled down of bf16):
 //                  removes the down input's share of the activation error at the cost of the down GEMM's FP4 rate.
-enum class Activations : std::uint8_t { bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up };
+//   iu4_rot        the rotated integer class of the same projections (moe_core/grouped_iu4a4.hpp, grouped-iu4a4-rot-v1:
+//                  rotated IU4 expert images + A4 activations on integer 4-bit WMMA): a HIP value; this NVFP4 class declines it
+//                  (the BF16 tile runs) and a backend without the integer class declines it as well.
+enum class Activations : std::uint8_t { bf16, nvfp4, nvfp4_mse, nvfp4_mse_gate_up, iu4_rot };
 using ScaleRule = nvfp4_act::ScaleRule;
-constexpr bool w4a4_gate_up(Activations a) { return a != Activations::bf16; }
+constexpr bool w4a4_gate_up(Activations a) {
+    return a == Activations::nvfp4 || a == Activations::nvfp4_mse || a == Activations::nvfp4_mse_gate_up;
+}
 constexpr bool w4a4_down(Activations a) { return a == Activations::nvfp4 || a == Activations::nvfp4_mse; }
 constexpr ScaleRule scale_rule(Activations a) { return a == Activations::nvfp4 ? ScaleRule::nearest : ScaleRule::mse; }
 constexpr const char* identity(Activations a) {
     return a == Activations::bf16 ? "bf16" : a == Activations::nvfp4 ? "nvfp4-nearest@1"
-         : a == Activations::nvfp4_mse ? "nvfp4-mse@1" : "nvfp4-mse-gate-up@1";
+         : a == Activations::nvfp4_mse ? "nvfp4-mse@1" : a == Activations::nvfp4_mse_gate_up ? "nvfp4-mse-gate-up@1"
+         : "iu4a4-rot@1";
 }
 
 // NVFP4 image of assignment rows (device addresses). Row a holds assignment a of the plan.

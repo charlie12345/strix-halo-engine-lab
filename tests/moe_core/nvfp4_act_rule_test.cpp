@@ -130,6 +130,9 @@ void classes() {
           "nvfp4_mse: both projections, mse@1");
     check(gw::w4a4_gate_up(gw::Activations::nvfp4_mse_gate_up) && !gw::w4a4_down(gw::Activations::nvfp4_mse_gate_up),
           "nvfp4_mse_gate_up: gate-up W4A4, down BF16");
+    check(!gw::w4a4_gate_up(gw::Activations::iu4_rot) && !gw::w4a4_down(gw::Activations::iu4_rot) &&
+              std::strcmp(gw::identity(gw::Activations::iu4_rot), "iu4a4-rot@1") == 0,
+          "iu4_rot: declined by the NVFP4 class (the integer class runs it)");
     check(std::strcmp(gw::identity(gw::Activations::nvfp4_mse), "nvfp4-mse@1") == 0 &&
               std::strcmp(act::identity(act::ScaleRule::nearest), "nvfp4-act-scale-nearest@1") == 0, "identities");
 }

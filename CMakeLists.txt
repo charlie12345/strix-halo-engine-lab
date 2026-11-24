@@ -3967,6 +3967,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         add_test(NAME strix-hip-grouped-schedule-test COMMAND strix-hip-grouped-schedule-test)
         set_tests_properties(strix-hip-grouped-schedule-test PROPERTIES LABELS "hip;moe")
+        # Grouped rotated A4W4 expert class grouped-iu4a4-rot-v1 (moe_core/grouped_iu4a4.hpp): expert images and routed
+        # outputs bit for bit against iu4a4_rot (ctest); --bench [tokens] times the pass at Inkling shapes.
+        add_executable(strix-hip-grouped-iu4a4-tests tests/hip_grouped_iu4a4_tests.hip)
+        target_link_libraries(strix-hip-grouped-iu4a4-tests PRIVATE strix_hip_runtime strix_core)
+        target_include_directories(strix-hip-grouped-iu4a4-tests PRIVATE src include)
+        set_target_properties(strix-hip-grouped-iu4a4-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        add_test(NAME strix-hip-grouped-iu4a4-tests COMMAND strix-hip-grouped-iu4a4-tests)
+        set_tests_properties(strix-hip-grouped-iu4a4-tests PROPERTIES LABELS "hip;moe")
         # No-model check and bench of the R1 decode launch (Inkling shapes): rows-launch rows equal one-row launches,
         # per-case output digests for cross-build identity, --bench ms per launch; not a ctest (needs a GPU).
         add_executable(strix-hip-microscaled-r1-bench tests/moe_core/microscaled_r1_hip.hip)
@@ -4416,12 +4425,6 @@ int main() { return 0; }"
             target_link_libraries(strix-hip-iu4a4-dense-tests PRIVATE strix_hip_runtime strix_core)
             target_include_directories(strix-hip-iu4a4-dense-tests PRIVATE src)
             add_test(NAME strix-hip-iu4a4-dense-tests COMMAND strix-hip-iu4a4-dense-tests)
-            # Grouped rotated A4W4 expert class grouped-iu4a4-rot-v1 (moe_core/grouped_iu4a4.hpp): images + routed outputs bit for bit
-            add_executable(strix-hip-grouped-iu4a4-tests tests/hip_grouped_iu4a4_tests.hip)
-            set_target_properties(strix-hip-grouped-iu4a4-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_link_libraries(strix-hip-grouped-iu4a4-tests PRIVATE strix_hip_runtime strix_core)
-            target_include_directories(strix-hip-grouped-iu4a4-tests PRIVATE src include)
-            add_test(NAME strix-hip-grouped-iu4a4-tests COMMAND strix-hip-grouped-iu4a4-tests)
             # Shared FAST wide-window attention (flash over the dense_decode BF16 cache) vs the decode form
             add_executable(strix-hip-dense-decode-flash-tests tests/hip_dense_decode_flash_tests.hip)
             set_target_properties(strix-hip-dense-decode-flash-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")

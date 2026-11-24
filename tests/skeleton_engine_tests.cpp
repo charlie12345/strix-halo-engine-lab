@@ -248,11 +248,74 @@ void native_handoff() {
     fs::remove_all(dir);
 }
 
+// Review r9 M1: a placement query alone does not apply a model preset. A family-native --profile after `--` keeps its
+// passthrough and is the tier the placement is admitted at, in the in-process branch and in the external handoff.
+void native_tier_placement() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::current_path() / "serve-native-tier-fixture";
+    fs::create_directories(dir / "models");
+    std::ofstream(dir / "models/registry.toml") << "schema = \"strix-registry/v1\"\n[models.fixture]\n"
+        "name = \"fixture\"\nfamily = \"fixture\"\ndescription = \"models/m.toml\"\n";
+    // A narrow tensor wire: explicit tensor is refused at EXACT ("tier is exact") and reaches the executor check at FAST.
+    std::ofstream(dir / "models/m.toml") << "schema = \"strix-model/v1\"\nname = \"fixture\"\n[multi_device]\nversion = 1\n"
+        "[multi_device.forms.tensor]\nwire = \"fp16\"\n";
+    std::vector<std::string> seen;
+    bool launched = false;
+    sv::ServiceFactories family;
+    sv::ServiceFactory fixture;
+    fixture.validate = [&](const sv::ServiceSelection& selection) { seen = selection.arguments; };
+    fixture.inspect = [](const sv::ServiceSelection&, std::ostream&) {};
+    fixture.create = [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> { return nullptr; };
+    fixture.early_exit = [](const sv::ServiceSelection&, std::ostream&) -> std::optional<int> { return 0; };
+    family.install("fixture", std::move(fixture));
+    const sv::ServiceFactories none;
+    const auto invoke = [&](const sv::ServiceFactories& factories, std::vector<std::string> extra, std::string& error) {
+        std::vector<std::string> args{"serve", "--registry-root", dir.string(), "--model", "fixture"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        std::vector<char*> pointers;
+        for (auto& a : args) pointers.push_back(a.data());
+        sv::ServeShell shell;
+        shell.launch = [&](const sv::ServiceSelection&, const sv::ServeShell::NativeRequest&, std::ostream&) {
+            launched = true;
+            return 0;
+        };
+        seen.clear();
+        launched = false;
+        std::ostringstream out, err;
+        const int result = sv::run(static_cast<int>(pointers.size()), pointers.data(), factories, out, err, shell);
+        error = err.str();
+        return result;
+    };
+    std::string error;
+    // In-process: the native --profile passes through untouched (no preset injection) under an explicit single.
+    CHECK(invoke(family, {"--placement", "single", "--", "--profile", "fast"}, error) == 0);
+    CHECK((seen == std::vector<std::string>{"--profile", "fast"}));
+    CHECK(invoke(family, {"--placement", "single", "--", "--profile=fast"}, error) == 0);
+    CHECK((seen == std::vector<std::string>{"--profile=fast"}));
+    // The placement is admitted at the effective (native) tier: FAST passes the tier rule and meets the executor check,
+    // while without a native tier the standard (EXACT) rule refuses the narrow wire.
+    CHECK(invoke(family, {"--device-count", "2", "--placement", "tensor", "--", "--profile", "fast"}, error) == 2);
+    CHECK(error.find("is not executed by any engine yet") != std::string::npos &&
+          error.find("tier is exact") == std::string::npos);
+    CHECK(invoke(family, {"--device-count", "2", "--placement", "tensor"}, error) == 2);
+    CHECK(error.find("tier is exact") != std::string::npos);
+    // External handoff: the same effective tier decides the admission made before delegation.
+    CHECK(invoke(none, {"--asset", "w.gguf", "--placement", "single", "--", "--profile", "fast"}, error) == 0 && launched);
+    CHECK(invoke(none, {"--asset", "w.gguf", "--device-count", "2", "--placement", "tensor", "--", "--profile", "fast"},
+                 error) == 2);
+    CHECK(!launched && error.find("is not executed by any engine yet") != std::string::npos &&
+          error.find("tier is exact") == std::string::npos);
+    CHECK(invoke(none, {"--asset", "w.gguf", "--device-count", "2", "--placement", "tensor"}, error) == 2);
+    CHECK(!launched && error.find("tier is exact") != std::string::npos);
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     shell_config_tests();
     multi_device_parity();
     native_handoff();
+    native_tier_placement();
     embed_rows();
     sv::ServiceFactories factories;
     skeleton::install_session_service(factories);

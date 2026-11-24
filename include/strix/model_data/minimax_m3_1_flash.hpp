@@ -58,7 +58,6 @@ inline constexpr std::int64_t top_k = 4;
 } // namespace moe
 namespace multi_device {
 namespace legacy_env {
-inline constexpr std::string_view STRIX_MMX_PREFILL_PIPE_PAIR = "forms.layers";
 inline constexpr std::string_view STRIX_MM_PF_GROUP = "forms.layers.window_rows";
 inline constexpr std::string_view STRIX_MM_PF_MOE_GROUP = "forms.layers.window_rows";
 inline constexpr std::string_view STRIX_SPLIT = "forms.layers";

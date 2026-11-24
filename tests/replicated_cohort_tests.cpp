@@ -4,9 +4,20 @@
 // with the same per-lane state; every request's ids equal its solo run; one control message per forward when commit
 // and release are rank-local; a dropped / altered control message stops rank 1 before its backend sees it.
 #include "strix/pair/lockstep.hpp"
+#include "strix/dist/exchange_transport.hpp"
 #include "strix/serve/replicated_cohort.hpp"
 
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
+#include "strix/dist/communicator.hpp"
+#include "strix/dist/host_copy.hpp"
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +26,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -29,9 +41,18 @@
 
 using namespace strix::serve;
 
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
+namespace strix::dist {
+void enqueue_host_d2h_copy(void* mapped_host, const void* device, std::size_t bytes, hipStream_t) {
+    std::memcpy(mapped_host, device, bytes);
+}
+}
+#endif
+
 namespace {
 // A one-shot allocation failure on the calling rank only.
 thread_local std::size_t fail_allocation_size = 0;
+thread_local bool fail_next_allocation = false;
 #if defined(__GNUC__)
 __attribute__((noinline))
 #endif
@@ -39,7 +60,8 @@ void free_test_allocation(void* ptr) noexcept { std::free(ptr); }
 }
 
 void* operator new(std::size_t size) {
-    if (fail_allocation_size != 0 && size == fail_allocation_size) {
+    if (fail_next_allocation || (fail_allocation_size != 0 && size == fail_allocation_size)) {
+        fail_next_allocation = false;
         fail_allocation_size = 0;
         throw std::bad_alloc{};
     }
@@ -269,7 +291,7 @@ struct Follower {
     std::uint64_t rounds = 0;
     std::string error;
     bool protocol_error = false;
-    void start(FakeBackend& be, QueueTransport& link, ReplicaOptions options) {
+    void start(FakeBackend& be, strix::dist::Transport& link, ReplicaOptions options) {
         thread = std::thread([this, &be, &link, options] {
             try {
                 rounds = follow_cohort(be, link, options);
@@ -471,18 +493,17 @@ void run_bind_control(bool local_ops) {
 
 // The verify frame carries no score-read flag: both ranks run every group as read whatever rank 0 was told, so a
 // backend that picks its route from the flag takes the same route on both ranks, and both can read the scores after.
-void run_score_reads() {
+void run_score_reads(strix::dist::Transport& t0, strix::dist::Transport& t1) {
     const std::string name = "score reads (collective)";
-    Pair link;
     FakeBackend be0(3, 8, 23), be1(3, 8, 23);
     ReplicaOptions options;
     options.collective_reads = true;
     options.frame_words = 5;
     Follower follower;
-    follower.start(be1, link.t1, options);
+    follower.start(be1, t1, options);
     float read0 = -1.0F, read1 = -1.0F;
     try {
-        ReplicatedCohort rep(be0, link.t0, options);
+        ReplicatedCohort rep(be0, t0, options);
         const std::vector<std::uint32_t> p = {1, 2, 3};
         rep.prefill(0, p, true);
         rep.prefill(1, p, true);
@@ -583,6 +604,148 @@ void run_verify_backend_failure() {
     }
 }
 
+void run_exchange_abort_allocation_failure() {
+    const std::string reason(256, 'x');
+    unsigned callbacks = 0;
+    strix::dist::ExchangeTransport link([](auto, auto) {}, "exchange",
+                                       [&](const std::string&) { ++callbacks; });
+    fail_next_allocation = true;
+    try {
+        link.abort(reason);
+    } catch (const std::bad_alloc&) {
+        link.abort({});
+    }
+    const bool allocation_failed = !fail_next_allocation;
+    fail_next_allocation = false;
+    link.abort({});
+    check(allocation_failed && link.aborted() && callbacks == 1,
+          "exchange abort: failed reason capture still cancels exactly once");
+
+    bool retried = false;
+    strix::dist::ExchangeTransport retry([](auto, auto) {}, "exchange", [&](const std::string& why) {
+        if (!why.empty()) throw std::bad_alloc{};
+        retried = true;
+    });
+    try {
+        retry.abort(reason);
+    } catch (const std::bad_alloc&) {
+        retry.abort({});
+    }
+    check(retry.aborted() && retried, "exchange abort: a failed callback does not swallow the empty retry");
+}
+
+void run_follower_abort_allocation_failure() {
+    Pair wire;
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    const std::runtime_error original(std::string(256, 'x'));
+    be1.on_verify = [&] {
+        fail_next_allocation = true;
+        throw original;
+    };
+    auto follow = std::async(std::launch::async, [&] {
+        try {
+            (void)follow_cohort(be1, wire.t1);
+        } catch (const std::runtime_error& e) {
+            return std::string_view(e.what()) == original.what();
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        return false;
+    });
+    ReplicatedCohort rep(be0, wire.t0);
+    const CohortGroup group{0, 1, false};
+    const std::uint32_t token = 4;
+    std::uint32_t top = 0;
+    rep.verify({&group, 1}, {&token, 1}, {&top, 1});
+    check(follow.get(), "follower abort: preserves the original verify exception under allocation failure");
+    std::lock_guard lock(wire.wire->m);
+    check(wire.wire->aborted, "follower abort: cancels the link when building the reason fails");
+}
+
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
+void run_verify_transport_failure(strix::dist::Transport& t0, strix::dist::Transport& t1) {
+    using namespace std::chrono_literals;
+    const auto name = t0.name();
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    std::promise<void> entered;
+    auto waiting = entered.get_future();
+    be0.on_verify = [&] {
+        if (waiting.wait_for(5s) != std::future_status::ready)
+            throw std::runtime_error("follower did not enter verify");
+        throw std::runtime_error("rank 0 verify failed");
+    };
+    be1.on_verify = [&] {
+        std::byte unused{};
+        entered.set_value();
+        t1.receive({&unused, 1});
+        throw std::runtime_error("test cleanup byte received");
+    };
+    auto follow = std::async(std::launch::async, [&] {
+        try {
+            (void)follow_cohort(be1, t1);
+        } catch (const std::exception& e) {
+            return std::string(e.what());
+        }
+        return std::string{};
+    });
+    ReplicatedCohort rep(be0, t0);
+    const CohortGroup group{0, 1, false};
+    const std::uint32_t token = 4;
+    std::uint32_t top = 0;
+    bool rethrew = false;
+    try {
+        rep.verify({&group, 1}, {&token, 1}, {&top, 1});
+    } catch (const std::runtime_error& e) {
+        rethrew = std::string_view(e.what()) == "rank 0 verify failed";
+    }
+    check(rethrew && rep.rounds() == 1, name + ": rank 0 rethrows after publishing verify");
+    const bool cancelled = follow.wait_for(2s) == std::future_status::ready;
+    check(cancelled, name + ": abort wakes the collective before its deadline with both links alive");
+    if (!cancelled) {
+        const std::byte cleanup{};
+        // Unblock the baseline's still-open transport instead of waiting for its full receive timeout.
+        try { t0.send({&cleanup, 1}); } catch (const std::exception&) {}
+    }
+    const auto error = follow.get();
+    check(!error.empty() && error != "test cleanup byte received" && error.find("timed out") == std::string::npos,
+          name + ": follower exits with a cancellation error");
+}
+
+void run_real_transports() {
+    using namespace std::chrono_literals;
+    using namespace strix::dist;
+    auto [mem0, mem1] = memory_pair();
+    run_score_reads(*mem0, *mem1);
+    run_verify_transport_failure(*mem0, *mem1);
+
+    int sockets[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
+        throw std::runtime_error("USB4 host fixture: socketpair failed");
+    auto usb0 = usb4_host_descriptors({sockets[0]}, {"stream"}, {1}, 0, 5s);
+    auto usb1 = usb4_host_descriptors({sockets[1]}, {"stream"}, {1}, 0, 5s);
+    run_score_reads(*usb0, *usb1);
+    run_verify_transport_failure(*usb0, *usb1);
+
+    // Use an ephemeral loopback port so concurrent test invocations normally get distinct listeners.
+    const int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (probe < 0) throw std::runtime_error("TCP fixture: socket failed");
+    sockaddr_in loopback{};
+    loopback.sin_family = AF_INET;
+    loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof(loopback);
+    const bool bound = ::bind(probe, reinterpret_cast<sockaddr*>(&loopback), length) == 0 &&
+                       ::getsockname(probe, reinterpret_cast<sockaddr*>(&loopback), &length) == 0;
+    ::close(probe);
+    if (!bound) throw std::runtime_error("TCP fixture: could not choose a loopback port");
+    const auto port = ntohs(loopback.sin_port);
+    auto listen = std::async(std::launch::async, [port] { return tcp_listen(port, 5s); });
+    auto tcp1 = tcp_connect("127.0.0.1", port, 5s);
+    auto tcp0 = listen.get();
+    run_score_reads(*tcp0, *tcp1);
+    run_verify_transport_failure(*tcp0, *tcp1);
+}
+#endif
+
 // One long prefill split into many frames arrives intact, and a closed replica refuses further calls.
 void run_frames() {
     Pair link;
@@ -658,9 +821,15 @@ int main() {
     run_hooks(true, true);
     run_hooks(false, true);
     run_tamper();
-    run_score_reads();
+    Pair wire;
+    run_score_reads(wire.t0, wire.t1);
     run_verify_allocation_failure();
     run_verify_backend_failure();
+    run_exchange_abort_allocation_failure();
+    run_follower_abort_allocation_failure();
+#ifdef STRIX_TEST_REPLICA_TRANSPORTS
+    run_real_transports();
+#endif
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";
         return 1;

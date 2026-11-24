@@ -23,8 +23,6 @@ namespace strix::serve {
 // single-session prefill does: a served lane then runs the same prefill rows
 // as that session. The call's final scores are its row 0 (read_slot_logits),
 // copied out only when a sampled lane asks, like a one-lane decode window.
-// A decoder whose decode_slots also takes `reads_scores` learns whether any lane of the window will read its final
-// scores (CohortGroup::reads_scores), so a greedy-only pick form serves only windows nobody reads.
 template <class Decoder>
 class FixedKvCohort final : public CohortBackend {
 public:
@@ -83,6 +81,7 @@ public:
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
         withdraw();
+        // A decoder with the score-read hook may use a pick-only form when no lane needs final scores.
         bool reads_scores = false;
         for (const auto& group : groups) {
             if (group.rows != 1U) throw std::logic_error("fixed KV cohort requires one decode row per lane");

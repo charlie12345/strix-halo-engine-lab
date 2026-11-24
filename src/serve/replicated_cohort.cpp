@@ -99,6 +99,18 @@ void check_frame(std::uint32_t frame_words) {
     if (frame_words == 0U) throw std::invalid_argument("cohort replica: frame_words >= 1");
 }
 
+void abort_link(dist::Transport& link, const char* reason) noexcept {
+    try {
+        link.abort(reason);
+    } catch (...) {
+        // Under memory pressure even building the reason string can fail. Retry without it.
+        try {
+            link.abort({});
+        } catch (...) {  // Keep the original exception.
+        }
+    }
+}
+
 }  // namespace
 
 ReplicatedCohort::ReplicatedCohort(CohortBackend& local, dist::Transport& link, ReplicaOptions options)
@@ -107,11 +119,7 @@ ReplicatedCohort::ReplicatedCohort(CohortBackend& local, dist::Transport& link, 
 }
 
 ReplicatedCohort::~ReplicatedCohort() {
-    if (closed_) return;
-    try {
-        link_.abort("cohort replica: rank 0 ended without close()");
-    } catch (...) {  // a destructor reports nothing further; rank 1 sees the aborted link
-    }
+    if (!closed_) abort_link(link_, "cohort replica: rank 0 ended without close()");
 }
 
 std::uint32_t ReplicatedCohort::lanes() const { return local_.lanes(); }
@@ -133,15 +141,7 @@ std::uint32_t ReplicatedCohort::max_window(std::uint32_t lane) const { return lo
 
 void ReplicatedCohort::abort_replica(const char* reason) noexcept {
     closed_ = true;
-    try {
-        link_.abort(reason);
-    } catch (...) {
-        // Under memory pressure even building the reason string can fail. Retry without it.
-        try {
-            link_.abort({});
-        } catch (...) {  // Keep the original exception.
-        }
-    }
+    abort_link(link_, reason);
 }
 
 void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body) {
@@ -471,7 +471,10 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             }
         }
     } catch (const std::exception& error) {
-        link.abort(error.what());
+        abort_link(link, error.what());
+        throw;
+    } catch (...) {
+        abort_link(link, "cohort replica: rank 1 failed");
         throw;
     }
 }

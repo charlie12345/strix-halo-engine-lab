@@ -87,24 +87,34 @@ request runs on one node with the single-node identity. The
 `[multi_device]` section of `models/inkling2-mini.toml` declares this form;
 with one device the same resolver selects `single`, as before.
 
-Pin the same backend, profile and checkpoint on both workers: without `--backend` a build with HIP chooses HIP and a
+Pin the same backend, profile, checkpoint and tokenizer on both workers: without `--backend` a build with HIP chooses HIP and a
 CUDA-only build chooses CUDA, and the router checks the endpoint count and the requested tier, not the backend, so a
 mixed pair would answer identical requests with different identities. `--backend` goes after `--` so it reaches the
 Inkling adapter's own parser (the top-level `strix-serve --backend` is read by the shell and not forwarded to the
-in-process arguments); `--profile` is a shell option and is forwarded to the adapter.
+in-process arguments); `--profile` is a shell option and is forwarded to the adapter. Pass `--tokenizer PATH`
+explicitly too: without it each worker loads the `tokenizer.json` next to its own checkpoint, the loader only checks
+vocabulary size and EOS, and two tokenizers with different merges would tokenize the same request differently while
+the router, which sees only health and capacity, could not tell.
 
 ```sh
 # on node A and on node B: one worker each, listening on that node's private address
 # (the listener defaults to 127.0.0.1, which the other node cannot reach); same --profile, --backend and checkpoint
-strix-serve --model inkling2-mini --profile exact --bind NODE_A_ADDRESS --port 18196 -- --checkpoint MODEL.safetensors --backend hip   # node A
-strix-serve --model inkling2-mini --profile exact --bind NODE_B_ADDRESS --port 18196 -- --checkpoint MODEL.safetensors --backend hip   # node B
-# check that both workers answer from the router's node
+strix-serve --model inkling2-mini --profile exact --bind NODE_A_ADDRESS --port 18196 -- --checkpoint MODEL.safetensors --tokenizer TOKENIZER.json --backend hip   # node A
+strix-serve --model inkling2-mini --profile exact --bind NODE_B_ADDRESS --port 18196 -- --checkpoint MODEL.safetensors --tokenizer TOKENIZER.json --backend hip   # node B
+# identity check, before any traffic: on each node, the checkpoint and tokenizer hashes must be equal across the two nodes
+sha256sum MODEL.safetensors TOKENIZER.json
+# and the effective identity of each worker (backend, tier/profile) must be the same on both nodes: print it with the worker's own
+# command line plus --print-effective-config (the worker's listening line shows only its address; the checkpoint and
+# tokenizer paths are the ones on its command line, pinned by the hashes above)
+strix-serve --model inkling2-mini --profile exact --print-effective-config -- --checkpoint MODEL.safetensors --tokenizer TOKENIZER.json --backend hip
+# only then check that both workers answer from the router's node
 curl -fsS http://NODE_A_ADDRESS:18196/health && curl -fsS http://NODE_B_ADDRESS:18196/health
 # on the node that takes the API traffic (the same tier the workers run)
 strix-router --description models/inkling2-mini.toml --profile exact \
   --replica http://NODE_A_ADDRESS:18196 --replica http://NODE_B_ADDRESS:18196 --listen 0.0.0.0:8090
 # both endpoints must be listed (healthy, with capacity) before sending traffic
 curl -fsS http://ROUTER_ADDRESS:8090/router/status
+# then send independent requests through the router and check that both endpoints receive them
 ```
 
 The router prints `effective-multi-device {...}` and refuses to start if
@@ -125,10 +135,16 @@ Dos nodos: cada nodo ejecuta un `strix-serve` completo, escuchando en su
 dirección privada (`--bind`; por defecto escucha en 127.0.0.1 y el otro
 nodo no lo alcanza), y `strix-router` reparte las peticiones; cada petición
 se resuelve en un solo nodo con la identidad de un nodo. Fija el mismo
-backend, perfil y checkpoint en los dos workers (`--profile exact` y, tras
-`--`, `--checkpoint ... --backend hip`; el `--backend` de nivel superior lo
+backend, perfil, checkpoint y tokenizador en los dos workers (`--profile exact` y, tras
+`--`, `--checkpoint ... --tokenizer RUTA --backend hip`; el `--backend` de nivel superior lo
 consume el shell y no llega al adaptador), porque el router comprueba el
-número de endpoints y el perfil, no el backend. Solo el router ejecuta la
+número de endpoints y el perfil, no el backend, y sin `--tokenizer` cada worker
+carga el `tokenizer.json` junto a su propio checkpoint (el cargador solo
+comprueba tamaño de vocabulario y EOS). Antes de enviar tráfico, comprueba que
+`sha256sum` del checkpoint y del tokenizador coincide en los dos nodos y que la
+identidad efectiva de cada worker (backend, perfil; `--print-effective-config`
+con la misma línea de comandos) es la misma; solo después comprueba que
+peticiones independientes llegan a ambos endpoints. Solo el router ejecuta la
 forma `replica`; `strix-serve --model inkling2-mini --device-count 2 --
 --checkpoint MODEL.safetensors` se rechaza (la CLI `strix` no tiene ruta
 nativa para Inkling) y el mismo `host:puerto` repetido no cuenta como dos

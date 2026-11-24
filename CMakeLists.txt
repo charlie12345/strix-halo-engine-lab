@@ -1152,6 +1152,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-dense-linear-group-test)
     add_test(NAME strix-dense-linear-group-test COMMAND strix-dense-linear-group-test)
     set_tests_properties(strix-dense-linear-group-test PROPERTIES LABELS "cpu;exactness")
+    # Byte-range overlap of launch operands (reads vs writes of one launch).
+    add_executable(strix-byte-range-test tests/core/byte_range_test.cpp)
+    target_include_directories(strix-byte-range-test PRIVATE src)
+    strix_target_warnings(strix-byte-range-test)
+    add_test(NAME strix-byte-range-test COMMAND strix-byte-range-test)
+    set_tests_properties(strix-byte-range-test PROPERTIES LABELS "cpu")
     # EXACT screened LM head: plane builder and the error bound (candidate set contains the true argmax and every tie).
     add_executable(strix-screened-head-tests tests/screened_head_tests.cpp)
     target_include_directories(strix-screened-head-tests PRIVATE src include)

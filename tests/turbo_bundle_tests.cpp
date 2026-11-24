@@ -83,7 +83,7 @@ void families() {
     generic(ds, p::Name::turbo, none, r);
     require(find(r, "attention_f16wmma") != nullptr && find(r, "attention_f16wmma")->value == "2", "ds41 turbo attention = bf16flash");
     require(find(r, "dense_f16") != nullptr && find(r, "dense_f16")->value == "1", "ds41 turbo dense f16");
-    require(profile_table.size() == 9, "ds41 keeps nine rows (pending Engram replaced, opt-in shared_f16 and moe_f16wmma added)");
+    require(profile_table.size() == 13, "ds41 keeps thirteen rows (nine profile rows, the TURBO IU4 candidate with its scope, two explicit diagnostics)");
     require(find(r, "shared_f16") == nullptr || find(r, "shared_f16")->value != "1", "ds41 turbo does not turn on shared_f16");
     require(find(r, "moe_f16wmma") == nullptr || find(r, "moe_f16wmma")->value != "1", "ds41 turbo does not turn on moe_f16wmma");
     std::size_t engram_rows = 0;

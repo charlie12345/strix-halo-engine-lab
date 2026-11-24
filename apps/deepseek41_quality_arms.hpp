@@ -15,8 +15,17 @@ namespace strix::deepseek41::quality {
 // qa kv qb oa ob (projections; none = all), l<first>t<end> (layers), a8 (FP16 operands from the A8 codes), r<rows>
 // (FP16 only at calls of >= rows rows), f (FP16 output form: STRIX_DS41_PREFILL_FP16_FAST), s<seed> (null: +-1 ulp by a
 // hash of the seed instead of the last-bit flip, so seeds sample the noise floor).
+// Prefix i4_ (any arm, e.g. i4_fast3): routed experts on the TURBO candidate gguf-iu4-direct-v1 (IU4 codes x A4), replacing
+// the relaxed MoE of the arm; the receipt profile is "diagnostic".
 // Prefix eng_ (any arm, e.g. eng_fast3, eng_exact; labels are [a-z0-9_]): adds the FAST lever ds41-engram-f16wmma-v1 (Engram projection on WMMA).
 inline PrefillOptions arm_precision(const std::string& label) {
+    if (label.rfind("i4_", 0) == 0 && label.size() > 3) {  // routed experts on gguf-iu4-direct-v1 instead of the relaxed MoE
+        PrefillOptions o = arm_precision(label.substr(3));
+        o.fast_i4 = 1;
+        o.fast_moe = false;
+        o.fast_moe_f16 = false;
+        return o;
+    }
     if (label.rfind("m16_", 0) == 0 && label.size() > 4) {  // + ds41-moe-f16wmma-v1 (relaxed MoE FP16 operands)
         PrefillOptions e = arm_precision(label.substr(4));
         e.fast_moe_f16 = true;
@@ -97,7 +106,7 @@ inline PrefillOptions executed_precision(PrefillOptions o, const PrefillResult& 
 }
 
 inline std::string arm_profile(const PrefillOptions& o) {
-    if (!o.decoder_replay_override && o.decoder_replay_rows == 0U) return "diagnostic";  // unresolved inheritance
+    if (o.fast_i4 > 0 || (!o.decoder_replay_override && o.decoder_replay_rows == 0U)) return "diagnostic";
     const bool fast3 = o.fast_attention && o.fast_attention_flash && o.fast_moe && o.fast_dense;
     const bool other = o.fp16_dense || o.bf16_attention || o.fp16_fast || o.fp16_keep_a8 || o.fp16_wsplit ||
                        o.fp16_projections != 31U || o.approx_layer_first != 0U || o.approx_layer_end != 1000U || o.fp16_min_rows != 0U;

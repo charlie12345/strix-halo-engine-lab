@@ -6,6 +6,7 @@
 #include "glm/serve/glm_serve_lead.hpp"
 #include "glm/serve/glm_serve_import.hpp"
 #include "glm/serve/glm_serve_selftest.hpp"
+#include "glm/serve/glm_serve_vision.hpp"
 #include "glm/rtxpf/import/glm_import_socket.hpp"
 
 #include <cctype>
@@ -90,8 +91,44 @@ std::vector<std::uint8_t> relay_full(unsigned rank) {
     return gs::merge_dsa(relay_part(false, rank), relay_part(true, 0), kRelayLayout);
 }
 
+std::uint32_t fake_frame_crc(std::span<const std::byte> bytes) noexcept {
+    std::uint32_t h = 2166136261U;
+    for (const std::byte b : bytes) h = (h ^ static_cast<std::uint32_t>(b)) * 16777619U;
+    return h;
+}
+
 struct FakeEng {
     std::uint32_t slots;
+    // Image input, with the real adapter's PromptEmbeds: this rank's table and frames. A provided row enters the
+    // slot's chain as a hash of its data instead of its token, so the ranks' tokens agree only when both hold the
+    // same rows at the same positions.
+    gs::PromptEmbeds embeds{&fake_frame_crc};
+    std::uint64_t embed_rows = 0, embed_frames = 0, embed_frame_bytes = 0;
+    std::vector<std::uint32_t> effective;
+    void bind_embeds(std::shared_ptr<const strix::session::EmbedTable> table) { embeds.bind(std::move(table)); }
+    std::vector<std::byte> embed_frame(std::span<const std::uint32_t> ids) {
+        auto frame = embeds.frame(ids);
+        ++embed_frames;
+        embed_frame_bytes += frame.size();
+        return frame;
+    }
+    void embed_frame_received(std::span<const std::byte> frame, std::vector<std::uint32_t>& ids) {
+        embeds.received(frame, ids);
+        ++embed_frames;
+        embed_frame_bytes += frame.size();
+    }
+    std::span<const std::uint32_t> provide(std::span<const std::uint32_t> t) {
+        if (!gs::PromptEmbeds::holds_virtual_ids(t)) return t;
+        const auto run = embeds.resolve(t);
+        effective = run.tokens;
+        for (const auto& seg : run.splice.segments)
+            for (std::uint32_t j = 0; j < seg.rows; ++j) {
+                const auto* row = seg.data + std::size_t{j} * run.splice.width;
+                effective[seg.run_row + j] = 0x40000000U | (fake_frame_crc(std::as_bytes(std::span(row, run.splice.width))) >> 2U);
+                ++embed_rows;
+            }
+        return effective;
+    }
     bool stops = true;
     std::uint32_t corrupt_call = 0;  // > 0: the n-th step returns a different first token
     unsigned delay_us = 0;           // per step / verify cycle
@@ -231,6 +268,7 @@ struct FakeEng {
         plain_call();
         if (units_open) throw std::runtime_error("fake prefill: another prompt's prefill units session is open");
         if (!ready.at(s) || pos0 != frontier[s]) throw std::runtime_error("fake prefill: not at the slot frontier / without reset");
+        t = provide(t);
         for (const auto x : t) h[s] = fold(h[s], x);
         frontier[s] = pos0 + t.size();
         ++calls;
@@ -410,6 +448,7 @@ struct FakeEng {
         if (start) {
             if (units_open) throw std::runtime_error("fake units: a session is already open");
             units_open = true;
+            t = provide(t);  // as the real adapter: resolved once, at the start of the session
             units_tokens.assign(t.begin(), t.end());
             units_slot = s;
             units_pos = pos0;
@@ -888,6 +927,163 @@ void import_route_receipts() {
 // root_mark(stable, n, 1024, 2) on its way through the prefill (the fake snapshot throws unless the slot is exactly at
 // that frontier); a sibling (same system prompt, other user turn) restores there and its tokens equal its cold run;
 // the producer's tokens equal its run without a root; a restore that reached the root stores none.
+// Image prompts on the pair: the lead flags each prefill chunk that holds virtual ids, the embed frame of its spans
+// follows the tokens, and the follower prefills the same rows. Tokens must not depend on chunking or on MTP, image
+// prompts must stay out of the prefix cache, and the rows must matter (the same ids as plain tokens give other text).
+struct ImageRun {
+    std::vector<std::uint32_t> image, text, repeat;
+    std::string error, session_error;
+    std::uint64_t rows0 = 0, rows1 = 0, frames0 = 0, frames1 = 0, bytes0 = 0, prefix_stores = 0, prefix_lookups = 0;
+    std::uint64_t first_frame_bytes = 0;
+    bool logs_equal = false, chunked = false;
+};
+ImageRun image_run(bool mtp, unsigned chunk, bool neighbour, unsigned units_rows = 0) {
+    ImageRun out;
+    const std::uint32_t slots = 2, width = strix::glm::kLanguageHidden, rows = 40, image_token = strix::glm::kImageToken;
+    strix::session::EmbedInterner interner;
+    strix::session::EmbedRows span;
+    span.rows = rows;
+    span.width = width;
+    span.real_token_id = image_token;
+    span.digest.fill(7);
+    span.data.resize(std::size_t{rows} * width);
+    for (std::size_t i = 0; i < span.data.size(); ++i) span.data[i] = static_cast<std::uint16_t>(i * 2654435761U >> 13U);
+    const auto lease = interner.intern(std::move(span));
+    const auto table = std::make_shared<const strix::session::EmbedTable>(std::vector<strix::session::EmbedLease>{lease});
+    std::vector<std::uint32_t> prompt, plain;
+    for (std::uint32_t k = 0; k < 30; ++k) prompt.push_back(500U + k);
+    prompt.push_back(strix::glm::kImageBeginToken);
+    for (const auto id : lease.ids()) prompt.push_back(id);
+    prompt.push_back(strix::glm::kImageEndToken);
+    for (std::uint32_t k = 0; k < 25; ++k) prompt.push_back(900U + k);
+    for (const auto id : prompt) plain.push_back(strix::session::is_embed_id(id) ? image_token : id);
+
+    Loopback lb;
+    FakeEng e0(slots), e1(slots);
+    Pipe pipe;
+    e0.pipe = e1.pipe = &pipe;
+    e1.rank = 1;
+    e0.stops = e1.stops = false;
+    e0.unit_rows = e1.unit_rows = units_rows;
+    e0.unit_layers = e1.unit_layers = units_rows ? 4U : 0U;
+    gs::Channel c0(lb.side(0), 0), c1(lb.side(1), 1);
+    gs::Hello h0 = hello_for(slots, 4096, 2), h1 = hello_for(slots, 4096, 2);
+    h0.prefix_cache_bytes = h1.prefix_cache_bytes = 1U << 22;
+    h0.mtp = h1.mtp = mtp ? 1U : 0U;
+    std::string follow_error, lead_error, driver_error;
+    std::thread follower([&] {
+        try { gs::follow(e1, c1, h1, slots, 4096); } catch (const std::exception& e) { follow_error = e.what(); }
+    });
+    std::atomic<bool> stop{false};
+    sv::GenerationQueue queue(16);
+    gs::LeadConfig lc;
+    lc.prefix_cache_bytes = h0.prefix_cache_bytes;
+    lc.slots = slots;
+    lc.capacity = 4096;
+    lc.heartbeat_seconds = 0.01;
+    lc.mtp = mtp;
+    lc.mtp_cycles = 2;
+    lc.prefill_chunk = chunk;
+    lc.interleave.select = sv::PrefillInterleave::Select::off;
+    if (units_rows) {
+        lc.prefill_units_rows = units_rows;
+        lc.prefill_units_layers = 4;
+        lc.prefill_units_admit = [](std::uint64_t) { return true; };
+    }
+    try {
+        c0.hello(h0);
+        gs::Lead<FakeEng> lead(e0, c0, queue, lc, stop);
+        std::thread driver([&] {
+            try {
+                const auto submit = [&](const std::vector<std::uint32_t>& p, bool image, std::uint32_t max_tokens, const std::string& session = {}) {
+                    sv::GenerationJob job;
+                    job.prompt = p;
+                    if (image) job.embeds = table;
+                    job.session_id = session;
+                    job.max_tokens = max_tokens;
+                    auto t = queue.submit(std::move(job));
+                    if (!t) throw std::runtime_error("image: queue refused a job");
+                    return t;
+                };
+                const auto collect = [](const std::shared_ptr<sv::GenerationTicket>& t, std::string* error = nullptr) {
+                    std::vector<std::uint32_t> got_all;
+                    for (bool done = false; !done;) {
+                        const auto got = t->wait(std::chrono::milliseconds(200), done);
+                        got_all.insert(got_all.end(), got.begin(), got.end());
+                    }
+                    if (error) *error = t->error();
+                    return got_all;
+                };
+                // A neighbour that keeps decoding makes the scheduler cut the image prompt into chunks.
+                std::shared_ptr<sv::GenerationTicket> busy;
+                if (neighbour) {
+                    std::vector<std::uint32_t> other;
+                    for (std::uint32_t k = 0; k < 9; ++k) other.push_back(40U + k);
+                    busy = submit(other, false, 400);
+                    while (lead.stats().active == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+                }
+                const auto before = lead.stats();
+                out.image = collect(submit(prompt, true, 12), &out.error);
+                out.first_frame_bytes = e0.embed_frame_bytes;
+                out.prefix_stores = lead.stats().prefix_stores - before.prefix_stores;
+                out.prefix_lookups = lead.stats().prefix_hits + lead.stats().prefix_misses - before.prefix_hits - before.prefix_misses;
+                out.repeat = collect(submit(prompt, true, 12));
+                if (busy) (void)collect(busy);
+                out.text = collect(submit(plain, false, 12));
+                (void)collect(submit(prompt, true, 12, "conversation-1"), &out.session_error);
+            } catch (const std::exception& e) {
+                driver_error = e.what();
+            }
+            stop.store(true);
+        });
+        try {
+            lead.loop();
+        } catch (const std::exception& e) {
+            lead_error = e.what();
+            queue.shutdown();
+        }
+        driver.join();
+    } catch (const std::exception& e) {
+        lead_error = e.what();
+    }
+    follower.join();
+    if (!lead_error.empty() || !follow_error.empty() || !driver_error.empty()) {
+        std::printf("image: lead '%s' follow '%s' driver '%s'\n", lead_error.c_str(), follow_error.c_str(), driver_error.c_str());
+        out.error = "pair failed";
+    }
+    out.rows0 = e0.embed_rows;
+    out.rows1 = e1.embed_rows;
+    out.frames0 = e0.embed_frames;
+    out.frames1 = e1.embed_frames;
+    out.bytes0 = e0.embed_frame_bytes;
+    out.logs_equal = e0.log == e1.log;
+    unsigned image_calls = 0;  // prefill calls of the first image request's slot before it decodes
+    for (const auto& l : e0.log) image_calls += l.rfind("prefill ", 0) == 0 || l.rfind("units ", 0) == 0 ? 1U : 0U;
+    out.chunked = image_calls > 4;
+    return out;
+}
+void image_prompts() {
+    const std::uint64_t span_bytes = 40ULL * strix::glm::kLanguageHidden * 2U;
+    const ImageRun whole = image_run(false, 0, false);
+    CHECK(whole.error.empty() && whole.image.size() == 12 && whole.image == whole.repeat);
+    CHECK(whole.image != whole.text);                       // the provided rows are what the model saw
+    CHECK(whole.logs_equal && whole.rows0 == 80 && whole.rows1 == 80);  // two image requests, 40 rows each, on both ranks
+    CHECK(whole.frames0 == 2 && whole.frames1 == 2);
+    CHECK(whole.first_frame_bytes > span_bytes && whole.bytes0 < whole.first_frame_bytes + 1024);  // the rows travel once
+    CHECK(whole.prefix_stores == 0 && whole.prefix_lookups == 0);       // an image prompt has no cache key
+    CHECK(whole.session_error.find("image input does not take sessions") != std::string::npos);
+    struct Case { bool mtp; unsigned chunk; bool neighbour; unsigned units; };
+    for (const Case k : {Case{true, 0, false, 0}, Case{false, 16, true, 0}, Case{true, 16, true, 0}, Case{true, 16, true, 64}}) {
+        const ImageRun r = image_run(k.mtp, k.chunk, k.neighbour, k.units);
+        CHECK(r.error.empty() && r.image == whole.image && r.repeat == whole.image && r.text == whole.text);
+        CHECK(r.logs_equal && r.rows0 == 80 && r.rows1 == 80 && r.frames0 == r.frames1);
+        CHECK(r.prefix_stores == 0 && r.prefix_lookups == 0);
+        CHECK(r.first_frame_bytes > span_bytes && r.bytes0 < r.first_frame_bytes + 8192);
+        if (k.neighbour && k.units == 0) CHECK(r.chunked && r.frames0 > 2);  // one frame per chunk that holds image rows
+    }
+    std::printf("image prompts: %s\n", failures == 0 ? "PASS" : "FAIL");
+}
+
 void prefix_root_sibling() {
     CHECK(gs::prefix_root_row(2100, 2300) == 2048);
     CHECK(gs::prefix_root_row(1024, 5000) == 0);     // strictly inside the system prompt
@@ -999,7 +1195,12 @@ int main(int argc, char** argv) {
         queued_successor_interleave();
         return failures == 0 ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--image-only") {
+        image_prompts();
+        return failures == 0 ? 0 : 1;
+    }
     const bool prefix_only = argc == 2 && std::string(argv[1]) == "--prefix-only";
+    image_prompts();
     prefix_root_sibling();
     // ---- admission order: LeadConfig::short_first feeds SessionRuntime::reserve_fifo(wait, short_first), which takes
     // from the shared queue with this selection; off keeps FIFO

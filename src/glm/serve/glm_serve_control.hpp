@@ -29,7 +29,7 @@
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 9;  // v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
+inline constexpr std::uint32_t kControlVersion = 10;  // v10: prefill embed frame (kPrefillEmbeds); v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 // prefill pflags (with kPrefillMtp): a prefill_mtp session of layer units; `budget` = units to run (0: cancel it).
@@ -37,6 +37,12 @@ inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt
 inline constexpr std::uint32_t kPrefillUnits = 32U;
 inline constexpr std::uint32_t kPrefillStart = 64U;
 inline constexpr std::uint32_t kPrefillSample = 128U;  // final plain prefill chunk
+// prefill pflags: the chunk's tokens hold virtual ids (strix/session/embed_rows.hpp, image input). On the pair the
+// embed frame of its spans (strix/pair/embed_frame.hpp) follows the tokens: one message with its byte length, then
+// the bytes as 32-bit words. The follower re-interns the rows and remaps the ids to its own handles.
+inline constexpr std::uint32_t kPrefillEmbeds = 256U;
+inline constexpr std::uint32_t kEmbedFrameMaxBytes = 1U << 30U;
+inline constexpr std::size_t kEmbedFrameMessage = std::size_t{1} << 19U;  // first message index of a frame (prompt messages stay below)
 inline constexpr std::uint32_t kStepSample = 1U << 31;  // step pflags carries a sampled-row mask
 inline constexpr std::uint32_t kHelloSamplingVote = 1U;
 inline constexpr std::uint32_t kPrefillPending = 0xFFFFFFFEU;  // a prefill units call that did not complete the prompt
@@ -329,12 +335,13 @@ public:
     }
 
     // Prompt tokens after a prefill block: the lead sends `tokens`, the follower receives `n` of them.
-    void tokens(std::vector<std::uint32_t>& tokens, std::size_t n, bool sender) {
+    // k0: index of the first message inside the round (a second transfer of one round takes its own range).
+    void tokens(std::vector<std::uint32_t>& tokens, std::size_t n, bool sender, std::size_t k0 = 0) {
         if (sender && tokens.size() != n) throw std::logic_error("control channel: prompt size");
         if (!wire_) return;
         if (!sender) tokens.assign(n, 0);
         std::vector<std::uint32_t> out, in;
-        for (std::size_t c0 = 0, k = 0; c0 < n; c0 += kTokensPerMessage, ++k) {
+        for (std::size_t c0 = 0, k = k0; c0 < n; c0 += kTokensPerMessage, ++k) {
             const std::size_t m = std::min(kTokensPerMessage, n - c0);
             out.assign(m, 0);
             in.assign(m, 0);
@@ -379,6 +386,41 @@ private:
     std::uint64_t echo_round_ = kNoRound;
     std::uint32_t echo_count_ = 0, echo_token_ = 0, echo_hash_ = 2166136261U;
 };
+
+// The embed frame of a prefill chunk with virtual ids (kPrefillEmbeds), after its tokens. Eng: embed_frame(ids) ->
+// frame bytes (the lead: the rows of the spans its peer does not hold yet, for the table it was bound to);
+// embed_frame_received(frame, ids) (the follower: re-interns the rows, binds its table and rewrites ids to its own
+// handles). World 1 sends nothing: the lead resolves the ids against its own table.
+template<class Eng>
+void embed_frame_round(Eng& eng, Channel& ch, std::vector<std::uint32_t>& prompt, bool sender) {
+    if constexpr (requires(std::span<const std::byte> f) { eng.embed_frame(std::span<const std::uint32_t>{}); eng.embed_frame_received(f, prompt); }) {
+        if (!ch.paired()) return;
+        std::vector<std::byte> frame;
+        std::vector<std::uint32_t> length(1, 0), words;
+        if (sender) {
+            frame = eng.embed_frame(std::span<const std::uint32_t>(prompt));
+            if (frame.empty() || frame.size() > kEmbedFrameMaxBytes) throw std::logic_error("control channel: embed frame size");
+            length[0] = static_cast<std::uint32_t>(frame.size());
+        }
+        ch.tokens(length, 1, sender, kEmbedFrameMessage);
+        if (length[0] == 0 || length[0] > kEmbedFrameMaxBytes) throw ProtocolError("control channel: embed frame length out of range");
+        const std::size_t n = (std::size_t{length[0]} + 3U) / 4U;
+        words.assign(n, 0);
+        if (sender) std::memcpy(words.data(), frame.data(), frame.size());
+        ch.tokens(words, n, sender, kEmbedFrameMessage + 1U);
+        if (!sender) {
+            frame.resize(length[0]);
+            std::memcpy(frame.data(), words.data(), frame.size());
+            try {
+                eng.embed_frame_received(std::span<const std::byte>(frame), prompt);
+            } catch (const std::exception& e) {  // a frame the follower cannot apply leaves the ranks apart: fatal for the pair
+                throw ProtocolError(std::string("control channel: embed frame: ") + e.what());
+            }
+        }
+    } else {
+        throw ProtocolError("control channel: this engine takes no embedding rows");
+    }
+}
 
 // The engine calls of one command, made identically by both ranks (the lead after sending it, the follower after
 // receiving it). Eng: reset(slot); prefill(slot, tokens, pos0) -> next; step(span<const WireRow>) -> tokens;
@@ -521,6 +563,7 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             if (c.plen == 0 || c.ppos >= capacity || c.plen >= capacity - c.ppos)
                 throw ProtocolError("control channel: prompt chunk out of range");
             ch.tokens(prompt, c.plen, sender);
+            if ((c.pflags & kPrefillEmbeds) != 0U) embed_frame_round(eng, ch, prompt, sender);
             const std::span<const std::uint32_t> p(prompt);
             if ((c.pflags & kPrefillUnits) != 0U) {
                 if ((c.pflags & kPrefillMtp) == 0U || c.budget == 0)

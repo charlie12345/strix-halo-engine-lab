@@ -3894,6 +3894,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-controller-image-test tests/core/controller_image_hip.hip)
         add_executable(strix-hip-controller-rms-test tests/core/controller_rms_hip.hip)
         add_executable(strix-hip-rms-wave-rows-test tests/core/rms_wave_rows_hip.hip)
+        add_executable(strix-hip-mix-serial-registers-test tests/core/mix_serial_registers_hip.hip)
         add_executable(strix-hip-dense-linear-tight-rows-test tests/core/dense_linear_tight_rows_hip.hip)
         add_executable(strix-hip-screened-head-test tests/core/screened_head_hip.hip)
         add_executable(strix-hip-round-fold-test tests/core/round_fold_hip.hip)
@@ -3909,6 +3910,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-controller-image-test
                        strix-hip-controller-rms-test
                        strix-hip-rms-wave-rows-test
+                       strix-hip-mix-serial-registers-test
                        strix-hip-dense-linear-tight-rows-test strix-hip-dense-flash-projected-bias-test
                        strix-hip-screened-head-test strix-hip-round-fold-test)
             target_link_libraries(${target} PRIVATE strix_tiled_core)
@@ -3971,6 +3973,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                        strix-hip-controller-image-test
                        strix-hip-controller-rms-test
                        strix-hip-rms-wave-rows-test
+                       strix-hip-mix-serial-registers-test
                        strix-hip-inkling2-mini-attention-projected-bias-test)
             target_compile_options(${target} PRIVATE -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         endforeach()

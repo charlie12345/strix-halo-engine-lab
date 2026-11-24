@@ -7,7 +7,9 @@
 #include "strix/weight/formats/scalar_float.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
+#include <string_view>
 
 namespace strix::core::fma_rows {
 
@@ -157,8 +159,34 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
 }
 
 // Image rows from this height up take the K64 packed schedule where the shape admits it (measured faster than the K32
-// image tile at 4,096 and 8,192 rows on every wide shape; lower heights keep the K32 image tile).
-inline constexpr unsigned kPackedImageMinRows = 1024U;
+// image tile at 4,096 and 8,192 rows on every wide shape; lower heights keep the K32 image tile). It is also the lowest
+// height of a routed call: no receipt measures the image routes below it (review r17), so lower calls keep their rows.
+inline constexpr unsigned kPackedImageMinRows = 4096U;
+
+// The image routes' profitability data (kImageRoutePolicy) is measured on one device class only: gfx1151 with wave32
+// (Strix Halo, 40 CUs). Any other HIP device keeps the incumbent launches of enqueue_bf16_rows.
+constexpr bool image_routes_measured_device(std::string_view arch, unsigned wave_size, unsigned compute_units) {
+    return wave_size == 32U && compute_units == 40U && (arch == "gfx1151" || arch.starts_with("gfx1151:"));
+}
+
+// image_routes_measured_device of the current device (first call per device ordinal, then cached; an unknown device
+// or a failed query keeps the incumbent).
+inline bool image_routes_device_qualified() {
+    constexpr int kSlots = 16;
+    static std::atomic<unsigned char> cached[kSlots] = {};  // 0 unknown, 1 qualified, 2 not
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0) return false;
+    if (dev < kSlots) {
+        const auto known = cached[dev].load(std::memory_order_relaxed);
+        if (known != 0U) return known == 1U;
+    }
+    hipDeviceProp_t prop{};
+    const bool qualified = hipGetDeviceProperties(&prop, dev) == hipSuccess && prop.multiProcessorCount > 0 &&
+                           image_routes_measured_device(prop.gcnArchName, static_cast<unsigned>(prop.warpSize),
+                                                        static_cast<unsigned>(prop.multiProcessorCount));
+    if (dev < kSlots) cached[dev].store(qualified ? 1U : 2U, std::memory_order_relaxed);
+    return qualified;
+}
 
 inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned input_width, unsigned rows,
                                           std::span<const Bf16RowProjection> projections, unsigned max_outputs,
@@ -305,7 +333,8 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
                                            std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                            std::span<std::uint16_t> image, hipStream_t stream) {
     ImageRoute routes[kImageRouteMaxProjections]{};
-    if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
+    if (!input || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U || !image_routes_device_qualified() ||
+        !image_routes_order_free(input, input_width, rows, projections) ||
         !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes))
         return for_each_bf16_projection_group<kGroupMax>(projections, hipSuccess, [&](auto group) {
             return enqueue_bf16_rows(input, input_width, rows, group, max_outputs, stream);
@@ -318,31 +347,55 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
                                          std::span<const ImageRoute>(routes, projections.size()), stream);
 }
 
-// Whether enqueue_bf16_rows_routed would read every projection of this call from the operand image (no FP32 run): a
-// producer may then store the image itself (its bits = bf16_encode of the FP32 rows) and call
-// enqueue_bf16_rows_from_image instead of writing the FP32 rows.
-inline bool bf16_rows_read_image(unsigned input_width, unsigned rows, std::span<const Bf16RowProjection> projections,
-                                 unsigned max_outputs, std::span<const std::uint16_t> image) {
+// The admitted plan of a call whose producer stores the call's operand image itself (plan_bf16_rows_from_image), with
+// the call it was admitted for: the consumer runs exactly these routes and refuses any other call.
+struct Bf16ImageCallPlan {
     ImageRoute routes[kImageRouteMaxProjections]{};
-    if (!detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes)) return false;
-    return std::none_of(routes, routes + projections.size(), [](ImageRoute route) {
-        return route == ImageRoute::fp32_rows;
-    });
+    const std::uint16_t* image{};
+    unsigned input_width{};
+    unsigned rows{};
+    std::size_t count{};
+    bool admitted{};
+};
+
+// Admission of a producer-stored operand image, decided before anything is enqueued (review r17): the routed entry's
+// rules (measured device and height, no ordered alias between outputs), every projection of the call reads the image
+// (no FP32 run), and the image (rows x input_width u16) shares no byte with a weight or an output of the call nor with
+// any FP32 row block [rows][input_width] the producer reads (sources; null entries skipped). Not admitted: nothing may
+// be enqueued from the plan; the caller runs its FP32 producer and the routed entry instead.
+inline Bf16ImageCallPlan plan_bf16_rows_from_image(unsigned input_width, unsigned rows,
+                                                   std::span<const Bf16RowProjection> projections, unsigned max_outputs,
+                                                   std::span<const std::uint16_t> image,
+                                                   std::span<const float* const> sources) {
+    Bf16ImageCallPlan plan{};
+    if (!image_routes_device_qualified() || !image_routes_order_free(nullptr, input_width, rows, projections) ||
+        !detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, plan.routes) ||
+        std::any_of(plan.routes, plan.routes + projections.size(),
+                    [](ImageRoute route) { return route == ImageRoute::fp32_rows; }) ||
+        !detail::bf16_image_disjoint(nullptr, input_width, rows, projections, image.data()))
+        return {};
+    for (const float* source : sources)
+        if (source && !detail::bf16_image_disjoint(source, input_width, rows, {}, image.data())) return {};
+    plan.image = image.data();
+    plan.input_width = input_width;
+    plan.rows = rows;
+    plan.count = projections.size();
+    plan.admitted = true;
+    return plan;
 }
 
-// enqueue_bf16_rows_routed after a producer stored the call's operand image: the same launches without the image pass,
-// the same bits. hipErrorNotSupported (nothing launched) when the plan keeps any projection on FP32 rows;
-// hipErrorInvalidValue when the image shares a byte with a weight or an output of the call.
-inline hipError_t enqueue_bf16_rows_from_image(std::span<const std::uint16_t> image, unsigned input_width,
-                                               unsigned rows, std::span<const Bf16RowProjection> projections,
-                                               unsigned max_outputs, hipStream_t stream) {
-    if (!bf16_rows_read_image(input_width, rows, projections, max_outputs, image)) return hipErrorNotSupported;
-    if (!detail::bf16_image_disjoint(nullptr, input_width, rows, projections, image.data()))
-        return hipErrorInvalidValue;
-    ImageRoute routes[kImageRouteMaxProjections]{};
-    detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes);
+// The launches of an admitted producer-stored image call after the producer stored the image: the routed entry's
+// launches without its image pass, the same bits. hipErrorNotSupported, nothing launched, for a plan that was not
+// admitted or was admitted for another call.
+inline hipError_t enqueue_bf16_rows_from_image(const Bf16ImageCallPlan& plan, std::span<const std::uint16_t> image,
+                                               unsigned input_width, unsigned rows,
+                                               std::span<const Bf16RowProjection> projections, unsigned max_outputs,
+                                               hipStream_t stream) {
+    if (!plan.admitted || plan.image != image.data() || plan.input_width != input_width || plan.rows != rows ||
+        plan.count != projections.size())
+        return hipErrorNotSupported;
     return detail::run_bf16_image_routes(nullptr, image.data(), input_width, rows, projections, max_outputs,
-                                         std::span<const ImageRoute>(routes, projections.size()), stream);
+                                         std::span<const ImageRoute>(plan.routes, projections.size()), stream);
 }
 
 // The [forget, gain] pair of a low-rank controller with the controller as the tile epilogue:

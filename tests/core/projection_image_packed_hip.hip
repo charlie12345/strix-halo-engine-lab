@@ -142,16 +142,16 @@ int main(int argc, char** argv) {
             std::size_t misaligned;          // projections from this index start 2 bytes past a 16-byte boundary
             std::vector<ImageRoute> expect;  // empty: not planned (every projection keeps the FP32 rows)
         };
-        // Pitched o (packed with a row pitch); the q call at the packed height (1,024 routed, 1,023 not); K off the K64
+        // Pitched o (packed with a row pitch); the q call at the routed height (4,096 routed, 4,095 not); K off the K64
         // stage; one incumbent group of an aligned 2048 and a misaligned 32 (the incumbent runs both on the FMA rows);
         // a planned call whose second group holds the misaligned weight (that whole group keeps the FP32 rows).
         const std::vector<RouteCase> route_cases = {
             {"o_pitched", 3072U, 8192U, {2304U}, true, 3200U, 99U, {P}},
-            {"q_call_1024", 2304U, 1024U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {P, P, I, P, P, P}},
-            {"q_call_1023", 2304U, 1023U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {}},
+            {"q_call_4096", 2304U, 4096U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {P, P, I, P, P, P}},
+            {"q_call_4095", 2304U, 4095U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {}},
             {"k_off_stage", 2336U, 8192U, {3072U, 1024U}, false, 0U, 99U, {}},
-            {"mixed_align", 2304U, 1024U, {2048U, 32U}, false, 0U, 1U, {}},
-            {"mixed_groups", 2304U, 1024U, {2048U, 1024U, 24U, 2048U, 32U}, false, 0U, 4U, {P, P, I, F, F}},
+            {"mixed_align", 2304U, 4096U, {2048U, 32U}, false, 0U, 1U, {}},
+            {"mixed_groups", 2304U, 4096U, {2048U, 1024U, 24U, 2048U, 32U}, false, 0U, 4U, {P, P, I, F, F}},
         };
         std::vector<float> host_b(host_a.size());
         for (auto& v : host_b) v = nd(rng);
@@ -219,6 +219,57 @@ int main(int argc, char** argv) {
                       << (same ? " entry-same-bits" : " ENTRY-DIFFER") << (pass ? " PASS" : " FAIL") << '\n';
             for (const Run* run : {&ref_a, &ref_b, &got, &entry})
                 for (auto* p : run->outputs) require(hipFree(p), "free");
+            for (auto* w : bases) require(hipFree(w), "free");
+        }
+        {  // review r17: an FMA group 0 (projection 0 two bytes past a 16-byte boundary) and a packed group 1 whose
+           // projection 3 writes the output of projection 0. The incumbent writes group 0, then group 1 (projection 3
+           // wins); the routed entry must keep that sequence (image_routes_order_free refuses the reordering).
+            constexpr unsigned K = 2304U, rows = 4096U;
+            const unsigned widths[4] = {2048U, 128U, 128U, 2048U};
+            std::vector<std::uint16_t*> bases;
+            std::vector<float*> outs;
+            std::vector<Bf16RowProjection> ref, got;
+            float* shared_ref = device<float>(std::size_t{rows} * 2048U);
+            float* shared_got = device<float>(std::size_t{rows} * 2048U);
+            for (unsigned p = 0; p < 4U; ++p) {
+                std::vector<std::uint16_t> w(std::size_t{widths[p]} * K + 8U, std::uint16_t{0x7FC0U});
+                const std::size_t shift = p == 0U ? 1U : 0U;
+                for (std::size_t i = 0; i < std::size_t{widths[p]} * K; ++i) w[shift + i] = bf16(0.05F * nd(rng));
+                bases.push_back(device<std::uint16_t>(w.size()));
+                require(hipMemcpy(bases.back(), w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+                const bool shared = p == 0U || p == 3U;
+                float* out_ref = shared ? shared_ref : device<float>(std::size_t{rows} * widths[p]);
+                float* out_got = shared ? shared_got : device<float>(std::size_t{rows} * widths[p]);
+                if (!shared) outs.insert(outs.end(), {out_ref, out_got});
+                ref.push_back({bases.back() + shift, widths[p], out_ref, false, 0U});
+                got.push_back({bases.back() + shift, widths[p], out_got, false, 0U});
+            }
+            for (const auto* run : {&ref, &got})
+                for (const auto& projection : *run)
+                    require(hipMemset(projection.output, 0xFF, std::size_t{rows} * projection.outputs * 4U), "seed");
+            require(strix::core::for_each_bf16_projection_group<fma_rows::kGroupMax>(
+                        std::span<const Bf16RowProjection>(ref), hipSuccess,
+                        [&](std::span<const Bf16RowProjection> group) {
+                            return fma_rows::enqueue_bf16_rows(a, K, rows, group, kMaxOutputs, nullptr);
+                        }),
+                    "alias incumbent");
+            require(fma_rows::enqueue_bf16_rows_routed(a, K, rows, got, kMaxOutputs,
+                                                       std::span<std::uint16_t>(image, host_a.size()), nullptr),
+                    "alias routed entry");
+            require(hipDeviceSynchronize(), "sync");
+            bool same = true;
+            for (std::size_t p = 0; p < 4U; ++p) {
+                std::vector<float> x(std::size_t{rows} * widths[p]), y(x.size());
+                require(hipMemcpy(x.data(), ref[p].output, x.size() * 4U, hipMemcpyDeviceToHost), "d2h");
+                require(hipMemcpy(y.data(), got[p].output, y.size() * 4U, hipMemcpyDeviceToHost), "d2h");
+                same = same && std::memcmp(x.data(), y.data(), x.size() * 4U) == 0;
+            }
+            ok = ok && same;
+            std::cout << "route alias_fma_first rows " << rows << (same ? " entry-same-bits PASS" : " ENTRY-DIFFER FAIL")
+                      << '
+';
+            for (auto* p : outs) require(hipFree(p), "free");
+            for (auto* p : {shared_ref, shared_got}) require(hipFree(p), "free");
             for (auto* w : bases) require(hipFree(w), "free");
         }
         require(hipFree(b), "free");
@@ -326,15 +377,18 @@ int main(int argc, char** argv) {
                 require(rt::elements(n, rt::Bf16SigmoidProduct{a, gate, gated}, nullptr), "gate");
                 require(fma_rows::enqueue_bf16_rows_routed(gated, K, rows, {&pa, 1U}, kMaxOutputs, scratch, nullptr),
                         "routed");
-                const bool reads = fma_rows::bf16_rows_read_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch);
-                bool same = reads == (rows >= 1024U);
+                const float* sources[2] = {a, gate};
+                const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch, sources);
+                const bool reads = plan.admitted;
+                bool same = reads == (rows >= fma_rows::kPackedImageMinRows);
                 if (reads) {
                     require(rt::elements(n, rt::Bf16SigmoidProductImage{a, gate, image}, nullptr), "gate image");
-                    require(fma_rows::enqueue_bf16_rows_from_image(scratch, K, rows, {&pb, 1U}, kMaxOutputs, nullptr),
+                    require(fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U}, kMaxOutputs,
+                                                                   nullptr),
                             "from image");
                 } else {
-                    same = same && fma_rows::enqueue_bf16_rows_from_image(scratch, K, rows, {&pb, 1U}, kMaxOutputs,
-                                                                          nullptr) == hipErrorNotSupported;
+                    same = same && fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U},
+                                                                          kMaxOutputs, nullptr) == hipErrorNotSupported;
                     require(fma_rows::enqueue_bf16_rows_routed(gated, K, rows, {&pb, 1U}, kMaxOutputs, scratch, nullptr),
                             "routed b");
                 }
@@ -347,6 +401,54 @@ int main(int argc, char** argv) {
                           << (same ? "EXACT" : "DIFFER") << '\n';
                 ok = ok && same;
             }
+        }
+        {  // review r17: an image over a gate input (attended rows a, gate logits) or over a weight is refused before
+           // any launch: the plan is not admitted, the consumer launches nothing, every byte under the image survives.
+            const unsigned rows = 8192U;
+            const std::size_t n = std::size_t{rows} * K;
+            auto* big = device<std::uint16_t>(n + w.size() + 64U);  // weights at 0, an image from byte 16 on
+            require(hipMemcpy(big, w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w big");
+            const Bf16RowProjection pw{big, N, out_b, false, std::size_t{ld} * 2U};
+            const Bf16RowProjection pc{weights, N, out_b, false, std::size_t{ld} * 2U};
+            require(hipMemset(out_b, 0xFF, std::size_t{rows} * N * 4U), "seed");
+            const float* sources[2] = {a, gate};
+            struct Overlap {
+                const char* name;
+                const Bf16RowProjection* projection;
+                std::uint16_t* image;
+            };
+            const Overlap overlaps[] = {{"attended", &pc, reinterpret_cast<std::uint16_t*>(a) + 8U},
+                                        {"gate_logits", &pc, reinterpret_cast<std::uint16_t*>(gate) + 8U},
+                                        {"weight", &pw, big + 8U}};
+            for (const auto& o : overlaps) {
+                const std::span<const std::uint16_t> view(o.image, n);
+                const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {o.projection, 1U}, kMaxOutputs, view,
+                                                                      sources);
+                const bool refused =
+                    !plan.admitted && fma_rows::enqueue_bf16_rows_from_image(plan, view, K, rows, {o.projection, 1U},
+                                                                             kMaxOutputs, nullptr) == hipErrorNotSupported;
+                require(hipDeviceSynchronize(), "sync");
+                std::vector<float> ha(host_a.size()), hg(logits.size()), ho(std::size_t{rows} * N);
+                std::vector<std::uint16_t> hw(w.size());
+                require(hipMemcpy(ha.data(), a, ha.size() * 4U, hipMemcpyDeviceToHost), "a back");
+                require(hipMemcpy(hg.data(), gate, hg.size() * 4U, hipMemcpyDeviceToHost), "gate back");
+                require(hipMemcpy(hw.data(), big, hw.size() * 2U, hipMemcpyDeviceToHost), "w back");
+                require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
+                const bool guarded = std::memcmp(ha.data(), host_a.data(), ha.size() * 4U) == 0 &&
+                                     std::memcmp(hg.data(), logits.data(), hg.size() * 4U) == 0 &&
+                                     std::memcmp(hw.data(), w.data(), hw.size() * 2U) == 0 &&
+                                     std::all_of(ho.begin(), ho.end(), [](float v) {
+                                         std::uint32_t bits = 0;
+                                         std::memcpy(&bits, &v, 4U);
+                                         return bits == 0xFFFFFFFFU;
+                                     });
+                std::cout << "gate_image_overlap " << o.name << (refused ? " refused" : " ADMITTED")
+                          << (guarded ? " guard-intact" : " GUARD-CHANGED") << (refused && guarded ? " PASS" : " FAIL")
+                          << '
+';
+                ok = ok && refused && guarded;
+            }
+            require(hipFree(big), "free");
         }
         for (void* p : {static_cast<void*>(weights), static_cast<void*>(gate), static_cast<void*>(gated),
                         static_cast<void*>(out_a), static_cast<void*>(out_b)})

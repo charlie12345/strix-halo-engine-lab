@@ -106,10 +106,10 @@ int main(int argc, char** argv) {
                                      {"routed_q_call", 2304U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, true, 0U, true},
                                      {"routed_o_pitched", 3072U, {2304U}, true, true, 3200U, true},
                                      {"routed_kv_narrow", 2304U, {1024U, 32U}, false, true, 0U, false}};
-    const std::vector<unsigned> heights = {1000U, 1024U, 4100U, 8192U, 8209U};
+    const std::vector<unsigned> heights = {1000U, 1024U, 4100U, 8192U, 8209U, 9232U};  // 9,232: above the measured band
     std::mt19937 rng(20261124U);
     std::normal_distribution<float> nd(0.0F, 1.0F);
-    const unsigned max_rows = 8209U, max_k = 3072U, bench_rows = 8192U;
+    const unsigned max_rows = 9232U, max_k = 3072U, bench_rows = 8192U;
     std::vector<float> host_a(std::size_t{max_rows} * max_k);
     for (auto& v : host_a) v = nd(rng);
     host_a[17] = 0.0F, host_a[18] = -0.0F, host_a[19] = 1.0e-40F;  // signed zero and a subnormal input
@@ -311,7 +311,8 @@ int main(int argc, char** argv) {
                 strix::core::ImageRoute routes[fma_rows::kImageRouteMaxProjections]{};
                 const bool planned =
                     fma_rows::detail::plan_bf16_image_call(c.K, rows, img.projections, kMaxOutputs, scratch, routes);
-                admitted = planned == (c.expect_image && rows >= fma_rows::kPackedImageMinRows);
+                admitted = planned ==
+                           (c.expect_image && strix::core::image_rows_measured(fma_rows::kImageRoutePolicy, rows));
             }
             require(image_arm(img), "image rows");
             require(hipDeviceSynchronize(), "sync");
@@ -379,7 +380,7 @@ int main(int argc, char** argv) {
                 const float* sources[2] = {a, gate};
                 const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch, sources);
                 const bool reads = plan.admitted;
-                bool same = reads == (rows >= fma_rows::kPackedImageMinRows);
+                bool same = reads == strix::core::image_rows_measured(fma_rows::kImageRoutePolicy, rows);
                 if (reads) {
                     require(rt::elements(n, rt::Bf16SigmoidProductImage{a, gate, image}, nullptr), "gate image");
                     require(fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U}, kMaxOutputs,
@@ -447,6 +448,38 @@ int main(int argc, char** argv) {
                 ok = ok && refused && guarded;
             }
             require(hipFree(big), "free");
+        }
+        {  // review r20: the plan binds the descriptors and the image span it admitted. A consumer call with a substituted
+           // descriptor at the same count (the output moved into the image) or a shorter view of the same image is
+           // refused before any launch: the output rows and the image keep every byte.
+            const unsigned rows = 8192U;
+            const Bf16RowProjection pc{weights, N, out_b, false, std::size_t{ld} * 2U};
+            const float* sources[2] = {a, gate};
+            const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {&pc, 1U}, kMaxOutputs, scratch, sources);
+            auto moved = pc;
+            moved.output = reinterpret_cast<float*>(scratch.data());
+            require(hipMemset(out_b, 0xFF, std::size_t{rows} * N * 4U), "seed");
+            require(hipMemset(scratch.data(), 0x5A, scratch.size() * 2U), "seed image");
+            const bool substituted = fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&moved, 1U},
+                                                                            kMaxOutputs, nullptr) == hipErrorNotSupported;
+            const bool short_view = fma_rows::enqueue_bf16_rows_from_image(plan, scratch.first(1U), K, rows, {&pc, 1U},
+                                                                           kMaxOutputs, nullptr) == hipErrorNotSupported;
+            require(hipDeviceSynchronize(), "sync");
+            std::vector<float> ho(std::size_t{rows} * N);
+            std::vector<std::uint16_t> hi(scratch.size());
+            require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
+            require(hipMemcpy(hi.data(), scratch.data(), hi.size() * 2U, hipMemcpyDeviceToHost), "image back");
+            const bool guarded = std::all_of(ho.begin(), ho.end(), [](float v) {
+                                     std::uint32_t bits = 0;
+                                     std::memcpy(&bits, &v, 4U);
+                                     return bits == 0xFFFFFFFFU;
+                                 }) &&
+                                 std::all_of(hi.begin(), hi.end(), [](std::uint16_t v) { return v == 0x5A5AU; });
+            const bool pass = plan.admitted && substituted && short_view && guarded;
+            std::cout << "gate_image_plan_binding admitted " << plan.admitted << " substituted "
+                      << (substituted ? "refused" : "ADMITTED") << " short_view " << (short_view ? "refused" : "ADMITTED")
+                      << (guarded ? " guard-intact" : " GUARD-CHANGED") << (pass ? " PASS" : " FAIL") << '\n';
+            ok = ok && pass;
         }
         for (void* p : {static_cast<void*>(weights), static_cast<void*>(gate), static_cast<void*>(gated),
                         static_cast<void*>(out_a), static_cast<void*>(out_b)})

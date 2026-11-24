@@ -162,6 +162,14 @@ inline bool admits_bf16_image_projections(unsigned input_width, unsigned rows,
 // image tile at 4,096 and 8,192 rows on every wide shape; lower heights keep the K32 image tile). It is also the lowest
 // height of a routed call: no receipt measures the image routes below it (review r17), so lower calls keep their rows.
 inline constexpr unsigned kPackedImageMinRows = 4096U;
+// The greatest measured height: one 8,192-row prefill chunk with its absorbed tail (up to chunk / 8 rows; full-model
+// runs at 8,209 / 8,237 / 8,292 rows). Taller calls keep the incumbent launches until a receipt measures them.
+inline constexpr unsigned kPackedImageMaxRows = 8192U + 8192U / 8U;
+
+// The image routes of the shared tile on gfx11 (backend data, measured at 8,192 rows, K 2,304: FP32 route 0.150 ms per
+// 128-column tile, packed K64 0.109 ms, image pass 0.48 ms -> the image pays from ~12 packed tiles in one call; 16 kept).
+inline constexpr ImageRoutePolicy kImageRoutePolicy{kPackedImageMinRows, f16_tile_gemm::ImageProjectionSchedule::kStageK,
+                                                    f16_tile_gemm::kBN, 16U * f16_tile_gemm::kBN, kPackedImageMaxRows};
 
 // The image routes' profitability data (kImageRoutePolicy) is measured on one device class only: gfx1151 with wave32
 // and kMeasuredComputeUnits (40) CUs (Strix Halo). arch is gcnArchName without its feature suffix; compute_units comes
@@ -204,8 +212,10 @@ inline hipError_t enqueue_bf16_image_rows(const std::uint16_t* input, unsigned i
     f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> group{};
     for (const auto& projection : projections)
         group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
-    // Prefill heights on whole 128-column projections take the packed-operand core's K64 schedule (same bits).
-    if (rows >= kPackedImageMinRows && f16_tile_gemm::admits_packed_image_projections(input_width, group))
+    // Measured prefill heights on the measured device class, on whole 128-column projections, take the packed-operand
+    // core's K64 schedule (same bits); every other call keeps the K32 image tile.
+    if (image_packed_schedule(kImageRoutePolicy, image_routes_device_qualified(), rows) &&
+        f16_tile_gemm::admits_packed_image_projections(input_width, group))
         return f16_tile_gemm::gemm_bf16_projections_image_packed(input, rows, input_width, group, stream);
     f16_tile_gemm::gemm_bf16_projections_image(input, rows, input_width, group, stream);
     return hipGetLastError();
@@ -252,10 +262,6 @@ inline hipError_t enqueue_bf16_operand_image(const float* input, unsigned width,
     return hipGetLastError();
 }
 
-// The image routes of the shared tile on gfx11 (backend data, measured at 8,192 rows, K 2,304: FP32 route 0.150 ms per
-// 128-column tile, packed K64 0.109 ms, image pass 0.48 ms -> the image pays from ~12 packed tiles in one call; 16 kept).
-inline constexpr ImageRoutePolicy kImageRoutePolicy{kPackedImageMinRows, f16_tile_gemm::ImageProjectionSchedule::kStageK,
-                                                    f16_tile_gemm::kBN, 16U * f16_tile_gemm::kBN};
 inline constexpr std::size_t kImageRouteMaxProjections = 8U;
 
 namespace detail {
@@ -358,9 +364,12 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
 // the call it was admitted for: the consumer runs exactly these routes and refuses any other call.
 struct Bf16ImageCallPlan {
     ImageRoute routes[kImageRouteMaxProjections]{};
+    Bf16RowProjection projections[kImageRouteMaxProjections]{};  // the admitted descriptors: the launches use these
     const std::uint16_t* image{};
+    std::size_t image_size{};  // the admitted span's length
     unsigned input_width{};
     unsigned rows{};
+    unsigned max_outputs{};
     std::size_t count{};
     bool admitted{};
 };
@@ -383,26 +392,38 @@ inline Bf16ImageCallPlan plan_bf16_rows_from_image(unsigned input_width, unsigne
         return {};
     for (const float* source : sources)
         if (source && !detail::bf16_image_disjoint(source, input_width, rows, {}, image.data())) return {};
+    std::copy(projections.begin(), projections.end(), plan.projections);
     plan.image = image.data();
+    plan.image_size = image.size();
     plan.input_width = input_width;
     plan.rows = rows;
+    plan.max_outputs = max_outputs;
     plan.count = projections.size();
     plan.admitted = true;
     return plan;
 }
 
 // The launches of an admitted producer-stored image call after the producer stored the image: the routed entry's
-// launches without its image pass, the same bits. hipErrorNotSupported, nothing launched, for a plan that was not
-// admitted or was admitted for another call.
+// launches without its image pass, the same bits, run from the plan's own descriptors. hipErrorNotSupported, nothing
+// launched, for a plan that was not admitted or was admitted for another call: any other image span (address or
+// length), shape, output bound or descriptor (weights, width, output, rounding, pitch), even at the same count.
 inline hipError_t enqueue_bf16_rows_from_image(const Bf16ImageCallPlan& plan, std::span<const std::uint16_t> image,
                                                unsigned input_width, unsigned rows,
                                                std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                                hipStream_t stream) {
-    if (!plan.admitted || plan.image != image.data() || plan.input_width != input_width || plan.rows != rows ||
-        plan.count != projections.size())
+    const auto same = [](const Bf16RowProjection& x, const Bf16RowProjection& y) {
+        return x.weights == y.weights && x.outputs == y.outputs && x.output == y.output &&
+               x.round_bf16 == y.round_bf16 && x.row_bytes == y.row_bytes;
+    };
+    if (!plan.admitted || plan.image != image.data() || plan.image_size != image.size() ||
+        plan.input_width != input_width || plan.rows != rows || plan.max_outputs != max_outputs ||
+        plan.count != projections.size() || plan.count > kImageRouteMaxProjections ||
+        !std::equal(projections.begin(), projections.end(), plan.projections, same))
         return hipErrorNotSupported;
-    return detail::run_bf16_image_routes(nullptr, image.data(), input_width, rows, projections, max_outputs,
-                                         std::span<const ImageRoute>(plan.routes, projections.size()), stream);
+    return detail::run_bf16_image_routes(nullptr, plan.image, plan.input_width, plan.rows,
+                                         std::span<const Bf16RowProjection>(plan.projections, plan.count),
+                                         plan.max_outputs, std::span<const ImageRoute>(plan.routes, plan.count),
+                                         stream);
 }
 
 // The [forget, gain] pair of a low-rank controller with the controller as the tile epilogue:

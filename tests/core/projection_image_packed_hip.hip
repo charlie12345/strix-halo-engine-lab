@@ -266,8 +266,7 @@ int main(int argc, char** argv) {
             }
             ok = ok && same;
             std::cout << "route alias_fma_first rows " << rows << (same ? " entry-same-bits PASS" : " ENTRY-DIFFER FAIL")
-                      << '
-';
+                      << '\n';
             for (auto* p : outs) require(hipFree(p), "free");
             for (auto* p : {shared_ref, shared_got}) require(hipFree(p), "free");
             for (auto* w : bases) require(hipFree(w), "free");
@@ -444,8 +443,7 @@ int main(int argc, char** argv) {
                                      });
                 std::cout << "gate_image_overlap " << o.name << (refused ? " refused" : " ADMITTED")
                           << (guarded ? " guard-intact" : " GUARD-CHANGED") << (refused && guarded ? " PASS" : " FAIL")
-                          << '
-';
+                          << '\n';
                 ok = ok && refused && guarded;
             }
             require(hipFree(big), "free");

@@ -4921,15 +4921,21 @@ the single-request MTP route instead of plain steps. After each verify, rank 1 s
 row rank 0 reaches; rank 0 decides the rows in order with the request's sampler under coupled acceptance (a row is
 sampled as without a draft, with the uniform of its absolute position; the draft is accepted when it equals that
 token), then sends the decided tokens back, and both ranks accept, commit and catch up the drafter from them
-([shared window decision](../include/strix/serve/pair_sampling.hpp) `decide_pair_window`). Drafts stay the drafter's
-greedy tokens. A sampled first token re-seeds the drafter from the prompt's last row (`mtp_enter`).
+([shared window decision](../include/strix/serve/pair_sampling.hpp) `decide_pair_window`). Below temperature 0.7
+(the shared argmax gate) drafts are the drafter's greedy tokens; from 0.7 up each draft is drawn from the drafter's
+full row with the uniform of the position it proposes (`pick_pair_draft`: rank 1 sends its half of the drafter row,
+rank 0 draws and sends the token), so a drafter close to the target proposes the very token the row will sample.
+A sampled first token re-seeds the drafter from the prompt's last row (`mtp_enter`). `STRIX_GLM_SERVE_SAMPLED_ACCEPT=rejection`
+selects speculative rejection sampling instead (drafts always drawn from the drafter rows, rank 0 keeps their
+distributions, the shared lookup arbiter is off for those requests): exact in distribution, but the tokens of a seed
+then depend on the drafts and are not those of plain sampling.
 
 - **Preconditions:** `strix-glm5-serve` with MTP on and sampling available (both ranks vote for it in the hello); one sampled request decoding (C1).
 - **Automatic selection:** none; batched MTP verify (G2) never takes a sampled request (with one decoding, the server uses batched plain steps).
 - **Fallback notice:** the request's `sampling_receipt` counts drafts, accepted and rejected rows (all zero on plain steps).
-- **Exactness evidence:** host fake pair: three sampled requests x 40 tokens equal plain sampling of the same seeds, also beside a greedy request with G2 on; shared window tests: coupled windows equal plain sampling on both ranks, cut windows send no extra rows. Pair gates pending: SP1a (`strix-glm5-rank --spec-oracle`, committed-row logits bitwise equal plain steps) on the current build, and the same sampled requests served with the switch on and off with equal token vectors on both ranks.
-- **Off switch:** unset or `STRIX_GLM_SERVE_SAMPLED_MTP=0` (plain steps); `STRIX_GLM_SERVE_MTP=0` turns off MTP for every request
-- **Measured gain:** not measured yet (prediction only: acceptance falls with temperature because drafts are greedy; each decided row moves one vocabulary half, about 310 KB, over the pair link).
+- **Exactness evidence:** host fake pair: three sampled requests x 40 tokens equal plain sampling of the same seeds, with greedy drafts (T 0.5) and with drafts drawn from the drafter rows (T 0.9), also beside a greedy request with G2 on; rejection completes with accepted and rejected rows (not token-compared); shared tests: coupled windows equal plain sampling on both ranks, cut windows send no extra rows, rejection windows equal `decide_rows`, drafts picked across the pair equal the sampler's own draft. Pair gates pending: SP1a (`strix-glm5-rank --spec-oracle`, committed-row logits bitwise equal plain steps) on the current build, and the same sampled requests served with the switch on and off with equal token vectors on both ranks.
+- **Off switch:** unset or `STRIX_GLM_SERVE_SAMPLED_MTP=0` (plain steps); `STRIX_GLM_SERVE_SAMPLED_ACCEPT=coupled` (default) restores coupled acceptance; `STRIX_GLM_SERVE_MTP=0` turns off MTP for every request
+- **Measured gain:** not measured yet (prediction only: with greedy drafts acceptance falls with temperature; each decided row and each drawn draft moves one vocabulary half, about 310 KB, over the pair link). Bench matrix to run on the pair, interleaved against plain steps: coupled at T 0.6 (greedy drafts), coupled at T 0.8 / 1.0 (drawn drafts), rejection at T 0.8 / 1.0.
 - **Implementation / evidence:** [lead loop](../src/glm/serve/glm_serve_lead.hpp), [server adapter](../apps/glm_serve_main.cpp), [decoder hook](../src/glm/spec/glm_spec_run.cpp), [tests](../tests/glm_serve_cpu_tests.cpp)
 
 <a id="glm-serve-prefill-chunk"></a>

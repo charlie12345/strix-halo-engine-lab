@@ -142,7 +142,7 @@ Las peticiones muestreadas (`temperature > 0`) decodifican con pasos simples sal
 esté puesto en el rank 0 (opcional hasta que pasen sus gates del par, ver
 [glm-serve-sampled-mtp](../../optimizations.md#glm-serve-sampled-mtp)): entonces una petición muestreada en vuelo
 decodifica por MTP, y el rank 0 decide cada fila de verificación con el muestreador de la petición sobre el vocabulario
-completo de la fila (el rank 1 envía su mitad), aceptando un borrador solo cuando coincide con ese token muestreado.
+completo de la fila (el rank 1 envía su mitad), aceptando un borrador solo cuando coincide con ese token muestreado. Desde temperatura 0.7 los borradores se extraen de las filas del borrador de la misma forma; `STRIX_GLM_SERVE_SAMPLED_ACCEPT=rejection` selecciona muestreo por rechazo (exacto en distribución, no los tokens del muestreo simple).
 `--selftest N` en el rank 0 (sin HTTP) ejecuta N prompts integrados juntos
 y cada uno por separado e informa EXACT/FAIL con tok/s por nivel de concurrencia.
 

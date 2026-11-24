@@ -2958,9 +2958,9 @@
     "flag_or_env": "STRIX_GLM_SERVE_SAMPLED_MTP",
     "default": "off (opt-in; pair gates pending)",
     "exact": "Coupled acceptance: tokens equal plain sampling of the same seed when verify rows equal plain-step rows bitwise (SP1a). Host fake pair: 3 sampled requests x 40 tokens equal plain sampling, also beside a greedy request with G2 on. Pair gates pending.",
-    "gain": "Not measured (prediction: acceptance falls with temperature; one 310 KB vocabulary half per decided row over the pair link).",
+    "gain": "Not measured (prediction: greedy drafts below T 0.7 lose acceptance as T rises; from T 0.7 drafts are drawn from the drafter rows; one 310 KB vocabulary half per decided row and per drawn draft over the pair link).",
     "preconditions": "strix-glm5-serve with MTP on and sampling available; one sampled request decoding (C1); never in batched verify (G2).",
-    "off_switch": "STRIX_GLM_SERVE_SAMPLED_MTP=0 (plain steps)",
+    "off_switch": "STRIX_GLM_SERVE_SAMPLED_MTP=0 (plain steps); STRIX_GLM_SERVE_SAMPLED_ACCEPT=rejection opts into rejection sampling (exact in distribution, not token-equal to plain sampling)",
     "doc_anchor": "docs/optimizations.md#glm-serve-sampled-mtp"
   },
   {

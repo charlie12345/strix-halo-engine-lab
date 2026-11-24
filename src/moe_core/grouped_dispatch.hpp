@@ -58,6 +58,8 @@ struct HipBackend {
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_activated_indirect = grouped_microscaled::launch_activated_indirect<Format>;
     template<unsigned Experts, unsigned TopK>
+    using Planner = device_grouped::Planner<Experts, TopK>;
+    template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
     static constexpr bool small_form = true;  // grouped_microscaled::Form::small_f16
 #endif
@@ -79,6 +81,8 @@ struct CudaBackend {
     static constexpr auto gather = grouped_rows::gather;
     template<weight::microscaled::MatrixFormat Format>
     static constexpr auto launch_projection = cuda::core::mma::microscaled::launch<Format>;
+    template<unsigned Experts, unsigned TopK>
+    using Planner = device_grouped::Planner<Experts, TopK>;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
     // FAST W4A4 operand class (moe_core/grouped_w4a4.hpp; sm_120 block-scaled FP4).
@@ -366,21 +370,28 @@ inline bool prepare_resident(unsigned layer, unsigned rows, RouteBuffers route,
     return true;
 }
 
-// Upload or build the plan on this stream before launching. Keep all buffers
-// alive through completion and check the device failure word before consuming output.
+namespace detail {
+
+struct Visit {
+    WorkspaceElements need;
+    unsigned assignments;
+    grouped_microscaled::Args gate_up, down;
+};
+
+// Admit the whole visit before any submission. The resident path also does this before routing and planning.
 template<class Config, class Backend>
-inline typename Backend::Status enqueue(
+inline bool preflight_visit(
     const DevicePlan& plan, std::span<const float> input, std::span<float> output,
-    Workspace workspace, typename Backend::Stream stream) {
+    Workspace workspace, Visit& visit) {
     const auto need = workspace_requirement<Config>(plan.rows);
-    if (need.bf16 == 0U) return Backend::invalid_value;
+    if (need.bf16 == 0U) return false;
     const unsigned assignments = plan.rows * Config::top_k;
     const auto row_elements = std::size_t{plan.rows} * Config::hidden;
     if (plan.physical_layer >= Config::layers || input.size() < row_elements || output.size() < row_elements ||
         workspace.bf16.size() < need.bf16 || workspace.fp32.size() < need.fp32 ||
         plan.assignment_rows.size() != assignments || plan.combine_rows.size() != assignments ||
         plan.assignment_weights.size() != assignments || plan.gate_up.size() != plan.down.size() ||
-        plan.gate_up.empty() || plan.gate_up.size() > grouped_microscaled::kMaxTiles) return Backend::invalid_value;
+        plan.gate_up.empty() || plan.gate_up.size() > grouped_microscaled::kMaxTiles) return false;
 
     constexpr unsigned gate_width = 2U * Config::intermediate;
     const auto tiles = static_cast<unsigned>(plan.gate_up.size());
@@ -393,22 +404,29 @@ inline typename Backend::Status enqueue(
     gate_up.decode = down.decode = plan.decode;
     gate_up.schedule = down.schedule = plan.schedule;
     gate_up.form = down.form = plan.form;
-    // The whole visit is admitted before any of it is submitted: a leg the launchers would refuse returns
-    // invalid_value here, with nothing queued and the workspace untouched (never after gate-up already ran).
     if (plan.form != grouped_microscaled::Form::bf16_tile) {
-        if constexpr (!requires { Backend::small_form; }) return Backend::invalid_value;
-        if (plan.activations != grouped_w4a4::Activations::bf16) return Backend::invalid_value;
+        if constexpr (!requires { Backend::small_form; }) return false;
+        if (plan.activations != grouped_w4a4::Activations::bf16) return false;
         if (!grouped_microscaled::fits_small(gate_up) || !grouped_microscaled::fits_small(down))
-            return Backend::invalid_value;
+            return false;
     }
-    if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
+    if (!Backend::fits(gate_up) || !Backend::fits(down)) return false;
+    if constexpr (requires { Backend::token_rows; })
+        if (reinterpret_cast<std::uintptr_t>(workspace.bf16.data()) % 16U != 0U) return false;
+    visit = {need, assignments, gate_up, down};
+    return true;
+}
+
+template<class Config, class Backend>
+inline typename Backend::Status enqueue_visit(
+    const DevicePlan& plan, std::span<const float> input, std::span<float> output,
+    Workspace workspace, const Visit& visit, typename Backend::Stream stream) {
+    const auto& [need, assignments, gate_up, down] = visit;
+    constexpr unsigned gate_width = 2U * Config::intermediate;
     // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at
     // workspace.bf16 (the base the plan's gathered addresses are relative to) instead of top_k gathered copies; each
     // tile row then reads bf16_encode of the FP32 element the gather would have copied (same operand bits).
     constexpr bool in_place = requires { Backend::token_rows; };
-    // In place, gate-up reads the token image at workspace.bf16 (16-byte rows, grouped_microscaled::fits_indirect).
-    if constexpr (in_place)
-        if (reinterpret_cast<std::uintptr_t>(workspace.bf16.data()) % 16U != 0U) return Backend::invalid_value;
     [[maybe_unused]] const auto rows_in_place = [&](const grouped_microscaled::Args& args) {
         grouped_microscaled::IndirectArgs indirect{args, plan.assignment_rows.data(), workspace.bf16.data()};
         return indirect;
@@ -496,6 +514,19 @@ inline typename Backend::Status enqueue(
          plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
 }
 
+}  // namespace detail
+
+// Upload or build the plan on this stream before launching. Keep all buffers
+// alive through completion and check the device failure word before consuming output.
+template<class Config, class Backend>
+inline typename Backend::Status enqueue(
+    const DevicePlan& plan, std::span<const float> input, std::span<float> output,
+    Workspace workspace, typename Backend::Stream stream) {
+    detail::Visit visit{};
+    if (!detail::preflight_visit<Config, Backend>(plan, input, output, workspace, visit)) return Backend::invalid_value;
+    return detail::enqueue_visit<Config, Backend>(plan, input, output, workspace, visit, stream);
+}
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 template<class Caps>
 struct SoftcappedSwigluBf16 {
@@ -509,6 +540,7 @@ struct SoftcappedSwigluBf16 {
 struct Bf16Combine {
     static constexpr auto launch = grouped_rows::combine;
 };
+#endif
 
 // The route hook owns selection. Its outputs feed the common CSR planner and
 // the same execution path used with an uploaded host plan.
@@ -522,7 +554,7 @@ inline typename Backend::Status enqueue_resident(
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16,
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic,
     grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile) {
-    using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
+    using Planner = typename Backend::template Planner<Config::experts, Config::top_k>;
     if (form == grouped_microscaled::Form::small_f16 && !admit_small<Config>(layer, matrices))
         return Backend::invalid_value;  // before routing or planning is queued
     device_grouped::Args args{};
@@ -535,18 +567,19 @@ inline typename Backend::Status enqueue_resident(
         bias.size() != Config::experts || route.scratch.size() < Planner::scratch_bytes(rows) / sizeof(unsigned)) {
         return Backend::invalid_value;
     }
-    auto status = select(logits, bias, route, rows, stream);
-    if (status != Backend::success) return status;
-    status = Backend::template materialize<Config::experts, Config::top_k>(args, route.scratch, stream);
-    if (status != Backend::success) return status;
-
     const auto assignments = std::size_t{rows} * Config::top_k;
     const auto tiles = args.out.tile_capacity;
     const DevicePlan plan{layer, rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
                           {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles},
                           {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule, form};
-    return enqueue<Config, Backend>(plan, input, output, workspace, stream);
+    detail::Visit visit{};
+    if (!detail::preflight_visit<Config, Backend>(plan, input, output, workspace, visit)) return Backend::invalid_value;
+
+    auto status = select(logits, bias, route, rows, stream);
+    if (status != Backend::success) return status;
+    status = Backend::template materialize<Config::experts, Config::top_k>(args, route.scratch, stream);
+    if (status != Backend::success) return status;
+    return detail::enqueue_visit<Config, Backend>(plan, input, output, workspace, visit, stream);
 }
-#endif
 
 }  // namespace strix::moe_core::grouped_dispatch

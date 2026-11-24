@@ -250,10 +250,14 @@ std::vector<float> edge_projection(const Device& d, const grouped::TileRows& til
     require_hip(hipMemcpy(d.gu_tiles, &tile, sizeof(tile), hipMemcpyHostToDevice), "edge tile");
     const auto args = args_of(d.gu_tiles, 1U, static_cast<unsigned>(tile.input_row),
                               static_cast<unsigned>(tile.output_row), tile.rows, form);
-    if (map)
-        require_hip(grouped::launch_indirect<F>({args, map, tile.input}, nullptr), "edge indirect");
-    else
-        require_hip(grouped::launch<F>(args, nullptr), "edge direct");
+    const auto status = map ? grouped::launch_indirect<F>({args, map, tile.input}, nullptr)
+                            : grouped::launch<F>(args, nullptr);
+    if (status != hipSuccess) {
+        std::cerr << "edge " << (F == Format::nvfp4 ? "NVFP4" : "MXFP8") << " K=" << args.inputs
+                  << " N=" << args.outputs << ' ' << (map ? "indirect" : "direct") << ": "
+                  << hipGetErrorString(status) << '\n';
+        return {};
+    }
     require_hip(hipMemcpy(out.data(), d.gu_out, out.size() * sizeof(float), hipMemcpyDeviceToHost), "edge read");
     return out;
 }
@@ -281,6 +285,7 @@ bool mxfp8_edge_check(const Device& d) {
     const auto ref = edge_projection<Format::mxfp8>(d, tile, grouped::Form::bf16_tile);
     require_hip(hipFree(device_codes), "free edge codes");
     require_hip(hipFree(device_scales), "free edge scales");
+    if (out.empty() || ref.empty()) return false;
     bool ok = true;
     for (unsigned c = 0; c < bytes.size(); ++c) {
         const bool matches = bytes[c] == 255U
@@ -303,9 +308,9 @@ bool mxfp8_edge_check(const Device& d) {
     return ok;
 }
 
-template <Format F>
+template <Format F, unsigned k = 256U, unsigned n = 256U>
 bool activation_range_check(const Device& d) {
-    constexpr unsigned k = 256U, n = 256U, rows = 33U;
+    constexpr unsigned rows = 33U, ref_n = std::max(n, grouped::gemm::kBN);
     constexpr bool nv = F == Format::nvfp4;
     constexpr unsigned code_stride = nv ? k / 2U : k, scale_stride = k / (nv ? 16U : 32U);
     constexpr std::uint8_t one = nv ? 0x02U : 0x38U;
@@ -336,22 +341,42 @@ bool activation_range_check(const Device& d) {
     auto* map = device_copy(reverse);
     const packed::PackedMatrix w{device_codes, device_scales, n, k, 1.0F};
     const grouped::TileRows tile{w, d.gu_in, d.gu_out, k, n, rows};
+    auto* ref_codes = device_codes;
+    auto* ref_scales = device_scales;
+    if constexpr (ref_n != n) {
+        // The BF16 entry requires a full 128-column tile. Pad only its weight planes, leaving the small form's
+        // matrices at their actual width so its exceptional-row fallback must stay within the final 64 columns.
+        codes.resize(ref_n * code_stride);
+        scales.resize(ref_n * scale_stride, nv ? 0x38U : 127U);
+        ref_codes = device_copy(codes);
+        ref_scales = device_copy(scales);
+    }
+    const grouped::TileRows ref_tile{{ref_codes, ref_scales, ref_n, k, 1.0F}, d.gu_in, d.gu_out, k, ref_n, rows};
     bool ok = true;
     for (const auto* indices : {static_cast<std::uint32_t*>(nullptr), map}) {
         const auto out = edge_projection<F>(d, tile, grouped::Form::small_f16, indices);
-        const auto ref = edge_projection<F>(d, tile, grouped::Form::bf16_tile, indices);
+        const auto ref = edge_projection<F>(d, ref_tile, grouped::Form::bf16_tile, indices);
+        if (out.empty() || ref.empty()) {
+            ok = false;
+            continue;
+        }
         for (unsigned r = 0; r < rows; ++r) {
             const unsigned source = indices ? reverse[r] : r;
             const bool outside = source == 1U || source == 16U || source == 31U || source == 32U;
             const float expected = widen(input[source * k]) + widen(input[(source + 1U) * k - 1U]);
             if (out[r * n] != expected ||
-                (outside ? std::memcmp(out.data() + r * n, ref.data() + r * n, n * sizeof(float)) != 0
-                         : out[(r + 1U) * n - 1U] != 0.0F || ref[(r + 1U) * n - 1U] != 0x1p-30F)) {
+                (outside ? std::memcmp(out.data() + r * n, ref.data() + r * ref_n, n * sizeof(float)) != 0
+                         : out[(r + 1U) * n - 1U] != 0.0F || ref[r * ref_n + n - 1U] != 0x1p-30F)) {
                 std::cerr << "BF16 activation range (" << (nv ? "NVFP4" : "MXFP8") << ", "
-                          << (indices ? "indirect" : "direct") << "), input row " << source << '\n';
+                          << (indices ? "indirect" : "direct") << "), K=" << k << " N=" << n
+                          << ", input row " << source << '\n';
                 ok = false;
             }
         }
+    }
+    if constexpr (ref_n != n) {
+        require_hip(hipFree(ref_codes), "free padded edge codes");
+        require_hip(hipFree(ref_scales), "free padded edge scales");
     }
     require_hip(hipFree(map), "free edge map");
     require_hip(hipFree(device_codes), "free edge codes");
@@ -810,7 +835,9 @@ int main(int argc, char** argv) {
         const bool mxfp8_edges = mxfp8_edge_check(dev);
         const bool nvfp4_activations = activation_range_check<Format::nvfp4>(dev);
         const bool mxfp8_activations = activation_range_check<Format::mxfp8>(dev);
-        ok = mxfp8_edges && nvfp4_activations && mxfp8_activations;
+        const bool nvfp4_last_panel = activation_range_check<Format::nvfp4, 128U, 64U>(dev);
+        const bool mxfp8_last_panel = activation_range_check<Format::mxfp8, 128U, 64U>(dev);
+        ok = mxfp8_edges && nvfp4_activations && mxfp8_activations && nvfp4_last_panel && mxfp8_last_panel;
         std::cout << "small-form weight code, scale and activation edges: " << (ok ? "PASS" : "FAIL") << '\n';
     }
     {

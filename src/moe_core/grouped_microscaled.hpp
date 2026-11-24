@@ -17,7 +17,12 @@ namespace gemm = strix::core::f16_tile_gemm;
 inline constexpr unsigned kRowsPerTile = 256U;
 
 inline bool fits(const Args& args) {
-    return fits_args(args, gemm::kBK, gemm::kBN);
+    return args.form == Form::small_f16 ? fits_small(args) : fits_args(args, gemm::kBK, gemm::kBN);
+}
+
+inline bool fits_indirect(const IndirectArgs& args) {
+    return fits(args) && args.gather_rows && args.gather_from &&
+           reinterpret_cast<std::uintptr_t>(args.gather_from) % 16U == 0U;
 }
 
 template <packed::MatrixFormat Format>
@@ -272,11 +277,6 @@ inline hipError_t launch_tiles(const A& args, hipStream_t stream) {
         return gemm::gemm_packed_bf16<Binding>(args, args.inputs, args.outputs, args.count, stream,
                                                tile_row_slices(args.max_tile_rows, kRowsPerTile, gemm::kBM));
     }
-}
-
-inline bool fits_indirect(const IndirectArgs& args) {
-    return fits(args) && args.gather_rows && args.gather_from &&
-           reinterpret_cast<std::uintptr_t>(args.gather_from) % 16U == 0U;
 }
 
 // Host admission checks the tile descriptors before upload with fits_tile().

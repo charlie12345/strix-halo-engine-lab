@@ -304,6 +304,117 @@ bool whole_visit_admission() {
            visit<DownTooNarrow>(Form::bf16_tile, 0, 5);
 }
 
+bool small_panel_admission() {
+    namespace gm = moe::grouped_microscaled;
+    using dispatch = moe::grouped_dispatch::HipBackend;
+    const gm::TileRows tile_rows{};
+    const std::uint32_t map = 0U;
+    alignas(16) const std::array<std::uint16_t, 128> input{};
+    gm::Args args{&tile_rows, 1U, 128U, 64U, nullptr, nullptr, 1U};
+    args.form = gm::Form::small_f16;
+    const bool direct = dispatch::fits(args);
+    const bool indirect = gm::fits_indirect({args, &map, input.data()});
+    const bool bad_indirect = gm::fits_indirect({args, nullptr, input.data()}) ||
+                              gm::fits_indirect({args, &map, input.data() + 1});
+    args.form = gm::Form::bf16_tile;
+    const bool incumbent = dispatch::fits(args) || gm::fits_indirect({args, &map, input.data()});
+    if (!direct || !indirect || bad_indirect || incumbent) {
+        std::cerr << "K=128 N=64 admission: direct " << direct << ", indirect " << indirect
+                  << ", invalid gather " << bad_indirect << ", BF16 " << incumbent << '\n';
+        return false;
+    }
+    return true;
+}
+
+struct ResidentVisitBackend : VisitBackend {
+    template<unsigned Experts, unsigned TopK>
+    struct Planner {
+        static constexpr std::size_t scratch_bytes(unsigned) { return sizeof(unsigned); }
+    };
+    template<unsigned Experts, unsigned TopK>
+    static Status materialize(const moe::device_grouped::Args& args, std::span<unsigned>, Stream) {
+        args.csr.offsets[0] = 0U;
+        return ++visit_submissions, success;
+    }
+    static constexpr auto token_rows = gather;
+    template<packed::MatrixFormat Format>
+    static Status launch_indirect(const moe::grouped_microscaled::IndirectArgs& args, Stream stream) {
+        if (!moe::grouped_microscaled::fits_indirect(args)) return invalid_value;
+        return launch_projection<Format>(args, stream);
+    }
+};
+
+struct ResidentVisitConfig : VisitConfig<128U, 128U> {
+    static constexpr unsigned experts = 32U, max_rows = 33U;
+};
+
+bool resident_visit_admission() {
+    namespace dispatch = moe::grouped_dispatch;
+    namespace gm = moe::grouped_microscaled;
+    using Config = ResidentVisitConfig;
+    using Act = moe::grouped_w4a4::Activations;
+    constexpr unsigned rows = 33U, assignments = rows * Config::top_k, max_tiles = gm::kMaxTiles;
+    constexpr unsigned sentinel = 12345U;
+    alignas(16) const std::array<std::uint8_t, 16> plane{};
+    const packed::PackedMatrix gate_up{plane.data(), plane.data(), 2U * Config::intermediate, Config::hidden};
+    const packed::PackedMatrix down{plane.data(), plane.data(), Config::hidden, Config::intermediate};
+    std::array<dispatch::ExpertWeights, Config::experts> matrices;
+    matrices.fill({gate_up, down});
+    const auto need = dispatch::workspace_requirement<Config>(rows);
+    alignas(16) std::array<std::uint16_t, assignments * Config::hidden + 1U> bf16{};
+    std::vector<float> fp32(need.fp32), input(rows * Config::hidden), output(input.size());
+    std::array<float, Config::experts> bias{};
+    std::array<float, rows * Config::experts> logits{};
+    std::array<float, assignments> weights{}, assignment_weights{};
+    std::array<unsigned, assignments> ids{}, combine{}, order{}, slots{};
+    std::array<unsigned, rows> status{};
+    std::array<unsigned, 1> scratch{};
+    std::array<unsigned, Config::experts + 1U> offsets{};
+    std::array<unsigned, Config::experts> touched{};
+    std::vector<unsigned> experts(max_tiles), begins(max_tiles + 1U);
+    std::vector<gm::TileRows> gate_tiles(max_tiles), down_tiles(max_tiles);
+    unsigned tile_count = 0U, failure = 0U;
+    const moe::device_grouped::CsrTables csr{offsets.data(), touched.data(), experts.data(), begins.data(),
+                                            order.data(), slots.data()};
+    const dispatch::RouteBuffers route{ids, status, scratch, weights};
+    const auto select = [](auto, auto, dispatch::RouteBuffers r, unsigned, int) {
+        r.ids[0] = 0U;
+        return ++visit_submissions, ResidentVisitBackend::success;
+    };
+    const auto run = [&](const char* name, gm::Form form, unsigned capacity, Act activations, unsigned misalign,
+                         int expected_submissions) {
+        ids[0] = offsets[0] = sentinel;
+        bf16.fill(0x1234U);
+        visit_submissions = 0;
+        const moe::device_grouped::Output plan_out{assignment_weights.data(), combine.data(), gate_tiles.data(),
+                                                   down_tiles.data(), &tile_count, &failure, capacity};
+        const dispatch::Workspace workspace{{bf16.data() + misalign, need.bf16}, fp32};
+        moe::device_grouped::Args args{};
+        if (!dispatch::prepare_resident<Config, ResidentVisitBackend>(0U, rows, route, matrices, csr, plan_out,
+                                                                       workspace, args)) {
+            std::cerr << "resident fixture does not pass planner admission: " << name << '\n';
+            return false;
+        }
+        const auto result = dispatch::enqueue_resident<Config, ResidentVisitBackend>(
+            0U, rows, input, logits, bias, output, route, matrices, csr, plan_out, workspace, 0,
+            dispatch::LogitExtent::exact, select, gm::Decode::reference, activations, gm::Schedule::automatic, form);
+        const bool untouched = ids[0] == sentinel && offsets[0] == sentinel && workspace.bf16[0] == 0x1234U;
+        const int expected = expected_submissions == 0 ? ResidentVisitBackend::invalid_value : ResidentVisitBackend::success;
+        if (result != expected || visit_submissions != expected_submissions || untouched != (expected_submissions == 0)) {
+            std::cerr << "resident " << name << ": status " << result << ", submissions " << visit_submissions
+                      << ", untouched " << untouched << '\n';
+            return false;
+        }
+        return true;
+    };
+    bool ok = run("small grid overflow", gm::Form::small_f16, max_tiles, Act::bf16, 0U, 0);
+    ok = run("small incompatible operand", gm::Form::small_f16, max_tiles / 2U, Act::nvfp4, 0U, 0) && ok;
+    ok = run("misaligned in-place workspace", gm::Form::small_f16, max_tiles / 2U, Act::bf16, 1U, 0) && ok;
+    ok = run("small grid boundary", gm::Form::small_f16, max_tiles / 2U, Act::bf16, 0U, 7) && ok;
+    ok = run("BF16 incumbent", gm::Form::bf16_tile, max_tiles, Act::bf16, 0U, 7) && ok;
+    return ok;
+}
+
 // Small-form admission of the expert banks: a scale plane that starts one byte past a 4-byte boundary (legal for the
 // BF16 tile) is refused for the small form, in either bank, by admit_small and by prepare_form(..., small_f16).
 bool small_scale_admission() {
@@ -357,6 +468,9 @@ int main() {
     if (!weight_codes || !scale_range || !activation_range) return 1;
     std::cout << "small-form MXFP8 weight codes: PASS\n";
     std::cout << "small-form MXFP8 scale range and BF16 activation range: PASS\n";
+    const bool panel = small_panel_admission(), resident = resident_visit_admission();
+    if (!panel || !resident) return 1;
+    std::cout << "small-form 64-column and resident preflight admission: PASS\n";
     // Small form row plan: one form for any tile height (no row cap); 16-row blocks up to 16 rows, then 32-row blocks.
     {
         namespace gm = moe::grouped_microscaled;

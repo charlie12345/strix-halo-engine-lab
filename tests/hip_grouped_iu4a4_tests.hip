@@ -229,7 +229,7 @@ int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsi
     Act tok, hact;
     tok.alloc(tokens, hidden);
     hact.alloc(A, ffn);
-    ad::enqueue_quantise(dx, hidden, tok.act, nullptr);
+    ad::enqueue_quantise_rows(dx, hidden, tok.act, nullptr);
     const Image gim = requantise(gate, ffn), dim = requantise(down, 0U);
     // Outputs prefilled with a NaN pattern; one guard row past the end.
     float *dplain = nullptr, *dh = nullptr, *dhc = nullptr, *dy = nullptr;
@@ -247,7 +247,7 @@ int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsi
     ad::enqueue_grouped_gemm(source(l, gate, gim, true, ng, dh, ffn), tiles, tall, ng, tok.act, nullptr, epi);
     hipLaunchKernelGGL(swiglu_check_kernel, dim3(static_cast<unsigned>((std::size_t(A) * ffn + 255U) / 256U)), dim3(256), 0, nullptr, dplain, A, ng, dhc, epi);
     // h rows past the cut are NaN-pattern: quantise them anyway (their down tiles are refused).
-    ad::enqueue_quantise(dh, ffn, hact.act, nullptr);
+    ad::enqueue_quantise_rows(dh, ffn, hact.act, nullptr);
     ad::enqueue_grouped_gemm(source(l, down, dim, false, hidden, nullptr, 0U), tiles, tall, hidden, hact.act, nullptr);
     CHECK(hipGetLastError());
     CHECK(hipDeviceSynchronize());
@@ -287,9 +287,15 @@ int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsi
                            std::vector<std::int8_t>& rc, std::vector<std::uint8_t>& ru) {
         rc.resize(in);
         ru.resize(in / rot::kGroupA);
-        for (unsigned c = 0; c < in; ++c) rc[c] = static_cast<std::int8_t>(rot::pack_code(codes.data(), c, r, mp));
-        for (unsigned blk = 0; blk < in / rot::kBlock; ++blk)
-            for (unsigned q = 0; q < rot::kGroupsPerBlock; ++q) ru[blk * 4U + q] = static_cast<std::uint8_t>((u[std::size_t(blk) * mp + r] >> (8U * q)) & 255U);
+        // Row-major image (enqueue_quantise_rows): codes [r][in / 2] low nibble first, u [r][in / 128].
+        static_cast<void>(mp);
+        for (unsigned c = 0; c < in; ++c) {
+            const unsigned nib = (codes[std::size_t(r) * (in / 2U) + c / 2U] >> ((c & 1U) * 4U)) & 15U;
+            rc[c] = static_cast<std::int8_t>(nib < 8U ? int(nib) : int(nib) - 16);
+        }
+        const unsigned blocks = in / rot::kBlock;
+        for (unsigned blk = 0; blk < blocks; ++blk)
+            for (unsigned q = 0; q < rot::kGroupsPerBlock; ++q) ru[blk * 4U + q] = static_cast<std::uint8_t>((u[std::size_t(r) * blocks + blk] >> (8U * q)) & 255U);
     };
     const auto plain = download(dplain, std::size_t(A + 1U) * ng), h = download(dh, std::size_t(A + 1U) * ffn), hchk = download(dhc, std::size_t(A) * ffn);
     const auto y = download(dy, std::size_t(A + 1U) * hidden);
@@ -358,11 +364,11 @@ int bench(unsigned tokens) {
     float ms[4] = {0, 0, 0, 0};
     for (unsigned it = 0; it < reps + 2U; ++it) {
         CHECK(hipEventRecord(ev[0], nullptr));
-        ad::enqueue_quantise(dx, hidden, tok.act, nullptr);
+        ad::enqueue_quantise_rows(dx, hidden, tok.act, nullptr);
         CHECK(hipEventRecord(ev[1], nullptr));
         ad::enqueue_grouped_gemm(gs, tiles, 256U, ng, tok.act, nullptr, epi);
         CHECK(hipEventRecord(ev[2], nullptr));
-        ad::enqueue_quantise(dh, ffn, hact.act, nullptr);
+        ad::enqueue_quantise_rows(dh, ffn, hact.act, nullptr);
         CHECK(hipEventRecord(ev[3], nullptr));
         ad::enqueue_grouped_gemm(ds, tiles, 256U, hidden, hact.act, nullptr);
         CHECK(hipEventRecord(ev[4], nullptr));

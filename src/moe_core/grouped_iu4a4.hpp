@@ -6,7 +6,7 @@
 //   weights: once at load, each expert matrix (NVFP4 or MXFP8 as stored) is requantised to the rotated IU4 image of
 //     dense-iu4a4-rot-v1 (iu4a4_rot::requantise_values on the EXACT BF16 operand value of every weight); a gate/up matrix
 //     is built in the paired column order (iu4a4_rot::paired_column) so the SwiGLU epilogue meets gate and up in a lane.
-//   activations: the A4 image of dense-iu4a4-rot-v1. Gate/up: the TOKEN rows quantised once (not once per assignment),
+//   activations: the A4 image of dense-iu4a4-rot-v1 (row-major: the grouped launch gathers rows). Gate/up: the TOKEN rows quantised once (not once per assignment),
 //     read through the plan's assignment -> token map. Down: the activated rows h (FP32 [assignment][ffn], the BF16 value
 //     of the incumbent epilogue) quantised in assignment order.
 // Arithmetic identity "grouped-iu4a4-rot-v1": every output is iu4a4_rot::dot of its row and rotated column (the dense
@@ -133,7 +133,8 @@ inline void enqueue_requantise_expert(const packed::PackedMatrix& matrix, unsign
 inline hipError_t launch(const Pass& p, hipStream_t s) {
     const unsigned gate_width = 2U * p.intermediate;
     if (!p.images || !p.tokens || !p.h || !p.act || !p.assignment_rows || !p.gate_up || !p.down || p.tiles == 0U ||
-        !supported(p.hidden, gate_width, true) || !supported(p.intermediate, p.hidden, false) ||
+        !dense::grouped_supported(p.hidden, gate_width, true, p.tiles, p.max_tile_rows) ||
+        !dense::grouped_supported(p.intermediate, p.hidden, false, p.tiles, p.max_tile_rows) ||
         reinterpret_cast<std::uintptr_t>(p.act) % 256U != 0U ||
         p.act_size < act_bytes(p.rows, p.assignments, p.hidden, p.intermediate))
         return hipErrorInvalidValue;
@@ -155,9 +156,9 @@ inline hipError_t launch(const Pass& p, hipStream_t s) {
                     p.images->gate_up_codes, p.images->gate_up_stride, p.images->gate_up, p.hidden, gate_width, p.h, p.intermediate};
     TileSource down{p.down, p.gate_up, p.index_base, nullptr, p.tile_count, p.failure,
                     p.images->down_codes, p.images->down_stride, p.images->down, p.intermediate, p.hidden, nullptr, 0U};
-    dense::enqueue_quantise(p.tokens, p.hidden, tokens, s);
+    dense::enqueue_quantise_rows(p.tokens, p.hidden, tokens, s);
     dense::enqueue_grouped_gemm(gate, p.tiles, p.max_tile_rows, gate_width, tokens, s, SwigluOut{p.gate_cap, p.up_cap});
-    dense::enqueue_quantise(p.h, p.intermediate, inner, s);
+    dense::enqueue_quantise_rows(p.h, p.intermediate, inner, s);
     dense::enqueue_grouped_gemm(down, p.tiles, p.max_tile_rows, p.hidden, inner, s);
     return hipGetLastError();
 }

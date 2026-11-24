@@ -103,6 +103,17 @@ typedef const __attribute__((address_space(1))) std::uint32_t GU32;
 
 // One wave per row (blockDim 256 = 8 rows). Lanes 0-15 take block 2 s, lanes 16-31 block 2 s + 1 of step s; lane
 // holds inputs 8 (lane % 16) .. + 7 of its block (the a4_tiles::Emu lane form, bitwise = fwht128).
+// Output layout of the quantisers: Rows = false the fragment tile layout (codes pack_byte(k, m, mp), u [blk][mp]), Rows =
+// true the row-major image the grouped launch gathers (codes [m][in / 2], u [m][in / 128]); same values.
+template <bool Rows>
+__device__ __forceinline__ std::size_t code_offset(unsigned k0, unsigned row, unsigned mp, unsigned in) {
+    return Rows ? std::size_t(row) * (in / 2U) + k0 / 2U : rot::pack_byte(k0, row, mp);
+}
+template <bool Rows>
+__device__ __forceinline__ std::size_t u_offset(unsigned blk, unsigned row, unsigned mp, unsigned in) {
+    return Rows ? std::size_t(row) * (in / rot::kBlock) + blk : std::size_t(blk) * mp + row;
+}
+template <bool Rows>
 __global__ __launch_bounds__(256) void quantise_kernel(const float* __restrict__ x, unsigned x_stride, Act a) {
 #pragma clang fp contract(off)
     const unsigned lane = threadIdx.x & 31U, row = blockIdx.x * 8U + (threadIdx.x >> 5U);
@@ -177,8 +188,8 @@ __global__ __launch_bounds__(256) void quantise_kernel(const float* __restrict__
                                  static_cast<std::uint32_t>(__shfl(ug, int(hb + 12U), 32)) << 24U;
         if (blk < blocks) {
             const unsigned k0 = blk * rot::kBlock + sub * 8U;
-            *reinterpret_cast<std::uint32_t*>(a.codes + rot::pack_byte(k0, row, mp)) = packed;
-            if (sub == 0U) a.u[std::size_t(blk) * mp + row] = uw;
+            *reinterpret_cast<std::uint32_t*>(a.codes + code_offset<Rows>(k0, row, mp, in)) = packed;
+            if (sub == 0U) a.u[u_offset<Rows>(blk, row, mp, in)] = uw;
         }
     }
 }
@@ -192,7 +203,7 @@ inline constexpr unsigned kCtaSteps = 12U, kCtaInputs = 8U * kCtaSteps * 2U * 12
 struct Ident {
     __device__ __forceinline__ static float apply(float a, float) { return a; }
 };
-template <class F>
+template <class F, bool Rows>
 __global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
 #pragma clang fp contract(off)
     __shared__ float s_amax[8], s_bad[8];
@@ -281,8 +292,8 @@ __global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restri
                                  static_cast<std::uint32_t>(__shfl(ug, int(hb + 8U), 32)) << 16U |
                                  static_cast<std::uint32_t>(__shfl(ug, int(hb + 12U), 32)) << 24U;
         if (blk < blocks) {
-            *reinterpret_cast<std::uint32_t*>(a.codes + rot::pack_byte(blk * rot::kBlock + sub * 8U, row, mp)) = packed;
-            if (sub == 0U) a.u[std::size_t(blk) * mp + row] = uw;
+            *reinterpret_cast<std::uint32_t*>(a.codes + code_offset<Rows>(blk * rot::kBlock + sub * 8U, row, mp, a.in)) = packed;
+            if (sub == 0U) a.u[u_offset<Rows>(blk, row, mp, a.in)] = uw;
         }
     }
 }
@@ -449,78 +460,79 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
     });
 }
 
-// Grouped trait of the GEMM (see GroupCta): the dense copy roles, block_dot and output rounding; the x side copies two
-// gathered rows per 16 B piece (8 B each, the same LDS layout) and their u words one by one.
+// Grouped trait of the GEMM (see GroupCta): the dense W copy, block_dot and output rounding. The x side reads a ROW-MAJOR
+// A4 image (enqueue_quantise_rows: a row's codes contiguous, u [row][blocks]): each x-side thread copies the 64 B of one
+// gathered row per block (4 x 16 B, two K16 units each) into the same LDS fragment layout, so a gathered row costs whole
+// lines. Grid: x = blocks of kCtaTilesN W tiles (fastest: the CTAs of one tile slice share its rows in L2), y = tile *
+// slices + slice (the slices and tiles of one expert run together and share its weight block).
 template <class Src, class Epi>
-__global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsigned n, Epi epi) {
+__global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsigned n, unsigned slices, Epi epi) {
     __shared__ __attribute__((aligned(16))) std::uint8_t lds[2U * kBlockBytes];
-    if (!src.active(blockIdx.x)) return;  // uniform, before any barrier
-    GroupCta g = src.bind(blockIdx.x);
-    // Row slice z of the tile: rows [128 z, 128 z + 128) (a plan tile taller than one CTA).
-    const unsigned skip = blockIdx.z * kCtaTilesM * 16U, all = f16_dense_tall::detail::uni(g.rows);
+    const unsigned tile = blockIdx.y / slices, slice = blockIdx.y % slices;
+    if (!src.active(tile)) return;  // uniform, before any barrier
+    GroupCta g = src.bind(tile);
+    // Row slice of the tile: rows [128 slice, 128 slice + 128) (a plan tile taller than one CTA).
+    const unsigned skip = slice * kCtaTilesM * 16U, all = f16_dense_tall::detail::uni(g.rows);
     if (all <= skip) return;
     const unsigned rows = all - skip < kCtaTilesM * 16U ? all - skip : kCtaTilesM * 16U;
     g.first += skip;
     g.y += std::size_t(skip) * g.y_row;
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, l16 = lane & 15U, hi = lane >> 4U;
-    const unsigned ntiles = f16_dense_tall::detail::uni(n) / 16U, mp = padded_rows(f16_dense_tall::detail::uni(a.rows));
-    const unsigned mtiles = (rows + 15U) / 16U, blocks = f16_dense_tall::detail::uni(a.in) / rot::kBlock;
+    const unsigned ntiles = f16_dense_tall::detail::uni(n) / 16U, in = f16_dense_tall::detail::uni(a.in);
+    const unsigned mtiles = (rows + 15U) / 16U, blocks = in / rot::kBlock;
     const unsigned wn = wave % kWavesN, wm = wave / kWavesN;
-    const unsigned nt0 = blockIdx.y * kCtaTilesN + wn * kTw, mt0 = wm * kTm;
+    const unsigned nt0 = blockIdx.x * kCtaTilesN + wn * kTw, mt0 = wm * kTm;
     const bool live = mt0 < mtiles;  // a wave without a live x tile still copies and meets the barriers
     const auto image_row = [&](unsigned r) __attribute__((always_inline)) {
         const unsigned c = g.first + (r < rows ? r : rows - 1U);  // rows past the tile re-read its last row (never stored)
         return g.map ? g.map[c] : c;
     };
-    // Code copy: piece q of a block = unit 2 q + (tid >> 7); waves 0-1 / 4-5 copy W (as the dense launch), 2-3 / 6-7 x.
+    // W copy (waves 0-1 / 4-5, as the dense launch): piece q of a block = unit 2 q + (tid >> 7).
     const unsigned side = (tid >> 6U) & 1U, piece = tid & 63U, cu = tid >> 7U;
-    const unsigned dst = cu * kUnitBytes + side * 1024U + piece * 16U;
+    const unsigned wdst = cu * kUnitBytes + piece * 16U;
     const std::size_t wstride = std::size_t(ntiles) * 8U;  // one K16 unit of W, in 16 B pieces
-    const unsigned wtile = blockIdx.y * kCtaTilesN + (piece >> 3U), wct = wtile < ntiles ? wtile : ntiles - 1U;
+    const unsigned wtile = blockIdx.x * kCtaTilesN + (piece >> 3U), wct = wtile < ntiles ? wtile : ntiles - 1U;
     const GI4* wsrc = (const GI4*)g.w.codes + std::size_t(cu) * wstride + std::size_t(wct) * 8U + (piece & 7U);
-    typedef const __attribute__((address_space(1))) I2 GI2;
-    const unsigned xt = (piece >> 3U) < mtiles ? (piece >> 3U) : mtiles - 1U, xr = xt * 16U + 2U * (piece & 7U);
-    const unsigned r0 = image_row(xr), r1 = image_row(xr + 1U);
-    const GI2* x0 = (const GI2*)(a.codes + std::size_t(r0 / 16U) * 128U + (r0 % 16U) * 8U) + std::size_t(cu) * mp;
-    const GI2* x1 = (const GI2*)(a.codes + std::size_t(r1 / 16U) * 128U + (r1 % 16U) * 8U) + std::size_t(cu) * mp;
-    // Side copy: tid < 32 the steps of W tile tid / 4 (as the dense launch); 32 <= tid < 64 the u of 4 rows of x tile.
+    // x copy (waves 2-3 / 6-7): thread = CTA row xi (tile xi / 16, row xi % 16); piece q = units 2 q, 2 q + 1.
+    const unsigned xi = piece + 64U * cu, xdst = 1024U + (xi / 16U) * 128U + (xi % 16U) * 8U;
+    const GI4* xsrc = (const GI4*)(a.codes + std::size_t(image_row(xi)) * (in / 2U));
+    // Side copy: tid < 32 the steps of W tile tid / 4 (as the dense launch); 32 <= tid < 64 the u of 4 rows of an x tile.
     const unsigned sq = tid & 31U;
     const bool wside = tid < 32U, xside = tid >= 32U && tid < 64U;
-    const unsigned stile = blockIdx.y * kCtaTilesN + (sq >> 2U), stc = stile < ntiles ? stile : ntiles - 1U;
+    const unsigned stile = blockIdx.x * kCtaTilesN + (sq >> 2U), stc = stile < ntiles ? stile : ntiles - 1U;
     const GI4* ssrc = (const GI4*)g.w.step + std::size_t(stc) * 4U + (sq & 3U);
     const std::size_t sstride = std::size_t(ntiles) * 4U;
     const unsigned ut = (sq >> 2U) < mtiles ? (sq >> 2U) : mtiles - 1U;
-    unsigned ur[4];
+    std::size_t ur[4];
 #pragma unroll
-    for (unsigned i = 0; i < 4U; ++i) ur[i] = image_row(ut * 16U + (sq & 3U) * 4U + i);
+    for (unsigned i = 0; i < 4U; ++i) ur[i] = std::size_t(image_row(ut * 16U + (sq & 3U) * 4U + i)) * blocks;
     const GU32* ug = (const GU32*)a.u;
     I4 stg[4], sstg = {0, 0, 0, 0};
     const auto fetch = [&](unsigned b) __attribute__((always_inline)) {
 #pragma unroll
-        for (unsigned q = 0; q < 4U; ++q) {
-            const std::size_t unit = std::size_t(b) * 8U + 2U * q;
-            if (side == 0U) {
-                stg[q] = wsrc[unit * wstride];
-            } else {
-                const I2 lo = x0[unit * mp], hv = x1[unit * mp];
-                const I4 pair = {lo[0], lo[1], hv[0], hv[1]};
-                stg[q] = pair;
-            }
-        }
+        for (unsigned q = 0; q < 4U; ++q) stg[q] = side == 0U ? wsrc[(std::size_t(b) * 8U + 2U * q) * wstride] : xsrc[std::size_t(b) * 4U + q];
         if (wside) {
             sstg = ssrc[std::size_t(b) * sstride];
         } else if (xside) {
-            const std::size_t ub = std::size_t(b) * mp;
-            const I4 words = {static_cast<int>(ug[ub + ur[0]]), static_cast<int>(ug[ub + ur[1]]), static_cast<int>(ug[ub + ur[2]]),
-                              static_cast<int>(ug[ub + ur[3]])};
+            const I4 words = {static_cast<int>(ug[ur[0] + b]), static_cast<int>(ug[ur[1] + b]), static_cast<int>(ug[ur[2] + b]),
+                              static_cast<int>(ug[ur[3] + b])};
             sstg = words;
         }
     };
     const bool scopy = tid < 64U;
     const auto put = [&](unsigned buf) __attribute__((always_inline)) {
+        std::uint8_t* base = lds + buf * kBlockBytes;
 #pragma unroll
-        for (unsigned q = 0; q < 4U; ++q) *reinterpret_cast<I4*>(lds + buf * kBlockBytes + dst + q * 2U * kUnitBytes) = stg[q];
-        if (scopy) *reinterpret_cast<I4*>(lds + buf * kBlockBytes + kCodeBytes + tid * 16U) = sstg;
+        for (unsigned q = 0; q < 4U; ++q) {
+            if (side == 0U) {
+                *reinterpret_cast<I4*>(base + wdst + q * 2U * kUnitBytes) = stg[q];
+            } else {
+                const I2 lo = {stg[q][0], stg[q][1]}, hv = {stg[q][2], stg[q][3]};
+                *reinterpret_cast<I2*>(base + xdst + 2U * q * kUnitBytes) = lo;
+                *reinterpret_cast<I2*>(base + xdst + (2U * q + 1U) * kUnitBytes) = hv;
+            }
+        }
+        if (scopy) *reinterpret_cast<I4*>(base + kCodeBytes + tid * 16U) = sstg;
     };
     float acc[kTw][kTm][8];
 #pragma unroll
@@ -578,12 +590,17 @@ __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsig
 // x: rows of a.in values at x_stride floats. quantise_map2: the quantised value is F::apply(a[k], b[k]) (same stride);
 // with a second input it needs map2_supported(in).
 inline bool map2_supported(unsigned in) { return in <= detail::kCtaInputs; }
-template <class F = detail::Ident> inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s) {
-    if (a.in <= detail::kCtaInputs) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_kernel<F>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
-    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::quantise_kernel, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
+template <class F = detail::Ident, bool Rows = false>
+inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s) {
+    if (a.in <= detail::kCtaInputs) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_kernel<F, Rows>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, detail::quantise_kernel<Rows>, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
 }
 inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
     enqueue_quantise_map2<detail::Ident>(x, nullptr, x_stride, a, s);
+}
+// The row-major image of the grouped launch (same values as enqueue_quantise; byte sizes act_*_bytes).
+inline void enqueue_quantise_rows(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
+    enqueue_quantise_map2<detail::Ident, true>(x, nullptr, x_stride, a, s);
 }
 // Requantisation from a weight source (Src::requantise(col, b, n, dst) -> step, see detail::requantise_kernel).
 template <class Src>
@@ -592,15 +609,22 @@ inline void enqueue_requantise_source(const Src& src, unsigned in, unsigned n, s
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::requantise_kernel<Src>), dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256), 0, s, src, in, n,
                          dst, step);
 }
-// Grouped launch (GroupCta): `tiles` CTAs in x. Limits: supported(a.in, n), 0 < tiles <= 0x7fffffff, a paired epilogue
-// n % 32 == 0; every image row a map names is < a.rows.
-inline bool grouped_supported(unsigned in, unsigned n, bool paired) { return supported(in, n) && (!paired || n % 32U == 0U); }
+// Grouped launch (GroupCta) over a ROW-MAJOR activation image (enqueue_quantise_rows). Limits: supported(a.in, n), a
+// paired epilogue n % 32 == 0, 0 < tiles * grouped_slices(max_tile_rows) <= 65535 (grid y); every image row a map names
+// is < a.rows.
+inline unsigned grouped_slices(unsigned max_tile_rows) {
+    const unsigned s = (max_tile_rows + kCtaTilesM * 16U - 1U) / (kCtaTilesM * 16U);
+    return s > 0U ? s : 1U;
+}
+inline bool grouped_supported(unsigned in, unsigned n, bool paired, unsigned tiles, unsigned max_tile_rows) {
+    return supported(in, n) && (!paired || n % 32U == 0U) && tiles > 0U && std::size_t(tiles) * grouped_slices(max_tile_rows) <= 65535U;
+}
 // max_tile_rows: the plan's tallest tile (grid z = row slices of kCtaTilesM * 16 rows; a slice past a tile leaves).
 template <class Src, class Epi = PlainOut>
 inline void enqueue_grouped_gemm(const Src& src, unsigned tiles, unsigned max_tile_rows, unsigned n, const Act& a, hipStream_t s, Epi epi = {}) {
-    const unsigned slices = (max_tile_rows + kCtaTilesM * 16U - 1U) / (kCtaTilesM * 16U);
-    const dim3 grid(tiles, (n / 16U + kCtaTilesN - 1U) / kCtaTilesN, slices > 0U ? slices : 1U);
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::grouped_gemm_kernel<Src, Epi>), grid, dim3(32U * kWavesN * kWavesM), 0, s, src, a, n, epi);
+    const unsigned slices = grouped_slices(max_tile_rows);
+    const dim3 grid((n / 16U + kCtaTilesN - 1U) / kCtaTilesN, tiles * slices);
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::grouped_gemm_kernel<Src, Epi>), grid, dim3(32U * kWavesN * kWavesM), 0, s, src, a, n, slices, epi);
 }
 inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* scales, unsigned in, unsigned n, std::uint8_t* dst, float* step,
                                hipStream_t s) {

@@ -39,6 +39,26 @@ struct MiniPreparedHipImageBackend : MiniPreparedHipBackend {
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::fma_rows::enqueue_bf16_rows_routed(input, width, rows, views, kVocabulary, operand_image, stream);
     }
+
+    // The output gate stores the gated rows as that image when the output projection reads its whole call from it
+    // (attn_core::PreparedGqaGateImage; same bits as gate() + linear()). The plan is admitted before anything is
+    // enqueued: the image shares no byte with the gate's inputs, the weights or the outputs.
+    core::fma_rows::Bf16ImageCallPlan output_image_plan(unsigned width, unsigned rows,
+                                                        std::span<const MiniAttentionLinear> views, const float* input,
+                                                        const float* logits) const {
+        const float* sources[2] = {input, logits};
+        return core::fma_rows::plan_bf16_rows_from_image(width, rows, views, kVocabulary, operand_image, sources);
+    }
+    Status gate_image(const float* input, const float* logits, std::size_t elements) const {
+        if (elements > operand_image.size()) return hipErrorInvalidValue;
+        namespace prep = core::row_transforms;
+        return prep::elements(elements, prep::Bf16SigmoidProductImage{input, logits, operand_image.data()}, stream);
+    }
+    Status linear_image(const core::fma_rows::Bf16ImageCallPlan& plan, unsigned width, unsigned rows,
+                        std::span<const MiniAttentionLinear> views) const {
+        return core::fma_rows::enqueue_bf16_rows_from_image(plan, operand_image, width, rows, views, kVocabulary,
+                                                            stream);
+    }
 };
 
 // The same backend for a visit whose flash projects the relative bias (MiniHipAttentionProjectedPolicy).

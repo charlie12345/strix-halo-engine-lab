@@ -906,6 +906,7 @@ struct SampledServe {
     std::uint64_t mtp_rounds = 0, sampled_runs = 0, steps = 0, g2_cycles = 0, draft_picks = 0, sampled_enters = 0;
     std::uint64_t lead_accepted = 0, lead_rejected = 0;
     bool lead_coupled = true;
+    std::vector<std::string> receipts;  // each request's sampling_receipt ("" when none)
     std::string error;
 };
 // One pair (loopback) serving `jobs`; sequential = one request at a time (the C1 route), otherwise all queued at once.
@@ -962,6 +963,10 @@ SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool samp
                 out.tokens[i].insert(out.tokens[i].end(), t.begin(), t.end());
             }
             if (!done) out.error += " request " + std::to_string(i) + " timed out";
+            std::string receipt;
+            for (const auto& [k, v] : tickets[i]->stats().engine_extra)
+                if (k == "sampling_receipt") receipt = v;
+            out.receipts.push_back(receipt);
         };
         for (std::size_t i = 0; i < jobs.size(); ++i) {
             tickets.push_back(queue.submit(sv::GenerationJob(jobs[i])));
@@ -1016,6 +1021,13 @@ void test_sampled_drafts_serve() {
     const auto rej = serve_sampled(hot, true, true, false, strix::SampledAcceptance::rejection);
     CHECK(rej.error.empty() && !rej.lead_coupled && rej.draft_picks > 0 && rej.lead_accepted + rej.lead_rejected > 0);
     for (const auto& t : rej.tokens) CHECK(t.size() == 40);
+    // every sampled response states its acceptance rule and what its drafts did (plain steps: no drafted rows)
+    const auto has = [](const std::vector<std::string>& r, const std::string& needle) {
+        return r.size() == 3 && std::all_of(r.begin(), r.end(), [&](const std::string& x) { return x.find(needle) != std::string::npos; });
+    };
+    CHECK(has(hot_plain.receipts, "\"acceptance\":\"coupled\"") && has(hot_plain.receipts, "\"accepted\":0,\"rejected\":0"));
+    CHECK(has(hot_spec.receipts, "\"acceptance\":\"coupled\"") && !has(hot_spec.receipts, "\"accepted\":0,"));
+    CHECK(has(rej.receipts, "\"acceptance\":\"rejection\""));
     if (!hot_spec.error.empty() || !cool_spec.error.empty() || !rej.error.empty())
         std::fprintf(stderr, "sampled drafts errors: %s | %s | %s\n", hot_spec.error.c_str(), cool_spec.error.c_str(), rej.error.c_str());
     std::printf("sampled drafts: T0.9 coupled == plain (%llu draft picks, %llu accepted), T0.5 no draft exchange, "
@@ -1107,6 +1119,25 @@ void test_sampled_mtp_replay() {
     (void)gs::replay(probe, solo, enter, none, true, 2, 64, nullptr, choice);
     CHECK(probe.enters.size() == 1 && probe.enters.at(0).flags == (gs::kRunSample | gs::kRunSampleDrafts) &&
           probe.enters.at(0).sampler == &sampler);
+    // A sampled final units call that the engine did not complete keeps kPrefillPending (the lead's unit check then
+    // fails loudly) instead of a token sampled from rows that are not the prompt's last.
+    {
+        SampledFake units(2);
+        units.unit_rows = 4;
+        units.unit_layers = 2;
+        gs::Control pf;
+        pf.cmd = static_cast<std::uint32_t>(gs::Cmd::prefill);
+        pf.pslot = 1;
+        pf.resets = 1U << 1;
+        pf.ppos = 0;
+        pf.pflags = gs::kPrefillMtp | gs::kPrefillUnits | gs::kPrefillStart | gs::kPrefillLast | gs::kPrefillSample;
+        pf.budget = 1;  // one unit of several: the engine is still pending
+        std::vector<std::uint32_t> prompt{5, 6, 7, 8, 9, 10, 11, 12, 13};
+        pf.plen = static_cast<std::uint32_t>(prompt.size());
+        std::vector<std::uint32_t> first;
+        const bool threw = throws_with([&] { first = gs::replay(units, solo, pf, prompt, true, 2, 64, nullptr, choice); }, "");
+        CHECK(!threw && first.size() == 1 && first[0] == gs::kPrefillPending);
+    }
     CHECK(gs::kControlVersion == 11);
     std::printf("sampled MTP replay: flags and the lead's sampler reach the engine; unknown flags and engines refused\n");
 }

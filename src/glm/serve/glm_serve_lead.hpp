@@ -602,7 +602,7 @@ private:
         strix::serve::GenerationStats st;
         st.finish = "cancelled";
         st.prompt_tokens = request(p->a).prompt.size();
-        if (p->a.sampler) st.sampling = "sampling-v1";
+        strix::serve::record_job_sampling(st, p->a.sampler ? &*p->a.sampler : nullptr);
         runtime().complete_native(p->a.state, std::move(st));
         table_.release(p->slot);
         p.reset();
@@ -954,7 +954,7 @@ private:
         st.finish = why;
         st.prompt_tokens = request(a).prompt.size();
         st.generated_tokens = a.generated;
-        if (a.sampler) st.sampling = "sampling-v1";
+        strix::serve::record_job_sampling(st, a.sampler ? &*a.sampler : nullptr);  // sampling-v1 and its receipt
         st.prefill_ms = a.prefill_ms;
         st.decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - a.t_first).count();
         st.first_token_ms = a.first_token_ms;
@@ -1400,7 +1400,7 @@ private:
             if (*p) {
                 strix::serve::GenerationStats st;
                 st.prompt_tokens = request((*p)->a).prompt.size();
-                if ((*p)->a.sampler) st.sampling = "sampling-v1";
+                strix::serve::record_job_sampling(st, (*p)->a.sampler ? &*(*p)->a.sampler : nullptr);
                 runtime().complete_native((*p)->a.state, std::move(st), error);
                 table_.release((*p)->slot);
                 p->reset();

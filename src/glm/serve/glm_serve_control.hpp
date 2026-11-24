@@ -717,7 +717,10 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
     }
     // Both ranks still echo the paired head's result. Only the lead's returned tokens are replaced.
     ch.record(ch.round() - 1, out);
-    if (sample_mask) {
+    // A units call the engine did not complete keeps kPrefillPending on both ranks: the lead's unit arithmetic check
+    // then fails loudly instead of emitting a token sampled from rows that are not the prompt's last.
+    const bool pending = cmd == Cmd::prefill && !out.empty() && out[0] == kPrefillPending;
+    if (sample_mask && !pending) {
         if constexpr (requires { eng.sample_outputs(ch, sample_mask, choices, std::span(out)); })
             eng.sample_outputs(ch, sample_mask, choices, std::span(out));
         else

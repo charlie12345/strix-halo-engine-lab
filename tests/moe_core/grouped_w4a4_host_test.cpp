@@ -98,7 +98,7 @@ void simulate(const Case& c, std::mt19937& rng) {
     for (auto& b : x_scales) b = static_cast<std::uint8_t>(scale(rng));
     const unsigned w_code_row = k_total / 2U, w_scale_row = k_total / 16U;
     std::vector<int> seen(std::size_t{c.rows} * out_total, 0);
-    const unsigned rows = c.rows < lay::kRows ? c.rows : lay::kRows, rows8 = (rows + 7U) & ~7U;
+    const unsigned rows = c.rows < lay::kRows ? c.rows : lay::kRows, rows8 = (rows + 7U) & ~7U, rows16 = (rows + 15U) & ~15U;
     constexpr unsigned kAcc = 4U * 4U * 4U;  // acc[mt][nt][z] per lane
     for (unsigned block = 0; block < out_total / lay::kOutputs; ++block) {
         const unsigned first_output = block * lay::kOutputs;
@@ -110,7 +110,7 @@ void simulate(const Case& c, std::mt19937& rng) {
             for (unsigned thread = 0; thread < lay::kThreads; ++thread) {
                 for (unsigned j = 0; j < lay::kCodeChunksPerThread; ++j) {
                     const auto ch = lay::code_chunk(thread, j);
-                    if (ch.activation && ch.row >= rows8) continue;  // not issued: never read
+                    if (ch.activation && ch.row >= rows16) continue;  // not issued: never read
                     const std::size_t off = lay::stage_offset(ch.activation, ch.row, 16U * ch.part);
                     std::uint8_t* dst = slot(smem, off, 16);
                     std::memset(written.data() + off, 1, 16);
@@ -172,9 +172,7 @@ void simulate(const Case& c, std::mt19937& rng) {
                         unsigned addr[32];
                         for (unsigned l = 0; l < 32U; ++l)
                             addr[l] = lay::stage_offset(true, lay::ldsm_b_row(warp, p, l), lay::ldsm_b_byte(kb, l));
-                        const bool before = stale;
                         ldsm(addr, b[p]);
-                        if (2U * p + 1U >= live) stale = before;  // the unused upper block of a pair past the live rows
                     }
                     for (unsigned l = 0; l < 32U; ++l) {
                         for (unsigned mt = 0; mt < 4U; ++mt)
@@ -273,7 +271,9 @@ int main() {
                           {256, 256, 33, 2, packed::RowOrder::contiguous},
                           {128, 256, 128, 3, packed::RowOrder::interleaved_halves},
                           {128, 128, 97, 0, packed::RowOrder::contiguous},
-                          {256, 128, 72, 9, packed::RowOrder::contiguous}};
+                          {256, 128, 72, 9, packed::RowOrder::contiguous},
+                          {128, 256, 8, 4, packed::RowOrder::contiguous},
+                          {256, 128, 17, 6, packed::RowOrder::interleaved_halves}};
     for (const auto& c : cases) simulate(c, rng);
     if (failures != 0) {
         std::printf("grouped_w4a4_host_test: %d failure(s)\n", failures);

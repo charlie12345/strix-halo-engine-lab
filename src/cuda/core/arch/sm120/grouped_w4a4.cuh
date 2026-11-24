@@ -51,8 +51,9 @@ __global__ void __launch_bounds__(256) quantize_rows(const contract::QuantizeArg
 
 // Grid (outputs / 128, row slices, tile count); dynamic shared memory kSmem. Slice y takes tile rows 128 y .. 128 y + 127 (one
 // slice for every plan tile of <= 128 rows). Stage s (128 inputs) of weight row o: codes + 64 s, scales + 8 s of physical row o;
-// activation row r < slice rows: image row first + r; rows in a partly live n8 block are zero-filled (zero codes and scales,
-// product 0, never stored); rows past the live rows rounded up to 8 are neither copied nor read.
+// activation row r < slice rows: image row first + r; activation code rows past the live rows up to a multiple of 16 are
+// zero-filled (the x4 B fragment load reads n8 blocks in pairs; product 0, never stored), scale rows up to a multiple of 8
+// (only live n8 blocks read scale words); rows past those are neither copied nor read.
 __global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a) {
     const auto& args = a.tiles;
     if ((args.failure && *args.failure != 0U) || (args.tile_count && blockIdx.z >= *args.tile_count)) return;
@@ -62,7 +63,7 @@ __global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a
     tile.input += std::size_t{first_row} * tile.input_row;
     tile.output += std::size_t{first_row} * tile.output_row;
     tile.rows -= first_row;
-    const unsigned rows = tile.rows < kRows ? tile.rows : kRows, rows8 = (rows + 7U) & ~7U;
+    const unsigned rows = tile.rows < kRows ? tile.rows : kRows, rows8 = (rows + 7U) & ~7U, rows16 = (rows + 15U) & ~15U;
     extern __shared__ __align__(16) std::uint8_t smem[];
     const std::uint32_t base = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
     const unsigned thread = threadIdx.x, lane = thread & 31U, warp = thread >> 5U;
@@ -79,7 +80,7 @@ __global__ void __launch_bounds__(kThreads, 1) projection(const contract::Args a
         const Chunk c = code_chunk(thread, j);
         if (c.activation) {
             code_ok[j] = c.row < rows;
-            code_issue[j] = c.row < rows8;
+            code_issue[j] = c.row < rows16;
             code_src[j] = a.input.codes + (first + (code_ok[j] ? c.row : 0U)) * a.input.code_row + 16U * c.part;
         } else {
             const auto row = packed::physical_row(tile.weights.row_order, tile.weights.rows, first_output + c.row);

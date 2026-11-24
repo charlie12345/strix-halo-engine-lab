@@ -377,15 +377,18 @@ int main(int argc, char** argv) {
                 require(rt::elements(n, rt::Bf16SigmoidProduct{a, gate, gated}, nullptr), "gate");
                 require(fma_rows::enqueue_bf16_rows_routed(gated, K, rows, {&pa, 1U}, kMaxOutputs, scratch, nullptr),
                         "routed");
-                const bool reads = fma_rows::bf16_rows_read_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch);
-                bool same = reads == (rows >= 1024U);
+                const float* sources[2] = {a, gate};
+                const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch, sources);
+                const bool reads = plan.admitted;
+                bool same = reads == (rows >= fma_rows::kPackedImageMinRows);
                 if (reads) {
                     require(rt::elements(n, rt::Bf16SigmoidProductImage{a, gate, image}, nullptr), "gate image");
-                    require(fma_rows::enqueue_bf16_rows_from_image(scratch, K, rows, {&pb, 1U}, kMaxOutputs, nullptr),
+                    require(fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U}, kMaxOutputs,
+                                                                   nullptr),
                             "from image");
                 } else {
-                    same = same && fma_rows::enqueue_bf16_rows_from_image(scratch, K, rows, {&pb, 1U}, kMaxOutputs,
-                                                                          nullptr) == hipErrorNotSupported;
+                    same = same && fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pb, 1U},
+                                                                          kMaxOutputs, nullptr) == hipErrorNotSupported;
                     require(fma_rows::enqueue_bf16_rows_routed(gated, K, rows, {&pb, 1U}, kMaxOutputs, scratch, nullptr),
                             "routed b");
                 }
@@ -398,6 +401,54 @@ int main(int argc, char** argv) {
                           << (same ? "EXACT" : "DIFFER") << '\n';
                 ok = ok && same;
             }
+        }
+        {  // review r17: an image over a gate input (attended rows a, gate logits) or over a weight is refused before
+           // any launch: the plan is not admitted, the consumer launches nothing, every byte under the image survives.
+            const unsigned rows = 8192U;
+            const std::size_t n = std::size_t{rows} * K;
+            auto* big = device<std::uint16_t>(n + w.size() + 64U);  // weights at 0, an image from byte 16 on
+            require(hipMemcpy(big, w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w big");
+            const Bf16RowProjection pw{big, N, out_b, false, std::size_t{ld} * 2U};
+            const Bf16RowProjection pc{weights, N, out_b, false, std::size_t{ld} * 2U};
+            require(hipMemset(out_b, 0xFF, std::size_t{rows} * N * 4U), "seed");
+            const float* sources[2] = {a, gate};
+            struct Overlap {
+                const char* name;
+                const Bf16RowProjection* projection;
+                std::uint16_t* image;
+            };
+            const Overlap overlaps[] = {{"attended", &pc, reinterpret_cast<std::uint16_t*>(a) + 8U},
+                                        {"gate_logits", &pc, reinterpret_cast<std::uint16_t*>(gate) + 8U},
+                                        {"weight", &pw, big + 8U}};
+            for (const auto& o : overlaps) {
+                const std::span<const std::uint16_t> view(o.image, n);
+                const auto plan = fma_rows::plan_bf16_rows_from_image(K, rows, {o.projection, 1U}, kMaxOutputs, view,
+                                                                      sources);
+                const bool refused =
+                    !plan.admitted && fma_rows::enqueue_bf16_rows_from_image(plan, view, K, rows, {o.projection, 1U},
+                                                                             kMaxOutputs, nullptr) == hipErrorNotSupported;
+                require(hipDeviceSynchronize(), "sync");
+                std::vector<float> ha(host_a.size()), hg(logits.size()), ho(std::size_t{rows} * N);
+                std::vector<std::uint16_t> hw(w.size());
+                require(hipMemcpy(ha.data(), a, ha.size() * 4U, hipMemcpyDeviceToHost), "a back");
+                require(hipMemcpy(hg.data(), gate, hg.size() * 4U, hipMemcpyDeviceToHost), "gate back");
+                require(hipMemcpy(hw.data(), big, hw.size() * 2U, hipMemcpyDeviceToHost), "w back");
+                require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
+                const bool guarded = std::memcmp(ha.data(), host_a.data(), ha.size() * 4U) == 0 &&
+                                     std::memcmp(hg.data(), logits.data(), hg.size() * 4U) == 0 &&
+                                     std::memcmp(hw.data(), w.data(), hw.size() * 2U) == 0 &&
+                                     std::all_of(ho.begin(), ho.end(), [](float v) {
+                                         std::uint32_t bits = 0;
+                                         std::memcpy(&bits, &v, 4U);
+                                         return bits == 0xFFFFFFFFU;
+                                     });
+                std::cout << "gate_image_overlap " << o.name << (refused ? " refused" : " ADMITTED")
+                          << (guarded ? " guard-intact" : " GUARD-CHANGED") << (refused && guarded ? " PASS" : " FAIL")
+                          << '
+';
+                ok = ok && refused && guarded;
+            }
+            require(hipFree(big), "free");
         }
         for (void* p : {static_cast<void*>(weights), static_cast<void*>(gate), static_cast<void*>(gated),
                         static_cast<void*>(out_a), static_cast<void*>(out_b)})

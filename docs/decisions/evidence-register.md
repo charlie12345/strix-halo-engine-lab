@@ -253,26 +253,19 @@ for the model identity, fallback policy, measurement scope and remaining gates.
 ## Inkling 2 Mini Q8_0 attention and head on gfx1151
 
 **observed** (2026-11-23). Policy `weights.attention_head.q8_0@1` (attention projections and output head stored as
-Q8_0, converted from BF16 at load), HIP (device compiler clang 24.0.0git, commit d6f6cb691863) on gfx1151, checkpoint SHA-256 `65e60f51…39d1`, gate v2 against the
-EXACT reference with a null arm, 39 held-out windows of three content classes (prose, code, structured) at 8K, 32K
-and 64K context.
+Q8_0, converted from BF16 at load), HIP (device compiler clang 24.0.0git, commit d6f6cb691863) on gfx1151,
+checkpoint SHA-256 `65e60f51…39d1`. Gate v2 used the device's BASE reference (`--profile exact`), a null arm
+and 39 held-out windows of three content classes (prose, code, structured) at 8K, 32K and 64K context.
 
 - Prefill regime: PASS, 2,457 pooled rows (KL 0.00044, top-1 0.9963, dNLL -0.00066 ± 0.00053), every class, band
   and window inside its limits. Prompt timing on the same device: 4K 2,544 -> 2,541 ms, 8K 4,684 -> 4,673 ms,
   32K 20,650 -> 20,732 ms (no gain: the prompt projections are bound by the WMMA rate, not by weight bytes). The
   decision row is therefore gate-only (`kMiniWeightLoadRows`, regime `prefill`, band <= 65,536).
-- Decode regime: PASS with the reference-window bar frozen from the original 39 windows (median 0.975, bar 2.975),
-  three protocol substitutions recorded beside the set (two off-distribution reference windows replaced by reserve
-  windows, one 63-row run by its 255-row rerun): 2,649 pooled rows, KL 0.00042, top-1 0.9966, dNLL +0.00041 ±
-  0.00057, free-flip ratio 1.09; every class and band inside its limits. The arm ran the Q8_0 image in both phases.
-  Served decode on the same device (4K prompt, 256 tokens, two repeats each): one lane 27.22 -> 30.53 tok/s; eight
-  lanes 68.95 -> 63.81 tok/s (the cohort step read the Q8_0 head once per lane). The row's gain is banded to one
-  decode lane (`max_lanes` 1).
-- Selection rule: one resident image serves both regimes, so the Q8_0 image is taken only when every regime has a
-  gate v2 PASS row and one of them a measured gain covering the instance (context <= 65,536, decode lanes inside the
-  gain's band). FAST on this device: the serial CLI (one lane, prompt + generated positions) and one-slot servers run
-  prefill and decode on the Q8_0 image; wider servers, servers whose slot count is left to the memory budget and
-  contexts above 65,536 keep the BF16 image. Q8_0 prefill followed by BF16 decode never runs (it would need a second
-  resident image).
+- Decode qualification is pending. The frozen R4 assessment is diagnostic. Registering a decode row requires a
+  PASS from the production gate and a speed receipt covering the regime.
+- One resident image serves prefill and decode. Automatic Q8_0 selection requires a gate v2 PASS in both regimes
+  and a measured gain covering the instance's context and lane count. FAST and TURBO currently default to BF16
+  for the serial CLI and all server slot and context settings. On a native resident route, `--profile fast
+  --qualify-q8` selects the explicit Q8_0 qualification arm for both phases.
 
 Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.

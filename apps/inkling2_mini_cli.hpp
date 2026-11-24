@@ -6,10 +6,12 @@
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -85,6 +87,14 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");
     return options;
+}
+
+// A gate holds one sequence at a time and reuses one weight image across all windows.
+inline weight::WeightLoadExtent gate_weight_extent(std::span<const session::HeadGateWindow> windows) {
+    unsigned positions = 0;
+    for (const auto& window : windows)
+        positions = std::max(positions, static_cast<unsigned>(window.ids.size()));
+    return {positions, 1U};
 }
 
 // Exact R1 latency forms of the CUDA step program (mask: 1 tiled bank readout, 2 controller output split,

@@ -2,6 +2,7 @@
 #include "inkling2/inkling2_mini_checkpoint.hpp"
 #include "inkling2/inkling2_mini_expert_layout.hpp"
 #include "inkling2/inkling2_mini_schedule.hpp"
+#include "inkling2/inkling2_mini_weight_options.hpp"
 #include "strix/ggml_dequant.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "strix/weight/host_q8.hpp"
@@ -150,12 +151,13 @@ void test_selection() {
         // One image serves prefill and decode: a full decode row selects it once prefill has its gate row.
         auto prefill = scope;
         prefill.regime = weight::kPrefillRegime;
-        const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4)},
+        const weight::WeightLoadEvidence one_lane{"fixture", "2026-11-23", 800, 65536, 1};
+        const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4), one_lane},
                                   weight::WeightLoadDecision{policy.id, prefill, digest(6), {}}};
-        weight::WeightLoadRequest request{profile::Name::standard, scope, formats, true, true};
+        weight::WeightLoadRequest request{profile::Name::standard, scope, formats, true, true, {}, {8192U, 1U}};
         const auto resolve = [&] {
             return mini::resolve_mini_weight_load(request.tier, request.scope, request.consumer_formats,
-                                                  request.enabled, request.allow_pending, receipts);
+                                                  request.enabled, request.allow_pending, receipts, request.extent);
         };
         require(resolve().storage == weight::kBf16WeightStorage, "explicit qualification opt-in changed EXACT");
         request.tier = profile::Name::fast;
@@ -164,6 +166,13 @@ void test_selection() {
                     weight::kBf16WeightStorage, "FAST default before gate and speed receipts");
         require(resolve().status == profile::Status::set && resolve().storage == weight::kQ8WeightStorage &&
                     resolve().gate_v2_pass == digest(3) && resolve().measured_gain == digest(4), "qualified FAST selection");
+        request.extent = {65536U, 1U};
+        require(resolve().storage == weight::kQ8WeightStorage, "one lane at the band edge");
+        for (const weight::WeightLoadExtent extent : {weight::WeightLoadExtent{8192U, 8U}, {8192U, 0U}, {65537U, 1U}}) {
+            request.extent = extent;
+            require(resolve().storage == weight::kBf16WeightStorage, "outside the measured gain bands");
+        }
+        request.extent = {8192U, 1U};
         request.tier = profile::Name::turbo;
         require(resolve().storage == weight::kQ8WeightStorage, "TURBO omitted FAST storage");
         request.tier = profile::Name::fast;
@@ -172,10 +181,10 @@ void test_selection() {
         request.enabled = true;
         auto no_speed = receipts;
         no_speed.front().measured_gain = {};
-        require(mini::resolve_mini_weight_load(request.tier, scope, formats, true, false, no_speed).storage ==
+        require(mini::resolve_mini_weight_load(request.tier, scope, formats, true, false, no_speed, request.extent).storage ==
                     weight::kBf16WeightStorage, "missing measured gain");
-        require(mini::resolve_mini_weight_load(request.tier, scope, formats, true, false, std::span(receipts).first(1))
-                    .storage == weight::kBf16WeightStorage, "a regime without a gate row needs a second image");
+        require(mini::resolve_mini_weight_load(request.tier, scope, formats, true, false, std::span(receipts).first(1),
+                                              request.extent).storage == weight::kBf16WeightStorage, "a regime without a gate row needs a second image");
         request.scope.checkpoint = digest(5);
         require(resolve().status == profile::Status::pending && resolve().storage == weight::kBf16WeightStorage,
                 "unqualified checkpoint used FAST storage");
@@ -194,6 +203,12 @@ void test_selection() {
 // rows) keeps the image BF16 and the receipt line names every regime's row.
 void test_committed_rows() {
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
+    const auto& own = mini::kMiniWeightLoadDecisions[0].scope;
+    for (const auto tier : {profile::Name::fast, profile::Name::turbo}) {
+        require(mini::resolve_mini_weight_load(tier, own, formats, true, false,
+                    mini::kMiniWeightLoadDecisions, {8192U, 1U}).storage == weight::kBf16WeightStorage,
+                "an unqualified decode arm must preserve the incumbent BF16 default");
+    }
     for (const auto& row : mini::kMiniWeightLoadDecisions) {
         const auto& consumers = row.scope.backend == weight::Backend::hip ?
             std::span<const weight::ArithmeticId>(strix::core::kResidentQ8ArithmeticHip) :
@@ -247,45 +262,25 @@ void test_committed_rows() {
         require(weight::find_weight_load_gate(mini::kMiniWeightLoadPolicy, other, mini::kMiniWeightLoadDecisions,
                                               {context, 1U}) == nullptr, "empty scope admitted");
     }
-    // Today, pinned as literals (not through the lookup the resolver uses): prefill gate-only (no measured gain in
-    // prefill), decode full with its gain banded to one decode lane. On the rows' own gfx1151 scope FAST takes the
-    // Q8_0 image for one lane inside the 65,536 context band (serial CLI: prompt + generated positions; one-slot
-    // server: its context) and keeps BF16 for wider servers, an unknown slot count or a context outside the band.
     require(weight::registered_regime_rows(mini::kMiniWeightLoadPolicy, weight::Backend::hip, mini::kMiniWeightLoadRegimes,
-                                           mini::kMiniWeightLoadDecisions) ==
-                "prefill=gate-only@gfx1151,decode=full@gfx1151/lanes<=1",
-            "registered rows of the route line");
-    const auto& own = mini::kMiniWeightLoadDecisions[0].scope;
-    const auto fast = [&](weight::WeightLoadExtent extent) {
-        return mini::resolve_mini_weight_load(profile::Name::fast, own, formats, true, false,
-                                              mini::kMiniWeightLoadDecisions, extent);
+                                           mini::kMiniWeightLoadDecisions) == "prefill=gate-only@gfx1151,decode=none",
+            "only the prefill gate row belongs in the registered table");
+    const weight::WeightLoadExtent one_lane{8192U, 1U};
+    mini::MiniWeightOptions options;
+    const auto fast = [&] {
+        return mini::resolve_mini_resident_weight_load(profile::Name::fast, options, own, one_lane);
     };
-    constexpr std::string_view receipt = "docs/decisions/evidence-register.md#inkling-2-mini-q8_0-attention-and-head-on-gfx1151";
-    const auto line = [&](std::string_view tail) {
-        return "strix-weight-load-regimes/v1 weights.attention_head.q8_0@1 " + std::string(tail);
-    };
-    auto plan = fast({8192U, 1U});
-    require(plan.storage == weight::kQ8WeightStorage && plan.status == profile::Status::set &&
+    const auto plan = fast();
+    require(plan.status == profile::Status::pending &&
                 weight::weight_load_regime_receipt(plan) ==
-                    line("gguf.q8_0@1 profile prefill=gate-only:" + std::string(receipt) + " decode=full:" +
-                         std::string(receipt)),
-            "one lane, 8K: FAST runs prefill and decode on the Q8_0 image");
-    require(fast({65536U, 1U}).storage == weight::kQ8WeightStorage, "one lane at the band edge");
-    plan = fast({8192U, 8U});
-    require(plan.storage == weight::kBf16WeightStorage && plan.status == profile::Status::pending &&
-                weight::weight_load_regime_receipt(plan) ==
-                    line("plain.bf16@1 pending prefill=gate-only:" + std::string(receipt) + " decode=gate-only:" +
-                         std::string(receipt) + ":gain-lanes<=1"),
-            "eight lanes: the decode gain does not cover them, BF16");
-    require(fast({8192U, 0U}).storage == weight::kBf16WeightStorage, "unknown lanes (server slots left to the budget)");
-    plan = fast({1U << 20U, 1U});  // the model limit (1M)
-    require(plan.storage == weight::kBf16WeightStorage &&
-                weight::weight_load_regime_receipt(plan) ==
-                    line("plain.bf16@1 pending prefill=none:outside-band<=65536 decode=none:outside-band<=65536"),
-            "the model limit is outside the band (gate and route resolution)");
-    require(mini::resolve_mini_weight_load(profile::Name::standard, own, formats, true, false,
-                                           mini::kMiniWeightLoadDecisions, {8192U, 1U}).storage ==
-                weight::kBf16WeightStorage, "EXACT keeps BF16 where FAST selects Q8_0");
+                    "strix-weight-load-regimes/v1 weights.attention_head.q8_0@1 plain.bf16@1 pending "
+                    "prefill=gate-only:docs/decisions/evidence-register.md#inkling-2-mini-q8_0-attention-and-head-on-gfx1151 "
+                    "decode=none",
+            "the resident FAST plan must report the admitted prefill row and missing decode qualification");
+    options.qualify_q8 = true;
+    const auto qualification = fast();
+    require(qualification.storage == weight::kQ8WeightStorage && qualification.status == profile::Status::unqualified,
+            "the candidate must remain available under explicit qualification");
 }
 
 void test_token_bytes() {

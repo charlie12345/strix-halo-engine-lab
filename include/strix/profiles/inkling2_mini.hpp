@@ -21,13 +21,8 @@ inline constexpr std::array<std::string_view, 2> kMiniWeightLoadRegimes{weight::
 // Gate v2 rows of the shared policy (receipt ids name the evidence register entry; detailed receipts stay outside
 // the repository). PREFILL, gfx1151, HIP device compiler clang 24.0.0git d6f6cb691863: PASS, 39 windows (prose,
 // code, structured at 8K, 32K and 64K), 2,457 pooled rows; no measured gain in this regime (prompt projections are
-// WMMA-bound: 8K 4,684 -> 4,673 ms, 32K 20,650 -> 20,732 ms), so the row is gate-only and admits prefill onto a
-// Q8_0 image a decode row selects. DECODE, same scope: PASS, the same 39 windows with three protocol substitutions
-// recorded beside the set (two off-distribution reference windows replaced by reserve windows, one 63-row run by its
-// 255-row rerun), the R4 reference-window bar frozen from the original set, 2,649 pooled rows; the decode arm ran the
-// Q8_0 image in both phases, which is what FAST runs when this row selects it. Measured served decode gain (4K prompt,
-// 256 tokens): one lane 27.22 -> 30.53 tok/s; eight lanes lost (68.95 -> 63.81, the Q8_0 head was read once per lane),
-// so the gain is banded to one decode lane: CLI and one-slot servers take the Q8_0 image, wider servers keep BF16.
+// WMMA-bound: 8K 4,684 -> 4,673 ms, 32K 20,650 -> 20,732 ms), so the row is gate-only. Decode qualification
+// is pending. FAST and TURBO use BF16 by default; --profile fast --qualify-q8 selects the qualification arm.
 inline constexpr weight::WeightLoadDecision kMiniWeightLoadRows[] = {
     {kMiniWeightLoadPolicy.id,
      {weight::Backend::hip, "gfx1151", "hip-clang-24.0.0git-d6f6cb691863", weight::kPrefillRegime,
@@ -36,14 +31,6 @@ inline constexpr weight::WeightLoadDecision kMiniWeightLoadRows[] = {
      weight::digest_from_hex("d64b562553020001310a9ad9831d4197fb17ae47ae8cc49fa3fec80fdc51518c"), {},
      {"docs/decisions/evidence-register.md#inkling-2-mini-q8_0-attention-and-head-on-gfx1151", "2026-11-23", 2457,
       65536}},
-    {kMiniWeightLoadPolicy.id,
-     {weight::Backend::hip, "gfx1151", "hip-clang-24.0.0git-d6f6cb691863", weight::kDecodeRegime,
-      weight::digest_from_hex("06b924b4f4116787df43a3668795417070ca22669e6314fd3bb8250eb29bd9c6"),
-      weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1")},
-     weight::digest_from_hex("7ec63bd6db841811f160e1e056c4e857de1b49f7aeb0e7f2883e319a34607309"),
-     weight::digest_from_hex("dbf6bcd5c1bccb956d7315a5dfb54cc661cee8410a2165cff3923a2537c49e51"),
-     {"docs/decisions/evidence-register.md#inkling-2-mini-q8_0-attention-and-head-on-gfx1151", "2026-11-23", 2649,
-      65536, 1}},
 };
 inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{kMiniWeightLoadRows};
 
@@ -65,10 +52,21 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 // one-row calls keep the BF16 tile. CUDA sm_120 only (HIP ignores it). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
-inline constexpr std::array<profile::Lever, 1> kMiniLevers{{
+
+// Exact lever, opt-in: the grouped MoE down projection of the HIP resident prefill stores a BF16 image of its sums and the
+// combine reads it (moe_core grouped_rows combine, ImageOperand), with a sticky NaN word sending NaN sums to the FP32 sum:
+// the bits of the FP32 down rows for every sum. Off in every profile column (all cells empty, builtin 0): select it with
+// STRIX_INK_COMBINE_IMAGE=1 (any profile). Runs only on the qualified HIP target (mini_combine_image_arch).
+inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-down-image@1";
+inline constexpr std::array<profile::Lever, 2> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
+     false, {}, true},
+    {kMiniCombineImage, "STRIX_INK_COMBINE_IMAGE", "", {"", "", "", ""}, "0", profile::Kind::exact,
+     {true, true, true, true}, {true, true, true, true}, "", "0",
+     "BF16 down image + combine: output bits of the FP32 down rows (device A/B through the grouped down producer, NaN "
+     "operand-position fixture); gfx1151 only",
      false, {}, true},
 }};
 

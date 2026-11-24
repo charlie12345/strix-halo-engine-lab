@@ -250,6 +250,11 @@ void test_windows(const fs::path& directory) {
     const auto windows = read(HeadGateMode::decode, 2U);
     require(windows.size() == 2U && windows[0].name == "first" && windows[1].ids.back() == 7U,
             "parsed windows differ");
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
+    const auto extent = cli::gate_weight_extent(windows);
+    require(extent.context == 4U && extent.lanes == 1U,
+            "the gate weight plan must use the longest full window and one decode lane");
+#endif
     expect_invalid([&] { (void)read(HeadGateMode::decode, 3U); });
     require(read(HeadGateMode::prefill, 3U).size() == 2U, "prefill permits an all-scored prompt");
     std::ofstream(manifest) << "dup 4 a.ids\ndup 3 b.ids\n";

@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 
 namespace strix::inkling2::cli {
 
@@ -90,15 +91,14 @@ private:
     std::optional<MiniResidentDSpark> drafter_;
 };
 
-inline void run_gate(const char* checkpoint, const Options& options, const weight::WeightLoadPlan& weights
+inline void run_gate(const char* checkpoint, const Options& options, std::span<const session::HeadGateWindow> windows,
+                     unsigned positions, const weight::WeightLoadPlan& weights
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      , bool step_program, bool epilogue_fusion, unsigned latency_forms
 #endif
 ) {
     namespace fs = std::filesystem;
     const auto mode = *options.gate_mode;
-    const auto windows = session::read_head_gate_manifest(options.gate_manifest, mode, options.gate_rows,
-                                                          kMaxContext, kOutputVocabulary);
     const auto route_config = moe::route_tap_config_from_env();
     if (route_config.null_on)
         throw std::invalid_argument("use --gate-order-null for the Inkling evaluation-order null");
@@ -118,8 +118,6 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     const fs::path out(options.gate_out);
     fs::create_directories(out);
     fs::create_directories(out / "log");
-    unsigned positions = 0;
-    for (const auto& window : windows) positions = std::max(positions, static_cast<unsigned>(window.ids.size()));
     const auto prefix_positions = mode == session::HeadGateMode::decode ? positions - options.gate_rows : positions;
     const auto max_rows = std::min(options.generation.prefill_chunk, prefix_positions);
     const auto load_start = session::CliClock::now();
@@ -280,8 +278,25 @@ int main(int argc, char** argv) {
 #else
         auto options = cli::parse(argc, argv, family);
 #endif
-        const auto scope = mini_weight_scope(argv[1], options.tier.profile, options.weights);
-        const auto weights = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view());
+        // The serial CLI resolves its one lane at load using prompt + generated positions. A gate knows its
+        // resident context from the manifest. CUDA step routing precedes serial loading and has no banded CUDA row.
+        struct ResolvedWeights {
+            MiniWeightScope scope;
+            strix::weight::WeightLoadPlan plan;
+        };
+        const auto resolve_weights = [&options, model = std::string(argv[1])](strix::weight::WeightLoadExtent extent) {
+            auto scope = mini_weight_scope(model, options.tier.profile, options.weights, extent);
+            const auto plan = resolve_mini_resident_weight_load(options.tier.profile, options.weights, scope.view(), extent);
+            return ResolvedWeights{std::move(scope), plan};
+        };
+        const auto gate_windows = options.gate_manifest
+            ? strix::session::read_head_gate_manifest(options.gate_manifest, *options.gate_mode, options.gate_rows,
+                                                      kMaxContext, kOutputVocabulary)
+            : std::vector<strix::session::HeadGateWindow>{};
+        const auto gate_extent = cli::gate_weight_extent(gate_windows);
+        const auto early = resolve_weights(options.gate_manifest ? gate_extent : strix::weight::WeightLoadExtent{});
+        std::optional<ResolvedWeights> loaded;
+        const auto& weights = early.plan;
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
@@ -297,22 +312,28 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
+        family.load = [&loaded, &resolve_weights, step_graphs, dspark = options.dspark,
                        moe_w4a4 = mini_moe_w4a4_class(options.tier),
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier)](const serve::SerialGenerationLoad& load) {
-            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4, combine_image, round_fold);
+            loaded = resolve_weights({load.positions, 1U});
+            return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.storage, dspark, moe_w4a4,
+                                                           combine_image, round_fold);
         };
         const auto write_profile = [&] {
+            const auto& resolved = loaded ? *loaded : early;
+            const auto& plan = resolved.plan;
+            const auto& scope = resolved.scope;
             cli::write_profile(options.tier, std::cerr, true);
-            cli::write_weight_load_plan(std::cerr, weights);
+            cli::write_weight_load_plan(std::cerr, plan);
+            std::cerr << strix::weight::weight_load_regime_receipt(plan) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
             if (!route.speculation_reason.empty())
                 std::cerr << "strix-speculation-route/v1 requested auto effective off ("
                           << route.speculation_reason << ")\n";
 #endif
-            std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(weights.status) << " ("
-                      << weights.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
+            std::cerr << "strix-weight-load-status/v1 " << strix::profile::status_name(plan.status) << " ("
+                      << plan.reason << ") device " << (scope.device_class.empty() ? "-" : scope.device_class)
                       << " compiler " << (scope.compiler_id.empty() ? "-" : scope.compiler_id) << " checkpoint ";
             if (scope.checkpoint == strix::weight::Digest256{}) std::cerr << '-';
             for (std::size_t i = 0; i < 8 && !(scope.checkpoint == strix::weight::Digest256{}); ++i)
@@ -322,7 +343,7 @@ int main(int argc, char** argv) {
         };
         if (options.gate_manifest) {
             write_profile();
-            cli::run_gate(argv[1], options, weights
+            cli::run_gate(argv[1], options, gate_windows, gate_extent.context, weights
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                           , step_program, program_options.epilogue_fusion, program_options.latency_forms
 #endif

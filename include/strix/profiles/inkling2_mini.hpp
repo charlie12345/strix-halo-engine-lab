@@ -14,19 +14,36 @@ namespace strix::inkling2 {
 inline constexpr weight::WeightLoadPolicy kMiniWeightLoadPolicy = weight::with_legacy(
     weight::kAttentionHeadQ8Policy, {"inkling2-mini-attention-head-bf16-q8_0", 1});
 
-// The resident engine is the one regime of these rows (serial CLI and served requests share its routes).
-inline constexpr std::string_view kMiniResidentRegime = "resident";
+// One resident image serves both regimes (prompt chunks and one-row steps share it, in the CLI and in a served
+// cohort step), so its storage changes only when every regime has a gate v2 PASS row and one of them a measured gain.
+inline constexpr std::array<std::string_view, 2> kMiniWeightLoadRegimes{weight::kPrefillRegime, weight::kDecodeRegime};
 
-// The existing gate passed for 8K prose. It does not cover a resident load, whose
-// storage is fixed before the content class or context of any request is known.
-inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{};
+// Gate v2 rows of the shared policy (receipt ids name the evidence register entry; detailed receipts stay outside
+// the repository). PREFILL, gfx1151, HIP device compiler clang 24.0.0git d6f6cb691863: PASS, 39 windows (prose,
+// code, structured at 8K, 32K and 64K), 2,457 pooled rows; no measured gain in this regime (prompt projections are
+// WMMA-bound: 8K 4,684 -> 4,673 ms, 32K 20,650 -> 20,732 ms), so the row is gate-only. Decode qualification
+// is pending. FAST and TURBO use BF16 by default; --profile fast --qualify-q8 selects the qualification arm.
+inline constexpr weight::WeightLoadDecision kMiniWeightLoadRows[] = {
+    {kMiniWeightLoadPolicy.id,
+     {weight::Backend::hip, "gfx1151", "hip-clang-24.0.0git-d6f6cb691863", weight::kPrefillRegime,
+      weight::digest_from_hex("06b924b4f4116787df43a3668795417070ca22669e6314fd3bb8250eb29bd9c6"),
+      weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1")},
+     weight::digest_from_hex("d64b562553020001310a9ad9831d4197fb17ae47ae8cc49fa3fec80fdc51518c"), {},
+     {"docs/decisions/evidence-register.md#inkling-2-mini-q8_0-attention-and-head-on-gfx1151", "2026-11-23", 2457,
+      65536}},
+};
+inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{kMiniWeightLoadRows};
 
+// `extent`: what the instance holds, the same rule for the CLI and the server: context = the resident positions
+// (serial CLI: prompt + generated tokens of its one sequence; server: its configured context), lanes = concurrent
+// decode lanes (serial CLI: 1; server: its slot cap, 0 when the slot count is left to the memory budget). A banded
+// row applies only inside its bands.
 inline weight::WeightLoadPlan resolve_mini_weight_load(
     profile::Name tier, const weight::WeightLoadScope& scope,
     std::span<const weight::FormatId> consumer_formats, bool enabled, bool qualify,
-    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions) {
+    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions, weight::WeightLoadExtent extent = {}) {
     return weight::resolve_weight_load(weight::builtin_registry(), kMiniWeightLoadPolicy,
-        {tier, scope, consumer_formats, enabled, qualify}, decisions);
+        {tier, scope, consumer_formats, enabled, qualify, kMiniWeightLoadRegimes, extent}, decisions);
 }
 
 // FAST lever: W4A4 experts. Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4

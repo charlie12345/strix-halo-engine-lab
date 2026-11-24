@@ -606,15 +606,35 @@ __global__ void __launch_bounds__(256, 1)
                                        b.pos0, 1U, b.out, 1U, d.heads, 8, b.prepared);
 }
 
+// The lanes with the relative bias loaded one key tile ahead (lanes_bias_ahead picks it per launch; same bits).
+template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_lanes_bias_ahead_kernel(AttentionDims d, PreparedBf16Flash shape, PreparedBf16LaneImages images,
+                                           attn::lanes::LaneBlock block) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, block.lane[blockIdx.y],
+                                           std::size_t{block.first_row} + blockIdx.y);
+    flash_body<LY, true, false, false, ContiguousFlashKeys, true>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {},
+                                                                 b.k_cache, b.v_cache, b.pos0, 1U, b.out, 1U, d.heads,
+                                                                 8, b.prepared);
+}
+
+// Every lane binds its bias rows from images.relative_bias with the launch's window and extent, so the one-row
+// step's rule (prepared_flash_bias_ahead) holds for all lanes of a launch alike.
+[[nodiscard]] bool lanes_bias_ahead(PreparedBf16Flash shape, const PreparedBf16LaneImages& images) {
+    shape.relative_bias = images.relative_bias;
+    return prepared_flash_bias_ahead(shape);
+}
+
 template <class LY>
 cudaError_t launch_flash_prepared_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
                                         const PreparedBf16LaneImages& images, const attn::lanes::LaneBlock& block,
                                         cudaStream_t stream) {
     if (block.count == 0U) return cudaErrorInvalidValue;
-    if (auto e = cudaFuncSetAttribute(flash_prepared_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      smem_bytes<LY>()); e != cudaSuccess) return e;
-    flash_prepared_lanes_kernel<LY><<<dim3(d.heads, block.count), 256, smem_bytes<LY>(), stream>>>(
-        d, shape, images, block);
+    const auto kernel = lanes_bias_ahead(shape, images) ? flash_prepared_lanes_bias_ahead_kernel<LY>
+                                                        : flash_prepared_lanes_kernel<LY>;
+    if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<LY>());
+        e != cudaSuccess) return e;
+    kernel<<<dim3(d.heads, block.count), 256, smem_bytes<LY>(), stream>>>(d, shape, images, block);
     return cudaGetLastError();
 }
 
@@ -631,14 +651,26 @@ __global__ void __launch_bounds__(256, 1)
 }
 
 template <class LY>
+__global__ void __launch_bounds__(256, 1)
+    flash_prepared_step_lanes_bias_ahead_kernel(AttentionDims d, PreparedBf16Flash shape,
+                                                PreparedBf16LaneImages images, PreparedBf16StepLanes lanes) {
+    const auto b = lanes_detail::bind_lane(d, shape, images, lanes_detail::resolve_step_lane(lanes, blockIdx.y),
+                                           blockIdx.y);
+    flash_body<LY, true, false, false, ContiguousFlashKeys, true>(b.dims, b.q, {1U, d.heads, d.head_dim}, nullptr, {},
+                                                                 b.k_cache, b.v_cache, b.pos0, 1U, b.out, 1U, d.heads,
+                                                                 8, b.prepared);
+}
+
+template <class LY>
 cudaError_t launch_flash_prepared_step_lanes(const AttentionDims& d, const PreparedBf16Flash& shape,
                                              const PreparedBf16LaneImages& images, const PreparedBf16StepLanes& lanes,
                                              cudaStream_t stream) {
     if (lanes.lanes.lanes == 0U) return cudaErrorInvalidValue;
-    if (auto e = cudaFuncSetAttribute(flash_prepared_step_lanes_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      smem_bytes<LY>()); e != cudaSuccess) return e;
-    flash_prepared_step_lanes_kernel<LY><<<dim3(d.heads, lanes.lanes.lanes), 256, smem_bytes<LY>(), stream>>>(
-        d, shape, images, lanes);
+    const auto kernel = lanes_bias_ahead(shape, images) ? flash_prepared_step_lanes_bias_ahead_kernel<LY>
+                                                        : flash_prepared_step_lanes_kernel<LY>;
+    if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<LY>());
+        e != cudaSuccess) return e;
+    kernel<<<dim3(d.heads, lanes.lanes.lanes), 256, smem_bytes<LY>(), stream>>>(d, shape, images, lanes);
     return cudaGetLastError();
 }
 

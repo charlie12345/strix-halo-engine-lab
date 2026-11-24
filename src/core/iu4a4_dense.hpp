@@ -328,11 +328,10 @@ struct G64Source {
 inline constexpr unsigned kUnitBytes = 2048U, kCodeBytes = 8U * kUnitBytes, kSideBytes = 1024U, kBlockBytes = kCodeBytes + kSideBytes;
 static_assert(kCtaTilesN == 8U && kCtaTilesM == 8U, "a staged unit holds 8 W tiles and 8 x tiles (64 x 16 B per side)");
 // The contract arithmetic of one staged 128-input block `buf` (codes, then side data) for a wave's kTw x kTm tiles,
-// added to acc (shared by the dense and the grouped launch: same operations, same order).
-// SplitC (the grouped trait): the integer accumulator c holds one x tile at a time (kTw x 8 registers instead of
-// kTw x kTm x 8; the grouped launch spilled 38-40 VGPRs, its copy staging, in the K loop). Every t is the same exact integer
-// sum in the same group order, so acc is the same bits; the dense launch keeps the default form.
-template <bool SplitC = false>
+// added to acc, for the grouped trait (the dense launch keeps its inline form, ISA unchanged): the integer accumulator c holds one x tile at a time (kTw x 8
+// registers instead of the dense launch's kTw x kTm x 8; with the dense form the grouped launch spilled 38-40 VGPRs, its
+// copy staging, in the K loop). Every t is the same exact integer sum in the same group order as the dense launch, so
+// acc is the same bits.
 __device__ __forceinline__ void block_dot(const std::uint8_t* buf, unsigned wn, unsigned wm, unsigned l16, unsigned hi, float (&acc)[kTw][kTm][8]) {
     const I2* wl = reinterpret_cast<const I2*>(buf + wn * (kTw * 128U) + l16 * 8U);
     const I2* xl = reinterpret_cast<const I2*>(buf + 1024U + wm * (kTm * 128U) + l16 * 8U);
@@ -341,63 +340,28 @@ __device__ __forceinline__ void block_dot(const std::uint8_t* buf, unsigned wn, 
 #pragma unroll
     for (unsigned j = 0; j < kTm; ++j) ub[j] = reinterpret_cast<const std::uint32_t*>(sd + 512U + (wm * kTm + j) * 64U)[l16];
     I8 t[kTw][kTm];
-    if constexpr (!SplitC) {
-        const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
-        I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];  // fragment sets in ping-pong (named: no ring copies)
-        const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
+    const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+        I2 w0[kTw], w1[kTw];
+#pragma unroll
+        for (unsigned i = 0; i < kTw; ++i) {
+            w0[i] = wl[((2U * g) * kUnitBytes + i * 128U) / 8U];
+            w1[i] = wl[((2U * g + 1U) * kUnitBytes + i * 128U) / 8U];
+        }
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j) {
+            const I2 x0 = xl[((2U * g) * kUnitBytes + j * 128U) / 8U], x1 = xl[((2U * g + 1U) * kUnitBytes + j * 128U) / 8U];
+            I8 c[kTw];
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) c[i] = STRIX_HIP_WMMA_IU4(true, w0[i], true, x0, zero, false);
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) c[i] = STRIX_HIP_WMMA_IU4(true, w1[i], true, x1, c[i], false);
+            const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
 #pragma unroll
             for (unsigned i = 0; i < kTw; ++i)
 #pragma unroll
-                for (unsigned j = 0; j < kTm; ++j)
-                    c[i][j] = STRIX_HIP_WMMA_IU4(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
-        };
-        const auto load = [&](unsigned k, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
-#pragma unroll
-            for (unsigned i = 0; i < kTw; ++i) wd[i] = wl[(k * kUnitBytes + i * 128U) / 8U];
-#pragma unroll
-            for (unsigned j = 0; j < kTm; ++j) xd[j] = xl[(k * kUnitBytes + j * 128U) / 8U];
-        };
-        load(0U, wa, xa);
-#pragma unroll
-        for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
-            I8 c[kTw][kTm];
-            load(2U * g + 1U, wb, xb);
-            mma(wa, xa, c, true);
-            if (g + 1U < rot::kGroupsPerBlock) load(2U * g + 2U, wa, xa);
-            mma(wb, xb, c, false);
-#pragma unroll
-            for (unsigned j = 0; j < kTm; ++j) {
-                const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
-#pragma unroll
-                for (unsigned i = 0; i < kTw; ++i)
-#pragma unroll
-                    for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
-            }
-        }
-    } else {
-        const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
-#pragma unroll
-        for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
-            I2 w0[kTw], w1[kTw];
-#pragma unroll
-            for (unsigned i = 0; i < kTw; ++i) {
-                w0[i] = wl[((2U * g) * kUnitBytes + i * 128U) / 8U];
-                w1[i] = wl[((2U * g + 1U) * kUnitBytes + i * 128U) / 8U];
-            }
-#pragma unroll
-            for (unsigned j = 0; j < kTm; ++j) {
-                const I2 x0 = xl[((2U * g) * kUnitBytes + j * 128U) / 8U], x1 = xl[((2U * g + 1U) * kUnitBytes + j * 128U) / 8U];
-                I8 c[kTw];
-#pragma unroll
-                for (unsigned i = 0; i < kTw; ++i) c[i] = STRIX_HIP_WMMA_IU4(true, w0[i], true, x0, zero, false);
-#pragma unroll
-                for (unsigned i = 0; i < kTw; ++i) c[i] = STRIX_HIP_WMMA_IU4(true, w1[i], true, x1, c[i], false);
-                const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
-#pragma unroll
-                for (unsigned i = 0; i < kTw; ++i)
-#pragma unroll
-                    for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][e]) : __mul24(ug, c[i][e]) + t[i][j][e];
-            }
+                for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][e]) : __mul24(ug, c[i][e]) + t[i][j][e];
         }
     }
 #pragma unroll
@@ -456,13 +420,63 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
         for (unsigned j = 0; j < kTm; ++j)
 #pragma unroll
             for (unsigned e = 0; e < 8U; ++e) acc[i][j][e] = 0.0F;
+    const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];  // fragment sets in ping-pong (named: no ring copies)
+    const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j)
+                c[i][j] = STRIX_HIP_WMMA_IU4(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
+    };
     fetch(0U);
     put(0U);
     __syncthreads();
     for (unsigned b = 0; b < blocks; ++b) {
         const bool more = b + 1U < blocks;
         if (more) fetch(b + 1U);
-        if (live) block_dot(lds + (b & 1U) * kBlockBytes, wn, wm, l16, hi, acc);
+        if (live) {
+            const I2* wl = reinterpret_cast<const I2*>(lds + (b & 1U) * kBlockBytes + wn * (kTw * 128U) + l16 * 8U);
+            const I2* xl = reinterpret_cast<const I2*>(lds + (b & 1U) * kBlockBytes + 1024U + wm * (kTm * 128U) + l16 * 8U);
+            const auto load = [&](unsigned k, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
+#pragma unroll
+                for (unsigned i = 0; i < kTw; ++i) wd[i] = wl[(k * kUnitBytes + i * 128U) / 8U];
+#pragma unroll
+                for (unsigned j = 0; j < kTm; ++j) xd[j] = xl[(k * kUnitBytes + j * 128U) / 8U];
+            };
+            const std::uint8_t* sd = lds + (b & 1U) * kBlockBytes + kCodeBytes;
+            std::uint32_t ub[kTm];
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j) ub[j] = reinterpret_cast<const std::uint32_t*>(sd + 512U + (wm * kTm + j) * 64U)[l16];
+            I8 t[kTw][kTm];
+            load(0U, wa, xa);
+#pragma unroll
+            for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+                I8 c[kTw][kTm];
+                load(2U * g + 1U, wb, xb);
+                mma(wa, xa, c, true);
+                if (g + 1U < rot::kGroupsPerBlock) load(2U * g + 2U, wa, xa);
+                mma(wb, xb, c, false);
+#pragma unroll
+                for (unsigned j = 0; j < kTm; ++j) {
+                    const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+#pragma unroll
+                    for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+                        for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
+                }
+            }
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) {
+                const F4* sb = reinterpret_cast<const F4*>(sd + (wn * kTw + i) * 64U + hi * 32U);
+                const F4 s0 = sb[0], s1 = sb[1];
+#pragma unroll
+                for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+                    for (unsigned e = 0; e < 8U; ++e)
+                        acc[i][j][e] = __builtin_fmaf(static_cast<float>(t[i][j][e]), e < 4U ? s0[e] : s1[e - 4U], acc[i][j][e]);
+            }
+        }
         if (more) put((b + 1U) & 1U);
         __syncthreads();
     }
@@ -584,7 +598,7 @@ __global__ __launch_bounds__(256) void grouped_gemm_kernel(Src src, Act a, unsig
     for (unsigned b = 0; b < blocks; ++b) {
         const bool more = b + 1U < blocks;
         if (more) fetch(b + 1U);
-        if (live) block_dot<true>(lds + (b & 1U) * kBlockBytes, wn, wm, l16, hi, acc);
+        if (live) block_dot(lds + (b & 1U) * kBlockBytes, wn, wm, l16, hi, acc);
         if (more) put((b + 1U) & 1U);
         __syncthreads();
     }

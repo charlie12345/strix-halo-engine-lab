@@ -18,11 +18,10 @@ inline constexpr Lever table[] = {
      .native_option = true, .provisional = {false, true, false}},
     {.name = "moe_route_prune", .env = "STRIX_QPF2K_MOE_ROUTE_PRUNE", .option = "--prefill-moe-route-prune",
      .value = {"", "", "", "cap9"}, .builtin = "off",
-     .kind = Kind::bit_changing, .ready = {true, false, true, true}, .runnable = {false, true, false, true},
+     .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {false, true, false, true},
      .target = "rel<f>[n] | topp<f>[n] | cap<k>[n]", .off = "off",
-     .source = "RoutePrune: lowest-weight route assignments leave the prefill MoE plan (cap9: the 9 heaviest routes of each row stay); "
-               "turbo quality vs exact, teacher-forced 256 rows per held-out window: 8K pooled KL 0.00528, top-1 0.9707, dNLL +0.0050; "
-               "the turbo cell runs only in a regime whose speed row over FAST shows a gain (ladder_rows); changes logits"},
+     .source = "RoutePrune: cap9 keeps the 9 heaviest routes of each row; changes logits. "
+               "Automatic TURBO selection requires qualification of the admitted TURBO composition and a matching workload speed receipt"},
     {.name = "gdn_fp16_chunk", .env = "STRIX_QPF2K_GDN_FP16_CHUNK", .option = "--gdn-fp16-chunk",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
@@ -134,13 +133,4 @@ inline constexpr ::strix::profile::LadderRow ladder_rows[] = {
     ::strix::profile::incumbent_cell("index_proj_wmma", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
     ::strix::profile::incumbent_cell("index_score_wmma", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
     ::strix::profile::incumbent_cell("ple_rows_f16", "1", Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
-    // TURBO route prune cap9 over FAST, CLI prefill on gfx1151 (one binary, alternating arms, request latency of a
-    // --generate 1 run): 4,096 tokens 2,107.1 -> 2,047.1 ms (x1.029), 8,192 tokens 4,020.9 -> 3,919.3 ms (x1.026),
-    // 32,768 tokens 16,140.4 -> 15,846.1 ms (x1.019); spread <= 0.8 %. Each band takes the lower of its two end points.
-    {.lever = "moe_route_prune", .value = "cap9", .tier = Name::turbo, .phase = ::strix::profile::Phase::prefill,
-     .device = "gfx1151", .min_context = 4096, .max_context = 8192, .speedup = 1.026, .noise = 0.01,
-     .receipt = "qwen/length-matrix 4K+8K ABAB, fast vs fast+cap9: x1.029 / x1.026"},
-    {.lever = "moe_route_prune", .value = "cap9", .tier = Name::turbo, .phase = ::strix::profile::Phase::prefill,
-     .device = "gfx1151", .min_context = 8193, .max_context = 32768, .speedup = 1.019, .noise = 0.01,
-     .receipt = "qwen/length-matrix 8K+32K ABAB, fast vs fast+cap9: x1.026 / x1.019"},
 };

@@ -53,14 +53,14 @@ void qwen_rows() {
         require(find(def, lever) == nullptr || find(def, lever)->status == p::Status::builtin, "default keeps the lever off");
     }
     const auto* prune = find(turbo, "moe_route_prune");
-    require(prune == nullptr || !p::applied(prune->status) || prune->value == "off",
-            "calibrated route pruning stays off where no speed row covers the regime (unknown prompt length)");
+    require(prune != nullptr && prune->status == p::Status::pending && prune->value == "off",
+            "TURBO reports pending route pruning when the prompt length is unknown");
     q::Inputs measured = in;
     measured.regime = {p::Phase::prefill, 8192, 1, "gfx1151"};
     const auto turbo_8k = q::resolve(p::Name::turbo, measured);
     const auto* cap9 = find(turbo_8k, "moe_route_prune");
-    require(cap9 != nullptr && p::applied(cap9->status) && cap9->value == "cap9",
-            "calibrated route pruning runs in turbo at a measured 8K prefill on gfx1151");
+    require(cap9 != nullptr && cap9->status == p::Status::pending && cap9->value == "off",
+            "TURBO keeps cap9 pending at 8K until its composition has evidence");
     // One resolver: CLI spelling and serve-style inputs give the same fingerprint.
     const char* argv[] = {"app", "--profile", "turbo"};
     std::optional<p::Name> name;

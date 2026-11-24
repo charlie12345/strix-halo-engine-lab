@@ -6,6 +6,9 @@
 namespace pr = strix::qwen::profile;
 namespace dc = strix::decode_cli;
 namespace {
+static_assert(!std::is_pointer_v<decltype(pr::Resolution{}.find("moe_route_prune"))>,
+              "a temporary profile must not lend a pointer to an entry");
+
 unsigned checks = 0, fixtures = 0;
 bool emit = false;
 using Env = std::map<std::string, std::string>;
@@ -169,7 +172,6 @@ void registered_controls_resolve_builtin() {
         if (allow) env["STRIX_QWEN_PROFILE_ALLOW_PENDING"] = "1";
         for (const auto tier : {pr::Name::standard, pr::Name::fast, pr::Name::turbo}) {
             pr::Inputs input{{}, lookup(env), false};
-            input.ladder = pr::ladder_rows;
             input.regime = {strix::profile::Phase::prefill, 8192, 1, "gfx1151"};
             const auto r = pr::resolve(tier, input);
             for (const char* key : registered) {
@@ -177,22 +179,23 @@ void registered_controls_resolve_builtin() {
                 check(!entry || !strix::profile::applied(entry->status) || entry->value == entry->lever->builtin,
                     "a registered control without a speed row keeps its builtin");
             }
-            if (const auto* prune = r.find("moe_route_prune")) {
-                const bool cap9 = strix::profile::applied(prune->status) && prune->value == "cap9";
-                check(cap9 == (tier == pr::Name::turbo), "cap9 runs in turbo at a measured 8K prompt, never in exact or fast");
-            }
-            // Outside the measured bands (unknown serving length, short and very long prompts) turbo keeps FAST's prune.
-            for (const std::uint64_t context : {std::uint64_t{0}, std::uint64_t{2048}, std::uint64_t{65536}}) {
-                input.regime = {strix::profile::Phase::prefill, context, 1, "gfx1151"};
-                const auto outside = pr::resolve(tier, input);
-                if (const auto* prune = outside.find("moe_route_prune"))
-                    check(!strix::profile::applied(prune->status) || prune->value == "off", "unmeasured regime keeps the prune off");
-            }
-            // Another device class is never covered by the gfx1151 rows.
-            input.regime = {strix::profile::Phase::prefill, 8192, 1, "sm_120"};
-            if (const auto* prune = pr::resolve(tier, input).find("moe_route_prune"))
-                check(!strix::profile::applied(prune->status) || prune->value == "off", "unmeasured device keeps the prune off");
+            check(tier == pr::Name::turbo || !r.find("moe_route_prune"), "exact and fast have no automatic prune entry");
         }
+        pr::Inputs input{{}, lookup(env), false};
+        const auto pending = [](const pr::Resolution& resolution) {
+            const auto* prune = resolution.find("moe_route_prune");
+            check(prune != nullptr, "TURBO must report the cap9 candidate");
+            check(prune->status == pr::Status::pending && prune->value == "off",
+                  "TURBO cap9 stays pending without a receipt for its composition");
+        };
+        for (const std::uint64_t context : {0U, 2048U, 4096U, 8192U, 8193U, 32767U, 32768U, 65536U}) {
+            input.regime = {strix::profile::Phase::prefill, context, 1, "gfx1151"};
+            const auto resolution = pr::resolve(pr::Name::turbo, input);
+            pending(resolution);
+        }
+        input.regime = {strix::profile::Phase::prefill, 8192, 1, "sm_120"};
+        const auto outside_device = pr::resolve(pr::Name::turbo, input);
+        pending(outside_device);
     }
     const pr::Lever* recipe = nullptr;
     for (const auto& lever : pr::levers()) if (lever.name == "decode_numerical_profile") recipe = &lever;
@@ -217,6 +220,25 @@ void pending_weights_inspection() {
     try { pr::apply(c.options.product_profile, [&](const char*, const char*) { exported = true; return true; }); }
     catch (const std::invalid_argument&) { refused = true; }
     check(refused && !exported, "execution must refuse pending weights before exporting");
+}
+void route_prune_startup_binding() {
+    constexpr auto key = "STRIX_QPF2K_MOE_ROUTE_PRUNE";
+    const char* before = std::getenv(key);
+    const auto saved = before ? std::optional<std::string>(before) : std::nullopt;
+    check(pr::erase_environment(key), "clear prune before memory planning");
+    (void)strix::moe_core::route_prune_active_tag(true);
+    const auto exact_identity = strix::prefill_identity_hash(0U, 0U, 0U);
+    check(strix::moe_core::route_prune_active_tag().empty(), "early planning sees pruning off");
+    check(pr::export_environment(key, "cap9"), "export admitted pruning after planning");
+    check(strix::moe_core::route_prune_active_tag(true) == "cap9" &&
+        strix::moe_core::route_prune_active().active(), "execution sees the admitted cap9");
+    check(strix::prefill_identity_hash(0U, 0U, 0U) != exact_identity, "pruning is in the arithmetic identity");
+    check(pr::erase_environment(key), "withdraw incompatible inherited pruning");
+    check(strix::moe_core::route_prune_active_tag(true).empty() &&
+        !strix::moe_core::route_prune_active().active(), "execution sees the withdrawn cap9");
+    check(strix::prefill_identity_hash(0U, 0U, 0U) == exact_identity, "withdrawal restores the unpruned identity");
+    if (saved) check(pr::export_environment(key, saved->c_str()), "restore prune environment");
+    (void)strix::moe_core::route_prune_active_tag(true);
 }
 
 void config_matrix() {
@@ -310,6 +332,7 @@ void common_adapters() {
 int main(int argc,char** argv) try {
     emit=argc==2 && std::string_view(argv[1])=="--fixtures";
     pending_weights_inspection();
+    route_prune_startup_binding();
     registered_controls_resolve_builtin();
     product_matrix(); admission_matrix(); defaults_matrix(); config_matrix(); identities();
 #ifndef STRIX_STEP1_ORIGINAL

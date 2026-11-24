@@ -1,6 +1,7 @@
 #pragma once
 #include "registry.hpp"
 #include "resolve.hpp"
+#include <strix/device/cost_identity.hpp>
 #include <strix/engine_profile.hpp>
 #include <strix/lever.hpp>
 
@@ -107,11 +108,13 @@ struct WeightLoadScope {
     Digest256 build, checkpoint;
 };
 
-// Device class of a weight-load scope and of the decision rows measured on it: the architecture plus the counts that
-// change residency and timing (compute units / multiprocessors, device memory). Two cards of one architecture with
-// different counts never share a receipt by the architecture name alone.
-[[nodiscard]] inline std::string device_class_key(std::string_view arch, long long units, unsigned long long memory_bytes) {
-    return std::string(arch) + "|cu" + std::to_string(units) + "|mem" + std::to_string(memory_bytes);
+// Device class of a weight-load scope and of the decision rows measured on it: the shared cost-device identity
+// (strix/device/cost_identity.hpp: architecture, product name, compute units, memory, clock, runtime and driver
+// versions), the same key the persisted cost tables use. Two products that report the same architecture and resource
+// counts but a different name or clock limit never share a receipt. The HIP and CUDA queries
+// (device/hip_cost_identity.hpp, device/cuda_cost_identity.hpp) fill the facts of the current device.
+[[nodiscard]] inline std::string device_class_key(const device::CostDeviceFacts& facts) {
+    return device::cost_device_identity(facts);
 }
 
 // Regimes a decision row is qualified for (WeightLoadScope::regime): the gate v2 regime of its quality receipt.

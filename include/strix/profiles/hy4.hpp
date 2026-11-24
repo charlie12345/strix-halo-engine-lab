@@ -105,6 +105,23 @@ inline constexpr Qualified qualified[] = {
      "prefill 8K 669.7 -> 693.1 tok/s (rows 2048)"}},
 };
 
+// Incumbent grants: the FAST cells main selected from a quality row before the ladder rule, frozen as data at the prompt
+// bands they ran in (FAST value 4096 only; same shape as `qualified`). A grant keeps the cell applying where no timing row covers the regime; it
+// is NOT derived from `qualified`, so a new gate row (or a wider band) leaves its cell at the tier below until a timing row
+// is registered. Do not add rows here.
+inline constexpr Qualified incumbent_grants[] = {
+    {Device::gfx1151, Topology::one_node, {"prompt_rows", "4096", 0, 32568,
+     "frozen incumbent: bitwise == prompt_rows 2048, prompts <= 32,568"}},
+    {Device::gfx1151, Topology::pair, {"prompt_rows", "4096", 0, 32568,
+     "frozen incumbent: pair logits_fnv64 == one node at the same width, prompts <= 32,568"}},
+    {Device::gfx1151, Topology::one_node, {"head_q8", "1", 0, kNoPromptBound,
+     "frozen incumbent: gate v2 head copy, 5 windows, 1,000 held-out rows"}},
+    {Device::gfx1151, Topology::pair, {"head_q8", "1", 0, kNoPromptBound,
+     "frozen incumbent: same head numerics as one node"}},
+    {Device::gfx1151, Topology::one_node, {"pf_mha", "1", 0, 32568,
+     "frozen incumbent: gate v2 FAST composition, 10 windows PASS, prompts <= 32,568"}},
+};
+
 [[nodiscard]] inline const Qualified* qualification(std::string_view lever, std::string_view value, const Regime& regime,
                                                     std::span<const Qualified> rows) {
     const Qualified* best = nullptr;
@@ -125,7 +142,7 @@ inline constexpr Qualified qualified[] = {
 struct Resolved {
     Regime regime;
     std::vector<sp::Lever> rows;
-    std::vector<sp::LadderRow> ladder;  // incumbent grants: the qualification receipt of each cell qualified here
+    std::vector<sp::LadderRow> ladder;  // incumbent grants of the cells granted in this regime
     sp::Engine engine;
     sp::Resolution resolution;
     Resolved() = default;
@@ -136,7 +153,8 @@ struct Resolved {
 
 // The CLI and the server call this one function with the same Inputs and Regime (ONE RESOLVER).
 [[nodiscard]] inline std::unique_ptr<Resolved> resolve(const Regime& regime, const sp::Inputs& inputs,
-                                                       std::span<const Qualified> rows = qualified) {
+                                                       std::span<const Qualified> rows = qualified,
+                                                       std::span<const Qualified> grants = incumbent_grants) {
     auto out = std::make_unique<Resolved>();
     out->regime = regime;
     constexpr auto fast = static_cast<unsigned>(sp::Name::fast);
@@ -144,9 +162,10 @@ struct Resolved {
         sp::Lever row = lever;
         const auto* q = qualification(lever.name, lever.value[fast], regime, rows);
         row.ready[fast] = q != nullptr;
-        // A cell qualified for this regime ran before the ladder rule: its qualification receipt is its incumbent grant.
-        if (q != nullptr && lever.kind != sp::Kind::exact)
-            out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[fast], sp::Name::fast, q->gate.receipt));
+        // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
+        if (const auto* grant = qualification(lever.name, lever.value[fast], regime, grants);
+            grant != nullptr && lever.kind != sp::Kind::exact)
+            out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[fast], sp::Name::fast, grant->gate.receipt));
         out->rows.push_back(row);
     }
     out->engine = engine();

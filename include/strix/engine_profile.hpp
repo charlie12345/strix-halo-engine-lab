@@ -121,13 +121,22 @@ struct LadderRow {
     // (unchanged by the ladder) admits it; where a timing row covers the regime, the timing row decides. Phase, device,
     // bands, speedup and noise are unused.
     bool incumbent = false;
+    // Paired decision: names the partner lever. The row was measured on the combined operation of this cell and the
+    // partner's cell (one complete workload against the effective arm of the tier below) and decides only that pair
+    // (ladder_judge with the same `joint`). A plain judge never reads it, so two separately timed cells cannot admit
+    // a pair. Empty: an ordinary single-cell row.
+    std::string_view joint{};
 };
 
 // Receipts of incumbent grants for cells that ran before the ladder rule without a quality gate of their own.
 inline constexpr std::string_view kProvisionalBeforeLadder =
     "provisional cell selected before the ladder rule; the row's source names the qualification in progress";
+// Compatibility opt-out, not a measured claim: a TURBO column that leaves a FAST member off ("0" over the FAST "1") ran
+// that way before the ladder rule and keeps doing so. The nested rule (TURBO resolves over the admitted FAST set) does not
+// hold for these cells; each table lists them as incumbent grants with this receipt (DeepSeek 4.1 pair: fast_prefill,
+// engram_f16wmma, shared_f16, moe_f16wmma; MiniMax: router_wmma) and a test pins the exact list.
 inline constexpr std::string_view kTurboOffBeforeLadder =
-    "turbo cell that leaves the fast cell off, selected before the ladder rule";
+    "compatibility opt-out kept from before the ladder rule: this TURBO column leaves the FAST member off; no measured claim against FAST";
 
 // An incumbent grant row (LadderRow::incumbent). `value` empty: the tier's cell.
 [[nodiscard]] constexpr LadderRow incumbent_cell(std::string_view lever, std::string_view value, Name tier,
@@ -185,10 +194,12 @@ struct LadderVerdict {
 // The verdict of `value` of `lever` in `tier` for `regime`: applies only when every covering timing row shows a gain;
 // with no timing row covering the regime, an incumbent grant with a receipt keeps the cell (Rung::incumbent).
 [[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
-                                                   std::string_view value, Name tier, const Regime& regime) noexcept {
+                                                   std::string_view value, Name tier, const Regime& regime,
+                                                   std::string_view joint = {}) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
     for (const auto& row : rows) {
+        if (row.joint != joint) continue;  // a paired receipt is read only by the pair's own judge
         if (row.incumbent) {
             if (!grant && !row.receipt.empty() && ladder_names(row, lever, value, tier)) grant = &row;
             continue;
@@ -996,7 +1007,14 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             return where + ": ladder row value is not the tier's cell";
         if (row.incumbent) {
             if (row.receipt.empty()) return where + ": incumbent grant without a receipt";
+            if (!row.joint.empty()) return where + ": incumbent grant cannot be a paired row";
             continue;
+        }
+        if (!row.joint.empty()) {
+            const auto same = [&](const Lever& candidate) { return candidate.name == row.joint; };
+            const auto partner = std::find_if(engine.table.begin(), engine.table.end(), same);
+            if (partner == engine.table.end() || partner->kind == Kind::exact || row.joint == row.lever)
+                return where + ": paired row names no other lossy lever of the table";
         }
         if (row.device.empty() || row.receipt.empty()) return where + ": ladder row without device or receipt";
         if (!valid_ladder_measurement(row.speedup, row.noise)) return where + ": invalid speedup or noise";

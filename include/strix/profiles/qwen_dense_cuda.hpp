@@ -139,6 +139,21 @@ inline constexpr Qualified qualified[] = {
     // {Weights::nvfp4_rtn, Route::large_prefill, {"split_k", "", 0, sp::kNoPromptBound, ...}}: a composition gate of that bundle against fast4 + chunk16tc.
 };
 
+// Incumbent grants: the FAST cells that main selected from a quality row before the ladder rule, frozen as data at the
+// identities and prompt bands they ran in (same shape as `qualified`). A grant keeps the cell applying where no timing
+// row covers the regime; it is NOT derived from `qualified`, so a new quality row (a pending cell such as prefill_hid, or
+// a wider band) leaves its cell at the tier below until a matching timing row is registered. Do not add rows here.
+inline constexpr Qualified incumbent_grants[] = {
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_arith", "", 0, sp::kNoPromptBound,
+     "frozen incumbent: 52dd7d1f0 FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack)"}},
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_gdn", "", 0, sp::kNoPromptBound,
+     "frozen incumbent: gdn-chunk16-tf32-v2 with fast4 gate 8K / 32K PASS"}},
+    {Weights::nvfp4_rtn, Route::large_prefill, {"prefill_attn8", "", 8192, sp::kNoPromptBound,
+     "frozen incumbent: with fast4 + chunk16 / chunk16tc gate 8K / 32K 2/2 windows PASS"}},
+    {Weights::nvfp4_rtn, Route::windows, {"split_k", "", 0, sp::kNoPromptBound,
+     "frozen incumbent: nvfp4-splitk-fast-v1 gate EXACT -> FAST pooled KL 0.00000 top-1 0.9990, spec ids == FAST serial x1200"}},
+};
+
 inline bool offered(std::string_view lever, Route route, bool drafter = false) {
     if (lever == "drafter_window") return drafter;
     if (route == Route::large_prefill) return true;
@@ -199,15 +214,41 @@ struct Resolved {
 // cli: {lever name, value} for each per-lever option given on the command line. Profile names: exact = default.
 inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regime& regime, const sp::Pairs& cli,
                                          std::span<const Qualified> rows = qualified,
-                                         std::span<const TurboEvidence> evidence = turbo_evidence) {
+                                         std::span<const TurboEvidence> evidence = turbo_evidence,
+                                         std::span<const Qualified> grants = incumbent_grants) {
     auto out = std::make_unique<Resolved>();
     out->regime = regime;
     const bool turbo = profile == Name::turbo;
+    // The shadow and its reader are one operation: single-cell timing rows of either half never admit it (they time
+    // something else), only a joint row (LadderRow::joint) measured on the combined operation does.
+    const auto paired_half = [](const sp::LadderRow& row) {
+        return row.joint.empty() && !row.incumbent && row.tier == Name::turbo &&
+               (row.lever == "kv_fp8" || row.lever == "decode_attn8");
+    };
     for (const auto& record : evidence)
         if (record.weights == regime.weights && record.route == regime.route)
-            out->ladder.insert(out->ladder.end(), record.ladder.begin(), record.ladder.end());
+            for (const auto& row : record.ladder)
+                if (!paired_half(row)) out->ladder.push_back(row);
     const sp::Regime timing_regime{
         sp::Phase::prefill, regime.uniform_prompt_length && regime.linear_session ? regime.prompt_tokens : 0, 1, regime.arch};
+    // One shared admission of the pair: a joint receipt on the shadow lever, scoped to the measured device and run shape.
+    const Lever* kv_row = nullptr;
+    const Lever* attn_row = nullptr;
+    for (const auto& lever : table) {
+        if (lever.name == "kv_fp8") kv_row = &lever;
+        if (lever.name == "decode_attn8") attn_row = &lever;
+    }
+    const auto joint = sp::ladder_judge(out->ladder, "kv_fp8", kv_row->value[kTurboColumn], Name::turbo, timing_regime,
+                                        "decode_attn8");
+    const bool joint_receipt = joint.rung == sp::Rung::applies && joint.row != nullptr;
+    if (joint_receipt) {  // the plain rows the resolver reads for each half, derived from the one joint receipt
+        auto half = *joint.row;
+        half.joint = {};
+        out->ladder.push_back(half);
+        half.lever = "decode_attn8";
+        half.value = attn_row->value[kTurboColumn];
+        out->ladder.push_back(half);
+    }
     const auto cuda_admission = [&](std::string_view identity) -> TurboAdmission {
         if (regime.arch != "sm_120") return {false, "requires CUDA sm_120"};
         return turbo_admission(identity, regime, evidence);
@@ -236,10 +277,10 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
         Lever row = lever;
         const auto* q = qualification(lever.name, regime, rows);
         row.ready[static_cast<unsigned>(Name::fast)] = q != nullptr;
-        // A cell qualified for this regime ran before the ladder rule: its qualification receipt is its incumbent grant.
-        if (q != nullptr && lever.kind != Kind::exact)
+        // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
+        if (const auto* grant = qualification(lever.name, regime, grants); grant != nullptr && lever.kind != Kind::exact)
             out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[static_cast<unsigned>(Name::fast)], Name::fast,
-                                                     q->gate.receipt));
+                                                     grant->gate.receipt));
         TurboAdmission result;
         if (turbo && !row.value[kTurboColumn].empty()) {
             result = admission(row);
@@ -247,11 +288,16 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
                 // The current CUDA body reads the shadow and runs both E4M3 products as one operation.
                 const auto& peer = row.name == "kv_fp8" ? attn_admit : kv_admit;
                 if (result.ready && !peer.ready) result = {false, "paired arm: " + peer.reason};
+                if (result.ready && !joint_receipt)
+                    result = {false, "paired arm: no joint timing receipt for the shadow and its reader in this regime"};
                 if (kv_override) result = {false, "controlled explicitly by --kv or --decode-attn8"};
+                // A half whose FAST cell is admitted reads that cell when the pair is refused: the FAST resolution
+                // stands as if no TURBO cell existed for it.
+                if (!result.ready && row.ready[static_cast<unsigned>(Name::fast)] &&
+                    !row.value[static_cast<unsigned>(Name::fast)].empty())
+                    row.value[kTurboColumn] = {};
             }
-            if (row.name == "decode_attn8" && !result.ready && row.ready[static_cast<unsigned>(Name::fast)])
-                row.value[kTurboColumn] = {};
-            row.ready[kTurboColumn] = result.ready;
+            row.ready[kTurboColumn] = result.ready && !row.value[kTurboColumn].empty();
         }
         admissions.push_back(std::move(result));
         out->rows.push_back(row);
@@ -270,34 +316,6 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
     inputs.regime = timing_regime;
     inputs.env = [](const char*) -> const char* { return nullptr; };  // CLI-only levers: the environment selects nothing
     out->resolution = sp::resolve(out->engine, inputs);
-    // A half runs its TURBO cell only on its own TURBO decision (a timing row of the TURBO rung), never because the
-    // value it inherits from FAST is spelled like the TURBO cell (decode_attn8 is "on" in both columns).
-    const auto selected_turbo = [&](std::string_view name) {
-        const auto* entry = out->resolution.find(name);
-        if (!entry || !sp::applied(entry->status) || entry->value != entry->lever->value[kTurboColumn]) return false;
-        return sp::rung_runs(sp::ladder_judge(out->ladder, name, entry->value, Name::turbo, timing_regime).rung);
-    };
-    const bool kv_turbo = selected_turbo("kv_fp8"), attn_turbo = selected_turbo("decode_attn8");
-    const auto ran_turbo_value = [&](std::string_view name) {
-        const auto* entry = out->resolution.find(name);
-        return entry && sp::applied(entry->status) && entry->value == entry->lever->value[kTurboColumn];
-    };
-    // The pair runs on TURBO only when both halves carry their own TURBO decision.
-    if (turbo && !kv_override && (ran_turbo_value("kv_fp8") || attn_turbo) && !(kv_turbo && attn_turbo)) {
-        // The shadow and its reader are one operation. Select the lower tier
-        // for both if either half failed the shared decision.
-        const auto unpaired = out->resolution;
-        for (auto& row : out->rows)
-            if (row.name == "kv_fp8" || row.name == "decode_attn8") row.ready[kTurboColumn] = false;
-        out->resolution = sp::resolve(out->engine, inputs);
-        for (auto& entry : out->resolution.entries)
-            if (entry.lever->name == "kv_fp8" || entry.lever->name == "decode_attn8") {
-                const auto* attempted = unpaired.find(entry.lever->name);
-                entry.reason = "paired FP8 shadow/reader did not both pass the ladder";
-                if (attempted && !attempted->ladder.empty() && !sp::applied(attempted->status))
-                    entry.ladder = attempted->ladder;
-            }
-    }
     for (std::size_t i = 0; i < out->resolution.entries.size(); ++i) {
         auto& entry = out->resolution.entries[i];
         if (entry.reason.empty() && !admissions[i].reason.empty() &&

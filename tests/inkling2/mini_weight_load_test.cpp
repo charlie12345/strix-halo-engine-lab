@@ -146,9 +146,15 @@ void test_selection() {
                   &weight::kAttentionHeadQ8Policy, "old Inkling receipts resolve to the shared policy");
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto backend : {weight::Backend::hip, weight::Backend::cuda}) {
-        const weight::WeightLoadScope scope{backend, "test-device", "test-compiler", "decode", digest(1), digest(2)};
-        const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4),
-                                                             {"receipts/t", "2026-11-24", 16, 0, 1.10, 0.02}}};
+        const weight::WeightLoadScope scope{backend, "test-device", "test-compiler", "resident", digest(1), digest(2)};
+        const auto phase = [&](std::string_view regime, double speedup = 1.10) {
+            auto at = scope;
+            at.regime = regime;
+            return weight::WeightLoadDecision{policy.id, at, digest(3), digest(4),
+                                              {"receipts/t", "2026-11-24", 16, 0, speedup, 0.02}};
+        };
+        // The resident image is consumed by prefill and decode: the production adapter asks both phases.
+        const std::array receipts{phase(weight::kPrefillRegime), phase(weight::kDecodeRegime)};
         weight::WeightLoadRequest request{profile::Name::standard, scope, formats, true, true};
         const auto resolve = [&] {
             return mini::resolve_mini_weight_load(request.tier, request.scope, request.consumer_formats,
@@ -161,6 +167,28 @@ void test_selection() {
                     weight::kBf16WeightStorage, "FAST default before gate and speed receipts");
         require(resolve().status == profile::Status::set && resolve().storage == weight::kQ8WeightStorage &&
                     resolve().gate_v2_pass == digest(3) && resolve().measured_gain == digest(4), "qualified FAST selection");
+        {   // r32 P2-c: a winning prefill row alone, or with a missing / losing decode row, never admits the image.
+            const auto with = [&](std::span<const weight::WeightLoadDecision> rows) {
+                return mini::resolve_mini_weight_load(profile::Name::fast, scope, formats, true, false, rows, 4096, 1, 1, 1);
+            };
+            const std::array prefill_only{phase(weight::kPrefillRegime)};
+            const std::array decode_only{phase(weight::kDecodeRegime)};
+            const std::array losing_decode{phase(weight::kPrefillRegime), phase(weight::kDecodeRegime, 0.95)};
+            const std::array resident_label{phase(mini::kMiniResidentRegime)};
+            require(with(prefill_only).storage == weight::kBf16WeightStorage &&
+                        with(prefill_only).status == profile::Status::pending, "prefill row without decode admitted the image");
+            require(with(decode_only).storage == weight::kBf16WeightStorage, "decode row without prefill admitted the image");
+            require(with(losing_decode).storage == weight::kBf16WeightStorage, "a losing decode row admitted the image");
+            require(with(resident_label).storage == weight::kBf16WeightStorage,
+                    "an aggregate resident receipt admitted the image");
+            require(with(receipts).storage == weight::kQ8WeightStorage && with(receipts).regime_count == 2,
+                    "both phases timed: the image is admitted over both regimes");
+            // the explicit, stamped qualification arm still selects the image without rows
+            const auto arm = mini::resolve_mini_weight_load(profile::Name::fast, scope, formats, true, true, prefill_only,
+                                                            4096, 1, 1, 1);
+            require(arm.status == profile::Status::unqualified && arm.storage == weight::kQ8WeightStorage,
+                    "qualification arm changed");
+        }
         request.tier = profile::Name::turbo;
         require(resolve().storage == weight::kQ8WeightStorage, "TURBO omitted FAST storage");
         request.tier = profile::Name::fast;
@@ -195,7 +223,8 @@ void test_committed_rows() {
                 "decision row is stale: resident Q8_0 arithmetic revision changed, re-qualify or remove the row");
         require(row.policy.name == mini::kMiniWeightLoadPolicy.id.name &&
                     row.policy.revision == mini::kMiniWeightLoadPolicy.id.revision &&
-                    row.scope.regime == mini::kMiniResidentRegime, "decision row policy/regime");
+                    (row.scope.regime == weight::kPrefillRegime || row.scope.regime == weight::kDecodeRegime),
+                "decision row policy/phase regime");
         auto plan = mini::resolve_mini_weight_load(row.evidence.tier, row.scope, formats, true, false,
                                                   mini::kMiniWeightLoadDecisions, row.evidence.min_context,
                                                   row.evidence.min_lanes);

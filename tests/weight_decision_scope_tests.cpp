@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <limits>
 #include <span>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -234,20 +235,41 @@ int main() {
     auto other_device = request;
     other_device.scope.device_class = "other";
     ok &= check(selected(other_device, narrow) == weight::kBf16WeightStorage, "other device declines");
-    {   // One architecture, two cards with different resource counts: a row measured on one never serves the other.
-        const auto card_a = weight::device_class_key("gfx1151", 20, 128ULL << 30);
-        const auto card_b = weight::device_class_key("gfx1151", 40, 128ULL << 30);
-        const auto card_c = weight::device_class_key("gfx1151", 20, 96ULL << 30);
-        ok &= check(card_a != card_b && card_a != card_c, "device class keys separate units and memory");
+    {   // The weight device class is the shared cost-device identity: a row measured on one product never serves another
+        // of the same architecture, even with equal unit count and memory (name, clock, runtime and driver are keyed too).
+        strix::device::CostDeviceFacts base{"gfx1151", "fixture card", 20, 128ULL << 30, 2900000, "hip", 7, 7};
+        const auto card_a = weight::device_class_key(base);
+        auto variant = base;
+        variant.units = 40;
+        const auto card_b = weight::device_class_key(variant);
+        variant = base;
+        variant.memory = 96ULL << 30;
+        const auto card_c = weight::device_class_key(variant);
+        variant = base;
+        variant.name = "faster product";
+        const auto card_d = weight::device_class_key(variant);
+        variant = base;
+        variant.clock_khz = 2400000;
+        const auto card_e = weight::device_class_key(variant);
+        variant = base;
+        variant.driver = 8;
+        const auto card_f = weight::device_class_key(variant);
+        ok &= check(card_a == strix::device::cost_device_identity(base), "weight class is the shared cost-device identity");
+        const std::set<std::string> distinct{card_a, card_b, card_c, card_d, card_e, card_f};
+        ok &= check(distinct.size() == 6, "device class keys separate units, memory, product name, clock and driver");
         auto measured = narrow;
         measured.scope.device_class = card_a;
-        auto run_a = request, run_b = request, run_c = request;
-        run_a.scope.device_class = card_a;
-        run_b.scope.device_class = card_b;
-        run_c.scope.device_class = card_c;
-        ok &= check(selected(run_a, measured) == weight::kQ8WeightStorage, "the measured card selects its row");
-        ok &= check(selected(run_b, measured) == weight::kBf16WeightStorage, "same architecture, other unit count declines");
-        ok &= check(selected(run_c, measured) == weight::kBf16WeightStorage, "same architecture, other memory declines");
+        const auto select_on = [&](const std::string& card) {
+            auto run = request;
+            run.scope.device_class = card;
+            return selected(run, measured);
+        };
+        ok &= check(select_on(card_a) == weight::kQ8WeightStorage, "the measured card selects its row");
+        ok &= check(select_on(card_b) == weight::kBf16WeightStorage, "same architecture, other unit count declines");
+        ok &= check(select_on(card_c) == weight::kBf16WeightStorage, "same architecture, other memory declines");
+        ok &= check(select_on(card_d) == weight::kBf16WeightStorage, "equal resources, different product name declines");
+        ok &= check(select_on(card_e) == weight::kBf16WeightStorage, "equal resources, different clock limit declines");
+        ok &= check(select_on(card_f) == weight::kBf16WeightStorage, "different driver declines");
     }
     auto malformed = narrow;
     malformed.evidence.receipt = {};

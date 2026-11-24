@@ -256,7 +256,7 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     auto command = resolve(req, entries, matrix, probes, "bin", exists, &dense);
     require(command.executable.stem() == "strix-cuda-qwen35-decode", "launches the qualified backend route");
     require(command.args == std::vector<std::string>{"--model", "model.gguf", "--n-gen", "32", "--profile",
-        "turbo", "--print-effective-config"}, "TURBO and native config arguments");
+        "fast", "--kv", "fp8", "--print-effective-config"}, "TURBO and native config arguments");
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};
     refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "requires the turbo preset");

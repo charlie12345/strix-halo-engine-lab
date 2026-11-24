@@ -5,9 +5,11 @@
 #include "strix/model_content_hash.hpp"
 
 #if defined(__HIPCC__)
+#include "device/hip_cost_identity.hpp"
 #include "strix/device/hip_enumerator.hpp"
 #include <hip/hip_version.h>
 #else
+#include "device/cuda_cost_identity.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #endif
 
@@ -18,8 +20,9 @@ namespace strix::inkling2 {
 // checkpoint SHA-256 (shared persistent stat-keyed cache: only the first FAST run of a checkpoint reads it whole).
 // Hash only for explicit qualification or when a default decision row can match.
 // Owns the strings; view() builds the scope on use, so copies and moves never leave a view dangling.
-// device_class: the architecture (the profile ladder's device class); weight_device_class: the weight-load key
-// (weight::device_class_key: architecture, compute units, memory), so a residency receipt never crosses cards.
+// device_class: the architecture (the profile ladder's device class); weight_device_class: the weight-load key, the
+// shared cost-device identity of the current device (device/{hip,cuda}_cost_identity.hpp: architecture, product name,
+// compute units, memory, clock, runtime and driver), so a residency receipt never crosses products or clock limits.
 struct MiniWeightScope {
     weight::Backend backend{};
     std::string device_class, weight_device_class, compiler_id;
@@ -56,17 +59,14 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
     out.compiler_id = "cuda-" + std::to_string(CUDART_VERSION / 1000) + "." + std::to_string(CUDART_VERSION % 1000 / 10);
     const auto identity = weight::implementation_identity(core::kResidentQ8ArithmeticCuda);
 #endif
-    int units = 0;
-#if defined(__HIPCC__)
-    if (hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount, ordinal) != hipSuccess) return out;
-#else
-    if (cudaDeviceGetAttribute(&units, cudaDevAttrMultiProcessorCount, ordinal) != cudaSuccess) return out;
-#endif
     for (const auto& device : visible)
-        if (device.ordinal == ordinal) {
-            out.device_class = device.arch;
-            out.weight_device_class = weight::device_class_key(device.arch, units, device.memory_bytes);
-        }
+        if (device.ordinal == ordinal) out.device_class = device.arch;
+    // Empty when the runtime cannot describe the device: no weight row matches then.
+#if defined(__HIPCC__)
+    out.weight_device_class = device::hip_cost_device_identity();
+#else
+    out.weight_device_class = device::cuda_cost_device_identity();
+#endif
     if (!needed) return out;
     out.regime = kMiniResidentRegime;
     out.build = identity;

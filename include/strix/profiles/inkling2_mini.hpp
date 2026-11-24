@@ -14,8 +14,12 @@ namespace strix::inkling2 {
 inline constexpr weight::WeightLoadPolicy kMiniWeightLoadPolicy = weight::with_legacy(
     weight::kAttentionHeadQ8Policy, {"inkling2-mini-attention-head-bf16-q8_0", 1});
 
-// The resident engine is the one regime of these rows (serial CLI and served requests share its routes).
+// The resident image is built once and consumed by both phases (serial CLI and served requests share its routes): prefill
+// chunks and one-row decode steps. Decision rows are per phase (WeightLoadScope::regime is kPrefillRegime or
+// kDecodeRegime); the image takes the policy storage only when every consuming phase has a full row.
+// kMiniResidentRegime labels the scope of a run that may select the image (it is replaced by each consuming phase).
 inline constexpr std::string_view kMiniResidentRegime = "resident";
+inline constexpr std::array<std::string_view, 2> kMiniConsumingRegimes{weight::kPrefillRegime, weight::kDecodeRegime};
 
 // The existing gate passed for 8K prose. It does not cover a resident load, whose
 // storage is fixed before the content class or context of any request is known.
@@ -28,7 +32,8 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
     std::uint32_t context = 0, std::uint32_t lanes = 0, std::uint32_t first_context = 0,
     std::uint32_t first_lanes = 0) {
     return weight::resolve_weight_load(weight::builtin_registry(), kMiniWeightLoadPolicy,
-        {tier, scope, consumer_formats, enabled, qualify, {}, context, lanes, first_context, first_lanes}, decisions);
+        {tier, scope, consumer_formats, enabled, qualify, kMiniConsumingRegimes, context, lanes, first_context, first_lanes},
+        decisions);
 }
 
 // FAST lever: W4A4 experts. Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4

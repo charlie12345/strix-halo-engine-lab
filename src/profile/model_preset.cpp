@@ -91,14 +91,11 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
     if (kv != "resolver" && kv != "native" && kv != "fp8")
         throw std::invalid_argument(path + ".kv must be resolver, native or fp8");
 
-    Json storage_policy = Json::Object{{"policy", kv == "fp8" ? "resolver" : kv}};
-    // A TOML candidate must remain automatic in the native resolver.
-    // Exporting --kv fp8 would make it a user override and skip admission.
-    if (kv == "fp8") storage_policy.set("requested", kv);
+    Json storage_policy = Json::Object{{"policy", kv}};
     if (const auto* storage = description.find("presets.native_kv"))
         storage_policy.set("native", setting(*storage, "presets.native_kv"));
     Json config = Json::Object{{"profile", tier_word(requested)}, {"backend", backend},
-        {"levers", Json::Object{{"column", tier_word(kv == "fp8" ? requested : column)}, {"admission", "qualified-by-engine"}}},
+        {"levers", Json::Object{{"column", tier_word(column)}, {"admission", "qualified-by-engine"}}},
         {"kv", std::move(storage_policy)}};
     if (const auto* name = description.find("name")) config.set("model", description_json(*name));
     if (const auto* reference = description.find("presets.reference"))
@@ -159,8 +156,8 @@ void ModelPreset::append_options(std::vector<std::string>& args) const {
         }
     }
     args.emplace_back("--profile");
-    args.emplace_back(tier_word(kv == "fp8" ? requested : levers));
-    if (kv != "resolver" && kv != "fp8" && !has("--kv") && !has("--prefill-attn8") && !has("--decode-attn8")) {
+    args.emplace_back(tier_word(levers));
+    if (kv != "resolver" && !has("--kv") && !has("--prefill-attn8") && !has("--decode-attn8")) {
         args.emplace_back("--kv");
         args.push_back(kv);
     }

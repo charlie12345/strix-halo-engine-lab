@@ -314,6 +314,7 @@ int main() {
             gains[i] = {keys[i], "", Name::turbo, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
                         1.1, 0.01, "fixture gain"};
         }
+        gains[0].joint = "decode_attn8";  // the pair is admitted by one joint receipt on the shadow lever
         const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, "fixture", gates, gains}};
         const auto resolve = [&](const qp::Regime& r, const Pairs& opts = {}) {
             return qp::resolve(Name::turbo, r, opts, qp::qualified, evidence);
@@ -326,26 +327,86 @@ int main() {
                   options.decode_attn8 && options.dense_activation && kv.source == qp::kvp::Source::tier,
               "matching receipts enable all four TURBO cells on top of FAST");
         check(resolve(regime, {{"decode_attn8", "off"}})->find("kv_fp8")->value == "native", "off switch disables the paired default");
-        gains[1].max_lanes = 0;
-        check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs both timing records");
-        gains[1].max_lanes = 1;
+        gains[0].max_lanes = 0;
+        check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs the joint receipt in the run shape");
+        gains[0].max_lanes = 1;
+        gains[0].joint = {};
+        check(resolve(regime)->find("kv_fp8")->value == "native" && resolve(regime)->find("decode_attn8")->value == "off",
+              "two individually winning single-cell rows without a joint receipt do not admit the pair");
+        gains[0].joint = "decode_attn8";
+        gains[0].device = "sm_89";
+        check(resolve(regime)->find("kv_fp8")->value == "native", "a joint receipt of another device does not admit the pair");
+        gains[0].device = regime.arch;
+        gains[0].speedup = 1.005;
+        check(resolve(regime)->find("kv_fp8")->value == "native", "a joint receipt within noise does not admit the pair");
+        gains[0].speedup = 1.1;
         gates[1].tier = Name::fast;
         check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs both TURBO records");
         gates[1].tier = Name::turbo;
-        {   // Equal spelling on the two rungs: a FAST-qualified reader ("on" in both columns) does not stand in for the
-            // TURBO reader's own timing; either half missing from the TURBO timing evidence keeps the pair off.
+        check(resolve(regime)->find("kv_fp8")->value == "fp8", "a valid joint receipt admits the pair again");
+        {   // r32 P1-a: a refused pair leaves both halves exactly as the standalone FAST resolution (qualified FAST reader).
             std::vector<qp::Qualified> reader(std::begin(qp::qualified), std::end(qp::qualified));
             reader.push_back({regime.weights, regime.route,
                               {"decode_attn8", "", 0, p::kNoPromptBound, "fixture FAST reader receipt"}});
-            const auto with_reader = [&] { return qp::resolve(Name::turbo, regime, {}, reader, evidence); };
-            check(with_reader()->find("kv_fp8")->value == "fp8", "both halves timed: the pair runs on TURBO");
-            for (const std::size_t half : {std::size_t{0}, std::size_t{1}}) {
-                gains[half].max_lanes = 0;
-                const auto run = with_reader();
-                check(run->find("kv_fp8")->value == "native",
-                      half == 0 ? "TURBO pair without the shadow timing row keeps the FP8 shadow off"
-                                : "TURBO pair without the reader timing row keeps the FP8 shadow off");
-                gains[half].max_lanes = 1;
+            const auto fast_reader = [&](Name tier) {
+                std::vector<p::LadderRow> ladder(gains.begin(), gains.end());  // the evidence as it stands now
+                ladder.push_back({"decode_attn8", "on", Name::fast, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
+                                  1.05, 0.01, "fixture FAST reader gain"});
+                const qp::TurboEvidence reader_evidence[] = {{regime.weights, regime.route, "fixture", gates, ladder}};
+                return qp::resolve(tier, regime, {}, reader, reader_evidence);
+            };
+            const auto turbo = [&] { return fast_reader(Name::turbo); };
+            const auto standalone = fast_reader(Name::fast);
+            check(standalone->find("decode_attn8")->value == "on" && p::applied(standalone->find("decode_attn8")->status),
+                  "fixture: the qualified FAST reader runs standalone");
+            Options expected;
+            qp::apply(expected, *standalone);
+            const auto same_as_fast = [&](const char* what) {
+                const auto run = turbo();
+                for (const char* lever : {"kv_fp8", "decode_attn8"}) {
+                    const auto* got = run->find(lever);
+                    const auto* want = standalone->find(lever);
+                    check(got->value == want->value && p::applied(got->status) == p::applied(want->status), what);
+                    if (std::string_view(lever) == "decode_attn8") check(got->status == want->status, what);
+                }
+                Options pair_options;
+                qp::apply(pair_options, *run);
+                // the pair's applied option: the reader runs as the standalone FAST arm (the unrelated TURBO cells are not compared)
+                check(pair_options.decode_attn8 && pair_options.decode_attn8 == expected.decode_attn8 &&
+                          pair_options.nvfp4_split == expected.nvfp4_split, what);
+            };
+            const auto with_pair = turbo();
+            check(with_pair->find("kv_fp8")->value == "fp8" && with_pair->find("decode_attn8")->value == "on",
+                  "joint receipt: the pair runs on TURBO over the qualified FAST reader");
+            gains[0].joint = {};
+            same_as_fast("no joint receipt: both halves keep the standalone FAST resolution");
+            gains[0].joint = "decode_attn8";
+            gains[0].max_lanes = 0;
+            same_as_fast("joint receipt outside the run shape: standalone FAST");
+            gains[0].max_lanes = 1;
+            gates[0].tier = Name::fast;
+            same_as_fast("shadow gate missing: standalone FAST");
+            gates[0].tier = Name::turbo;
+            gates[1].tier = Name::fast;
+            same_as_fast("reader gate missing: standalone FAST");
+            gates[1].tier = Name::turbo;
+        }
+        {   // r32 P2-e: the launcher's native route `--profile fast --kv fp8` forces both FP8 readers, with missing and with
+            // valid pair evidence alike (the TURBO ledger neither admits nor removes it).
+            auto large = regime;
+            large.route = qp::Route::large_prefill;
+            const qp::TurboEvidence valid[] = {{large.weights, large.route, "fixture", gates, gains}};
+            for (const auto ledger : {std::span<const qp::TurboEvidence>{}, std::span<const qp::TurboEvidence>(valid)}) {
+                Pairs forced;
+                const auto kv_fp8 = qp::resolve_kv(Name::fast, qp::kvp::Request{qp::kvp::Precision::fp8, false, "--kv"},
+                                                   large.route, forced);
+                const auto run = qp::resolve(Name::fast, large, forced, qp::qualified, ledger);
+                Options forced_options;
+                qp::apply(forced_options, *run);
+                check(kv_fp8.precision == qp::kvp::Precision::fp8 && forced_options.decode_attn8 && forced_options.prefill_attn8 &&
+                          run->find("decode_attn8")->status == p::Status::explicit_cli &&
+                          run->find("prefill_attn8")->status == p::Status::explicit_cli,
+                      "--profile fast --kv fp8 forces the FP8 readers whatever the TURBO ledger holds");
             }
         }
         classes[1].rows = 799;
@@ -367,6 +428,39 @@ int main() {
         static_assert(select(Activation::fp8, true, 128, 16) == Activation::fp8);
         static_assert(select(Activation::fp8, false, 128, 16) == Activation::native);
         static_assert(select(Activation::fp4, true, 127, 16) == Activation::native);
+    }
+
+    // r32 P1-b: incumbent grants are frozen data, not derived from quality rows. A new quality PASS (a pending cell, or a wider
+    // band) leaves its cell at the tier below until a matching timing row is registered.
+    {
+        namespace p = strix::profile;
+        const qp::Regime regime{qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 8192, "fixture GPU", "sm_120", true};
+        const auto lever_value = [](const qp::Resolved& r, const char* lever) { return r.find(lever)->value; };
+        const auto shipped = qp::resolve(Name::fast, regime, {});
+        check(lever_value(*shipped, "prefill_arith") == "fast4" && lever_value(*shipped, "prefill_gdn") == "chunk16tc" &&
+                  lever_value(*shipped, "prefill_attn8") == "on" && lever_value(*shipped, "prefill_hid") == "f32",
+              "frozen grants keep the shipped FAST cells (prefill_hid stays pending)");
+        std::vector<qp::Qualified> rows(std::begin(qp::qualified), std::end(qp::qualified));
+        rows.push_back({regime.weights, regime.route, {"prefill_hid", "", 0, p::kNoPromptBound, "fixture new quality row"}});
+        const auto extended = qp::resolve(Name::fast, regime, {}, rows);
+        check(lever_value(*extended, "prefill_hid") == "f32" && !p::applied(extended->find("prefill_hid")->status),
+              "a new quality PASS without a timing row leaves prefill_hid at the lower tier");
+        check(lever_value(*extended, "prefill_arith") == "fast4", "the new row leaves the incumbent cells alone");
+        const p::LadderRow timing[] = {{"prefill_hid", "bf16", Name::fast, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
+                                        1.04, 0.01, "fixture timing"}};
+        const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, {}, {}, timing}};
+        check(lever_value(*qp::resolve(Name::fast, regime, {}, rows, evidence), "prefill_hid") == "bf16",
+              "a matching timing row admits the newly qualified cell");
+        auto outside = regime;
+        outside.prompt_tokens = 8193;
+        check(lever_value(*qp::resolve(Name::fast, outside, {}, rows, evidence), "prefill_hid") == "f32",
+              "a timing row covers only its measured band");
+        // a wider quality band than the frozen grant: prefill_attn8 was granted from 8,192 tokens
+        rows.push_back({regime.weights, regime.route, {"prefill_attn8", "", 4096, p::kNoPromptBound, "fixture wider band"}});
+        auto small = regime;
+        small.prompt_tokens = 4096;
+        check(lever_value(*qp::resolve(Name::fast, small, {}, rows), "prefill_attn8") == "off",
+              "a wider quality band is not a wider grant");
     }
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

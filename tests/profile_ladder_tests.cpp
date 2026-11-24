@@ -423,6 +423,88 @@ void incumbents(const char* golden, bool write) {
     for (std::size_t i = 0; i < before.size() && i < now.size(); ++i)
         require(before[i] == now[i], "selection moved: '" + before[i] + "' -> '" + now[i] + "'");
 }
+// TURBO columns that leave a FAST member off are compatibility opt-outs kept from before the ladder rule, not measured
+// claims: the nested rule (TURBO over the admitted FAST set) does not hold for them. The exact list is pinned here; a new
+// opt-out must be a deliberate change of this list, and an off cell without the opt-out receipt is a defect.
+void compatibility_opt_outs(std::span<const p::Engine> engines) {
+    std::set<std::string> found;
+    for (const auto& engine : engines)
+        for (const auto& row : engine.ladder) {
+            if (!row.incumbent || row.tier != p::Name::turbo) continue;
+            const p::Lever* lever = nullptr;
+            for (const auto& candidate : engine.table)
+                if (candidate.name == row.lever) lever = &candidate;
+            if (lever == nullptr) continue;
+            const auto fast = lever->value[static_cast<unsigned>(p::Name::fast)];
+            const auto turbo = lever->value[static_cast<unsigned>(p::Name::turbo)];
+            const bool leaves_fast_off = !fast.empty() && !turbo.empty() && turbo != fast && turbo == lever->builtin;
+            const bool opt_out_receipt = row.receipt == p::kTurboOffBeforeLadder;
+            require(leaves_fast_off == opt_out_receipt, std::string(engine.tag) + "/" + std::string(row.lever) +
+                    ": a TURBO cell that leaves a FAST member off must carry the compatibility opt-out receipt");
+            if (opt_out_receipt) found.insert(std::string(engine.tag) + "/" + std::string(row.lever));
+        }
+    const std::set<std::string> expected{"deepseek41-pair/fast_prefill", "deepseek41-pair/engram_f16wmma",
+                                         "deepseek41-pair/shared_f16", "deepseek41-pair/moe_f16wmma",
+                                         "minimax-pair/router_wmma"};
+    if (found != expected) {
+        std::string got;
+        for (const auto& item : found) got += " " + item;
+        require(false, "compatibility opt-out list changed:" + got);
+    }
+}
+
+// A paired decision is admitted only by a row measured on the pair (LadderRow::joint): single-cell rows of either half
+// never read it, and the joint row is invisible to the plain judge.
+void paired_rows() {
+    const p::Regime regime{p::Phase::prefill, 8192, 1, "dev"};
+    p::LadderRow joint{"shadow", "fp8", p::Name::turbo, p::Phase::prefill, "dev", 8192, 8192, 1, 1, 1.10, 0.01, "pair receipt"};
+    joint.joint = "reader";
+    p::LadderRow plain = joint;
+    plain.joint = {};
+    plain.receipt = "shadow alone";
+    const p::LadderRow both[] = {joint, plain};
+    require(p::ladder_judge(std::span(&plain, 1), "shadow", "fp8", p::Name::turbo, regime, "reader").rung !=
+                p::Rung::applies, "a single-cell row admitted the pair");
+    require(p::ladder_judge(std::span(&joint, 1), "shadow", "fp8", p::Name::turbo, regime).rung != p::Rung::applies,
+            "a joint row decided the plain cell");
+    const auto verdict = p::ladder_judge(both, "shadow", "fp8", p::Name::turbo, regime, "reader");
+    require(verdict.rung == p::Rung::applies && verdict.row == &both[0], "the joint row decides the pair");
+    require(p::ladder_judge(both, "shadow", "fp8", p::Name::turbo, regime, "other").rung != p::Rung::applies,
+            "a joint row decided another partner");
+    p::LadderRow slow = joint;
+    slow.speedup = 0.97;
+    require(p::ladder_judge(std::span(&slow, 1), "shadow", "fp8", p::Name::turbo, regime, "reader").rung == p::Rung::slower,
+            "a losing joint row must not admit the pair");
+}
+// A new gate row (a wider prompt band for a qualified cell) is not an incumbent grant: the cell keeps the tier below
+// beyond the frozen band until a matching timing row is registered.
+void hy4_new_quality_rows() {
+    namespace h = strix::hy4::profile;
+    const auto none = [](const char*) -> const char* { return nullptr; };
+    p::Inputs in;
+    in.profile = p::Name::fast;
+    in.env = none;
+    const h::Regime beyond{h::Device::gfx1151, h::Topology::one_node, 40000};
+    const h::Regime inside{h::Device::gfx1151, h::Topology::one_node, 32568};
+    require(h::resolve(inside, in)->find("prompt_rows")->value == "4096", "frozen grant: the qualified band still runs");
+    std::vector<h::Qualified> rows(std::begin(h::qualified), std::end(h::qualified));
+    rows.push_back({h::Device::gfx1151, h::Topology::one_node, {"prompt_rows", "4096", 0, 65536, "fixture wider gate row"}});
+    rows.push_back({h::Device::gfx1151, h::Topology::one_node, {"pf_mha", "1", 0, 65536, "fixture wider gate row"}});
+    const auto wide = h::resolve(beyond, in, rows);
+    require(wide->find("prompt_rows")->value == "0" && wide->find("pf_mha")->value == "0",
+            "a new quality row beyond the frozen band must leave the cell at the lower tier without a timing row");
+    require(h::resolve(inside, in, rows)->find("prompt_rows")->value == "4096", "the frozen band keeps its cell");
+    // the matching timing row admits it
+    p::LadderRow timing{"prompt_rows", "4096", p::Name::fast, p::Phase::prefill, "gfx1151", 32569, 65536, 1, 1, 1.05, 0.01,
+                        "fixture timing"};
+    auto timed = h::resolve(beyond, in, rows);
+    std::vector<p::LadderRow> ladder(timed->ladder);
+    ladder.push_back(timing);
+    timed->engine.ladder = std::span<const p::LadderRow>(ladder);
+    in.regime = {p::Phase::prefill, 40000, 1, "gfx1151"};
+    const auto resolved = p::resolve(timed->engine, in);
+    require(resolved.find("prompt_rows")->value == "4096", "a matching timing row admits the new band");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -459,6 +541,9 @@ int main(int argc, char** argv) {
                     return engine.tag == tag || (tag == "hy4" && engine.tag == "hy4-hip");
                 }), "profile registry entry must be covered: " + tag);
     }
+    compatibility_opt_outs(engines);
+    paired_rows();
+    hy4_new_quality_rows();
     for (const auto& engine : engines) walk(engine);
     if (failures) return 1;
     std::puts("profile ladder tests: PASS");

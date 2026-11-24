@@ -74,6 +74,8 @@ inline constexpr strix::profile::FastGate fast_gates[] = {
     {"shared_f16", "1", kFastGateD1},   {"moe_f16wmma", "1", kFastGateD1}};
 
 // Ladder rows (strix::profile::LadderRow): incumbent grants for the cells the resolver ran before the ladder rule.
+// The four TURBO "0" rows are compatibility opt-outs (kTurboOffBeforeLadder), not measured claims: TURBO of this table
+// does not resolve over the admitted FAST set for fast_prefill, engram_f16wmma, shared_f16 and moe_f16wmma.
 namespace ladder_detail {
 namespace sp = ::strix::profile;
 inline constexpr auto kFast = sp::Name::fast;

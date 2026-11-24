@@ -109,7 +109,8 @@ inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
 }};
 
 // Ladder rows (strix::profile::LadderRow): incumbent grants for the mm-fast-pf-v2 bundle members the resolver ran before
-// the ladder rule, and the turbo cell that keeps the router member off.
+// the ladder rule, and the turbo cell that keeps the router member off: a compatibility opt-out (kTurboOffBeforeLadder),
+// not a measured claim; TURBO of this table does not resolve over the admitted FAST set for router_wmma.
 inline constexpr strix::profile::LadderRow ladder_rows[] = {
     strix::profile::incumbent_cell("msa_flash", "1", strix::profile::Name::fast,
                                    "bundle mm-fast-pf-v2: EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029"),

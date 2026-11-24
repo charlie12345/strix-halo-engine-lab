@@ -703,6 +703,15 @@ struct EngineOps {
         spec.at(slot) = {};
         import_done = gs::ImportReport{id, static_cast<std::uint32_t>(gs::ImportStatus::failed), 0};
     }
+    // Sampled drafts (kRunSampleDrafts): the seed draft is drawn from the drafter row of the seed call.
+    void mtp_enter(std::uint32_t r, const gs::WireRow& row, bool from_seed, gs::SampledRun run) {
+        if (from_seed || (run.flags & gs::kRunSampleDrafts) == 0) throw std::logic_error("mtp_enter: sampled seeds come from a step row");
+        mtp_enter(r, row, false);
+        sample_run = run;
+        sample_chunk = 0;
+        kept_drafts.clear();
+        if (!seed->flagged) seed->draft = pick_draft_row(0, seed->p + 1, 0);
+    }
     // Seed from the last step's row r (it produced row.token at row.pos): the drafter pair (h_r, token) at row.pos,
     // as decode_greedy's catch-up does after a verify.
     // from_seed: the C1 decoder takes over the slot's batched-spec drafter seed (its first draft, h' row hp_row).
@@ -749,25 +758,57 @@ struct EngineOps {
     std::uint32_t dec_flags = 0;
     std::uint64_t sample_chunk = 0;
     std::vector<float> sample_local{};
-    void pick_window(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first, std::span<std::uint32_t> ids) {
+    // Lead only, kRunSampleDrafts: the drafts of the open window as drawn (with their distributions), by index.
+    std::vector<strix::TokenDraft> kept_drafts{};
+    bool sample_lead() const {
         const bool lead = sample_run.sampler != nullptr;
         if (lead != (control.rank == 0) || sample_run.ch == nullptr) throw std::logic_error("sampled MTP: the lead holds the sampler");
-        auto& ch = *sample_run.ch;
+        return lead;
+    }
+    // This rank's logits slice of row `row` of the last engine call (verify rows, or the drafter rows after mtp()).
+    std::span<const float> sample_row(std::size_t row) {
         const std::size_t width = eng.vocab_slice();
         sample_local.resize(width);
+        const auto status = hipMemcpy(sample_local.data(), eng.last_logits() + row * width, width * sizeof(float), hipMemcpyDeviceToHost);
+        if (status != hipSuccess) throw std::runtime_error(std::string("sampling logits: ") + hipGetErrorString(status));
+        return std::span<const float>(sample_local);
+    }
+    // Draft `index` of the window, drawn from drafter row `row` of the last mtp() call (pick_pair_draft).
+    std::uint32_t pick_draft_row(unsigned row, std::uint64_t position, unsigned index) {
+        const bool lead = sample_lead();
+        auto& ch = *sample_run.ch;
+        strix::TokenDraft kept;
+        const auto token = sv::pick_pair_draft(lead, ch.paired() ? eng.vocab_slice() : 0U, sampling_vocab, sample_run.sampler, position,
+            [&] { return sample_row(row); },
+            [&](std::span<const float> send, std::span<float> receive) { ch.exchange_sampling_logits(send, receive, sample_chunk++); },
+            [&](std::span<const std::uint32_t> send, std::span<std::uint32_t> receive) {
+                ch.exchange_sampling_words(send, receive, sample_chunk++);
+            },
+            lead ? &kept : nullptr);
+        if (lead) {
+            kept_drafts.resize(index);
+            kept_drafts.push_back(std::move(kept));
+        }
+        return token;
+    }
+    void pick_window(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first, std::span<std::uint32_t> ids) {
+        const bool lead = sample_lead();
+        auto& ch = *sample_run.ch;
+        const std::size_t width = eng.vocab_slice();
         std::vector<strix::TokenDraft> td(drafts.size());
         for (std::size_t i = 0; i < drafts.size(); ++i) {
-            td[i].position = first + i;
+            if (lead && (dec_flags & gs::kRunRejection) != 0) {  // rejection reads the distribution each draft came from
+                if (i >= kept_drafts.size() || kept_drafts[i].token != drafts[i] || kept_drafts[i].position != first + i)
+                    throw std::logic_error("sampled MTP: a rejection window's draft was not drawn by the sampler");
+                td[i] = kept_drafts[i];
+                continue;
+            }
+            td[i].position = first + i;  // coupled: only the draft token is read
             td[i].token = drafts[i];
         }
         const auto tokens = sv::decide_pair_window(lead, ch.paired() ? width : 0, sampling_vocab, sample_run.sampler, first,
             std::span<const strix::TokenDraft>(td), rows,
-            [&](std::size_t row) {
-                const auto status = hipMemcpy(sample_local.data(), eng.last_logits() + row * width,
-                                              width * sizeof(float), hipMemcpyDeviceToHost);
-                if (status != hipSuccess) throw std::runtime_error(std::string("sampling logits: ") + hipGetErrorString(status));
-                return std::span<const float>(sample_local);
-            },
+            [&](std::size_t row) { return sample_row(row); },
             [&](std::span<const float> send, std::span<float> receive) { ch.exchange_sampling_logits(send, receive, sample_chunk++); },
             [&](std::span<const std::uint32_t> send, std::span<std::uint32_t> receive) {
                 ch.exchange_sampling_words(send, receive, sample_chunk++);
@@ -778,7 +819,6 @@ struct EngineOps {
     }
     std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles, gs::SampledRun run) {
         if (dec && dec_flags != run.flags) throw std::logic_error("mtp_run: the open decoder was opened with other sampling flags");
-        if ((run.flags & gs::kRunSampleDrafts) != 0) throw std::logic_error("mtp_run: sampled drafts are not available");
         sample_run = run;
         sample_chunk = 0;
         if (!dec) {
@@ -788,6 +828,9 @@ struct EngineOps {
             if ((run.flags & gs::kRunSample) != 0)
                 pol.pick_targets = [this](std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first,
                                           std::span<std::uint32_t> ids) { pick_window(drafts, rows, first, ids); };
+            if ((run.flags & gs::kRunSampleDrafts) != 0)
+                pol.pick_draft = [this](unsigned row, std::uint64_t position, unsigned index) { return pick_draft_row(row, position, index); };
+            if ((run.flags & gs::kRunRejection) != 0) pol.spec_arbiter = false;  // lookup drafts carry no distribution
             dec_flags = run.flags;
             dec = std::make_unique<sp::GreedyDecoder>(eng, slot, *seed, pol, budget, control);
             dec_slot = slot;
@@ -813,6 +856,7 @@ struct EngineOps {
             dec->finish();
             dec_flags = 0;
             sample_run = {};
+            kept_drafts.clear();
             if (control.rank == 0 && !dec->result().spec_stats.empty())
                 std::fprintf(stderr, "strix-spec-stats %s\n", dec->result().spec_stats.c_str());
             dec.reset();
@@ -827,6 +871,7 @@ struct EngineOps {
         dec.reset();
         dec_flags = 0;
         sample_run = {};
+        kept_drafts.clear();
         seed.reset();
         stager.reset();
     }
@@ -1120,8 +1165,9 @@ int main(int argc, char** argv) {
                         prefill_chunk_mtp ? 1 : 0,
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
             // Sampled requests through MTP at C1 (coupled acceptance; opt-in until its pair gates pass).
-            std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP)\n",
-                        strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP") ? (mtp_on ? "on" : "off (MTP off)") : "off");
+            std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP) sampled-accept=%s (STRIX_GLM_SERVE_SAMPLED_ACCEPT)\n",
+                        strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP") ? (mtp_on ? "on" : "off (MTP off)") : "off",
+                        strix::env_choice("STRIX_GLM_SERVE_SAMPLED_ACCEPT", 0, {"coupled", "rejection"}) == 1 ? "rejection" : "coupled");
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
             // prefill; off unless --rtx-prefill / --import-listen are given).
             std::printf("serve import-route=%s import-listen=%s wire=v%u index-rows=%s identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
@@ -1419,6 +1465,8 @@ int main(int argc, char** argv) {
         lc.mtp = mtp_on;
         lc.sampling = sampling;
         lc.sampled_mtp = strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP");
+        lc.sampled_accept = strix::env_choice("STRIX_GLM_SERVE_SAMPLED_ACCEPT", 0, {"coupled", "rejection"}) == 1
+                                ? strix::SampledAcceptance::rejection : strix::SampledAcceptance::coupled;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;
         lc.kmax = eff.kmax;
@@ -1775,8 +1823,10 @@ int main(int argc, char** argv) {
                                     " slots, " + (serial ? "serial" : "batched") + " decode" +
                                     (mtp_on ? ", MTP self-speculation at C1" : "") +
                                     (g2_on ? " and in the batch" : "") + ", greedy, exact per request" +
-                                    (lead.supports_sampling() ? (lc.sampled_mtp && mtp_on ? "; sampling-v1 through MTP at C1 (coupled, "
-                                                                 "tokens of plain sampling)" : "; sampling-v1 uses plain decode") : "") +
+                                    (lead.supports_sampling() ? (lc.sampled_mtp && mtp_on ? (lc.sampled_accept == strix::SampledAcceptance::coupled
+                                                                 ? "; sampling-v1 through MTP at C1 (coupled, tokens of plain sampling)"
+                                                                 : "; sampling-v1 through MTP at C1 (rejection, exact in distribution)")
+                                                              : "; sampling-v1 uses plain decode") : "") +
                                     (rtx_prefill.empty() ? std::string()
                                                          : std::string("; prompts of >= ") + std::to_string(import_min_tokens) +
                                                                " tokens may take the RTX prefill route (FAST identity glm-pf-rtx-native-v1, wire v" +

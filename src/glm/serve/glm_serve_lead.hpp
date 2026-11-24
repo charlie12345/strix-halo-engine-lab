@@ -170,7 +170,17 @@ struct LeadConfig {
     // row with coupled acceptance (strix::serve::decide_pair_window), so the tokens equal plain sampling of the same seed
     // when verify rows equal plain-step rows bit for bit (gate SP1a). Never in batched verify (G2). Off: plain steps.
     bool sampled_mtp = false;
+    // How a sampled request's drafted rows are decided (STRIX_GLM_SERVE_SAMPLED_ACCEPT): coupled keeps plain sampling's
+    // tokens; rejection (opt-in) is exact in distribution only (its tokens depend on the drafts) and accepts more.
+    strix::SampledAcceptance sampled_accept = strix::SampledAcceptance::coupled;
 };
+
+// The sampled-MTP flags of a request's sampler: drafts are drawn from the drafter rows unless coupled acceptance draws
+// them as the drafter's argmax (below its temperature gate), which the engine's merged argmax already is.
+inline std::uint32_t sampled_run_flags(const strix::TokenSampler& sampler) {
+    const bool argmax_drafts = sampler.coupled() && sampler.draft_policy().top_k == 1U;
+    return kRunSample | (argmax_drafts ? 0U : kRunSampleDrafts) | (sampler.coupled() ? 0U : kRunRejection);
+}
 
 
 // Self-test trace (Lead::set_trace): what happened when, per request (key = its ticket). first: the request's prefill
@@ -490,8 +500,9 @@ private:
             return reject(400, "context_length_exceeded",
                           "prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(cfg_.capacity) + " positions");
         std::optional<strix::TokenSampler> sampler;
-        // Coupled acceptance: a drafted row is decided as without its draft, so sampled MTP keeps plain sampling's tokens.
-        try { sampler = strix::serve::make_pair_sampler(job, strix::SampledAcceptance::coupled); }
+        // Coupled acceptance (default): a drafted row is decided as without its draft, so sampled MTP keeps plain
+        // sampling's tokens; rejection only on request (LeadConfig::sampled_accept).
+        try { sampler = strix::serve::make_pair_sampler(job, cfg_.sampled_accept); }
         catch (const std::invalid_argument& error) { return reject(400, "invalid_request", error.what()); }
         auto lease = runtime().activate(0, true); // retain original queue take timestamp
         const auto slot = table_.alloc();
@@ -1172,8 +1183,15 @@ private:
                 Control e;
                 e.cmd = static_cast<std::uint32_t>(Cmd::mtp_enter);
                 e.pslot = static_cast<std::uint32_t>(r);
+                // sampled drafts: the seed draft is drawn from the drafter row too (the lead's sampler)
+                strix::serve::PairSamplingRow enter_choice;
+                if (a.sampler && (sampled_run_flags(*a.sampler) & kRunSampleDrafts) != 0) {
+                    e.pflags = sampled_run_flags(*a.sampler);
+                    enter_choice.sampler = &*a.sampler;
+                }
                 e.row[0] = {s, a.last, a.pos - 1};  // the step row that produced a.last
-                (void)engine_round(e);
+                (void)engine_round(e, nullptr, enter_choice.sampler ? std::span(&enter_choice, 1) :
+                                   std::span<strix::serve::PairSamplingRow>{});
                 seed_slot_ = static_cast<int>(s);
                 std::lock_guard<std::mutex> l(m_);
                 ++stats_.mtp_enters;
@@ -1189,7 +1207,7 @@ private:
         c.cycles = std::clamp(cfg_.mtp_cycles, 1U, kMaxMtpCycles);
         strix::serve::PairSamplingRow choice;
         if (a.sampler) {
-            c.pflags = kRunSample;
+            c.pflags = sampled_run_flags(*a.sampler);
             choice.sampler = &*a.sampler;
         }
         const auto t0 = Clock::now();

@@ -36,6 +36,10 @@ struct DecodePolicy {
     // rejected draft). accept_greedy then accepts a draft exactly when its row decided it. Empty: greedy (merged argmax).
     std::function<void(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first_position,
                        std::span<std::uint32_t> ids)> pick_targets{};
+    // Sampled drafts (serve, kRunSampleDrafts): both ranks call this after each drafter call whose row `row` becomes
+    // draft `index` of the window (an extension step, or the seed after a catch-up), for the token at `position`; it
+    // returns the draft drawn from that row (the same on both ranks). Empty: the merged argmax draft.
+    std::function<std::uint32_t(unsigned row, std::uint64_t position, unsigned index)> pick_draft{};
 };
 struct CycleRecord {
     std::uint64_t p = 0;

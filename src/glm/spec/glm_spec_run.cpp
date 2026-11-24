@@ -188,7 +188,8 @@ bool GreedyDecoder::cycle() {
         rec.extend += elapsed;
         if (control.on_sample) control.on_sample({2, 1, 0, elapsed});
         if (m.flagged) { disabled = true; break; }
-        drafts.push_back(m.id.at(0));
+        const auto index = static_cast<unsigned>(drafts.size());
+        drafts.push_back(policy.pick_draft ? policy.pick_draft(0, p + 1 + index, index) : m.id.at(0));
         confidences.push_back(m.confidence);
         hp = e.mtp_hidden();
         add_estimate(m.confidence);
@@ -276,7 +277,8 @@ bool GreedyDecoder::cycle() {
         control.observe(10, rec.catchup);
         if (control.on_sample) control.on_sample({3, acc.m + 1, 0, rec.catchup});
         disabled = disabled || m.flagged;
-        set_seed(m.id.at(acc.m), m.confidence);
+        // the next cycle's first draft proposes the token after the new frontier p + acc.rows
+        set_seed(policy.pick_draft && !disabled ? policy.pick_draft(acc.m, p + acc.rows + 1, 0) : m.id.at(acc.m), m.confidence);
         hp = e.mtp_hidden() + static_cast<std::size_t>(acc.m) * 4096;
     }
     p += acc.rows;

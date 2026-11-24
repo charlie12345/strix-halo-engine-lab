@@ -738,8 +738,22 @@ struct SampledFake : FakeEng {
     struct RowAt { std::uint32_t slot; std::uint32_t token; std::uint64_t pos; std::uint64_t x; };
     std::vector<RowAt> last_sampled;  // rows of the last step / prefill call (sample_outputs reads them)
     bool last_prefill = false;
-    std::uint64_t sampled_runs = 0, window_rows = 0;
+    std::uint64_t sampled_runs = 0, window_rows = 0, draft_picks = 0, sampled_enters = 0;
+    std::uint64_t lead_accepted = 0, lead_rejected = 0;
+    bool lead_coupled = true;
     std::uint32_t dec_flags = 0;
+    // the fake drafter's rows: the target's peak a little lower and other noise, so q is close to p but not equal
+    static float draft_logit(std::uint64_t x, std::uint32_t t) {
+        if (t == peak(x)) return 6.0F;
+        const std::uint64_t m = (x ^ (std::uint64_t{t} * 0xD6E8FEB86659FD93ULL)) * 0x94D049BB133111EBULL;
+        return static_cast<float>((m >> 40) % 1000U) / 400.0F;
+    }
+    std::vector<float> draft_slice(std::uint64_t x, bool paired) const {
+        const std::uint32_t lo = paired ? rank * kFakeSlice : 0U, n = paired ? kFakeSlice : kFakeVocab;
+        std::vector<float> v(n);
+        for (std::uint32_t i = 0; i < n; ++i) v[i] = draft_logit(x, lo + i);
+        return v;
+    }
     static std::uint32_t peak(std::uint64_t x) { return static_cast<std::uint32_t>((x >> 13) % kFakeVocab); }
     static float logit(std::uint64_t x, std::uint32_t t) {
         if (t == peak(x)) return 7.0F;
@@ -804,6 +818,11 @@ struct SampledFake : FakeEng {
         }
         FakeEng::mtp_enter(r, w, from_seed);
     }
+    void mtp_enter(std::uint32_t r, const gs::WireRow& w, bool from_seed, gs::SampledRun run) {
+        if (from_seed || (run.flags & gs::kRunSampleDrafts) == 0) throw std::runtime_error("fake sampled mtp_enter: flags");
+        ++sampled_enters;
+        mtp_enter(r, w, from_seed);
+    }
     std::vector<std::uint32_t> mtp_run(std::uint32_t s, std::uint32_t budget, std::uint32_t n, gs::SampledRun run) {
         if (dec && dec_flags != run.flags) throw std::runtime_error("fake sampled mtp_run: flags changed under an open decoder");
         if (!dec) {
@@ -823,21 +842,32 @@ struct SampledFake : FakeEng {
             const unsigned k = std::min(1U + static_cast<unsigned>(h[s] % 3U), remaining - 1U);
             std::vector<std::uint32_t> inputs{dec->last}, drafts, ids;
             std::vector<std::uint64_t> xs{fold(h[s], dec->last)};
+            const std::uint64_t first = frontier[s] + 1;
+            std::vector<strix::TokenDraft> td;
+            std::vector<float> local;
             for (unsigned i = 0; i < k; ++i) {  // the fake drafter: the row's argmax, wrong for a quarter of the states
                 const auto x = xs.back();
-                const std::uint32_t d = ((x >> 17) % 4U) != 0 ? peak(x) : (peak(x) + 1U) % kFakeVocab;
+                std::uint32_t d = ((x >> 17) % 4U) != 0 ? peak(x) : (peak(x) + 1U) % kFakeVocab;
+                strix::TokenDraft kept;
+                if ((run.flags & gs::kRunSampleDrafts) != 0) {  // drawn from the drafter's row on the lead
+                    d = sv::pick_pair_draft(run.sampler != nullptr, paired ? kFakeSlice : 0U, kFakeVocab, run.sampler, first + i,
+                        [&] { local = draft_slice(x, paired); return std::span<const float>(local); },
+                        [&](std::span<const float> a, std::span<float> b) { run.ch->exchange_sampling_logits(a, b, chunk++); },
+                        [&](std::span<const std::uint32_t> a, std::span<std::uint32_t> b) { run.ch->exchange_sampling_words(a, b, chunk++); },
+                        &kept);
+                    ++draft_picks;
+                }
+                if (run.sampler == nullptr || (run.flags & gs::kRunSampleDrafts) == 0) {
+                    kept = strix::TokenDraft{};
+                    kept.token = d;
+                }
+                kept.position = first + i;
+                td.push_back(std::move(kept));
                 drafts.push_back(d);
                 inputs.push_back(d);
                 xs.push_back(fold(x, d));
             }
             for (const auto x : xs) ids.push_back(peak(x));
-            std::vector<strix::TokenDraft> td(drafts.size());
-            const std::uint64_t first = frontier[s] + 1;
-            for (std::size_t i = 0; i < drafts.size(); ++i) {
-                td[i].position = first + i;
-                td[i].token = drafts[i];
-            }
-            std::vector<float> local;
             const auto tokens = sv::decide_pair_window(run.sampler != nullptr, paired ? kFakeSlice : 0U, kFakeVocab, run.sampler,
                 first, td, std::min(k + 1U, remaining),
                 [&](std::size_t r) { local = slice(xs.at(r), paired); return std::span<const float>(local); },
@@ -848,6 +878,11 @@ struct SampledFake : FakeEng {
             const auto acc = strix::glm::spec::accept_greedy(drafts, ids, strix::glm::spec::kNoFlag,
                                                              strix::glm::spec::Terminal{strix::glm::spec::kNoFlag, remaining});
             for (unsigned j = 0; j < acc.rows; ++j) (void)row(s, inputs[j]);
+            if (run.sampler) {
+                lead_accepted = run.sampler->stats().accepted;
+                lead_rejected = run.sampler->stats().rejected;
+                lead_coupled = run.sampler->coupled();
+            }
             for (unsigned j = 0; j < acc.m; ++j) out.push_back(drafts[j]);
             if (acc.has_bonus) out.push_back(acc.bonus);
             dec->emitted += acc.m + (acc.has_bonus ? 1U : 0U);
@@ -868,11 +903,14 @@ struct SampledFake : FakeEng {
 struct SampledServe {
     std::vector<std::vector<std::uint32_t>> tokens;
     std::vector<std::string> log0;
-    std::uint64_t mtp_rounds = 0, sampled_runs = 0, steps = 0, g2_cycles = 0;
+    std::uint64_t mtp_rounds = 0, sampled_runs = 0, steps = 0, g2_cycles = 0, draft_picks = 0, sampled_enters = 0;
+    std::uint64_t lead_accepted = 0, lead_rejected = 0;
+    bool lead_coupled = true;
     std::string error;
 };
 // One pair (loopback) serving `jobs`; sequential = one request at a time (the C1 route), otherwise all queued at once.
-SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool sampled_mtp, bool sequential, bool g2 = false) {
+SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool sampled_mtp, bool sequential, bool g2 = false,
+                           strix::SampledAcceptance accept = strix::SampledAcceptance::coupled) {
     SampledServe out;
     Loopback lb;
     SampledFake e0(4), e1(4);
@@ -899,6 +937,7 @@ SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool samp
     lc.g2 = g2;
     lc.sampling = c0.hello(h, true);
     lc.sampled_mtp = sampled_mtp;
+    lc.sampled_accept = accept;
     try {
         gs::Lead<SampledFake> lead(e0, c0, queue, lc, stop);
         std::thread runner([&] {
@@ -941,6 +980,11 @@ SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool samp
     follower.join();
     out.log0 = e0.log;
     out.sampled_runs = e0.sampled_runs;
+    out.draft_picks = e0.draft_picks;
+    out.sampled_enters = e0.sampled_enters;
+    out.lead_accepted = e0.lead_accepted;
+    out.lead_rejected = e0.lead_rejected;
+    out.lead_coupled = e0.lead_coupled;
     return out;
 }
 
@@ -952,6 +996,32 @@ sv::GenerationJob sampled_job(unsigned i, double temperature, std::uint32_t max_
     j.sampling.seed = 1000U + i;
     j.sampling.seeded = true;
     return j;
+}
+
+void test_sampled_drafts_serve() {
+    // coupled, temperature 0.9 (above the argmax gate): drafts drawn from the drafter rows, tokens of plain sampling
+    std::vector<sv::GenerationJob> hot, cool;
+    for (unsigned i = 0; i < 3; ++i) {
+        hot.push_back(sampled_job(i, 0.9, 40));
+        cool.push_back(sampled_job(i, 0.5, 40));
+    }
+    const auto hot_plain = serve_sampled(hot, false, true), hot_spec = serve_sampled(hot, true, true);
+    CHECK(hot_plain.error.empty() && hot_spec.error.empty() && hot_plain.tokens == hot_spec.tokens);
+    CHECK(hot_spec.draft_picks > 0 && hot_spec.sampled_enters > 0 && hot_spec.lead_accepted > 0);
+    // temperature 0.5 (below the gate): greedy drafts, no drafter row crosses the pair
+    const auto cool_plain = serve_sampled(cool, false, true), cool_spec = serve_sampled(cool, true, true);
+    CHECK(cool_plain.error.empty() && cool_spec.error.empty() && cool_plain.tokens == cool_spec.tokens);
+    CHECK(cool_spec.mtp_rounds > 0 && cool_spec.draft_picks == 0 && cool_spec.sampled_enters == 0);
+    // rejection (opt-in): exact in distribution, not token-equal to plain sampling; every request completes
+    const auto rej = serve_sampled(hot, true, true, false, strix::SampledAcceptance::rejection);
+    CHECK(rej.error.empty() && !rej.lead_coupled && rej.draft_picks > 0 && rej.lead_accepted + rej.lead_rejected > 0);
+    for (const auto& t : rej.tokens) CHECK(t.size() == 40);
+    if (!hot_spec.error.empty() || !cool_spec.error.empty() || !rej.error.empty())
+        std::fprintf(stderr, "sampled drafts errors: %s | %s | %s\n", hot_spec.error.c_str(), cool_spec.error.c_str(), rej.error.c_str());
+    std::printf("sampled drafts: T0.9 coupled == plain (%llu draft picks, %llu accepted), T0.5 no draft exchange, "
+                "rejection completes (%llu accepted / %llu rejected)\n",
+                static_cast<unsigned long long>(hot_spec.draft_picks), static_cast<unsigned long long>(hot_spec.lead_accepted),
+                static_cast<unsigned long long>(rej.lead_accepted), static_cast<unsigned long long>(rej.lead_rejected));
 }
 
 void test_sampled_mtp_serve() {
@@ -1023,9 +1093,11 @@ void test_sampled_mtp_replay() {
     (void)gs::replay(probe, solo, run, none, false, 2, 64);  // the follower runs the same command without a sampler
     CHECK(probe.runs.size() == 2 && probe.runs.at(1).sampler == nullptr && probe.runs.at(1).flags == gs::kRunSample);
     CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64); }, "sampled MTP without a sampler"));
-    run.pflags = gs::kRunSample | 8U;
+    run.pflags = gs::kRunSample | 16U;
     CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice); }, "mtp_run flags"));
     run.pflags = gs::kRunSampleDrafts;  // sampled drafts need sampled targets
+    CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice); }, "mtp_run flags"));
+    run.pflags = gs::kRunSample | gs::kRunRejection;  // rejection needs the drafts' distributions: sampled drafts
     CHECK(throws_with([&] { (void)gs::replay(probe, solo, run, none, true, 2, 64, nullptr, choice); }, "mtp_run flags"));
     gs::Control enter;
     enter.cmd = static_cast<std::uint32_t>(gs::Cmd::mtp_enter);
@@ -1495,6 +1567,7 @@ void prefix_root_sibling() {
 int main(int argc, char** argv) {
     test_sampled_mtp_replay();
     test_sampled_mtp_serve();
+    test_sampled_drafts_serve();
     if (argc == 2 && std::string(argv[1]) == "--prefix-root") {
         prefix_root_sibling();
         return failures == 0 ? 0 : 1;

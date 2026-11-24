@@ -54,6 +54,9 @@ inline constexpr std::uint32_t kPrefixPressure = 16U; // prefix_evict pflags: ev
 // from the drafter's rows too (strix::serve::pick_pair_draft). Both ranks run the same exchanges.
 inline constexpr std::uint32_t kRunSample = 1U;
 inline constexpr std::uint32_t kRunSampleDrafts = 2U;
+// kRunRejection (only with kRunSampleDrafts): the sampler decides drafted rows by rejection sampling (it reads the
+// drafts' distributions; the shared lookup arbiter is off, its drafts have none).
+inline constexpr std::uint32_t kRunRejection = 8U;
 inline constexpr std::uint32_t kEnterSeed = 4U;   // mtp_enter pflags: open the C1 decoder from the slot's batched-spec seed
 inline constexpr std::uint32_t kImportFailed = ~0U;  // import_state's token on a rank whose restore failed
 inline constexpr std::uint32_t kImportDsaOnce = 8U;  // import_state pflags: hand-off v2, rank 0 relays the DSA components to rank 1
@@ -409,7 +412,9 @@ struct SampledRun {
 inline SampledRun sampled_run(const Control& c, Channel& ch, bool sender, std::span<const strix::serve::PairSamplingRow> choices,
                               std::uint32_t other_flags, const char* what) {
     SampledRun run{&ch, nullptr, c.pflags & ~other_flags};
-    if ((run.flags & ~(kRunSample | kRunSampleDrafts)) != 0 || (run.flags == kRunSampleDrafts))
+    const bool drafts = (run.flags & kRunSampleDrafts) != 0, rejection = (run.flags & kRunRejection) != 0;
+    if ((run.flags & ~(kRunSample | kRunSampleDrafts | kRunRejection)) != 0 ||
+        ((drafts || rejection) && (run.flags & kRunSample) == 0) || (rejection && !drafts))
         throw ProtocolError(std::string("control channel: ") + what + " flags");
     if (run.flags != 0 && sender) {
         if (choices.empty() || choices[0].sampler == nullptr) throw std::logic_error("control channel: sampled MTP without a sampler");

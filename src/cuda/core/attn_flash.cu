@@ -126,7 +126,8 @@ __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __n
     }
 }
 
-template <class LY, bool Prepared, bool Bf16Gate = false, bool Bidirectional = false, class Keys = ContiguousFlashKeys>
+template <class LY, bool Prepared, bool Bf16Gate = false, bool Bidirectional = false, class Keys = ContiguousFlashKeys,
+          bool BiasAhead = false>
 __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv,
                                            const __nv_bfloat16* kc, const __nv_bfloat16* vc, std::uint32_t pos0,
                                            std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full,
@@ -203,6 +204,24 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
             if (qrow1 < rows) { m1 = sinks.sink(qrow1, head) * log2e; l1 = q4 == 0 ? 1.0f : 0.0f; }
         }
     }
+    // BiasAhead (a compile-time trait; the host picks the instance per launch): the relative bias of a key tile is
+    // loaded one tile ahead. Same values (score_bias guards the extent and the causal side, qr < rows the row) and the
+    // same arithmetic, but the load latency overlaps the previous tile instead of following this tile's scores. Masked
+    // keys load a value that is never added. BiasAhead = false is the incumbent body (no look-ahead code is emitted).
+    constexpr bool kTileBias = Prepared && !Bidirectional && BiasAhead;
+    [[maybe_unused]] float bias_next[4][4] = {};
+    [[maybe_unused]] const auto load_bias = [&](std::uint32_t key0, float (&dst)[4][4]) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const std::uint32_t kp = key0 + nt * 8 + 2 * q4 + (j & 1);
+                const std::uint32_t qp = j < 2 ? qpos0 : qpos1, qr = j < 2 ? qrow0 : qrow1;
+                dst[nt][j] = qr < rows ? bias.score_bias(qr, head, qp, kp) : 0.0f;
+            }
+    };
+    if constexpr (kTileBias)
+        if (act && ntiles != 0) load_bias(tile_start, bias_next);
 
     std::uint32_t stage_idx = 0;  // t % STAGES
     for (std::uint32_t t = 0; t < ntiles; ++t) {
@@ -235,6 +254,14 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
             const unsigned char* sK = smem + stage;
             const std::uint32_t sV = smem_base + stage;
             float s[4][4];
+            [[maybe_unused]] float bias_tile[4][4];
+            if constexpr (kTileBias) {
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) bias_tile[nt][j] = bias_next[nt][j];
+                if (t + 1 < ntiles) load_bias(tile_start + (t + 1) * KT, bias_next);
+            }
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
 #pragma unroll
@@ -264,6 +291,8 @@ __device__ __forceinline__ void flash_body(AttentionDims d, const float* q, Grou
                             if constexpr (Keys::step) visible = visible && keys.visible(kp);
                             if (!visible) {
                                 v = attn_core::mask::excluded_score;
+                            } else if constexpr (kTileBias) {
+                                v += bias_tile[nt][j] * log2e;
                             } else {
                                 v += bias.score_bias(qr, head, qp, kp) * log2e;
                             }
@@ -377,6 +406,16 @@ void flash_prepared_step_kernel(AttentionDims d, PreparedBf16Flash prepared, con
                          *position, 1U, out, 1U, d.heads, 8, prepared);
 }
 
+// The same step with the relative bias loaded one key tile ahead (prepared_flash_bias_ahead picks it per launch).
+template <class LY>
+__global__ __launch_bounds__(256, 1)
+void flash_prepared_step_bias_ahead_kernel(AttentionDims d, PreparedBf16Flash prepared, const float* q,
+                                           const __nv_bfloat16* kc, const __nv_bfloat16* vc,
+                                           const std::uint32_t* position, float* out) {
+    flash_body<LY, true, false, false, ContiguousFlashKeys, true>(d, q, {1U, d.heads, d.head_dim}, nullptr, {}, kc, vc,
+                                                                 *position, 1U, out, 1U, d.heads, 8, prepared);
+}
+
 template <unsigned Rows, class LY>
 __global__ __launch_bounds__(256, 1) void flash_prepared_step_rows(attn_core::PreparedStepFlash args) {
     const unsigned r = blockIdx.y;
@@ -405,10 +444,11 @@ cudaError_t launch_flash_prepared(const AttentionDims& d, const PreparedBf16Flas
                                  std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream,
                                  const std::uint32_t* device_position) {
     if (device_position) {
-        if (auto e = cudaFuncSetAttribute(flash_prepared_step_kernel<LY>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          smem_bytes<LY>()); e != cudaSuccess) return e;
-        flash_prepared_step_kernel<LY><<<d.heads, 256, smem_bytes<LY>(), stream>>>(
-            d, prepared, q, k_cache, v_cache, device_position, out);
+        const auto kernel = !Bidirectional && prepared_flash_bias_ahead(prepared) ? flash_prepared_step_bias_ahead_kernel<LY>
+                                                                                   : flash_prepared_step_kernel<LY>;
+        if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<LY>()); e != cudaSuccess)
+            return e;
+        kernel<<<d.heads, 256, smem_bytes<LY>(), stream>>>(d, prepared, q, k_cache, v_cache, device_position, out);
         return cudaGetLastError();
     }
     const auto tiles = (rows + QB - 1U) / QB;

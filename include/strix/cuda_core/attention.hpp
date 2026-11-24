@@ -108,6 +108,14 @@ struct PreparedBf16Flash {
     bool bidirectional = false;  // Entire block plus window preceding pos0; no bias or sinks.
 };
 
+// Schedule trait of the one-row prepared step with a device position (scheduling only, SAME bits): the relative bias of
+// the next 32-key tile is loaded while the current tile computes, instead of after its scores. Chosen per launch from the
+// shape alone: a sliding window that lies inside the bias extent, so every visible key reads a bias value. Elsewhere
+// (full causal prefix, a window wider than the extent, no bias table) the incumbent instance runs unchanged.
+[[nodiscard]] inline bool prepared_flash_bias_ahead(const PreparedBf16Flash& p) {
+    return p.relative_bias != nullptr && !p.bidirectional && p.window != 0 && p.window <= p.relative_extent;
+}
+
 // Cache append for the prepared slot-major layout. K/V inputs are contiguous
 // [row][kv_head][dim] FP32 and cache values are rounded to BF16 nearest-even.
 // In wrapped mode, the caller reserves the live window tail as well as these rows.

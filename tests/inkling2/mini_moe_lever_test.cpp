@@ -68,7 +68,8 @@ void test_resolution() {
                                               {"mse", A::nvfp4_mse},
                                               {"mse-gate-up", A::nvfp4_mse_gate_up},
                                               {"mse-r2-gate-up", A::nvfp4_mse_r2_gate_up},
-                                              {"mse-r2", A::nvfp4_mse_r2}}) {
+                                              {"mse-r2", A::nvfp4_mse_r2},
+                                              {"r2", A::nvfp4_r2}}) {
             options.tier = inputs(tier, value);
             require(mini::mini_moe_w4a4_class(mini::resolve_mini_profile(options, true)) == expected,
                     "lever value selects the shared activation class");

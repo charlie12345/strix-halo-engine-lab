@@ -31,7 +31,8 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
 
 // Resolved operand class of the W4A4 expert lever (multi-row prefill chunks run NVFP4 expert layers through the shared
 // grouped W4A4 class on CUDA): 0 = bf16 (off), 1 = nvfp4 (nearest@1), mse = nvfp4_mse, mse-gate-up = nvfp4_mse_gate_up,
-// mse-r2-gate-up = nvfp4_mse_r2_gate_up, mse-r2 = nvfp4_mse_r2 (two-term activation rule r2@1 of moe_core/nvfp4_act_rule.hpp).
+// mse-r2-gate-up = nvfp4_mse_r2_gate_up, mse-r2 = nvfp4_mse_r2 (two-term activation rule r2@1 of moe_core/nvfp4_act_rule.hpp),
+// r2 = nvfp4_r2 (two nearest@1 terms on both projections).
 // Every value but 0 / 1 is a candidate of the route-flip re-qualification, not yet gated.
 inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Resolution& tier) {
     using A = moe_core::grouped_w4a4::Activations;
@@ -42,7 +43,8 @@ inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Re
     if (entry->value == "mse-gate-up") return A::nvfp4_mse_gate_up;
     if (entry->value == "mse-r2-gate-up") return A::nvfp4_mse_r2_gate_up;
     if (entry->value == "mse-r2") return A::nvfp4_mse_r2;
-    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse, mse-gate-up, mse-r2-gate-up or mse-r2");
+    if (entry->value == "r2") return A::nvfp4_r2;
+    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse, mse-gate-up, mse-r2-gate-up, mse-r2 or r2");
 }
 
 // Resolved state of the W4A4 expert lever (true: multi-row prefill chunks run NVFP4 expert layers as W4A4 on CUDA).

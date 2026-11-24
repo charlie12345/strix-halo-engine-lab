@@ -162,7 +162,10 @@ void correctness(std::mt19937& rng) {
         unsigned assignments = 0;
         for (const auto& t : tiles_spec) assignments += t.rows;
         std::vector<float> tokens(std::size_t{kTokens} * K);
-        for (auto& v : tokens) v = normal(rng) * (1.F + static_cast<float>(byte(rng) % 7));
+        for (auto& v : tokens) {  // two sequenced draws: the fixture's inputs (and digests) must not depend on the compiler
+            const float n = normal(rng);
+            v = n * (1.F + static_cast<float>(byte(rng) % 7));
+        }
         std::vector<std::uint32_t> index(assignments);
         for (auto& i : index) i = static_cast<std::uint32_t>(byte(rng)) % kTokens;
         // device operands

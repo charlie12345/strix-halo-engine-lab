@@ -40,6 +40,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " KV and history bytes per slot " << slot_bytes
               << " profile " << mini_profile_name(opt.tier)
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
+              << " prefill_route " << (cohort->prefill_emits_first() ? "emits-first" : "plain")
               << " weight_storage " << weights.storage.name << '@' << weights.storage.revision
 #if !defined(__HIPCC__)
               << " cohort_programs " << (programs.enabled ? "on" : "off")

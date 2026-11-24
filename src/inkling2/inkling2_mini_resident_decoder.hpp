@@ -165,6 +165,24 @@ public:
 #endif
     }
 
+    // Served emits-first prefill (serve/fixed_kv_cohort.hpp): the lane reads its WHOLE prompt by prefill and its first id
+    // comes from the final prompt row, as prefill() does for the CLI session; the final scores are row 0
+    // (read_slot_logits). The decoder serves this route only while a W4A4 class is bound (prefill_emits_first, read once
+    // when the cohort is built): the final prompt token is then a prefill row on both entry points, so a served lane
+    // quantises exactly the prompt rows of the CLI session. Otherwise the incumbent prefill_slot route serves.
+    [[nodiscard]] std::uint32_t prefill_slot_first(std::uint32_t slot, std::span<const std::uint32_t> ids, bool first) {
+        if (first) reset_slot(slot);
+        auto& state = slots_.at(slot)->state();
+        validate_inputs(state, ids, {});
+        last_logit_rows_ = 0U;
+        const auto top = state.append_sequence(ids, [&](std::span<const unsigned> chunk, bool last) {
+            return append(state, chunk, last, {});
+        }, prefill_rows_, tail_rows_);
+        last_logit_rows_ = 1U;
+        return top;
+    }
+    [[nodiscard]] bool prefill_emits_first() const noexcept { return backend_.moe_w4a4_bound(); }
+
     void prefill_slot(unsigned slot, std::span<const unsigned> ids, bool first) {
         if (first) reset_slot(slot);
         auto& state = slots_.at(slot)->state();

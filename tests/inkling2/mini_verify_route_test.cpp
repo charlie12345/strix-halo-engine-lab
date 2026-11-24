@@ -31,6 +31,33 @@ constexpr bool check_routes() {
 
 static_assert(check_routes());
 
+// The prompt-row rule of a bound W4A4 class: every prefill row runs the class (a one-row prefill chunk on the grouped
+// route, so a lone prompt row or a singleton tail is quantised like a row of a wide chunk); decode and verify rows never
+// do and keep their routes; with no class bound every route is the incumbent one.
+constexpr bool check_w4a4_rows() {
+    using strix::inkling2::mini_resident_chunk_route;
+    using strix::inkling2::mini_w4a4_rows;
+    for (bool packed : {false, true}) {
+        for (unsigned rows = 1; rows <= 128U; rows = rows * 2U + 1U) {
+            for (auto kind : {MiniAppendKind::prefill, MiniAppendKind::decode, MiniAppendKind::verify}) {
+                const auto incumbent = mini_resident_route(kind, rows, packed, false);
+                const auto off = mini_resident_chunk_route(kind, rows, packed, false);
+                const auto on = mini_resident_chunk_route(kind, rows, packed, true);
+                if (mini_w4a4_rows(false, kind) || mini_w4a4_rows(true, kind) != (kind == MiniAppendKind::prefill))
+                    return false;
+                if (off.attention_rows != incumbent.attention_rows || off.packed_moe != incumbent.packed_moe ||
+                    off.step_graph != incumbent.step_graph || on.attention_rows != incumbent.attention_rows ||
+                    on.step_graph != incumbent.step_graph)
+                    return false;
+                if (on.packed_moe != (kind == MiniAppendKind::prefill ? false : incumbent.packed_moe)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+static_assert(check_w4a4_rows());
+
 struct Shape {
     static constexpr unsigned kQueryWidth = 4U;
     static constexpr unsigned kKvWidth = 2U;

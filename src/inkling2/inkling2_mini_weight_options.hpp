@@ -3,6 +3,10 @@
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
 namespace strix::inkling2 {
 
 struct MiniWeightOptions {
@@ -51,6 +55,29 @@ inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Re
 inline bool mini_moe_w4a4(const profile::Resolution& tier) {
     return mini_moe_w4a4_class(tier) != moe_core::grouped_w4a4::Activations::bf16;
 }
+
+// The W4A4 class a run on `backend` ("hip", "cuda") executes. Only the CUDA backend holds the grouped W4A4 tile: a
+// selected class that the backend cannot run is refused, never replaced by the BF16 tile under the class's name. Every
+// entry point (generation CLI, gate, step program, server) admits through here before it reports or binds the class.
+inline moe_core::grouped_w4a4::Activations admit_mini_moe_w4a4(moe_core::grouped_w4a4::Activations activations,
+                                                                std::string_view backend) {
+    if (activations != moe_core::grouped_w4a4::Activations::bf16 && backend != "cuda")
+        throw std::invalid_argument(std::string("STRIX_INK_MOE_W4A4 selects ") +
+                                    moe_core::grouped_w4a4::identity(activations) + ": the " + std::string(backend) +
+                                    " backend has no grouped W4A4 tile (CUDA only); select 0 to run the BF16 tile");
+    return activations;
+}
+
+inline moe_core::grouped_w4a4::Activations admit_mini_moe_w4a4(const profile::Resolution& tier, std::string_view backend) {
+    return admit_mini_moe_w4a4(mini_moe_w4a4_class(tier), backend);
+}
+
+// Backend of this translation unit's device build, for the entry points compiled once per backend.
+#if defined(__HIPCC__)
+inline constexpr std::string_view kMiniBuildBackend = "hip";
+#else
+inline constexpr std::string_view kMiniBuildBackend = "cuda";
+#endif
 
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);

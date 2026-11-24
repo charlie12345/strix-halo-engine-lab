@@ -423,6 +423,35 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         socket_startup(*factory, backend, sample_capable);
     }
 }
+
+// A selected W4A4 class on the HIP backend (no W4A4 tile there) is refused before any device work: the server never
+// starts a BF16 run whose startup line reports the class.
+void hip_refuses(const char* root, W4a4 selected) {
+    sv::ServiceFactories factories;
+    bool created = false;
+    mini::MiniServeBackends backends;
+    backends.hip = [&](const mini::MiniServeOptions&) -> mini::MiniServeCohort {
+        created = true;
+        throw std::logic_error("HIP adapter constructed for a W4A4 class");
+    };
+    mini::install_mini_service(factories, std::move(backends),
+        [](const std::string&) {
+            return sv::BpeTokenizer::from_parts({"a", "b"}, {1, 1}, {}, "o200k");
+        },
+        [](const sv::Json&, const sv::Json&, const sv::Json&) { return std::string("a"); });
+    const char* args[]{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
+                       "--checkpoint", "MODEL.safetensors", "--backend", "hip",
+                       "--profile", "fast", "--speculation", "off"};
+    std::vector<std::string> strings(std::begin(args), std::end(args));
+    std::vector<char*> argv;
+    for (auto& arg : strings) argv.push_back(arg.data());
+    std::ostringstream out, error;
+    const auto rc = sv::run(static_cast<int>(argv.size()), argv.data(), factories, out, error, {});
+    require(rc != 0 && !created, "HIP served a selected W4A4 class");
+    require(error.str().find(strix::moe_core::grouped_w4a4::identity(selected)) != std::string::npos &&
+                error.str().find("CUDA only") != std::string::npos,
+            "HIP refusal does not name the W4A4 class");
+}
 } // namespace
 
 int main(int argc, char** argv) try {
@@ -442,7 +471,10 @@ int main(int argc, char** argv) try {
                                           std::pair{"r2", W4a4::nvfp4_r2}}) {
         set_w4a4_env(value);
         wiring(argv[1], "cuda", false, false, expected);
+        hip_refuses(argv[1], expected);
     }
+    set_w4a4_env("0");
+    wiring(argv[1], "hip", false);  // the off switch still serves HIP
     set_w4a4_env(nullptr);
     return 0;
 } catch (const std::exception& error) {

@@ -7,7 +7,7 @@ en el par de dos nodos. Un [runtime de visión compartido](shared-cores.es.md#lo
 | Modelo | Entrada de imágenes |
 |---|---|
 | DeepSeek V4.1 | sí, en el par, con `--vision` |
-| GLM-5.3 Flash | borrador: `strix-glm5-rank --embed-rows` y `strix-glm5-serve --vision`, torre en CPU; la ruta de dispositivo aún no se ha ejecutado |
+| GLM-5.3 Flash | borrador: `strix-glm5-rank --embed-rows` y `strix-glm5-serve --vision`, torre en CPU; el servidor funciona en el par (dos imágenes bien respondidas), `--embed-rows` aún sin ejecutar |
 | Qwen, MiniMax, Gemma | todavía no |
 
 ## Uso
@@ -46,8 +46,10 @@ MTP), no entran en la caché de prefijos ni en la ruta RTX y rechazan `session_i
 
 Estado: el adaptador, la herramienta, la mitad de host del servidor y el protocolo del par (con un motor simulado)
 están probados en el host con ficheros de proyector sintéticos. La mitad de dispositivo (`Engine::set_embed_rows` en
-el prefill normal y en el de MTP, `--embed-rows`, el `main` del servidor) se escribió sin toolchain HIP y no está compilada ni ejecutada;
-el fichero de proyector real no se ha ejecutado. Detalles, coste en CPU y límites: [versión en inglés](vision.md#glm-53-flash).
+el prefill normal y en el de MTP, `--embed-rows`, el `main` del servidor) compila para gfx1151 y, en un par (2026-11-24,
+un cable USB4), el servidor funciona con el fichero de proyector real (`mmproj-F16.gguf`): dos imágenes sintéticas se
+respondieron bien, voraz y muestreado. Aún sin ejecutar: `strix-glm5-rank --embed-rows`, imágenes que ocupen varios
+trozos o unidades de prefill, y la identidad de un prompt de texto frente a la build anterior en el dispositivo. Detalles, coste en CPU y límites: [versión en inglés](vision.md#glm-53-flash).
 
 ## Ruta de datos
 

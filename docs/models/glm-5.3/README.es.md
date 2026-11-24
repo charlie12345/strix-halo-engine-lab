@@ -116,8 +116,12 @@ el prefill del prompt:
 El servidor acepta partes `image_url` de las peticiones de chat con `--vision MMPROJ.gguf` en el rank 0; codifica cada
 imagen nueva en su CPU y envía las filas al rank 1 una sola vez.
 
-Borrador: la mitad de host está probada con ficheros de proyector sintéticos y un motor simulado; la mitad de
-dispositivo está escrita pero no compilada ni ejecutada, y no se ha comprobado ninguna respuesta sobre una imagen.
+Borrador: la mitad de host está probada con ficheros de proyector sintéticos y un motor simulado. En el par
+(2026-11-24, gfx1151, un cable USB4) la mitad de dispositivo compila y se ejecuta con el fichero de proyector real
+(`mmproj-F16.gguf`, `glm5v`): con `strix-glm5-serve --vision` se respondieron bien dos imágenes sintéticas (mitades
+roja | azul; un círculo relleno junto a un cuadrado solo con contorno), voraz y muestreado, 5-8 s por petición. Aún sin
+ejecutar: `strix-glm5-rank --embed-rows`, imágenes que ocupen varios trozos o unidades de prefill, y la identidad de un
+prompt de texto frente a la build anterior.
 Órdenes, estado y límites: [entrada de imágenes](../../engine/vision.es.md#glm-53-flash).
 
 <a id="glm-serve"></a>

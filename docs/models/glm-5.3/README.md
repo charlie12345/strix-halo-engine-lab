@@ -110,8 +110,11 @@ tower runs on the CPU ahead of the run and the ranks splice its rows into the pr
 The server takes `image_url` parts of chat requests with `--vision MMPROJ.gguf` on rank 0; it encodes each new
 image on its CPU and sends the rows to rank 1 once.
 
-Draft: the host half is tested on synthetic projector files and a fake engine; the device half is written but not
-compiled or run, and no answer on an image has been checked. Commands, status and limits:
+Draft: the host half is tested on synthetic projector files and a fake engine. On the pair (2026-11-24, gfx1151,
+one USB4 cable) the device half compiles and runs with the real projector file (`mmproj-F16.gguf`, `glm5v`): through
+`strix-glm5-serve --vision`, two synthetic images were answered correctly (red | blue halves; a filled circle beside
+an outlined square), greedy and sampled, 5-8 s per request. Not run yet: `strix-glm5-rank --embed-rows`, images
+large enough to span prefill chunks or units, and text-prompt identity against the previous build. Commands, status and limits:
 [image input](../../engine/vision.md#glm-53-flash); the adapter and its gate:
 [vision adapters](../../engine/vision-adapters.md#glm-53-flash).
 

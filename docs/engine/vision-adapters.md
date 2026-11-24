@@ -269,11 +269,11 @@ storage) and the eight images of `images`, on one x86 host, CPU only.
 | Preprocessing against the reference row below, 32 file x image cases | canvas sizes equal, normalised pixels bit-equal |
 | FP32 rows against the reference row below, 32 cases | row cosine at least 0.99989, relative L2 at most 5.6e-3 |
 | `--reference-f16-conv` arm against the reference row below, 32 cases | row cosine at least 0.9999999, relative L2 at most 1.2e-4 |
-| The real projector file | **not run** |
+| The real projector file | run on the pair through the server (`mmproj-F16.gguf`, 2026-11-24); not compared against the reference row |
 | Server host half (`glm5-serve-vision`): file to bridge to interned rows, embed frame lead to follower, both ranks' chunk resolution | pass: identical tokens and row bytes on both ranks for chunks that cut a span; an image's rows travel once |
 | Pair protocol on a fake engine (`strix-glm5-serve-cpu-tests --image-only`): whole prompt, chunks beside a decoding request, MTP, prefill units | pass: the same tokens in every arm, equal call logs on both ranks, no prefix cache entry, `session_id` refused |
-| Device splice into the GLM prefill (`Engine::set_embed_rows` in `prefill` and `prefill_mtp`, `--embed-rows`, `apps/glm_serve_main.cpp`) | **not compiled or run** (written without a HIP toolchain); host tests cover the row ownership, the drafter's row shift and the protocol only |
-| Language model answers on images | **not run** |
+| Device splice into the GLM prefill (`Engine::set_embed_rows` in `prefill` and `prefill_mtp`, `--embed-rows`, `apps/glm_serve_main.cpp`) | compiles for gfx1151; the server path runs on the pair (whole short image prompts); `--embed-rows`, prompts that span chunks or units, and text-prompt identity against the previous build **not run** |
+| Language model answers on images | pass on two synthetic images, greedy and sampled (red \| blue halves: "The left side is red and the right side is blue."; filled circle beside an outlined square: "A solid black filled circle sits on the left, while an unfilled square outline appears on the right.") |
 
 Reference row (same machine): llama.cpp `fd24ee2`, the `mtmd` library built for the CPU backend, `glm5v` projector,
 its image preprocessor and `encode_image` with flash attention off, on the same file and the same RGB pixels.
@@ -402,6 +402,7 @@ element) and is allocated in `set_embed_rows`, never inside a prefill.
   apply is a protocol error for the pair. Image prompts take no prefix cache entry (handles are process-local, so
   a key of virtual ids means nothing on the other rank), no root store, no RTX route and no session.
 
-Status: written without a HIP toolchain; not compiled, not run. Identity for text prompts is by construction (no
-splice: nothing is launched or uploaded and no kernel of the text path is changed) and still has to be shown on
-the device (tokens, logits and state digest of a text prompt against the previous build).
+Status: compiles for gfx1151; the server path runs on a pair (2026-11-24) and answers images correctly (see the gate
+table). Identity for text prompts is by construction (no splice: nothing is launched or uploaded and no kernel of the
+text path is changed) and still has to be shown on the device (tokens, logits and state digest of a text prompt
+against the previous build).

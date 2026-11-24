@@ -9,7 +9,7 @@ has an image tower adapter, a command-line path and a server path that are writt
 | Model | Image input |
 |---|---|
 | DeepSeek V4.1 | yes, on the pair, behind `--vision` |
-| GLM-5.3 Flash | draft: `strix-glm5-rank --embed-rows` and `strix-glm5-serve --vision`, tower on the CPU; the device path is not yet run |
+| GLM-5.3 Flash | draft: `strix-glm5-rank --embed-rows` and `strix-glm5-serve --vision`, tower on the CPU; the server runs on the pair (two images answered correctly), `--embed-rows` not yet run |
 | Qwen, MiniMax, Gemma | not yet |
 
 ## Use
@@ -68,9 +68,11 @@ prefix cache and the RTX prefill route, and refuse `session_id`. `--vision` need
 
 Status: the adapter, the tool, the server's host half and the pair protocol (on a fake engine) are tested on the
 host against synthetic projector files ([gate status](vision-adapters.md#gate-status)). The device half
-(`Engine::set_embed_rows` in the plain and the MTP prefill, `--embed-rows`, the server main) was written without a
-HIP toolchain and is not compiled or run; the real projector file is not run; no answer of the language model on an
-image has been checked.
+(`Engine::set_embed_rows` in the plain and the MTP prefill, `--embed-rows`, the server main) compiles for gfx1151 and,
+on a pair (2026-11-24, one USB4 cable), the server runs with the real projector file (`mmproj-F16.gguf`): two
+synthetic images were answered correctly, greedy and sampled (red | blue halves; a filled circle beside an outlined
+square; 5-8 s per request). Not run yet: `strix-glm5-rank --embed-rows`, images that span several prefill chunks or
+units, and text-prompt identity against the previous build on the device.
 
 Cost of the CPU tower: the host reference accumulates in FP64 and is slow by design. On a synthetic tower of width
 1024 with 4 blocks (MLP 4096) and a projector of width 4096, on a 4-thread x86 host: 20.9 s for 1,024 patches (a

@@ -182,6 +182,54 @@ inline hipError_t enqueue_bf16_operand_image(const float* input, unsigned width,
     return hipGetLastError();
 }
 
+// The image routes of the shared tile on gfx11 (backend data, measured at 8,192 rows, K 2,304: FP32 route 0.150 ms per
+// 128-column tile, packed K64 0.109 ms, image pass 0.48 ms -> the image pays from ~12 packed tiles in one call; 16 kept).
+inline constexpr ImageRoutePolicy kImageRoutePolicy{kPackedImageMinRows, f16_tile_gemm::ImageProjectionSchedule::kStageK,
+                                                    f16_tile_gemm::kBN, 16U * f16_tile_gemm::kBN};
+inline constexpr std::size_t kImageRouteMaxProjections = 8U;
+
+// enqueue_bf16_rows for every projection of one call on the same FP32 rows (any count, consecutive runs of kGroupMax),
+// where a call at prefill height with enough whole-tile columns stores the rows' BF16 operand image once (in image, at
+// least rows x input_width u16, 16-byte aligned) and runs the packed K64 schedule (pitched weights included), the K32
+// image tile for the narrow contiguous rest and the FP32 rows for what neither reads. Every output keeps the bits
+// enqueue_bf16_rows stores; a call the plan keeps on its rows makes the launches enqueue_bf16_rows makes.
+inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_width, unsigned rows,
+                                           std::span<const Bf16RowProjection> projections, unsigned max_outputs,
+                                           std::span<std::uint16_t> image, hipStream_t stream) {
+    const auto fp32_rows = [&]() {
+        return for_each_bf16_projection_group<kGroupMax>(projections, hipSuccess, [&](auto group) {
+            return enqueue_bf16_rows(input, input_width, rows, group, max_outputs, stream);
+        });
+    };
+    ImageRoute routes[kImageRouteMaxProjections]{};
+    if (!input || !image.data() || projections.size() > kImageRouteMaxProjections || input_width == 0U ||
+        input_width % 8U != 0U ||
+        image.size() / input_width < rows || reinterpret_cast<std::uintptr_t>(input) % 16U != 0U ||
+        reinterpret_cast<std::uintptr_t>(image.data()) % 16U != 0U ||
+        !plan_image_routes(kImageRoutePolicy, input_width, rows, projections, max_outputs, routes,
+                           [&](const Bf16RowProjection& projection) {
+                               return admits_bf16_image_projections(input_width, rows, {&projection, 1U}, max_outputs);
+                           }))
+        return fp32_rows();
+    if (const auto status = enqueue_bf16_operand_image(input, input_width, rows, image.data(), stream);
+        status != hipSuccess)
+        return status;
+    const auto natural = std::size_t{input_width} * sizeof(std::uint16_t);
+    return for_each_image_route_run<kGroupMax>(projections, std::span<const ImageRoute>(routes, projections.size()),
+        input_width, hipSuccess, [&](ImageRoute route, std::span<const Bf16RowProjection> run) {
+            if (route == ImageRoute::fp32_rows)
+                return enqueue_bf16_rows(input, input_width, rows, run, max_outputs, stream);
+            if (route == ImageRoute::image)
+                return enqueue_bf16_image_rows(image.data(), input_width, rows, run, max_outputs, stream);
+            f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> group{};
+            for (const auto& projection : run)
+                group.append({projection.weights, projection.outputs, projection.output, projection.round_bf16});
+            const auto pitch = run.front().row_bytes != 0U ? run.front().row_bytes : natural;
+            return f16_tile_gemm::gemm_bf16_projections_image_packed(image.data(), rows, input_width, group, stream,
+                                                                     pitch / sizeof(std::uint16_t));
+        });
+}
+
 // The [forget, gain] pair of a low-rank controller with the controller as the tile epilogue:
 // output[r][n] = controller_mix(current[r][n], message[r][n], forget sum, gain sum), the same bits as
 // enqueue_bf16_rows (FP32 sums) followed by the pointwise controller. hipErrorNotSupported where the shared WMMA tile

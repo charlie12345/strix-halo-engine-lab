@@ -430,15 +430,20 @@ constexpr bool admits_packed_image_projections(unsigned K, const Bf16ProjectionG
     return true;
 }
 
-// gemm_bf16_projections_image through the packed-operand core under ImageProjectionSchedule (contiguous weights).
+// gemm_bf16_projections_image through the packed-operand core under ImageProjectionSchedule. Every weight row of the
+// group starts w_ld elements after the previous one (0 = K, contiguous); a pitched row (w_ld > K, w_ld % 8 == 0 so each
+// 16-value tile stays one 32-byte load) changes only the addresses, not the operands or the chain.
 template <unsigned Capacity>
 inline hipError_t gemm_bf16_projections_image_packed(const std::uint16_t* a16, unsigned rows, unsigned K,
-                                                     const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream) {
-    if (rows == 0U || !admits_packed_image_projections(K, group)) return hipErrorInvalidValue;
+                                                     const Bf16ProjectionGroup<Capacity>& group, hipStream_t stream,
+                                                     std::size_t w_ld = 0U) {
+    if (w_ld == 0U) w_ld = K;
+    if (rows == 0U || !admits_packed_image_projections(K, group) || w_ld < K || w_ld % 8U != 0U)
+        return hipErrorInvalidValue;
     unsigned outputs = 0U;
     for (unsigned p = 0; p < group.count; ++p) outputs = std::max(outputs, group.projections[p].outputs);
     using Binding = Bf16ImageProjections<Capacity>;
-    const typename Binding::Args args{a16, K, rows, K, group};
+    const typename Binding::Args args{a16, w_ld, rows, K, group};
     const unsigned slices = (rows + ImageProjectionSchedule::kRows - 1U) / ImageProjectionSchedule::kRows;
     return gemm_packed_bf16<Binding, ImageProjectionSchedule>(args, K, outputs, group.count, stream, slices);
 }

@@ -165,9 +165,72 @@ bool check_exact_operand_planes() {
 
 }  // namespace
 
+// The image route plan: whole-tile projections (pitched included) go packed, narrow contiguous ones to the image tile,
+// what neither reads keeps the FP32 rows; a call below the height or the packed-column bar keeps every FP32 route; runs
+// keep call order per route and split on the group limit, the rounding class and the row pitch.
+static bool check_image_routes() {
+    using strix::core::Bf16RowProjection;
+    using strix::core::ImageRoute;
+    using R = ImageRoute;
+    constexpr strix::core::ImageRoutePolicy policy{1024U, 64U, 128U, 2048U};
+    constexpr unsigned K = 2304U;
+    constexpr unsigned kWide = 1U << 20U;
+    const auto* w = std::bit_cast<const std::uint16_t*>(std::uintptr_t{0x10000U});
+    const auto* odd = std::bit_cast<const std::uint16_t*>(std::uintptr_t{0x10008U});
+    auto* y = std::bit_cast<float*>(std::uintptr_t{0x20000U});
+    const auto image_admits = [](const Bf16RowProjection& p) {  // the image tile: contiguous 16-byte aligned rows
+        return p.weights != nullptr && p.contiguous(K) && std::bit_cast<std::uintptr_t>(p.weights) % 16U == 0U;
+    };
+    // q 3072, relative 384, sink 24, o-like pitched 2304 (6400 B rows, rounded), a misaligned 128 (FP32), k 1024.
+    const std::array<Bf16RowProjection, 6> call{{{w, 3072U, y, false, 0U}, {w, 384U, y, false, 0U},
+        {w, 24U, y, false, 0U}, {w, 2304U, y, true, 6400U}, {odd, 128U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    std::array<ImageRoute, 8> routes{};
+    if (!strix::core::plan_image_routes(policy, K, 8192U, call, kWide, routes, image_admits)) return false;
+    if (routes[0] != R::packed || routes[1] != R::packed || routes[2] != R::image || routes[3] != R::packed ||
+        routes[4] != R::fp32_rows || routes[5] != R::packed)
+        return false;
+    std::vector<std::pair<R, std::vector<unsigned>>> runs;
+    const auto record = [&](R route, std::span<const Bf16RowProjection> run) {
+        std::vector<unsigned> widths;
+        for (const auto& p : run) widths.push_back(p.outputs);
+        runs.emplace_back(route, widths);
+        return Status::ok;
+    };
+    // Runs: packed [q, rel] then [o] (pitch + round change) then [k]; image [sink]; fp32 [misaligned].
+    if (strix::core::for_each_image_route_run<3U>(call, routes, K, Status::ok, record) != Status::ok) return false;
+    if (runs != decltype(runs){{R::packed, {3072U, 384U}}, {R::packed, {2304U}}, {R::packed, {1024U}},
+                               {R::image, {24U}}, {R::fp32_rows, {128U}}})
+        return false;
+    // Group limit: 4 packed projections in runs of 3 + 1.
+    const std::array<Bf16RowProjection, 4> four{{{w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U},
+        {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    runs.clear();
+    if (!strix::core::plan_image_routes(policy, K, 4096U, four, kWide, routes, image_admits) ||
+        strix::core::for_each_image_route_run<3U>(four, routes, K, Status::ok, record) != Status::ok ||
+        runs != decltype(runs){{R::packed, {1024U, 1024U, 1024U}}, {R::packed, {1024U}}})
+        return false;
+    const auto all_fp32 = [&](std::size_t n) {
+        return std::all_of(routes.begin(), routes.begin() + static_cast<std::ptrdiff_t>(n),
+                           [](R r) { return r == R::fp32_rows; });
+    };
+    // Narrow calls ([k], [k, k_taps]) stay on FP32: 1,024 packed columns < 2,048.
+    const std::array<Bf16RowProjection, 2> narrow{{{w, 1024U, y, false, 0U}, {w, 32U, y, false, 0U}}};
+    if (strix::core::plan_image_routes(policy, K, 8192U, narrow, kWide, routes, image_admits) || !all_fp32(2U))
+        return false;
+    // Below the height, K off the stage, outputs above max_outputs (1,408 packed columns left), too few route slots.
+    if (strix::core::plan_image_routes(policy, K, 1023U, call, kWide, routes, image_admits) || !all_fp32(6U))
+        return false;
+    if (strix::core::plan_image_routes(policy, K + 32U, 8192U, call, kWide, routes, image_admits) || !all_fp32(6U))
+        return false;
+    if (strix::core::plan_image_routes(policy, K, 8192U, call, 2048U, routes, image_admits) || !all_fp32(6U))
+        return false;
+    std::array<ImageRoute, 2> few{};
+    return !strix::core::plan_image_routes(policy, K, 8192U, call, kWide, few, image_admits);
+}
+
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
-        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes()) {
+        !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() || !check_image_routes()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

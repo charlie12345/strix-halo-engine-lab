@@ -7,12 +7,14 @@
 //   3. whenever the overflow / non-finite guard passes, every incumbent logit is finite.
 // It prints the mean candidate counts (the screen's tightness) for Gaussian-like and peaked rows.
 #include "core/screened_head.hpp"
+#include "core/screened_head_plan.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <random>
 #include <span>
@@ -183,6 +185,82 @@ void softcap_monotone_host() {
     }
 }
 
+void rescore_plan_tests() {
+    namespace plan = strix::core::screened_head_plan;
+    // The order key is monotone over every non-NaN float (bf16 grid, both zeros, both infinities).
+    std::vector<float> grid;
+    for (std::uint32_t b = 0; b < 65536U; ++b) {
+        const float f = strix::weight::scalar_float::u2f(b << 16U);
+        if (!std::isnan(f)) grid.push_back(f);
+    }
+    std::sort(grid.begin(), grid.end());
+    for (std::size_t i = 1; i < grid.size(); ++i)
+        if (grid[i] > grid[i - 1]) expect(plan::order_key(grid[i]) > plan::order_key(grid[i - 1]), "order key monotone");
+    // The threshold selects the exact top-k plus the rows sharing the k-th key's 24-bit prefix, never fewer than k.
+    std::mt19937 rng(11U);
+    std::normal_distribution<float> normal(0.0F, 3.0F);
+    for (const unsigned k : {1U, 2U, 64U, 300U}) {
+        for (unsigned trial = 0; trial < 4U; ++trial) {
+            std::vector<float> s(5003U);
+            for (auto& v : s) v = normal(rng);
+            if (trial == 1U) std::fill(s.begin() + 100, s.begin() + 900, s[0]);  // a block of equal scores
+            if (trial == 2U) s[17] = std::numeric_limits<float>::quiet_NaN();    // NaN: the largest key
+            const auto t = plan::rescore_threshold(s, k);
+            expect((t & 0xffU) == 0U, "threshold low byte clear", t);
+            std::vector<std::uint32_t> keys(s.size());
+            std::transform(s.begin(), s.end(), keys.begin(), [](float v) { return plan::order_key(v); });
+            std::vector<std::uint32_t> sorted = keys;
+            std::sort(sorted.begin(), sorted.end(), std::greater<>{});
+            expect(t == (sorted[k - 1U] & ~0xffU), "threshold = k-th key prefix", t, sorted[k - 1U]);
+            unsigned selected = 0U, above = 0U;
+            for (const auto key : keys) {
+                selected += key >= t ? 1U : 0U;
+                above += key > sorted[k - 1U] ? 1U : 0U;
+            }
+            expect(selected >= k && above < k, "selection holds the exact top-k", selected, above);
+            for (const auto key : keys)
+                if (key >= t) expect((key >> 8U) >= (sorted[k - 1U] >> 8U), "selected rows share or pass the prefix");
+        }
+    }
+    expect(plan::rescore_threshold(std::vector<float>(40U, 1.0F), 64U) == 0U, "fewer rows than k: every row");
+    // Scratch layout: 256-byte parts, the cleared prefix ends where the ids start.
+    const auto l = plan::rescore_layout(200058U, plan::kCapacity, 16U);
+    expect(l.hist % 256U == 0U && l.ids % 256U == 0U && l.y % 256U == 0U && l.cleared == l.ids, "rescore layout parts");
+    expect(l.hist >= 16U * sizeof(plan::RescoreState) && l.bytes >= l.y + 16U * 200058U * 4U, "rescore layout sizes");
+    expect(plan::rescore_blocks(200058U) == 98U && plan::rescore_blocks(1U) == 1U &&
+               plan::rescore_blocks(1U << 30U) == 128U,
+           "rescore blocks");
+    // Launch contract (host-side pointers stand in for device pointers: only values and alignment are checked).
+    alignas(256) static std::uint8_t scratch[256];
+    alignas(16) static std::uint16_t weights[8];
+    alignas(16) static float x[64];
+    static float scores[64];
+    const plan::RescoreLaunch ok{{weights, 32U, 8U, 30.0F}, x, scores, scratch, 2U, 8U, 32U, 4U, 16U, 64U};
+    expect(plan::rescore_launch_valid(ok), "valid rescore launch");
+    auto bad = ok;
+    bad.k = 0U;
+    expect(!plan::rescore_launch_valid(bad), "k 0");
+    bad = ok;
+    bad.capacity = 3U;
+    expect(!plan::rescore_launch_valid(bad), "capacity < k");
+    bad = ok;
+    bad.head.softcap = 0.0F;
+    expect(!plan::rescore_launch_valid(bad), "softcap 0");
+    bad = ok;
+    bad.pitch = 31U;
+    expect(!plan::rescore_launch_valid(bad), "pitch < rows");
+    bad = ok;
+    bad.x_stride = 6U;
+    expect(!plan::rescore_launch_valid(bad), "x stride < width");
+    bad = ok;
+    bad.head.width = 6U;
+    bad.x_stride = 8U;
+    expect(!plan::rescore_launch_valid(bad), "width not a multiple of 4");
+    bad = ok;
+    bad.scratch = scratch + 16;
+    expect(!plan::rescore_launch_valid(bad), "scratch alignment");
+}
+
 void builder_tests() {
     expect(sh::plane_layout(2304U, 4U).row_bytes == 1296U, "layout 2304x4");
     expect(sh::plane_layout(2304U, 8U).row_bytes == 2448U, "layout 2304x8");
@@ -255,6 +333,7 @@ void builder_tests() {
 int main() {
     builder_tests();
     softcap_monotone_host();
+    rescore_plan_tests();
     const Scenario scenarios[] = {
         {"gaussian", 1500, 256, 0.02F, 1.0F, 0.0F, false, false, 1.0F},
         {"gaussian-k2304", 1200, 2304, 0.02F, 1.0F, 0.0F, false, false, 1.0F},

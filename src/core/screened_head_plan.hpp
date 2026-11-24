@@ -3,13 +3,16 @@
 // the launch-argument contract and the resident-screen build logic (shape admission, host plane, bound, scratch size).
 // No HIP or CUDA type appears here: a backend contributes only kernel bodies and its allocator / copy calls
 // (core/hip_screened_head.hpp, cuda/core/head_screened.cuh). The math and the invariant are in core/screened_head.hpp.
+// The rescore trait (end of this file) is the FAST form: exact rows for the largest scores of an approximate head.
 #include "core/screened_head.hpp"
 #include "strix/env_flags.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <thread>
@@ -231,5 +234,89 @@ private:
     std::vector<unsigned> candidates_;
     std::size_t fallbacks_ = 0;
 };
+
+// ---- Rescore trait: exact rows for the largest scores of an approximate head (a screen, not a bound). ----
+// Input: scores [lanes][pitch] already written by an approximate head (e.g. a low-bit image of the same rows) with the
+// head's post-transform applied. Per lane the trait selects S = { i : key(s_i) >> 8 >= key(s_(k)) >> 8 }, where key is
+// the order-preserving key below and s_(k) the k-th largest score: every row of the exact top-k plus the rows sharing
+// the k-th one's 24-bit key prefix (so S never depends on the visit order). Each row of S is recomputed from the
+// incumbent BF16 rows with the incumbent tight-row body and the incumbent post-transform, and written back in place:
+// a selected row holds the bits of the full incumbent head; every other row keeps its approximate score. |S| > capacity
+// (degenerate scores: many equal keys) recomputes every row, i.e. the incumbent head. Not EXACT: the order of the
+// approximate scores decides S. The selection is two passes of 12-bit digits (key >> 20, then (key >> 8) & 0xfff).
+inline constexpr unsigned kRescoreBins = 4096U;
+inline constexpr unsigned kRescoreMaxK = 4096U;
+
+constexpr std::uint32_t order_key(float v) noexcept {
+    const auto b = std::bit_cast<std::uint32_t>(v);
+    return (b & 0x80000000U) != 0U ? ~b : (b | 0x80000000U);
+}
+
+// The selection threshold of one lane (host reference of the device digits): the k-th largest key with its low 8 bits
+// cleared; 0 (every row) when the lane has fewer than k rows.
+inline std::uint32_t rescore_threshold(std::span<const float> scores, unsigned k) {
+    if (k == 0U || scores.size() < k) return 0U;
+    std::vector<std::uint32_t> keys(scores.size());
+    std::transform(scores.begin(), scores.end(), keys.begin(), [](float v) { return order_key(v) >> 8U; });
+    const auto nth = keys.begin() + static_cast<std::ptrdiff_t>(k - 1U);
+    std::nth_element(keys.begin(), nth, keys.end(), std::greater<>{});
+    return *nth << 8U;
+}
+
+// Per lane state: the first digit, the rank still needed inside it, the threshold key, the selected count.
+struct RescoreState {
+    unsigned digit, need, key, count;
+};
+static_assert(sizeof(RescoreState) == 16U, "rescore state is four 32-bit words");
+
+// Scratch: RescoreState[lanes] | hist[lanes][2][kRescoreBins] | ids[lanes][capacity] | y[lanes][max(capacity, rows)].
+// The state and histogram parts (`cleared` bytes from the start) are zeroed by every enqueue before its first launch.
+struct RescoreLayout {
+    std::size_t hist, ids, y, cleared, bytes;
+    std::size_t hist_stride, ids_stride, y_stride;
+};
+constexpr RescoreLayout rescore_layout(unsigned rows, unsigned capacity, unsigned lanes) noexcept {
+    const auto up = [](std::size_t v) { return (v + 255U) / 256U * 256U; };
+    RescoreLayout l{};
+    l.hist_stride = 2U * kRescoreBins;
+    l.ids_stride = up(std::size_t{capacity} * 4U) / 4U;
+    l.y_stride = up(std::size_t{rows > capacity ? rows : capacity} * 4U) / 4U;
+    l.hist = up(std::size_t{lanes} * sizeof(RescoreState));
+    l.ids = l.hist + std::size_t{lanes} * l.hist_stride * 4U;
+    l.cleared = l.ids;
+    l.y = l.ids + std::size_t{lanes} * l.ids_stride * 4U;
+    l.bytes = l.y + std::size_t{lanes} * l.y_stride * 4U;
+    return l;
+}
+
+// Blocks per lane of the histogram and compaction passes (each thread visits 8 rows of a 256-thread block).
+constexpr unsigned rescore_blocks(unsigned rows) noexcept {
+    const unsigned blocks = (rows + 2047U) / 2048U;
+    return blocks == 0U ? 1U : (blocks > 128U ? 128U : blocks);
+}
+
+// One enqueue of the rescore trait over `lanes` rows of scores (all pointers are device pointers).
+struct RescoreLaunch {
+    HeadSpec head;          // incumbent BF16 rows and the post-transform cap (> 0)
+    const float* x;         // activations [lanes][x_stride], 16-byte aligned
+    float* scores;          // [lanes][pitch]: approximate scores in, selected rows replaced in place
+    std::uint8_t* scratch;  // rescore_layout(head.rows, capacity, lanes).bytes
+    unsigned lanes, x_stride, pitch, k, capacity;
+    unsigned pass2_blocks = 1024U;
+};
+
+inline bool rescore_launch_valid(const RescoreLaunch& a) noexcept {
+    const auto aligned = [](const void* p, std::uintptr_t n) {
+        return p != nullptr && reinterpret_cast<std::uintptr_t>(p) % n == 0U;
+    };
+    if (a.lanes == 0U || a.lanes > kMaxLanes || a.k == 0U || a.k > kRescoreMaxK || a.capacity < a.k ||
+        a.capacity > kCapacity || a.pass2_blocks == 0U)
+        return false;
+    if (a.head.rows == 0U || a.head.width == 0U || a.head.width > kMaxWidth || a.head.width % 4U != 0U ||
+        !(a.head.softcap > 0.0F) || !std::isfinite(a.head.softcap))
+        return false;
+    if (a.pitch < a.head.rows || (a.lanes > 1U && (a.x_stride < a.head.width || a.x_stride % 4U != 0U))) return false;
+    return aligned(a.head.weights, 16U) && aligned(a.x, 16U) && aligned(a.scores, 4U) && aligned(a.scratch, 256U);
+}
 
 }  // namespace strix::core::screened_head_plan

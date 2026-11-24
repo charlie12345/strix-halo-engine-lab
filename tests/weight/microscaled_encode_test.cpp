@@ -4,6 +4,7 @@
 // error and the reported error matches a recomputation; (5) malformed inputs throw.
 #include "strix/weight/formats/microscaled_encode.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -129,6 +130,65 @@ void malformed() {
     expect(threw, "inconsistent or NaN MXFP8 throws");
 }
 
+// (6) A MXFP8 expert slab read from its source: every expert equals the one-matrix transcode, the bytes do not depend on
+// the thread count, the device-style binding matches a checkpoint NVFP4 slab (strides, outer per expert, row order), a
+// NVFP4 slab and a NaN source are refused.
+void slab(std::mt19937& rng) {
+    namespace w = strix::weight;
+    constexpr std::size_t experts = 5, rows = 6, cols = 128;
+    std::vector<std::uint8_t> bytes(experts * rows * cols + experts * rows * cols / 32U);
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::uniform_int_distribution<int> e(116, 126);
+    const std::size_t code_bytes = experts * rows * cols;
+    for (std::size_t i = 0; i < code_bytes; ++i) bytes[i] = sf::e4m3_encode(nd(rng) * 32.0F);
+    for (std::size_t i = code_bytes; i < bytes.size(); ++i) bytes[i] = static_cast<std::uint8_t>(e(rng));
+    const auto source = w::memory_source(std::as_bytes(std::span(bytes)));
+    const ms::ExpertSlabView view{ms::MatrixFormat::mxfp8, ms::RowOrder::interleaved_halves, experts, rows, cols,
+                                  {source, {0, code_bytes}}, {source, {code_bytes, bytes.size() - code_bytes}}, {}, {}};
+    ms::Nvfp4Slab one, many;
+    expect(static_cast<bool>(ms::transcode_slab_to_nvfp4(view, one, 1U)), "slab transcode, one thread");
+    expect(static_cast<bool>(ms::transcode_slab_to_nvfp4(view, many, 3U)), "slab transcode, three threads");
+    expect(one.codes == many.codes && one.scales == many.scales && one.outer == many.outer, "thread-count invariant");
+    double sse = 0.0, energy = 0.0;
+    for (std::size_t x = 0; x < experts; ++x) {
+        const std::span<const std::uint8_t> codes(bytes.data() + x * rows * cols, rows * cols);
+        const std::span<const std::uint8_t> scales(bytes.data() + code_bytes + x * rows * cols / 32U, rows * cols / 32U);
+        const auto m = ms::transcode_mxfp8_to_nvfp4(codes, scales, rows, cols);
+        expect(std::equal(m.codes.begin(), m.codes.end(), one.codes.begin() + static_cast<std::ptrdiff_t>(x * one.code_stride())),
+               "expert codes equal the matrix transcode");
+        expect(std::equal(m.scales.begin(), m.scales.end(),
+                          one.scales.begin() + static_cast<std::ptrdiff_t>(x * one.scale_stride())),
+               "expert scales equal the matrix transcode");
+        expect(m.outer == one.outer[x], "outer per expert");
+        sse += m.error.sse;
+        energy += m.error.energy;
+    }
+    expect(one.error.sse == sse && one.error.energy == energy, "slab error is the expert sum in order");
+    std::printf("slab relative RMS error %.4f\n", one.error.relative());
+
+    // Binding: strides and metadata of a checkpoint NVFP4 slab of the same geometry.
+    std::vector<ms::PackedMatrix> matrices(experts);
+    expect(static_cast<bool>(one.bind_storage(one.codes, one.scales, matrices)), "bind");
+    for (std::size_t x = 0; x < experts; ++x) {
+        const auto& m = matrices[x];
+        expect(m.codes == one.codes.data() + x * rows * cols / 2U && m.block_scales == one.scales.data() + x * rows * cols / 16U &&
+                   m.rows == rows && m.columns == cols && m.outer_scale == one.outer[x] &&
+                   m.row_order == ms::RowOrder::interleaved_halves,
+               "binding layout");
+    }
+    expect(!one.bind_storage(std::span(one.codes).first(one.codes.size() - 1U), one.scales, matrices), "short storage refused");
+
+    ms::Nvfp4Slab refused;
+    ms::ExpertSlabView fp4 = view;
+    fp4.format = ms::MatrixFormat::nvfp4;
+    expect(!ms::transcode_slab_to_nvfp4(fp4, refused), "NVFP4 slab refused");
+    bytes[3 * rows * cols + 7] = 0x7F;  // E4M3 NaN in expert 3 (memory_source keeps its own copy: a new source)
+    ms::ExpertSlabView nan_view = view;
+    nan_view.codes.source = nan_view.block_scales.source = w::memory_source(std::as_bytes(std::span(bytes)));
+    const auto status = ms::transcode_slab_to_nvfp4(nan_view, refused, 2U);
+    expect(!status && refused.codes.empty(), "NaN source refused, output untouched");
+}
+
 }  // namespace
 
 int main() {
@@ -137,6 +197,7 @@ int main() {
     mse_rule(rng);
     transcode(rng);
     malformed();
+    slab(rng);
     std::printf("%s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }

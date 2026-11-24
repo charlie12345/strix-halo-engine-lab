@@ -177,8 +177,21 @@ void registered_controls_resolve_builtin() {
                 check(!entry || !strix::profile::applied(entry->status) || entry->value == entry->lever->builtin,
                     "a registered control without a speed row keeps its builtin");
             }
-            if (const auto* prune = r.find("moe_route_prune"))
-                check(!strix::profile::applied(prune->status) || prune->value == "off", "unmeasured prune candidate stays off");
+            if (const auto* prune = r.find("moe_route_prune")) {
+                const bool cap9 = strix::profile::applied(prune->status) && prune->value == "cap9";
+                check(cap9 == (tier == pr::Name::turbo), "cap9 runs in turbo at a measured 8K prompt, never in exact or fast");
+            }
+            // Outside the measured bands (unknown serving length, short and very long prompts) turbo keeps FAST's prune.
+            for (const std::uint64_t context : {std::uint64_t{0}, std::uint64_t{2048}, std::uint64_t{65536}}) {
+                input.regime = {strix::profile::Phase::prefill, context, 1, "gfx1151"};
+                const auto outside = pr::resolve(tier, input);
+                if (const auto* prune = outside.find("moe_route_prune"))
+                    check(!strix::profile::applied(prune->status) || prune->value == "off", "unmeasured regime keeps the prune off");
+            }
+            // Another device class is never covered by the gfx1151 rows.
+            input.regime = {strix::profile::Phase::prefill, 8192, 1, "sm_120"};
+            if (const auto* prune = pr::resolve(tier, input).find("moe_route_prune"))
+                check(!strix::profile::applied(prune->status) || prune->value == "off", "unmeasured device keeps the prune off");
         }
     }
     const pr::Lever* recipe = nullptr;

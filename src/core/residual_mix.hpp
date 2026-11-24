@@ -927,19 +927,22 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
     // the operand bits its FP32 staging makes of the same values), the pair stores only that image: half the operand
     // bytes written and read, the same latent bits. The backend admits the shape before any launch.
     bool image = false;
+#if defined(__HIPCC__)
     if constexpr (requires {
                       { operations.admits_dense_bf16_image(stride, rows) } -> std::same_as<bool>;
                       operations.dense_bf16_image(static_cast<const std::uint16_t*>(nullptr), stride, rows, down);
-                  })
+                  }) {
         image = operations.admits_dense_bf16_image(stride, rows);
-    if (image) {
-        auto* const operand_image = reinterpret_cast<std::uint16_t*>(operands.data());
-        detail::normalize_pair_image<<<grid, detail::kThreads, 0, stream>>>(
-            normalize.operands[0], normalize.operands[1], operand_image, operand_image + width);
-        operations.check(detail::last_error());
-        if constexpr (requires { operations.dense_bf16_image(operand_image, stride, rows, down); })
+        if (image) {
+            auto* const operand_image = reinterpret_cast<std::uint16_t*>(operands.data());
+            detail::normalize_pair_image<<<grid, detail::kThreads, 0, stream>>>(
+                normalize.operands[0], normalize.operands[1], operand_image, operand_image + width);
+            operations.check(detail::last_error());
             operations.dense_bf16_image(operand_image, stride, rows, down);
-    } else {
+        }
+    }
+#endif
+    if (!image) {
         detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
             normalize.operands[0], normalize.operands[1]);
         operations.check(detail::last_error());

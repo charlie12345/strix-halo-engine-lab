@@ -23,8 +23,12 @@ struct ReplicaEndpoint {
 };
 // "host:port" or "http://host:port[/]". nullopt when malformed.
 [[nodiscard]] std::optional<ReplicaEndpoint> parse_replica_endpoint(std::string_view text);
-// A policy-validated router counts endpoints as ranks and load slots: the same host:port twice is one worker, not two.
-// Host names compare case-insensitively; std::invalid_argument names the repeated endpoint.
+// The comparison key of a replica host: a numeric address in one spelling (IPv4 in any inet_aton form -> a.b.c.d;
+// IPv6 -> eight lowercase hex groups, an IPv4-mapped address -> its IPv4 form; a zone id kept, URI "%25" read as "%"),
+// a host name lowercased without a trailing dot. Names are not resolved: two names of one listener still count twice.
+[[nodiscard]] std::string canonical_replica_host(std::string_view host);
+// A policy-validated router counts endpoints as ranks and load slots: the same listener twice is one worker, not two.
+// Hosts compare by canonical_replica_host; std::invalid_argument names the repeated endpoint.
 void require_distinct_replicas(const std::vector<ReplicaEndpoint>& replicas);
 
 struct ReplicaProxyConfig {

@@ -271,12 +271,36 @@ void run() {
             return list;
         };
         require_distinct_replicas(endpoints({"http://node-a:18196", "http://node-b:18196", "http://node-a:18197"}));
+        // distinct listeners stay distinct: other addresses, other ports, other zones, a zone vs none
+        require_distinct_replicas(endpoints({"http://[::1]:18196", "http://[::2]:18196", "http://[::1]:18197",
+                                             "http://127.0.0.1:18196", "http://[fe80::1%eth0]:18196",
+                                             "http://[fe80::1%eth1]:18196", "http://[fe80::1]:18196"}));
         for (const auto& repeated : {endpoints({"http://node-a:18196", "http://node-a:18196"}),
-                                     endpoints({"node-a:18196", "http://NODE-A:18196/"})}) {
+                                     endpoints({"node-a:18196", "http://NODE-A:18196/"}),
+                                     endpoints({"node-a:18196", "node-a.:18196"}),
+                                     // one IPv6 listener in equivalent spellings, bracketed with and without a scheme
+                                     endpoints({"http://[::1]:18196", "http://[0:0:0:0:0:0:0:1]:18196"}),
+                                     endpoints({"[::1]:18196", "http://[0000:0::0001]:18196/"}),
+                                     endpoints({"[2001:DB8::A]:18196", "[2001:db8:0:0:0:0:0:a]:18196"}),
+                                     // zone ids: the URI form %25 names the same interface
+                                     endpoints({"http://[fe80::1%eth0]:18196", "http://[FE80::1%25eth0]:18196"}),
+                                     // an IPv4-mapped address reaches the IPv4 listener
+                                     endpoints({"http://127.0.0.1:18196", "http://[::ffff:127.0.0.1]:18196"}),
+                                     endpoints({"http://[::ffff:7f00:1]:18196", "127.0.0.1:18196"}),
+                                     // numeric IPv4 forms getaddrinfo reads as one address
+                                     endpoints({"127.0.0.1:18196", "127.1:18196"}),
+                                     endpoints({"10.0.0.2:18196", "0x0a.0.0.02:18196"})}) {
             bool refused = false;
             try { require_distinct_replicas(repeated); } catch (const std::invalid_argument&) { refused = true; }
-            require(refused, "a repeated replica endpoint is refused");
+            require(refused, ("a repeated replica endpoint is refused: " + repeated[0].host + " / " + repeated[1].host).c_str());
         }
+        require(canonical_replica_host("[0:0:0:0:0:0:0:1]") == "0:0:0:0:0:0:0:1" &&
+                    canonical_replica_host("::ffff:10.1.2.3") == "10.1.2.3" &&
+                    canonical_replica_host("fe80::1%25eth0") == "fe80:0:0:0:0:0:0:1%eth0" &&
+                    canonical_replica_host("Node-A.") == "node-a" && canonical_replica_host("1::2::3") == "1::2::3" &&
+                    canonical_replica_host("1:2:3:4:5:6:7:8:9") == "1:2:3:4:5:6:7:8:9" &&
+                    canonical_replica_host("::1.2.3") == "::1.2.3",
+                "canonical replica hosts (malformed IPv6 text stays a name)");
     }
 }
 

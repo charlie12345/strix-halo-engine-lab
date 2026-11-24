@@ -25,6 +25,13 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     // sigmoid-gated product; the shared BF16 rows entry then runs the tall chain on one plane with the same bits.
     core::Bf16Operand operand = core::Bf16Operand::fp32;
 
+    bool linear_admitted(const float* input, unsigned width, unsigned rows,
+                         std::span<const MiniAttentionLinear> views) const {
+        return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, true, [&](auto group) {
+            return cuda_core::detail::valid_bf16_dense_row_group({input, width, group}, rows, arithmetic);
+        });
+    }
+
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {
@@ -46,6 +53,12 @@ struct MiniPreparedCudaProjectionBatch : MiniPreparedCudaBackend {
     mutable std::array<MiniAttentionLinear, core::rows::kMaxJobs> projections{};
     mutable std::array<cuda_core::Bf16DenseRowGroup, core::rows::kMaxJobs> groups{};
     mutable std::size_t projection_count = 0, group_count = 0;
+
+    bool linear_admitted(const float* input, unsigned width, unsigned rows,
+                         std::span<const MiniAttentionLinear> views) const {
+        return rows == row_count && views.size() <= projections.size() - projection_count &&
+               MiniPreparedCudaBackend::linear_admitted(input, width, rows, views);
+    }
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         if (rows != row_count || views.size() > projections.size() - projection_count) return invalid;

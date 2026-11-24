@@ -19,7 +19,8 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Bf16Proj
     static_assert(!(kA16 && (kHalfTail || kGated)));
     constexpr Layout L = Layout::NK;
 #elif defined(STRIX_F16_TILE_Q8)
-template <unsigned Capacity>
+// Staging: the Q8_0 block decoder, or a low-bit storage decoder of the same interface (core/lowbit_f16_staging.hpp).
+template <unsigned Capacity, class Staging = q8_f16_staging::Q8F16Staging>
 __device__ __forceinline__ void q8_core(const Args& p, Storage& lds, const Q8ProjectionGroup<Capacity>& group) {
     constexpr bool kA16 = false;
 #else
@@ -101,8 +102,7 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #elif defined(STRIX_F16_TILE_Q8)
     const unsigned wc = (tid >> 1U) % kProjectionPanel;
     const std::uint8_t* wp = wc < left ? projection.weights + std::size_t{col0 + wc} * p.w_ld : nullptr;
-    using Staging = q8_f16_staging::Q8F16Staging;
-    Staging::Raw rb;
+    typename Staging::Raw rb;
 #elif defined(STRIX_F16_TILE_PLAIN_BF16)
     // Inactive columns stage a valid weight row. Only live columns store.
     const unsigned wc = (tid >> 1U) % kProjectionPanel;
@@ -248,6 +248,12 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #endif
     };
     Float8 acc[2][4] = {};
+#if defined(STRIX_F16_TILE_Q8)
+    // Group-scaled staging (low-bit codes): each kGroupK group is a WMMA chain from +0 into sum, then
+    // acc = fma(sum, d, acc) with the column's group scale (the small-M schedule's arithmetic).
+    constexpr bool kGroupScaled = detail::group_scaled<Staging>;
+    [[maybe_unused]] detail::LowBitGroup sum[2][4] = {};
+#endif
     load(0U);
     for (unsigned k0 = 0; k0 < p.K; k0 += kBK) {
         __syncthreads();  // every wave finished reading the previous stage
@@ -257,6 +263,15 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
 #if defined(STRIX_F16_TILE_PACKED_OPERANDS) || defined(STRIX_F16_TILE_PROJECTIONS)
         // Keep the block-wide staging barriers for inactive waves.
         if (live_tiles == 0) continue;
+#endif
+#if defined(STRIX_F16_TILE_Q8)
+        if constexpr (kGroupScaled) {
+            if (k0 % Staging::kGroupK == 0U)
+#pragma unroll
+                for (unsigned m = 0; m < 2U; ++m)
+#pragma unroll
+                    for (unsigned t = 0; t < 4U; ++t) sum[m][t] = {};
+        }
 #endif
 #pragma unroll
         for (unsigned u = 0; u < 2U; ++u) {
@@ -288,10 +303,33 @@ __device__ __forceinline__ void core(const Args& p, Storage& lds, const Store& s
                             __builtin_bit_cast(ops::Frag, fa[m]), __builtin_bit_cast(ops::Frag, fb[t]), acc[m][t]);
                     }
 #else
+#if defined(STRIX_F16_TILE_Q8)
+                    {
+                        if constexpr (kGroupScaled)
+                            sum[m][t].add(fa[m], fb[t]);
+                        else
+                            acc[m][t] = STRIX_HIP_WMMA_F16(
+                                __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
+                    }
+#else
                     acc[m][t] = STRIX_HIP_WMMA_F16(
                         __builtin_bit_cast(Half16, fa[m]), __builtin_bit_cast(Half16, fb[t]), acc[m][t]);
 #endif
+#endif
         }
+#if defined(STRIX_F16_TILE_Q8)
+        if constexpr (kGroupScaled) {
+            if ((k0 + kBK) % Staging::kGroupK == 0U) {
+#pragma unroll
+                for (unsigned t = 0; t < 4U; ++t) {
+                    const float d = Staging::scale(&lds.b[64U * wn + 16U * t + c][0]);
+#pragma unroll
+                    for (unsigned m = 0; m < 2U; ++m)
+                        if (m < live_tiles) sum[m][t].apply(d, acc[m][t]);
+                }
+            }
+        }
+#endif
     }
 #endif
     // acc[m][t][j] -> row 32 wm + 16 m + 2 j + lane / 16, column 64 wn + 16 t + lane % 16 (packed: row 16 kRT wm + 16 m +

@@ -70,7 +70,7 @@ struct MiniResidentGqaBackend : Base {
 
     Status linear(const float* input, unsigned width, unsigned rows,
                   std::span<const core::ResidentRowProjection> views) const {
-        return core::dispatch_resident_rows<MiniProjectionWeights::role_count>(views, success, invalid,
+        return core::dispatch_resident_rows<MiniProjectionWeights::role_count>(input, width, rows, views, success, invalid,
             [&](std::span<const MiniAttentionLinear> group) {
                 return Base::linear(input, width, rows, group);
             },
@@ -81,6 +81,12 @@ struct MiniResidentGqaBackend : Base {
                     , this->big_context
 #endif
                 );
+            },
+            [&](std::span<const MiniAttentionLinear> group) {
+                return Base::linear_admitted(input, width, rows, group);
+            },
+            [&](std::span<const core::ResidentRowProjection> group) {
+                return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(input, width, rows, group);
             });
     }
 

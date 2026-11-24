@@ -357,9 +357,11 @@ public:
     }
 
 #if !defined(__HIPCC__)
-    // The shared controller declares its BF16-rounded operands: the tall chain runs one activation plane (same bits).
+    // The shared controller declares its BF16-rounded operands: the tall chain runs one activation plane (same bits)
+    // where the weight load proved the controller's bound (finite weights, sums kept finite); otherwise FP32 operands.
     void dense(const float* input, unsigned width, unsigned rows, std::span<const Projection> projections,
                core::Bf16Operand operand) {
+        if (!weights_.controller_operands_bounded()) operand = core::Bf16Operand::fp32;
         check(cuda_core::enqueue_bf16_dense_rows(input, width, rows, projections, stream_, cuda_core::DenseArith::mma3,
                                                  big_context_.get(), nullptr, operand));
     }

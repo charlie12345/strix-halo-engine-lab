@@ -535,7 +535,9 @@ private:
         MiniTextWeights source;
         const auto status = source.open(path);
         if (!status) throw std::runtime_error(status.detail);
-        return MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule());
+        auto plan = MiniResidentWeightPlan::make(source, storage, MiniResidentBackend::resident_row_pitch_rule());
+        plan.admit_controller_operands(source);
+        return plan;
     }
 
     [[nodiscard]] MiniResidentWeights upload_weights() {

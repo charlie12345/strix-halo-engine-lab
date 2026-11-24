@@ -252,7 +252,7 @@ inline bool plan_bf16_image_call(unsigned input_width, unsigned rows, std::span<
 }
 
 // The image (rows x input_width u16) is written before the first projection launch and read by the last one: its bytes
-// may share no byte with the input rows, a weight matrix or an output of the call.
+// may share no byte with the input rows (when stored), a weight matrix or an output of the call.
 inline bool bf16_image_disjoint(const float* input, unsigned input_width, unsigned rows,
                                 std::span<const Bf16RowProjection> projections, const std::uint16_t* image) noexcept {
     const auto lo = reinterpret_cast<std::uintptr_t>(image);
@@ -262,7 +262,7 @@ inline bool bf16_image_disjoint(const float* input, unsigned input_width, unsign
         return start + bytes <= lo || hi <= start;
     };
     const auto natural = std::size_t{input_width} * sizeof(std::uint16_t);
-    if (!apart(input, std::uintptr_t{rows} * input_width * sizeof(float))) return false;
+    if (input && !apart(input, std::uintptr_t{rows} * input_width * sizeof(float))) return false;
     return std::ranges::all_of(projections, [&](const Bf16RowProjection& projection) {
         const auto pitch = projection.row_bytes != 0U ? projection.row_bytes : natural;
         return apart(projection.weights, projection.outputs * pitch) &&
@@ -272,6 +272,7 @@ inline bool bf16_image_disjoint(const float* input, unsigned input_width, unsign
 
 // The launches of a planned call: fp32_rows runs read the FP32 rows, image and packed runs read image (the operand
 // image of input for the routed entry; any BF16 rows for a fixture that checks which launch served a projection).
+// input is null when a producer stored only the image (every route then reads it; an fp32_rows run is refused).
 inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t* image, unsigned input_width,
                                         unsigned rows, std::span<const Bf16RowProjection> projections,
                                         unsigned max_outputs, std::span<const ImageRoute> routes, hipStream_t stream) {
@@ -279,7 +280,8 @@ inline hipError_t run_bf16_image_routes(const float* input, const std::uint16_t*
     return for_each_image_route_run<kGroupMax>(projections, routes, input_width, hipSuccess,
         [&](ImageRoute route, std::span<const Bf16RowProjection> run) {
             if (route == ImageRoute::fp32_rows)
-                return enqueue_bf16_rows(input, input_width, rows, run, max_outputs, stream);
+                return input ? enqueue_bf16_rows(input, input_width, rows, run, max_outputs, stream)
+                             : hipErrorNotSupported;
             if (route == ImageRoute::image)
                 return enqueue_bf16_image_rows(image, input_width, rows, run, max_outputs, stream);
             f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> group{};
@@ -313,6 +315,33 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
         status != hipSuccess)
         return status;
     return detail::run_bf16_image_routes(input, image.data(), input_width, rows, projections, max_outputs,
+                                         std::span<const ImageRoute>(routes, projections.size()), stream);
+}
+
+// Whether enqueue_bf16_rows_routed would read every projection of this call from the operand image (no FP32 run): a
+// producer may then store the image itself (its bits = bf16_encode of the FP32 rows) and call
+// enqueue_bf16_rows_from_image instead of writing the FP32 rows.
+inline bool bf16_rows_read_image(unsigned input_width, unsigned rows, std::span<const Bf16RowProjection> projections,
+                                 unsigned max_outputs, std::span<const std::uint16_t> image) {
+    ImageRoute routes[kImageRouteMaxProjections]{};
+    if (!detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes)) return false;
+    return std::none_of(routes, routes + projections.size(), [](ImageRoute route) {
+        return route == ImageRoute::fp32_rows;
+    });
+}
+
+// enqueue_bf16_rows_routed after a producer stored the call's operand image: the same launches without the image pass,
+// the same bits. hipErrorNotSupported (nothing launched) when the plan keeps any projection on FP32 rows;
+// hipErrorInvalidValue when the image shares a byte with a weight or an output of the call.
+inline hipError_t enqueue_bf16_rows_from_image(std::span<const std::uint16_t> image, unsigned input_width,
+                                               unsigned rows, std::span<const Bf16RowProjection> projections,
+                                               unsigned max_outputs, hipStream_t stream) {
+    if (!bf16_rows_read_image(input_width, rows, projections, max_outputs, image)) return hipErrorNotSupported;
+    if (!detail::bf16_image_disjoint(nullptr, input_width, rows, projections, image.data()))
+        return hipErrorInvalidValue;
+    ImageRoute routes[kImageRouteMaxProjections]{};
+    detail::plan_bf16_image_call(input_width, rows, projections, max_outputs, image, routes);
+    return detail::run_bf16_image_routes(nullptr, image.data(), input_width, rows, projections, max_outputs,
                                          std::span<const ImageRoute>(routes, projections.size()), stream);
 }
 

@@ -15,6 +15,7 @@
 #include "strix/hip/legacy_launch.hpp"
 
 #include "core/fma_bf16_rows.hpp"
+#include "core/row_transforms.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -297,6 +298,59 @@ int main(int argc, char** argv) {
             for (auto* p : img.outputs) require(hipFree(p), "free");
         }
         for (auto* w : weights) require(hipFree(w), "free");
+    }
+    {  // gate -> image: the gate's own image + enqueue_bf16_rows_from_image == FP32 gated rows + the routed entry
+        namespace rt = strix::core::row_transforms;
+        const unsigned K = 3072U, N = 2304U, ld = 3200U;  // the pitched output projection
+        std::vector<std::uint16_t> w(std::size_t{N} * ld, std::uint16_t{0x7FC0U});
+        for (unsigned o = 0; o < N; ++o)
+            for (unsigned k = 0; k < K; ++k) w[std::size_t{o} * ld + k] = bf16(0.05F * nd(rng));
+        auto* weights = device<std::uint16_t>(w.size());
+        require(hipMemcpy(weights, w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+        std::vector<float> logits(std::size_t{max_rows} * K);
+        for (auto& v : logits) v = 2.0F * nd(rng);
+        logits[5] = INFINITY, logits[6] = -INFINITY, logits[7] = NAN, logits[8] = -0.0F;
+        auto* gate = device<float>(logits.size());
+        require(hipMemcpy(gate, logits.data(), logits.size() * 4U, hipMemcpyHostToDevice), "gate");
+        auto* gated = device<float>(logits.size());
+        auto* out_a = device<float>(std::size_t{max_rows} * N);
+        auto* out_b = device<float>(std::size_t{max_rows} * N);
+        const std::span<std::uint16_t> scratch(image, host_a.size());
+        for (const unsigned rows : {1000U, 1024U, 8192U, 8209U}) {
+            for (const bool rounded : {false, true}) {
+                const Bf16RowProjection pa{weights, N, out_a, rounded, std::size_t{ld} * 2U};
+                const Bf16RowProjection pb{weights, N, out_b, rounded, std::size_t{ld} * 2U};
+                require(hipMemset(out_a, 0xFF, std::size_t{rows} * N * 4U), "seed");
+                require(hipMemset(out_b, 0xFF, std::size_t{rows} * N * 4U), "seed");
+                const std::size_t n = std::size_t{rows} * K;
+                require(rt::elements(n, rt::Bf16SigmoidProduct{a, gate, gated}, nullptr), "gate");
+                require(fma_rows::enqueue_bf16_rows_routed(gated, K, rows, {&pa, 1U}, kMaxOutputs, scratch, nullptr),
+                        "routed");
+                const bool reads = fma_rows::bf16_rows_read_image(K, rows, {&pb, 1U}, kMaxOutputs, scratch);
+                bool same = reads == (rows >= 1024U);
+                if (reads) {
+                    require(rt::elements(n, rt::Bf16SigmoidProductImage{a, gate, image}, nullptr), "gate image");
+                    require(fma_rows::enqueue_bf16_rows_from_image(scratch, K, rows, {&pb, 1U}, kMaxOutputs, nullptr),
+                            "from image");
+                } else {
+                    same = same && fma_rows::enqueue_bf16_rows_from_image(scratch, K, rows, {&pb, 1U}, kMaxOutputs,
+                                                                          nullptr) == hipErrorNotSupported;
+                    require(fma_rows::enqueue_bf16_rows_routed(gated, K, rows, {&pb, 1U}, kMaxOutputs, scratch, nullptr),
+                            "routed b");
+                }
+                require(hipDeviceSynchronize(), "sync");
+                std::vector<float> ha(std::size_t{rows} * N), hb(ha.size());
+                require(hipMemcpy(ha.data(), out_a, ha.size() * 4U, hipMemcpyDeviceToHost), "a");
+                require(hipMemcpy(hb.data(), out_b, hb.size() * 4U, hipMemcpyDeviceToHost), "b");
+                same = same && std::memcmp(ha.data(), hb.data(), ha.size() * 4U) == 0;
+                std::cout << "gate_image rows " << rows << " round " << rounded << " reads_image " << reads << ' '
+                          << (same ? "EXACT" : "DIFFER") << '\n';
+                ok = ok && same;
+            }
+        }
+        for (void* p : {static_cast<void*>(weights), static_cast<void*>(gate), static_cast<void*>(gated),
+                        static_cast<void*>(out_a), static_cast<void*>(out_b)})
+            require(hipFree(p), "free");
     }
     std::cout << (ok ? "ALL PASS" : "FAILED") << '\n';
     return ok ? 0 : 1;

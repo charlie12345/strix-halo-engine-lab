@@ -196,10 +196,29 @@ bool check_dense_declared() {
 
 }  // namespace
 
+bool check_low_rank_bound() {
+    using strix::core::finite_magnitude_max;
+    using strix::core::low_rank_operands_bounded;
+    const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+    const float finite[] = {0.5F, -3.0F, 2.0F}, with_inf[] = {1.0F, -inf}, with_nan[] = {nan, 1.0F};
+    const bool magnitudes = finite_magnitude_max(finite) == 3.0F && finite_magnitude_max(with_inf) == inf &&
+                            finite_magnitude_max(with_nan) == inf && finite_magnitude_max({}) == 0.0F;
+    // Inkling's controller shape (width 2304, two messages, rank 64): ordinary weights pass, any non-finite weight or
+    // a maximum that lets the latent or a gate sum reach 2^126 keeps the FP32 class.
+    const bool bounds = low_rank_operands_bounded(2304, 2, 64, 4.0F, 4.0F) &&
+                        !low_rank_operands_bounded(2304, 2, 64, inf, 1.0F) &&
+                        !low_rank_operands_bounded(2304, 2, 64, 1.0F, nan) &&
+                        !low_rank_operands_bounded(2304, 2, 64, 0x1p115F, 1.0F) &&   // latent ~ 2^127.2
+                        low_rank_operands_bounded(2304, 2, 64, 0x1p100F, 0x1p7F) &&   // gate sum ~ 2^125.2
+                        !low_rank_operands_bounded(2304, 2, 64, 0x1p100F, 0x1p8F);    // gate sum ~ 2^126.2
+    if (!magnitudes || !bounds) std::cerr << "low-rank operand bound: magnitudes " << magnitudes << " bounds " << bounds << '\n';
+    return magnitudes && bounds;
+}
+
 int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
         !check_cuda_bf16_fast_terms() || !check_exact_operand_planes() ||
-        !check_dense_declared()) {
+        !check_dense_declared() || !check_low_rank_bound()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

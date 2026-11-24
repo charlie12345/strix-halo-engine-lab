@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 namespace strix::core {
@@ -29,8 +31,9 @@ enum class Bf16Operand : unsigned char { fp32, bf16_exact };
 // Activation planes the exact BF16 split needs. The split writes hi = RN_bf16(x),
 // mid = RN_bf16(x - hi), lo = RN_bf16(x - hi - mid), and each K16 step of the tall
 // chain issues lo, mid, hi into one accumulator that starts at +0. For a BF16-exact
-// finite x, mid and lo are +0, so the two leading MMAs add only zero products to an
-// accumulator that is never -0: one plane (hi) gives the same bits. This is an EXACT
+// finite x, mid and lo are +0, so the two leading MMAs add only zero products (finite
+// weights: 0 x inf would be NaN) to an accumulator that is never -0, and with sums that
+// stay finite one plane (hi) gives the same bits. This is an EXACT
 // schedule of the three-term arithmetic, not a FAST operand class.
 constexpr int exact_bf16_planes(Bf16Operand operand) {
     return operand == Bf16Operand::bf16_exact ? 1 : 3;
@@ -46,6 +49,31 @@ void dense_declared(Operations& operations, const float* input, unsigned width, 
         operations.dense(input, width, rows, projections, rounded ? Bf16Operand::bf16_exact : Bf16Operand::fp32);
     else
         operations.dense(input, width, rows, projections);
+}
+
+// Largest |w| of a weight tensor, +infinity when an element is not finite (host check at weight load).
+inline float finite_magnitude_max(std::span<const float> values) {
+    float top = 0.0F;
+    for (const float value : values) {
+        if (!std::isfinite(value)) return std::numeric_limits<float>::infinity();
+        top = std::max(top, std::fabs(value));
+    }
+    return top;
+}
+
+// Admission of a low-rank controller's declared operands (residual_mix::LowRankController: down reads message_count
+// RMS-normalised BF16 rows of `width`, the gates read `rank` latent values) to the one-plane class. For finite residual
+// rows each normalised row has |row|_2 <= sqrt(width) up to rounding, so the down operands have |x|_1 <= 1.01
+// message_count width, |latent| <= that times down_max, and each gate sum is at most rank |latent|max gate_max. With
+// finite weights (maxima from finite_magnitude_max) and both bounds below 2^126, no partial sum, product or BF16
+// rounding of either chain leaves the finite range, so the one-plane bits are the three-plane bits. False keeps the
+// FP32 operand class. Non-finite residual rows are non-finite under either class.
+inline bool low_rank_operands_bounded(unsigned width, unsigned message_count, unsigned rank, float down_max,
+                                      float gate_max) {
+    constexpr float limit = 0x1p126F;
+    if (!std::isfinite(down_max) || !std::isfinite(gate_max)) return false;
+    const float latent = 1.01F * static_cast<float>(message_count) * static_cast<float>(width) * down_max;
+    return latent < limit && static_cast<float>(rank) * latent * gate_max < limit;
 }
 
 // Verify step rows of the BF16 -> FP32 dense family: one warp reads its weight row once for a tile of up to

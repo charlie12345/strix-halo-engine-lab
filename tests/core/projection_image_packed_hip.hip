@@ -6,6 +6,9 @@
 // Routed cases (enqueue_bf16_rows_routed, one call of any count against enqueue_bf16_rows in runs of kGroupMax): a q-like
 // call of six projections (packed, a 24-wide image projection), pitched weights whose pad holds NaN (packed with a row
 // pitch), a narrow call the plan keeps on the FP32 rows; also at 8,209 rows (8,192 + 17).
+// Route cases: the plan's routes run with the operand image of other rows than the FP32 input, which shows on the device
+// which launch served each projection (pitched o, the packed height boundary, K off the K64 stage, mixed weight
+// alignment inside one incumbent group); the routed entry must then store the incumbent's bits.
 // --bench: ms of the FP32 route and of image + image route (or the routed call) at 8,192 rows. Exit 1 on a failed check.
 #include <hip/hip_runtime.h>
 #include "strix/hip/legacy_intrinsics.hpp"
@@ -124,6 +127,102 @@ int main(int argc, char** argv) {
         std::cout << "rejected_arguments " << (refused ? "PASS" : "FAIL") << '\n';
         ok = ok && refused;
     }
+    {  // Which launch served each projection: the plan's routes run with the operand image of OTHER rows (b) while the
+       // FP32 rows are a, so an image or packed projection stores the bits enqueue_bf16_rows stores on b and an FP32 one
+       // those on a (the two differ). Then the routed entry on a must store the incumbent's bits for every projection.
+        using strix::core::ImageRoute;
+        constexpr auto P = ImageRoute::packed, I = ImageRoute::image, F = ImageRoute::fp32_rows;
+        struct RouteCase {
+            const char* name;
+            unsigned K, rows;
+            std::vector<unsigned> widths;
+            bool round;
+            unsigned pitch;                  // weight row elements (0 = K)
+            std::size_t misaligned;          // projections from this index start 2 bytes past a 16-byte boundary
+            std::vector<ImageRoute> expect;  // empty: not planned (every projection keeps the FP32 rows)
+        };
+        // Pitched o (packed with a row pitch); the q call at the packed height (1,024 routed, 1,023 not); K off the K64
+        // stage; one incumbent group of an aligned 2048 and a misaligned 32 (the incumbent runs both on the FMA rows);
+        // a planned call whose second group holds the misaligned weight (that whole group keeps the FP32 rows).
+        const std::vector<RouteCase> route_cases = {
+            {"o_pitched", 3072U, 8192U, {2304U}, true, 3200U, 99U, {P}},
+            {"q_call_1024", 2304U, 1024U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {P, P, I, P, P, P}},
+            {"q_call_1023", 2304U, 1023U, {3072U, 384U, 24U, 3072U, 1024U, 1024U}, false, 0U, 99U, {}},
+            {"k_off_stage", 2336U, 8192U, {3072U, 1024U}, false, 0U, 99U, {}},
+            {"mixed_align", 2304U, 1024U, {2048U, 32U}, false, 0U, 1U, {}},
+            {"mixed_groups", 2304U, 1024U, {2048U, 1024U, 24U, 2048U, 32U}, false, 0U, 4U, {P, P, I, F, F}},
+        };
+        std::vector<float> host_b(host_a.size());
+        for (auto& v : host_b) v = nd(rng);
+        std::vector<std::uint16_t> host_ib(host_b.size());
+        for (std::size_t i = 0; i < host_b.size(); ++i) host_ib[i] = bf16(host_b[i]);
+        float* b = device<float>(host_b.size());
+        auto* image_b = device<std::uint16_t>(host_ib.size());
+        require(hipMemcpy(b, host_b.data(), host_b.size() * 4U, hipMemcpyHostToDevice), "b");
+        require(hipMemcpy(image_b, host_ib.data(), host_ib.size() * 2U, hipMemcpyHostToDevice), "image b");
+        for (const auto& rc : route_cases) {
+            const unsigned ld = rc.pitch != 0U ? rc.pitch : rc.K;
+            std::vector<std::uint16_t*> bases;
+            Run ref_a, ref_b, got, entry;
+            for (std::size_t p = 0; p < rc.widths.size(); ++p) {
+                std::vector<std::uint16_t> w(std::size_t{rc.widths[p]} * ld + 8U, std::uint16_t{0x7FC0U});  // pad = NaN
+                const std::size_t shift = p >= rc.misaligned ? 1U : 0U;
+                for (unsigned o = 0; o < rc.widths[p]; ++o)
+                    for (unsigned k = 0; k < rc.K; ++k) w[shift + std::size_t{o} * ld + k] = bf16(0.05F * nd(rng));
+                bases.push_back(device<std::uint16_t>(w.size()));
+                require(hipMemcpy(bases.back(), w.data(), w.size() * 2U, hipMemcpyHostToDevice), "w");
+                for (Run* run : {&ref_a, &ref_b, &got, &entry}) {
+                    run->outputs.push_back(device<float>(std::size_t{rc.rows} * rc.widths[p]));
+                    run->projections.push_back({bases.back() + shift, rc.widths[p], run->outputs.back(), rc.round,
+                                                rc.pitch != 0U ? std::size_t{rc.pitch} * 2U : 0U});
+                }
+            }
+            for (const Run* run : {&ref_a, &ref_b, &got, &entry}) seed(*run, rc.rows);
+            const auto incumbent = [&](const float* x, const Run& run) {
+                return strix::core::for_each_bf16_projection_group<fma_rows::kGroupMax>(run.projections, hipSuccess,
+                    [&](std::span<const Bf16RowProjection> group) {
+                        return fma_rows::enqueue_bf16_rows(x, rc.K, rc.rows, group, kMaxOutputs, nullptr);
+                    });
+            };
+            require(incumbent(a, ref_a), "fp32 rows a");
+            require(incumbent(b, ref_b), "fp32 rows b");
+            ImageRoute routes[fma_rows::kImageRouteMaxProjections]{};
+            const bool planned = fma_rows::detail::plan_bf16_image_call(rc.K, rc.rows, got.projections, kMaxOutputs,
+                std::span<const std::uint16_t>(image_b, host_ib.size()), routes);
+            bool as_planned = planned == !rc.expect.empty();
+            for (std::size_t p = 0; p < rc.widths.size(); ++p)
+                as_planned = as_planned && routes[p] == (rc.expect.empty() ? F : rc.expect[p]);
+            require(planned ? fma_rows::detail::run_bf16_image_routes(a, image_b, rc.K, rc.rows, got.projections,
+                                  kMaxOutputs, std::span<const ImageRoute>(routes, rc.widths.size()), nullptr)
+                            : incumbent(a, got), "routes");
+            require(fma_rows::enqueue_bf16_rows_routed(a, rc.K, rc.rows, entry.projections, kMaxOutputs,
+                                                       std::span<std::uint16_t>(image, host_a.size()), nullptr),
+                    "routed entry");
+            require(hipDeviceSynchronize(), "sync");
+            const auto xa = fetch(ref_a, rc.rows), xb = fetch(ref_b, rc.rows), xg = fetch(got, rc.rows),
+                       xe = fetch(entry, rc.rows);
+            bool served = true;
+            for (std::size_t p = 0, at = 0; p < rc.widths.size(); at += std::size_t{rc.rows} * rc.widths[p], ++p) {
+                const auto n = std::size_t{rc.rows} * rc.widths[p] * 4U;
+                const auto& want = routes[p] != F ? xb : xa;
+                const auto& other = routes[p] != F ? xa : xb;
+                served = served && std::memcmp(xg.data() + at, want.data() + at, n) == 0 &&
+                         std::memcmp(xg.data() + at, other.data() + at, n) != 0;
+            }
+            const bool same = xe.size() == xa.size() && std::memcmp(xe.data(), xa.data(), xa.size() * 4U) == 0;
+            const bool pass = as_planned && served && same;
+            ok = ok && pass;
+            std::cout << "route " << rc.name << " rows " << rc.rows << (planned ? " planned" : " fp32-rows")
+                      << (as_planned ? " routes-as-expected" : " ROUTES-DIFFER")
+                      << (served ? " served-as-planned" : " SERVED-ELSEWHERE")
+                      << (same ? " entry-same-bits" : " ENTRY-DIFFER") << (pass ? " PASS" : " FAIL") << '\n';
+            for (const Run* run : {&ref_a, &ref_b, &got, &entry})
+                for (auto* p : run->outputs) require(hipFree(p), "free");
+            for (auto* w : bases) require(hipFree(w), "free");
+        }
+        require(hipFree(b), "free");
+        require(hipFree(image_b), "free");
+    }
     for (const auto& c : cases) {
         std::vector<std::uint16_t*> weights;
         const unsigned ld = c.pitch != 0U ? c.pitch : c.K;
@@ -159,10 +258,8 @@ int main(int argc, char** argv) {
             bool admitted = fma_rows::admits_bf16_image_projections(c.K, rows, img.projections, kMaxOutputs);
             if (c.routed) {
                 strix::core::ImageRoute routes[fma_rows::kImageRouteMaxProjections]{};
-                const bool planned = strix::core::plan_image_routes(fma_rows::kImageRoutePolicy, c.K, rows,
-                    img.projections, kMaxOutputs, routes, [&](const Bf16RowProjection& projection) {
-                        return fma_rows::admits_bf16_image_projections(c.K, rows, {&projection, 1U}, kMaxOutputs);
-                    });
+                const bool planned =
+                    fma_rows::detail::plan_bf16_image_call(c.K, rows, img.projections, kMaxOutputs, scratch, routes);
                 admitted = planned == (c.expect_image && rows >= fma_rows::kPackedImageMinRows);
             }
             require(image_arm(img), "image rows");

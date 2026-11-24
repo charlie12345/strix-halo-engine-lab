@@ -1,13 +1,16 @@
 #include "core/dense_row_plan.hpp"
 #include "cuda/core/dense/row_plan.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -165,9 +168,11 @@ bool check_exact_operand_planes() {
 
 }  // namespace
 
-// The image route plan: whole-tile projections (pitched included) go packed, narrow contiguous ones to the image tile,
-// what neither reads keeps the FP32 rows; a call below the height or the packed-column bar keeps every FP32 route; runs
-// keep call order per route and split on the group limit, the rounding class and the row pitch.
+/// The image route plan: inside the incumbent groups the WMMA tile serves, whole-tile projections (pitched included)
+// go packed, narrow contiguous ones to the image tile, what neither reads keeps the FP32 rows; a group the incumbent
+// runs elsewhere (here: a misaligned weight) keeps every projection on the FP32 rows; a call below the height or the
+// packed-column bar keeps every FP32 route; runs keep call order per route and split on the group limit, the rounding
+// class and the row pitch, and an FP32 run never leaves its incumbent group.
 static bool check_image_routes() {
     using strix::core::Bf16RowProjection;
     using strix::core::ImageRoute;
@@ -181,14 +186,12 @@ static bool check_image_routes() {
     const auto image_admits = [](const Bf16RowProjection& p) {  // the image tile: contiguous 16-byte aligned rows
         return p.weights != nullptr && p.contiguous(K) && std::bit_cast<std::uintptr_t>(p.weights) % 16U == 0U;
     };
-    // q 3072, relative 384, sink 24, o-like pitched 2304 (6400 B rows, rounded), a misaligned 128 (FP32), k 1024.
-    const std::array<Bf16RowProjection, 6> call{{{w, 3072U, y, false, 0U}, {w, 384U, y, false, 0U},
-        {w, 24U, y, false, 0U}, {w, 2304U, y, true, 6400U}, {odd, 128U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    const auto group_admits = [](std::span<const Bf16RowProjection> group) {  // the incumbent's WMMA condition
+        return std::all_of(group.begin(), group.end(), [](const Bf16RowProjection& p) {
+            return std::bit_cast<std::uintptr_t>(p.weights) % 16U == 0U;
+        });
+    };
     std::array<ImageRoute, 8> routes{};
-    if (!strix::core::plan_image_routes(policy, K, 8192U, call, kWide, routes, image_admits)) return false;
-    if (routes[0] != R::packed || routes[1] != R::packed || routes[2] != R::image || routes[3] != R::packed ||
-        routes[4] != R::fp32_rows || routes[5] != R::packed)
-        return false;
     std::vector<std::pair<R, std::vector<unsigned>>> runs;
     const auto record = [&](R route, std::span<const Bf16RowProjection> run) {
         std::vector<unsigned> widths;
@@ -196,36 +199,81 @@ static bool check_image_routes() {
         runs.emplace_back(route, widths);
         return Status::ok;
     };
-    // Runs: packed [q, rel] then [o] (pitch + round change) then [k]; image [sink]; fp32 [misaligned].
-    if (strix::core::for_each_image_route_run<3U>(call, routes, K, Status::ok, record) != Status::ok) return false;
-    if (runs != decltype(runs){{R::packed, {3072U, 384U}}, {R::packed, {2304U}}, {R::packed, {1024U}},
-                               {R::image, {24U}}, {R::fp32_rows, {128U}}})
+    const auto routed = [&](std::initializer_list<R> expect) {
+        return std::equal(expect.begin(), expect.end(), routes.begin());
+    };
+    // Groups of 3: [q 3072, relative 384, sink 24] (WMMA) and [o-like pitched 2304 (6400 B rows, rounded), a misaligned
+    // 128, k 1024] (FMA rows for the whole group: the misaligned weight sends the incumbent there).
+    const std::array<Bf16RowProjection, 6> call{{{w, 3072U, y, false, 0U}, {w, 384U, y, false, 0U},
+        {w, 24U, y, false, 0U}, {w, 2304U, y, true, 6400U}, {odd, 128U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
+    if (!strix::core::plan_image_routes<3U>(policy, K, 8192U, call, kWide, routes, group_admits, image_admits) ||
+        !routed({R::packed, R::packed, R::image, R::fp32_rows, R::fp32_rows, R::fp32_rows}))
+        return false;
+    if (strix::core::for_each_image_route_run<3U>(call, routes, K, Status::ok, record) != Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U, 384U}}, {R::image, {24U}}, {R::fp32_rows, {2304U}},
+                               {R::fp32_rows, {128U, 1024U}}})
+        return false;
+    // The same call without the misaligned weight: [q, rel, sink] [o, k]: packed [q, rel] then [o] (pitch + round
+    // change) then [k]; image [sink].
+    const std::array<Bf16RowProjection, 5> aligned{{{w, 3072U, y, false, 0U}, {w, 384U, y, false, 0U},
+        {w, 24U, y, false, 0U}, {w, 2304U, y, true, 6400U}, {w, 1024U, y, false, 0U}}};
+    runs.clear();
+    if (!strix::core::plan_image_routes<3U>(policy, K, 8192U, aligned, kWide, routes, group_admits, image_admits) ||
+        !routed({R::packed, R::packed, R::image, R::packed, R::packed}) ||
+        strix::core::for_each_image_route_run<3U>(aligned, routes, K, Status::ok, record) != Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U, 384U}}, {R::packed, {2304U}}, {R::packed, {1024U}},
+                               {R::image, {24U}}})
         return false;
     // Group limit: 4 packed projections in runs of 3 + 1.
     const std::array<Bf16RowProjection, 4> four{{{w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U},
         {w, 1024U, y, false, 0U}, {w, 1024U, y, false, 0U}}};
     runs.clear();
-    if (!strix::core::plan_image_routes(policy, K, 4096U, four, kWide, routes, image_admits) ||
+    if (!strix::core::plan_image_routes<3U>(policy, K, 4096U, four, kWide, routes, group_admits, image_admits) ||
         strix::core::for_each_image_route_run<3U>(four, routes, K, Status::ok, record) != Status::ok ||
         runs != decltype(runs){{R::packed, {1024U, 1024U, 1024U}}, {R::packed, {1024U}}})
+        return false;
+    // Groups of 2: [q, a pitched 96 (FP32 inside a WMMA group)] [misaligned pitched 96, misaligned pitched 64]: the two
+    // FP32 runs share pitch and rounding but not the incumbent group, so they stay apart.
+    const std::array<Bf16RowProjection, 4> split{{{w, 3072U, y, false, 0U}, {w, 96U, y, false, 6400U},
+        {odd, 96U, y, false, 6400U}, {odd, 64U, y, false, 6400U}}};
+    runs.clear();
+    if (!strix::core::plan_image_routes<2U>(policy, K, 8192U, split, kWide, routes, group_admits, image_admits) ||
+        !routed({R::packed, R::fp32_rows, R::fp32_rows, R::fp32_rows}) ||
+        strix::core::for_each_image_route_run<2U>(split, routes, K, Status::ok, record) != Status::ok ||
+        runs != decltype(runs){{R::packed, {3072U}}, {R::fp32_rows, {96U}}, {R::fp32_rows, {96U, 64U}}})
         return false;
     const auto all_fp32 = [&](std::size_t n) {
         return std::all_of(routes.begin(), routes.begin() + static_cast<std::ptrdiff_t>(n),
                            [](R r) { return r == R::fp32_rows; });
     };
+    // One group of an aligned 2048 and a misaligned contiguous 32: the incumbent runs both on the FMA rows, so the
+    // 2,048 whole-tile columns do not take the image.
+    const std::array<Bf16RowProjection, 2> mixed{{{w, 2048U, y, false, 0U}, {odd, 32U, y, false, 0U}}};
+    if (strix::core::plan_image_routes<3U>(policy, K, 8192U, mixed, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(2U))
+        return false;
+    // A row pitch whose outputs x pitch wraps is not packed (2,048 outputs x 2^63 bytes).
+    const std::array<Bf16RowProjection, 1> wrapped{{{w, 2048U, y, false, std::size_t{1} << 63U}}};
+    if (strix::core::plan_image_routes<3U>(policy, K, 8192U, wrapped, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(1U))
+        return false;
     // Narrow calls ([k], [k, k_taps]) stay on FP32: 1,024 packed columns < 2,048.
     const std::array<Bf16RowProjection, 2> narrow{{{w, 1024U, y, false, 0U}, {w, 32U, y, false, 0U}}};
-    if (strix::core::plan_image_routes(policy, K, 8192U, narrow, kWide, routes, image_admits) || !all_fp32(2U))
+    if (strix::core::plan_image_routes<3U>(policy, K, 8192U, narrow, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(2U))
         return false;
-    // Below the height, K off the stage, outputs above max_outputs (1,408 packed columns left), too few route slots.
-    if (strix::core::plan_image_routes(policy, K, 1023U, call, kWide, routes, image_admits) || !all_fp32(6U))
+    // Below the height, K off the stage, outputs above max_outputs (384 packed columns left), too few route slots.
+    if (strix::core::plan_image_routes<3U>(policy, K, 1023U, aligned, kWide, routes, group_admits, image_admits) ||
+        !all_fp32(5U))
         return false;
-    if (strix::core::plan_image_routes(policy, K + 32U, 8192U, call, kWide, routes, image_admits) || !all_fp32(6U))
+    if (strix::core::plan_image_routes<3U>(policy, K + 32U, 8192U, aligned, kWide, routes, group_admits,
+                                           image_admits) || !all_fp32(5U))
         return false;
-    if (strix::core::plan_image_routes(policy, K, 8192U, call, 2048U, routes, image_admits) || !all_fp32(6U))
+    if (strix::core::plan_image_routes<3U>(policy, K, 8192U, call, 2048U, routes, group_admits, image_admits) ||
+        !all_fp32(6U))
         return false;
     std::array<ImageRoute, 2> few{};
-    return !strix::core::plan_image_routes(policy, K, 8192U, call, kWide, few, image_admits);
+    return !strix::core::plan_image_routes<3U>(policy, K, 8192U, call, kWide, few, group_admits, image_admits);
 }
 
 int main() {

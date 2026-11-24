@@ -800,17 +800,6 @@ int main(int argc, char** argv) {
                                                                             kMaxOutputs, nullptr) == hipErrorNotSupported;
             const bool short_view = fma_rows::enqueue_bf16_rows_from_image(plan, scratch.first(1U), K, rows, {&pc, 1U},
                                                                            kMaxOutputs, nullptr) == hipErrorNotSupported;
-            require(hipDeviceSynchronize(), "sync");
-            std::vector<float> ho(std::size_t{rows} * N);
-            std::vector<std::uint16_t> hi(scratch.size());
-            require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
-            require(hipMemcpy(hi.data(), scratch.data(), hi.size() * 2U, hipMemcpyDeviceToHost), "image back");
-            const bool guarded = std::all_of(ho.begin(), ho.end(), [](float v) {
-                                     std::uint32_t bits = 0;
-                                     std::memcpy(&bits, &v, 4U);
-                                     return bits == 0xFFFFFFFFU;
-                                 }) &&
-                                 std::all_of(hi.begin(), hi.end(), [](std::uint16_t v) { return v == 0x5A5AU; });
             // a refused admission (a one-element span) is a plan that launches nothing
             const auto inert = fma_rows::plan_bf16_rows_from_image(K, rows, {&pc, 1U}, kMaxOutputs, scratch.first(1U), sources);
             const bool inert_refused =
@@ -835,11 +824,55 @@ int main(int argc, char** argv) {
             device_bound = device_bound && remote.admitted() &&
                            fma_rows::enqueue_bf16_rows_from_image(remote, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
                                                                   nullptr) == hipErrorNotSupported;
-            const bool pass = plan.admitted() && substituted && short_view && inert_refused && device_bound && guarded;
+            // the store policy is part of the admitted descriptor: a call that changes only it is refused
+            auto policy_changed = pc;
+            policy_changed.round_separate = !pc.round_separate;
+            const bool policy_bound = fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&policy_changed, 1U},
+                                                                           kMaxOutputs, nullptr) == hipErrorNotSupported;
+            // a launch stream owned by another device than the admitted one is refused, the current device unchanged
+            // (the stream's owner is injected: a node has no second GPU); the default, legacy and per-thread streams
+            // belong to the current device
+            hipStream_t stream = nullptr;
+            require(hipStreamCreate(&stream), "stream");
+            const fma_rows::ImageDeviceClass stream_elsewhere{"gfx1151", 32U, 40U, here + 1};
+            bool stream_bound = false;
+            {
+                const fma_rows::ScopedImageStreamOwner owner(stream, stream_elsewhere);
+                stream_bound = fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pc, 1U}, kMaxOutputs,
+                                                                      stream) == hipErrorNotSupported;
+            }
+            // Every refused call above ran before this point: a launch that still returned the refusal code shows in
+            // the bytes after the synchronization.
+            require(hipStreamSynchronize(stream), "stream sync");
+            require(hipDeviceSynchronize(), "sync");
+            std::vector<float> ho(std::size_t{rows} * N);
+            std::vector<std::uint16_t> hi(scratch.size());
+            require(hipMemcpy(ho.data(), out_b, ho.size() * 4U, hipMemcpyDeviceToHost), "out back");
+            require(hipMemcpy(hi.data(), scratch.data(), hi.size() * 2U, hipMemcpyDeviceToHost), "image back");
+            const bool guarded = std::all_of(ho.begin(), ho.end(), [](float v) {
+                                     std::uint32_t bits = 0;
+                                     std::memcpy(&bits, &v, 4U);
+                                     return bits == 0xFFFFFFFFU;
+                                 }) &&
+                                 std::all_of(hi.begin(), hi.end(), [](std::uint16_t v) { return v == 0x5A5AU; });
+            const bool pass = plan.admitted() && substituted && short_view && inert_refused && device_bound &&
+                              policy_bound && stream_bound && guarded;
+            // controls after the guards: the same call on the admitted device's own explicit stream, on the per-thread
+            // stream and on the default stream is accepted
+            bool accepted = true;
+            for (hipStream_t s : {stream, hipStreamPerThread, static_cast<hipStream_t>(nullptr)}) {
+                accepted = accepted && fma_rows::enqueue_bf16_rows_from_image(plan, scratch, K, rows, {&pc, 1U},
+                                                                              kMaxOutputs, s) == hipSuccess;
+                require(hipStreamSynchronize(s), "control sync");
+            }
+            require(hipStreamDestroy(stream), "stream destroy");
             std::cout << "gate_image_plan_binding admitted " << plan.admitted() << " substituted "
                       << (substituted ? "refused" : "ADMITTED") << " short_view " << (short_view ? "refused" : "ADMITTED") << " device_bound " << (device_bound ? "refused" : "LAUNCHED")
-                      << (guarded ? " guard-intact" : " GUARD-CHANGED") << (pass ? " PASS" : " FAIL") << '\n';
-            ok = ok && pass;
+                      << " policy_bound " << (policy_bound ? "refused" : "LAUNCHED") << " stream_bound "
+                      << (stream_bound ? "refused" : "LAUNCHED") << (guarded ? " guard-intact" : " GUARD-CHANGED")
+                      << " own_streams " << (accepted ? "accepted" : "REFUSED") << (pass && accepted ? " PASS" : " FAIL")
+                      << '\n';
+            ok = ok && pass && accepted;
         }
         for (void* p : {static_cast<void*>(weights), static_cast<void*>(gate), static_cast<void*>(gated),
                         static_cast<void*>(out_a), static_cast<void*>(out_b)})

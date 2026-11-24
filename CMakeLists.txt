@@ -754,6 +754,19 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-hip-arch-target-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_target_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
+        set(controller_rms_host_inc "${CMAKE_CURRENT_BINARY_DIR}/controller_rms_launch_host.inc")
+        add_custom_command(OUTPUT "${controller_rms_host_inc}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/extract_controller_rms_launch.py"
+                "${controller_rms_host_inc}"
+            DEPENDS tests/core/extract_controller_rms_launch.py src/core/controller_rms_rows.hpp src/core/fma_bf16_rows.hpp
+            VERBATIM)
+        add_executable(strix-hip-controller-rms-launch-host-test tests/core/controller_rms_launch_host_test.cpp
+            "${controller_rms_host_inc}")
+        target_include_directories(strix-hip-controller-rms-launch-host-test PRIVATE
+            tests/stubs/hip_archguard include "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_features(strix-hip-controller-rms-launch-host-test PRIVATE cxx_std_20)
+        strix_target_warnings(strix-hip-controller-rms-launch-host-test)
+        add_test(NAME strix-hip-controller-rms-launch-host-test COMMAND strix-hip-controller-rms-launch-host-test)
         add_subdirectory(tests/qwen_cuda_graph_host)
         add_test(NAME strix-hip-arch-caps-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_caps_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")

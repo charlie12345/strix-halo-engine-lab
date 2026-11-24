@@ -5,6 +5,7 @@
 #include "core/dense_row_plan.hpp"
 #include "core/f16_tile_gemm.hpp"
 #include "core/fma_rows.hpp"
+#include "strix/hip/legacy_launch.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -14,6 +15,7 @@
 namespace strix::core::controller_rms_rows {
 inline hipError_t enqueue(const Args& a, hipStream_t stream) {
     if (!admits(a, 0U)) return hipErrorInvalidValue;
+    ::strix::hip::arch::require_current_device(::strix::hip::arch::LaunchRequirement::Rdna3Layout);
     const dim3 grid(grid_blocks(a.rows));
     switch (a.rank / 16U) {
     case 1U: detail::controller_rms_kernel<1U><<<grid, kThreads, 0, stream>>>(a); break;

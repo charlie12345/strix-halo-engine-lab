@@ -3,8 +3,9 @@
 //   forward_rows(tokens, rows, LogitRows) -> Out; read_top(Out, rows, host) (synchronizes); commit(k); sync().
 // Greedy verification keeps read_top. Sampled verification optionally reads [rows][vocab()] host floats through
 // read_logits_rows(Out, rows, float*). Both reads synchronize. commit(k) = engine commit + sync.
-// An engine whose LogitRows names `scores` gets it for windows whose scores will be read (sampled verification),
-// `all` for greedy-only windows, so it may serve the latter with a pick form that writes no scores.
+// An engine whose LogitRows names `scores` gets it for windows whose scores may be read (sampled verification, or any
+// window an observer sees unless the observer declared it reads no scores), `all` only for greedy windows nobody else
+// reads, so it may serve those with a pick form that writes no scores.
 // Optional: decode_committed_row(token, host_logits) -> next token, the engine's plain one-row decode step
 // (committed at once; host_logits empty or [vocab()]). A one-row verify (a serial step of the speculator) then
 // runs as that decode step and the following commit(1) has nothing left to do: a one-row window is always kept.
@@ -44,8 +45,13 @@ public:
     explicit EngineVerifyTarget(Engine& e) : e_(e) {}
     // Optional observer of every verify pass (rows of [anchor, drafts...] + the engine's per-row outputs): the MTP chain
     // (strix/spec/mtp_chain.hpp) takes the hidden rows of the pass from it. Needs Engine::Rows.
+    // An observer may read the pass's row scores (e.g. read_logits_rows on `out`): by default its windows ask for them.
+    // reads_scores = false declares an observer that reads no scores (hidden rows only).
     using Observer = std::function<void(const Rows&, std::uint32_t)>;
-    void set_observer(Observer f) { observer_ = std::move(f); }
+    void set_observer(Observer f, bool reads_scores = true) {
+        observer_ = std::move(f);
+        observer_reads_scores_ = reads_scores;
+    }
     void set_row_rule(const RowRule& rule) override { rule_ = rule; }
     [[nodiscard]] bool supports_row_rule(bool sampled) const override { return !sampled || has_logits; }
     void set_first_position(std::uint64_t position) override { first_position_ = position; }
@@ -102,10 +108,11 @@ public:
     Engine& engine() { return e_; }
 
 private:
-    // Sampled verification reads every row's scores (read_tokens): an engine that names that need gets `scores`.
+    // Sampled verification reads every row's scores (read_tokens), and an observer may: an engine that names that
+    // need gets `scores`; `all` only when neither reads.
     [[nodiscard]] typename Engine::LogitRows logit_rows() const {
         if constexpr (requires { Engine::LogitRows::scores; }) {
-            if (has_logits && rule_.sampled()) return Engine::LogitRows::scores;
+            if ((has_logits && rule_.sampled()) || (observer_ && observer_reads_scores_)) return Engine::LogitRows::scores;
         }
         return Engine::LogitRows::all;
     }
@@ -160,6 +167,7 @@ private:
 
     Engine& e_;
     Observer observer_;
+    bool observer_reads_scores_ = true;
     RowRule rule_;
     std::uint64_t first_position_ = 1;
     std::vector<float> logits_;

@@ -664,11 +664,49 @@ void score_read_requirement() {
     check(picks.size() == window.size() && picks[0] == 4U && picks[1] == 6U, "the scores form reads the same rows");
 }
 
+// A greedy window an observer sees may have its scores read by the observer: it asks for `scores` unless the observer
+// declares it reads none; linear and tree passes alike.
+struct ScoredTreeEngine : ScoredRowsEngine {
+    std::uint32_t tree_rows() const { return 4U; }
+    Rows forward_tree_rows(const sp::TreeRows& tree, LogitRows mode) {
+        asked.push_back(mode);
+        rows_read = static_cast<std::uint32_t>(tree.tokens.size());
+        return {};
+    }
+    void commit_path(std::span<const std::uint32_t> path) { committed_rows = static_cast<std::uint32_t>(path.size()); }
+};
+
+void observer_score_reads() {
+    const std::array<std::uint32_t, 3> window{3, 4, 5};
+    sp::TreeRows tree;
+    tree.tokens = {3, 4, 5};
+    tree.parent = {-1, 0, 0};
+    tree.node = {0, 1, 2};
+    tree.depth = {0, 1, 1};
+    std::vector<std::uint32_t> picks;
+    ScoredTreeEngine engine;
+    sp::EngineVerifyTarget<ScoredTreeEngine> target(engine);
+    target.verify(window, picks);
+    target.verify_tree(tree, picks);
+    unsigned seen = 0;
+    target.set_observer([&](const ScoredTreeEngine::Rows&, std::uint32_t) { ++seen; });
+    target.verify(window, picks);
+    target.verify_tree(tree, picks);
+    target.set_observer([&](const ScoredTreeEngine::Rows&, std::uint32_t) { ++seen; }, false);
+    target.verify(window, picks);
+    target.verify_tree(tree, picks);
+    using M = ScoredTreeEngine::LogitRows;
+    check(engine.asked == std::vector{M::all, M::all, M::scores, M::scores, M::all, M::all},
+          "greedy observed windows (linear and tree) ask for scores unless the observer reads none");
+    check(seen == 4U, "the observer saw every observed pass");
+}
+
 }  // namespace
 
 int main() {
     lazy_sampled_rows();
     score_read_requirement();
+    observer_score_reads();
     identity_and_accounting();
     distribution();
     arbiter();

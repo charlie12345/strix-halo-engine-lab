@@ -356,6 +356,15 @@ public:
 #endif
     }
 
+#if !defined(__HIPCC__)
+    // The shared controller declares its BF16-rounded operands: the tall chain runs one activation plane (same bits).
+    void dense(const float* input, unsigned width, unsigned rows, std::span<const Projection> projections,
+               core::Bf16Operand operand) {
+        check(cuda_core::enqueue_bf16_dense_rows(input, width, rows, projections, stream_, cuda_core::DenseArith::mma3,
+                                                 big_context_.get(), nullptr, operand));
+    }
+#endif
+
 #if defined(__HIPCC__)
     // Projections on a BF16 operand image (the shared tile's image rows: same bits as dense on the FP32 rows).
     static bool admits_dense_bf16_image(unsigned width, unsigned rows, std::span<const Projection> projections) {

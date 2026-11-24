@@ -100,6 +100,7 @@ public:
     [[nodiscard]] std::uint64_t rounds() const noexcept { return round_; }  // control messages sent
 
 private:
+    void abort_replica(const char* reason) noexcept;
     void send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body);
     void defer(std::uint32_t kind, std::span<const std::uint32_t> head, std::span<const std::uint32_t> body);
 

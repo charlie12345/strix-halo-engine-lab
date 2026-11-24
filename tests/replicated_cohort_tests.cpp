@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -18,13 +19,36 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 using namespace strix::serve;
+
+namespace {
+// A one-shot allocation failure on the calling rank only.
+thread_local std::size_t fail_allocation_size = 0;
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void free_test_allocation(void* ptr) noexcept { std::free(ptr); }
+}
+
+void* operator new(std::size_t size) {
+    if (fail_allocation_size != 0 && size == fail_allocation_size) {
+        fail_allocation_size = 0;
+        throw std::bad_alloc{};
+    }
+    if (void* ptr = std::malloc(size == 0 ? 1 : size)) return ptr;
+    throw std::bad_alloc{};
+}
+
+void operator delete(void* ptr) noexcept { free_test_allocation(ptr); }
+void operator delete(void* ptr, std::size_t) noexcept { ::operator delete(ptr); }
 
 namespace {
 int failures = 0;
@@ -124,6 +148,7 @@ public:
     }
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override {
+        if (on_verify) on_verify();
         check(window_.empty(), "verify with an open window");
         withheld_.clear();
         std::string rec = "V";
@@ -202,6 +227,7 @@ public:
         ++controls;
     }
     std::vector<std::vector<std::uint32_t>> retained;
+    std::function<void()> on_verify;
     bool restores = true;  // false: this rank's store cannot restore (a diverging replica)
     bool whole = false;    // prefill_emits_first: restore may return the whole prompt
     const std::vector<std::vector<std::uint32_t>>& state() const { return ctx_; }
@@ -479,6 +505,84 @@ void run_score_reads() {
     check(read0 == 0.0F && read1 == 1.0F, name + ": both lanes' scores read back on rank 0");
 }
 
+void run_verify_allocation_failure() {
+    Pair link;
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    Follower follower;
+    follower.start(be1, link.t1, {});
+    {
+        ReplicatedCohort rep(be0, link.t0);
+        rep.bind_lane(0, 1, {});  // A queued record must survive a failure before publication.
+        const CohortGroup group{0, 2, false};
+        const std::uint32_t tokens[] = {4, 5};
+        std::uint32_t top[2] = {};
+        // The inline frame has four body words, so this targets the first group allocation only.
+        fail_allocation_size = sizeof(CohortGroup);
+        bool threw = false;
+        try {
+            rep.verify({&group, 1}, tokens, top);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        fail_allocation_size = 0;
+        check(threw, "verify allocation: rank 0 throws bad_alloc");
+        check(rep.rounds() == 0, "verify allocation: no frame was published");
+        if (threw && rep.rounds() == 0) {
+            rep.verify({&group, 1}, tokens, top);
+            const std::uint32_t accept[] = {1};
+            rep.commit(accept);
+            rep.close();
+        }
+    }
+    follower.thread.join();
+    check(follower.error.empty(), "verify allocation: rank 1 finishes cleanly after retry");
+    check(be0.log == be1.log && be0.binds == 1 && be0.forwards == 1 && be0.commits == 1,
+          "verify allocation: retry delivers the queued bind and verify once on both ranks");
+}
+
+void run_verify_backend_failure() {
+    Pair link;
+    FakeBackend be0(1, 4, 23), be1(1, 4, 23);
+    be0.on_verify = [] { throw std::runtime_error("rank 0 verify failed"); };
+    be1.on_verify = [&] {
+        std::byte unused{};
+        link.t1.receive({&unused, 1});  // Simulate waiting for rank 0 inside the backend collective.
+    };
+    Follower follower;
+    follower.start(be1, link.t1, {});
+    {
+        ReplicatedCohort rep(be0, link.t0);
+        const CohortGroup group{0, 1, false};
+        const std::uint32_t token = 4;
+        std::uint32_t top = 0;
+        bool rethrew = false;
+        try {
+            rep.verify({&group, 1}, {&token, 1}, {&top, 1});
+        } catch (const std::runtime_error& e) {
+            rethrew = std::string_view(e.what()) == "rank 0 verify failed";
+        }
+        check(rethrew && rep.rounds() == 1, "verify backend: rank 0 rethrows the failure after publishing");
+        bool aborted = false;
+        {
+            std::lock_guard lock(link.wire->m);
+            aborted = link.wire->aborted;
+        }
+        check(aborted, "verify backend: rank 0 aborts immediately while the replica still exists");
+        if (!aborted) link.t0.abort("test cleanup");
+        bool closed = false;
+        try {
+            rep.keepalive();
+        } catch (const std::logic_error&) {
+            closed = true;
+        } catch (const std::runtime_error&) {
+            // The regressed path tries to use the aborted link.
+        }
+        check(closed, "verify backend: rank 0 refuses further work on the replica");
+        follower.thread.join();
+        check(follower.error == "link aborted: rank 0 verify failed", "verify backend: rank 1 exits its collective");
+    }
+}
+
 // One long prefill split into many frames arrives intact, and a closed replica refuses further calls.
 void run_frames() {
     Pair link;
@@ -555,6 +659,8 @@ int main() {
     run_hooks(false, true);
     run_tamper();
     run_score_reads();
+    run_verify_allocation_failure();
+    run_verify_backend_failure();
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";
         return 1;

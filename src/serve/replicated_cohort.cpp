@@ -131,6 +131,19 @@ bool ReplicatedCohort::prefill_emits_first() const { return local_.prefill_emits
 std::uint32_t ReplicatedCohort::prefill_top(std::uint32_t lane) { return local_.prefill_top(lane); }
 std::uint32_t ReplicatedCohort::max_window(std::uint32_t lane) const { return local_.max_window(lane); }
 
+void ReplicatedCohort::abort_replica(const char* reason) noexcept {
+    closed_ = true;
+    try {
+        link_.abort(reason);
+    } catch (...) {
+        // Under memory pressure even building the reason string can fail. Retry without it.
+        try {
+            link_.abort({});
+        } catch (...) {  // Keep the original exception.
+        }
+    }
+}
+
 void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t flag, std::span<const std::uint32_t> body) {
     if (closed_) throw std::logic_error("cohort replica: call after close()");
     try {
@@ -160,8 +173,7 @@ void ReplicatedCohort::send(std::uint32_t op, std::uint32_t arg, std::uint32_t f
             at += n;
         }
     } catch (const std::exception& error) {
-        closed_ = true;  // the pair is out of step: nothing further may run on either rank
-        link_.abort(error.what());
+        abort_replica(error.what());
         throw;
     }
     deferred_.clear();
@@ -187,12 +199,20 @@ void ReplicatedCohort::verify(std::span<const CohortGroup> groups, std::span<con
     if (rows != tokens.size() || top.size() != tokens.size())
         throw std::invalid_argument("cohort replica: verify rows, tokens and top disagree");
     body_.insert(body_.end(), tokens.begin(), tokens.end());
-    send(kOpVerify, words_of(groups.size(), "groups"), 0U, body_);
     // The verify frame carries no score-read flag yet: both ranks run every group as read (CohortGroup's default), so
-    // rank 0 and rank 1 always take the same backend route (a collective one must not diverge).
+    // rank 0 and rank 1 always take the same backend route. Finish any group allocation before rank 1 can start.
     read_groups_.assign(groups.begin(), groups.end());
     for (auto& g : read_groups_) g.reads_scores = true;
-    local_.verify(read_groups_, tokens, top);
+    send(kOpVerify, words_of(groups.size(), "groups"), 0U, body_);
+    try {
+        local_.verify(read_groups_, tokens, top);
+    } catch (const std::exception& error) {
+        abort_replica(error.what());
+        throw;
+    } catch (...) {
+        abort_replica("cohort replica: rank 0 verify failed");
+        throw;
+    }
 }
 
 void ReplicatedCohort::commit(std::span<const std::uint32_t> accept) {

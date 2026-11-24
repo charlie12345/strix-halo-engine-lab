@@ -406,11 +406,19 @@ void no_pending_executes() {
 void parsing_and_apply() {
     check(pr::parse("default") == pr::Name::standard && pr::parse("fast") == pr::Name::fast &&
           pr::parse("quality") == pr::Name::quality, "parse names");
-    refuses([] { (void)pr::parse("turbo"); }, "exact (default), fast or quality", "unknown profile");
+    check(pr::parse("turbo") == pr::Name::turbo, "parse turbo");
     check(pr::parse("exact") == pr::Name::standard, "exact is the default column (shared tier word)");
-    // An empty table proves admission is checked before indexing, without triggering UB on an unfixed build.
-    for (const auto app : {pr::App::engine, pr::App::decode_bench, pr::App::prefill_bench})
-        refuses([&] { (void)pr::resolve(pr::Name::turbo, app, in(), {}); }, "turbo", "direct TURBO resolution");
+    auto inputs = in();
+    inputs.allow_pending = true;
+    for (const auto app : {pr::App::engine, pr::App::decode_bench, pr::App::prefill_bench}) {
+        const auto fast = pr::resolve(pr::Name::fast, app, inputs);
+        const auto turbo = pr::resolve(pr::Name::turbo, app, inputs);
+        for (const auto& entry : fast.entries) {
+            const auto* inherited = turbo.find(entry.lever->name);
+            check(inherited && inherited->value == entry.value && inherited->status == entry.status,
+                  "TURBO inherits FAST without a measured higher rung");
+        }
+    }
     char a0[] = "app", a1[] = "--profile", a2[] = "fast", a3[] = "--steps";
     char* with_value[] = {a0, a1, a2};
     char* bare[] = {a0, a1, a3};

@@ -25,8 +25,8 @@ constexpr std::string_view fast_prefill_attention_receipt =
 // because a8 prefill rows are byte-identical to g4-a8-v1 decode rows (byte receipt 4e914dcf: KV and per-row logits on
 // 56/56 teacher-v2 parents; served ids equal to decode-fed rows at C1/C4).
 [[maybe_unused]] constexpr std::string_view fast_a8_prefill_receipt = "g4-a8-v1 9ba0cf53 + a8 prefill byte receipt 4e914dcf";
-// Profile columns: default, fast, quality. One row per lever; an owner merge (or a passed gate) flips its
-// own `runnable` / `ready` column (and, if its switch name differs, `env`) on its own row.
+// Profile columns: default, fast, quality, turbo (an empty turbo cell reads the fast cell). One row per lever;
+// an owner merge (or a passed gate) flips its own `runnable` / `ready` column (and, if its switch name differs, `env`) on its own row.
 constexpr Lever table[] = {
     {.name = "decode_identity", .env = "STRIX_G4_IDENTITY", .value = {"g4-v1", "g4-a8-v1", ""}, .builtin = "g4-v1",
      .required = {false, true, false}, .ready = {true, true, true}, .runnable = {true, true, true},
@@ -137,6 +137,11 @@ constexpr Lever table[] = {
      .builtin = "1", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = prefill_bench,
      .source = "whole-chunk canonical attention, byte-equal to the 8-row loop"},
+    {.name = "mtp_q8", .env = "STRIX_G4_MTP_Q8", .value = {"0", "0", "0"}, .builtin = "0",
+     .kind = Kind::exact, .apps = engine, .off = "0",
+     .source = "explicit-only Q8_0 assistant weights at load; target verification owns the emitted tokens"},
+    {.name = "prefill_linear_policy", .env = "STRIX_G4_PREFILL_LINEAR_POLICY", .kind = Kind::bit_changing,
+     .apps = prefill_bench, .source = "explicit-only per-site WMMA operand policy; app-level v1/v2 identities own the runtime policy"},
 };
 using strix::profile::environment;
 void escape(std::string& out, std::string_view text) {
@@ -183,10 +188,8 @@ const char* status_name(Status status) {
 }
 Name parse(std::string_view value) {
     // Preserve the app's legacy diagnostic while sharing the name parser.
-    // 'turbo' is a shared name, but gemma4 has no versioned TURBO name and its rows have three columns
-    // (strix/profiles/gemma4.hpp Lever::value): refused here, before any column index.
-    if (!strix::profile::is_name(value) || value == "turbo")
-        throw std::invalid_argument("profile must be exact (default), fast or quality");
+    if (!strix::profile::is_name(value))
+        throw std::invalid_argument("profile must be exact (default), fast, turbo or quality");
     return strix::profile::parse(value);
 }
 strix::profile::ExecutionReceipt host_receipt(strix::profile::NumericalIdentity known) {
@@ -285,7 +288,6 @@ std::string Resolution::json() const {
 }
 
 Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const Lever> levers) {
-    if (profile == Name::turbo) throw std::invalid_argument("Gemma does not support profile turbo");
     Resolution out;
     out.name = profile;
     out.app = app;
@@ -293,9 +295,9 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
     ladder.insert(ladder.end(), std::begin(ladder_rows), std::end(ladder_rows));
     const auto* allow = environment(inputs.env, "STRIX_G4_PROFILE_ALLOW_PENDING");
     out.allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
-    const auto column = unsigned(profile);
     for (const auto& lever : levers) {
         if (!(lever.apps & unsigned(app))) continue;
+        const auto column = strix::profile::value_column(lever, profile);
         const auto& wanted = lever.value[column];
         const auto admit = [&](unsigned c) {
             return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
@@ -412,7 +414,7 @@ void apply(const Resolution& resolution) {
 bool take_option(int argc, char** argv, int& i, std::optional<Name>& out) {
     if (std::string_view(argv[i]) != "--profile" || i + 1 >= argc) return false;
     const std::string_view next = argv[i + 1];
-    if (!strix::profile::is_name(next)) return false;  // shared tier words; parse() refuses turbo with its reason
+    if (!strix::profile::is_name(next)) return false;
     out = parse(next);
     ++i;
     return true;

@@ -47,8 +47,10 @@ enum class Schedule : std::uint8_t { automatic, staged, tall };
 // the outer scale at the store. Row r's bits depend on its own inputs and the shape only (not on the tile's other rows,
 // its position in the tile, the row tile count or the row block count), so one form serves every row count of a launch
 // class (a lone decode row, a cohort, a verify window) with the same bits per row. Needs max_tile_rows >= 1, inputs %
-// 128 == 0, outputs % 64 == 0, 4-byte aligned scale rows, tiles x row blocks within the y grid; the activated
-// (epilogue) launches refuse it. Each row block reads the tile's weights again, so a tall tile (prefill) belongs to the
+// 128 == 0, outputs % 64 == 0, tiles x row blocks within the y grid (fits_small, checked for both legs of a visit
+// before any of it is submitted) and every expert matrix's codes 16-byte and scale plane 4-byte aligned
+// (fits_small_matrix, admitted on the host before descriptors can select the form); the activated (epilogue) launches
+// refuse it. Each row block reads the tile's weights again, so a tall tile (prefill) belongs to the
 // BF16 tile: the caller selects the form per launch class.
 enum class Form : std::uint8_t { bf16_tile, small_f16 };
 
@@ -102,6 +104,28 @@ STRIX_GROUPED_ROWS_HD constexpr unsigned tile_row_slices(unsigned max_tile_rows,
                                                          unsigned cta_rows) {
     const unsigned rows = max_tile_rows == 0U || max_tile_rows > tile_capacity ? tile_capacity : max_tile_rows;
     return cta_rows == 0U ? 0U : rows / cta_rows + (rows % cta_rows != 0U ? 1U : 0U);
+}
+
+// Shape and grid of a small-form launch (Form::small_f16): the one predicate its launcher and the dispatcher's
+// preflight of a whole visit share. Each CTA covers kSmallOutputs outputs (one projection panel) of one tile's row
+// block over K in kSmallInputs steps; the y grid holds tiles x row blocks.
+inline constexpr unsigned kSmallInputs = 128U, kSmallOutputs = 64U, kSmallGridY = 65535U;
+inline bool fits_small(const Args& args) {
+    const auto plan = small_rows(args.max_tile_rows);
+    return args.tiles && args.count >= 1U && args.count <= kMaxTiles && plan.row_tiles != 0U &&
+           args.inputs >= kSmallInputs && args.inputs % kSmallInputs == 0U && args.outputs >= kSmallOutputs &&
+           args.outputs % kSmallOutputs == 0U && args.count <= kSmallGridY / plan.row_blocks;
+}
+
+// An expert matrix the small form may read (host admission, before descriptors select the form): the shape of
+// fits_small, 16-byte code rows and a 4-byte aligned scale plane. The form loads scale bytes as 4-byte words (NVFP4:
+// four groups; MXFP8: two groups, or one 2-byte pair), and with inputs % 128 every row's codes and scales keep the
+// alignment of the plane's start. The BF16 tile's own admission (fits_rows) does not require it.
+inline bool fits_small_matrix(const packed::PackedMatrix& w, unsigned inputs, unsigned outputs) {
+    return w.codes && w.block_scales && w.rows == outputs && w.columns == inputs && inputs >= kSmallInputs &&
+           inputs % kSmallInputs == 0U && outputs >= kSmallOutputs && outputs % kSmallOutputs == 0U &&
+           reinterpret_cast<std::uintptr_t>(w.codes) % 16U == 0U &&
+           reinterpret_cast<std::uintptr_t>(w.block_scales) % 4U == 0U;
 }
 
 inline bool fits_args(const Args& args, unsigned k, unsigned n) {

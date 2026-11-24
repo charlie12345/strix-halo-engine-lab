@@ -8,6 +8,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -167,6 +168,131 @@ bool admission() {
     return hip_fits && moe::grouped_dispatch::HipBackend::fits(args);
 }
 
+// A whole grouped visit (grouped_dispatch::enqueue) on a recording backend: every submission counts, the gather
+// writes the workspace, and the projection refuses what the HIP launcher refuses (fits, and fits_small for the small
+// form). Hidden 256 / intermediate 64: gate-up (K 256, N 128) fits the small form, down (K 64, N 256) does not.
+int visit_submissions = 0;
+
+template<unsigned Hidden, unsigned Intermediate>
+struct VisitConfig {
+    enum class Projection { gate_up, down };
+    static constexpr unsigned hidden = Hidden, intermediate = Intermediate, experts = 4U, top_k = 2U, layers = 1U,
+                              max_rows = 4U;
+    static constexpr packed::MatrixFormat format(unsigned) { return packed::MatrixFormat::nvfp4; }
+    static constexpr packed::RowOrder row_order(Projection) { return packed::RowOrder::contiguous; }
+    struct Activation {
+        static constexpr float gate_cap = 4.0F, up_cap = 25.0F;
+        static int launch(const moe::expert_activation::Args&, int) { return ++visit_submissions, 0; }
+    };
+    struct Combine {
+        static int launch(const moe::grouped_rows::CombineArgs&, int) { return ++visit_submissions, 0; }
+    };
+};
+
+struct VisitBackend {
+    using Status = int;
+    using Stream = int;
+    static constexpr Status success = 0, invalid_value = 1;
+    static constexpr unsigned rows_per_tile = moe::grouped_microscaled::kRowsPerTile;
+    static constexpr auto fits = moe::grouped_microscaled::fits;
+    static constexpr bool small_form = true;
+    static Status gather(const moe::grouped_rows::GatherArgs& args, Stream) {
+        args.grouped[0] = 0U;
+        return ++visit_submissions, success;
+    }
+    template<packed::MatrixFormat Format>
+    static Status launch_projection(const moe::grouped_microscaled::Args& args, Stream) {
+        if (!moe::grouped_microscaled::fits(args) ||
+            (args.form == moe::grouped_microscaled::Form::small_f16 && !moe::grouped_microscaled::fits_small(args)))
+            return invalid_value;
+        return ++visit_submissions, success;
+    }
+};
+
+template<class Config>
+bool visit(moe::grouped_microscaled::Form form, int expect_status, int expect_submissions) {
+    namespace dispatch = moe::grouped_dispatch;
+    constexpr unsigned rows = 1U, assignments = rows * Config::top_k;
+    const auto need = dispatch::workspace_requirement<Config>(rows);
+    std::vector<std::uint16_t> bf16(need.bf16, std::uint16_t{0x1234U});
+    std::vector<float> fp32(need.fp32, 3.0F), input(Config::hidden, 1.0F), output(Config::hidden, 5.0F);
+    const std::array<std::uint32_t, assignments> assignment_rows{0U, 0U}, combine_rows{0U, 1U};
+    const std::array<float, assignments> weights{0.5F, 0.5F};
+    const std::array<moe::grouped_microscaled::TileRows, 2> gate_up{}, down{};
+    unsigned failure = 0U;
+    dispatch::DevicePlan plan{0U, rows, assignment_rows, combine_rows, weights, gate_up, down, nullptr, &failure};
+    plan.form = form;
+    visit_submissions = 0;
+    const int status = dispatch::enqueue<Config, VisitBackend>(plan, input, output, {bf16, fp32}, 0);
+    const bool untouched = std::ranges::all_of(bf16, [](std::uint16_t x) { return x == 0x1234U; }) &&
+                           std::ranges::all_of(fp32, [](float x) { return x == 3.0F; }) &&
+                           std::ranges::all_of(output, [](float x) { return x == 5.0F; });
+    if (status != expect_status || visit_submissions != expect_submissions ||
+        (expect_submissions == 0 && !untouched)) {
+        std::cout << "visit hidden " << Config::hidden << " intermediate " << Config::intermediate << " form "
+                  << static_cast<unsigned>(form) << ": status " << status << " submissions " << visit_submissions
+                  << " untouched " << untouched << "\n";
+        return false;
+    }
+    return true;
+}
+
+bool whole_visit_admission() {
+    using Fits = VisitConfig<256U, 128U>;
+    using DownTooNarrow = VisitConfig<256U, 64U>;
+    using Form = moe::grouped_microscaled::Form;
+    // Both legs fit: gather, gate-up, activation, down, combine. Down refused by the small form: nothing submitted,
+    // workspace and output untouched (before: gather, gate-up and the activation were queued, then down returned
+    // invalid_value). The BF16 tile takes both legs of that shape.
+    return visit<Fits>(Form::small_f16, 0, 5) && visit<DownTooNarrow>(Form::small_f16, 1, 0) &&
+           visit<DownTooNarrow>(Form::bf16_tile, 0, 5);
+}
+
+// Small-form admission of the expert banks: a scale plane that starts one byte past a 4-byte boundary (legal for the
+// BF16 tile) is refused for the small form, in either bank, by admit_small and by prepare_form(..., small_f16).
+bool small_scale_admission() {
+    namespace dispatch = moe::grouped_dispatch;
+    using Config = VisitConfig<256U, 128U>;
+    using Form = moe::grouped_microscaled::Form;
+    std::vector<std::uint8_t> storage(std::size_t{1} << 16U);
+    auto* base = storage.data() + (256U - reinterpret_cast<std::uintptr_t>(storage.data()) % 256U) % 256U;
+    const auto* codes = base;
+    const auto* scales = base + 32768U;  // 4-byte aligned scale plane
+    const packed::PackedMatrix gate_up{codes, scales, 2U * Config::intermediate, Config::hidden};
+    const packed::PackedMatrix down{codes, scales, Config::hidden, Config::intermediate};
+    std::vector<moe::grouped_dispatch::ExpertWeights> matrices(Config::experts, moe::grouped_dispatch::ExpertWeights{gate_up, down});
+    const auto need = dispatch::workspace_requirement<Config>(1U);
+    std::vector<std::uint16_t> bf16(need.bf16);
+    std::vector<float> fp32(need.fp32);
+    const std::array<std::uint32_t, 2> ids{0U, 1U};
+    const std::array<float, 2> weights{0.5F, 0.5F};
+    const auto prepares = [&](Form form) {
+        try {
+            (void)dispatch::prepare_form<Config, dispatch::HipBackend>(0U, 1U, ids, weights, matrices, {bf16, fp32},
+                                                                       form);
+            return true;
+        } catch (const std::invalid_argument&) {
+            return false;
+        }
+    };
+    if (!dispatch::admit_small<Config>(0U, matrices) || !prepares(Form::small_f16) || !prepares(Form::bf16_tile))
+        return false;
+    for (const bool in_down : {false, true}) {
+        auto odd = matrices;
+        (in_down ? odd[1].down : odd[1].gate_up).block_scales = scales + 1;
+        matrices.swap(odd);
+        const bool refused = !dispatch::admit_small<Config>(0U, matrices) && !prepares(Form::small_f16);
+        const bool incumbent = prepares(Form::bf16_tile);
+        matrices.swap(odd);
+        if (!refused || !incumbent) {
+            std::cout << "small-form scale admission (" << (in_down ? "down" : "gate-up") << "): refused " << refused
+                      << " incumbent admits " << incumbent << "\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -224,10 +350,14 @@ int main() {
             }
         }
     }
+    if (!whole_visit_admission() || !small_scale_admission()) {
+        std::cerr << "small-form visit or scale admission failed\n";
+        return 1;
+    }
     if (!admission() || !planner(200U, true, random) || !planner(4096U, false, random)) {
         std::cerr << "microscaled admission or large partition failed\n";
         return 1;
     }
-    std::cout << "microscaled tile host maps: PASS rows=1..128 K=1152,2304 N=2304 and planner bounds\n";
+    std::cout << "microscaled tile host maps: PASS rows=1..128 K=1152,2304 N=2304 and planner bounds, small-form visit and scale admission\n";
     return 0;
 }

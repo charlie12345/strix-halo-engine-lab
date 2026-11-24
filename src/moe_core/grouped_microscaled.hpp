@@ -185,10 +185,9 @@ __global__ __launch_bounds__(128) void small_kernel(Args args, const std::uint32
 template <packed::MatrixFormat Format>
 inline hipError_t launch_small(const Args& args, const std::uint32_t* gather_rows, const std::uint16_t* gather_from,
                                hipStream_t stream) {
+    static_assert(kSmallOutputs == gemm::kProjectionPanel);
+    if (!fits_small(args)) return hipErrorInvalidValue;  // the predicate the dispatcher preflights a visit with
     const auto plan = small_rows(args.max_tile_rows);
-    if (plan.row_tiles == 0U || args.inputs % 128U != 0U || args.outputs % gemm::kProjectionPanel != 0U ||
-        args.count > 65535U / plan.row_blocks)
-        return hipErrorInvalidValue;
     const dim3 grid(args.outputs / gemm::kProjectionPanel, args.count * plan.row_blocks);
     if (plan.row_tiles == 1U)
         STRIX_HIP_LAUNCH(Rdna3Layout, small_kernel<Format, 1U><<<grid, 128, 0, stream>>>(args, gather_rows, gather_from, plan.row_blocks));

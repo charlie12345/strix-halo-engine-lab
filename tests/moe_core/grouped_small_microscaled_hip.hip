@@ -551,8 +551,8 @@ dispatch::Workspace route_workspace(const RouteDevice& d, unsigned rows) {
 template <Format F>
 dispatch::DevicePlan upload_route(const Format_& Fm, const RouteDevice& d, unsigned rows,
                                   std::span<const std::uint32_t> ids, std::span<const float> weights, grouped::Form form) {
-    const auto plan = dispatch::prepare<RouteConfig<F>, dispatch::HipBackend>(
-        0U, rows, ids, weights, std::span<const ExpertWeights>(Fm.host), route_workspace<F>(d, rows));
+    const auto plan = dispatch::prepare_form<RouteConfig<F>, dispatch::HipBackend>(
+        0U, rows, ids, weights, std::span<const ExpertWeights>(Fm.host), route_workspace<F>(d, rows), form);
     const std::size_t A = std::size_t{rows} * kTopK;
     require_hip(hipMemcpy(d.assignment_rows, plan.routes.grouping.assignment_rows.data(), A * 4U, hipMemcpyHostToDevice), "p");
     require_hip(hipMemcpy(d.combine_rows, plan.routes.combine_rows.data(), A * 4U, hipMemcpyHostToDevice), "p");

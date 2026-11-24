@@ -230,10 +230,12 @@ struct HostPlan {
     std::vector<TileRows> down;
 };
 
+// prepare() for a plan whose projections run in `form`: the small form also admits every expert matrix with
+// grouped_microscaled::fits_small_matrix (prepare() itself is the BF16 tile's admission, unchanged).
 template<class Config, class Backend>
-inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
-                        std::span<const float> weights, std::span<const ExpertWeights> matrices,
-                        Workspace workspace) {
+inline HostPlan prepare_form(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
+                             std::span<const float> weights, std::span<const ExpertWeights> matrices,
+                             Workspace workspace, grouped_microscaled::Form form) {
     using Projection = typename Config::Projection;
     const auto need = workspace_elements<Config>(rows);
     if (layer >= Config::layers || matrices.size() != Config::experts ||
@@ -262,10 +264,23 @@ inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint
             !fits_tile<Config, Backend>(layer, Projection::down, down)) {
             throw std::invalid_argument("grouped MoE: incompatible expert descriptor");
         }
+        if (form == grouped_microscaled::Form::small_f16 &&
+            (!grouped_microscaled::fits_small_matrix(matrix.gate_up, Config::hidden, gate_width) ||
+             !grouped_microscaled::fits_small_matrix(matrix.down, Config::intermediate, Config::hidden))) {
+            throw std::invalid_argument("grouped MoE: expert descriptor not admitted for the small form");
+        }
         plan.gate_up.push_back(gate_up);
         plan.down.push_back(down);
     }
     return plan;
+}
+
+template<class Config, class Backend>
+inline HostPlan prepare(unsigned layer, unsigned rows, std::span<const std::uint32_t> experts,
+                        std::span<const float> weights, std::span<const ExpertWeights> matrices,
+                        Workspace workspace) {
+    return prepare_form<Config, Backend>(layer, rows, experts, weights, matrices, workspace,
+                                         grouped_microscaled::Form::bf16_tile);
 }
 
 struct DevicePlan {
@@ -306,6 +321,20 @@ inline bool admit_w4a4(unsigned layer, std::span<const ExpertWeights> matrices) 
     };
     for (const auto& m : matrices)
         if (!fits(m.gate_up, Config::hidden, gate_width) || !fits(m.down, Config::intermediate, Config::hidden)) return false;
+    return true;
+}
+
+// Load-time admission of the small form (grouped_microscaled::Form::small_f16) for one layer's experts: both banks
+// (gate-up and down) of every expert pass fits_small_matrix (shape, 16-byte codes, 4-byte aligned scale plane). A
+// caller that uploads its own descriptors (enqueue with DevicePlan::form = small_f16) admits them here or through
+// prepare_form(..., Form::small_f16); enqueue_resident admits them itself before it plans.
+template<class Config>
+inline bool admit_small(unsigned layer, std::span<const ExpertWeights> matrices) {
+    if (layer >= Config::layers || matrices.size() != Config::experts) return false;
+    constexpr unsigned gate_width = 2U * Config::intermediate;
+    for (const auto& m : matrices)
+        if (!grouped_microscaled::fits_small_matrix(m.gate_up, Config::hidden, gate_width) ||
+            !grouped_microscaled::fits_small_matrix(m.down, Config::intermediate, Config::hidden)) return false;
     return true;
 }
 
@@ -362,15 +391,22 @@ inline typename Backend::Status enqueue(
     gate_up.decode = down.decode = plan.decode;
     gate_up.schedule = down.schedule = plan.schedule;
     gate_up.form = down.form = plan.form;
+    // The whole visit is admitted before any of it is submitted: a leg the launchers would refuse returns
+    // invalid_value here, with nothing queued and the workspace untouched (never after gate-up already ran).
     if (plan.form != grouped_microscaled::Form::bf16_tile) {
         if constexpr (!requires { Backend::small_form; }) return Backend::invalid_value;
         if (plan.activations != grouped_w4a4::Activations::bf16) return Backend::invalid_value;
+        if (!grouped_microscaled::fits_small(gate_up) || !grouped_microscaled::fits_small(down))
+            return Backend::invalid_value;
     }
     if (!Backend::fits(gate_up) || !Backend::fits(down)) return Backend::invalid_value;
     // A backend whose gate-up reads token rows in place writes the rows x hidden BF16 image of the token rows at
     // workspace.bf16 (the base the plan's gathered addresses are relative to) instead of top_k gathered copies; each
     // tile row then reads bf16_encode of the FP32 element the gather would have copied (same operand bits).
     constexpr bool in_place = requires { Backend::token_rows; };
+    // In place, gate-up reads the token image at workspace.bf16 (16-byte rows, grouped_microscaled::fits_indirect).
+    if constexpr (in_place)
+        if (reinterpret_cast<std::uintptr_t>(workspace.bf16.data()) % 16U != 0U) return Backend::invalid_value;
     [[maybe_unused]] const auto rows_in_place = [&](const grouped_microscaled::Args& args) {
         grouped_microscaled::IndirectArgs indirect{args, plan.assignment_rows.data(), workspace.bf16.data()};
         return indirect;
@@ -475,6 +511,8 @@ inline typename Backend::Status enqueue_resident(
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic,
     grouped_microscaled::Form form = grouped_microscaled::Form::bf16_tile) {
     using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
+    if (form == grouped_microscaled::Form::small_f16 && !admit_small<Config>(layer, matrices))
+        return Backend::invalid_value;  // before routing or planning is queued
     device_grouped::Args args{};
     if (!prepare_resident<Config, Backend>(layer, rows, route, matrices, csr, out, workspace, args)) {
         return Backend::invalid_value;

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <span>
 #include <string>
 #include <thread>
@@ -244,12 +245,23 @@ private:
 // a selected row holds the bits of the full incumbent head; every other row keeps its approximate score. |S| > capacity
 // (degenerate scores: many equal keys) recomputes every row, i.e. the incumbent head. Not EXACT: the order of the
 // approximate scores decides S. The selection is two passes of 12-bit digits (key >> 20, then (key >> 8) & 0xfff).
+// All NaNs share the highest key, so every NaN is selected. Signed zeros are a numeric tie.
 inline constexpr unsigned kRescoreBins = 4096U;
 inline constexpr unsigned kRescoreMaxK = 4096U;
+inline constexpr unsigned kRescorePass2Threads = 128U;
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+__host__ __device__
+#endif
+constexpr std::uint32_t rescore_order_key_bits(std::uint32_t b) noexcept {
+    const auto magnitude = b & 0x7fffffffU;
+    if (magnitude > 0x7f800000U) return 0xffffffffU;
+    if (magnitude == 0U) return 0x80000000U;
+    return (b & 0x80000000U) != 0U ? ~b : (b | 0x80000000U);
+}
 
 constexpr std::uint32_t order_key(float v) noexcept {
-    const auto b = std::bit_cast<std::uint32_t>(v);
-    return (b & 0x80000000U) != 0U ? ~b : (b | 0x80000000U);
+    return rescore_order_key_bits(std::bit_cast<std::uint32_t>(v));
 }
 
 // The selection threshold of one lane (host reference of the device digits): the k-th largest key with its low 8 bits
@@ -276,26 +288,29 @@ struct RescoreLayout {
     std::size_t hist_stride, ids_stride, y_stride;
 };
 constexpr RescoreLayout rescore_layout(unsigned rows, unsigned capacity, unsigned lanes) noexcept {
-    const auto up = [](std::size_t v) { return (v + 255U) / 256U * 256U; };
-    RescoreLayout l{};
-    l.hist_stride = 2U * kRescoreBins;
-    l.ids_stride = up(std::size_t{capacity} * 4U) / 4U;
-    l.y_stride = up(std::size_t{rows > capacity ? rows : capacity} * 4U) / 4U;
-    l.hist = up(std::size_t{lanes} * sizeof(RescoreState));
-    l.ids = l.hist + std::size_t{lanes} * l.hist_stride * 4U;
-    l.cleared = l.ids;
-    l.y = l.ids + std::size_t{lanes} * l.ids_stride * 4U;
-    l.bytes = l.y + std::size_t{lanes} * l.y_stride * 4U;
-    return l;
+    if (lanes == 0U || lanes > kMaxLanes) return {};
+    const auto up = [](std::uint64_t v) { return (v + 255U) / 256U * 256U; };
+    constexpr std::size_t hist_stride = 2U * kRescoreBins;
+    const auto ids_bytes = up(std::uint64_t{capacity} * 4U);
+    const auto y_bytes = up(std::uint64_t{std::max(rows, capacity)} * 4U);
+    const auto hist = up(std::uint64_t{lanes} * sizeof(RescoreState));
+    const auto ids = hist + std::uint64_t{lanes} * hist_stride * 4U;
+    const auto y = ids + lanes * ids_bytes;
+    const auto bytes = y + lanes * y_bytes;
+    if (bytes > std::numeric_limits<std::size_t>::max()) return {};
+    return {static_cast<std::size_t>(hist), static_cast<std::size_t>(ids), static_cast<std::size_t>(y),
+            static_cast<std::size_t>(ids), static_cast<std::size_t>(bytes), hist_stride,
+            static_cast<std::size_t>(ids_bytes / 4U), static_cast<std::size_t>(y_bytes / 4U)};
 }
 
 // Blocks per lane of the histogram and compaction passes (each thread visits 8 rows of a 256-thread block).
 constexpr unsigned rescore_blocks(unsigned rows) noexcept {
-    const unsigned blocks = (rows + 2047U) / 2048U;
-    return blocks == 0U ? 1U : (blocks > 128U ? 128U : blocks);
+    return rows == 0U ? 1U : std::min(128U, 1U + (rows - 1U) / 2048U);
 }
 
 // One enqueue of the rescore trait over `lanes` rows of scores (all pointers are device pointers).
+// The required prefix of scratch must be disjoint from weights, activations and the score image (including pitch
+// tails). The enqueue owns this prefix exclusively until stream completion.
 struct RescoreLaunch {
     HeadSpec head;          // incumbent BF16 rows and the post-transform cap (> 0)
     const float* x;         // activations [lanes][x_stride], 16-byte aligned
@@ -303,6 +318,7 @@ struct RescoreLaunch {
     std::uint8_t* scratch;  // rescore_layout(head.rows, capacity, lanes).bytes
     unsigned lanes, x_stride, pitch, k, capacity;
     unsigned pass2_blocks = 1024U;
+    std::size_t scratch_bytes = 0U;  // available bytes at scratch
 };
 
 inline bool rescore_launch_valid(const RescoreLaunch& a) noexcept {
@@ -310,13 +326,30 @@ inline bool rescore_launch_valid(const RescoreLaunch& a) noexcept {
         return p != nullptr && reinterpret_cast<std::uintptr_t>(p) % n == 0U;
     };
     if (a.lanes == 0U || a.lanes > kMaxLanes || a.k == 0U || a.k > kRescoreMaxK || a.capacity < a.k ||
-        a.capacity > kCapacity || a.pass2_blocks == 0U)
+        a.capacity > kCapacity || a.pass2_blocks == 0U ||
+        a.pass2_blocks > std::numeric_limits<unsigned>::max() / kRescorePass2Threads)
         return false;
-    if (a.head.rows == 0U || a.head.width == 0U || a.head.width > kMaxWidth || a.head.width % 4U != 0U ||
+    // The mapped BF16 body consumes 16 columns at a time. The incumbent row bound leaves room for
+    // grid-stride increments, histogram totals and rounding the all-row mapped launch.
+    if (a.head.rows == 0U || a.head.rows >= (1U << 30U) ||
+        a.head.width == 0U || a.head.width > kMaxWidth || a.head.width % 16U != 0U ||
         !(a.head.softcap > 0.0F) || !std::isfinite(a.head.softcap))
         return false;
     if (a.pitch < a.head.rows || (a.lanes > 1U && (a.x_stride < a.head.width || a.x_stride % 4U != 0U))) return false;
-    return aligned(a.head.weights, 16U) && aligned(a.x, 16U) && aligned(a.scores, 4U) && aligned(a.scratch, 256U);
+    if (!aligned(a.head.weights, 16U) || !aligned(a.x, 16U) || !aligned(a.scores, 4U) || !aligned(a.scratch, 256U))
+        return false;
+    const auto bytes = rescore_layout(a.head.rows, a.capacity, a.lanes).bytes;
+    const auto scratch = reinterpret_cast<std::uintptr_t>(a.scratch);
+    constexpr auto max_address = std::numeric_limits<std::uintptr_t>::max();
+    if (bytes == 0U || bytes > a.scratch_bytes || bytes > max_address - scratch) return false;
+    const auto disjoint = [&](const void* p, std::uint64_t size) {
+        const auto start = reinterpret_cast<std::uintptr_t>(p);
+        return size <= max_address - start && (start + size <= scratch || scratch + bytes <= start);
+    };
+    const auto activations = std::uint64_t{a.lanes - 1U} * a.x_stride + a.head.width;
+    return disjoint(a.head.weights, std::uint64_t{a.head.rows} * a.head.width * sizeof(std::uint16_t)) &&
+           disjoint(a.x, activations * sizeof(float)) &&
+           disjoint(a.scores, std::uint64_t{a.lanes} * a.pitch * sizeof(float));
 }
 
 }  // namespace strix::core::screened_head_plan

@@ -418,7 +418,7 @@ __global__ void __launch_bounds__(kRescoreThreads) rescore_hist_kernel(const flo
     for (unsigned b = threadIdx.x; b < kRescoreBins; b += kRescoreThreads) counts[b] = 0U;
     __syncthreads();
     for (unsigned i = blockIdx.x * kRescoreThreads + threadIdx.x; i < rows; i += gridDim.x * kRescoreThreads) {
-        const unsigned key = order_key(s[i]);
+        const unsigned key = screened_head_plan::rescore_order_key_bits(__float_as_uint(s[i]));
         if (Digit == 1U) atomicAdd(&counts[key >> 20U], 1U);
         else if ((key >> 20U) == first) atomicAdd(&counts[(key >> 8U) & (kRescoreBins - 1U)], 1U);
     }
@@ -501,7 +501,7 @@ __global__ void __launch_bounds__(kRescoreThreads) rescore_compact_kernel(const 
     const unsigned lane = threadIdx.x % static_cast<unsigned>(warpSize);
     for (unsigned base = blockIdx.x * kRescoreThreads; base < rows; base += gridDim.x * kRescoreThreads) {
         const unsigned i = base + threadIdx.x;
-        const bool hit = i < rows && order_key(s[i]) >= threshold;
+        const bool hit = i < rows && screened_head_plan::rescore_order_key_bits(__float_as_uint(s[i])) >= threshold;
         const unsigned long long mask = __ballot(hit);
         if (mask == 0ULL) continue;
         const unsigned leader = static_cast<unsigned>(__ffsll(static_cast<long long>(mask))) - 1U;
@@ -544,18 +544,26 @@ inline hipError_t enqueue_rescore_rows(const screened_head_plan::RescoreLaunch& 
     const dim3 grid(screened_head_plan::rescore_blocks(a.head.rows), a.lanes);
     rescore_hist_kernel<1U><<<grid, kRescoreThreads, 0, stream>>>(a.scores, a.pitch, a.head.rows, states, hist,
                                                                   layout.hist_stride);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     rescore_select_kernel<1U><<<a.lanes, kRescoreThreads, 0, stream>>>(states, hist, layout.hist_stride, a.k);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     rescore_hist_kernel<2U><<<grid, kRescoreThreads, 0, stream>>>(a.scores, a.pitch, a.head.rows, states, hist,
                                                                   layout.hist_stride);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     rescore_select_kernel<2U><<<a.lanes, kRescoreThreads, 0, stream>>>(states, hist, layout.hist_stride, a.k);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     rescore_compact_kernel<<<grid, kRescoreThreads, 0, stream>>>(a.scores, a.pitch, a.head.rows, states, ids,
                                                                  layout.ids_stride, a.capacity);
+    if (const auto e = hipGetLastError(); e != hipSuccess) return e;
     const dense_linear::View view{reinterpret_cast<const std::uint8_t*>(a.head.weights), a.head.width, a.head.rows,
                                   std::size_t{a.head.width} * sizeof(std::uint16_t)};
-    for (unsigned l = 0; l < a.lanes; ++l)
-        dense_linear::mapped_rows_kernel<weight_decode::Format::bf16><<<a.pass2_blocks, 128, 0, stream>>>(
+    for (unsigned l = 0; l < a.lanes; ++l) {
+        dense_linear::mapped_rows_kernel<weight_decode::Format::bf16>
+            <<<a.pass2_blocks, screened_head_plan::kRescorePass2Threads, 0, stream>>>(
             view, a.x + std::size_t{l} * a.x_stride, y + std::size_t{l} * layout.y_stride,
             dense_linear::MappedRows{ids + std::size_t{l} * layout.ids_stride, &states[l].count, a.capacity});
+        if (const auto e = hipGetLastError(); e != hipSuccess) return e;
+    }
     rescore_scatter_kernel<<<grid, kRescoreThreads, 0, stream>>>(a.scores, a.pitch, a.head.rows, states, ids,
                                                                  layout.ids_stride, y, layout.y_stride, a.capacity,
                                                                  a.head.softcap);

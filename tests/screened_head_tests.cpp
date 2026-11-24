@@ -196,6 +196,23 @@ void rescore_plan_tests() {
     std::sort(grid.begin(), grid.end());
     for (std::size_t i = 1; i < grid.size(); ++i)
         if (grid[i] > grid[i - 1]) expect(plan::order_key(grid[i]) > plan::order_key(grid[i - 1]), "order key monotone");
+    const float negative_nan = std::bit_cast<float>(0xffc00000U);
+    const float positive_nan = std::bit_cast<float>(0x7fc12345U);
+    const float signaling_nan = std::bit_cast<float>(0x7f800001U);
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float mixed[] = {negative_nan, 1.0F, positive_nan, signaling_nan, infinity};
+    const auto nan_cutoff = plan::rescore_threshold(mixed, 1U);
+    unsigned selected_nans = 0U;
+    for (float v : mixed) selected_nans += plan::order_key(v) >= nan_cutoff ? 1U : 0U;
+    expect(plan::order_key(negative_nan) == plan::order_key(positive_nan) &&
+               plan::order_key(positive_nan) == plan::order_key(signaling_nan) &&
+               plan::order_key(negative_nan) > plan::order_key(infinity),
+           "NaN signs and payloads share the highest key");
+    expect(selected_nans == 3U, "all NaNs selected at k=1, overflowing a capacity of two", selected_nans);
+    const float zeros[] = {-0.0F, 0.0F, -1.0F};
+    expect(plan::order_key(zeros[0]) == plan::order_key(zeros[1]) &&
+               plan::order_key(zeros[0]) >= plan::rescore_threshold(zeros, 1U),
+           "signed zeros share the numeric tie at k=1");
     // The threshold selects the exact top-k plus the rows sharing the k-th key's 24-bit prefix, never fewer than k.
     std::mt19937 rng(11U);
     std::normal_distribution<float> normal(0.0F, 3.0F);
@@ -230,12 +247,15 @@ void rescore_plan_tests() {
     expect(plan::rescore_blocks(200058U) == 98U && plan::rescore_blocks(1U) == 1U &&
                plan::rescore_blocks(1U << 30U) == 128U,
            "rescore blocks");
-    // Launch contract (host-side pointers stand in for device pointers: only values and alignment are checked).
-    alignas(256) static std::uint8_t scratch[256];
-    alignas(16) static std::uint16_t weights[8];
-    alignas(16) static float x[64];
-    static float scores[64];
-    const plan::RescoreLaunch ok{{weights, 32U, 8U, 30.0F}, x, scores, scratch, 2U, 8U, 32U, 4U, 16U, 64U};
+    constexpr unsigned huge = std::numeric_limits<unsigned>::max();
+    expect(plan::rescore_blocks(huge) == 128U, "histogram grid rounds without wrap");
+    // Host storage stands in for device ranges. Put lane 1 at a scratch-aligned address.
+    alignas(256) static std::uint8_t scratch[plan::rescore_layout(32U, 16U, 2U).bytes];
+    alignas(256) static std::uint16_t weights[32U * 16U];
+    alignas(256) static float x[128];
+    alignas(256) static float scores[128];
+    const plan::RescoreLaunch ok{{weights, 32U, 16U, 30.0F}, x, scores, scratch, 2U, 64U, 64U, 4U, 16U, 64U,
+                                 sizeof(scratch)};
     expect(plan::rescore_launch_valid(ok), "valid rescore launch");
     auto bad = ok;
     bad.k = 0U;
@@ -253,12 +273,32 @@ void rescore_plan_tests() {
     bad.x_stride = 6U;
     expect(!plan::rescore_launch_valid(bad), "x stride < width");
     bad = ok;
-    bad.head.width = 6U;
-    bad.x_stride = 8U;
-    expect(!plan::rescore_launch_valid(bad), "width not a multiple of 4");
+    for (unsigned width : {8U, 20U}) {
+        bad.head.width = width;
+        expect(!plan::rescore_launch_valid(bad), "width leaves a mapped BF16 tail", width);
+    }
+    bad = ok;
+    bad.head.rows = huge;
+    bad.pitch = huge;
+    expect(!plan::rescore_launch_valid(bad), "row loops and all-row mapping cannot wrap");
+    bad = ok;
+    bad.pass2_blocks = huge / 128U + 1U;
+    expect(!plan::rescore_launch_valid(bad), "pass-2 grid must fit the 32-bit work-item limit");
     bad = ok;
     bad.scratch = scratch + 16;
     expect(!plan::rescore_launch_valid(bad), "scratch alignment");
+    bad = ok;
+    --bad.scratch_bytes;
+    expect(!plan::rescore_launch_valid(bad), "undersized scratch");
+    for (const void* overlap : {static_cast<const void*>(scores + 64), static_cast<const void*>(x + 64),
+                                static_cast<const void*>(weights)}) {
+        bad = ok;
+        bad.scratch = reinterpret_cast<std::uint8_t*>(const_cast<void*>(overlap));
+        expect(!plan::rescore_launch_valid(bad), "scratch overlaps a live input or score lane");
+    }
+    bad = ok;
+    bad.scratch = reinterpret_cast<std::uint8_t*>(std::numeric_limits<std::uintptr_t>::max() & ~std::uintptr_t{255});
+    expect(!plan::rescore_launch_valid(bad), "scratch address range cannot wrap");
 }
 
 void builder_tests() {

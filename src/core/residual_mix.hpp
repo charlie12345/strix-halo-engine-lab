@@ -412,6 +412,13 @@ static __global__ void normalize_pair_image(NormalizeArgs first, NormalizeArgs s
         __syncthreads();
     }
 }
+
+// The kernel's one launch site, outside any template: a translation unit whose backend never admits the image
+// still uses the kernel (an internal kernel referenced only from a discarded branch is an unneeded declaration).
+inline void launch_normalize_pair_image(dim3 grid, const NormalizeArgs& first, const NormalizeArgs& second,
+                                        std::uint16_t* first_image, std::uint16_t* second_image, Stream stream) {
+    normalize_pair_image<<<grid, kThreads, 0, stream>>>(first, second, first_image, second_image);
+}
 #endif
 
 #if defined(__HIPCC__)
@@ -937,8 +944,8 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
         image = operations.admits_dense_bf16_image(stride, rows, down_rows);
         if (image) {
             auto* const operand_image = reinterpret_cast<std::uint16_t*>(operands.data());
-            detail::normalize_pair_image<<<grid, detail::kThreads, 0, stream>>>(
-                normalize.operands[0], normalize.operands[1], operand_image, operand_image + width);
+            detail::launch_normalize_pair_image(grid, normalize.operands[0], normalize.operands[1], operand_image,
+                                                operand_image + width, stream);
             operations.check(detail::last_error());
             operations.dense_bf16_image(operand_image, stride, rows, down);
         }

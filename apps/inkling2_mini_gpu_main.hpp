@@ -45,7 +45,7 @@ inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
 public:
-    DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::RoleStorage storage,
+    DeviceCliDecoder(const serve::SerialGenerationLoad& load, bool step_graphs, weight::FormatId storage,
                      const char* dspark,
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
@@ -120,7 +120,7 @@ inline void run_gate(const char* checkpoint, const Options& options, const weigh
     const auto max_rows = std::min(options.generation.prefill_chunk, prefix_positions);
     const auto load_start = session::CliClock::now();
     MiniResidentDecoder decoder(checkpoint, positions, max_rows, options.generation.packed_decode,
-                                 options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.roles());
+                                 options.step_graphs.value_or(MiniResidentBackend::default_step_graphs), weights.storage);
     decoder.set_moe_w4a4(mini_moe_w4a4_class(options.tier));
     if (mini_moe_w4a4(options.tier))
         std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [step_graphs, storage = weights.roles(), dspark = options.dspark,
+        family.load = [step_graphs, storage = weights.storage, dspark = options.dspark,
                        moe_w4a4 = mini_moe_w4a4_class(options.tier)](const serve::SerialGenerationLoad& load) {
             return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, storage, dspark, moe_w4a4);
         };

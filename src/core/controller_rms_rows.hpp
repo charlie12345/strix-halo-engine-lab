@@ -121,7 +121,8 @@ __global__ __launch_bounds__(kThreads) void controller_rms_kernel(Args a) {
 
 // The shapes the row-owner form takes: prefill rows (decode rows keep their gemv gates), rank a multiple of 16 up to
 // 64, width a multiple of 16 above 256, 16-byte aligned latent rows and weights, output either the current rows or
-// disjoint from current, message and latent. Rows of at most 256 values keep the two launches: there the separate
+// disjoint from current, message and latent, and always disjoint from the operands a CTA reads after another CTA may
+// have stored output rows (both gate weight panels and the norm scale). Rows of at most 256 values keep the two launches: there the separate
 // norm runs its one-wave form (ops/norm/rms_bf16_rows.hpp), the same bits for finite rows but not always the same
 // NaN payload as the block form this kernel shares with rmsnorm_strided_kernel.
 inline bool admits(const Args& a, unsigned decode_rows) noexcept {
@@ -137,10 +138,16 @@ inline bool admits(const Args& a, unsigned decode_rows) noexcept {
         !aligned(a.latent) || !aligned(a.forget) || !aligned(a.gain) || !(a.epsilon > 0.0F))
         return false;
     const std::size_t rows_bytes = std::size_t{a.rows} * a.width * sizeof(float);
+    const std::size_t panel_bytes = std::size_t{a.width} * a.rank * sizeof(std::uint16_t);
     return (a.output == a.current || disjoint(a.output, rows_bytes, a.current, rows_bytes)) &&
            disjoint(a.output, rows_bytes, a.message, rows_bytes) &&
-           disjoint(a.output, rows_bytes, a.latent, std::size_t{a.rows} * a.rank * sizeof(float));
+           disjoint(a.output, rows_bytes, a.latent, std::size_t{a.rows} * a.rank * sizeof(float)) &&
+           disjoint(a.output, rows_bytes, a.forget, panel_bytes) && disjoint(a.output, rows_bytes, a.gain, panel_bytes) &&
+           (!a.scale || disjoint(a.output, rows_bytes, a.scale, std::size_t{a.width} * sizeof(std::uint16_t)));
 }
+
+// One CTA per 16 rows, without the rounding addition that wraps for row counts near the unsigned maximum.
+inline constexpr unsigned grid_blocks(unsigned rows) noexcept { return rows / kRows + (rows % kRows != 0U ? 1U : 0U); }
 
 }  // namespace strix::core::controller_rms_rows
 #endif

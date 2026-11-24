@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <limits>
 
-// HIP launch boundary: the row-owner body remains in the shared core header.
+// HIP launch boundary: the row-owner body remains in the shared core header. The launch re-checks the admitted shape
+// (rank selects the kernel's K16 unit count; a refused shape never reaches a specialization with other strides).
 namespace strix::core::controller_rms_rows {
 inline hipError_t enqueue(const Args& a, hipStream_t stream) {
-    const dim3 grid((a.rows + kRows - 1U) / kRows);
+    if (!admits(a, 0U)) return hipErrorInvalidValue;
+    const dim3 grid(grid_blocks(a.rows));
     switch (a.rank / 16U) {
     case 1U: detail::controller_rms_kernel<1U><<<grid, kThreads, 0, stream>>>(a); break;
     case 2U: detail::controller_rms_kernel<2U><<<grid, kThreads, 0, stream>>>(a); break;

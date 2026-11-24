@@ -162,7 +162,54 @@ int run(unsigned rows, unsigned width, unsigned rank, bool in_place, bool expect
 
 }  // namespace
 
+// Host-only admission of the row-owner launch (no device access: every refused call returns before a launch).
+static_assert(strix::core::controller_rms_rows::grid_blocks(0U) == 0U);
+static_assert(strix::core::controller_rms_rows::grid_blocks(16U) == 1U);
+static_assert(strix::core::controller_rms_rows::grid_blocks(17U) == 2U);
+static_assert(strix::core::controller_rms_rows::grid_blocks(0xFFFFFFFFU) == 0x10000000U);
+
+static int admission_refusals() {
+    namespace crr = strix::core::controller_rms_rows;
+    alignas(16) static unsigned char arena[256U * 1024U];
+    const auto at = [](std::size_t offset) { return static_cast<void*>(arena + offset); };
+    // width 272, rank 16, 32 rows: latent 2 KiB, panels 8.5 KiB, row blocks 34 KiB, scale 544 B, all disjoint.
+    crr::Args base{static_cast<const float*>(at(0U)),           static_cast<const std::uint16_t*>(at(4096U)),
+                   static_cast<const std::uint16_t*>(at(16384U)), static_cast<const float*>(at(32768U)),
+                   static_cast<const float*>(at(73728U)),        static_cast<const std::uint16_t*>(at(155648U)),
+                   static_cast<float*>(at(114688U)),             32U, 272U, 16U, 1.0e-6F};
+    const auto output_bytes = [&](unsigned offset) { return static_cast<const std::uint16_t*>(at(114688U + offset)); };
+    int failures = 0;
+    const auto expect = [&](const char* name, bool got, bool want) {
+        if (got != want) {
+            std::printf("controller-rms: FAIL admission %s admitted %d expected %d\n", name, got ? 1 : 0, want ? 1 : 0);
+            ++failures;
+        }
+    };
+    expect("disjoint", crr::admits(base, 16U), true);
+    auto a = base;
+    a.scale = nullptr;
+    expect("unscaled", crr::admits(a, 16U), true);
+    a = base;
+    a.scale = output_bytes(0U);  // the scale's 544 bytes inside the first output row
+    expect("output_holds_scale", crr::admits(a, 16U), false);
+    a = base;
+    a.forget = output_bytes(34816U - 4096U);  // forget panel overlaps the last output rows
+    expect("output_holds_forget", crr::admits(a, 16U), false);
+    a = base;
+    a.gain = output_bytes(1024U);
+    expect("output_holds_gain", crr::admits(a, 16U), false);
+    a = base;
+    a.rank = 20U;  // not a K16 multiple: the raw launch refuses instead of running the rank-16 specialization
+    expect("rank20", crr::admits(a, 16U), false);
+    expect("rank20_raw_launch", crr::enqueue(a, nullptr) == hipSuccess, false);
+    a = base;
+    a.scale = output_bytes(0U);
+    expect("alias_raw_launch", crr::enqueue(a, nullptr) == hipSuccess, false);
+    return failures == 0 ? 1 : 0;
+}
+
 int main() {
+    if (admission_refusals() != 1) return 1;
     std::mt19937 random(20261124U);
     std::size_t compared = 0;
     // (rows, width, rank, in place, row-owner expected): the Inkling controller (width 2304, rank 64) with full and

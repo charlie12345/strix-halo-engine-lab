@@ -13,6 +13,7 @@
 // contract per tile); h = activate_bf16(gate, up) as the incumbent gate/up epilogue. Bits differ from the BF16 tile:
 // FAST / TURBO class only, behind gate v2.
 #include "core/iu4a4_rot.hpp"
+#include "moe_core/grouped_iu4a4_plan.hpp"
 #include "moe_core/grouped_microscaled_rows.hpp"
 #include "strix/weight/formats/microscaled.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
@@ -34,16 +35,8 @@ namespace strix::moe_core::grouped_iu4a4 {
 namespace packed = strix::weight::microscaled;
 namespace rot = strix::core::iu4a4_rot;
 using grouped_microscaled::TileRows;
-inline constexpr const char* kArithmeticId = "grouped-iu4a4-rot-v1";
 inline constexpr unsigned kCtaRows = 128U;  // rows per CTA of the grouped GEMM; taller plan tiles run as row slices
 
-// Resident image of one projection of a layer's experts: expert e at codes + e * code_bytes, steps + e * step_floats.
-struct ExpertImage {
-    std::uint8_t* codes{};
-    float* steps{};
-    std::size_t code_bytes{};
-    std::size_t step_floats{};
-};
 constexpr std::size_t image_code_bytes(unsigned in, unsigned n) { return std::size_t(n) * in / 2U; }
 constexpr std::size_t image_step_floats(unsigned in, unsigned n) { return std::size_t(n) * (in / rot::kBlock); }
 inline bool supported(unsigned in, unsigned n, bool paired) {
@@ -79,6 +72,8 @@ inline bool expert_codes_strided(std::span<const packed::PackedMatrix> experts, 
         if (experts[e].codes != codes_from + e * codes_stride) return false;
     return codes_stride > 0U;
 }
+
+static_assert(rot::kBlock == kInputBlock, "act_image_bytes assumes the contract's 128-input block");
 
 #if defined(__HIPCC__)
 namespace dense = strix::core::iu4a4_dense;
@@ -131,6 +126,40 @@ template <packed::MatrixFormat Format>
 inline void enqueue_requantise_expert(const packed::PackedMatrix& matrix, unsigned pair_rows, unsigned in, unsigned n,
                                       std::uint8_t* codes, float* steps, hipStream_t s) {
     dense::enqueue_requantise_source(ExpertSource<Format>{matrix, pair_rows}, in, n, codes, steps, s);
+}
+
+// The pass (see Pass) on stream s: four launches. Refuses (hipErrorInvalidValue, nothing enqueued) shapes the class
+// does not take, a missing image or a workspace below act_bytes.
+inline hipError_t launch(const Pass& p, hipStream_t s) {
+    const unsigned gate_width = 2U * p.intermediate;
+    if (!p.images || !p.tokens || !p.h || !p.act || !p.assignment_rows || !p.gate_up || !p.down || p.tiles == 0U ||
+        !supported(p.hidden, gate_width, true) || !supported(p.intermediate, p.hidden, false) ||
+        reinterpret_cast<std::uintptr_t>(p.act) % 256U != 0U ||
+        p.act_size < act_bytes(p.rows, p.assignments, p.hidden, p.intermediate))
+        return hipErrorInvalidValue;
+    const auto carve = [](std::uint8_t*& at, unsigned rows, unsigned in) {
+        dense::Act a{};
+        a.rows = rows;
+        a.in = in;
+        a.codes = at;
+        at += align256(dense::act_code_bytes(rows, in));
+        a.u = reinterpret_cast<std::uint32_t*>(at);
+        at += align256(dense::act_u_bytes(rows, in));
+        a.base = reinterpret_cast<float*>(at);
+        at += align256(dense::act_base_bytes(rows));
+        return a;
+    };
+    std::uint8_t* at = p.act;
+    const dense::Act tokens = carve(at, p.rows, p.hidden), inner = carve(at, p.assignments, p.intermediate);
+    TileSource gate{p.gate_up, p.gate_up, p.index_base, p.assignment_rows, p.tile_count, p.failure,
+                    p.images->gate_up_codes, p.images->gate_up_stride, p.images->gate_up, p.hidden, gate_width, p.h, p.intermediate};
+    TileSource down{p.down, p.gate_up, p.index_base, nullptr, p.tile_count, p.failure,
+                    p.images->down_codes, p.images->down_stride, p.images->down, p.intermediate, p.hidden, nullptr, 0U};
+    dense::enqueue_quantise(p.tokens, p.hidden, tokens, s);
+    dense::enqueue_grouped_gemm(gate, p.tiles, p.max_tile_rows, gate_width, tokens, s, SwigluOut{p.gate_cap, p.up_cap});
+    dense::enqueue_quantise(p.h, p.intermediate, inner, s);
+    dense::enqueue_grouped_gemm(down, p.tiles, p.max_tile_rows, p.hidden, inner, s);
+    return hipGetLastError();
 }
 #endif
 

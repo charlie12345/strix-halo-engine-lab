@@ -4,10 +4,14 @@
 #include "moe_core/expert_activation.hpp"
 #include "moe_core/expert_major_plan.hpp"
 #include "moe_core/grouped_rows.hpp"
+#include "moe_core/grouped_iu4a4_plan.hpp"
 #include "moe_core/grouped_w4a4.hpp"
 
 #if !defined(__CUDACC__) || defined(__HIPCC__)
 #include "moe_core/grouped_microscaled.hpp"
+#endif
+#if defined(__HIPCC__)
+#include "moe_core/grouped_iu4a4.hpp"
 #endif
 
 #if !defined(__HIPCC__)
@@ -59,6 +63,8 @@ struct HipBackend {
     static constexpr auto launch_activated_indirect = grouped_microscaled::launch_activated_indirect<Format>;
     template<unsigned Experts, unsigned TopK>
     static constexpr auto materialize = device_grouped::enqueue<Experts, TopK>;
+    // Rotated integer A4W4 operand class (moe_core/grouped_iu4a4.hpp; iu4 WMMA).
+    static constexpr auto launch_iu4a4 = grouped_iu4a4::launch;
 #endif
 };
 #endif
@@ -284,6 +290,10 @@ struct DevicePlan {
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16;
     // Schedule of both BF16 projections (never changes bits): automatic = the backend's tall slab schedule where it fits.
     grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic;
+    // Rotated integer A4W4 operand class (FAST / TURBO trait, grouped-iu4a4-rot-v1): with the layer's images both projections
+    // run on the backend's integer tile (Workspace::nvfp4 holds the activation images, grouped_iu4a4::act_bytes); a backend
+    // without it, or images == nullptr: the tiles above.
+    grouped_iu4a4::Selection iu4{};
 };
 
 // Load-time admission of the W4A4 operand class for one layer's experts (stage copies need 16-byte code rows and 8-byte scale
@@ -368,6 +378,20 @@ inline typename Backend::Status enqueue(
         return indirect;
     };
     typename Backend::Status status;
+    if constexpr (requires { &Backend::launch_iu4a4; Config::Activation::gate_cap; Config::Activation::up_cap; }) {
+        if (plan.iu4.images) {
+            status = Backend::launch_iu4a4({input.data(), plan.rows, assignments, Config::hidden, Config::intermediate,
+                                            plan.assignment_rows.data(), plan.gate_up.data(), plan.down.data(), tiles,
+                                            max_tile_rows, plan.tile_count, plan.failure, workspace.bf16.data(),
+                                            workspace.fp32.data(), workspace.nvfp4.data(), workspace.nvfp4.size(),
+                                            plan.iu4.images, Config::Activation::gate_cap, Config::Activation::up_cap},
+                                           stream);
+            if (status != Backend::success) return status;
+            return Config::Combine::launch(
+                {workspace.fp32.data(), Config::hidden, plan.combine_rows.data(), plan.assignment_weights.data(),
+                 plan.rows, Config::top_k, Config::hidden, output.data(), Config::hidden, plan.failure}, stream);
+        }
+    }
     if constexpr (requires { &Backend::launch_w4a4; }) {
         // FAST W4A4 operand class: quantise the gathered rows once per projection input (FP32 token rows by assignment, then
         // the BF16 activation rows) with the class's scale rule, run the projection(s) of the class on the block-scaled FP4
@@ -474,7 +498,8 @@ inline typename Backend::Status enqueue_resident(
     Workspace workspace, typename Backend::Stream stream, LogitExtent logit_extent, Route select,
     grouped_microscaled::Decode decode = grouped_microscaled::Decode::reference,
     grouped_w4a4::Activations activations = grouped_w4a4::Activations::bf16,
-    grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic) {
+    grouped_microscaled::Schedule schedule = grouped_microscaled::Schedule::automatic,
+    grouped_iu4a4::Selection iu4 = {}) {
     using Planner = device_grouped::Planner<Config::experts, Config::top_k>;
     device_grouped::Args args{};
     if (!prepare_resident<Config, Backend>(layer, rows, route, matrices, csr, out, workspace, args)) {
@@ -495,7 +520,7 @@ inline typename Backend::Status enqueue_resident(
     const auto tiles = args.out.tile_capacity;
     const DevicePlan plan{layer, rows, {args.csr.rows, assignments}, {args.out.combine_rows, assignments},
                           {args.out.assignment_weights, assignments}, {args.out.gate_up, tiles},
-                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule};
+                          {args.out.down, tiles}, args.out.tile_count, args.out.failure, decode, activations, schedule, iu4};
     return enqueue<Config, Backend>(plan, input, output, workspace, stream);
 }
 #endif

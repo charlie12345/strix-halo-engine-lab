@@ -51,7 +51,7 @@ int main() {
     const std::array table{pending};
     constexpr Regime measured{Phase::prefill, 8, 1, "fixture"};
     const LadderRow timing{"item", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
-    const Engine engine{"test", "ALLOW", table, false, {}, {}, std::span(&timing, 1)};
+    const Engine engine{"test", "ALLOW", table, false, {}, {}, {}, std::span(&timing, 1)};
     Inputs inputs;
     inputs.env = env;
     inputs.regime = measured;

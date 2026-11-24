@@ -62,7 +62,7 @@ inline constexpr sp::LadderRow kLadderRows[] = {
 inline sp::Engine engine(App app) {
     const std::span<const sp::Lever> rows(table);
     return {app == App::spec ? "qwen35-hip-spec" : "qwen35-hip-decode", kAllowEnv,
-            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U), false, {}, {}, kLadderRows};
+            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U), false, {}, {}, {}, kLadderRows};
 }
 
 struct Result {

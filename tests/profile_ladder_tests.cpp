@@ -67,7 +67,7 @@ void verdicts() {
     constexpr p::LadderRow turbo_dec_b1{kLever, "a4", p::Name::turbo, p::Phase::decode, "dev", 1, 65536, 1, 1, 1.25, 0.02,
                                         "r/turbo-dec-b1"};
     constexpr std::array rows{fast_pf, turbo_pf, turbo_pf_noise, turbo_dec_slow, fast_dec_slow, turbo_dec_b1};
-    const p::Engine engine{"fixture", "", kRows, false, "fixture-turbo-v1", {}, rows};
+    const p::Engine engine{"fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, rows};
     require(p::ladder_defect(engine).empty(), "fixture ladder is well formed: " + p::ladder_defect(engine));
 
     static_assert(p::ladder_gain(1.008, 0.002), "a measured sub-percent gain is enough");
@@ -129,7 +129,7 @@ void verdicts() {
 void defects() {
     const auto defect = [](p::LadderRow row) {
         const std::array rows{row};
-        const p::Engine engine{"fixture", "", kRows, false, "fixture-turbo-v1", {}, rows};
+        const p::Engine engine{"fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, rows};
         return p::ladder_defect(engine);
     };
     const p::LadderRow good{kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 4096, 1, 1, 1.3, 0.02, "r"};
@@ -297,7 +297,7 @@ std::vector<std::string> selections() {
     const auto tier = [](int t) { return std::string(t == 1 ? "fast" : "turbo"); };
     std::vector<std::string> out;
     const p::Engine engines[] = {
-        {"deepseek41-pair", "", strix::deepseek41::pair_defaults::profile_table, false, "ds41-turbo-v1", {},
+        {"deepseek41-pair", "", strix::deepseek41::pair_defaults::profile_table, false, "ds41-turbo-v1", {}, {},
          strix::deepseek41::pair_defaults::ladder_rows},
         {"deepseek41-rtx", "", strix::ds41::rtx::profile::shared_rows()},
         strix::glm::rank_defaults::product_profile_engine,
@@ -440,9 +440,9 @@ int main(int argc, char** argv) {
     namespace qd = strix::qwen35;
     namespace mm = strix::minimax::defaults;
     const p::Engine engines[] = {
-        {"qwen", "", q::profile::levers(), false, q::profile::kTurboVersion, {}, q::profile::ladder_rows},
-        {"qwen-cuda", "", q::cuda_profile::levers(), false, q::profile::kTurboVersion, {}, q::cuda_profile::ladder_rows},
-        {"deepseek41-pair", "", strix::deepseek41::pair_defaults::profile_table, false, "ds41-turbo-v1", {},
+        {"qwen", "", q::profile::levers(), false, q::profile::kTurboVersion, {}, {}, q::profile::ladder_rows},
+        {"qwen-cuda", "", q::cuda_profile::levers(), false, q::profile::kTurboVersion, {}, {}, q::cuda_profile::ladder_rows},
+        {"deepseek41-pair", "", strix::deepseek41::pair_defaults::profile_table, false, "ds41-turbo-v1", {}, {},
          strix::deepseek41::pair_defaults::ladder_rows},
         {"deepseek41-rtx", "", strix::ds41::rtx::profile::shared_rows()},
         strix::glm::rank_defaults::product_profile_engine,

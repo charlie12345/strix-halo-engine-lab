@@ -76,7 +76,8 @@ void qwen_rows() {
 
 void families() {
     using strix::deepseek41::pair_defaults::profile_table;
-    const p::Engine ds{"deepseek41-pair", "", profile_table, false, "ds41-turbo-v1"};
+    const p::Engine ds{"deepseek41-pair", "", profile_table, false, "ds41-turbo-v1", {}, {},
+                      strix::deepseek41::pair_defaults::ladder_rows};  // the production engine (its incumbent grants)
     const std::map<std::string, std::string> none;
     p::Resolution r;
     generic(ds, p::Name::turbo, none, r);
@@ -99,7 +100,8 @@ void families() {
     generic(ds, p::Name::standard, none, r);
     require(find(r, "engram_f16wmma") != nullptr && find(r, "engram_f16wmma")->status == p::Status::builtin, "ds41 default unchanged");
 
-    const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1"};
+    const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1", {}, {},
+                       strix::minimax::defaults::ladder_rows};  // the production engine (its incumbent grants)
     generic(mm, p::Name::turbo, none, r);
     require(strix::minimax::defaults::profile_table.size() == 9, "minimax retains six base rows, the FAST router rows and explicit-only TP2 exchange row");
     for (const char* lever : {"idx_wmma", "idx_wmma_layers", "router_wmma", "router_wmma_layers"}) {

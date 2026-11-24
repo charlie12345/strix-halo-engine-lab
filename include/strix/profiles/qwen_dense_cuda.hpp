@@ -261,7 +261,7 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
         for (const auto& row : out->rows) known |= row.name == key;
         if (!known) throw std::invalid_argument("qwen35-cuda-dense: " + key + " is not offered on route " + route_name(regime.route));
     }
-    out->engine = sp::Engine{"qwen35-cuda-dense", "", out->rows, false, kTurboVersion, {}, out->ladder};
+    out->engine = sp::Engine{"qwen35-cuda-dense", "", out->rows, false, kTurboVersion, {}, {}, out->ladder};
     sp::Inputs inputs;
     inputs.profile = profile;
     inputs.cli = cli;

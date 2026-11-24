@@ -52,7 +52,7 @@ constexpr p::LadderRow kTiming[] = {
     {"dense", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
     {"dense", "0", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
 };
-const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1", {}, kTiming};
+const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, kTiming};
 const p::Engine kNoTurbo{"no-turbo-fixture", "", kRows, false};
 
 p::Lookup env_of(const std::map<std::string, std::string>& vars) {

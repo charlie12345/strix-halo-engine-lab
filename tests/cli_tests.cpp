@@ -291,7 +291,7 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     inputs.profile = Name::fast;
     const profile::LadderRow timing{candidate.name, candidate.value[1], Name::fast, profile::Phase::prefill,
                                     "fixture", 8, 8, 1, 1, 1.02, 0.001, "fixture timing"};
-    const profile::Engine engine{"preset-test", "", std::span(&candidate, 1), false, {}, {}, std::span(&timing, 1)};
+    const profile::Engine engine{"preset-test", "", std::span(&candidate, 1), false, {}, {}, {}, std::span(&timing, 1)};
     inputs.regime = {profile::Phase::prefill, 8, 1, "fixture"};
     require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::provisional,
             "legacy native profiles retain experimental admission");

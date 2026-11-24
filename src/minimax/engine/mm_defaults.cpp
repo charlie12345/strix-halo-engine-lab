@@ -337,7 +337,7 @@ strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows) {
 }
 
 const profile::Engine& profile_engine() {
-    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1", {}, ladder_rows};
+    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1", {}, {}, ladder_rows};
     return engine;
 }
 

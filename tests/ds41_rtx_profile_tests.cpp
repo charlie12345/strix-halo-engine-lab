@@ -178,8 +178,19 @@ int main() {
     CHECK(value(syn({}, false, pf::Name::standard), "ready_lever") == "off");
     CHECK(status(syn({}, false), "runnable_pending") == "pending" && value(syn({}, false), "runnable_pending") == "off");
     CHECK(syn({}, false).qualification() == "qualified");
-    CHECK(status(syn({}, true), "runnable_pending") == "unqualified" && value(syn({}, true), "runnable_pending") == "on");
-    CHECK(syn({}, true).qualification() == "unqualified: runnable_pending");
+    // Ladder rule: --allow-pending runs a runnable pending cell only in a regime where a timing row shows its gain.
+    CHECK(status(syn({}, true), "runnable_pending") == "pending" && value(syn({}, true), "runnable_pending") == "off");
+    CHECK(syn({}, true).qualification() == "qualified");
+    {
+        const strix::profile::LadderRow timing{"runnable_pending", "on", strix::profile::Name::fast,
+                                               strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
+        auto measured = in({});
+        measured.regime = {strix::profile::Phase::prefill, 8, 1, "fixture"};
+        measured.ladder = std::span(&timing, 1);
+        const auto r = pf::resolve(pf::Name::fast, true, pf::App::replica, std::move(measured), synthetic);
+        CHECK(status(r, "runnable_pending") == "unqualified" && value(r, "runnable_pending") == "on");
+        CHECK(r.qualification() == "unqualified: runnable_pending");
+    }
     CHECK(syn({}, true, pf::Name::standard).find("runnable_pending") == nullptr);  // default leaves it alone
     CHECK(status(syn({}, true, pf::Name::fast, {{"TEST_RP", "0"}}), "runnable_pending") == "explicit-env");
     CHECK(syn({}, true, pf::Name::fast, {{"TEST_RP", "0"}}).qualification() == "qualified");

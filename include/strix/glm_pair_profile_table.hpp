@@ -27,6 +27,6 @@ inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
     strix::profile::incumbent_cell("pf_wmma", "1", strix::profile::Name::turbo,
                                    "glm-pf-wmma-x turbo cell ready before the ladder rule (docs/optimizations.md#glm-pf-wmma-x)")};
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
-                                                           {}, product_ladder_rows};
+                                                           {}, {}, product_ladder_rows};
 
 }  // namespace strix::glm::rank_defaults

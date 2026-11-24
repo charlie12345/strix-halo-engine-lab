@@ -332,11 +332,15 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
             const auto admission = admit(column);
             auto cell = strix::profile::select_profile_cell(lever, inputs.ladder, profile, inputs.regime, admit);
             entry.ladder = std::move(cell.route);
-            if (!entry.ladder.empty()) entry.value = cell.value;
-            if (admission != strix::profile::Status::set || (!entry.ladder.empty() && entry.value == lever.builtin)) {
+            // The ladder ran a lower cell: the status is that cell's admission (the builtin: pending, with the
+            // wanted cell named). Otherwise the column's own admission stands, as before the ladder rule.
+            const bool lowered = !entry.ladder.empty() && cell.value != wanted;
+            const auto status_of = lowered && cell.value == lever.builtin ? strix::profile::Status::pending
+                                 : lowered ? admit(strix::profile::value_column(lever, cell.tier)) : admission;
+            if (lowered) entry.value = cell.value;
+            if (status_of != strix::profile::Status::set) {
                 entry.wanted = std::string(wanted);
-                entry.status = admission == strix::profile::Status::unqualified && entry.value != lever.builtin
-                    ? Status::unqualified : Status::pending;
+                entry.status = status_of == strix::profile::Status::pending ? Status::pending : Status::unqualified;
                 if (entry.status == Status::pending) entry.value = std::string(lever.builtin);
             }
         }

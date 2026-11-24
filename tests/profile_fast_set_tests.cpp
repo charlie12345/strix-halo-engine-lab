@@ -84,7 +84,7 @@ bool fast_cell_live(const p::Lever& l) {
 // `ladder`: the engine's ladder rows (incumbent grants keep the cells that ran before the ladder rule).
 void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extra_fast = false,
                  std::span<const p::LadderRow> ladder = {}) {
-    const p::Engine engine{tag, "", rows, false, {}, {}, ladder};
+    const p::Engine engine{tag, "", rows, false, {}, {}, {}, ladder};
     const auto exact = run(engine, p::Name::standard);
     const auto fast = run(engine, p::Name::fast);
     bool any = extra_fast;
@@ -119,7 +119,7 @@ void check_bundle(std::string_view tag, std::span<const p::Lever> rows, const st
         if (!fixture) std::printf("%-22s bundle %s: switch only (no profile receipt)\n", std::string(tag).c_str(), bundle.profile);
         return;
     }
-    const p::Engine engine{tag, "", rows, false, {}, {}, ladder};
+    const p::Engine engine{tag, "", rows, false, {}, {}, {}, ladder};
     const auto fast = run(engine, p::Name::fast);
     for (const auto& m : bundle.members) {
         const std::string where = std::string(tag) + "/" + bundle.profile + "/" + m.env;

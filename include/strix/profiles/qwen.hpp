@@ -80,7 +80,7 @@ struct Resolution {
         std::vector<std::string> out;
         if (profile == Name::quality) out.emplace_back("quality: no quality rows for this model, using default");
         if (!weights.honoured()) out.push_back("profile turbo: " + weights.describe().substr(0, weights.describe().size() - 1U));
-        for (const auto& entry : entries) if (!entry.ladder.empty()) out.push_back(entry.ladder);
+        for (const auto& entry : entries) if (entry.ladder_lowered) out.push_back(entry.ladder);
         for (const auto& entry : entries) if (entry.status == Status::provisional)
             out.push_back(std::string("profile ") + name(profile) + ": " + std::string(entry.lever->name) +
                 " is bit-changing; qualification in progress");

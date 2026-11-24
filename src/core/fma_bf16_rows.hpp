@@ -364,9 +364,12 @@ inline hipError_t enqueue_bf16_rows_routed(const float* input, unsigned input_wi
 // the call it was admitted for: the consumer runs exactly these routes and refuses any other call.
 struct Bf16ImageCallPlan {
     ImageRoute routes[kImageRouteMaxProjections]{};
+    Bf16RowProjection projections[kImageRouteMaxProjections]{};  // the admitted descriptors: the launches use these
     const std::uint16_t* image{};
+    std::size_t image_size{};  // the admitted span's length
     unsigned input_width{};
     unsigned rows{};
+    unsigned max_outputs{};
     std::size_t count{};
     bool admitted{};
 };
@@ -389,26 +392,38 @@ inline Bf16ImageCallPlan plan_bf16_rows_from_image(unsigned input_width, unsigne
         return {};
     for (const float* source : sources)
         if (source && !detail::bf16_image_disjoint(source, input_width, rows, {}, image.data())) return {};
+    std::copy(projections.begin(), projections.end(), plan.projections);
     plan.image = image.data();
+    plan.image_size = image.size();
     plan.input_width = input_width;
     plan.rows = rows;
+    plan.max_outputs = max_outputs;
     plan.count = projections.size();
     plan.admitted = true;
     return plan;
 }
 
 // The launches of an admitted producer-stored image call after the producer stored the image: the routed entry's
-// launches without its image pass, the same bits. hipErrorNotSupported, nothing launched, for a plan that was not
-// admitted or was admitted for another call.
+// launches without its image pass, the same bits, run from the plan's own descriptors. hipErrorNotSupported, nothing
+// launched, for a plan that was not admitted or was admitted for another call: any other image span (address or
+// length), shape, output bound or descriptor (weights, width, output, rounding, pitch), even at the same count.
 inline hipError_t enqueue_bf16_rows_from_image(const Bf16ImageCallPlan& plan, std::span<const std::uint16_t> image,
                                                unsigned input_width, unsigned rows,
                                                std::span<const Bf16RowProjection> projections, unsigned max_outputs,
                                                hipStream_t stream) {
-    if (!plan.admitted || plan.image != image.data() || plan.input_width != input_width || plan.rows != rows ||
-        plan.count != projections.size())
+    const auto same = [](const Bf16RowProjection& x, const Bf16RowProjection& y) {
+        return x.weights == y.weights && x.outputs == y.outputs && x.output == y.output &&
+               x.round_bf16 == y.round_bf16 && x.row_bytes == y.row_bytes;
+    };
+    if (!plan.admitted || plan.image != image.data() || plan.image_size != image.size() ||
+        plan.input_width != input_width || plan.rows != rows || plan.max_outputs != max_outputs ||
+        plan.count != projections.size() || plan.count > kImageRouteMaxProjections ||
+        !std::equal(projections.begin(), projections.end(), plan.projections, same))
         return hipErrorNotSupported;
-    return detail::run_bf16_image_routes(nullptr, image.data(), input_width, rows, projections, max_outputs,
-                                         std::span<const ImageRoute>(plan.routes, projections.size()), stream);
+    return detail::run_bf16_image_routes(nullptr, plan.image, plan.input_width, plan.rows,
+                                         std::span<const Bf16RowProjection>(plan.projections, plan.count),
+                                         plan.max_outputs, std::span<const ImageRoute>(plan.routes, plan.count),
+                                         stream);
 }
 
 // The [forget, gain] pair of a low-rank controller with the controller as the tile epilogue:

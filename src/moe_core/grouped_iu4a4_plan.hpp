@@ -45,7 +45,9 @@ constexpr std::size_t act_bytes(unsigned rows, unsigned assignments, unsigned hi
 }
 // One grouped expert pass of the class (the backend-neutral dispatcher fills it; plan, tiles and outputs as the BF16 tile):
 // token rows (FP32 rows x hidden) -> A4 token image; gate/up tiles (rows through assignment_rows) with the paired SwiGLU
-// epilogue -> h (FP32 [assignment][intermediate]); h -> A4 image; down tiles -> their outputs (the combine's rows).
+// epilogue -> h (FP32 [assignment][intermediate]); h -> A4 image; down tiles -> y (FP32 [assignment][hidden], the
+// combine's rows). Both destinations are derived from the admitted base, pitch and assignment interval of a tile; the
+// tiles' own output fields are not read.
 struct Pass {
     const float* tokens{};
     unsigned rows{}, assignments{}, hidden{}, intermediate{};
@@ -61,11 +63,14 @@ struct Pass {
     std::size_t act_size{};
     const LayerImages* images{};
     float gate_cap{}, up_cap{};
-    // Device word the pass sets (kFaultBounds) when a tile names an expert outside its image or an assignment range past
-    // `assignments` (that tile stores nothing), or when a map entry names a token past the token image (that row reads
-    // the image's last row). The dispatcher passes the plan's failure word, so later consumers skip and the step fails
-    // as on a planner failure. nullptr: no report (still no access past the images).
+    // Verdict word of the pass (required). A validation launch, complete before any compute launch, copies a planner
+    // failure into it and sets kFaultBounds when an active tile names an expert outside its image or an assignment
+    // range past `assignments`, when the active tiles do not cover the assignments exactly once (a short or zero device
+    // count), or when a map entry names a token past the token image. The compute launches only read it (one value for
+    // every wave of a launch) and store nothing when it is set. The dispatcher passes the plan's failure word, so the
+    // combine skips and the step fails as on a planner failure.
     unsigned* fault{};
+    float* y{};  // down destination: assignment a at y + a * hidden
 };
 inline constexpr unsigned kFaultBounds = 1U << 30U;
 

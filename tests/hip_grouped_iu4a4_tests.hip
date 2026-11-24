@@ -5,7 +5,14 @@
 //   - every plain output of a routed gate/up and down launch against iu4a4_rot::dot of its gathered row (token image
 //     read through the assignment -> token map; down rows in assignment order located through the gate/up tiles);
 //   - the paired SwiGLU epilogue against the plain outputs of the same image put through the same device activation;
-//   - rows outside the tiles stay untouched; a device tile count refuses the tiles past it.
+//   - rows outside the tiles stay untouched; a device tile count refuses the tiles past it;
+//   - the validation launch: every bounds defect, a short / zero / oversized device count, overlapping tiles and a
+//     planner failure set the verdict word; a clean plan leaves it 0;
+//   - the whole pass (gi::launch) at Inkling 2 Mini shapes: the same inputs give the same token image, h image and
+//     down rows bit for bit whatever the workspace held before (two poison patterns, three passes); a planner
+//     failure or a short count stores nothing (h image and down rows keep the poison); a down tile output one past
+//     the destination changes nothing (destinations derive from the admitted interval); the exact workspace is
+//     admitted and one byte short is refused with nothing enqueued.
 // --bench [tokens]: Inkling 2 Mini shapes (128 experts, top-8, hidden 2304, ffn 1152), uniform routing, ms and TOPS of
 // the token quantise, paired gate/up, h quantise and down launches (plan tiles of <= 256 rows as the HIP plan) (no reference; a rate, not a model receipt).
 #include "strix/hip/legacy_intrinsics.hpp"
@@ -210,11 +217,10 @@ gi::TileSource source(const Launch& l, const Bank& bank, const Image& im, bool g
     s.image = im.view;
     s.in = bank.in;
     s.n = n;
-    s.h = h;
-    s.h_row = h_row;
+    s.out = h;
+    s.out_row = h_row;
     s.index_rows = l.rows;
     s.max_rows = l.max_rows;
-    s.fault = l.dfault;
     return s;
 }
 
@@ -257,7 +263,7 @@ int fixture(unsigned tokens, unsigned experts, unsigned k, unsigned hidden, unsi
     hipLaunchKernelGGL(swiglu_check_kernel, dim3(static_cast<unsigned>((std::size_t(A) * ffn + 255U) / 256U)), dim3(256), 0, nullptr, dplain, A, ng, dhc, epi);
     // h rows past the cut are NaN-pattern: quantise them anyway (their down tiles are refused).
     ad::enqueue_quantise_rows(dh, ffn, hact.act, nullptr);
-    ad::enqueue_grouped_gemm(source(l, down, dim, false, hidden, nullptr, 0U), tiles, tall, hidden, hact.act, nullptr);
+    ad::enqueue_grouped_gemm(source(l, down, dim, false, hidden, dy, hidden), tiles, tall, hidden, hact.act, nullptr);
     CHECK(hipGetLastError());
     CHECK(hipDeviceSynchronize());
 
@@ -367,7 +373,7 @@ int bench(unsigned tokens) {
     CHECK(hipMalloc(&dy, std::size_t(A) * hidden * 4U));
     const Launch l = make_launch(p, gate, down, dy, hidden, tiles);
     const gi::SwigluOut epi{4.0F, 25.0F};
-    const auto gs = source(l, gate, gim, true, ng, dh, ffn), ds = source(l, down, dim, false, hidden, nullptr, 0U);
+    const auto gs = source(l, gate, gim, true, ng, dh, ffn), ds = source(l, down, dim, false, hidden, dy, hidden);
     hipEvent_t ev[5];
     for (auto& e : ev) CHECK(hipEventCreate(&e));
     const unsigned reps = 10U;
@@ -481,6 +487,8 @@ int faults() {
         s.tiles = dt;
         s.map = dm;
         ad::enqueue_grouped_gemm(s, tiles, l.max_rows, ng, tok.act, nullptr);
+        hipLaunchKernelGGL(gi::detail::validate_kernel, dim3(1), dim3(1024), 0, nullptr, s, s, static_cast<const unsigned*>(nullptr),
+                           tiles, A, tokens, l.dfault);
         CHECK(hipGetLastError());
         CHECK(hipDeviceSynchronize());
         const auto h = download(dh, std::size_t(A + 1U) * ng);
@@ -505,7 +513,164 @@ int faults() {
         CHECK(hipFree(dt));
         CHECK(hipFree(dm));
     }
+    // Verdicts of the validation launch alone (count, coverage, planner failure).
+    const auto verdict = [&](const char* what, std::vector<TileRows> tl, unsigned count, unsigned planned, unsigned want) {
+        gi::TileSource s = source(l, gate, gim, true, ng, dh, ng);
+        TileRows* dt = upload(tl);
+        unsigned* dc = upload(std::vector<unsigned>{count});
+        unsigned* df = upload(std::vector<unsigned>{planned});
+        s.tiles = s.index_tiles = dt;
+        s.tile_count = dc;
+        CHECK(hipMemset(l.dfault, 0, 4U));
+        hipLaunchKernelGGL(gi::detail::validate_kernel, dim3(1), dim3(1024), 0, nullptr, s, s, static_cast<const unsigned*>(df), tiles, A,
+                           tokens, l.dfault);
+        CHECK(hipGetLastError());
+        CHECK(hipDeviceSynchronize());
+        const unsigned got = download(l.dfault, 1U)[0];
+        std::printf("%s verdict '%s': 0x%08x (want 0x%08x)\n", got == want ? "PASS" : "FAIL", what, got, want);
+        fails += got == want ? 0 : 1;
+        CHECK(hipFree(dt));
+        CHECK(hipFree(dc));
+        CHECK(hipFree(df));
+    };
+    std::vector<TileRows> overlap = l.gate_tiles;
+    overlap[1].input = overlap[0].input;  // tile 1 over tile 0's rows (conflicting destinations), row sum unchanged
+    verdict("clean plan", l.gate_tiles, tiles, 0U, 0U);
+    verdict("device count one short (truncated cover)", l.gate_tiles, tiles - 1U, 0U, gi::kFaultBounds);
+    verdict("device count zero", l.gate_tiles, 0U, 0U, gi::kFaultBounds);
+    verdict("device count past the plan", l.gate_tiles, tiles + 1U, 0U, gi::kFaultBounds);
+    verdict("overlapping tiles", overlap, tiles, 0U, gi::kFaultBounds);
+    verdict("planner failure copied", l.gate_tiles, tiles, 5U, 5U);
     CHECK(hipFree(dh));
+    return fails;
+}
+
+// The whole pass (gi::launch) at Inkling 2 Mini shapes with a skewed routing: run-to-run identity under different
+// workspace contents, refusals that store nothing, derived destinations, workspace admission.
+int pass_cases() {
+    std::mt19937 g(21U);
+    const unsigned tokens = 515U, experts = 128U, k = 8U, hidden = 2304U, ffn = 1152U, ng = 2U * ffn;
+    const Bank gate = make_bank(packed::MatrixFormat::nvfp4, experts, ng, hidden, packed::RowOrder::contiguous, g);
+    const Bank down = make_bank(packed::MatrixFormat::mxfp8, experts, hidden, ffn, packed::RowOrder::contiguous, g);
+    const Plan p = route(tokens, experts, k, g, true, 256U);
+    const unsigned A = static_cast<unsigned>(p.token.size()), tiles = static_cast<unsigned>(p.tile_first.size());
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::vector<float> x(std::size_t(tokens) * hidden);
+    for (auto& v : x) v = nd(g);
+    const float* dx = upload(x);
+    const Image gim = requantise(gate, ffn), dim = requantise(down, 0U);
+    gi::LayerImages images;
+    images.gate_up = gim.view;
+    images.down = dim.view;
+    images.gate_up_codes = gate.dcodes;
+    images.gate_up_stride = std::size_t(gate.rows) * gate.code_row();
+    images.down_codes = down.dcodes;
+    images.down_stride = std::size_t(down.rows) * down.code_row();
+    const std::size_t act_size = gi::act_bytes(tokens, A, hidden, ffn), y_floats = std::size_t(A + 1U) * hidden;
+    std::uint8_t* act = nullptr;
+    float *dh = nullptr, *dy = nullptr;
+    CHECK(hipMalloc(&act, act_size));
+    CHECK(hipMalloc(&dh, std::size_t(A) * ffn * 4U));
+    CHECK(hipMalloc(&dy, y_floats * 4U));
+    Launch l = make_launch(p, gate, down, dy, hidden, tiles);
+    unsigned* dfail = upload(std::vector<unsigned>{0U});
+    gi::Pass pass;
+    pass.tokens = dx;
+    pass.rows = tokens;
+    pass.assignments = A;
+    pass.hidden = hidden;
+    pass.intermediate = ffn;
+    pass.assignment_rows = l.dmap;
+    pass.gate_up = l.dgate;
+    pass.down = l.ddown;
+    pass.tiles = tiles;
+    pass.max_tile_rows = l.max_rows;
+    pass.tile_count = l.dcount;
+    pass.failure = dfail;
+    pass.index_base = l.index_base;
+    pass.h = dh;
+    pass.act = act;
+    pass.act_size = act_size;
+    pass.images = &images;
+    pass.gate_cap = 4.0F;
+    pass.up_cap = 25.0F;
+    pass.fault = dfail;  // the dispatcher's alias: verdict word = planner failure word
+    pass.y = dy;
+    const std::size_t inner_at = gi::act_image_bytes(tokens, hidden);
+    struct Out {
+        std::vector<std::uint8_t> act;
+        std::vector<float> y;
+        unsigned verdict;
+        hipError_t status;
+    };
+    const auto run = [&](int poison, unsigned planned, unsigned count, const gi::Pass& q) {
+        CHECK(hipMemset(act, poison, act_size));
+        CHECK(hipMemset(dh, poison, std::size_t(A) * ffn * 4U));
+        CHECK(hipMemset(dy, poison, y_floats * 4U));
+        CHECK(hipMemcpy(dfail, &planned, 4U, hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(l.dcount, &count, 4U, hipMemcpyHostToDevice));
+        const hipError_t st = gi::launch(q, nullptr);
+        CHECK(hipDeviceSynchronize());
+        return Out{download(act, act_size), download(dy, y_floats), download(dfail, 1U)[0], st};
+    };
+    // Bytes the pass defines: the two images' code / u / base regions (alignment gaps excluded) and the A down rows.
+    const auto image_same = [&](const Out& a, const Out& b, std::size_t at, unsigned r, unsigned in) {
+        const std::size_t parts[3] = {ad::act_code_bytes(r, in), ad::act_u_bytes(r, in), ad::act_base_bytes(r)};
+        unsigned differ = 0;
+        for (const std::size_t n : parts) {
+            differ += std::memcmp(a.act.data() + at, b.act.data() + at, n) != 0;
+            at += gi::align256(n);
+        }
+        return differ;
+    };
+    const auto rows_same = [&](const Out& a, const Out& b) {
+        return std::memcmp(a.y.data(), b.y.data(), std::size_t(A) * hidden * 4U) == 0;
+    };
+    const auto poisoned = [&](const std::vector<float>& y, std::size_t from, std::size_t to, int poison) {
+        const std::uint32_t want = 0x01010101U * static_cast<std::uint8_t>(poison);
+        unsigned bad = 0;
+        for (std::size_t i = from; i < to; ++i) bad += bits(y[i]) != want;
+        return bad;
+    };
+    int fails = 0;
+    const auto report = [&](bool ok, const char* what) {
+        std::printf("%s pass %s (tokens %u assignments %u tiles %u)\n", ok ? "PASS" : "FAIL", what, tokens, A, tiles);
+        fails += ok ? 0 : 1;
+    };
+    const Out a = run(0xff, 0U, tiles, pass), b = run(0x5a, 0U, tiles, pass), c = run(0x00, 0U, tiles, pass);
+    const unsigned img_ab = image_same(a, b, 0U, tokens, hidden) + image_same(a, b, inner_at, A, ffn);
+    const unsigned img_ac = image_same(a, c, 0U, tokens, hidden) + image_same(a, c, inner_at, A, ffn);
+    report(a.status == hipSuccess && a.verdict == 0U && b.verdict == 0U && c.verdict == 0U && img_ab == 0U && img_ac == 0U &&
+               rows_same(a, b) && rows_same(a, c) && poisoned(a.y, std::size_t(A) * hidden, y_floats, 0xff) == 0U,
+           "three runs over 0xff / 0x5a / 0x00 workspaces: images, down rows and guard row identical");
+    unsigned nonfinite = 0;
+    for (std::size_t i = 0; i < std::size_t(A) * hidden; ++i) nonfinite += !std::isfinite(a.y[i]);
+    report(nonfinite == 0U, "every down row written (finite)");
+    const Out f = run(0x5a, 1U, tiles, pass);
+    report(f.status == hipSuccess && f.verdict == 1U && poisoned(f.y, 0U, y_floats, 0x5a) == 0U &&
+               image_same(f, run(0x5a, 1U, tiles, pass), inner_at, A, ffn) == 0U &&
+               f.act[inner_at] == 0x5aU && f.act[inner_at + ad::act_code_bytes(A, ffn) - 1U] == 0x5aU,
+           "planner failure: no down row, no h image byte stored");
+    const Out t = run(0x5a, 0U, tiles - 1U, pass);
+    report(t.verdict == gi::kFaultBounds && poisoned(t.y, 0U, y_floats, 0x5a) == 0U, "short device count: refused, nothing stored");
+    std::vector<TileRows> past = l.down_tiles;
+    past[0].output = dy + y_floats;  // one past the destination
+    past[1].output = past[0].output;  // and a conflicting destination
+    TileRows* dpast = upload(past);
+    gi::Pass q = pass;
+    q.down = dpast;
+    const Out o = run(0xff, 0U, tiles, q);
+    report(o.verdict == 0U && rows_same(a, o) && poisoned(o.y, std::size_t(A) * hidden, y_floats, 0xff) == 0U,
+           "down tile outputs one past / conflicting: ignored, rows as the clean pass, guard untouched");
+    gi::Pass shortws = pass;
+    --shortws.act_size;
+    const Out w = run(0x5a, 0U, tiles, shortws);
+    report(w.status == hipErrorInvalidValue && poisoned(w.y, 0U, y_floats, 0x5a) == 0U && w.act[0] == 0x5aU,
+           "workspace one byte short: refused, nothing enqueued (exact size admitted above)");
+    CHECK(hipFree(dpast));
+    CHECK(hipFree(act));
+    CHECK(hipFree(dh));
+    CHECK(hipFree(dy));
     return fails;
 }
 
@@ -520,6 +685,7 @@ int main(int argc, char** argv) {
     fails += fixture(200U, 3U, 2U, 128U, 256U, F::nvfp4, O::contiguous, true, 4U, true);  // device tile count cuts the last tile
     fails += fixture(700U, 3U, 2U, 256U, 128U, F::nvfp4, O::contiguous, true, 5U, false, 256U);  // 256-row tiles: row slices
     fails += faults();
+    fails += pass_cases();
     std::printf("%s\n", fails ? "FAIL" : "ALL PASS");
     return fails ? 1 : 0;
 }

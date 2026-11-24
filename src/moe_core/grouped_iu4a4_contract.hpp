@@ -34,6 +34,10 @@ namespace packed = strix::weight::microscaled;
 namespace rot = strix::core::iu4a4_rot;
 using grouped_microscaled::TileRows;
 inline constexpr unsigned kCtaRows = 128U;  // rows per CTA of the grouped GEMM; taller plan tiles run as row slices
+// Widest intermediate the pass quantises in its one-CTA-per-row form (the verdict-gated launch of h), and the most
+// tiles its one-CTA validation launch admits (interval table in LDS).
+inline constexpr unsigned kMaxIntermediate = 24576U;
+inline constexpr unsigned kMaxPassTiles = 2048U;
 
 constexpr std::size_t image_code_bytes(unsigned in, unsigned n) { return std::size_t(n) * in / 2U; }
 constexpr std::size_t image_step_floats(unsigned in, unsigned n) { return std::size_t(n) * (in / rot::kBlock); }
@@ -81,20 +85,28 @@ inline const char* refusal(const Pass& p) {
     const unsigned gate_width = 2U * p.intermediate;
     if (p.rows == 0U || p.assignments < p.rows || std::size_t(p.assignments) + 15U > 0x7fffffffU)
         return "rows: none, fewer assignments than rows, or past the quantiser grid";
-    if (!p.tokens || !p.h || !p.act || !p.assignment_rows || !p.gate_up || !p.down || !p.index_base) return "missing operand";
-    if (p.tiles == 0U || p.max_tile_rows == 0U || p.max_tile_rows > p.assignments || !supported(p.hidden, gate_width, true) ||
-        !supported(p.intermediate, p.hidden, false))
+    if (!p.tokens || !p.h || !p.y || !p.act || !p.assignment_rows || !p.gate_up || !p.down || !p.index_base || !p.fault)
+        return "missing operand";
+    if (p.tiles == 0U || p.tiles > kMaxPassTiles || p.max_tile_rows == 0U || p.max_tile_rows > p.assignments ||
+        !supported(p.hidden, gate_width, true) || !supported(p.intermediate, p.hidden, false) ||
+        p.intermediate > kMaxIntermediate)
         return "shape the class does not take";
     if (reinterpret_cast<std::uintptr_t>(p.act) % 256U != 0U ||
         p.act_size < act_bytes(p.rows, p.assignments, p.hidden, p.intermediate))
         return "activation workspace unaligned or below act_bytes";
     if (!p.images) return "missing images";
+    // Every expert slot starts on the 16-byte boundary the 16-byte operand loads need (base and per-expert extents), and
+    // the image's total extent (experts x extent) is addressable.
     const auto image = [](const ExpertImage& i, unsigned in, unsigned n) {
+        constexpr std::size_t kMax = ~std::size_t{0};
         return i.codes && i.steps && i.experts > 0U && i.code_bytes >= image_code_bytes(in, n) &&
-               i.step_floats >= image_step_floats(in, n);
+               i.step_floats >= image_step_floats(in, n) && reinterpret_cast<std::uintptr_t>(i.codes) % 16U == 0U &&
+               reinterpret_cast<std::uintptr_t>(i.steps) % 16U == 0U && i.code_bytes % 16U == 0U &&
+               i.step_floats % 4U == 0U && i.code_bytes <= kMax / i.experts &&
+               i.step_floats <= kMax / sizeof(float) / i.experts;
     };
     if (!image(p.images->gate_up, p.hidden, gate_width) || !image(p.images->down, p.intermediate, p.hidden))
-        return "image view missing, without experts or below the shape's extent";
+        return "image view missing, without experts, below the shape's extent, off the 16-byte slot rule or past the address space";
     if (!p.images->gate_up_codes || !p.images->down_codes || p.images->gate_up_stride == 0U || p.images->down_stride == 0U)
         return "missing code-address rule";
     return nullptr;

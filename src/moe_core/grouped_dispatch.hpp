@@ -385,9 +385,12 @@ inline typename Backend::Status enqueue(
                                             max_tile_rows, plan.tile_count, plan.failure, workspace.bf16.data(),
                                             workspace.fp32.data(), workspace.nvfp4.data(), workspace.nvfp4.size(),
                                             plan.iu4.images, Config::Activation::gate_cap, Config::Activation::up_cap,
-                                            // a bounds fault lands in the plan's failure word (device memory the
-                                            // planner writes): the combine skips and the caller's failure check fails
-                                            const_cast<unsigned*>(plan.failure)},
+                                            // verdict word = the plan's failure word (device memory the planner
+                                            // writes): the pass's validation launch sets it before any compute launch
+                                            // reads it; the combine skips and the caller's failure check fails
+                                            const_cast<unsigned*>(plan.failure),
+                                            // down rows in assignment order: the combine's input rows
+                                            workspace.fp32.data()},
                                            stream);
             if (status != Backend::success) return status;
             return Config::Combine::launch(

@@ -117,6 +117,8 @@ void admission() {
     ok.act = at(0xb00000U);
     ok.act_size = gi::act_bytes(rows, assignments, hidden, inter);
     ok.images = &images;
+    ok.fault = reinterpret_cast<unsigned*>(at(0xc00000U));
+    ok.y = reinterpret_cast<float*>(at(0xd00000U));
     expect(gi::refusal(ok) == nullptr, "a valid pass is admitted");
     const auto refused = [&](const char* what, auto&& defect) {
         gi::Pass p = ok;
@@ -133,6 +135,10 @@ void admission() {
     refused("missing tokens", [](P p, I) { p.tokens = nullptr; });
     refused("missing index base", [](P p, I) { p.index_base = nullptr; });
     refused("missing images", [](P p, I) { p.images = nullptr; });
+    refused("missing verdict word", [](P p, I) { p.fault = nullptr; });
+    refused("missing down destination", [](P p, I) { p.y = nullptr; });
+    refused("tiles past the validation table", [](P p, I) { p.tiles = gi::kMaxPassTiles + 1U; });
+    refused("intermediate past the one-CTA quantiser", [](P p, I) { p.intermediate = gi::kMaxIntermediate + 128U; });
     refused("zero tiles", [](P p, I) { p.tiles = 0U; });
     refused("zero max tile rows", [](P p, I) { p.max_tile_rows = 0U; });
     refused("max tile rows above assignments", [](P p, I) { p.max_tile_rows = p.assignments + 1U; });
@@ -147,6 +153,19 @@ void admission() {
     refused("down step span one float short", [](P, I im) { --im.down.step_floats; });
     refused("missing code base", [](P, I im) { im.down_codes = nullptr; });
     refused("zero code stride", [](P, I im) { im.gate_up_stride = 0U; });
+    // Slot rule: every expert slot on a 16-byte boundary, the whole image addressable.
+    refused("gate/up code span one byte long (expert 1 off 16 B)", [](P, I im) { ++im.gate_up.code_bytes; });
+    refused("down step span one float long (expert 1 off 16 B)", [](P, I im) { ++im.down.step_floats; });
+    refused("gate/up codes off 16 B", [](P, I im) { im.gate_up.codes += 8; });
+    refused("down steps off 16 B", [](P, I im) { im.down.steps += 1; });
+    refused("image extent past the address space", [](P, I im) { im.gate_up.experts = ~0U; im.gate_up.code_bytes = ~std::size_t{0} / 2U & ~std::size_t{15}; });
+    {
+        gi::Pass p = ok;
+        gi::LayerImages im = images;
+        p.images = &im;
+        im.gate_up.code_bytes += 16U;  // a longer slot on the 16-byte rule is admitted
+        expect(gi::refusal(p) == nullptr, "a 16-byte-aligned longer slot is admitted");
+    }
 }
 }  // namespace
 

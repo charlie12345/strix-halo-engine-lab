@@ -206,7 +206,7 @@ struct Ident {
     __device__ __forceinline__ static float apply(float a, float) { return a; }
 };
 template <class F, bool Rows>
-__global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
+__device__ __forceinline__ void quantise_cta_row(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
 #pragma clang fp contract(off)
     __shared__ float s_amax[8], s_bad[8];
     __shared__ unsigned s_badk[8];
@@ -298,6 +298,18 @@ __global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restri
             if (sub == 0U) a.u[u_offset<Rows>(blk, row, mp, a.in)] = uw;
         }
     }
+}
+template <class F, bool Rows>
+__global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
+    quantise_cta_row<F, Rows>(x0, x1, x_stride, a);
+}
+// Verdict-gated form: the launch stores nothing when *verdict != 0. The word must not change during the launch (every
+// wave reads the same value before the first barrier).
+template <class F, bool Rows>
+__global__ __launch_bounds__(256) void quantise_cta_gated_kernel(const unsigned* __restrict__ verdict, const float* __restrict__ x0,
+                                                                 const float* __restrict__ x1, unsigned x_stride, Act a) {
+    if (*verdict != 0U) return;
+    quantise_cta_row<F, Rows>(x0, x1, x_stride, a);
 }
 
 // One thread per (column n, block b); load time.
@@ -682,6 +694,12 @@ inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hi
 // The row-major image of the grouped launch (same values as enqueue_quantise; byte sizes act_*_bytes).
 inline void enqueue_quantise_rows(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
     enqueue_quantise_map2<detail::Ident, true>(x, nullptr, x_stride, a, s);
+}
+// Same image, verdict-gated (nothing stored when *verdict != 0; the word must not change during the launch). Needs
+// map2_supported(a.in).
+inline void enqueue_quantise_rows_gated(const unsigned* verdict, const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (detail::quantise_cta_gated_kernel<detail::Ident, true>), dim3(padded_rows(a.rows)), dim3(256), 0, s,
+                         verdict, x, nullptr, x_stride, a);
 }
 // Requantisation from a weight source (Src::requantise(col, b, n, dst) -> step, see detail::requantise_kernel).
 template <class Src>

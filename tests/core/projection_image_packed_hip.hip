@@ -443,8 +443,7 @@ int main(int argc, char** argv) {
                                      });
                 std::cout << "gate_image_overlap " << o.name << (refused ? " refused" : " ADMITTED")
                           << (guarded ? " guard-intact" : " GUARD-CHANGED") << (refused && guarded ? " PASS" : " FAIL")
-                          << '
-';
+                          << '\n';
                 ok = ok && refused && guarded;
             }
             require(hipFree(big), "free");

@@ -255,6 +255,20 @@ void custom_adapters() {
     const auto ds = r::resolve(p::Name::fast, false, r::App::replica, {}, std::span(&rtx, 1));
     require(ds.find(kLever)->value == "off", "DeepSeek RTX cannot select a lossy unmeasured row");
 
+    // The shared ladder is also instantiated for three-column adapters. TURBO
+    // is not a valid column there, even if a caller bypasses native selection.
+    require(p::value_column(rtx, p::Name::fast) == 1U, "legacy FAST column");
+    require(p::value_column(rtx, p::Name::quality) == 2U, "legacy QUALITY column");
+    bool rejected = false;
+    try {
+        (void)p::select_profile_cell(rtx, {}, p::Name::turbo, regime,
+                                     [](unsigned) { return p::Status::set; });
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "three-column ladder refuses absent TURBO column");
+
+
     namespace glm = strix::glm::rtxpf::profile;
     glm::Lever candidate{.name = kLever, .env = "", .value = {"", "a8", ""}, .builtin = "off",
                          .ready = {true, true, true}, .kind = glm::Kind::bit_changing,

@@ -202,13 +202,17 @@ Read from the file: 23 blocks, width 1024, 16 heads (head dimension 64), LayerNo
 and out linears with bias, GELU (exact) MLP 4096 with bias, LayerScale after attention and after the MLP, a LayerNorm
 of the embedded rows before block 0 (`embed_norm`), no final norm, patch 20 without patch bias, a learned 32 x 32
 position table, a class token with its own position embedding, a 2 x 2 merge into `proj_in` (4096 to 4096) and
-`proj_out` (4096 to 2304), both without bias. Image rows replace the placeholder token 200054 and skip the token
-embedding norm.
+`proj_out` (4096 to 2304), both without bias. Image rows replace the embedding-table lookup for the placeholder
+token 200054 and pass through the language model's `embed_norm` in CPU and device prefill.
+
+The default image identity is `inkling2-vision-v1` under every profile. It uses per-channel normalization, zero RGB
+padding, raster patches, a trailing class row and learned positions. The CLI selects the candidate recipe only with
+`STRIX_INKLING2_VISION_RECIPE=axial@1`. The candidate has identity `inkling2-vision-axial@1`, can change the prompt
+length above the token cap and is pending complete CLI qualification. The Inkling 2 HTTP server currently accepts text.
 
 The reference is the model's own definition (`Inkling2VisionModel`, `Inkling2ImageProcessor` in the transformers
 package, Apache-2.0); `tools/vision/inkling2_vision_ref.py` runs it in FP32 on the checkpoint's vision tensors and
-writes the pixels, the tower output and the image rows per image. Parameters not stated by the file, each a rule of
-the adapter and part of its identity:
+writes the pixels, the tower output and the image rows per image. The candidate recipe uses the following rules:
 
 | Parameter | Value |
 |---|---|
@@ -227,6 +231,7 @@ Mapping onto the shared tower, without a tower change: the class token is patch 
 linear has no bias, so its embedding is exactly zero) and the class embedding plus its position embedding as that
 row's position addend (`positions()`); LayerScale is folded into the out and second MLP linears and their biases in
 FP32 (`EncoderWeights::owned`) before a backend builds its panels; q, k and v are concatenated into `qkv`.
+The shared projector receives the leading row offset and the packed-cell order.
 
 ### Gate
 
@@ -236,11 +241,10 @@ strix-inkling2-vision-gate --checkpoint CHECKPOINT_DIR --ref REF --backend host 
 strix-inkling2-vision-gate-hip --checkpoint CHECKPOINT_DIR --ref REF --backend hip NAME...
 ```
 
-Per image: the patches against the reference pixels (exact), the tower output (class row included) and the image rows
-(relative L2 and the worst row cosine; pass at relative L2 <= 0.02 by default). On the checkpoint (four images, 8 to
-192 tokens: two synthetic, one drawing with text, one RGBA): patches exact on every image; host FP32 tower output
-relative L2 5.8e-7 to 1.1e-6, image rows 1.6e-3 to 1.7e-3 (the BF16 rounding of the rows); HIP `vision-f16-v1`
-tower output 4.5e-4 to 1.8e-3, image rows 1.9e-3 to 2.4e-3, worst row cosine 0.99996 (gfx1151).
+The manual generator requires Linux with procfs and a fresh output directory or unused case names. It refuses
+images whose padded grids exceed 4096 tokens. The standalone tower gate requires exact patches and relative L2
+at most 0.02 by default for both hidden and projected rows. It reports the worst row cosine for each. The CLI
+workload also covers media admission, prompt IDs and language-model logits on CPU, HIP and CUDA.
 
 ## Image rows in the language model prefill
 

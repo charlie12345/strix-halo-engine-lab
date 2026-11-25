@@ -26,6 +26,9 @@ endif()
 strix_servespec_host_test(NAME inkling2-vision
     SOURCES tests/inkling2_vision_tests.cpp
     LIBS strix_inkling2_vision)
+strix_servespec_host_test(NAME inkling2-vision-adapter
+    SOURCES tests/inkling2/vision_adapter_test.cpp
+    LIBS strix_inkling2_vision)
 if(TARGET inkling2-vision AND NOT MSVC)
     target_compile_options(inkling2-vision PRIVATE -ffp-contract=off -fno-fast-math)
 endif()

@@ -128,11 +128,15 @@ float activate(Activation, float);
 // Merged row (my, mx) of the ratio x ratio cell has feature c * ratio^2 + slot, slot = row_major ? dy * ratio + dx :
 // dx * ratio + dy; cells past the grid edge are zeros. rows[t][w2.rows] = linear2(act(linear1(merged))) for the
 // t = my * ceil(grid_w / ratio) + mx merged rows.
+// Packed cells already store a complete cell in projector input order and skip the unshuffle.
 struct MergeProjector {
+    enum class Layout { raster, packed_cells };
     unsigned ratio = 1;
     bool row_major = true;
     Activation act = Activation::gelu;
     Tensor w1, b1, w2, b2;
+    Layout layout = Layout::raster;
+    unsigned row_offset = 0;  // number of leading non-image rows
     unsigned tokens(unsigned grid_h, unsigned grid_w) const;  // throws on empty or unrepresentable geometry
 };
 

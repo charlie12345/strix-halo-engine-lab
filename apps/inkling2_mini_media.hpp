@@ -13,10 +13,10 @@
 
 #include <filesystem>
 #include <fstream>
-#include <memory>
 #include <stdexcept>
-#include <string>
 #include <system_error>
+#include <memory>
+#include <string>
 
 namespace strix::inkling2::cli {
 
@@ -42,8 +42,8 @@ inline VisionSpec read_mini_vision_spec(const std::string& checkpoint) {
     return parse_vision_spec(text);
 }
 
-inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::string& checkpoint) {
-    const VisionSpec config = read_mini_vision_spec(checkpoint);
+inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(const std::string& checkpoint, const VisionSpec& config,
+                                                               VisionIdentity identity) {
     vision::SerialMediaSpec spec;
     spec.shard = checkpoint;
     spec.tensors = vision_tensor_specs(config);
@@ -52,7 +52,7 @@ inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::strin
     spec.lm_width = config.text_width;
     // Weight identity of the embed rows: the shard's size (no cross-run cache, so no content hash is needed).
     auto adapter = std::make_unique<VisionAdapter>(
-        config, "shard-bytes-" + std::to_string(std::filesystem::file_size(checkpoint)));
+        config, "shard-bytes-" + std::to_string(std::filesystem::file_size(checkpoint)), identity);
     return std::make_unique<vision::SerialMedia>(std::move(adapter), std::move(spec),
         [](const vision::EncoderConfig& c, const vision::EncoderWeights& w) -> std::unique_ptr<vision::EncoderBackend> {
 #if defined(__HIPCC__)
@@ -67,6 +67,10 @@ inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::strin
             return std::make_unique<vision::ReferenceEncoder>(c, w);  // the CPU reference CLI
 #endif
         });
+}
+
+inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::string& checkpoint) {
+    return make_mini_media(checkpoint, read_mini_vision_spec(checkpoint), resolve_vision_identity());
 }
 
 }  // namespace strix::inkling2::cli

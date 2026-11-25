@@ -1,10 +1,20 @@
 #pragma once
 
+#include "core/resident_row_plan.hpp"
 #include "inkling2_mini_resident_route.hpp"
 #include "moe_core/grouped_w4a4.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
+#include "strix/serve/row_budget.hpp"
+#include "strix/weight/lowbit_pack.hpp"
+#include "strix/weight/resolve.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <memory>
+#include <ostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -13,9 +23,80 @@ namespace strix::inkling2 {
 
 struct MiniWeightOptions {
     profile::Inputs tier;
-    bool qualify_q8{};
-    bool disable_q8{};
+    bool qualify_q8{};  // the Q8_0 qualification arm (--qualify-q8, the alias of --qualify-weights <Q8 policy>)
+    bool disable_q8{};  // off switch of every compact weight storage
+    // The shared policy of an explicit qualification arm (--qualify-weights KEY); nullptr: none.
+    const weight::WeightLoadPolicy* qualify{};
+    bool qualify_decode_only{};
+    bool lowbit_turbo{};  // resolved from the shared profile lever
 };
+
+// The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
+// the shared head-only low-bit rows (attention BF16).
+inline constexpr std::array<weight::WeightLoadPolicy, 6> kMiniQualifiablePolicies{
+    kMiniWeightLoadPolicy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
+    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy};
+
+inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
+    if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
+        return kMiniWeightLoadPolicy;
+    return *options.qualify;
+}
+
+// The PR's calibrated and qualification routes used the shared FP16 tile arithmetic.
+inline constexpr auto kMiniLowBitArithmetic = core::LowBitArithmetic::f16_group_scale;
+inline constexpr auto& kMiniLowBitConsumers = core::kResidentLowBitTileArithmeticHip;
+
+inline bool mini_lowbit_storage(weight::FormatId f) {
+    return f == weight::kQ4G64WeightStorage || f == weight::kQ6G64WeightStorage;
+}
+
+// The decode-only qualification arm keeps the incumbent BF16 tensors beside the compact
+// tensors. Ordinary weight qualification replaces the selected tensors.
+struct MiniLowBitRows {
+    bool decode_only = false;
+    std::shared_ptr<const weight::LowbitPack> admitted{};
+};
+
+inline weight::WeightLoadPlan mini_lowbit_receipt_plan(
+    profile::Name tier, const weight::WeightLoadScope& scope, weight::WeightLoadExtent extent,
+    std::span<const weight::WeightLoadDecision> decisions = kMiniLowBitDecisions) {
+    constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ4G64WeightStorage};
+    const auto& policy = tier == profile::Name::turbo ? kMiniTurboWeightPolicy : kMiniFastWeightPolicy;
+    const bool enabled = scope.backend == weight::Backend::hip && scope.regime == kMiniWeightRegime &&
+                         extent.context != 0U && extent.lanes != 0U;
+    return weight::resolve_weight_load(weight::builtin_registry(), policy, {tier, scope, formats, enabled, false,
+                                                                             {}, extent}, decisions);
+}
+
+inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniLowBitTurbo);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value != "1") throw std::invalid_argument("STRIX_INK_LOWBIT_TURBO must be 0 or 1");
+    return tier.profile == profile::Name::turbo;
+}
+
+inline bool mini_may_load_lowbit_row(profile::Name tier, const MiniWeightOptions& options,
+                                    weight::Backend backend, weight::WeightLoadExtent extent) {
+    return tier == profile::Name::turbo && options.lowbit_turbo && !options.disable_q8 &&
+           !options.qualify && !options.qualify_q8 &&
+           std::ranges::any_of(kMiniLowBitDecisions, [backend, extent](const auto& row) {
+               return backend == row.scope.backend && weight::weight_load_gain_selects(row, extent);
+           });
+}
+
+// The HTTP held-back route sends each prompt's last token through decode_slots. It is still prefill work and must use
+// the BF16 route used to qualify the calibrated row. Only an emits-first served route can admit that row safely.
+inline constexpr bool mini_server_calibrated_row_allowed(bool requested, bool emits_first) noexcept {
+    return requested && emits_first;
+}
+
+// Lookup and drafter speculation must verify against the same incumbent target for every verify width. Until the
+// calibrated target supports both serial and multi-row verification, keep the whole speculative run on incumbent weights.
+inline constexpr bool mini_calibrated_row_allowed_for_cli(bool requested, bool speculation_requested,
+                                                          bool drafter_requested) noexcept {
+    return requested && !speculation_requested && !drafter_requested;
+}
 
 template <class Value>
 bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argument, const Value& value,
@@ -30,7 +111,20 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
     } else if (argument == "--block-drafter") {
         options.tier.cli.emplace_back(std::string(spec::kBlockDraftLeverName), value());
     } else if (native && argument == "--qualify-q8") {
+        options.qualify_decode_only = false;
         options.qualify_q8 = true;
+        options.qualify = &weight::kAttentionHeadQ8Policy;
+    } else if (native && (argument == "--qualify-weights" || argument == "--qualify-decode-weights")) {
+        options.qualify_decode_only = argument == "--qualify-decode-weights";
+        const std::string_view key(value());
+        options.qualify = weight::find_weight_load_policy(key, kMiniQualifiablePolicies);
+        bool bound = false;
+        for (const auto& binding : kMiniQualifiablePolicies)
+            bound = bound || (options.qualify != nullptr && weight::same_id(binding.id, options.qualify->id));
+        if (!bound) throw std::invalid_argument("--qualify-weights: unknown or unbound weight policy " + std::string(key));
+        options.qualify_q8 = weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id);
+        if (options.qualify_decode_only && !mini_lowbit_storage(options.qualify->head_target()))
+            throw std::invalid_argument("--qualify-decode-weights requires a low-bit head");
     } else if (native && argument == "--no-weight-q8") {
         options.disable_q8 = true;
     } else {
@@ -244,6 +338,11 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     tier.weights.require_honoured();
     if (options.qualify_q8 && (tier.profile != profile::Name::fast || options.disable_q8 || !native_execution))
         throw std::invalid_argument("--qualify-q8 requires --profile fast and native model execution");
+    // A low-bit arm is a FAST candidate or, failing the FAST gate, a TURBO one.
+    if (options.qualify != nullptr &&
+        ((tier.profile != profile::Name::fast && tier.profile != profile::Name::turbo) || options.disable_q8 ||
+         !native_execution))
+        throw std::invalid_argument("--qualify-weights requires --profile fast or turbo and native model execution");
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
@@ -253,6 +352,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     mini_defer_vision_recipe(tier);  // image input only: re-admitted and checked by the image opener
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
+    static_cast<void>(mini_lowbit_turbo(tier));
     spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
 }
@@ -275,17 +375,95 @@ inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }
 
-// The one resolver of the CLI and the server: `extent` is what the instance holds (resident context, decode lanes;
-// see resolve_mini_weight_load); the receipt line weight::weight_load_regime_receipt says which regime rows are active.
+// Open once against the checkpoint identity. The same source is used for tensor validation
+// and staging, which retains the shared stale-source checks.
+inline std::string admit_mini_lowbit_pack(const std::string& file, const weight::Digest256& checkpoint,
+                                          std::shared_ptr<const weight::LowbitPack>& admitted,
+                                          const weight::Digest256* measured = nullptr) {
+    admitted.reset();
+    auto pack = std::make_shared<weight::LowbitPack>();
+    if (const auto opened = weight::LowbitPack::open(file, checkpoint, *pack); !opened) return opened.detail;
+    if (measured && !(pack->identity() == *measured)) return "pack content does not match the receipt";
+    admitted = std::move(pack);
+    return {};
+}
+
 inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name tier, const MiniWeightOptions& options,
                                                               const weight::WeightLoadScope& scope,
-                                                              weight::WeightLoadExtent extent) {
-    constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
-    const auto plan = resolve_mini_weight_load(tier, scope, consumers, !options.disable_q8, options.qualify_q8,
-                                               kMiniWeightLoadDecisions, extent);
-    if (options.qualify_q8 && plan.storage != weight::kQ8WeightStorage)
-        throw std::invalid_argument("native Q8_0 weights were not admitted");
+                                                              weight::WeightLoadExtent extent = {}) {
+    constexpr std::array consumers{weight::kBf16WeightStorage, weight::kQ8WeightStorage,
+                                   weight::kQ4G64WeightStorage, weight::kQ6G64WeightStorage};
+    const std::span<const weight::FormatId> formats(consumers.data(), scope.backend == weight::Backend::hip ? 4U : 2U);
+    const auto& policy = mini_weight_load_policy(options);
+    const bool qualify = options.qualify_q8 || options.qualify != nullptr;
+    if (mini_may_load_lowbit_row(tier, options, scope.backend, extent)) {
+        auto candidate = mini_lowbit_receipt_plan(tier, scope, extent);
+        if (mini_lowbit_storage(candidate.head_storage)) return candidate;
+    }
+    auto plan = weight::resolve_weight_load(weight::builtin_registry(), policy,
+        {tier, scope, formats, !options.disable_q8, qualify, kMiniWeightLoadRegimes, extent}, kMiniWeightLoadDecisions);
+    if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
+        throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
     return plan;
+}
+
+inline MiniLowBitRows open_mini_weight_pack(const std::string& file, const weight::Digest256& checkpoint,
+                                           bool decode_only, const weight::Digest256* measured = nullptr) {
+    MiniLowBitRows rows{decode_only, {}};
+    if (auto detail = admit_mini_lowbit_pack(file, checkpoint, rows.admitted, measured); !detail.empty())
+        throw std::runtime_error("calibrated low-bit pack refused: " + detail);
+    return rows;
+}
+
+inline weight::WeightLoadPlan mini_plain_weight_fallback(profile::Name tier, const MiniWeightOptions& options,
+                                                        const weight::WeightLoadScope& scope,
+                                                        weight::WeightLoadExtent extent, std::string_view reason) {
+    auto incumbent = options;
+    incumbent.qualify = nullptr;
+    incumbent.qualify_q8 = false;
+    incumbent.qualify_decode_only = false;
+    incumbent.lowbit_turbo = false;
+    auto plan = resolve_mini_resident_weight_load(tier, incumbent, scope, extent);
+    plan.reason = reason;
+    return plan;
+}
+
+// Called after the resident image and first slot are allocated; free bytes already account for
+// both BF16 and any compact copies. A calibrated load must retain the requested slot capacity.
+inline void require_mini_weight_slot_capacity(std::uint32_t slots, std::uint32_t requested, bool calibrated) {
+    if (calibrated && slots < requested)
+        throw std::runtime_error("calibrated image cannot retain the requested slot capacity");
+    if (!slots) throw std::runtime_error("Inkling KV budget holds no session slots");
+}
+
+inline std::uint32_t mini_weight_slot_capacity(std::uint64_t free, std::uint64_t total, std::uint64_t device_limit,
+                                               std::uint64_t kv_limit, std::uint64_t slot_bytes,
+                                               std::uint32_t requested, bool calibrated) {
+    const auto slots = serve::resident_kv_slots(free, total, device_limit, kv_limit, slot_bytes, requested);
+    require_mini_weight_slot_capacity(slots, requested, calibrated);
+    return slots;
+}
+
+// Keep the admitted handle through staging and verification. Destroy any failed image before
+// rebuilding the incumbent, and publish the fallback plan with the weights that actually loaded.
+template <class Load>
+auto load_mini_weight_pack(weight::WeightLoadPlan& plan, profile::Name tier, const MiniWeightOptions& options,
+                           const weight::WeightLoadScope& incumbent_scope, weight::WeightLoadExtent extent,
+                           const std::string& path, const weight::Digest256* measured, std::ostream& receipt, Load load) {
+    const bool decode_only = measured || options.qualify_decode_only;
+    if (path.empty() && !decode_only) return load(MiniLowBitRows{});
+    try {
+        if (path.empty()) throw std::runtime_error("--qualify-decode-weights requires STRIX_LOWBIT_PACK");
+        const auto rows = open_mini_weight_pack(path, incumbent_scope.checkpoint, decode_only, measured);
+        auto loaded = load(rows);
+        if (const auto checked = rows.admitted->verify_identity(); !checked) throw std::runtime_error(checked.detail);
+        return loaded;
+    } catch (const std::runtime_error& error) {
+        receipt << "strix-lowbit-pack/v2 declined (" << error.what() << "); retrying incumbent weights\n";
+        plan = mini_plain_weight_fallback(tier, options, incumbent_scope, extent,
+                                          "calibrated pack declined; incumbent weights");
+        return load(MiniLowBitRows{});
+    }
 }
 
 } // namespace strix::inkling2

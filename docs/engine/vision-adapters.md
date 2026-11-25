@@ -395,7 +395,8 @@ element) and is allocated in `set_embed_rows`, never inside a prefill.
   apply is a protocol error for the pair. Image prompts take no prefix cache entry (handles are process-local, so
   a key of virtual ids means nothing on the other rank), no root store, no RTX route and no session.
 
-Status: compiles for gfx1151; the server path runs on a pair (2026-11-24) and answers images correctly (see the gate
-table). Identity for text prompts is by construction (no splice: nothing is launched or uploaded and no kernel of the
-text path is changed) and still has to be shown on the device (tokens, logits and state digest of a text prompt
-against the previous build).
+Status: compiles for gfx1151; on a pair the server path passes a synthetic HTTP smoke (a generated image is admitted,
+its rows reach both ranks and a reply is returned). That smoke does not show image correctness: correctness on real
+images with the real projector file is pending. Identity for text prompts is by construction (no splice: nothing is
+launched or uploaded and no kernel of the text path is changed); the native device comparison (tokens, logits and
+state digest of a text prompt against the previous build) is pending.

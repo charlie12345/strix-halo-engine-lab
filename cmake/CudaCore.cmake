@@ -6,6 +6,7 @@ endif()
 enable_language(CUDA)
 include(CTest)
 include("${CMAKE_CURRENT_LIST_DIR}/CudaTokenSampling.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/CoreRowsPlan.cmake")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,10 +43,13 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda/core/attn_flash8.cu
     ${_cc_root}/src/cuda/core/recur_parity.cu
     ${_cc_root}/src/cuda/core/recur_chunk.cu  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
+    ${_cc_root}/src/cuda/core/attn_decode.cu  # decode_position_split (attn_core/position_split.hpp) and the decode kernels
+    ${_cc_root}/src/cuda/core/recur_decode.cu  # enqueue_decode_replay_step (GDN decode replay step)
+    ${_cc_root}/src/cuda/core/amd_math_tables.cu  # gfx1151 math tables read by recur_decode.cu
     ${_cc_root}/src/cuda/core/step_inputs.cu  # X3 step-input scatter (plain / tree / fed rows / slots)
     ${_cc_root}/src/cuda/core/lookup_cuda.cu  # K10c token lookup family
     ${_cc_root}/src/cuda/core/embed_splice.cu)  # provided embedding rows (session/embed_splice_device.hpp)
-target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling)
+target_link_libraries(strix_cuda_core_kernels PUBLIC strix_cuda_token_sampling strix_core_rows_plan)
 target_include_directories(strix_cuda_core_kernels PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
 target_compile_options(strix_cuda_core_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
@@ -58,7 +62,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 add_library(strix_qwen35_cuda STATIC ${_cc_root}/src/qwen35/cuda/engine.cu ${_cc_root}/src/gguf_reader.cpp
     ${_cc_root}/src/qwen35/config.cpp ${_cc_root}/src/qwen35/family.cpp ${_cc_root}/src/model_family_registry.cpp)
 target_link_libraries(strix_qwen35_cuda PUBLIC strix_cuda_core_kernels)
-target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include)
+target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)

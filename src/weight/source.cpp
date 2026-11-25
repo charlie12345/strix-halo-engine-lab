@@ -29,7 +29,10 @@ namespace {
 Digest256 digest(std::span<const Byte> bytes) {
     h3::te::Sha256 hash; hash.update(bytes.data(),bytes.size()); return {hash.finish()};
 }
-using FileHandle = std::unique_ptr<std::FILE, decltype(&std::fclose)>;
+struct FileClose {
+    void operator()(std::FILE* file) const noexcept { std::fclose(file); }
+};
+using FileHandle = std::unique_ptr<std::FILE, FileClose>;
 
 class FileSource final : public Source {
     struct Snapshot { std::array<std::uint64_t,6> words{}; bool operator==(const Snapshot&) const = default; };
@@ -255,7 +258,7 @@ struct ConfinedDirectory::Impl {
             CloseHandle(child);
             throw std::runtime_error("cannot adopt confined file: " + name.string());
         }
-        FileHandle file(_fdopen(fd, "rb"), &std::fclose);
+        FileHandle file(_fdopen(fd, "rb"));
         if (!file) _close(fd);
 #else
         const int fd = ::openat(handle, basename.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
@@ -268,7 +271,7 @@ struct ConfinedDirectory::Impl {
             ::close(fd);
             throw std::runtime_error("not a confined regular file: " + name.string());
         }
-        FileHandle file(::fdopen(fd, "rb"), &std::fclose);
+        FileHandle file(::fdopen(fd, "rb"));
         if (!file) ::close(fd);
 #endif
         if (!file) throw std::runtime_error("cannot adopt confined file: " + name.string());

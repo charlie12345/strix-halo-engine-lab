@@ -1097,7 +1097,7 @@ void profile_tests(){
         const auto unmeasured = rp::resolve(rp::App::decode_service, measured);
         const auto* unmeasured_tile = unmeasured.find("prefill_tile_large");
         const std::string tile_reference = unmeasured_tile ? unmeasured_tile->ladder_reference : std::string();
-        check(tile_reference.starts_with("ladder-arm/v3;"), "GLM reports the reference of the tile cell");
+        check(tile_reference.starts_with("ladder-arm/v4;"), "GLM reports the reference of the tile cell");
         timing.over = tile_reference;
         measured.ladder = std::span(&timing, 1);
         const auto experiment = rp::resolve(rp::App::decode_service, measured);

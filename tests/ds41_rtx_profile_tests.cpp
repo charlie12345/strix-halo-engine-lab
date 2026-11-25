@@ -166,9 +166,9 @@ int main() {
     // a synthetic table: a runnable pending column is refused unless --allow-pending, then stamped; a ready column applies
     static constexpr pf::Lever synthetic[] = {
         {.name = "ready_lever", .options = {{{"--ready", "on"}}}, .value = {"off", "on", "off"}, .builtin = "off",
-         .ready = {true, true, true}, .runnable = {true, true, true}, .apps = 1U, .source = "test"},
+         .ready = {true, true, true}, .runnable = {true, true, true}, .apps = 1U, .source = "test", .identity = {{{"off", "v1"}, {"on", "v1"}}}},
         {.name = "runnable_pending", .env = "TEST_RP", .value = {"", "on", ""}, .builtin = "off", .ready = {false, false, false},
-         .runnable = {false, true, false}, .kind = pf::Kind::bit_changing, .apps = 1U, .source = "pending: test band"},
+         .runnable = {false, true, false}, .kind = pf::Kind::bit_changing, .apps = 1U, .source = "pending: test band", .identity = {{{"off", "v1"}, {"on", "v1"}}}},
     };
     const auto syn = [&](std::vector<std::string> args, bool allow, pf::Name n = pf::Name::fast,
                          std::map<std::string, std::string> env = {}) {
@@ -185,7 +185,7 @@ int main() {
     CHECK(syn({}, true).qualification() == "unqualified: runnable_pending");
     {
         // The reference the FAST cell is measured over: ready_lever (exact, earlier in the table) already at FAST.
-        constexpr std::string_view over = "ladder-arm/v3;fixture-exec;ready_lever=on,runnable_pending=off;candidate=runnable_pending=on";
+        constexpr std::string_view over = "ladder-arm/v4;fixture-exec;ready_lever=on{v1},runnable_pending=off{v1};candidate=runnable_pending=on{v1};tier=fast";
         const auto timed = [&](double speedup, double noise) {
             strix::profile::LadderRow row{"runnable_pending", "on", strix::profile::Name::fast,
                                           strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, speedup, noise, "test"};
@@ -278,7 +278,7 @@ int main() {
     for (const bool ready : {false, true}) for (const bool runnable : {false, true})
     for (const bool allow : {false, true}) for (const auto profile : {pf::Name::standard, pf::Name::fast}) {
         pf::Lever row{.name = "same_builtin", .value = {"off", "off", "off"}, .builtin = "off",
-                      .ready = {ready, ready, ready}, .runnable = {runnable, runnable, runnable}, .apps = 1U, .source = {}};
+                      .ready = {ready, ready, ready}, .runnable = {runnable, runnable, runnable}, .apps = 1U, .source = {}, .identity = {{{"off", "v1"}}}};
         const auto r = pf::resolve(profile, allow, pf::App::replica, in({}), std::span(&row, 1));
         const auto expected = ready ? pf::Status::profile : allow && runnable ? pf::Status::unqualified : pf::Status::pending;
         CHECK(r.find("same_builtin")->status == expected && r.find("same_builtin")->value == "off");

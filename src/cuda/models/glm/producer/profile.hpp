@@ -37,7 +37,7 @@ struct Option {
 
 struct Lever {
     std::string_view name;                  // receipt key
-    std::string_view env;                   // the lever's own environment switch (empty: none)
+    std::string_view env{};                 // the lever's own environment switch (empty: none)
     std::array<Option, 4> options{};        // CLI options that set the lever explicitly (unused entries empty)
     std::array<std::string_view, 3> value;  // per profile (default, fast, quality); empty: the profile leaves it alone
     std::string_view builtin;               // this build with no profile, option or variable
@@ -46,6 +46,7 @@ struct Lever {
     Kind kind = Kind::exact;
     unsigned apps = 0;                      // mask of App values the lever concerns
     std::string_view source;                // owner commit; for a pending column, what it waits for
+    strix::profile::Identities identity{}; // declared identity per value (strix::profile::Lever::identity)
 };
 [[nodiscard]] std::span<const Lever> levers();
 

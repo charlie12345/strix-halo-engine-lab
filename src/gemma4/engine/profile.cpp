@@ -32,7 +32,7 @@ constexpr Lever table[] = {
      .required = {false, true, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::bit_changing, .apps = engine | decode_bench,
      .source = "g4-a8-v1 (A8G32 activations, integer dots; byte gates exact); "
-               "qualified: held-out fidelity bands met"},
+               "qualified: held-out fidelity bands met", .identity = {{{"g4-v1", "v1"}, {"g4-a8-v1", "v1"}}}},
     // FAST decode attention at depth (global layers): int8 KV groups (one FP16 scale per 16 features) from the
     // per-stream mirror, split-K over 128-key tiles, FP32 softmax and sums, ordered merge (g4-dattn-f2; g4-dattn-f1 =
     // FP16 operands, selectable). Pending its fast-parity receipt (decode after 8K/32K/64K prompts); until
@@ -40,58 +40,58 @@ constexpr Lever table[] = {
     {.name = "decode_attention", .env = "STRIX_G4_DECODE_ATTN", .value = {"exact", "g4-dattn-f2", "exact"},
      .builtin = "exact", .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, true, true},
      .kind = Kind::bit_changing, .apps = engine | decode_bench, .target = "g4-dattn-f2",
-     .source = "pending: g4-dattn-f2 qualification receipt (fast-parity, decode after 8K/32K/64K prompts)"},
+     .source = "pending: g4-dattn-f2 qualification receipt (fast-parity, decode after 8K/32K/64K prompts)", .identity = {{{"exact", "v1"}, {"g4-dattn-f2", "v1"}}}},
     // A8 FFN epilogue fused into the A8 PLE-gate linear prologue: active whenever the g4-a8-v1 decode identity
     // runs (a no-op otherwise); ids and bytes equal the separate epilogue. STRIX_G4_A8_FFN_PLE_FUSE=0 switches it off.
     {.name = "a8_ffn_ple_fuse", .env = "STRIX_G4_A8_FFN_PLE_FUSE", .value = {"1", "1", "1"}, .builtin = "1",
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine | decode_bench, .off = "0",
-     .source = "g4-a8-v1 FFN epilogue fused into the PLE-gate linear: ids and bytes == separate epilogue (0 = off)"},
+     .source = "g4-a8-v1 FFN epilogue fused into the PLE-gate linear: ids and bytes == separate epilogue (0 = off)", .identity = {{{"1", "v1"}, {"0", "v1"}}}},
     // Drafter: <model dir>/drafter-mtp when present, --draft-mtp DIR overrides, --draft off or
     // STRIX_G4_DRAFT=0 switches it off. Missing weights never fail: decode runs exact without it.
     {.name = "draft", .env = "STRIX_G4_DRAFT", .option = "--draft-mtp", .value = {"mtp-auto", "mtp-auto", "mtp-auto"},
      .builtin = "off", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .asset = true, .off = "0",
-     .source = "MTP assistant drafter: ids == OFF on g4-v1, g4-a8-v1 and g4-exl3-v3; C2..C8 auto k<=1 (STRIX_G4_DRAFT_MULTI=0 off)"},
+     .source = "MTP assistant drafter: ids == OFF on g4-v1, g4-a8-v1 and g4-exl3-v3; C2..C8 auto k<=1 (STRIX_G4_DRAFT_MULTI=0 off)", .identity = {{{"off", "v1"}, {"mtp-auto", "v1"}, {"0", "v1"}}}},
     {.name = "draft_mode", .env = "STRIX_G4_DFLASH", .option = "--dflash", .value = {"auto", "auto", "auto"},
      .builtin = "auto", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
-     .kind = Kind::exact, .apps = engine, .off = "0", .source = "draft admission auto: C1 drafts, C2..C8 plain"},
+     .kind = Kind::exact, .apps = engine, .off = "0", .source = "draft admission auto: C1 drafts, C2..C8 plain", .identity = {{{"auto", "v1"}, {"0", "v1"}}}},
     // C1 MTP drafter-confidence window: the window only selects how many drafted tokens are verified (ids == OFF).
     // Unset = per drafter (drafter-mtp/config.json confidence_tau, else the builtin tau for known weights, else 0.6);
     // a number forces tau; STRIX_G4_MTP_CONF=0 switches it off (AutoPolicy windows as before).
     {.name = "draft_window", .env = "STRIX_G4_MTP_CONF", .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
-     .source = "gemma4/e4b-mtp2: confidence-gated C1 MTP window, ids == OFF; gate EN untuned 85.6 -> 97.6 tok/s"},
+     .source = "gemma4/e4b-mtp2: confidence-gated C1 MTP window, ids == OFF; gate EN untuned 85.6 -> 97.6 tok/s", .identity = {{{"auto", "v1"}, {"0", "v1"}}}},
     // Cost-aware long-context window: when the stream's measured draft cost per depth is >= 0.04 x its measured one-row
     // pass (long contexts), start at one depth, extend while P >= 0.6, verify P >= 0.15. Exact. 0 = off.
     {.name = "draft_window_long", .env = "STRIX_G4_MTP_CONF_LONG", .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
-     .source = "cost-aware long-context MTP window (measured draft cost per depth vs one-row pass), ids == OFF"},
+     .source = "cost-aware long-context MTP window (measured draft cost per depth vs one-row pass), ids == OFF", .identity = {{{"auto", "v1"}, {"0", "v1"}}}},
     // Prompt lookup (n-gram) drafting, exact: auto = per-request selector beside the MTP drafter (drafts only on a strong
     // match, backs off on misses; measured equal to the drafter alone) and lookup drafting when no drafter is loaded
     // (agent prompts 48.2 -> 114.9, 49.3 -> 122.9 tok/s); 0 = off.
     {.name = "draft_lookup", .env = "STRIX_G4_LOOKUP", .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
-     .source = "prompt-lookup drafting, ids == OFF; beside the MTP drafter equal, without a drafter agent 48.2 -> 114.9 tok/s"},
+     .source = "prompt-lookup drafting, ids == OFF; beside the MTP drafter equal, without a drafter agent 48.2 -> 114.9 tok/s", .identity = {{{"auto", "v1"}, {"0", "v1"}}}},
     // HTTP serve: up to eight chat requests share one coordinator and decode together; each request's ids equal the
     // request served alone. STRIX_G4_SERVE_BATCH=0 serves one chat job at a time.
     {.name = "serve_batch", .env = "STRIX_G4_SERVE_BATCH", .value = {"continuous", "continuous", "continuous"},
      .builtin = "continuous", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
      .source = "continuous batching in serve: concurrent requests == each alone (greedy, seeded sampling, thinking "
-               "budget, streaming) on g4-v1, g4-a8-v1 and g4-exl3-v3"},
+               "budget, streaming) on g4-v1, g4-a8-v1 and g4-exl3-v3", .identity = {{{"continuous", "v1"}, {"0", "v1"}}}},
     {.name = "exl3_route", .option = "--exl3-arm", .value = {"", "", "pack"}, .builtin = "off",
      .required = {false, false, true}, .ready = {true, true, true}, .runnable = {true, true, true}, .kind = Kind::pack,
-     .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)"},
+     .apps = all_apps, .asset = true, .source = "EXL3 pack route (--exl3-arm)", .identity = {{{"off", "v1"}, {"pack", "v1"}}}},
     // Fixed per pack and session from the arm and --streams (crossover table in exl3/format.hpp);
     // STRIX_G4_EXL3_IDENTITY=v1|v2|v3 forces it, the same for the command line and the server.
     {.name = "exl3_identity", .env = "STRIX_G4_EXL3_IDENTITY", .value = {"", "", "auto"}, .builtin = "auto",
      .required = {false, false, false}, .ready = {false, false, true}, .runnable = {false, false, true},
      .kind = Kind::pack, .apps = engine,
-     .source = "auto-select per pack and --streams: M4/M6 g4-exl3-v3 always, M5 v3 at >= 8 streams, else v1"},
+     .source = "auto-select per pack and --streams: M4/M6 g4-exl3-v3 always, M5 v3 at >= 8 streams, else v1", .identity = {{{"auto", "v1"}}}},
     // Prompt prefill route. DEFAULT and QUALITY run prefill-exact. STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact
     // (the OFF switch under fast); =v1 / =v2 select a WMMA route explicitly.
     // =a8 (only with STRIX_G4_IDENTITY=g4-a8-v1): g4-a8-v1 linears on 512-row chunks; prompt rows equal the a8
@@ -104,7 +104,7 @@ constexpr Lever table[] = {
                "prompt rows and the anchor run the g4-a8-v1 decode; frozen FAST gate + v1/a8 pair receipt; not bitwise "
                "vs exact prefill), a8 on other non-EXL3 packs; =a8 keeps the previous fast route; default and quality run "
                "prefill-exact as many-row chunks (STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes); =v1 / =v2 select "
-               "g4-wmma-pf-v1 / -v2 on any non-EXL3 pack"},
+               "g4-wmma-pf-v1 / -v2 on any non-EXL3 pack", .identity = {{{"exact", "v1"}, {"fast", "g4-wmma-pf-v1"}}}},
     // Engine prompt attention on the WMMA prefill routes (v1/v2 only; exact, a8 and EXL3 routes ignore it):
     // fast runs g4-flash-attn-v1 (shared dense flash core: big query tiles, K/V once per work-group in LDS, FP16
     // WMMA, FP32 online softmax); =wmma selects g4-wmma-attn-v1, =canonical is the OFF switch.
@@ -112,14 +112,14 @@ constexpr Lever table[] = {
      .builtin = "canonical", .required = {false, false, false}, .ready = {true, !fast_prefill_attention_receipt.empty(), true},
      .runnable = {true, true, true}, .kind = Kind::bit_changing, .apps = engine, .target = "g4-flash-attn-v1",
      .source = "fast: g4-flash-attn-v1 prompt attention on the g4-wmma-pf-v1 route (Q4_K_M); =wmma selects "
-               "g4-wmma-attn-v1, =canonical keeps the canonical attention; default and quality never reach a WMMA prefill route"},
+               "g4-wmma-attn-v1, =canonical keeps the canonical attention; default and quality never reach a WMMA prefill route", .identity = {{{"canonical", "v1"}, {"flash", "g4-flash-attn-v1"}}}},
     // EXL3 packs: the pack's held-out bands were measured on g4-exl3-wmma-pf-v1 prompts (panel WMMA linears,
     // canonical attention); QUALITY targets that identity once its receipt lands, exact runs until then.
     {.name = "exl3_prefill", .env = "STRIX_G4_EXL3_PREFILL", .value = {"", "", "wmma"}, .builtin = "exact",
      .required = {false, false, false}, .ready = {false, false, false}, .runnable = {false, false, true},
      .kind = Kind::bit_changing, .apps = engine, .target = "g4-exl3-wmma-pf-v1",
      .source = "pending: g4-exl3-wmma-pf-v1 qualification receipt (EXL3 FP16 panels on the WMMA prefill GEMMs); "
-               "exact runs the many-row EXL3 core until then"},
+               "exact runs the many-row EXL3 core until then", .identity = {{{"exact", "v1"}, {"wmma", "g4-exl3-wmma-pf-v1"}}}},
     // The prefill bench (DevicePrefill) implements only g4-wmma-pf-v1 linears: its builtin is unqualified, so the
     // bench refuses every profile without --allow-pending (measure exact prefill through the decode app's prompt).
     {.name = "prefill_linears", .env = "STRIX_G4_PREFILL", .value = {"exact", "wmma", "exact"}, .builtin = "wmma",
@@ -128,15 +128,15 @@ constexpr Lever table[] = {
      .target = "g4-wmma-pf-v1",
      .source = "the prefill bench runs WMMA prefill linears (g4-wmma-pf-v1; STRIX_G4_PREFILL_LINEAR_POLICY selects "
                "g4-wmma-pf-v2), stamped unqualified here: the engine applies the qualified identity per profile and "
-               "pack; measure prefill-exact through strix-gemma4-decode prompt prefill"},
+               "pack; measure prefill-exact through strix-gemma4-decode prompt prefill", .identity = {{{"wmma", "v1"}, {"exact", "g4-wmma-pf-v1"}}}},
     {.name = "prefill_attention", .env = "STRIX_G4_PREFILL_ATTN", .value = {"canonical", "wmma", "canonical"},
      .builtin = "canonical", .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, true, true},
      .kind = Kind::bit_changing, .apps = prefill_bench, .target = "g4-wmma-attn-v1",
-     .source = "pending: WMMA attention is unqualified; the qualified prefill identities use canonical attention"},
+     .source = "pending: WMMA attention is unqualified; the qualified prefill identities use canonical attention", .identity = {{{"canonical", "v1"}, {"wmma", "g4-wmma-attn-v1"}}}},
     {.name = "prefill_canonical_kernel", .env = "STRIX_G4_PREFILL_CANON_KERNEL", .value = {"1", "1", "1"},
      .builtin = "1", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = prefill_bench,
-     .source = "whole-chunk canonical attention, byte-equal to the 8-row loop"},
+     .source = "whole-chunk canonical attention, byte-equal to the 8-row loop", .identity = {{{"1", "v1"}}}},
 };
 using strix::profile::environment;
 void escape(std::string& out, std::string_view text) {

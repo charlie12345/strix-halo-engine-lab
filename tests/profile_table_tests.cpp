@@ -457,7 +457,7 @@ void catalogue() {
     const auto unmeasured = p::resolve_effective_profile(p::Name::fast, q::levers(), on_cells, storage, native);
     const std::string native_reference =
         unmeasured.find("index_proj_wmma") ? unmeasured.find("index_proj_wmma")->ladder_reference : std::string();
-    check(native_reference.starts_with("ladder-arm/v3;"), "the native adapter reports the reference of the cell");
+    check(native_reference.starts_with("ladder-arm/v4;"), "the native adapter reports the reference of the cell");
     fixture_timing.over = native_reference;
     native_inputs.ladder = std::span(&fixture_timing, 1);
     const auto off = p::resolve_effective_profile(p::Name::fast, q::levers(), off_cells, storage, native);

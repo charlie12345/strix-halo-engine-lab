@@ -34,29 +34,29 @@ bool throws(F&& f) {
 constexpr p::Lever kRows[] = {
     {.name = "flash", .env = "T_FLASH", .option = "--flash", .value = {"", "1", "", ""}, .builtin = "0",
      .kind = p::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, true},
-     .target = "", .off = "0", .source = "fixture"},
+     .target = "", .off = "0", .source = "fixture", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "replay", .env = "T_REPLAY", .option = "", .value = {"", "", "", "128"}, .builtin = "256",
      .kind = p::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, true},
-     .target = "", .off = "256", .source = "fixture", .provisional = {false, false, false, true}},
+     .target = "", .off = "256", .source = "fixture", .provisional = {false, false, false, true}, .identity = {{{"256", "v1"}, {"128", "v1"}}}},
     {.name = "dense", .env = "T_DENSE", .option = "", .value = {"", "1", "", "0"}, .builtin = "0",
      .kind = p::Kind::bit_changing, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
-     .target = "", .off = "0", .source = "fixture"},
+     .target = "", .off = "0", .source = "fixture", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "head", .env = "", .option = "--head", .value = {"", "", "", "fp16"}, .builtin = "default",
      .kind = p::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, false},
-     .target = "fp16 head", .off = "off", .source = "pending fixture"},
+     .target = "fp16 head", .off = "off", .source = "pending fixture", .identity = {{{"default", "v1"}, {"fp16", "v1"}, {"off", "v1"}}}},
 };
 constexpr p::Regime kRegime{p::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
 constexpr p::LadderRow kTiming[] = {
     // Every row names the execution it was measured over (LadderRow::over): the levers before it at its tier (cells of
     // one tier compose in table order), itself and the later levers at the tier below.
     {"flash", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "ladder-arm/v3;fixture-exec;flash=0,replay=256,dense=0,head=default;candidate=flash=1"},
+     "ladder-arm/v4;fixture-exec;flash=0{v1},replay=256{v1},dense=0{v1},head=default{v1};candidate=flash=1{v1};tier=fast"},
     {"replay", "128", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "ladder-arm/v3;fixture-exec;flash=1,replay=256,dense=1,head=default;candidate=replay=128"},
+     "ladder-arm/v4;fixture-exec;flash=1{v1},replay=256{v1},dense=1{v1},head=default{v1};candidate=replay=128{v1};tier=turbo"},
     {"dense", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "ladder-arm/v3;fixture-exec;flash=1,replay=256,dense=0,head=default;candidate=dense=1"},
+     "ladder-arm/v4;fixture-exec;flash=1{v1},replay=256{v1},dense=0{v1},head=default{v1};candidate=dense=1{v1};tier=fast"},
     {"dense", "0", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "ladder-arm/v3;fixture-exec;flash=1,replay=128,dense=1,head=default;candidate=dense=0"},
+     "ladder-arm/v4;fixture-exec;flash=1{v1},replay=128{v1},dense=1{v1},head=default{v1};candidate=dense=0{v1};tier=turbo"},
 };
 const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, kTiming};
 const p::Engine kNoTurbo{"no-turbo-fixture", "", kRows, false};

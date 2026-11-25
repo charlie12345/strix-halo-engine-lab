@@ -201,10 +201,12 @@ inline void write_profile(const profile::Resolution& tier, std::ostream& output,
         if (!entry.ladder.empty()) output << entry.ladder << '\n';
 }
 
+// The one writer of the weight receipts of a command-line run (device stderr and gate receipt files): the plan line and
+// exactly one regime line.
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {
     output << "strix-weight-load/v1 " << plan.policy.name << '@' << plan.policy.revision
            << ' ' << plan.storage.name << '@' << plan.storage.revision << '\n';
-    if (!plan.regime_rows().empty()) output << weight::weight_load_regime_receipt(plan) << '\n';
+    output << weight::weight_load_regime_receipt(plan) << '\n';
 }
 
 // The evaluation-order null receipt of one gate window. A null arm whose window

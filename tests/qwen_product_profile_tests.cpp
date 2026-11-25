@@ -33,11 +33,11 @@ pr::Lookup lookup(const Env& env) {
 }
 constexpr pr::Lever synthetic[] = {
     {.name="ready", .env="STRIX_TEST_PROFILE_READY", .option="--ready", .value={"", "1", ""}, .builtin="0",
-     .kind=pr::Kind::exact, .ready={true,true,true}, .runnable={true,true,true}, .target="1", .off="0", .source="host fixture"},
+     .kind=pr::Kind::exact, .ready={true,true,true}, .runnable={true,true,true}, .target="1", .off="0", .source="host fixture", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name="pending", .env="STRIX_TEST_PROFILE_PENDING", .option="--pending", .value={"", "1", ""}, .builtin="0",
-     .kind=pr::Kind::bit_changing, .ready={true,false,true}, .runnable={false,true,false}, .target="candidate", .off="0", .source="host fixture"},
+     .kind=pr::Kind::bit_changing, .ready={true,false,true}, .runnable={false,true,false}, .target="candidate", .off="0", .source="host fixture", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name="absent", .env="STRIX_TEST_PROFILE_ABSENT", .option="--absent", .value={"", "1", ""}, .builtin="0",
-     .kind=pr::Kind::bit_changing, .ready={true,false,true}, .runnable={false,false,false}, .target="future", .off="0", .source="host fixture"},
+     .kind=pr::Kind::bit_changing, .ready={true,false,true}, .runnable={false,false,false}, .target="future", .off="0", .source="host fixture", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
 };
 dc::Options parse(std::vector<std::string> args) {
     std::vector<char*> argv;
@@ -197,7 +197,7 @@ void provisional_resolution() {
         .name="provisional", .env="STRIX_TEST_PROFILE_PROVISIONAL", .option="--provisional",
         .value={"", "1", ""}, .builtin="0", .kind=pr::Kind::bit_changing,
         .ready={true,false,true}, .runnable={false,true,false}, .target="candidate", .off="0",
-        .source="host fixture", .provisional={false,true,false}};
+        .source="host fixture", .provisional={false,true,false}, .identity = {{{"0", "v1"}, {"1", "v1"}}}};
     std::vector<pr::Lever> rows(std::begin(synthetic), std::end(synthetic));
     rows.push_back(provisional);
     Env env;

@@ -40,16 +40,16 @@ constexpr unsigned all = 1 | 2 | 4;
 // a CLI asset lever QUALITY requires, and a discovered asset lever with an off switch.
 constexpr pr::Lever synthetic[] = {
     {.name = "route", .env = "TEST_ROUTE", .value = {"a", "b", "a"}, .builtin = "a", .required = {false, false, false},
-     .ready = {true, true, true}, .kind = pr::Kind::bit_changing, .apps = all, .source = "ready"},
+     .ready = {true, true, true}, .kind = pr::Kind::bit_changing, .apps = all, .source = "ready", .identity = {{{"a", "v1"}, {"b", "v1"}}}},
     {.name = "speed", .env = "TEST_SPEED", .value = {"1", "1", "1"}, .builtin = "0", .required = {false, false, false},
-     .ready = {false, false, false}, .kind = pr::Kind::exact, .apps = all, .source = "owner-branch"},
+     .ready = {false, false, false}, .kind = pr::Kind::exact, .apps = all, .source = "owner-branch", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "named", .env = "TEST_NAMED", .value = {"", "x8", ""}, .builtin = "x0", .required = {false, true, false},
-     .ready = {true, false, true}, .kind = pr::Kind::bit_changing, .apps = 1, .source = "named-branch"},
+     .ready = {true, false, true}, .kind = pr::Kind::bit_changing, .apps = 1, .source = "named-branch", .identity = {{{"x0", "v1"}, {"x8", "v1"}}}},
     {.name = "pack", .option = "--pack", .value = {"", "", "pack"}, .builtin = "off", .required = {false, false, true},
-     .ready = {true, true, true}, .kind = pr::Kind::pack, .apps = all, .asset = true, .source = "pack-commit"},
+     .ready = {true, true, true}, .kind = pr::Kind::pack, .apps = all, .asset = true, .source = "pack-commit", .identity = {{{"off", "v1"}, {"pack", "v1"}}}},
     {.name = "draft", .env = "TEST_DRAFT", .option = "--draft-mtp", .value = {"on", "on", "on"}, .builtin = "off",
      .required = {false, false, false}, .ready = {true, false, true}, .kind = pr::Kind::exact, .apps = 1, .asset = true,
-     .off = "0", .source = "drafter"},
+     .off = "0", .source = "drafter", .identity = {{{"off", "v1"}, {"on", "v1"}, {"0", "v1"}}}},
 };
 
 void synthetic_table() {
@@ -85,7 +85,7 @@ void synthetic_table() {
     const std::string route_reference =  // owned: LadderRow::over is a view
         pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic).find("route")->ladder_reference;
     route_timing.over = route_reference;
-    check(route_timing.over.starts_with("ladder-arm/v3;"), "Gemma reports the reference of the route cell");
+    check(route_timing.over.starts_with("ladder-arm/v4;"), "Gemma reports the reference of the route cell");
     measured.ladder = std::span(&route_timing, 1);
     r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic);
     check(status(r, "route") == pr::Status::set && value(r, "route") == "b" && r.active("route"), "fast sets ready lever");
@@ -325,7 +325,7 @@ void product_table() {
                                   "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture timing"};
         pending_ok.regime = {shared::Phase::decode, 4096, 1, "fixture", "fixture-exec"};
         const std::string reference = pr::resolve(pr::Name::fast, app, pending_ok).find("decode_attention")->ladder_reference;
-        check(reference.starts_with("ladder-arm/v3;"), "Gemma reports the decode attention reference");
+        check(reference.starts_with("ladder-arm/v4;"), "Gemma reports the decode attention reference");
         timing.over = reference;
         pending_ok.ladder = std::span(&timing, 1);
         r = pr::resolve(pr::Name::fast, app, pending_ok);
@@ -427,7 +427,7 @@ void no_pending_executes() {
     constexpr pr::Lever fallback[] = {
         {.name = "bench_route", .env = "TEST_BENCH_ROUTE", .value = {"exact", "fast", "exact"}, .builtin = "fast",
          .required = {false, false, false}, .ready = {false, false, false}, .runnable = {false, true, false},
-         .apps = 1, .builtin_unqualified = true, .source = "pending: exact route"},
+         .apps = 1, .builtin_unqualified = true, .source = "pending: exact route", .identity = {{{"fast", "v1"}, {"exact", "v1"}}}},
     };
     refuses([&] { (void)pr::resolve(pr::Name::standard, pr::App::engine, in(), fallback); }, "pending: exact route",
             "unqualified builtin is never a silent fallback");
@@ -458,12 +458,12 @@ void parsing_and_apply() {
 
     // apply exports only profile-set plain switches, never over an existing value, never asset/off levers.
     constexpr pr::Lever exported[] = {
-        {.name = "one", .env = "STRIX_G4_PROFILE_TEST_ONE", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true}, .apps = 1, .source = "t"},
-        {.name = "two", .env = "STRIX_G4_PROFILE_TEST_TWO", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true}, .apps = 1, .source = "t"},
+        {.name = "one", .env = "STRIX_G4_PROFILE_TEST_ONE", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true}, .apps = 1, .source = "t", .identity = {{{"y", "v1"}, {"x", "v1"}}}},
+        {.name = "two", .env = "STRIX_G4_PROFILE_TEST_TWO", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true}, .apps = 1, .source = "t", .identity = {{{"y", "v1"}, {"x", "v1"}}}},
         {.name = "three", .env = "STRIX_G4_PROFILE_TEST_THREE", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true},
-         .apps = 1, .asset = true, .off = "0", .source = "t"},
+         .apps = 1, .asset = true, .off = "0", .source = "t", .identity = {{{"y", "v1"}, {"x", "v1"}, {"0", "v1"}}}},
         {.name = "four", .env = "STRIX_G4_PROFILE_TEST_FOUR", .value = {"x", "x", "x"}, .builtin = "y", .required = {true, true, true},
-         .ready = {false, false, false}, .runnable = {true, true, true}, .apps = 1, .source = "pending: gate"},
+         .ready = {false, false, false}, .runnable = {true, true, true}, .apps = 1, .source = "pending: gate", .identity = {{{"y", "v1"}, {"x", "v1"}}}},
     };
 #ifdef _WIN32
     _putenv_s("STRIX_G4_PROFILE_TEST_TWO", "mine");

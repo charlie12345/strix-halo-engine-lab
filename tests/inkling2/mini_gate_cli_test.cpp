@@ -6,6 +6,8 @@
 #include "strix/session/head_gate_cli.hpp"
 
 #include <iostream>
+#include <sstream>
+#include <string_view>
 #include <utility>
 
 #include <array>
@@ -360,9 +362,23 @@ void test_windows(const fs::path& directory) {
 
 }  // namespace
 
+// Review r63 P3: the command line writes the weight regime receipt once (one emitter, write_weight_load_plan).
+void test_weight_receipt_once() {
+    const auto count = [](const std::string& text, std::string_view key) {
+        std::size_t n = 0;
+        for (auto at = text.find(key); at != std::string::npos; at = text.find(key, at + key.size())) ++n;
+        return n;
+    };
+    std::ostringstream out;
+    cli::write_weight_load_plan(out, strix::weight::WeightLoadPlan{});
+    require(count(out.str(), "strix-weight-load/v1 ") == 1U, "one weight plan record");
+    require(count(out.str(), "strix-weight-load-regimes/v1 ") == 1U, "one weight regime record");
+}
+
 int main() {
     try {
         const TempDir directory;
+        test_weight_receipt_once();
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
         test_projected_bias_lever();

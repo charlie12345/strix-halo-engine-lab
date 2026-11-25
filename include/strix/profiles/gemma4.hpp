@@ -50,6 +50,7 @@ struct Lever {
     std::string_view off{};                // value of `env` (or the option) that switches the lever off;
                                            // such an env is only read, never exported
     std::string_view source{};             // owner commit/branch and, when pending, what it waits for
+    strix::profile::Identities identity{}; // declared identity per value (strix::profile::Lever::identity)
 };
 [[nodiscard]] std::span<const Lever> levers();
 

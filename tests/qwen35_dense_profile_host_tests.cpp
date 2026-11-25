@@ -204,8 +204,9 @@ int main() {
     // 3. Explicit per-lever options override the profile (both directions) and keep today's spellings.
     {
         const Options a = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192, {{"prefill_gdn", "serial"}});
-        // The explicit value runs; the fast4 receipt was timed with the FAST chunk16tc scan, so it does not decide here.
-        check(a.prefill_arith == PrefillArith::exact && a.prefill_gdn == PrefillGdn::serial, "explicit --prefill-gdn serial under fast");
+        // The explicit value runs; the fast4 timing receipt was measured with the FAST chunk16tc scan, so it does not
+        // match this run and has no effect: the frozen FAST grant (fast4 ran before the ladder rule) resolves.
+        check(a.prefill_arith == PrefillArith::fast4 && a.prefill_gdn == PrefillGdn::serial, "explicit --prefill-gdn serial under fast");
         const Options b = run(std::nullopt, TurboWeights::off, qp::Route::large_prefill, 0, {{"prefill_arith", "fast8"}, {"prefill_attn8", "on"}});
         check(b.prefill_arith == PrefillArith::fast8 && b.prefill_attn8, "explicit levers without a profile word");
         const Options c = run(std::nullopt, TurboWeights::off, qp::Route::large_prefill, 0, {{"prefill_arith", "windows"}});
@@ -213,10 +214,10 @@ int main() {
         const Options d = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 32768, {{"prefill_attn8", "off"}, {"prefill_arith", "exact"}});
         check(d.prefill_arith == PrefillArith::exact && !d.prefill_attn8, "explicit off switches under fast");
         // every engine spelling passes the resolver (the CLI path once kept a second spelling list that refused chunk16tc);
-        // chunk16 (the f32 scan) stays reachable under fast as an explicit choice; the explicit setting is part of the lower
-        // arm, so FAST timing rows measured over the builtin arm no longer decide (stale evidence) and their cells stay EXACT
+        // chunk16 (the f32 scan) stays reachable under fast as an explicit choice; the explicit setting is part of the key,
+        // so FAST timing rows measured over the chunk16tc arm do not match and have no effect: the frozen grant resolves
         const Options e = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192, {{"prefill_gdn", "chunk16"}});
-        check(e.prefill_arith == PrefillArith::exact && e.prefill_gdn == PrefillGdn::chunk16, "explicit --prefill-gdn chunk16 under fast");
+        check(e.prefill_arith == PrefillArith::fast4 && e.prefill_gdn == PrefillGdn::chunk16, "explicit --prefill-gdn chunk16 under fast");
         const Options f = run(std::nullopt, TurboWeights::converted, qp::Route::large_prefill, 0,
                               {{"prefill_arith", "fast4"}, {"prefill_gdn", "chunk16tc"}, {"prefill_hid", "bf16"}});
         check(f.prefill_arith == PrefillArith::fast4 && f.prefill_gdn == PrefillGdn::chunk16tc && f.prefill_hid == PrefillHid::bf16,
@@ -352,8 +353,8 @@ int main() {
         const auto resolve = [&](const qp::Regime& r, const Pairs& opts = {}) {
             return qp::resolve(Name::turbo, r, opts, qp::qualified, evidence);
         };
-        const auto reference = qp::joint_execution(fast->resolution);
-        std::string candidate_base = qp::joint_execution(resolve(regime)->resolution);
+        const auto reference = qp::joint_execution(*fast);
+        std::string candidate_base = qp::joint_execution(*resolve(regime));
         gains[0].joint_scope = {regime.cost_device, reference, candidate_base, qp::kKvIdentity, qp::kAttnIdentity,
                                 regime.workload, "on"};
         // Single-cell rows name their TURBO value and the reference that runs under them (LadderArms::over: cells of
@@ -363,14 +364,31 @@ int main() {
         for (std::size_t i = 1; i < gains.size(); ++i)
             for (const auto& lever : qp::table)
                 if (lever.name == keys[i]) gains[i].value = lever.value[static_cast<unsigned>(Name::turbo)];
-        // The TURBO schedule (an exact lever, no ladder reference of its own) is timed on the run's execution.
+        // The TURBO schedule is a timed exact lever (Lever::timed): judged in the shared chain over the complete key of
+        // the execution it extends, like every other timed cell. Review r63 P1 #2: a receipt naming only the schedule
+        // (the old truncated spelling) never decides it.
         const std::string execution = resolve(regime)->execution;
-        references[3] = std::string(p::kLadderArmVersion) + ";" + execution + ";drafter_window=7;candidate=drafter_window=" +
-                        std::string(gains[3].value);
-        gains[3].over = references[3];
         check(!execution.empty(), "the priced dense CLI spells its execution");
+        const std::string truncated = std::string(p::kLadderArmVersion) + ";" + execution +
+                                      ";drafter_window=7{chain-window-7-v1};candidate=drafter_window=" +
+                                      std::string(gains[3].value) + "{" + std::string(qp::kDraftIdentity) + "}";
+        gains[3].over = truncated;
+        check(resolve(regime)->find("drafter_window")->value == "7", "a truncated schedule receipt does not decide");
+        const auto settle = [&] {
+            for (std::size_t pass = 0; pass < gains.size(); ++pass) {
+                candidate_base = qp::joint_execution(*resolve(regime));
+                gains[0].joint_scope.candidate_base = candidate_base;
+                for (std::size_t i = 1; i < gains.size(); ++i) {
+                    const auto resolved = resolve(regime);  // the entry lives in this resolution
+                    const auto* entry = resolved->find(keys[i]);
+                    if (entry == nullptr || entry->ladder_reference.empty()) continue;
+                    references[i] = entry->ladder_reference;
+                    gains[i].over = references[i];
+                }
+            }
+        };
         for (std::size_t pass = 0; pass < gains.size(); ++pass) {
-            candidate_base = qp::joint_execution(resolve(regime)->resolution);
+            candidate_base = qp::joint_execution(*resolve(regime));
             gains[0].joint_scope.candidate_base = candidate_base;
             for (std::size_t i = 1; i < gains.size(); ++i) {
                 const auto resolved = resolve(regime);  // the entry lives in this resolution
@@ -380,7 +398,7 @@ int main() {
                 gains[i].over = references[i];
             }
         }
-        check(references[2].starts_with("ladder-arm/v3;"), ("Qwen dense reports the TURBO dense reference: " + references[2]).c_str());
+        check(references[2].starts_with("ladder-arm/v4;"), ("Qwen dense reports the TURBO dense reference: " + references[2]).c_str());
         const auto admitted = resolve(regime);
         qp::apply(options, *admitted);
         kv = qp::resolve_kv(Name::turbo, {}, regime.route, explicit_arms);
@@ -389,6 +407,21 @@ int main() {
                   options.decode_attn8 && options.dense_activation && kv.source == qp::kvp::Source::tier,
               ("matching receipts enable all four TURBO cells on top of FAST: " + qp::describe(*admitted)).c_str());
         check(resolve(regime, {{"decode_attn8", "off"}})->find("kv_fp8")->value == "native", "off switch disables the paired default");
+        // Review r63 P1 #2: the schedule's receipt binds the whole lower execution. A companion setting changed
+        // explicitly (split_k exact instead of the FAST fast) is another composition: the schedule falls back.
+        check(resolve(regime, {{"split_k", "exact"}})->find("drafter_window")->value == "7",
+              "an explicit companion setting retires the schedule receipt");
+        // Measured with dense_activation off (its own receipt slower), the schedule applies over that execution only:
+        // an explicit dense_activation=on is a composition nobody timed.
+        gains[2].speedup = 0.5;
+        settle();
+        check(resolve(regime)->find("dense_activation")->value == "off" && resolve(regime)->find("drafter_window")->value == "15",
+              "the schedule applies over the execution it was measured on");
+        check(resolve(regime, {{"dense_activation", "on"}})->find("drafter_window")->value == "7",
+              "an explicit dense_activation=on retires the schedule receipt measured with it off");
+        gains[2].speedup = 1.1;
+        settle();
+        check(resolve(regime)->find("drafter_window")->value == "15", "receipts restored");
         auto different_work = regime;
         different_work.cost_device = "another product with the same sm_120";
         check(resolve(different_work)->find("kv_fp8")->value == "native", "joint receipt binds the measured product");
@@ -427,7 +460,7 @@ int main() {
             reader.push_back({regime.weights, regime.route,
                               {"decode_attn8", "", 0, p::kNoPromptBound, "fixture FAST reader receipt"}});
             const std::string fast_reader_reference = qp::resolve(Name::fast, regime, {}, reader)->find("decode_attn8")->ladder_reference;
-            check(fast_reader_reference.starts_with("ladder-arm/v3;"), "Qwen dense reports the FAST reader reference");
+            check(fast_reader_reference.starts_with("ladder-arm/v4;"), "Qwen dense reports the FAST reader reference");
             const auto fast_reader = [&](Name tier) {
                 std::vector<p::LadderRow> ladder(gains.begin(), gains.end());  // the evidence as it stands now
                 ladder.push_back({"decode_attn8", "on", Name::fast, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
@@ -457,8 +490,8 @@ int main() {
                           pair_options.nvfp4_split == expected.nvfp4_split, what);
             };
             same_as_fast("receipt measured over FAST without the reader cannot promote the pair");
-            const auto reader_reference = qp::joint_execution(standalone->resolution);
-            const auto reader_candidate = qp::joint_execution(turbo()->resolution);
+            const auto reader_reference = qp::joint_execution(*standalone);
+            const auto reader_candidate = qp::joint_execution(*turbo());
             gains[0].joint_scope.reference = reader_reference;
             gains[0].joint_scope.candidate_base = reader_candidate;
             const auto with_pair = turbo();
@@ -486,8 +519,8 @@ int main() {
             const auto run = [&](Name tier, const Pairs& opts = {}) {
                 return qp::resolve(tier, large, opts, qp::qualified, ledger);
             };
-            const auto large_reference = qp::joint_execution(run(Name::fast)->resolution);
-            const auto large_candidate = qp::joint_execution(run(Name::turbo)->resolution);
+            const auto large_reference = qp::joint_execution(*run(Name::fast));
+            const auto large_candidate = qp::joint_execution(*run(Name::turbo));
             gains[0].joint_scope.reference = large_reference;
             gains[0].joint_scope.candidate_base = large_candidate;
             check(run(Name::turbo)->find("kv_fp8")->value == "fp8", "joint large-prefill fixture wins over its FAST arm");
@@ -567,7 +600,7 @@ int main() {
                                   1.04, 0.01, "fixture timing"}};
         // Measured over the reference that runs under the cell (LadderArms::over).
         const std::string hid_reference = extended->find("prefill_hid")->ladder_reference;
-        check(hid_reference.starts_with("ladder-arm/v3;"), ("Qwen dense reports the prefill_hid reference: " + hid_reference).c_str());
+        check(hid_reference.starts_with("ladder-arm/v4;"), ("Qwen dense reports the prefill_hid reference: " + hid_reference).c_str());
         timing[0].over = hid_reference;
         const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, {}, {}, timing}};
         check(lever_value(*qp::resolve(Name::fast, regime, {}, rows, evidence), "prefill_hid") == "bf16",

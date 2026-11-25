@@ -36,16 +36,16 @@ inline constexpr sp::Lever table[] = {
     {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "64", "", ""}, .builtin = "engine default (64-row EXACT windows, IU4)",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "64-row FAST wide windows (dense-q8a8-f16-v1)", .off = "16",
-     .source = "composite FAST gate (wide prefill rows > 16) pending"},
+     .source = "composite FAST gate (wide prefill rows > 16) pending", .identity = {{{"engine default (64-row EXACT windows, IU4)", "v1"}, {"64", "v1"}, {"16", "v1"}}}},
     {.name = "a4w4_layers", .env = "STRIX_DENSE_A4W4_LAYERS", .option = "", .value = {"", "48-63", "", ""},
      .builtin = "no A4W4 layer (STRIX_DENSE_A4W4=1: every layer, unqualified)", .kind = sp::Kind::bit_changing,
      .ready = {true, true, true, false}, .runnable = {true, true, true, false}, .target = "", .off = "none",
-     .source = "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)"},
+     .source = "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)", .identity = {{{"no A4W4 layer (STRIX_DENSE_A4W4=1: every layer, unqualified)", "v1"}, {"48-63", "v1"}, {"none", "v1"}}}},
     {.name = "prefill_rows", .env = "", .option = "--prefill-rows", .value = {"", "64", "", ""},
      .builtin = "engine default (64-row EXACT windows, IU4)",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "64-row FAST wide windows (dense-q8a8-f16-v1)", .off = "16",
-     .source = "composite FAST gate (wide prefill rows > 16) pending"},
+     .source = "composite FAST gate (wide prefill rows > 16) pending", .identity = {{{"engine default (64-row EXACT windows, IU4)", "v1"}, {"64", "v1"}, {"16", "v1"}}}},
 };
 inline constexpr std::string_view kAllowEnv = "STRIX_QWEN35_HIP_PROFILE_ALLOW_PENDING";
 // FAST gate ledger (strix::profile::FastGate): the qualified fast cells and their receipts.

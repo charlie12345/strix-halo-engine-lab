@@ -61,47 +61,56 @@ inline constexpr Lever table[] = {
     {.name = "prefill_arith", .env = "", .option = "--prefill-arith", .value = {"", "fast4", "", ""}, .builtin = "exact",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "fast4 (nvfp4-tile-mma-f32-v1, identity -pf-fast4)", .off = "exact",
-     .source = "W4A4 FAST4 large-M prefill; gate with chunk16 PASS 8K KL 0.01275 top-1 0.9648, 32K KL 0.00626 top-1 0.9668 (52dd7d1f0)"},
+     .source = "W4A4 FAST4 large-M prefill; gate with chunk16 PASS 8K KL 0.01275 top-1 0.9648, 32K KL 0.00626 top-1 0.9668 (52dd7d1f0)",
+     .identity = {{{"exact", "v1"}, {"fast4", "nvfp4-tile-mma-f32-v1"}}}},
     {.name = "prefill_gdn", .env = "", .option = "--prefill-gdn", .value = {"", "chunk16tc", "", ""}, .builtin = "serial",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "chunk16tc (gdn-chunk16-tf32-v2: split-TF32 tensor-core chunk scan, identity -gdnc16t2)", .off = "serial",
      .source = "chunked GDN prefill, K2 scan in split TF32 (FP32-class); with fast4: 8K 2/2 windows PASS KL 0.01243 top-1 0.9727, "
                "with fast4 + attn8: 32K 2/2 windows PASS KL 0.00761 top-1 0.9727; chunk16 (f32 scan) stays selectable; "
-               "ignored under prefill_arith exact"},
+               "ignored under prefill_arith exact",
+     .identity = {{{"serial", "v1"}, {"chunk16tc", "gdn-chunk16-tf32-v2"}, {"chunk16", "gdn-chunk16-f32-v1"}}}},
     {.name = "prefill_hid", .env = "", .option = "--prefill-hid", .value = {"", "bf16", "", ""}, .builtin = "f32",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "bf16 (nvfp4-tile-h16-v1: BF16 FFN hidden rows, identity -h16)", .off = "f32",
-     .source = "FAST4 glu epilogue stores BF16 H, down operand quantised from it (half the H bytes); no gate receipt yet"},
+     .source = "FAST4 glu epilogue stores BF16 H, down operand quantised from it (half the H bytes); no gate receipt yet",
+     .identity = {{{"f32", "v1"}, {"bf16", "nvfp4-tile-h16-v1"}}}},
     {.name = "prefill_attn8", .env = "", .option = "--prefill-attn8", .value = {"", "on", "", ""}, .builtin = "off",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "on (e4m3 flash over an e4m3 KV shadow, identity -a8)", .off = "off",
      .source = "with fast4+chunk16: 8K 2/2 windows PASS KL 0.01498 top-1 0.9688 per window, warm 14,361 tok/s (600 W); 32K 2/2 windows PASS KL 0.00589 top-1 "
-                      "0.9746-0.9805, warm 12,354 vs 10,946 tok/s"},
+                      "0.9746-0.9805, warm 12,354 vs 10,946 tok/s",
+     .identity = {{{"off", "v1"}, {"on", "prefill-attn8-e4m3-v1"}}}},
     {.name = "split_k", .env = "", .option = "--split-k", .value = {"", "fast", "", ""}, .builtin = "exact",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "fast (nvfp4-splitk-fast-v1, identity -skf1)", .off = "exact",
      .source = "NVFP4 GEMV split-K FAST targets (strix/split_k_policy.hpp, 188-SM cc 12.0 rows); gate EXACT -> FAST pooled "
-               "KL 0.00000 top-1 0.9990 dNLL -0.00000; spec verify -0.08 .. -0.12 ms/step (2 ABAB pairs)"},
+               "KL 0.00000 top-1 0.9990 dNLL -0.00000; spec verify -0.08 .. -0.12 ms/step (2 ABAB pairs)",
+     .identity = {{{"exact", "v1"}, {"fast", "nvfp4-splitk-fast-v1"}}}},
     {.name = "decode_attn8", .env = "", .option = "--decode-attn8",
      .value = {"", "on", "", model::profile::decode_attn8::turbo}, .builtin = "off",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, true},
      .target = "on (e4m3 decode / verify attention over the e4m3 K/V shadow, tensor-core S and PV, identity -d8)", .off = "off",
      .source = "cuda_core attention_decode8 (attention_flash8.cu): split-key items (2048-key chunk, kv head, 128 row x head "
-               "pairs) read each K/V tile once per kv head; verify rows == one-row calls bitwise; gate 8K / 28K / 64K pending"},
+               "pairs) read each K/V tile once per kv head; verify rows == one-row calls bitwise; gate 8K / 28K / 64K pending",
+     .identity = {{{"off", "v1"}, {"on", kAttnIdentity}, {model::profile::decode_attn8::turbo, kAttnIdentity}}}},
     {.name = "kv_fp8", .env = "", .option = "--kv", .value = {"", "", "", model::profile::kv_fp8::turbo},
      .builtin = "native", .kind = Kind::bit_changing, .runnable = {false, false, false, true},
      .target = kKvIdentity, .off = "native", .source = "TURBO gate and workload receipts",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true,
+     .identity = {{{"native", "v1"}, {model::profile::kv_fp8::turbo, kKvIdentity}}}},
     {.name = "dense_activation", .env = "", .option = "--dense-activation",
      .value = {"", "", "", model::profile::dense_activation::turbo}, .builtin = "off",
      .kind = Kind::bit_changing, .runnable = {false, false, false, true},
      .target = kDenseIdentity, .off = "off", .source = "TURBO gate and workload receipts",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true,
+     .identity = {{{"off", "v1"}, {model::profile::dense_activation::turbo, kDenseIdentity}}}},
     {.name = "drafter_window", .env = "", .option = "--chain-k",
      .value = {"", "", "", model::profile::drafter_window::turbo}, .builtin = "7",
      .kind = Kind::exact, .runnable = {false, false, false, true},
      .target = kDraftIdentity, .off = "7", .source = "TURBO gate, token identity and workload receipts",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true,
+     .identity = {{{"7", "chain-window-7-v1"}, {model::profile::drafter_window::turbo, kDraftIdentity}}}, .timed = true},
 };
 
 // Levers that act on the windowed forward_rows path (the spec CLI prefills through it: cuda_spec.hpp prefill). The
@@ -188,10 +197,17 @@ inline const IncumbentGrant* incumbent_grant(const Lever& lever, const Regime& r
 
 // Version of the builtin CUDA execution bound by joint receipts. The resolved options below include all per-lever
 // overrides of this execution; the caller supplies the device and complete workload of the supported launch form.
-inline std::string joint_execution(const sp::Resolution& resolution) {
-    std::string identity = "qwen35-cuda-dense-run@1";
-    for (const auto& entry : resolution.entries)
-        identity += " " + std::string(entry.lever->name) + "=" + entry.value;
+// The complete key of one execution for a paired receipt: the execution outside the table (Regime::execution) and
+// every lever at the value it runs with its declared implementation identity (Lever::identity). Empty (no paired
+// receipt matches) when the execution is not known or a value has no declared identity.
+inline std::string joint_execution(const sp::Resolution& resolution, std::string_view execution) {
+    if (execution.empty()) return {};
+    std::string identity = "qwen35-cuda-dense-run@2 " + std::string(execution);
+    for (const auto& entry : resolution.entries) {
+        const auto declared = sp::declared_identity(entry.lever->identity, entry.value);
+        if (!sp::identity_token(declared)) return {};
+        identity += " " + std::string(entry.lever->name) + "=" + entry.value + "{" + std::string(declared) + "}";
+    }
     return identity;
 }
 
@@ -239,6 +255,10 @@ struct Resolved {
     Resolved& operator=(const Resolved&) = delete;
     [[nodiscard]] const sp::Entry* find(std::string_view lever) const { return resolution.find(lever); }
 };
+// The paired key of a resolved run (joint_execution over its own execution).
+inline std::string joint_execution(const Resolved& resolved) {
+    return joint_execution(resolved.resolution, resolved.execution);
+}
 
 // cli: {lever name, value} for each per-lever option given on the command line. Profile names: exact = default.
 inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regime& regime, const sp::Pairs& cli,
@@ -284,20 +304,9 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
             if (regime.weights == Weights::exact_pack) return {false, "requires NVFP4 projection weights"};
             return cuda_admission(kDenseIdentity);
         }
-        auto gate = turbo_admission(row.target, regime, evidence);
-        if (gate.ready && row.kind == Kind::exact) {
-            // A TURBO schedule is timed on the same execution as an ordinary cell: rows of another device product,
-            // workload or setting (or a run that cannot spell its own) never decide it.
-            std::vector<sp::LadderRow> bound;
-            for (const auto& timed : out->ladder)
-                if (!timed.incumbent && !out->execution.empty() &&
-                    sp::ladder_reference_execution(timed.over) == out->execution)
-                    bound.push_back(timed);
-            if (sp::ladder_judge(bound, row.name, row.value[kTurboColumn], Name::turbo, timing_regime).rung !=
-                sp::Rung::applies)
-                return {false, "no timing gain for the schedule in this regime"};
-        }
-        return gate;
+        // A timed TURBO schedule (drafter_window) is admitted here by its quality gate only; whether it runs is the
+        // shared chain's timing judgement over the complete key of the execution it extends (Lever::timed).
+        return turbo_admission(row.target, regime, evidence);
     };
     const bool kv_override = std::ranges::any_of(cli, [](const auto& opt) {
         return opt.first == "kv_fp8" || opt.first == "decode_attn8";
@@ -351,18 +360,18 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
     if (turbo) {
         inputs.profile = Name::fast;
         auto fast = sp::resolve(out->engine, inputs);
-        const auto reference = joint_execution(fast);
+        const auto reference = joint_execution(fast, out->execution);
         auto& kv = out->resolution.entries[kv_index];
         auto& reader = out->resolution.entries[reader_index];
         kv = std::move(fast.entries[kv_index]);
         reader = std::move(fast.entries[reader_index]);
         if (!kv_override && kv_admit.ready && attn_admit.ready) {
-            const auto candidate_base = joint_execution(out->resolution);
+            const auto candidate_base = joint_execution(out->resolution, out->execution);
             const auto work = regime.workload.prompt_tokens == regime.prompt_tokens
                 ? regime.workload : sp::JointWorkload{};
             const sp::JointLadderScope scope{regime.cost_device, reference, candidate_base, kKvIdentity, kAttnIdentity, work, reader_value};
-            const auto joint = sp::ladder_judge(out->ladder, "kv_fp8", kv_value, Name::turbo, timing_regime,
-                                                "decode_attn8", scope);
+            const auto joint = sp::ladder_judge_pair(out->ladder, "kv_fp8", kv_value, Name::turbo, timing_regime,
+                                                     "decode_attn8", scope);
             if (joint.rung == sp::Rung::applies) {
                 const auto apply_pair = [&](sp::Entry& entry, std::string_view value) {
                     entry.requested = entry.value = value;

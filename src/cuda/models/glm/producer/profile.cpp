@@ -17,51 +17,51 @@ constexpr std::array<bool, 3> all{true, true, true}, none{false, false, false};
 constexpr Lever kTable[] = {
     {.name = "expert_tier", .options = {{{"--expert-tier", "*"}}}, .value = {"tierstream", "tierstream", "tierstream"},
      .builtin = "tierstream", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
-     .source = "the tierstream device-gated expert cache (prefill through the cache, one copy of each expert)"},
+     .source = "the tierstream device-gated expert cache (prefill through the cache, one copy of each expert)", .identity = {{{"tierstream", "v1"}}}},
     {.name = "placement", .options = {{{"--expert-residency", "*"}, {"--expert-routes", "*"}}}, .value = {"on", "on", "on"},
      .builtin = "on", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "DS-style placement: residency seed (<unit-file>.residency), routes census, expert-major round-robin "
-               "(dg_seed + tier array; placement only)"},
+               "(dg_seed + tier array; placement only)", .identity = {{{"on", "v1"}}}},
     {.name = "eviction_policy", .options = {{{"--tier-policy", "*"}}}, .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
-     .source = "SCORED_AUTO boundary victims as DS (victims only; outputs unchanged)"},
+     .source = "SCORED_AUTO boundary victims as DS (victims only; outputs unchanged)", .identity = {{{"auto", "v1"}}}},
     {.name = "spare_share", .options = {{{"--tier-spare-percent", "*"}, {"--tier-spare-slots", "*"}}},
      .value = {"5", "5", "5"}, .builtin = "5", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
-     .source = "arena spares 5% of the arena (retained misses; placement only)"},
+     .source = "arena spares 5% of the arena (retained misses; placement only)", .identity = {{{"5", "v1"}}}},
     {.name = "row_tile", .options = {{{"--row-tile", "*"}}}, .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "largest tile <= 8192, growth over 2048 <= 5% of its expert arena; extra file units require "
-               "2048 file share <= 15% and increase <= 5% of routed units; explicit --row-tile bypasses these bounds"},
+               "2048 file share <= 15% and increase <= 5% of routed units; explicit --row-tile bypasses these bounds", .identity = {{{"auto", "v1"}}}},
     {.name = "prefill_tile_crossover", .options = {{{"--prefill-tile-crossover", "*"}}}, .value = {"0", "0", "0"},
      .builtin = "0", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "per-request prefill tile inside the allocation: prefill rows below the crossover run at min(4096, allocated), "
                "at and above it at the allocated tile (exact: the tile only changes row chunking; the tile sweeps showed equal "
-               "prefill state digests); 0 = always the allocated tile: the one-load tile sweep (allocation 8192) had 8192 fastest at 8K/16K/32K (29.2/36.7/53.6 s vs 30.2/38.6/56.6 at 4096); --prefill-tile-crossover N re-enables the rule"},
+               "prefill state digests); 0 = always the allocated tile: the one-load tile sweep (allocation 8192) had 8192 fastest at 8K/16K/32K (29.2/36.7/53.6 s vs 30.2/38.6/56.6 at 4096); --prefill-tile-crossover N re-enables the rule", .identity = {{{"0", "v1"}}}},
     {.name = "cuda_graphs", .options = {{{"--no-graphs", "off"}}}, .value = {"on", "on", "on"}, .builtin = "on", .ready = all,
-     .runnable = all, .kind = Kind::exact, .apps = service, .source = "prefill CUDA graph templates (full tile + exact tail)"},
+     .runnable = all, .kind = Kind::exact, .apps = service, .source = "prefill CUDA graph templates (full tile + exact tail)", .identity = {{{"on", "v1"}}}},
     {.name = "restore_decode_residency", .env = "STRIX_GLM_RTX_RESTORE_RESIDENCY", .options = {{{"--restore-decode-residency", "*"}}},
      .value = {"on", "on", "on"}, .builtin = "on", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "placement only: after every prefill through the cache the open decode placement is made resident again (held "
-               "make_resident sets, then released); without it the last prefilled layers own the arena and decode misses everywhere"},
+               "make_resident sets, then released); without it the last prefilled layers own the arena and decode misses everywhere", .identity = {{{"on", "v1"}}}},
     {.name = "flush_ready", .env = "STRIX_GLM_RTX_FLUSH_READY", .options = {{{"--tier-flush-ready", "*"}}},
      .value = {"on", "on", "on"}, .builtin = "on", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "tierstream dg_flush_ready as the DS tier site: the demand stream is flushed after each ready signal so WDDM "
-               "submits the ready write at once (submission only; outputs unchanged)"},
+               "submits the ready write at once (submission only; outputs unchanged)", .identity = {{{"on", "v1"}}}},
     // pending in every profile until a PRO window proves it exact
     {.name = "predicted_prefetch", .options = {{{"--tier-predict", "*"}}}, .value = {"1", "1", "1"}, .builtin = "0",
      .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending: exact (tokens and every logits digest equal with --tier-predict 0/1, plain and self-speculation; "
                "the predicted branch reads its own input copy and only prefetches, up to 4 rows); decode 1K full card "
-               "3.5 -> 4.8 tok/s warm, no change at 24 GiB VRAM + 32 GiB RAM (disk bound); run-to-run spread not yet bounded"},
+               "3.5 -> 4.8 tok/s warm, no change at 24 GiB VRAM + 32 GiB RAM (disk bound); run-to-run spread not yet bounded", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     // exact decode levers, pending in every profile until a window shows equal digests
     {.name = "skip_empty_expert_groups", .env = "STRIX_GLM_RTX_SKIP_EMPTY_GROUPS", .options = {{{"--skip-empty-expert-groups", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending: the bitwise digest compare in a PRO window (exact by construction: the routed experts are compacted on "
-               "the device and only the 16-expert groups that can hold routed rows run; per-expert arithmetic unchanged)"},
+               "the device and only the 16-expert groups that can hold routed rows run; per-expert arithmetic unchanged)", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "persistent_dense_fp16", .env = "STRIX_GLM_RTX_PERSISTENT_DENSE_FP16", .options = {{{"--persistent-dense-fp16", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending: the bitwise digest compare in a PRO window (exact by construction: shared experts and dense FFNs keep "
-               "the FP16 operands the decode window writes, decoded once; ~2.8 GiB in the whole-device plan, off when it does not fit)"},
+               "the FP16 operands the decode window writes, decoded once; ~2.8 GiB in the whole-device plan, off when it does not fit)", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     // exact prefill lever: equal digests and a faster TTFT in PRO windows, on in every profile
     {.name = "prefill_overlap", .options = {{{"--prefill-overlap", "*"}}}, .value = {"1", "1", "1"}, .builtin = "1",
      .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
@@ -69,13 +69,13 @@ constexpr Lever kTable[] = {
                "token, released after their completion event); when only the boundary spares block two held layers the "
                "prefill lowers the spare target and restores it before decode; off when the arena cannot keep two layers. "
                "Prefill state digests, tokens and logits equal with it off. TTFT full card 8K 44.7 -> 25.1 s, 32K 71.1 -> "
-               "46.7 s; 24 GiB VRAM + 32 GiB RAM 1K 63.4 -> 60.3 s, 8K 73.7 -> 62.4 s. OFF: --prefill-overlap 0"},
+               "46.7 s; 24 GiB VRAM + 32 GiB RAM 1K 63.4 -> 60.3 s, 8K 73.7 -> 62.4 s. OFF: --prefill-overlap 0", .identity = {{{"1", "v1"}}}},
     {.name = "dsa_short_skip", .options = {{{"--dsa-short-skip", "*"}}}, .value = {"1", "1", "1"},
      .builtin = "1", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "one-row decode and MTP: omit dead iq decode/projection, index head weights and scores when complete pools "
                "fit the selection budget (through absolute position 2050). Full card: tokens, every logits digest, the "
                "final state and replay digests equal with it off across the 2050 -> 2051 boundary; 1K decode 14.30 -> "
-               "15.00 tok/s warm, 6.77 -> 6.91 cold. OFF: --dsa-short-skip 0"},
+               "15.00 tok/s warm, 6.77 -> 6.91 cold. OFF: --dsa-short-skip 0", .identity = {{{"1", "v1"}}}},
     {.name = "decode_row_kernels", .env = "STRIX_GLM_RTX_ROW_KERNELS", .options = {{{"--decode-row-kernels", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "1", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "few-row decode kernels, each output's arithmetic unchanged: MoE / KDA / DSA / MTP trellis GEMMs as "
@@ -85,7 +85,7 @@ constexpr Lever kTable[] = {
                "a subset such as moe+hc+router+kda+dsa (round one exactly) selects kernels; 1 includes r2pre (A loads before "
                "the weight decode: same bits, +8 % warm decode at 1K in an ABBA pair); 2 (or +r2, or one of "
                "+r2dense/r2idx/r2hc/r2par) adds the rest of round two, opt-in: bitwise equal "
-               "but not faster in one-load A/Bs (dense strips -8 %)"},
+               "but not faster in one-load A/Bs (dense strips -8 %)", .identity = {{{"1", "v1"}}}},
     {.name = "mtp_self_spec", .env = "STRIX_GLM_RTX_MTP_SPEC", .options = {{{"--mtp-self-spec", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending (not faster at every length): greedy verify of [pending, MTP draft] with the plain step's per-row "
@@ -94,21 +94,21 @@ constexpr Lever kTable[] = {
                "VRAM + 32 GiB RAM, 1K/8K prompts). Full card, 24-step benches: 8K +27 % warm / +15 % cold, a cold "
                "48-token generate +16 %, 1K warm about equal and cold -6 %. Adaptive: measured ms per emitted token picks "
                "verify cycles or plain steps (runs of 32, probes of 4); always = every step. Tierstream only and not "
-               "with --routes-out (otherwise off)"},
+               "with --routes-out (otherwise off)", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "lookup_drafts", .env = "STRIX_GLM_RTX_SPEC_LOOKUP", .options = {{{"--spec-lookup", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending: exact (tokens and every logits digest equal to plain decode in PRO windows; prompt-lookup "
                "drafts, up to 3, only propose tokens for the mtp_self_spec greedy verify) but not faster than MTP drafts "
-               "alone on the measured prompts"},
+               "alone on the measured prompts", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     // fast-only, pending
     {.name = "prefill_tile_large", .value = {"", "8192", ""}, .builtin = "off", .ready = none,
      .runnable = {false, true, false}, .kind = Kind::bit_changing, .apps = service,
      .source = "pending: the --tile-sweep window; BITWISE-EQUAL prefill state across tiles makes a larger tile an exact "
-               "default candidate, DIFFERENT makes this a fast row that needs qualification bands (--row-tile 8192 when run)"},
+               "default candidate, DIFFERENT makes this a fast row that needs qualification bands (--row-tile 8192 when run)", .identity = {{{"off", "v1"}, {"8192", "v1"}}}},
     {.name = "dsa_index_mma", .value = {"", "mma", ""}, .builtin = "fp32", .ready = none, .runnable = none,
      .kind = Kind::bit_changing, .apps = service,
      .source = "pending: DSA index MMA variants (dsa.cuh: mma, mma_proj_fp32_score, fp32_proj_mma_score, tf32x3) exist for "
-               "the prefill producer only; not wired into decode sessions; needs qualification bands"},
+               "the prefill producer only; not wired into decode sessions; needs qualification bands", .identity = {{{"fp32", "v1"}, {"mma", "v1"}}}},
 };
 
 const char* environment(const Lookup& env, const char* name) { return env ? env(name) : std::getenv(name); }

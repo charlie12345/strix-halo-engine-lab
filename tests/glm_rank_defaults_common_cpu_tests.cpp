@@ -189,6 +189,7 @@ void test_common_profile_admission() {
             row.value = {"0", "1", ""};
             row.kind = profile::Kind::bit_changing;
             row.target = "candidate";
+            row.identity = {{{"0", "v1"}, {"1", "v1"}}};
             rows.push_back(row);
         }
         rows[0].ready[1] = true;
@@ -204,18 +205,18 @@ void test_common_profile_admission() {
     constexpr std::array timing{
         profile::LadderRow{"qualified", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
                            1, 4096, 1, 1, 1.10, 0.02, "fixture/qualified", false, {}, {},
-                           "ladder-arm/v3;fixture-exec;qualified=0,pending=0,unavailable=0,provisional=0,provisional-unavailable=0;candidate=qualified=1"},
+                           "ladder-arm/v4;fixture-exec;qualified=0{v1},pending=0{v1},unavailable=0{v1},provisional=0{v1},provisional-unavailable=0{v1};candidate=qualified=1{v1};tier=fast"},
         profile::LadderRow{"provisional", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
                            1, 4096, 1, 1, 1.10, 0.02, "fixture/provisional", false, {}, {},
-                           "ladder-arm/v3;fixture-exec;qualified=1,pending=0,unavailable=0,provisional=0,provisional-unavailable=0;candidate=provisional=1"},
+                           "ladder-arm/v4;fixture-exec;qualified=1{v1},pending=0{v1},unavailable=0{v1},provisional=0{v1},provisional-unavailable=0{v1};candidate=provisional=1{v1};tier=fast"},
         profile::LadderRow{"provisional", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
                            1, 4096, 1, 1, 1.10, 0.02, "fixture/provisional-with-pending", false, {}, {},
-                           "ladder-arm/v3;fixture-exec;qualified=1,pending=1,unavailable=0,provisional=0,provisional-unavailable=0;candidate=provisional=1"},
+                           "ladder-arm/v4;fixture-exec;qualified=1{v1},pending=1{v1},unavailable=0{v1},provisional=0{v1},provisional-unavailable=0{v1};candidate=provisional=1{v1};tier=fast"},
         // Under --allow-pending the later benchmark cells (pending, provisional) run, so the earlier cell extends that
         // execution and needs its own row there.
         profile::LadderRow{"qualified", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
                            1, 4096, 1, 1, 1.10, 0.02, "fixture/qualified-with-pending", false, {}, {},
-                           "ladder-arm/v3;fixture-exec;qualified=0,pending=1,unavailable=0,provisional=1,provisional-unavailable=0;candidate=qualified=1"}};
+                           "ladder-arm/v4;fixture-exec;qualified=0{v1},pending=1{v1},unavailable=0{v1},provisional=1{v1},provisional-unavailable=0{v1};candidate=qualified=1{v1};tier=fast"}};
     const profile::Engine engine{"glm-host-test", "ALLOW_PENDING", levers, false, {}, {}, {}, timing};
     const Env absent;
     profile::Inputs input;

@@ -72,7 +72,7 @@ int main() {
         const auto granted = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture", "fixture-exec"});
         const auto* granted_entry = granted.resolution.find("a4w4_layers");
         const std::string reference = granted_entry ? granted_entry->ladder_reference : std::string();
-        require(reference.starts_with("ladder-arm/v3;"), "Qwen dense HIP reports the reference of the layer table");
+        require(reference.starts_with("ladder-arm/v4;"), "Qwen dense HIP reports the reference of the layer table");
         timing.over = reference;
         engine.ladder = std::span(&timing, 1);
         const auto measured = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture", "fixture-exec"});

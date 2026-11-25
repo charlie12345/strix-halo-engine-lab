@@ -22,7 +22,9 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <set>
 #include <string>
 #include <string_view>
@@ -44,7 +46,8 @@ constexpr std::string_view kLever = "fixture-w4a4@1";
 // FAST cell "a8", TURBO cell "a4": both lossy, both ready.
 constexpr std::array<p::Lever, 1> kRows{{
     {kLever, "STRIX_FIXTURE_W4A4", "", {"", "a8", "", "a4"}, "off", p::Kind::bit_changing,
-     {true, true, false, true}, {true, true, false, true}, "", "off", "fixture receipts"},
+     {true, true, false, true}, {true, true, false, true}, "", "off", "fixture receipts", false, {}, false, {},
+     {{{"off", "v1"}, {"a8", "v1"}, {"a4", "v1"}, {"a6", "v1"}}}},
 }};
 
 p::Resolution resolve(const p::Engine& engine, p::Name tier, p::Regime regime = {}) {
@@ -64,9 +67,24 @@ std::string_view keep(std::string text) {
 }
 // The reference execution a timing row was measured over, spelled as LadderArms::over() spells it: `levers` is the
 // table's "lever=value" list; the version, the execution and the candidate (the row's own lever and value) are added.
+// Every "lever=value" item without an identity gets the fixture identity {v1} (the fixture tables declare v1 for every
+// value they run).
+std::string identified(std::string_view items) {
+    std::string out;
+    while (!items.empty()) {
+        const auto comma = items.find(',');
+        const auto item = items.substr(0, comma);
+        if (!out.empty()) out += ",";
+        out += item;
+        if (item.find('{') == std::string_view::npos) out += "{v1}";
+        if (comma == std::string_view::npos) break;
+        items.remove_prefix(comma + 1U);
+    }
+    return out;
+}
 p::LadderRow measured_over(p::LadderRow row, std::string_view levers, std::string_view execution = kExec) {
-    row.over = keep(std::string(p::kLadderArmVersion) + ";" + std::string(execution) + ";" + std::string(levers) +
-                    ";candidate=" + std::string(row.lever) + "=" + std::string(row.value));
+    row.over = keep(std::string(p::kLadderArmVersion) + ";" + std::string(execution) + ";" + identified(levers) +
+                    ";candidate=" + std::string(row.lever) + "=" + std::string(row.value) + "{v1};tier=" + p::name(row.tier));
     return row;
 }
 // The references of the one-lever fixture (LadderArms::over spelling): a FAST row is measured over EXACT (the builtin
@@ -122,7 +140,7 @@ void verdicts() {
     check(p::Name::turbo, {p::Phase::decode, 4096, 8, "dev", "fixture-exec"}, "off", "slower");
     // FAST is measured slower in decode at one lane, so the FAST arm that runs there is not the arm the TURBO row was
     // measured over: the row is stale and the cell does not run.
-    check(p::Name::turbo, {p::Phase::decode, 4096, 1, "dev", "fixture-exec"}, "off", "timing rows measured over another fast arm");
+    check(p::Name::turbo, {p::Phase::decode, 4096, 1, "dev", "fixture-exec"}, "off", "unmeasured regime");
     check(p::Name::fast, {p::Phase::prefill, 4096, 1, "dev", "fixture-exec"}, "a8", "-> fast=a8");
     check(p::Name::standard, {p::Phase::prefill, 4096, 1, "dev", "fixture-exec"}, "off", "");
 
@@ -168,7 +186,7 @@ void verdicts() {
             "no ladder rows: lossy cells do not apply");
     constexpr std::array<p::Lever, 1> exact_rows{{
         {"sched", "STRIX_FIXTURE_SCHED", "", {"", "2", "", ""}, "1", p::Kind::exact, {true, true, false, true},
-         {true, true, false, true}, "", "", "fixture scheduling receipt"},
+         {true, true, false, true}, "", "", "fixture scheduling receipt", false, {}, false, {}, {{{"1", "v1"}, {"2", "v1"}}}},
     }};
     const p::Engine scheduling{"sched", "", exact_rows, false, "sched-turbo-v1"};
     require(resolve(scheduling, p::Name::turbo).find("sched")->value == "2",
@@ -192,7 +210,7 @@ void defects() {
                                            std::string_view{"ladder-arm/v1;fixture-w4a4@1=a8"},
                                            std::string_view{"ladder-arm/v2;fixture-exec;fixture-w4a4@1=a8;candidate=fixture-w4a4@1=a4"},
                                            std::string_view{"ladder-arm/v3"},
-                                           std::string_view{"ladder-arm/v3;;fixture-w4a4@1=a8;candidate=fixture-w4a4@1=a4"},
+                                           std::string_view{"ladder-arm/v4;;fixture-w4a4@1=a8{v1};candidate=fixture-w4a4@1=a4{v1}"},
                                            std::string_view{"ladder-arm/v3;fixture-exec;fixture-w4a4@1=a8"}}) {
         row.over = unbound;
         require(!defect(row).empty(), "timing row without a versioned reference: " + std::string(unbound));
@@ -238,7 +256,7 @@ std::string shipped_row_defect(const p::Engine& engine, const p::LadderRow& row)
     const std::string step = " " + std::string(p::name(row.tier)) + "=" + std::string(row.value) + " ";
     if (entry->ladder.find(step) == std::string::npos) return "the cell was not judged in its regime: " + entry->ladder;
     if (entry->ladder_reference != row.over) return "judged over " + entry->ladder_reference + ", not the row's reference";
-    if (entry->ladder.find("measured over another") != std::string::npos) return "stale: " + entry->ladder;
+    if (entry->ladder.find(std::string(row.receipt)) == std::string::npos) return "the row did not decide: " + entry->ladder;
     return {};
 }
 
@@ -284,29 +302,44 @@ void execution_binding() {
         unknown(other);
         require(p::ladder_execution(other).empty(), "an incomplete execution is not spelled");
     }
-    static_assert(p::value_identity("a8 (impl-v1)", "a8") == "a8 (impl-v1)" && p::value_identity("a8 (impl-v1)", "a") .empty() &&
-                  p::value_identity("", "a8").empty() && p::value_identity("a8", "a8") == "a8");
-    // The candidate's implementation identity (the table's target) is part of the reference: the same receipt does not
-    // decide once the identity changes, and a receipt spelled without it never did.
+    // Review r63 P1 #1: the declared implementation identity of every value (Lever::identity, exact value match, no
+    // prefix rule) is part of the key. A receipt kept fixed stops deciding when the candidate's identity changes, when a
+    // reference-only identity changes, and when the run spells a value the table does not identify.
+    static_assert(p::declared_identity({{{"on", "impl-v1"}, {"o", "x-v1"}}}, "on") == "impl-v1" &&
+                  p::declared_identity({{{"on", "impl-v1"}}}, "o").empty() &&
+                  p::declared_identity({{{"on", "impl-v1"}}}, "on (impl-v1)").empty() &&
+                  p::declared_identity({}, "on").empty() && !p::identity_token("a b") && !p::identity_token("{x}"));
     constexpr std::string_view kSpelled =
-        "ladder-arm/v3;fixture-exec;fixture-w4a4@1=off;candidate=fixture-w4a4@1=a8{a8 (fixture-impl-v1)}";
+        "ladder-arm/v4;fixture-exec;fixture-w4a4@1=off{v1};candidate=fixture-w4a4@1=a8{fixture-impl-v1};tier=fast";
     p::LadderRow timed{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.2, 0.02, "r/impl"};
     timed.over = kSpelled;
     const std::array rows{timed};
     const p::Regime at4k{p::Phase::prefill, 4096, 1, "dev", kExec};
     auto table = kRows;
-    table[0].target = "a8 (fixture-impl-v1)";
+    table[0].identity = {{{"off", "v1"}, {"a8", "fixture-impl-v1"}, {"a4", "v1"}}};
     const p::Engine v1{"identity", "", table, false, "identity-v1", {}, {}, rows};
     const auto applied = resolve(v1, p::Name::fast, at4k);
     require(applied.find(kLever)->value == "a8" && applied.find(kLever)->ladder_reference == kSpelled,
             "a receipt over the declared implementation applies: " + applied.find(kLever)->ladder_reference);
-    table[0].target = "a8 (fixture-impl-v2)";
+    table[0].identity = {{{"off", "v1"}, {"a8", "fixture-impl-v2"}, {"a4", "v1"}}};  // candidate identity v2
     const p::Engine v2{"identity", "", table, false, "identity-v1", {}, {}, rows};
-    require(resolve(v2, p::Name::fast, at4k).find(kLever)->value == "off", "a new implementation identity retires the receipt");
-    const std::array unspelled{measured_over(timed, kExactArm)};
+    require(resolve(v2, p::Name::fast, at4k).find(kLever)->value == "off", "a new candidate identity retires the receipt");
+    table[0].identity = {{{"off", "v2"}, {"a8", "fixture-impl-v1"}, {"a4", "v1"}}};  // reference-only identity v2
+    const p::Engine ref2{"identity", "", table, false, "identity-v1", {}, {}, rows};
+    require(resolve(ref2, p::Name::fast, at4k).find(kLever)->value == "off", "a new reference identity retires the receipt");
+    // The target text never identifies a value (no display-target rule): the same receipt with the identity only in the
+    // target does not decide.
+    table[0].identity = {{{"off", "v1"}, {"a8", "v1"}, {"a4", "v1"}}};
     table[0].target = "a8 (fixture-impl-v1)";
-    const p::Engine bare{"identity", "", table, false, "identity-v1", {}, {}, unspelled};
-    require(resolve(bare, p::Name::fast, at4k).find(kLever)->value == "off", "a receipt without the identity never decides");
+    const p::Engine bare{"identity", "", table, false, "identity-v1", {}, {}, rows};
+    require(resolve(bare, p::Name::fast, at4k).find(kLever)->value == "off", "a target is not an identity");
+    // A table read with timing receipts must identify every value it can run (load-time error, never a default).
+    table[0].identity = {{{"off", "v1"}, {"a4", "v1"}}};
+    const p::Engine missing{"identity", "", table, false, "identity-v1", {}, {}, rows};
+    require(!p::ladder_defect(missing).empty(), "an unidentified value is a ladder defect");
+    bool threw = false;
+    try { static_cast<void>(resolve(missing, p::Name::fast, at4k)); } catch (const std::logic_error&) { threw = true; }
+    require(threw, "an unidentified value refuses the resolution");
 }
 
 // Walk all declared rows, including currently pending candidates. Marking the candidate ready here makes this
@@ -372,7 +405,7 @@ void cuda_cli_server() {
     };
     request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture", "fixture-exec"};
     const std::string qsa_reference = reference_of("qsa_mma");
-    require(qsa_reference.starts_with("ladder-arm/v3;"), "Qwen CUDA reports the reference: " + qsa_reference);
+    require(qsa_reference.starts_with("ladder-arm/v4;"), "Qwen CUDA reports the reference: " + qsa_reference);
     timing.over = qsa_reference;
     request.inputs.ladder = std::span(&timing, 1);
     for (const auto context : {4096U, 4097U}) {
@@ -398,7 +431,7 @@ void cuda_cli_server() {
     request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture", "fixture-exec"};
     const std::string route_reference = reference_of("moe_route_bf16");
     // The explicit switch is spelled as the lever's off value; the lever runs after the judged cell, at the tier below.
-    require(route_reference.find(",expert_fast=0,") != std::string::npos,
+    require(route_reference.find(",expert_fast=0{") != std::string::npos,
             "the explicit expert_fast=off is part of the reference as its off value: " + route_reference);
     candidate.over = route_reference;
     request.inputs.ladder = std::span(&candidate, 1);
@@ -442,20 +475,20 @@ void custom_adapters() {
 
     namespace g = strix::gemma4::profile;
     g::Lever gemma{.name = kLever, .value = {"", "a8", ""}, .builtin = "off", .ready = {true, true, true},
-                   .kind = p::Kind::bit_changing, .apps = unsigned(g::App::engine)};
+                   .kind = p::Kind::bit_changing, .apps = unsigned(g::App::engine), .identity = {{{"off", "v1"}, {"a8", "v1"}}}};
     const auto g4 = g::resolve(p::Name::fast, g::App::engine, {}, std::span(&gemma, 1));
     require(g4.find(kLever)->value == "off", "Gemma cannot select a lossy unmeasured row");
 
     namespace r = strix::ds41::rtx::profile;
     r::Lever rtx{.name = kLever, .value = {"", "a8", ""}, .builtin = "off", .ready = {true, true, true},
-                 .kind = p::Kind::bit_changing, .apps = unsigned(r::App::replica), .source = "fixture"};
+                 .kind = p::Kind::bit_changing, .apps = unsigned(r::App::replica), .source = "fixture", .identity = {{{"off", "v1"}, {"a8", "v1"}}}};
     const auto ds = r::resolve(p::Name::fast, false, r::App::replica, {}, std::span(&rtx, 1));
     require(ds.find(kLever)->value == "off", "DeepSeek RTX cannot select a lossy unmeasured row");
 
     namespace glm = strix::glm::rtxpf::profile;
     glm::Lever candidate{.name = kLever, .env = "", .value = {"", "a8", ""}, .builtin = "off",
                          .ready = {true, true, true}, .kind = glm::Kind::bit_changing,
-                         .apps = unsigned(glm::App::decode_service), .source = "fixture"};
+                         .apps = unsigned(glm::App::decode_service), .source = "fixture", .identity = {{{"off", "v1"}, {"a8", "v1"}}}};
     const auto gpu = glm::resolve(glm::Name::fast, false, glm::App::decode_service, {}, std::span(&candidate, 1));
     require(gpu.find(kLever)->value == "off", "GLM RTX cannot select a lossy unmeasured row");
 }
@@ -658,17 +691,17 @@ void paired_rows() {
     plain.joint = {};
     plain.receipt = "shadow alone";
     const p::LadderRow both[] = {joint, plain};
-    require(p::ladder_judge(std::span(&plain, 1), "shadow", "fp8", p::Name::turbo, regime, "reader", scope).rung !=
+    require(p::ladder_judge_pair(std::span(&plain, 1), "shadow", "fp8", p::Name::turbo, regime, "reader", scope).rung !=
                 p::Rung::applies, "a single-cell row admitted the pair");
-    require(p::ladder_judge(std::span(&joint, 1), "shadow", "fp8", p::Name::turbo, regime).rung != p::Rung::applies,
+    require(p::ladder_judge(std::span(&joint, 1), "shadow", "fp8", p::Name::turbo, regime, regime.execution).rung != p::Rung::applies,
             "a joint row decided the plain cell");
-    const auto verdict = p::ladder_judge(both, "shadow", "fp8", p::Name::turbo, regime, "reader", scope);
+    const auto verdict = p::ladder_judge_pair(both, "shadow", "fp8", p::Name::turbo, regime, "reader", scope);
     require(verdict.rung == p::Rung::applies && verdict.row == &both[0], "the joint row decides the pair");
-    require(p::ladder_judge(both, "shadow", "fp8", p::Name::turbo, regime, "other", scope).rung != p::Rung::applies,
+    require(p::ladder_judge_pair(both, "shadow", "fp8", p::Name::turbo, regime, "other", scope).rung != p::Rung::applies,
             "a joint row decided another partner");
     p::LadderRow slow = joint;
     slow.speedup = 0.97;
-    require(p::ladder_judge(std::span(&slow, 1), "shadow", "fp8", p::Name::turbo, regime, "reader", scope).rung == p::Rung::slower,
+    require(p::ladder_judge_pair(std::span(&slow, 1), "shadow", "fp8", p::Name::turbo, regime, "reader", scope).rung == p::Rung::slower,
             "a losing joint row must not admit the pair");
 }
 // A new gate row (a wider prompt band for a qualified cell) is not an incumbent grant: the cell keeps the tier below
@@ -695,7 +728,7 @@ void hy4_new_quality_rows() {
          "fixture timing"}}};
     // Measured over the reference the adapter runs there (LadderArms::over).
     const std::string hy4_reference = h::resolve(beyond, in, rows)->find("prompt_rows")->ladder_reference;
-    require(hy4_reference.starts_with("ladder-arm/v3;"), "Hy4 reports the reference: " + hy4_reference);
+    require(hy4_reference.starts_with("ladder-arm/v4;"), "Hy4 reports the reference: " + hy4_reference);
     timings[0].timing.over = hy4_reference;
     const auto resolved = h::resolve(beyond, in, rows, h::incumbent_grants, timings);
     require(resolved->find("prompt_rows")->value == "4096", "a matching timing row admits the new band");
@@ -750,7 +783,7 @@ void bound_evidence() {
         const p::Engine after{"bound", "", requalified, false, "bound-v1", {}, {}, after_rows};
         const auto res = run(after, p::Name::turbo, at4k);
         require(value_of(res, kLever) == "a6", "stale TURBO row (measured over a8) keeps the new FAST cell a6");
-        require(route_of(res, kLever).find("timing rows measured over another fast arm") != std::string::npos,
+        require(route_of(res, kLever).find("unmeasured regime") != std::string::npos,
                 "the route names the stale evidence: " + route_of(res, kLever));
         // Re-timed over the new FAST arm, the TURBO cell runs again.
         const std::array retimed_rows{fast_a6, measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1,
@@ -768,6 +801,7 @@ void bound_evidence() {
         table[1].name = kOther;
         table[1].env = "STRIX_FIXTURE_OTHER";
         table[1].value = {"", "on", "", ""};
+        table[1].identity = {{{"off", "v1"}, {"on", "v1"}}};
         const auto grant = p::incumbent_cell(kOther, "on", p::Name::fast, "r/other-grant");
         const auto fast_row = [](double speedup, std::string_view over, std::string_view receipt) {
             return measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, speedup, 0.02,
@@ -777,9 +811,9 @@ void bound_evidence() {
         const p::Engine without{"later-grant", "", table, false, "later-grant-v1", {}, {}, isolated};
         const auto stale = run(without, p::Name::fast, at4k);
         require(value_of(stale, kLever) == "off" && value_of(stale, kOther) == "on" &&
-                    route_of(stale, kLever).find("timing rows measured over another") != std::string::npos &&
+                    route_of(stale, kLever).find("unmeasured regime") != std::string::npos &&
                     stale.find(kLever)->ladder_reference ==
-                        "ladder-arm/v3;fixture-exec;fixture-w4a4@1=off,fixture-other@1=on;candidate=fixture-w4a4@1=a8",
+                        "ladder-arm/v4;fixture-exec;fixture-w4a4@1=off{v1},fixture-other@1=on{v1};candidate=fixture-w4a4@1=a8{v1};tier=fast",
                 "a row measured without the later grant does not decide the combined arm: " + route_of(stale, kLever));
         const std::array losing{fast_row(0.95, "fixture-w4a4@1=off,fixture-other@1=on", "r/a8-with-other-loses"),
                                 isolated[0], grant};
@@ -856,10 +890,11 @@ void bound_evidence() {
         require(value_of(run(engine, p::Name::fast, at4k), kLever) == "a8", "FAST row over the builtin off applies");
         auto rebuilt = kRows;
         rebuilt[0].builtin = "a2";
+        rebuilt[0].identity = {{{"a2", "v1"}, {"off", "v1"}, {"a8", "v1"}, {"a4", "v1"}}};
         const p::Engine changed{"builtin", "", rebuilt, false, "builtin-v1", {}, {}, rows};
         const auto res = run(changed, p::Name::fast, at4k);
         require(value_of(res, kLever) == "a2" &&
-                    route_of(res, kLever).find("timing rows measured over another default arm") != std::string::npos,
+                    route_of(res, kLever).find("unmeasured regime") != std::string::npos,
                 "a changed builtin makes the FAST receipt stale: " + route_of(res, kLever));
     }
     {
@@ -872,6 +907,7 @@ void bound_evidence() {
         table[1].builtin = "1";
         table[1].off = {};
         table[1].kind = p::Kind::exact;
+        table[1].identity = {{{"1", "v1"}, {"2", "v1"}}};
         const std::array rows{measured_over(fast_a8, "fixture-w4a4@1=off,fixture-schedule@1=1")};
         const p::Engine engine{"schedule", "", table, false, "schedule-v1", {}, {}, rows};
         require(value_of(run(engine, p::Name::fast, at4k), kLever) == "a8", "FAST row over the default schedule applies");
@@ -879,7 +915,7 @@ void bound_evidence() {
         require(value_of(res, kLever) == "off" && value_of(res, kSchedule) == "2",
                 "an exact schedule override makes the FAST receipt stale: " + route_of(res, kLever));
         require(res.find(kLever)->ladder_reference ==
-                    "ladder-arm/v3;fixture-exec;fixture-w4a4@1=off,fixture-schedule@1=2;candidate=fixture-w4a4@1=a8",
+                    "ladder-arm/v4;fixture-exec;fixture-w4a4@1=off{v1},fixture-schedule@1=2{v1};candidate=fixture-w4a4@1=a8{v1};tier=fast",
                 "the reference spells the override: " + res.find(kLever)->ladder_reference);
         // A tier-specific exact schedule is part of the tier's incumbent execution (review r61): the row timed under
         // the default schedule does not decide where FAST runs schedule 2, a row timed under schedule 2 does.
@@ -921,6 +957,7 @@ void bound_evidence() {
         table[1].name = kSecond;
         table[1].env = "STRIX_FIXTURE_SECOND";
         table[1].value = {"", "", "", "b4"};
+        table[1].identity = {{{"off", "v1"}, {"b4", "v1"}}};
         constexpr std::string_view kBase = "fixture-w4a4@1=off,fixture-second@1=off";
         constexpr std::string_view kWithFirst = "fixture-w4a4@1=a4,fixture-second@1=off";
         const auto turbo_row = [](std::string_view lever, std::string_view value, double speedup, std::string_view over,
@@ -933,7 +970,7 @@ void bound_evidence() {
         const p::Engine alone{"compose", "", table, false, "compose-v1", {}, {}, isolated};
         const auto two = run(alone, p::Name::turbo, at4k);
         require(value_of(two, kLever) == "a4" && value_of(two, kSecond) == "off" &&
-                    route_of(two, kSecond).find("timing rows measured over another fast arm") != std::string::npos,
+                    route_of(two, kSecond).find("unmeasured regime") != std::string::npos,
                 "two isolated wins: only the first measured cell runs: " + route_of(two, kSecond));
         const std::array losing{isolated[0], isolated[1], turbo_row(kSecond, "b4", 0.95, kWithFirst, "r/b4-joint-loses")};
         const p::Engine joint_loses{"compose", "", table, false, "compose-v1", {}, {}, losing};
@@ -958,6 +995,7 @@ void bound_evidence() {
         table[1].name = kLater;
         table[1].env = "STRIX_FIXTURE_LATER";
         table[1].value = {"", "b8", "", ""};
+        table[1].identity = {{{"off", "v1"}, {"b8", "v1"}, {"b4", "v1"}}};
         const std::array rows{measured_over({kLater, "b8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
                                              1.10, 0.02, "r/b8-over-default"},
                                             "fixture-w4a4@1=off,fixture-later@1=off")};
@@ -970,7 +1008,7 @@ void bound_evidence() {
         require(value_of(bench, kLever) == "a8" && bench.find(kLever)->status == p::Status::unqualified,
                 "--allow-pending runs the pending cell as an unqualified benchmark");
         require(bench.find(kLater)->ladder_reference ==
-                        "ladder-arm/v3;fixture-exec;fixture-w4a4@1=a8,fixture-later@1=off;candidate=fixture-later@1=b8" &&
+                        "ladder-arm/v4;fixture-exec;fixture-w4a4@1=a8{v1},fixture-later@1=off{v1};candidate=fixture-later@1=b8{v1};tier=fast" &&
                     bench.find(kLater)->status != p::Status::set,
                 "the benchmark cell is part of the later cell's reference: " + route_of(bench, kLater));
         // TURBO falls back to the FAST cells the arms resolved, the unqualified benchmark cell included (review r61):
@@ -986,7 +1024,7 @@ void bound_evidence() {
         require(value_of(bench_turbo, kLever) == "a8" && bench_turbo.find(kLever)->status == p::Status::unqualified &&
                     value_of(bench_turbo, kLater) == "b4" &&
                     bench_turbo.find(kLater)->ladder_reference ==
-                        "ladder-arm/v3;fixture-exec;fixture-w4a4@1=a8,fixture-later@1=b8;candidate=fixture-later@1=b4",
+                        "ladder-arm/v4;fixture-exec;fixture-w4a4@1=a8{v1},fixture-later@1=b8{v1};candidate=fixture-later@1=b4{v1};tier=turbo",
                 "TURBO exports the benchmark cell its receipt was timed over: " + route_of(bench_turbo, kLater));
         const std::array over_dropped{rows[0], turbo_row("fixture-w4a4@1=off,fixture-later@1=b8", "r/b4-over-off")};
         const p::Engine with_dropped{"benchmark-arm", "", table, false, "benchmark-arm-v1", {}, {}, over_dropped};
@@ -995,6 +1033,333 @@ void bound_evidence() {
                 "a receipt over a fallback the run does not export decides nothing: " + route_of(mismatch, kLater));
     }
 }
+// ---- Review r63 D: the receipt matching holds by construction, proven by enumeration over every engine table ----
+
+// The shared row view of a custom adapter table (Gemma 4, GLM RTX producer): the lever data the shared ladder reads.
+template <class Row>
+std::vector<p::Lever> shared_view(std::span<const Row> table) {
+    std::vector<p::Lever> out;
+    for (const auto& l : table) {
+        p::Lever row{};
+        row.name = l.name;
+        row.env = l.env;
+        for (std::size_t c = 0; c < l.value.size() && c < row.value.size(); ++c) {
+            row.value[c] = l.value[c];
+            row.ready[c] = l.ready[c];
+            row.runnable[c] = l.runnable[c];
+        }
+        row.builtin = l.builtin;
+        row.kind = l.kind == decltype(l.kind)::exact ? p::Kind::exact : p::Kind::bit_changing;
+        if constexpr (requires { l.off; }) row.off = l.off;
+        row.identity = l.identity;
+        out.push_back(row);
+    }
+    return out;
+}
+
+// Every entry of every tier: value, status, route and reference (what a receipt could change).
+std::string spelled_resolution(const p::Engine& engine, const p::Regime& regime, std::optional<p::Name> only = {}) {
+    std::string out;
+    for (const auto tier : {p::Name::standard, p::Name::fast, p::Name::turbo}) {
+        if ((tier == p::Name::turbo && engine.turbo_version.empty()) || (only && tier != *only)) continue;
+        const auto res = resolve(engine, tier, regime);
+        for (const auto& e : res.entries)
+            out += std::string(e.lever->name) + "=" + e.value + "/" + p::status_name(e.status) + "/" + e.ladder + "/" +
+                   e.ladder_reference + ";";
+        out += "|";
+    }
+    return out;
+}
+
+constexpr p::LadderExecution kEnumExecution{"hip", "product-a", {8192, 16384, 1, 2048, 2048, 1, 0, 128}, "settings-a"};
+
+// The execution segment of `over` replaced by `execution`.
+std::string with_execution(std::string_view over, std::string_view execution) {
+    const auto first = over.find(';');
+    const auto second = over.find(';', first + 1U);
+    return std::string(over.substr(0, first + 1U)) + std::string(execution) + std::string(over.substr(second));
+}
+
+struct EnumerationCount {
+    std::size_t engines = 0, cells = 0, mutations = 0;
+};
+
+// For every judged cell (FAST and TURBO) of `registered`: a decisive receipt over its complete key (a gain where the cell
+// does not already run; a loss where an incumbent grant runs it) must decide it, and the same receipt with any ONE key
+// field changed (lever, value, tier, phase, device class, band, version, every field of the execution, every lever's
+// spelled value or identity, the candidate's identity, the partial spelling) must leave EVERY cell of EVERY tier exactly
+// as with no receipt at all. The run side too: the receipt kept fixed while the run changes one execution field or one
+// declared identity (candidate or reference-only) resolves as that run does with no receipt.
+void enumerate(const p::Engine& registered, EnumerationCount& count) {
+    const std::string tag(registered.tag);
+    ++count.engines;
+    for (const auto& lever : registered.table)
+        require(p::identity_defect(lever).empty(), tag + ": undeclared identity " + p::identity_defect(lever));
+    std::vector<p::Lever> rows(registered.table.begin(), registered.table.end());
+    for (auto& row : rows)
+        if (p::ladder_judged(row)) {
+            row.ready.fill(true);
+            row.runnable.fill(true);
+            row.provisional.fill(false);
+        }
+    std::vector<p::LadderRow> grants;
+    for (const auto& row : registered.ladder)
+        if (row.incumbent) grants.push_back(row);
+    const std::string execution = p::ladder_execution(kEnumExecution);
+    const p::Regime regime{p::Phase::prefill, 8192, 1, "dev-class", execution};
+    auto engine = registered;
+    engine.table = rows;
+    engine.ladder = grants;
+    const auto none = spelled_resolution(engine, regime);
+    const auto admit = [](const p::Lever& l, unsigned c) { return p::column_admission(l, c, false, false); };
+    const auto arms = p::ladder_arms(std::span<const p::Lever>(rows), std::span<const p::LadderRow>(grants), regime, admit);
+    const auto outcome = [&](const p::LadderRow& r, const p::Engine& base, const p::Regime& run) {
+        std::vector<p::LadderRow> v = grants;
+        v.push_back(r);
+        auto e = base;
+        e.ladder = v;
+        return spelled_resolution(e, run);
+    };
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        if (tier == p::Name::turbo && registered.turbo_version.empty()) continue;
+        const auto t = p::LadderArms::slot(tier), below = p::LadderArms::slot(p::tier_below(tier));
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const auto& lever = rows[i];
+            if (!p::ladder_judged(lever)) continue;
+            const auto column = p::value_column(lever, tier);
+            if (tier == p::Name::turbo && column == static_cast<unsigned>(p::Name::fast)) continue;
+            const std::string wanted(lever.value[column]);
+            const std::string lower = arms.values[below][i];
+            if (wanted.empty() || wanted == lower) continue;
+            const std::string where = tag + "/" + std::string(lever.name) + "=" + wanted + " " + p::name(tier);
+            const bool granted = arms.values[t][i] == wanted;
+            const auto reference = arms.over(tier, lever.name, wanted);
+            require(!reference.empty(), where + ": the cell's complete key is spelled");
+            if (reference.empty()) continue;
+            p::LadderRow receipt{keep(std::string(lever.name)), keep(wanted), tier, regime.phase, regime.device, 1,
+                                 p::kNoContextBound, 1, p::kNoLaneBound, granted ? 0.5 : 1.5, 0.01, "enum/receipt"};
+            receipt.over = keep(reference);
+            {
+                std::vector<p::LadderRow> v = grants;
+                v.push_back(receipt);
+                auto e = engine;
+                e.ladder = v;
+                const auto decided = resolve(e, tier, regime);
+                require(decided.find(lever.name)->value == (granted ? lower : wanted),
+                        where + ": the decisive receipt decides (" + decided.find(lever.name)->ladder + ")");
+            }
+            ++count.cells;
+            const auto inert = [&](const p::LadderRow& r, const std::string& what) {
+                ++count.mutations;
+                require(outcome(r, engine, regime) == none, where + ": a receipt with " + what + " changed a cell");
+            };
+            auto r = receipt;
+            r.lever = keep(std::string(lever.name) + "-other");
+            inert(r, "another lever");
+            r = receipt;
+            r.value = keep(wanted + "-other");
+            inert(r, "another value");
+            // Another tier: the cell under test resolves as with no receipt. (The receipt may still be a complete key of
+            // the other tier's cell when both tiers compare the very same pair of executions: that is not this cell.)
+            r = receipt;
+            r.tier = tier == p::Name::fast ? p::Name::turbo : p::Name::fast;
+            ++count.mutations;
+            {
+                std::vector<p::LadderRow> v = grants;
+                v.push_back(r);
+                auto e = engine;
+                e.ladder = v;
+                require(spelled_resolution(e, regime, tier) == spelled_resolution(engine, regime, tier),
+                        where + ": a receipt of another tier changed the cell");
+            }
+            r = receipt;
+            r.phase = p::Phase::decode;
+            inert(r, "another phase");
+            r = receipt;
+            r.device = "dev-other";
+            inert(r, "another device class");
+            r = receipt;
+            r.min_context = regime.context + 1U;
+            inert(r, "a context band outside the run");
+            r = receipt;
+            r.min_lanes = regime.lanes + 1U;
+            inert(r, "a lane band outside the run");
+            r = receipt;
+            r.over = keep("ladder-arm/v3" + reference.substr(p::kLadderArmVersion.size()));
+            inert(r, "another spelling version");
+            r = receipt;
+            r.over = keep(std::string(p::kLadderArmVersion) + ";" + execution + reference.substr(reference.find(";candidate=")));
+            inert(r, "a partial key (execution and candidate only)");
+            r = receipt;
+            const auto tier_at = reference.rfind(";tier=");
+            r.over = keep(reference.substr(0, tier_at - 1U) + "-other}" + reference.substr(tier_at));
+            inert(r, "another candidate identity");
+            const std::array<void (*)(p::LadderExecution&), 11> fields{
+                +[](p::LadderExecution& e) { e.backend = "cuda"; },
+                +[](p::LadderExecution& e) { e.device = "product-b"; },
+                +[](p::LadderExecution& e) { e.workload.prompt_tokens = 4096; },
+                +[](p::LadderExecution& e) { e.workload.context_capacity = 32768; },
+                +[](p::LadderExecution& e) { e.workload.lanes = 2; },
+                +[](p::LadderExecution& e) { e.workload.prefill_chunk = 4096; },
+                +[](p::LadderExecution& e) { e.workload.prefill_rows = 1024; },
+                +[](p::LadderExecution& e) { e.workload.decode_rows = 2; },
+                +[](p::LadderExecution& e) { e.workload.verify_rows = 4; },
+                +[](p::LadderExecution& e) { e.workload.generated_tokens = 256; },
+                +[](p::LadderExecution& e) { e.settings = "settings-b"; }};
+            for (std::size_t f = 0; f < fields.size(); ++f) {
+                auto other = kEnumExecution;
+                fields[f](other);
+                const auto spelled = p::ladder_execution(other);
+                r = receipt;
+                r.over = keep(with_execution(reference, spelled));
+                inert(r, "execution field " + std::to_string(f) + " changed");
+                // Run side: the receipt fixed, a run on the other execution resolves as with no receipt there.
+                auto run = regime;
+                run.execution = spelled;
+                ++count.mutations;
+                require(outcome(receipt, engine, run) == spelled_resolution(engine, run),
+                        where + ": the receipt decided a run on another execution (field " + std::to_string(f) + ")");
+            }
+            for (std::size_t j = 0; j < rows.size(); ++j) {
+                // The value lever j is spelled with in this key, and its declared identity entry.
+                const std::string spelled = j < i ? arms.values[t][j] : j == i ? arms.values[below][j] : arms.incumbent[t][j];
+                auto renamed = arms;
+                for (auto& entry : renamed.identities[j])
+                    if (entry.value == spelled) entry.identity = keep(std::string(entry.identity) + "-other");
+                r = receipt;
+                r.over = keep(renamed.over(tier, lever.name, wanted));
+                inert(r, "lever " + std::string(rows[j].name) + " at another identity");
+                auto revalued = arms;
+                for (auto& entry : revalued.identities[j])
+                    if (entry.value == spelled) entry.value = "zz-other";
+                auto& slot_value = j < i ? revalued.values[t][j] : j == i ? revalued.values[below][j] : revalued.incumbent[t][j];
+                slot_value = "zz-other";
+                r = receipt;
+                r.over = keep(revalued.over(tier, lever.name, wanted));
+                inert(r, "lever " + std::string(rows[j].name) + " at another value");
+                // Run side: the table declares another identity for that spelled value (a new implementation).
+                auto table = rows;
+                for (auto& entry : table[j].identity)
+                    if (entry.value == spelled) entry.identity = keep(std::string(entry.identity) + "-v2");
+                auto changed = engine;
+                changed.table = table;
+                ++count.mutations;
+                require(outcome(receipt, changed, regime) == spelled_resolution(changed, regime),
+                        where + ": the receipt decided after lever " + std::string(rows[j].name) + " changed identity");
+            }
+        }
+    }
+}
+
+// Review r63 reproductions on the shipped Qwen dense CUDA table (the shared resolver every adapter reads).
+void r63_reproductions() {
+    namespace qd = strix::qwen35;
+    std::vector<p::Lever> rows(std::begin(qd::profile::table), std::end(qd::profile::table));
+    // Every lossy or timed column admitted, as the adapter admits it from its quality evidence (qualified FAST cells,
+    // TURBO gates): what is left to decide is the timing.
+    for (auto& row : rows)
+        if (p::ladder_judged(row)) {
+            row.ready.fill(true);
+            row.runnable.fill(true);
+            row.provisional.fill(false);
+        }
+    const auto at = [&](std::string_view name) {
+        for (std::size_t i = 0; i < rows.size(); ++i)
+            if (rows[i].name == name) return i;
+        return rows.size();
+    };
+    const auto spelled = [](std::uint32_t generated, std::string_view product) {
+        auto e = kEnumExecution;
+        e.backend = "cuda";
+        e.device = product;
+        e.workload.generated_tokens = generated;
+        return p::ladder_execution(e);
+    };
+    const auto exec128 = spelled(128, "product-a"), exec256 = spelled(256, "product-a"), other = spelled(128, "product-b");
+    const p::Regime run128{p::Phase::prefill, 8192, 1, "sm_120", exec128};
+    const auto admit = [](const p::Lever& l, unsigned c) { return p::column_admission(l, c, false, false); };
+    const auto with_cli = [&](const p::Engine& engine, p::Name tier, p::Pairs cli) {
+        p::Inputs in;
+        in.profile = tier;
+        in.regime = run128;
+        in.env = [](const char*) -> const char* { return nullptr; };
+        in.cli = std::move(cli);
+        return p::resolve(engine, in);
+    };
+    // (1) A receipt keeps deciding only the implementation it names: dense_activation=on measured at identity v1.
+    {
+        const std::vector<p::LadderRow> none;
+        const auto arms = p::ladder_arms(std::span<const p::Lever>(rows), std::span<const p::LadderRow>(none), run128, admit);
+        p::LadderRow gain{"dense_activation", "on", p::Name::turbo, p::Phase::prefill, "sm_120", 1, p::kNoContextBound, 1,
+                          p::kNoLaneBound, 1.2, 0.01, "r63/dense-v1"};
+        gain.over = keep(arms.over(p::Name::turbo, "dense_activation", "on"));
+        const std::array ladder{gain};
+        p::Engine engine{"qwen35", "", rows, false, qd::profile::kTurboVersion, {}, {}, ladder};
+        require(resolve(engine, p::Name::turbo, run128).find("dense_activation")->value == "on", "r63 (1) the v1 receipt decides v1");
+        auto v2 = rows;
+        for (auto& entry : v2[at("dense_activation")].identity)
+            if (entry.value == "on") entry.identity = "dense-window-fp4-fp8-v2";
+        engine.table = v2;
+        require(resolve(engine, p::Name::turbo, run128).find("dense_activation")->value == "off",
+                "r63 (1) the v1 timing row does not decide the v2 implementation");
+        // The reference side: an explicit prefill_gdn=chunk16 is another implementation than the declared chunk16tc,
+        // and an explicit value the table does not identify spells no key at all.
+        engine.table = rows;
+        require(with_cli(engine, p::Name::turbo, {{"prefill_gdn", "chunk16"}}).find("dense_activation")->value == "off",
+                "r63 (1) an explicit chunk16 reference does not reuse the chunk16tc receipt");
+        const auto unknown = with_cli(engine, p::Name::turbo, {{"prefill_gdn", "chunk8"}});
+        require(unknown.find("dense_activation")->value == "off" && unknown.find("dense_activation")->ladder_reference.empty(),
+                "r63 (1) an unidentified explicit value spells no key");
+    }
+    // (3) An out-of-scope timing row never revokes the frozen FAST grant prefill_arith=fast4.
+    {
+        const std::vector<p::LadderRow> grant_only{p::incumbent_cell("prefill_arith", "fast4", p::Name::fast, "r63/frozen")};
+        const auto arms = p::ladder_arms(std::span<const p::Lever>(rows), std::span<const p::LadderRow>(grant_only), run128, admit);
+        for (const double speedup : {1.2, 0.8}) {
+            p::LadderRow timed{"prefill_arith", "fast4", p::Name::fast, p::Phase::prefill, "sm_120", 1, p::kNoContextBound,
+                               1, p::kNoLaneBound, speedup, 0.01, "r63/n-gen-128"};
+            timed.over = keep(arms.over(p::Name::fast, "prefill_arith", "fast4"));
+            const std::vector<p::LadderRow> ladder{grant_only[0], timed};
+            const p::Engine engine{"qwen35", "", rows, false, qd::profile::kTurboVersion, {}, {}, ladder};
+            const auto value = [&](std::string_view execution) {
+                return resolve(engine, p::Name::fast, {p::Phase::prefill, 8192, 1, "sm_120", execution}).find("prefill_arith")->value;
+            };
+            require(value(exec128) == (speedup > 1.0 ? "fast4" : "exact"), "r63 (3) the matching execution is decided by its row");
+            require(value(exec256) == "fast4", "r63 (3) a second generation length keeps the frozen grant: " + std::string(value(exec256)));
+            require(value(other) == "fast4", "r63 (3) a second product keeps the frozen grant");
+            require(value({}) == "fast4", "r63 (3) an unknown execution keeps the frozen grant");
+        }
+    }
+    // (2) The drafter schedule (timed exact lever) is judged over the complete lower execution: a receipt measured over
+    // the FAST split_k=fast does not admit it under an explicit split_k=exact, and the truncated spelling never does.
+    {
+        const std::vector<p::LadderRow> none;
+        const auto arms = p::ladder_arms(std::span<const p::Lever>(rows), std::span<const p::LadderRow>(none), run128, admit);
+        p::LadderRow gain{"drafter_window", "15", p::Name::turbo, p::Phase::prefill, "sm_120", 1, p::kNoContextBound, 1,
+                          p::kNoLaneBound, 1.2, 0.01, "r63/drafter"};
+        // split_k runs its FAST value through its incumbent grant (as in the adapter), so the schedule's key spells it.
+        const auto split_grant = p::incumbent_cell("split_k", "fast", p::Name::fast, "r63/split-k-grant");
+        const std::vector<p::LadderRow> granted{split_grant};
+        const auto with_split = p::ladder_arms(std::span<const p::Lever>(rows), std::span<const p::LadderRow>(granted),
+                                               run128, admit);
+        gain.over = keep(with_split.over(p::Name::turbo, "drafter_window", "15"));
+        std::array ladder{split_grant, gain};
+        p::Engine engine{"qwen35", "", rows, false, qd::profile::kTurboVersion, {}, {}, ladder};
+        require(resolve(engine, p::Name::turbo, run128).find("drafter_window")->value == "15", "r63 (2) the full key decides");
+        require(with_cli(engine, p::Name::turbo, {{"split_k", "exact"}}).find("drafter_window")->value == "7",
+                "r63 (2) another companion setting falls back");
+        require(with_cli(engine, p::Name::turbo, {{"dense_activation", "on"}}).find("drafter_window")->value == "7",
+                "r63 (2) an explicit dense_activation=on falls back");
+        ladder[1].over = keep(std::string(p::kLadderArmVersion) + ";" + exec128 +
+                              ";drafter_window=7{chain-window-7-v1};candidate=drafter_window=15{" +
+                              std::string(qd::profile::kDraftIdentity) + "}");
+        require(resolve(engine, p::Name::turbo, run128).find("drafter_window")->value == "7", "r63 (2) the truncated receipt is rejected");
+        // Without a timing receipt the schedule never runs: no arm-less judgement counts as incumbent.
+        engine.ladder = std::span<const p::LadderRow>(&ladder[0], 1);
+        require(resolve(engine, p::Name::turbo, run128).find("drafter_window")->value == "7", "r63 (2) no receipt, no schedule change");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
@@ -1038,6 +1403,24 @@ int main(int argc, char** argv) try {
     paired_rows();
     hy4_new_quality_rows();
     for (const auto& engine : engines) walk(engine);
+    // Review r63 D: every engine table the ladder reads, the custom adapters' tables through their shared row view.
+    EnumerationCount count;
+    const auto each = [&](const p::Engine& engine) {
+        try {
+            enumerate(engine, count);
+        } catch (const std::exception& error) {
+            require(false, std::string(engine.tag) + " enumeration: " + error.what());
+        }
+    };
+    for (const auto& engine : engines) each(engine);
+    const auto gemma_rows = shared_view(strix::gemma4::profile::levers());
+    each({"gemma4", "", gemma_rows, false, {}});
+    const auto glm_rtx_rows = shared_view(strix::glm::rtxpf::profile::levers());
+    each({"glm-rtx", "", glm_rtx_rows, false, {}});
+    require(count.engines == std::size(engines) + 2U && count.cells > 0U, "enumeration covered every engine table");
+    std::printf("profile ladder enumeration: %zu engine tables, %zu judged cells, %zu one-field mutations" "\n",
+                count.engines, count.cells, count.mutations);
+    r63_reproductions();
     if (failures) return 1;
     std::puts("profile ladder tests: PASS");
     return 0;

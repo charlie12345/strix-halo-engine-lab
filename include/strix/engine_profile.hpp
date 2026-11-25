@@ -43,6 +43,14 @@ enum class Name : unsigned { standard = 0, fast = 1, quality = 2, turbo = 3 };  
 inline constexpr std::size_t kProfileColumns = 4;  // default, fast, quality, turbo
 enum class Kind { exact, bit_changing, pack };
 
+// One declared implementation identity: the value a row can run and the versioned implementation it runs
+// ("fast4" -> "nvfp4-tile-mma-f32-v1"). Unused entries are empty.
+struct ValueIdentity {
+    std::string_view value, identity;
+};
+inline constexpr std::size_t kIdentityValues = 6;
+using Identities = std::array<ValueIdentity, kIdentityValues>;
+
 struct Lever {
     std::string_view name;                  // receipt key
     std::string_view env;                   // switch the profile exports (empty: CLI-only lever)
@@ -62,6 +70,14 @@ struct Lever {
     // a window-invariant prefill: choosing among them is scheduling, so an explicit member shares the qualification of a
     // ready column whose value is in the list. Empty: every value is its own class. Not part of the fingerprint.
     std::string_view same_bits{};
+    // Declared implementation identity of every value this row can run: the builtin, every non-empty column value and
+    // `off` at least (identity_defect()); an explicit alternative the list does not name is not identified. Timing
+    // receipts bind these identities (LadderArms::over()): a changed implementation under the same value is a new
+    // identity here, and no receipt of the old one decides it. Not part of the fingerprint.
+    Identities identity{};
+    // An exact schedule (kind exact) whose non-builtin FAST / TURBO cell applies only where a matching timing receipt
+    // shows a gain, judged in the shared chain like a lossy cell (ladder_judged()).
+    bool timed = false;
 };
 
 // True when `value` is one whole item of the comma list `list`.
@@ -154,12 +170,43 @@ template <class Pairs>
     return out;
 }
 
-// The implementation a lever value runs, as the table declares it: the lever's `target` when it names that value
-// ("fast4 (nvfp4-tile-mma-f32-v1, identity -pf-fast4)"); empty otherwise (the value is its own identity in this build).
-[[nodiscard]] constexpr std::string_view value_identity(std::string_view target, std::string_view value) noexcept {
-    if (value.empty() || !target.starts_with(value)) return {};
-    const auto rest = target.substr(value.size());
-    return rest.empty() || rest.front() == ' ' || rest.front() == '(' ? target : std::string_view{};
+// The implementation identity `list` (Lever::identity) declares for `value`: exact equality of the value, no prefix rule;
+// empty when the list does not declare it.
+// The empty value (a switch left unset: an empty builtin) is a value too and is declared like any other.
+[[nodiscard]] constexpr std::string_view declared_identity(const Identities& list, std::string_view value) noexcept {
+    for (const auto& item : list)
+        if (item.value == value && !item.identity.empty()) return item.identity;
+    return {};
+}
+// An identity token is non-empty and free of the reference spelling's separators.
+[[nodiscard]] constexpr bool identity_token(std::string_view identity) noexcept {
+    return !identity.empty() && identity.find_first_of("{},;|= ") == std::string_view::npos;
+}
+// First value of `lever` (its builtin, even an empty one, every non-empty column value and a non-empty `off`) without a
+// well-formed declared identity; empty:
+// the row is completely identified. A row type without an `identity` member is a compile-time error.
+template <class Row>
+[[nodiscard]] std::string identity_defect(const Row& lever) {
+    const auto missing = [&](std::string_view value) { return !identity_token(declared_identity(lever.identity, value)); };
+    // One identity per value: a second entry for the same value would be unreachable (declared_identity() reads the first).
+    for (std::size_t i = 0; i < lever.identity.size(); ++i)
+        for (std::size_t j = i + 1U; j < lever.identity.size(); ++j)
+            if (!lever.identity[i].value.empty() && lever.identity[i].value == lever.identity[j].value &&
+                lever.identity[i].identity != lever.identity[j].identity)
+                return std::string(lever.name) + "=" + std::string(lever.identity[i].value) + " (two identities)";
+    if (missing(lever.builtin)) return std::string(lever.name) + "=" + std::string(lever.builtin);
+    for (const auto value : lever.value)
+        if (!value.empty() && missing(value)) return std::string(lever.name) + "=" + std::string(value);
+    if constexpr (requires { lever.off; })
+        if (!lever.off.empty() && missing(lever.off)) return std::string(lever.name) + "=" + std::string(lever.off);
+    return {};
+}
+// A cell the ladder judges: a lossy cell, or an exact schedule declared as timed (Lever::timed).
+template <class Row>
+[[nodiscard]] constexpr bool ladder_judged(const Row& lever) noexcept {
+    if constexpr (requires { lever.timed; })
+        if (lever.timed) return true;
+    return lever.kind != decltype(lever.kind)::exact;
 }
 
 struct JointLadderScope {
@@ -199,16 +246,16 @@ struct LadderRow {
     // a pair. Empty: an ordinary single-cell row.
     std::string_view joint{};
     JointLadderScope joint_scope{};
-    // The reference execution an ordinary row was measured over (its denominator) and its candidate, spelled as
-    // LadderArms::over() spells them: kLadderArmVersion; the execution outside the table (Regime::execution: backend,
-    // device product, priced workload, effective settings); "lever=value{implementation}" for EVERY lever of the table
-    // in table order (builtin values, exact schedule levers and explicit settings included): the levers before this one
-    // at the row's tier, this one at the tier below, the later ones at their incumbent value of the row's tier; then
-    // "candidate=" this lever at `value` with its implementation. The row decides only while the run spells exactly
-    // that: another device product, workload or setting, a changed builtin or implementation identity, an exact schedule
-    // override, a newly qualified, granted or overridden cell anywhere in the table makes the row stale (it no longer
-    // covers the regime). Timed cells of one tier extend the tier's incumbent execution in table order, so the cells a
-    // tier exports are always one measured chain. Paired rows bind through `joint_scope` instead.
+    // The complete key of an ordinary row: the reference execution it was measured over (its denominator) and its
+    // candidate, spelled as LadderArms::over() spells them: kLadderArmVersion; the execution outside the table
+    // (Regime::execution: backend, device product, priced workload, effective settings); "lever=value{identity}" for
+    // EVERY lever of the table in table order with its declared implementation identity (Lever::identity; builtin
+    // values, exact schedules and explicit settings included): the levers before this one at the row's tier, this one
+    // at the tier below, the later ones at their incumbent value of the row's tier; then "candidate=" this lever at
+    // `value` with its identity; then ";tier=" and the row's tier. The row decides a cell only on exact equality of
+    // that whole key (with lever, value,
+    // tier, phase, device class and band: ladder_receipt_matches()); any other run is outside the row, which then has
+    // no effect at all there. Paired rows bind through `joint_scope` instead.
     std::string_view over{};
 };
 
@@ -254,13 +301,33 @@ template <class Context, class Lanes>
                                           Name tier) noexcept {
     return row.lever == lever && (row.value.empty() || row.value == value) && row.tier == tier;
 }
-// A timing row covering the regime (incumbent grants are not timing rows). A timing row names its measured value: an
-// empty value never covers a cell (it would match another execution of the same lever).
-[[nodiscard]] constexpr bool ladder_covers(const LadderRow& row, std::string_view lever, std::string_view value,
-                                           Name tier, const Regime& regime) noexcept {
-    return !row.incumbent && !row.value.empty() && ladder_names(row, lever, value, tier) &&
-           row.phase == regime.phase && !row.device.empty() && row.device == regime.device &&
-           ladder_band(regime.context, row.min_context, row.max_context, regime.lanes, row.min_lanes, row.max_lanes);
+// The key a timing receipt must equal to decide one cell in one regime. `reference` is the complete ordinary key
+// (LadderArms::over()); `joint` / `joint_scope` the complete paired key. Empty reference or incomplete scope: no
+// receipt matches.
+struct ReceiptKey {
+    std::string_view lever, value;
+    Name tier = Name::fast;
+    const Regime* regime = nullptr;
+    std::string_view reference{};
+    std::string_view joint{};
+    const JointLadderScope* joint_scope = nullptr;
+};
+// The one matching rule of every timing receipt (ordinary and paired): equality of the lever, the measured value, the
+// tier, the phase and the device class, the regime inside the row's band, and EXACT equality of the complete key (the
+// ordinary reference spelling, or the paired scope). No prefix, no partial key: a receipt that does not match has no
+// effect on the cell (it neither admits, nor lowers, nor revokes an incumbent grant). Incumbent grants are not timing
+// receipts and never match.
+[[nodiscard]] constexpr bool ladder_receipt_matches(const LadderRow& row, const ReceiptKey& key) noexcept {
+    if (row.incumbent || key.regime == nullptr || row.value.empty() || row.lever != key.lever ||
+        row.value != key.value || row.tier != key.tier || row.joint != key.joint)
+        return false;
+    const auto& regime = *key.regime;
+    if (row.phase != regime.phase || row.device.empty() || row.device != regime.device ||
+        !ladder_band(regime.context, row.min_context, row.max_context, regime.lanes, row.min_lanes, row.max_lanes))
+        return false;
+    if (key.joint.empty())
+        return !key.reference.empty() && !regime.execution.empty() && row.over == key.reference;
+    return key.joint_scope != nullptr && key.joint_scope->complete() && row.joint_scope == *key.joint_scope;
 }
 
 enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower, incumbent };
@@ -275,46 +342,49 @@ enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower, incu
 [[nodiscard]] constexpr bool rung_runs(Rung rung) noexcept { return rung == Rung::applies || rung == Rung::incumbent; }
 struct LadderVerdict {
     Rung rung = Rung::unmeasured;
-    const LadderRow* row = nullptr;  // the deciding row: the least favourable row covering the regime
+    const LadderRow* row = nullptr;  // the deciding row: the least favourable matching receipt, or the grant
     Name resolved = Name::standard;  // the tier whose cell the regime runs
-    bool stale = false;              // a row covered the regime but was measured over another lower arm
 };
 
-// The verdict of `value` of `lever` in `tier` for `regime`: applies only when every covering timing row shows a gain;
-// with no timing row covering the regime, an incumbent grant with a receipt keeps the cell (Rung::incumbent). An
-// unknown regime (context 0: an entry point that resolves before the request) is inside no timing band, so there only
-// grants run. `arm` (the lower arm that runs, ladder_arms()) binds ordinary rows: a row whose `over` differs does not
-// cover the regime (stale evidence; a grant does not run over it either). Paired rows bind through `joint_scope`.
-[[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
-                                                   std::string_view value, Name tier, const Regime& regime,
-                                                   std::string_view joint = {},
-                                                   const JointLadderScope& joint_scope = {},
-                                                   const std::string_view* arm = nullptr) noexcept {
+// The verdict over the receipts matching `key` (ladder_receipt_matches()): applies only when every matching receipt
+// shows a gain; with no matching receipt, an incumbent grant with a receipt keeps the cell (Rung::incumbent), and
+// otherwise the cell resolves to the tier below (unmeasured). Receipts that do not match are ignored entirely.
+[[nodiscard]] constexpr LadderVerdict ladder_verdict(std::span<const LadderRow> rows, const ReceiptKey& key) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
-    bool stale = false;
     for (const auto& row : rows) {
-        if (row.joint != joint) continue;  // a paired receipt is read only by the pair's own judge
-        if (!joint.empty() && (!joint_scope.complete() || row.value.empty() || row.joint_scope != joint_scope)) continue;
         if (row.incumbent) {
-            if (!grant && !row.receipt.empty() && ladder_names(row, lever, value, tier)) grant = &row;
+            if (!grant && key.joint.empty() && !row.receipt.empty() && ladder_names(row, key.lever, key.value, key.tier))
+                grant = &row;
             continue;
         }
-        if (!ladder_covers(row, lever, value, tier, regime)) continue;
-        if (joint.empty() && arm != nullptr && (arm->empty() || row.over != *arm)) {
-            stale = true;
-            continue;
-        }
+        if (!ladder_receipt_matches(row, key)) continue;
         if (row.receipt.empty() || !valid_ladder_measurement(row.speedup, row.noise))
-            return {Rung::unmeasured, nullptr, tier_below(tier)};
+            return {Rung::unmeasured, nullptr, tier_below(key.tier)};
         if (!worst || row.speedup - row.noise < worst->speedup - worst->noise) worst = &row;
     }
     if (!worst)
-        return grant && !stale ? LadderVerdict{Rung::incumbent, grant, tier}
-                               : LadderVerdict{Rung::unmeasured, nullptr, tier_below(tier), stale};
-    if (ladder_gain(worst->speedup, worst->noise)) return {Rung::applies, worst, tier};
+        return grant ? LadderVerdict{Rung::incumbent, grant, key.tier}
+                     : LadderVerdict{Rung::unmeasured, nullptr, tier_below(key.tier)};
+    if (ladder_gain(worst->speedup, worst->noise)) return {Rung::applies, worst, key.tier};
     const bool slower = worst->speedup < 1.0 - worst->noise;
-    return {slower ? Rung::slower : Rung::within_noise, worst, tier_below(tier)};
+    return {slower ? Rung::slower : Rung::within_noise, worst, tier_below(key.tier)};
+}
+// The verdict of `value` of `lever` in `tier` for `regime` over `arm`, the complete reference of the execution that runs
+// (LadderArms::over(); required: an empty arm matches no timing receipt, so only an incumbent grant can run the cell).
+[[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
+                                                   std::string_view value, Name tier, const Regime& regime,
+                                                   std::string_view arm) noexcept {
+    return ladder_verdict(rows, {lever, value, tier, &regime, arm});
+}
+// The verdict of a paired cell (LadderRow::joint): only receipts of the same pair with the same complete scope match;
+// grants never admit a pair.
+[[nodiscard]] constexpr LadderVerdict ladder_judge_pair(std::span<const LadderRow> rows, std::string_view lever,
+                                                        std::string_view value, Name tier, const Regime& regime,
+                                                        std::string_view joint,
+                                                        const JointLadderScope& joint_scope) noexcept {
+    if (joint.empty()) return {Rung::unmeasured, nullptr, tier_below(tier)};
+    return ladder_verdict(rows, {lever, value, tier, &regime, {}, joint, &joint_scope});
 }
 
 // Legacy identity-variant API. These selections are explicit arithmetic levers, not permission for a separate
@@ -925,14 +995,15 @@ struct LadderCell {
 
 // Version of the reference spelling (LadderRow::over). Bumped when the spelling rule changes, so a receipt written
 // under another rule never matches.
-inline constexpr std::string_view kLadderArmVersion = "ladder-arm/v3";
+inline constexpr std::string_view kLadderArmVersion = "ladder-arm/v4";
 
 // The effective executions of a regime (ladder_arms()): the cell every lever of the table runs in EXACT, FAST and
 // TURBO, in table order (builtin values, exact schedule levers and explicit settings included), the incumbent value
 // of every lever per tier, and the execution outside the table (Regime::execution).
 struct LadderArms {
     std::string execution;
-    std::vector<std::string> levers, targets;           // table order; targets: Lever::target (value_identity)
+    std::vector<std::string> levers;                    // table order
+    std::vector<Identities> identities;                 // Lever::identity per lever (table order)
     std::array<std::vector<std::string>, 3> values;     // standard, fast, turbo; values[t][i] = what lever i runs in t
     std::array<std::vector<std::string>, 3> incumbent;  // what lever i runs in t without any ordinary timing row
     std::array<std::vector<LadderCell>, 3> cells;       // the resolved cell of lever i in t
@@ -945,20 +1016,24 @@ struct LadderArms {
             if (levers[i] == lever) return i;
         return levers.size();
     }
-    // "lever=value", then "{implementation}" when the table declares the value's implementation (value_identity).
-    void spell(std::string& out, std::size_t i, std::string_view value) const {
-        out.append(levers[i]).append("=").append(value);
-        if (const auto identity = value_identity(targets[i], value); !identity.empty())
-            out.append("{").append(identity).append("}");
+    // "lever=value{identity}" with the identity the row declares for that value; false (nothing appended) when the
+    // row declares none (an explicit alternative the table does not identify): the arm is not completely identified.
+    [[nodiscard]] bool spell(std::string& out, std::size_t i, std::string_view value) const {
+        const auto identity = declared_identity(identities[i], value);
+        if (!identity_token(identity)) return false;
+        out.append(levers[i]).append("=").append(value).append("{").append(identity).append("}");
+        return true;
     }
-    // The reference an ordinary row of `candidate` for `lever` in `tier` is measured over (LadderRow::over):
+    // The complete key of an ordinary receipt of `candidate` for `lever` in `tier` (LadderRow::over):
     // kLadderArmVersion; the execution outside the table (Regime::execution); then every lever of the table in table
-    // order: the levers before `lever` at the value they run in `tier`, `lever` at its resolved cell of the tier below,
-    // every later lever at its incumbent value in `tier` (incumbent grants, exact schedules and explicit settings
-    // included, no ordinary timing row); then "candidate=" and the candidate. A timed change therefore extends the
-    // complete execution that runs under it, and a later timed change extends that one in turn: the cells a tier
-    // exports are one measured chain from its incumbent execution. Empty when the execution is not known or `lever` is
-    // not in the table these arms were built from: no ordinary row matches it.
+    // order with its declared identity: the levers before `lever` at the value they run in `tier`, `lever` at its
+    // resolved cell of the tier below, every later lever at its incumbent value in `tier` (incumbent grants, exact
+    // schedules and explicit settings included, no timing receipt); then "candidate=" and the candidate with its
+    // identity. A timed change therefore extends the complete execution that runs under it, and a later timed change
+    // extends that one in turn: the cells a tier exports are one measured chain from its incumbent execution. Empty
+    // (no receipt matches) when the execution is not known, `lever` is not in the table these arms were built from, or
+    // any spelled value has no declared identity. Ends with ";tier=<tier>": a key compares one pair of executions for
+    // one tier only.
     [[nodiscard]] std::string over(Name tier, std::string_view lever, std::string_view candidate) const {
         const auto at = index(lever);
         const auto& upper = values[slot(tier)];
@@ -971,20 +1046,22 @@ struct LadderArms {
         out.append(";").append(execution).append(";");
         for (std::size_t i = 0; i < levers.size(); ++i) {
             if (i != 0) out.append(",");
-            spell(out, i, i < at ? upper[i] : i == at ? lower[i] : later[i]);
+            if (!spell(out, i, i < at ? upper[i] : i == at ? lower[i] : later[i])) return {};
         }
         out.append(";candidate=");
-        spell(out, at, candidate);
+        if (!spell(out, at, candidate)) return {};
+        out.append(";tier=").append(name(tier));
         return out;
     }
-    // The whole execution of `tier` (receipts and fixtures): the execution outside the table, every lever at `tier`.
+    // The whole execution of `tier` (receipts and fixtures): the execution outside the table, every lever at `tier`
+    // with its identity; empty when a value has no declared identity.
     [[nodiscard]] std::string arm(Name tier) const {
         std::string out(kLadderArmVersion);
         out.append(";").append(execution).append(";");
         const auto& at = values[slot(tier)];
         for (std::size_t i = 0; i < levers.size() && i < at.size(); ++i) {
             if (i != 0) out.append(",");
-            spell(out, i, at[i]);
+            if (!spell(out, i, at[i])) return {};
         }
         return out;
     }
@@ -1015,10 +1092,9 @@ template <class Row, class Admission>
     const auto wanted = lever.value[column];
     // A cell spelling the builtin runs without a qualification of its own (resolve() treats it as builtin).
     const bool eligible = !wanted.empty() && (wanted == lever.builtin || applied(admit(column)));
-    if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo))
+    if (!ladder_judged(lever) || (tier != Name::fast && tier != Name::turbo))
         return {eligible ? wanted : lever.builtin, tier, {}};
 
-    const auto below = tier_below(tier);
     lower.measured = false;  // the lower step's own verdict is not this tier's
     if (!wanted.empty() && !eligible) {
         // An unavailable binding for the same value can represent a different tier-specific composition
@@ -1033,13 +1109,11 @@ template <class Row, class Admission>
     if (!eligible || (tier == Name::turbo && column == static_cast<unsigned>(Name::fast)) ||
         wanted == lower.value) return lower;
     std::string step = " " + std::string(name(tier)) + "=" + std::string(wanted) + " ";
-    // The reference that runs under this cell (the lower cell of this lever included): a row measured over any other
-    // execution is stale here.
+    // The complete key of the execution that runs under this cell (the lower cell of this lever included): only a
+    // receipt of exactly that key decides; any other receipt has no effect here.
     const std::string reference = arms.over(tier, lever.name, wanted);
-    const std::string_view arm = reference;
-    const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime, {}, {}, &arm);
+    const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime, reference);
     step += rung_name(verdict.rung);
-    if (verdict.stale) step += " (timing rows measured over another " + std::string(name(below)) + " arm)";
     if (verdict.row) {
         if (!verdict.row->incumbent) {
             char ratio[64];
@@ -1065,23 +1139,25 @@ template <class Row, class Admission>
 // admission and `explicit_of(lever)` its explicit CLI / env setting of the lever (std::nullopt: none; a repeated
 // option is its last value, the dispatch precedence: last_setting()), which runs in every tier; the "off" alias is
 // spelled as the lever's off value. Tiers resolve bottom up; a tier falls back to the cells the tier below resolved.
-// Within a tier the incumbent execution comes first (every lever without ordinary timing rows: grants, exact
-// schedules, explicit settings); then the cells in table order, each judged over the execution it would extend
-// (LadderArms::over()). A lever that leaves its incumbent value with no measurement deciding it (a grant whose regime
-// has only stale timing rows) changes the execution the earlier cells were judged over: the tier is judged again over
-// the new incumbent value, so every exported cell is measured over what actually runs (no stable chain: the incumbent
-// execution runs). `allow_pending` is the run's --allow-pending: an unqualified benchmark cell it runs is part of the
-// reference, and the tier above falls back to it.
+// Within a tier the incumbent execution comes first (no timing receipt: grants, exact schedules, explicit settings);
+// then the cells in table order, each judged over the complete key of the execution it would extend
+// (LadderArms::over()). A receipt that does not match a key has no effect, so a cell without a matching receipt runs
+// exactly its incumbent value and the chain is final after one judged pass. `allow_pending` is the run's
+// --allow-pending: an unqualified benchmark cell it runs is part of the reference, and the tier above falls back to it.
+// A table read with timing receipts must declare every row's identities (identity_defect(); std::logic_error at load).
 template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
 [[nodiscard]] inline LadderArms ladder_arms(std::span<const Row> table, std::span<const LadderRow> rows,
                                             const Regime& regime, const AdmitOf& admit_of,
                                             const ExplicitOf& explicit_of = {}, bool allow_pending = false) {
     LadderArms arms;
     arms.execution = std::string(regime.execution);
+    const bool timed = std::any_of(rows.begin(), rows.end(), [](const LadderRow& row) { return !row.incumbent; });
     for (const auto& lever : table) {
+        if (timed)
+            if (const auto defect = identity_defect(lever); !defect.empty())
+                throw std::logic_error("profile ladder: " + defect + " has no declared implementation identity");
         arms.levers.emplace_back(lever.name);
-        if constexpr (requires { lever.target; }) arms.targets.emplace_back(lever.target);  // value_identity
-        else arms.targets.emplace_back();
+        arms.identities.emplace_back(lever.identity);
     }
     std::vector<LadderRow> grants;
     for (const auto& row : rows) if (row.incumbent) grants.push_back(row);
@@ -1090,7 +1166,6 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
         const auto t = LadderArms::slot(tier);
         auto& values = arms.values[t];
         auto& cells = arms.cells[t];
-        auto& incumbent = arms.incumbent[t];
         const auto cell_of = [&](std::size_t i, std::span<const LadderRow> judged) -> LadderCell {
             const auto& lever = table[i];
             if (const auto set = explicit_of(lever)) {
@@ -1104,29 +1179,18 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
             return ladder_cell(lever, judged, tier, regime, [&](unsigned c) { return admit_of(lever, c); },
                                allow_pending, arms, lower);
         };
-        const auto run = [&](std::span<const LadderRow> judged, bool settle) {
+        const auto run = [&](std::span<const LadderRow> judged) {
             values.clear();
             cells.clear();
-            bool moved = false;
             for (std::size_t i = 0; i < n; ++i) {
                 auto cell = cell_of(i, judged);
-                if (settle && !cell.measured && cell.value != incumbent[i]) {
-                    incumbent[i] = std::string(cell.value);
-                    moved = true;
-                }
                 values.emplace_back(cell.value);
                 cells.push_back(std::move(cell));
             }
-            return moved;
         };
-        static_cast<void>(run(grants, false));
-        incumbent = values;
-        bool settled = false;
-        for (std::size_t round = 0; round <= n && !settled; ++round) settled = !run(rows, true);
-        if (!settled) {  // no stable measured chain: the incumbent execution
-            static_cast<void>(run(grants, false));
-            incumbent = values;
-        }
+        run(grants);  // the incumbent execution: no timing receipt decides any cell
+        arms.incumbent[t] = values;
+        run(rows);
     }
     return arms;
 }
@@ -1147,7 +1211,7 @@ template <class Row, class Admission>
 inline LadderCell select_profile_cell(const Row& lever, std::span<const LadderRow> rows, Name tier,
                                       const Regime& regime, const Admission& admit, bool allow_pending,
                                       const LadderArms& arms) {
-    if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo))
+    if (!ladder_judged(lever) || (tier != Name::fast && tier != Name::turbo))
         return {lever.value[value_column(lever, tier)], tier, {}};
     // The cell the arms resolved (the one their references were spelled over). A lever outside those arms is judged
     // over its own lower cells, and no ordinary row matches it (LadderArms::over()).
@@ -1165,7 +1229,7 @@ inline LadderCell select_profile_cell(const Row& lever, std::span<const LadderRo
 inline void apply_ladder(Entry& entry, std::span<const LadderRow> rows, Name tier, const Regime& regime,
                          const auto& admit, bool allow_pending, const LadderArms& arms) {
     const auto& lever = *entry.lever;
-    if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo)) return;
+    if (!ladder_judged(lever) || (tier != Name::fast && tier != Name::turbo)) return;
     auto cell = select_profile_cell(lever, rows, tier, regime, admit, allow_pending, arms);
     entry.ladder = std::move(cell.route);
     entry.ladder_reference = std::move(cell.reference);
@@ -1286,11 +1350,18 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     return out;
 }
 
-// First defect of an engine's ladder rows (empty: none). Every row names a lossy lever of the table, a fast or turbo
+// First defect of an engine's ladder rows (empty: none). With any timing receipt, every row of the table declares its
+// implementation identities (identity_defect()). Every row names a judged lever of the table (lossy, or an exact
+// schedule declared timed), a fast or turbo
 // column whose cell is the row's value, a device, a receipt, a finite positive speedup, a noise margin in
 // [0, 1) and ordered bands starting at context >= 1.
 [[nodiscard]] inline std::string ladder_defect(const Engine& engine) {
     const std::string tag(engine.tag);
+    // A table read with timing receipts declares the implementation identity of every value of every row.
+    if (std::any_of(engine.ladder.begin(), engine.ladder.end(), [](const LadderRow& row) { return !row.incumbent; }))
+        for (const auto& lever : engine.table)
+            if (const auto defect = identity_defect(lever); !defect.empty())
+                return tag + "/" + defect + ": no declared implementation identity";
     for (const auto& row : engine.ladder) {
         const std::string where = tag + "/" + std::string(row.lever) + "=" + std::string(row.value) + " " +
                                   std::string(name(row.tier)) + " (" + std::string(row.receipt) + ")";
@@ -1298,7 +1369,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         for (const auto& candidate : engine.table)
             if (candidate.name == row.lever) lever = &candidate;
         if (lever == nullptr) return where + ": ladder row names no lever of the table";
-        if (lever->kind == Kind::exact) return where + ": ladder row on an exact lever";
+        if (!ladder_judged(*lever)) return where + ": ladder row on an exact lever (not a timed schedule)";
         if (row.tier != Name::fast && row.tier != Name::turbo) return where + ": ladder rows are fast or turbo";
         const auto cell = lever->value[value_column(*lever, row.tier)];
         if (cell.empty() || (!row.value.empty() && row.value != cell))
@@ -1318,6 +1389,8 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         if (row.joint.empty() && row.value.empty()) return where + ": timing row names no measured value";
         if (row.joint.empty() && ladder_reference_execution(row.over).empty())
             return where + ": timing row without a versioned reference execution (LadderArms::over spelling)";
+        if (row.joint.empty() && !row.over.ends_with(std::string(";tier=") + name(row.tier)))
+            return where + ": timing row key names another tier";
         if (row.device.empty() || row.receipt.empty()) return where + ": ladder row without device or receipt";
         if (!valid_ladder_measurement(row.speedup, row.noise)) return where + ": invalid speedup or noise";
         if (row.min_context < 1 || row.min_context > row.max_context || row.min_lanes < 1 || row.min_lanes > row.max_lanes)

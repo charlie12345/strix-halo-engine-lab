@@ -286,12 +286,12 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     profile::Lever candidate{.name = "candidate", .env = {}, .option = {}, .value = {"", "1", "", ""}, .builtin = "0",
         .kind = profile::Kind::bit_changing, .ready = {true, false, true, false},
         .runnable = {true, true, true, false}, .target = {}, .off = "0", .source = {},
-        .provisional = {false, true, false, false}};
+        .provisional = {false, true, false, false}, .identity = {{{"0", "v1"}, {"1", "v1"}}}};
     profile::Inputs inputs;
     inputs.profile = Name::fast;
     const profile::LadderRow timing{candidate.name, candidate.value[1], Name::fast, profile::Phase::prefill,
                                     "fixture", 8, 8, 1, 1, 1.02, 0.001, "fixture timing", false, {}, {},
-                                    "ladder-arm/v3;fixture-exec;candidate=0;candidate=candidate=1"};  // measured over the builtin (LadderArms::over)
+                                    "ladder-arm/v4;fixture-exec;candidate=0{v1};candidate=candidate=1{v1};tier=fast"};  // measured over the builtin (LadderArms::over)
     const profile::Engine engine{"preset-test", "", std::span(&candidate, 1), false, {}, {}, {}, std::span(&timing, 1)};
     inputs.regime = {profile::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
     require(profile::resolve(engine, inputs).find("candidate")->status == profile::Status::provisional,

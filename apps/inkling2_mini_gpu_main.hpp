@@ -349,7 +349,6 @@ int main(int argc, char** argv) {
             const auto& scope = resolved.scope;
             cli::write_profile(options.tier, std::cerr, true);
             cli::write_weight_load_plan(std::cerr, plan);
-            std::cerr << strix::weight::weight_load_regime_receipt(plan) << '\n';
             std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
                       << family.prefill_tail_divisor << " first_id prefill\n";
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)

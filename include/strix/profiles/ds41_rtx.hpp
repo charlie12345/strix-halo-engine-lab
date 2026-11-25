@@ -62,6 +62,7 @@ struct Lever {
     unsigned apps = 0;                      // mask of App values the lever concerns
     bool baseline = true;                   // --baseline / STRIX_DS41_RTX_BASELINE=1 turn it off
     std::string_view source;                // owner commit / branch; for a pending column, what it waits for
+    strix::profile::Identities identity{}; // declared identity per value (strix::profile::Lever::identity)
 };
 [[nodiscard]] std::span<const Lever> levers();
 // The same rows as strix::profile::Lever (first option as the CLI switch, a three-column value padded with an empty turbo

@@ -363,10 +363,24 @@ serial decode. A family without `media` keeps its renderer, which refuses image 
 
 ### Inkling 2 Mini
 
-The image tower is read from the same checkpoint as the text weights; nothing extra is loaded or configured. Image
-input is on in `strix-inkling2-mini-hip`, `strix-inkling2-mini-cuda` and the CPU reference `strix-inkling2-mini-cpu`
-whenever they are built with the vision targets (default). Put the image in the `--messages` file as an OpenAI-style
-`image_url` part with a base64 `data:` URL (PNG or JPEG); the CLI fetches no `http(s)` URL:
+On the first image, the CLI opens the tower weights from the checkpoint shard and validates any adjacent
+`config.json` against the supported tower geometry. A linked checkpoint path names its target (as for the
+language model); both files are opened within the target's held directory, and there the shard and sidecar must be
+regular files without symlinks or reparse points at their names. The language model then loads from that same
+opened shard (a second lookup of the checkpoint name is not used), or the run is refused. `--logits` is opened
+before any input and refused when it is the checkpoint, the tokenizer, the messages file or one of the image input
+files under any name (compared by the identity of the opened files). The dump becomes visible under its name only
+when the whole run succeeds, and it never replaces anything. It is written to a file without a name in the
+destination directory, which is held open from the start (an `O_TMPFILE` file on Linux; on Windows a file under a
+random name that is deleted on close and cannot be opened for writing or deletion by others), and on success it is
+given the name relative to that directory by an operation that fails when the name exists (`linkat` on Linux, a
+rename by handle without replace on Windows). A name that exists at the start, or that appears during the run, fails
+the run and is left untouched; a failed run leaves no file behind. On Linux the destination file system must support
+`O_TMPFILE`; otherwise `--logits` is refused. The sidecar has
+a 1 MiB cap. A directory containing only the shard uses the binding's fixed geometry. Image input is on in
+`strix-inkling2-mini-hip`, `strix-inkling2-mini-cuda` and the CPU reference `strix-inkling2-mini-cpu` whenever
+they are built with the vision targets (default). Put the image in the `--messages` file as an OpenAI-style
+`image_url` part with a base64 `data:` URL (PNG or JPEG). The CLI fetches no `http(s)` URL.
 
 ```json
 {"messages": [{"role": "user", "content": [

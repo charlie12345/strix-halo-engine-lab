@@ -68,6 +68,18 @@ public:
         }catch(...){std::fclose(file_);throw; }
     }
     ~FileSource() override { std::fclose(file_); }
+    FileKey key() const {
+#ifdef _WIN32
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(file_))), &info))
+            throw std::runtime_error("cannot identify source handle");
+        return {info.dwVolumeSerialNumber, (std::uint64_t(info.nFileIndexHigh) << 32U) | info.nFileIndexLow};
+#else
+        struct stat st{};
+        if (fstat(fileno(file_), &st)) throw std::runtime_error("cannot identify source handle");
+        return {std::uint64_t(st.st_dev), std::uint64_t(st.st_ino)};
+#endif
+    }
     std::string read_all(std::size_t cap, std::optional<std::size_t> exact) const {
         if (size_ > cap || (exact && size_ != *exact))
             throw std::runtime_error(shard_ + ": file length outside bounds");
@@ -288,14 +300,60 @@ std::shared_ptr<const Source> ConfinedDirectory::open(const std::filesystem::pat
 }
 
 std::optional<std::string> ConfinedDirectory::read(const std::filesystem::path& name, std::size_t max_bytes,
-                                                   bool missing_ok, std::optional<std::size_t> exact_bytes) const {
+                                                   bool missing_ok, std::optional<std::size_t> exact_bytes,
+                                                   std::optional<FileKey>* key) const {
     auto file = directory_->open(name, missing_ok);
     if (!file) return std::nullopt;
+    if (key) *key = file->key();
     return file->read_all(max_bytes, exact_bytes);
 }
 
 Digest256 digest_bytes(std::span<const Byte> bytes) {return digest(bytes);}
+namespace {
+struct PinnedSource {
+    std::mutex mutex;
+    std::string path;
+    std::shared_ptr<const Source> source;
+    std::size_t uses = 0;
+};
+PinnedSource& pinned_source() { static PinnedSource pin; return pin; }
+}  // namespace
+std::optional<FileKey> source_file_key(const Source& source) {
+    const auto* file = dynamic_cast<const FileSource*>(&source);
+    if (!file) return std::nullopt;
+    return file->key();
+}
+SourcePin::SourcePin(std::string path, std::shared_ptr<const Source> source) {
+    auto& pin = pinned_source();
+    std::lock_guard lock(pin.mutex);
+    if (pin.source) throw std::logic_error("a source is already pinned");
+    if (!source || path.empty()) throw std::invalid_argument("source pin needs a path and a source");
+    pin.path = std::move(path);
+    pin.source = std::move(source);
+    pin.uses = 0;
+}
+SourcePin::~SourcePin() {
+    auto& pin = pinned_source();
+    std::lock_guard lock(pin.mutex);
+    pin.source.reset();
+    pin.path.clear();
+}
+std::size_t SourcePin::uses() const {
+    auto& pin = pinned_source();
+    std::lock_guard lock(pin.mutex);
+    return pin.uses;
+}
 Status open_source(const std::string& path,std::shared_ptr<const Source>& out,std::string shard) {
+    {
+        auto& pin = pinned_source();
+        std::lock_guard lock(pin.mutex);
+        if (pin.source && path == pin.path) {  // the held file, under the shard name this path gives
+            if (shard.empty()) shard = std::filesystem::path(path).filename().generic_string();
+            out = shard == pin.source->shard_name() ? pin.source : namespace_source(pin.source, std::move(shard));
+            ++pin.uses;
+            return {Error::ok, {}};
+        }
+    }
     try {auto source=std::make_shared<FileSource>(path,std::move(shard));out=std::move(source);return {Error::ok,{}};}
     catch(const std::exception& e){return {Error::malformed,e.what()};}
 }

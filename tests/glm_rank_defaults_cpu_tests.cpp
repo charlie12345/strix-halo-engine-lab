@@ -855,8 +855,12 @@ void test_sampled_mtp_admission() {
         return resolve(cat(args, {"--profile", "fast"}), env).product->fingerprint();
     };
     CHECK(fp("coupled") != fp("rejection") && fp("coupled") != fp(nullptr) && fp("rejection") != fp(nullptr));
-    const auto* row = resolve(cat(args, {"--profile", "fast"}), {}).product->find("serve_sampled_mtp");
+    const auto builtin = resolve(cat(args, {"--profile", "fast"}), {});
+    const auto* row = builtin.product->find("serve_sampled_mtp");
     CHECK(row != nullptr && row->value == "0" && row->lever->omit_builtin_fingerprint);
+    auto legacy = *builtin.product;
+    std::erase_if(legacy.entries, [](const auto& entry) { return entry.lever->name == "serve_sampled_mtp"; });
+    CHECK(legacy.fingerprint() == builtin.product->fingerprint());
     // the server's resolution path (rd::resolve_serve) resolves the same row
     const rd::EnvGet coupled_env = [](const char* k) -> const char* {
         return std::string(k) == "STRIX_GLM_SERVE_SAMPLED_MTP" ? "coupled" : nullptr;

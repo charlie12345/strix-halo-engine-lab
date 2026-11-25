@@ -21,10 +21,12 @@
 #include <map>
 #include <optional>
 #include <mutex>
+#include <semaphore>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace gs = strix::glm::serve;
@@ -227,7 +229,9 @@ struct FakeEng {
         last_rows.clear();
         last_out.clear();
     }
-    void wait() const {
+    std::function<void()> on_first_decode;
+    void wait() {
+        if (auto hook = std::exchange(on_first_decode, {})) hook();
         if (delay_us) std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
     }
     // one trunk row of `slot` at its frontier
@@ -1442,6 +1446,14 @@ ImageRun image_run(bool mtp, unsigned chunk, bool neighbour, unsigned units_rows
     e0.stops = e1.stops = false;
     e0.unit_rows = e1.unit_rows = units_rows;
     e0.unit_layers = e1.unit_layers = units_rows ? 4U : 0U;
+    std::binary_semaphore neighbour_decoding(0), image_queued(0);
+    if (neighbour) {
+        e0.on_first_decode = [&] {
+            neighbour_decoding.release();
+            if (!image_queued.try_acquire_for(std::chrono::seconds(3)))
+                throw std::runtime_error("image: timed out waiting for the image request");
+        };
+    }
     gs::Channel c0(lb.side(0), 0), c1(lb.side(1), 1);
     gs::Hello h0 = hello_for(slots, 4096, 2), h1 = hello_for(slots, 4096, 2);
     h0.prefix_cache_bytes = h1.prefix_cache_bytes = 1U << 22;
@@ -1496,10 +1508,13 @@ ImageRun image_run(bool mtp, unsigned chunk, bool neighbour, unsigned units_rows
                     std::vector<std::uint32_t> other;
                     for (std::uint32_t k = 0; k < 9; ++k) other.push_back(40U + k);
                     busy = submit(other, false, 400);
-                    while (lead.stats().active == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+                    if (!neighbour_decoding.try_acquire_for(std::chrono::seconds(3)))
+                        throw std::runtime_error("image: neighbour did not start decoding");
                 }
                 const auto before = lead.stats();
-                out.image = collect(submit(prompt, true, 12), &out.error);
+                const auto first_image = submit(prompt, true, 12);
+                if (neighbour) image_queued.release();
+                out.image = collect(first_image, &out.error);
                 out.first_frame_bytes = e0.embed_frame_bytes;
                 out.prefix_stores = lead.stats().prefix_stores - before.prefix_stores;
                 out.prefix_lookups = lead.stats().prefix_hits + lead.stats().prefix_misses - before.prefix_hits - before.prefix_misses;
@@ -2291,7 +2306,8 @@ int main(int argc, char** argv) {
             go = true;
         }
         gcv.notify_all();
-        for (int i = 0; i < 2000 && (st.status(1) == gs::ImportStatus::pending || st.status(2) == gs::ImportStatus::pending); ++i)
+        for (int i = 0; i < 2000 &&
+             (st.status(1) == gs::ImportStatus::listening || st.status(2) == gs::ImportStatus::pending); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         CHECK(st.status(1) == gs::ImportStatus::ready && st.payload(1).size() == 9 && st.payload(1)[0] == 1);
         CHECK(st.status(2) == gs::ImportStatus::failed && st.error(2).find("model hash") != std::string::npos);

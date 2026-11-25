@@ -11,6 +11,7 @@ dump comes from another implementation of the file format run on the same file a
 `synth` writes files of language width 4096 (the engine refuses another width); every other size is small.
 """
 import argparse
+import os
 import sys
 
 import numpy as np
@@ -130,7 +131,16 @@ def images(out):
             listing.write(f"{name} {w} {h}\n")
 
 
+MAX_DUMP_BYTES = 1 << 30
+
+
 def compare(args):
+    # Width and both file sizes are checked before anything is loaded.
+    if args.width <= 0:
+        sys.exit("--width must be positive")
+    sizes = [os.path.getsize(p) if os.path.isfile(p) else -1 for p in (args.a, args.b)]
+    if sizes[0] != sizes[1] or sizes[0] <= 0 or sizes[0] > MAX_DUMP_BYTES or sizes[0] % (4 * args.width):
+        sys.exit(f"dumps must be regular files of equal size, whole rows of width {args.width}, at most 1 GiB: {sizes}")
     a = np.fromfile(args.a, np.float32)
     b = np.fromfile(args.b, np.float32)
     if a.size != b.size or a.size == 0 or a.size % args.width:

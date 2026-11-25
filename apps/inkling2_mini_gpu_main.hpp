@@ -44,7 +44,7 @@ public:
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
                      bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
                      bool controller_one_plane = false, bool attn_projected_bias = false, bool screened_head = false,
-                     bool verify_rows = false)
+                     unsigned verify_rows = 0U)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane),
           projected_bias_(attn_projected_bias) {
@@ -281,7 +281,6 @@ int main(int argc, char** argv) {
         family.prefill_tail_divisor =
             mini_prefill_schedule_from_env(strix::inkling2::cli::kMiniHipSchedule, strix::profile::Name::standard).tail_divisor;
 #if defined(STRIX_INKLING2_MEDIA)
-        family.media = cli::open_mini_media;
         family.render_media_messages = serve::render_inkling2_chat_media_request;
 #endif
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -290,6 +289,9 @@ int main(int argc, char** argv) {
         auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family, kMiniBuildBackend);
 #else
         auto options = cli::parse(argc, argv, family, kMiniBuildBackend);
+#endif
+#if defined(STRIX_INKLING2_MEDIA)
+        family.media = cli::mini_media_opener(options.tier, std::cerr);  // image recipe: this run's resolution
 #endif
         if (!options.generation.prefill_chunk_explicit) {  // the declared chunk of this backend and profile
             family.default_prefill_chunk = mini_prefill_schedule(cli::kMiniHipSchedule, options.tier.profile).chunk;

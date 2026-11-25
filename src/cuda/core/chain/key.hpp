@@ -112,14 +112,14 @@ struct KernelKey {
 
 template <class ChainList>
 inline constexpr auto static_key = []<class... Steps>(List<Steps...>) {
-    auto key = kernel_key(ChainList::description);
-    if (!key) return key;
+    auto chain_key = kernel_key(ChainList::description);
+    if (!chain_key) return chain_key;
     constexpr std::array<std::uint32_t, sizeof...(Steps)> traits{
         ((static_cast<std::uint32_t>(Steps::math) << 24U) | (static_cast<std::uint32_t>(Steps::fold) << 28U))...
     };
-    for (std::size_t i = 0; i < traits.size(); ++i) key->links[i] |= traits[i];
-    if constexpr (((Steps::fold != Fold::none) || ...)) key->scope = Scope::row;
-    return key;
+    for (std::size_t i = 0; i < traits.size(); ++i) chain_key->links[i] |= traits[i];
+    if constexpr (((Steps::fold != Fold::none) || ...)) chain_key->scope = Scope::row;
+    return chain_key;
 }(ChainList{});
 
 template <Form F>

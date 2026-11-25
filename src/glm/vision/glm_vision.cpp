@@ -336,12 +336,23 @@ VisionAdapter::Canvas VisionAdapter::target(int width, int height) const {
     return {{static_cast<int>(canvas_w), static_cast<int>(canvas_h)}, {static_cast<int>(content_w), static_cast<int>(content_h)}};
 }
 
+std::uint64_t VisionAdapter::rows_for_size(int width, int height) const {
+    const Canvas t = target(width, height);
+    return (static_cast<std::uint64_t>(t.canvas.height) / config_.cell()) * (static_cast<std::uint64_t>(t.canvas.width) / config_.cell());
+}
+
 vision::PatchGrid VisionAdapter::patches(const vision::Image& image) const {
     if (image.width <= 0 || image.height <= 0 || image.rgb.size() != image.pixels() * 3U) bad("empty image");
     const Canvas t = target(image.width, image.height);
     // Before any resample or allocation: the grid must fit the 16-bit patch coordinates of the shared representation.
     vision::check_grid_axes(static_cast<std::uint64_t>(t.canvas.height) / config_.patch,
                             static_cast<std::uint64_t>(t.canvas.width) / config_.patch);
+    // Memory cost of this call from the canvas size, before it is built: padded RGB8 (3 B/px), the resized content
+    // (<= 3 B/px), FP32 pixels (12 B/px) and temporal patches (2 frames x 3 channels x 4 B = 24 B/px). The config
+    // bounds the canvas to 16384 rows (about 540 MB at 42 B/px); 2 GiB is a ceiling no valid config reaches.
+    constexpr std::uint64_t kBytesPerCanvasPixel = 3 + 3 + 12 + 24, kMaxPatchBytes = std::uint64_t{2} << 30U;
+    if (static_cast<std::uint64_t>(t.canvas.height) * static_cast<std::uint64_t>(t.canvas.width) > kMaxPatchBytes / kBytesPerCanvasPixel)
+        bad("the image needs more than " + std::to_string(kMaxPatchBytes) + " bytes of working memory");
     vision::Image resized;
     const vision::Image* content = &image;
     if (t.content.width != image.width || t.content.height != image.height) {

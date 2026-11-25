@@ -98,6 +98,8 @@ public:
     [[nodiscard]] std::vector<float> project_f32(const vision::EncoderOutput& hidden, const vision::PatchGrid& grid,
                                                  vision::DenseOps& dense) const;
     vision::SpanLayout layout(const vision::PatchGrid& grid) const override;
+    // Image rows of a width x height image: (canvas / cell) squared per axis, as layout() will state them.
+    std::uint64_t rows_for_size(int width, int height) const override;
     std::vector<std::pair<vision::Tensor, vision::Tensor>> projector_linears() const override;
     unsigned max_encoder_rows() const override;
 

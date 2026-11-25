@@ -99,6 +99,16 @@ inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-control
 // an explicit 1 selects it and is a distinct identity until an RTX identity receipt makes it a default.
 // Switch: STRIX_INK_SCREENED_HEAD=0/1.
 inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-head@1";
+// Exact lever (opt-in): a HIP verify window of 2..kMiniMaxVerifyRows rows projects its score rows through the decoder's
+// one pitched rows head (project_head_rows: the head read once, every row on its one-row body), attends its rows in one
+// lanes launch set (each row at its own position with its one-row decode geometry), and records its convolution inputs
+// (the shared session tape), so a partial commit rebuilds the histories by copies instead of replaying the kept rows.
+// Off in every tier (builtin 0: per-row head launches, per-row attention launches, replayed partial commits); CUDA
+// declines it. Select it with STRIX_INK_VERIFY_ROWS=1 (any profile), through the one resolver the CLI, the gate and the
+// server share; a distinct identity until device identity (scores, picks and continuation after a partial commit
+// bitwise the incumbent) makes it a default. Value 2 adds the lanes pick: greedy picks whose scores nobody reads (verify
+// windows, served cohorts whose groups declare no score read) take the lanes form of the EXACT screened head (BF16).
+inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1";
 // Image pre-processing recipe of the one vision adapter (src/inkling2/inkling2_vision.*), resolved here with the other
 // rows by the resolver the CLI and the server share. "legacy" (builtin, image identity inkling2-vision-v1) or "axial@1"
 // (the reference-checked axial recipe, image identity inkling2-vision-axial@1: checkerboard alpha, symmetric
@@ -109,7 +119,7 @@ inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-he
 // mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 10> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 11> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -151,6 +161,12 @@ inline constexpr std::array<profile::Lever, 10> kMiniLevers{{
      .runnable = {true, true, true, true}, .target = "1", .off = "0",
      .source = "awaits the RTX identity receipt on the landing head (greedy ids against the full head, CLI and served) "
                "before any default",
+     .omit_builtin_fingerprint = true},
+    {.name = kMiniVerifyRows, .env = "STRIX_INK_VERIFY_ROWS", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0",
+     .kind = profile::Kind::exact, .ready = {}, .runnable = {true, true, true, true}, .target = "1", .off = "0",
+     .source = "awaits device identity on the landing head (verify score rows, picks and the continuation after a "
+               "partial commit bitwise the per-row incumbent, BF16 and Q8_0 heads); HIP only",
      .omit_builtin_fingerprint = true},
     {kMiniVisionRecipe, "STRIX_INKLING2_VISION_RECIPE", "", {}, "legacy", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "axial@1", "legacy",

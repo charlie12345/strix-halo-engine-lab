@@ -421,17 +421,28 @@ void test_windows(const fs::path& directory) {
 
 }  // namespace
 
-// Review r63 P3: the command line writes the weight regime receipt once (one emitter, write_weight_load_plan).
+// Review r63 P3 / r75 P3: the command line writes the weight regime receipt once (one emitter, write_weight_load_plan),
+// checked through the receipt writers the GPU command line itself calls (gate window receipt and run receipt).
 void test_weight_receipt_once() {
     const auto count = [](const std::string& text, std::string_view key) {
         std::size_t n = 0;
         for (auto at = text.find(key); at != std::string::npos; at = text.find(key, at + key.size())) ++n;
         return n;
     };
-    std::ostringstream out;
-    cli::write_weight_load_plan(out, strix::weight::WeightLoadPlan{});
-    require(count(out.str(), "strix-weight-load/v1 ") == 1U, "one weight plan record");
-    require(count(out.str(), "strix-weight-load-regimes/v1 ") == 1U, "one weight regime record");
+    const strix::weight::WeightLoadPlan plan{};
+    std::ostringstream gate;
+    cli::write_gate_receipt(gate, plan, "{\"version\":1}");
+    require(count(gate.str(), "strix-weight-load/v1 ") == 1U, "gate receipt: one weight plan record");
+    require(count(gate.str(), "strix-weight-load-regimes/v1 ") == 1U, "gate receipt: one weight regime record");
+    require(count(gate.str(), "strix-route-file/v1 ") == 1U, "gate receipt: one route record");
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
+    for (const char* tier : {"exact", "fast", "turbo"}) {
+        std::ostringstream run;
+        cli::write_run_receipt(parse({"1", "--profile", tier}).tier, plan, run);
+        require(count(run.str(), "strix-weight-load/v1 ") == 1U, "run receipt: one weight plan record");
+        require(count(run.str(), "strix-weight-load-regimes/v1 ") == 1U, "run receipt: one weight regime record");
+    }
+#endif
 }
 
 int main() {

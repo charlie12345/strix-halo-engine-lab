@@ -212,6 +212,18 @@ inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoa
     output << weight::weight_load_regime_receipt(plan) << '\n';
 }
 
+// The receipts the GPU command line writes, composed here so a host fixture exercises the same path: the run's profile
+// receipt (profile summary, ladder decisions, weight plan) and one gate window's route receipt. Each holds exactly one
+// weight plan and one weight regime record (write_weight_load_plan is their only writer).
+inline void write_run_receipt(const profile::Resolution& tier, const weight::WeightLoadPlan& plan, std::ostream& output) {
+    write_profile(tier, output, true);
+    write_weight_load_plan(output, plan);
+}
+inline void write_gate_receipt(std::ostream& output, const weight::WeightLoadPlan& plan, std::string_view routes) {
+    write_weight_load_plan(output, plan);
+    output << "strix-route-file/v1 " << routes << '\n';
+}
+
 // The evaluation-order null receipt of one gate window. A null arm whose window
 // never reached the reversed relative-bias order is not a null: fail closed
 // instead of writing a receipt the gate would have to reject.

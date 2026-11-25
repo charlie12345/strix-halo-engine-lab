@@ -438,6 +438,24 @@ void cuda_cli_server() {
                     server.resolution.json().find("strix-ladder/v1 qsa_mma") != std::string::npos,
                 "Qwen CUDA CLI and server emit the same decision");
     }
+    // Review r75 P2: a receipt that observably changes the decision on BOTH entries. The same complete key measured
+    // slower turns the incumbent form off inside its band on the CLI and on the server alike (a server that ignored the
+    // receipt would keep the grant), and leaves the grant outside the band.
+    p::LadderRow slower = timing;
+    slower.speedup = 0.90;
+    slower.receipt = "fixture-qsa-slower";
+    request.inputs.ladder = std::span(&slower, 1);
+    for (const auto context : {4096U, 4097U}) {
+        request.inputs.regime = {p::Phase::prefill, context, 1, "fixture", "fixture-exec"};
+        const bool inside = context == 4096U;
+        for (const auto entry : {qo::Entry::cli, qo::Entry::serve}) {
+            const auto r = qo::resolve(request, entry);
+            require(r.choice.qsa_mma == !inside &&
+                        r.resolution.json().find(inside ? "slower x0.900" : "incumbent") != std::string::npos,
+                    std::string(entry == qo::Entry::cli ? "CLI" : "server") +
+                        ": a slower receipt of the complete key turns the form off inside its band only");
+        }
+    }
     // Provide evidence for a non-incumbent row through the native options adapter.
     const p::RegimeGate gate{"moe_route_bf16", "1", 4096, 4097, "fixture gate"};
     p::LadderRow candidate{"moe_route_bf16", "1", p::Name::fast, p::Phase::prefill, "fixture", 4096, 4096,
@@ -461,8 +479,9 @@ void cuda_cli_server() {
             profile_selects_storage(qo::resolve(request, qo::Entry::serve)),
             "a measured non-incumbent candidate runs with the same known prompt on both entries");
     ++request.inputs.regime.context;
-    require(!profile_selects_storage(qo::resolve(request, qo::Entry::cli)),
-            "the neighboring context declines the candidate");
+    require(!profile_selects_storage(qo::resolve(request, qo::Entry::cli)) &&
+                !profile_selects_storage(qo::resolve(request, qo::Entry::serve)),
+            "the neighboring context declines the candidate on both entries");
     request.inputs.regime = p::startup_prefill_regime("fixture");
     const auto startup = qo::resolve(request, qo::Entry::serve);
     require(!profile_selects_storage(startup) && startup.choice.qsa_mma,

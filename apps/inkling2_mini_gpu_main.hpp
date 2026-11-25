@@ -195,8 +195,7 @@ inline void run_gate(const char* checkpoint, const Options& options, std::span<c
         if (options.gate_order_null)
             routes = cli::gate_null_receipt(std::move(routes), decoder.gate_null_applications(), window.name);
         std::ofstream receipt(log);
-        cli::write_weight_load_plan(receipt, weights);
-        receipt << "strix-route-file/v1 " << routes << '\n';
+        cli::write_gate_receipt(receipt, weights, routes);
         receipt.close();
         if (!receipt) throw std::runtime_error("could not write gate route receipt: " + log.string());
     }
@@ -364,8 +363,7 @@ int main(int argc, char** argv) {
             const auto& resolved = loaded ? *loaded : early;
             const auto& plan = resolved.plan;
             const auto& scope = resolved.scope;
-            cli::write_profile(options.tier, std::cerr, true);
-            cli::write_weight_load_plan(std::cerr, plan);
+            cli::write_run_receipt(options.tier, plan, std::cerr);
             // The admitted W4A4 class of the prompt that loaded (mini_prompt_moe), the same identity the gate prints
             // and the server reports as moe_prefill.
             if (mini_moe_w4a4(options.tier))

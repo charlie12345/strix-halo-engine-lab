@@ -485,6 +485,19 @@ void custom_adapters() {
     const auto ds = r::resolve(p::Name::fast, false, r::App::replica, {}, std::span(&rtx, 1));
     require(ds.find(kLever)->value == "off", "DeepSeek RTX cannot select a lossy unmeasured row");
 
+    // The shared ladder is also instantiated for three-column adapters. TURBO
+    // is not a valid column there, even if a caller bypasses native selection.
+    require(p::value_column(rtx, p::Name::fast) == 1U, "legacy FAST column");
+    require(p::value_column(rtx, p::Name::quality) == 2U, "legacy QUALITY column");
+    bool rejected = false;
+    try {
+        (void)p::select_profile_cell(rtx, {}, p::Name::turbo, regime,
+                                     [](unsigned) { return p::Status::set; }, false, {});
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "three-column ladder refuses absent TURBO column");
+
     namespace glm = strix::glm::rtxpf::profile;
     glm::Lever candidate{.name = kLever, .env = "", .value = {"", "a8", ""}, .builtin = "off",
                          .ready = {true, true, true}, .kind = glm::Kind::bit_changing,
@@ -714,6 +727,17 @@ void hy4_new_quality_rows() {
     timings[0].timing.over = hy4_reference;
     const auto resolved = h::resolve(beyond, in, rows, h::incumbent_grants, timings);
     require(resolved->find("prompt_rows")->value == "4096", "a matching timing row admits the new band");
+    auto switched = in;
+    switched.env = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_HY4_PF_A8_PRODUCER" ? "off" : nullptr;
+    };
+    require(h::resolve(beyond, switched, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "4096",
+            "legacy flag spelling with the same runtime value keeps the timing match");
+    switched.env = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_HY4_PF_A8_PRODUCER" ? "0legacy" : nullptr;
+    };
+    require(h::resolve(beyond, switched, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "0",
+            "changing the effective Hy4 flag value invalidates the timing match");
     auto other = beyond;
     --other.prompt_tokens;
     require(h::resolve(other, in, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "0",
@@ -1342,6 +1366,49 @@ void r63_reproductions() {
     }
 }
 
+// MiniMax IU4 layer set: the TURBO cell is a candidate (no timing row: the builtin runs, also under --allow-pending);
+// an explicit positive layer set reaches the prefill identity; the legacy format keeps its layers 38-59.
+void minimax_i4_binding() {
+    namespace mm = strix::minimax::defaults;
+    p::Inputs in;
+    in.profile = p::Name::turbo;
+    in.allow_pending = true;
+    in.regime = {p::Phase::prefill, 8192, 1, "gfx1151", "fixture-exec"};
+    in.env = [](const char*) -> const char* { return nullptr; };
+    const auto r = p::resolve(mm::profile_engine(), in);
+    const auto* layers = r.find("iu4_layers");
+    require(layers && layers->lever->runnable[3], "MiniMax IU4 mask has a runnable TURBO binding");
+    require(layers && layers->value == "none", "MiniMax IU4 remains off in the unmeasured regime");
+    const auto explicit_layers = [](const char* k) -> const char* {
+        return std::string_view(k) == "STRIX_MM_IU4_LAYERS" ? "43-59" : nullptr;
+    };
+    require(mm::prefill_identity(explicit_layers).find("moe_prefill_format=fast_i4:layers=43-59") != std::string::npos,
+            "an explicit MiniMax IU4 mask reaches the execution identity");
+    const auto run = [](const std::map<std::string, std::string>& env) {
+        return mm::prefill_policy([&](const char* k) -> const char* {
+            const auto it = env.find(k);
+            return it == env.end() ? nullptr : it->second.c_str();
+        });
+    };
+    const auto legacy = run({{"STRIX_MMX_MODEL_FORMAT", "fast_i4"}});
+    require(legacy.fast_i4 && legacy.iu4_layers.count() == 22 && !legacy.iu4_layers.test(37) && legacy.iu4_layers.test(38),
+            "MiniMax legacy IU4 mask retains layers 38-59");
+    require(mm::prefill_identity([](const char* k) -> const char* {
+                return std::string_view(k) == "STRIX_MMX_MODEL_FORMAT" ? "fast_i4" : nullptr;
+            }).find("moe_prefill_format=fast_i4") != std::string::npos,
+            "the legacy format keeps its identity");
+    const auto selected = run({{"STRIX_MMX_MODEL_FORMAT", "fast_i4"}, {"STRIX_MMX_FAST_I4_EXL3_LAYERS", "none"},
+                               {"STRIX_MM_IU4_LAYERS", "43,58-59"}});
+    require(selected.fast_i4 && selected.iu4_layers.count() == 3 && selected.iu4_layers.test(43) && selected.iu4_layers.test(59),
+            "MiniMax explicit positive mask overrides the legacy exclusion mask");
+    const auto off = run({{"STRIX_MMX_MODEL_FORMAT", "exl3"}, {"STRIX_MM_IU4_LAYERS", "38-59"}});
+    require(!off.fast_i4 && off.iu4_layers.count() == 0, "MiniMax explicit EXL3 refuses an IU4 mask");
+    require(!run({{"STRIX_MM_IU4_LAYERS", "none"}}).fast_i4, "an empty explicit mask leaves EXL3 selected");
+    require(!run({{"STRIX_MMX_MODEL_FORMAT", "fast_i4"}, {"STRIX_MM_IU4_LAYERS", "none"}}).fast_i4,
+            "an empty explicit mask also disables the legacy IU4 format");
+    require(!run({}).fast_i4 && run({}).iu4_layers.count() == 0, "no setting: EXL3");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
@@ -1356,6 +1423,7 @@ int main(int argc, char** argv) try {
     defects();
     shipped_rows();
     execution_binding();
+    minimax_i4_binding();
     custom_adapters();
     cuda_cli_server();
     namespace q = strix::qwen;

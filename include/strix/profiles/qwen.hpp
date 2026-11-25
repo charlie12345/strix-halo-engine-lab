@@ -60,9 +60,14 @@ struct Resolution {
     std::string cache_namespace() const {
         return is_turbo() ? ::strix::profile::turbo::cache_namespace(kTurboVersion, fingerprint(), weights.identity()) : std::string();
     }
-    const Entry* find(std::string_view key) const {
+    const Entry* find(std::string_view key) const & {
         for (const auto& entry : entries) if (entry.lever->name == key) return &entry;
         return nullptr;
+    }
+    // A temporary resolution can return an owned entry, never a borrowed pointer.
+    std::optional<Entry> find(std::string_view key) const && {
+        if (const auto* entry = find(key)) return *entry;
+        return std::nullopt;
     }
     std::string qualification() const {
         std::string provisional, unqualified;

@@ -1,4 +1,5 @@
 #include "strix/profiles/gemma4.hpp"
+#include "gemma4/prefill/check_profile.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -7,6 +8,7 @@
 #include <string>
 
 namespace pr = strix::gemma4::profile;
+namespace pf = strix::gemma4::prefill;
 namespace {
 int failures = 0;
 void check(bool condition, const std::string& what) {
@@ -433,14 +435,80 @@ void no_pending_executes() {
             "unqualified builtin is never a silent fallback");
 }
 
+void prefill_check_policy() {
+    const auto test = [](const char* label, const std::string& cli, const char* env,
+                         const char* other_identity, const char* backend_spec, const char* expected_spec,
+                         const char* identity, pr::Status source) {
+        std::map<std::string, std::string> vars;
+        if (env) vars.emplace("STRIX_G4_PREFILL_LINEAR_POLICY", env);
+        auto product = pf::resolve_check_profile(pr::Name::turbo, cli, true, lookup(vars));
+        const auto receipt = pf::check_linear_receipt(product, backend_spec, other_identity);
+        const std::string prefix(label);
+        check(receipt.policy == expected_spec, prefix + ": run receipt reports the effective backend policy");
+        check(std::string_view(receipt.identity) == identity, prefix + ": run identity matches the backend policy");
+        const auto* entry = product.find("prefill_linear_policy");
+        if (*expected_spec) {
+            check(entry && entry->status == source && entry->value == expected_spec,
+                  prefix + ": profile reports the effective backend policy and its source");
+            check(product.json().find(std::string("\"prefill_linear_policy\":{\"value\":\"") + expected_spec +
+                                      "\",\"status\":\"" + pr::status_name(source) + "\"") != std::string::npos,
+                  prefix + ": profile JSON reports the effective backend policy and its source");
+        } else {
+            check(!entry, prefix + ": profile omits an inactive policy");
+        }
+    };
+    using enum pr::Status;
+    test("CLI only", ".*=exact", nullptr, nullptr, ".*=exact", ".*=exact", "g4-wmma-pf-policy", explicit_cli);
+    test("environment only", "", pf::v2_policy, nullptr, pf::v2_policy, pf::v2_policy, pf::v2_identity, explicit_env);
+    test("CLI over environment", ".*=exact", ".*=fp16", nullptr, ".*=exact", ".*=exact", "g4-wmma-pf-policy", explicit_cli);
+    test("canonical v2", "ple_model=fp16;.*;", nullptr, nullptr, pf::v2_policy, pf::v2_policy, pf::v2_identity, explicit_cli);
+    test("unset", "", nullptr, nullptr, "", "", pf::identity, builtin);
+    test("empty CLI keeps environment", "", ".*=fp16", nullptr, ".*=fp16", ".*=fp16", "g4-wmma-pf-policy", explicit_env);
+    test("exact ignores environment policy", "", ".*=fp16", "prefill-exact", "", "", "prefill-exact", builtin);
+    test("a8 ignores CLI policy", ".*=fp16", nullptr, "prefill-a8", ".*=fp16", "", "prefill-a8", builtin);
+}
+
 void parsing_and_apply() {
     check(pr::parse("default") == pr::Name::standard && pr::parse("fast") == pr::Name::fast &&
           pr::parse("quality") == pr::Name::quality, "parse names");
-    refuses([] { (void)pr::parse("turbo"); }, "exact (default), fast or quality", "unknown profile");
+    check(pr::parse("turbo") == pr::Name::turbo, "parse turbo");
     check(pr::parse("exact") == pr::Name::standard, "exact is the default column (shared tier word)");
-    // An empty table proves admission is checked before indexing, without triggering UB on an unfixed build.
-    for (const auto app : {pr::App::engine, pr::App::decode_bench, pr::App::prefill_bench})
-        refuses([&] { (void)pr::resolve(pr::Name::turbo, app, in(), {}); }, "turbo", "direct TURBO resolution");
+    auto inputs = in();
+    inputs.allow_pending = true;
+    for (const auto app : {pr::App::engine, pr::App::decode_bench, pr::App::prefill_bench}) {
+        const auto fast = pr::resolve(pr::Name::fast, app, inputs);
+        const auto turbo = pr::resolve(pr::Name::turbo, app, inputs);
+        for (const auto& entry : fast.entries) {
+            const auto* inherited = turbo.find(entry.lever->name);
+            check(inherited && inherited->value == entry.value && inherited->status == entry.status,
+                  "TURBO inherits FAST without a measured higher rung");
+        }
+    }
+    {
+        namespace p = strix::profile;
+        const pr::Lever candidate{.name = "fixture", .value = {"", "a8", "", "a4"}, .builtin = "off",
+                                  .ready = {true, true, true, true}, .runnable = {true, true, true, true},
+                                  .kind = p::Kind::bit_changing, .apps = unsigned(pr::App::engine),
+                                  .identity = {{{"off", "off-v1"}, {"a8", "a8-v1"}, {"a4", "a4-v1"}}}};
+        std::array timing{p::incumbent_cell("fixture", "a8", p::Name::fast, "fast fixture"),
+                          p::LadderRow{"fixture", "a4", p::Name::turbo, p::Phase::prefill,
+                                       "fixture", 4096, 4096, 1, 1, 1.1, 0.01, "turbo fixture"}};
+        inputs.regime = {p::Phase::prefill, 4096, 1, "fixture", "fixture-exec"};
+        inputs.ladder = std::span(timing).first(1);
+        const auto fallback = pr::resolve(pr::Name::turbo, pr::App::engine, inputs, std::span(&candidate, 1));
+        const auto* cell = fallback.find("fixture");
+        check(cell && cell->value == "a8" && cell->status == pr::Status::set,
+              "an unmeasured Gemma TURBO cell exports the resolved FAST value");
+        const auto arms = p::ladder_arms(std::span(&candidate, 1), inputs.ladder, inputs.regime,
+            [](const pr::Lever&, unsigned) { return p::Status::set; });
+        const auto reference = arms.over(p::Name::turbo, "fixture", "a4");
+        timing[1].over = reference;
+        inputs.ladder = timing;
+        const auto measured = pr::resolve(pr::Name::turbo, pr::App::engine, inputs, std::span(&candidate, 1));
+        cell = measured.find("fixture");
+        check(cell && cell->value == "a4" && cell->status == pr::Status::set,
+              "Gemma TURBO exports a higher value with a matching receipt");
+    }
     char a0[] = "app", a1[] = "--profile", a2[] = "fast", a3[] = "--steps";
     char* with_value[] = {a0, a1, a2};
     char* bare[] = {a0, a1, a3};
@@ -493,18 +561,22 @@ void parsing_and_apply() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool policy_only = argc == 2 && std::string_view(argv[1]) == "--prefill-check-policy";
     try {
-        synthetic_table();
-        drafter_convention();
-        product_table();
-        no_pending_executes();
-        parsing_and_apply();
+        prefill_check_policy();
+        if (!policy_only) {
+            synthetic_table();
+            drafter_convention();
+            product_table();
+            no_pending_executes();
+            parsing_and_apply();
+        }
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;
     }
     if (failures) { std::cerr << failures << " profile check(s) failed\n"; return 1; }
-    std::cout << "gemma4 profile resolver PASS\n";
+    std::cout << (policy_only ? "gemma4 prefill policy receipt PASS\n" : "gemma4 profile resolver PASS\n");
     return 0;
 }

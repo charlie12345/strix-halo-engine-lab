@@ -351,8 +351,7 @@ int main(int argc, char** argv) {
             // and the server reports as moe_prefill.
             if (mini_moe_w4a4(options.tier))
                 std::cerr << "strix-moe-w4a4 class "
-                          << strix::moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '
-';
+                          << strix::moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
             std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
                       << family.prefill_tail_divisor << " first_id prefill\n";
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)

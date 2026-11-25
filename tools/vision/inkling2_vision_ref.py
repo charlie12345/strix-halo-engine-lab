@@ -11,7 +11,7 @@ numpy and pillow. Writes, per image, little-endian float32 dumps for strix-inkli
 
 usage: inkling2_vision_ref.py --checkpoint DIR --out DIR [--dtype float32|bfloat16] IMAGE...  (IMAGE may be synth:WxH[:seed])
 """
-import argparse, json, os, sys
+import argparse, json, os, re, sys
 
 import numpy as np
 import torch
@@ -37,7 +37,11 @@ def rename(key):
 
 
 def load_model(checkpoint, dtype):
-    cfg_all = json.load(open(os.path.join(checkpoint, "config.json")))
+    cfg_path = os.path.join(checkpoint, "config.json")
+    if os.path.getsize(cfg_path) > MAX_CONFIG_BYTES:
+        sys.exit("config.json is larger than 1 MiB")
+    with open(cfg_path, encoding="utf-8") as f:
+        cfg_all = json.load(f)
     vc = dict(cfg_all["vision_config"])
     vc.pop("model_type", None)
     config = Inkling2VisionConfig(**vc)
@@ -55,10 +59,26 @@ def load_model(checkpoint, dtype):
     return model.to(dtype), config
 
 
-def synth(spec):
-    parts = spec.split(":")
-    w, h = (int(v) for v in parts[1].split("x"))
-    seed = int(parts[2]) if len(parts) > 2 else 0
+MAX_CONFIG_BYTES = 1 << 20
+MAX_IMAGE_BYTES = 20 << 20      # the gate's decoder limit
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_SYNTH_SIDE = 4096
+SYNTH = re.compile(r"synth:([0-9]{1,5})x([0-9]{1,5})(?::([0-9]{1,9}))?")
+SIMPLE_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}")
+
+
+def synth_fields(spec):
+    """synth:WxH[:seed], 1 <= W, H <= 4096; anything else is refused."""
+    m = SYNTH.fullmatch(spec)
+    if not m:
+        sys.exit(f"{spec!r}: expected synth:WxH[:seed]")
+    w, h, seed = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    if not (1 <= w <= MAX_SYNTH_SIDE and 1 <= h <= MAX_SYNTH_SIDE):
+        sys.exit(f"{spec!r}: each side must be 1..{MAX_SYNTH_SIDE}")
+    return w, h, seed
+
+
+def synth(w, h, seed):
     rng = np.random.default_rng(seed)
     # smooth gradients plus noise and a few flat blocks: exercises padding, edges and flat areas
     y, x = np.mgrid[0:h, 0:w]
@@ -82,10 +102,18 @@ def main():
     proc = Inkling2ImageProcessor()
     for spec in a.images:
         if spec.startswith("synth:"):
-            image, name = synth(spec), spec.replace(":", "_")
+            w, h, seed = synth_fields(spec)
+            image, name, source = synth(w, h, seed), f"synth_{w}x{h}_{seed}", f"synth:{w}x{h}:{seed}"
             image.save(os.path.join(a.out, name + ".png"))
         else:
-            image, name = Image.open(spec), os.path.splitext(os.path.basename(spec))[0]
+            name, source = os.path.splitext(os.path.basename(spec))[0], os.path.basename(spec)
+            if not SIMPLE_NAME.fullmatch(name):
+                sys.exit(f"{spec}: the file name must be a simple name ([A-Za-z0-9._-])")
+            if not os.path.isfile(spec) or os.path.getsize(spec) > MAX_IMAGE_BYTES:
+                sys.exit(f"{spec}: not a regular file of at most {MAX_IMAGE_BYTES} bytes")
+            image = Image.open(spec)
+            if image.width * image.height > MAX_IMAGE_PIXELS:
+                sys.exit(f"{spec}: more than {MAX_IMAGE_PIXELS} pixels")
             if image.format != "PNG":
                 sys.exit(f"{spec}: the gate decodes PNG only (lossless, same pixels as PIL)")
             import shutil
@@ -102,7 +130,7 @@ def main():
         hidden.astype("<f4").tofile(base + ".hidden.f32")
         rows.astype("<f4").tofile(base + ".rows.f32")
         json.dump({"rows": gr, "cols": gc, "tokens": gr * gc, "width": image.width, "height": image.height,
-                   "dtype": a.dtype, "source": spec}, open(base + ".grid.json", "w"))
+                   "dtype": a.dtype, "source": source}, open(base + ".grid.json", "w"))
         print(f"{name}: {image.width}x{image.height} -> {gr}x{gc} = {gr * gc} tokens, rows {rows.shape}, "
               f"|rows| mean {np.abs(rows).mean():.4f}", flush=True)
 

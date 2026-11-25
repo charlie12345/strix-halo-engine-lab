@@ -100,8 +100,8 @@ void append_tool_name(std::string& header, const Json* id, const Json::Array& me
     }
 }
 
-bool image_part(std::string_view kind) { return kind == "image" || kind == "input_image" || kind == "image_url"; }
-
+// images: the checkpoint template's image part, one <|content_image|> frame holding the placeholder the vision path
+// expands to the tower rows (user and tool messages only). Off: image parts are refused as before.
 void content_parts(std::string& out, std::string_view header, const Json& content, std::string_view role, bool images) {
     if (!content.is_array()) raise("message content must be text or an array of parts");
     for (const auto& part : content.as_array()) {
@@ -111,12 +111,13 @@ void content_parts(std::string& out, std::string_view header, const Json& conten
         }
         const auto* type = part.find("type");
         const auto kind = py_str(type, "content part type");
-        if (type && images && image_part(kind)) {
-            // chat_template.jinja: one image placeholder per image part (the caller expands it into the image rows)
+        if (images && type && (kind == "image" || kind == "input_image" || kind == "image_url")) {
             if (role != "user" && role != "tool") raise("Image content is only supported for user and tool messages");
-            frame(out, header, "<|content_image|>", "<|unused_200054|>");
+            frame(out, header, "<|content_image|>", kInkling2ImagePlaceholder);
             continue;
         }
+        if (images && type && (kind == "audio" || kind == "input_audio" || kind == "audio_url"))
+            raise("Inkling 2 does not accept audio input");
         if (type && kind != "text" && kind != "input_text")
             raise("Unsupported Inkling 2 Mini text content part type: " + kind);
         const auto* text = part.find("text");
@@ -142,8 +143,7 @@ void tool_calls(std::string& out, const Json& calls, const Json* assistant_name)
 
 }  // namespace
 
-namespace {
-std::string render_chat(const Json& messages, const Json& tools, const Json& reasoning_effort, bool images) {
+std::string render_inkling2_chat(const Json& messages, const Json& tools, const Json& reasoning_effort, bool images) {
     if (!messages.is_array()) raise("messages must be an array");
     std::string out;
     tool_declarations(out, tools);
@@ -180,26 +180,17 @@ std::string render_chat(const Json& messages, const Json& tools, const Json& rea
     if (!effort_emitted) frame(out, kSystem, kText, effort);
     return out;
 }
-}  // namespace
-
-std::string render_inkling2_chat(const Json& messages, const Json& tools, const Json& reasoning_effort) {
-    return render_chat(messages, tools, reasoning_effort, false);
-}
-
-std::string render_inkling2_chat_media(const Json& messages, const Json& tools, const Json& reasoning_effort) {
-    return render_chat(messages, tools, reasoning_effort, true);
-}
 
 namespace {
 std::string render_request(std::string_view json, bool images) {
     const auto request = parse_request_json(json);
     const Json absent;
-    if (request.is_array()) return render_chat(request, absent, absent, images);
+    if (request.is_array()) return render_inkling2_chat(request, absent, absent, images);
     const auto* messages = request.find("messages");
     if (!messages) throw std::invalid_argument("expected a messages array or an object with messages");
     const auto* tools = request.find("tools");
     const auto* effort = request.find("reasoning_effort");
-    return render_chat(*messages, tools ? *tools : absent, effort ? *effort : absent, images);
+    return render_inkling2_chat(*messages, tools ? *tools : absent, effort ? *effort : absent, images);
 }
 }  // namespace
 

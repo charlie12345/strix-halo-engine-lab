@@ -1,9 +1,11 @@
 # Inkling 2 image tower on the shared vision stack: the family adapter (strix_inkling2_vision) over the checkpoint's own
-# safetensors (LookupWeights) and the real-file gate tool against tools/vision/inkling2_vision_ref.py dumps.
-if(TARGET strix_vision_encoder AND TARGET strix_vision_preprocess AND TARGET strix_serve)
+# safetensors (LookupWeights) and the real-file gate tool against tools/vision/inkling2_vision_ref.py dumps (manual tool,
+# never run by CMake or CTest).
+if(TARGET strix_vision_encoder AND TARGET strix_vision_preprocess AND TARGET strix_serve AND TARGET strix-weight)
     add_library(strix_inkling2_vision STATIC "${CMAKE_SOURCE_DIR}/src/inkling2/inkling2_vision.cpp")
     target_include_directories(strix_inkling2_vision PUBLIC "${CMAKE_SOURCE_DIR}/src")
-    target_link_libraries(strix_inkling2_vision PUBLIC strix_vision_encoder strix_vision_preprocess strix_core strix_serve)
+    target_link_libraries(strix_inkling2_vision PUBLIC strix_vision_encoder strix_vision_preprocess strix_core strix_serve
+        strix-weight)
     if(NOT MSVC)
         # Rows are cache content: no fused multiply-add in positions, folding or the projector activation.
         target_compile_options(strix_inkling2_vision PRIVATE -ffp-contract=off -fno-fast-math)
@@ -27,4 +29,3 @@ strix_servespec_host_test(NAME inkling2-vision
 if(TARGET inkling2-vision AND NOT MSVC)
     target_compile_options(inkling2-vision PRIVATE -ffp-contract=off -fno-fast-math)
 endif()
-

@@ -74,38 +74,31 @@ bool check_errors() {
     return true;
 }
 
-bool check_media() {
-    // After media::normalize an image part is {"type": "image", "media": k}; the media entry point writes one image
-    // frame per part (chat_template.jinja: <|content_image|><|unused_200054|><|end_message|>), text parts unchanged.
-    constexpr std::string_view body =
-        R"({"messages":[{"role":"user","content":[{"type":"text","text":"A:"},{"type":"image","media":0},)"
-        R"({"type":"text","text":"Describe it."}]}]})";
-    constexpr std::string_view expected =
-        "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
-        "<|message_user|><|content_text|>A:<|end_message|>"
-        "<|message_user|><|content_image|><|unused_200054|><|end_message|>"
-        "<|message_user|><|content_text|>Describe it.<|end_message|>";
-    if (!matches("media request", render_inkling2_chat_media_request(body), expected)) return false;
-    if (kInkling2ImagePlaceholder != "<|unused_200054|>") return false;
-    for (const auto input : {R"({"messages":[{"role":"assistant","content":[{"type":"image","media":0}]}]})"}) {
+// With images: the checkpoint template's image frame, user and tool messages only; audio refused.
+bool check_images() {
+    const auto msgs = parse_json(
+        R"([{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}])");
+    const std::string got = render_inkling2_chat(msgs, {}, {}, true);
+    const std::string frame = "<|message_user|><|content_image|><|unused_200054|><|end_message|>";
+    if (got.find(frame) == std::string::npos || got.find("What is this?") > got.find(frame)) {
+        std::cerr << "image frame missing or out of order: " << got << '\n';
+        return false;
+    }
+    for (const auto input : {R"([{"role":"assistant","content":[{"type":"image"}]}])",
+                             R"([{"role":"user","content":[{"type":"input_audio"}]}])"}) {
         try {
-            (void)render_inkling2_chat_media_request(input);
-            std::cerr << "accepted an assistant image: " << input << '\n';
+            (void)render_inkling2_chat(parse_json(input), {}, {}, true);
+            std::cerr << "accepted: " << input << '\n';
             return false;
         } catch (const ChatTemplateError&) {}
     }
-    try {
-        (void)render_inkling2_chat_request(body);  // the text entry point keeps refusing images
-        std::cerr << "the text entry point accepted an image\n";
-        return false;
-    } catch (const ChatTemplateError&) {}
     return true;
 }
 
 }  // namespace
 
 int main() {
-    return check_template() && check_errors() && check_media() &&
+    return check_template() && check_errors() && check_images() &&
            matches("shared compact JSON", chat_kit::compact_json(parse_json(R"({"z":[1e-4,1e-5,1e15,1e16,-0.0,-0],"a":0})"),
                                                                  chat_kit::JsonKeyOrder::recursive),
                    R"({"a":0,"z":[0.0001,1e-05,1000000000000000.0,1e+16,-0.0,0]})") ? 0 : 1;

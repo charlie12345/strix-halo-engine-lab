@@ -1,3 +1,4 @@
+#include "strix/token_sampling.hpp"
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
@@ -54,6 +55,7 @@
 // rank with exit code 86 near the OOM line.
 // --print-model-graph / STRIX_PRINT_MODEL_GRAPH=1: validated description dump; exits before device work.
 #include "glm_rank_defaults.hpp"
+#include "glm_profile_overrides.hpp"
 #include "../src/glm/load/glm_model_description.hpp"
 #include "glm/prefill/glm_pf_load_admission.hpp"
 #include "strix/device_profile.hpp"
@@ -136,6 +138,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed run still leaves every printed line in its log
     std::setvbuf(stderr, nullptr, _IONBF, 0);  // unbuffered (the C default, made explicit): progress and errors land at once
     try {
+        strix::validate_sampling_startup_environment(); // refused before any rank starts protocol work
         if (strix::print_device_profile_if_requested(argc, argv)) return 0;
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [modes] [--identity r1|r1b|r1b-all] [--idcheck N --prompt T.u32]\n"
@@ -303,6 +306,8 @@ int main(int argc, char** argv) {
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
         if (eff.product) {
             std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());
+            eff.product->engine_overrides = strix::glm::explicit_prefill_overrides([](const char* k) { return std::getenv(k); });
+            for (const auto& line : eff.product->receipt_lines()) std::fprintf(stderr, "%s\n", line.c_str());
             for (const auto& notice : eff.product->notices()) std::fprintf(stderr, "%s\n", notice.c_str());
         }
         opt.mtp = eff.mtp.value == "1";

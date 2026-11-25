@@ -2822,6 +2822,144 @@ int main(int argc, char** argv) {
         stop.store(true);
         runner.join();
     }
+    {  // Embed frame round: receive bounds and paired refusals (host only). The follower must fail the pair before it
+       // enters a further collective: its wire-call count shows how far it got (1: summary only, 2: summary and bytes).
+        namespace sess = strix::session;
+        sess::EmbedInterner interner;
+        sess::EmbedRows span;
+        span.rows = 6;
+        span.width = 16;
+        span.real_token_id = strix::glm::kImageToken;
+        span.digest.fill(9);
+        span.data.assign(std::size_t{6} * 16U, 0x3F80);
+        const auto lease = interner.intern(std::move(span));
+        const auto table = std::make_shared<const sess::EmbedTable>(std::vector<sess::EmbedLease>{lease});
+        const auto all_ids = lease.ids();
+        CHECK(all_ids.size() == 6);
+
+        // The row bound: per handle the span limit and the rows the chunk and the room after it can hold.
+        const std::vector<std::uint32_t> head3(all_ids.begin(), all_ids.begin() + 3);
+        CHECK(gs::embed_frame_rows_bound(head3, 0) == 3);
+        CHECK(gs::embed_frame_rows_bound(head3, 3) == 6);
+        CHECK(gs::embed_frame_rows_bound(head3, std::uint64_t{1} << 40U) == sess::kEmbedMaxRows);
+        CHECK(gs::embed_frame_rows_bound(std::vector<std::uint32_t>{11, 12}, 100) == 0);
+
+        struct RefuseEng {
+            std::vector<std::byte> embed_frame(std::span<const std::uint32_t>) { return {}; }
+            void embed_frame_received(std::span<const std::byte>, std::vector<std::uint32_t>&) { throw std::runtime_error("refused here"); }
+        };
+        struct Outcome {
+            std::string lead_error, follow_error;
+            unsigned follower_calls = 0;
+        };
+        // lead_fn drives rank 0 on its channel; the follower runs the real round on `eng` for `chunk`.
+        const auto drive = [&](const std::function<void(gs::Channel&)>& lead_fn, auto& eng, const std::vector<std::uint32_t>& chunk,
+                               std::uint64_t capacity, std::uint64_t room_after) {
+            Outcome o;
+            Loopback lb;
+            std::atomic<unsigned> calls{0};
+            auto w1 = lb.side(1);
+            gs::Channel c0(lb.side(0), 0);
+            gs::Channel c1([&](std::span<const std::byte> out, std::span<std::byte> in, std::uint32_t layer, std::uint64_t request) {
+                ++calls;
+                w1(out, in, layer, request);
+            }, 1);
+            std::thread lead([&] {
+                try { lead_fn(c0); } catch (const std::exception& e) { o.lead_error = e.what(); }
+            });
+            std::vector<std::uint32_t> prompt1 = chunk;
+            try { gs::embed_frame_round(eng, c1, prompt1, false, capacity, room_after); } catch (const std::exception& e) { o.follow_error = e.what(); }
+            lead.join();
+            o.follower_calls = calls.load();
+            return o;
+        };
+        const auto frame_of = [&](const std::vector<std::uint32_t>& chunk) {  // a fresh ledger each time: rows always travel
+            FakeEng probe(2);
+            probe.bind_embeds(table);
+            return probe.embed_frame(chunk);
+        };
+        const auto send_summary = [](gs::Channel& ch, std::array<std::uint32_t, gs::kEmbedFrameSummaryWords> s) {
+            std::vector<std::uint32_t> v(s.begin(), s.end());
+            ch.tokens(v, v.size(), true, gs::kEmbedFrameMessage);
+        };
+        const auto send_bytes = [](gs::Channel& ch, const std::vector<std::byte>& frame) {
+            std::vector<std::uint32_t> w((frame.size() + 3U) / 4U, 0U);
+            std::memcpy(w.data(), frame.data(), frame.size());
+            ch.tokens(w, w.size(), true, gs::kEmbedFrameMessage + 1U);
+        };
+        const std::uint64_t cap = std::uint64_t{1} << 17U;
+
+        {  // the whole span in the chunk, bound met: applied
+            FakeEng e0(2), e1(2);
+            e0.bind_embeds(table);
+            std::vector<std::uint32_t> p0 = all_ids;
+            const auto o = drive([&](gs::Channel& ch) { gs::embed_frame_round(e0, ch, p0, true, cap, 0); }, e1, all_ids, cap, 0);
+            CHECK(o.lead_error.empty() && o.follow_error.empty() && o.follower_calls == 2 && e1.embed_frames == 1);
+        }
+        {  // a chunk of one handle whose summary claims the whole span (6 rows), but the chunk holds 3 and the context room
+           // after it is zero: the bound is 3 rows, so the follower refuses on the summary, before any payload storage
+            FakeEng e1(2);
+            const auto frame = frame_of(head3);
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, gs::embed_frame_summary(frame)); }, e1, head3, cap, 0);
+            CHECK(o.follow_error.find("summary out of range") != std::string::npos);
+            CHECK(o.follower_calls == 1 && e1.embed_frames == 0);
+        }
+        {  // spans of the summary differ from the chunk's distinct handles
+            FakeEng e1(2);
+            auto s = gs::embed_frame_summary(frame_of(all_ids));
+            s[1] = 2;
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, s); }, e1, all_ids, cap, 0);
+            CHECK(o.follow_error.find("summary out of range") != std::string::npos && o.follower_calls == 1);
+        }
+        {  // width above the model's
+            FakeEng e1(2);
+            auto s = gs::embed_frame_summary(frame_of(all_ids));
+            s[3] = 1U << 17U;
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, s); }, e1, all_ids, cap, 0);
+            CHECK(o.follow_error.find("summary out of range") != std::string::npos && o.follower_calls == 1);
+        }
+        {  // the bytes disagree with the summary: an entry claims other rows / width / axes than the summary says
+            const auto good = frame_of(all_ids);
+            const std::size_t at = strix::pair::kEmbedFrameHeaderBytes;  // first entry; rows at +4, width at +8, axes at +16
+            for (const std::size_t field : {std::size_t{4}, std::size_t{8}, std::size_t{16}}) {
+                FakeEng e1(2);
+                auto bad = good;
+                std::uint32_t v = 0;
+                std::memcpy(&v, bad.data() + at + field, 4);
+                v = field == 16U ? 1U : v - 1U;
+                std::memcpy(bad.data() + at + field, &v, 4);
+                const auto o = drive([&](gs::Channel& ch) { send_summary(ch, gs::embed_frame_summary(good)); send_bytes(ch, bad); }, e1,
+                                     all_ids, cap, 0);
+                CHECK(o.follow_error.find("does not match its summary") != std::string::npos);
+                CHECK(o.follower_calls == 2 && e1.embed_frames == 0);
+            }
+        }
+        {  // a byte length that the entries do not imply (two trailing bytes under a summary that states them)
+            FakeEng e1(2);
+            auto longer = frame_of(all_ids);
+            auto s = gs::embed_frame_summary(longer);
+            longer.insert(longer.end(), 2, std::byte{0});
+            s[0] = static_cast<std::uint32_t>(longer.size());
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, s); send_bytes(ch, longer); }, e1, all_ids, cap, 0);
+            CHECK(o.follow_error.find("does not match its summary") != std::string::npos);
+            CHECK(o.follower_calls == 2 && e1.embed_frames == 0);
+        }
+        {  // receiver refusal: the engine cannot apply a frame that matches its summary; the pair fails on the follower
+            RefuseEng refuse;
+            const auto good = frame_of(all_ids);
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, gs::embed_frame_summary(good)); send_bytes(ch, good); }, refuse,
+                                 all_ids, cap, 0);
+            CHECK(o.follow_error.find("control channel: embed frame: refused here") != std::string::npos);
+            CHECK(o.follower_calls == 2);
+        }
+        {  // peer teardown: the lead leaves after the summary; the follower's byte exchange fails (loopback timeout, 5 s)
+           // and the round throws instead of returning a half-received frame
+            FakeEng e1(2);
+            const auto good = frame_of(all_ids);
+            const auto o = drive([&](gs::Channel& ch) { send_summary(ch, gs::embed_frame_summary(good)); }, e1, all_ids, cap, 0);
+            CHECK(!o.follow_error.empty() && e1.embed_frames == 0);
+        }
+    }
     if (failures == 0) std::printf("glm serve cpu tests: ALL PASS\n");
     else std::printf("glm serve cpu tests: %d FAILED\n", failures);
     return failures == 0 ? 0 : 1;

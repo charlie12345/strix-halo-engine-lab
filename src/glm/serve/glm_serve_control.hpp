@@ -18,6 +18,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -434,9 +435,13 @@ inline SampledRun sampled_run(const Control& c, Channel& ch, bool sender, std::s
 //
 // Wire: one message of kEmbedFrameSummaryWords (frame bytes, spans, payload rows, widest row, most axes), then the
 // bytes as 32-bit words. The follower checks the summary before it allocates anything: the spans are exactly the
-// chunk's distinct virtual ids, the rows fit the context (capacity), the width is the model's, and the byte length is
-// at most what those spans and rows can take (and kEmbedFrameMaxBytes). The frame is then parsed in place from the
-// received words (one buffer), and its own checksums and manifest decide the rest.
+// chunk's distinct virtual ids, the rows fit embed_frame_rows_bound (per span: the span limit and the context room
+// after the chunk, not the whole slot capacity), the width is the model's, and the byte length is at most what those
+// spans and rows can take (and kEmbedFrameMaxBytes). The received bytes are then reconciled with the summary
+// (embed_frame_matches_summary: every entry's rows, width and axes, the exact byte length) before the parser sees them,
+// which then runs on the received words (the interner holds its own copy of each new span).
+// A refusal throws ProtocolError on the follower before the next collective; the lead, still in this exchange or the
+// next one, sees the follower leave (wire error or timeout) and fails the pair; neither rank continues alone.
 inline constexpr std::size_t kEmbedFrameSummaryWords = 5U;
 inline constexpr std::uint32_t kEmbedFrameMaxAxes = 4U;
 inline constexpr std::uint32_t kEmbedFrameMaxWidth = 1U << 16U;  // without embed_row_width()
@@ -460,8 +465,52 @@ inline std::array<std::uint32_t, kEmbedFrameSummaryWords> embed_frame_summary(st
     return s;
 }
 
+// Most payload rows the frame of this chunk can carry, from data both ranks hold (the chunk's ids, the context room
+// after it). A span has at most kEmbedMaxRows rows; its rows up to the highest one in this chunk are known, and the
+// rest are placeholder ids of the same prompt that must fit the context after the chunk. A chunk of one handle is thus
+// bounded by that span, not by the slot capacity. A frame only carries rows the peer lacks, so this is an upper bound.
+inline std::uint64_t embed_frame_rows_bound(std::span<const std::uint32_t> ids, std::uint64_t room_after) {
+    std::map<std::uint32_t, std::uint32_t> top;  // handle -> highest row index seen
+    for (const auto id : ids)
+        if (strix::session::is_embed_id(id)) {
+            auto& t = top[strix::session::embed_handle(id)];
+            t = std::max(t, strix::session::embed_row(id));
+        }
+    std::uint64_t bound = 0;
+    for (const auto& kv : top)
+        bound += std::min<std::uint64_t>(strix::session::kEmbedMaxRows, std::uint64_t{kv.second} + 1U + room_after);
+    return bound;
+}
+
+// The received bytes against the summary both ranks agreed on: length, span count, payload rows, widest row, most axes
+// and the exact byte length that the entries (rows, width, axes) imply. The caller has checked that the length holds
+// the header and the entries. False on any difference; the parser then never sees the frame.
+inline bool embed_frame_matches_summary(std::span<const std::byte> frame, const std::array<std::uint32_t, kEmbedFrameSummaryWords>& s,
+                                        std::uint32_t max_width) {
+    namespace fd = strix::pair::embed_frame_detail;
+    const std::uint64_t head = strix::pair::kEmbedFrameHeaderBytes + std::uint64_t{s[1]} * strix::pair::kEmbedFrameEntryBytes;
+    if (frame.size() != s[0] || frame.size() < head || fd::get32(frame, 8U) != s[1]) return false;
+    std::uint64_t rows = 0, bytes = head;
+    std::uint32_t width = 0, axes = 0;
+    for (std::uint32_t e = 0; e < s[1]; ++e) {
+        const std::size_t at = strix::pair::kEmbedFrameHeaderBytes + std::size_t{e} * strix::pair::kEmbedFrameEntryBytes;
+        const std::uint32_t r = fd::get32(frame, at + 4U), w = fd::get32(frame, at + 8U), a = fd::get32(frame, at + 16U),
+                            flags = fd::get32(frame, at + 20U);
+        if (r == 0U || r > strix::session::kEmbedMaxRows || w == 0U || w > max_width || a > kEmbedFrameMaxAxes || (flags & ~1U) != 0U)
+            return false;
+        if ((flags & 1U) == 0U) continue;
+        rows += r;
+        bytes += fd::payload_bytes(r, w, a);
+        width = std::max(width, w);
+        axes = std::max(axes, a);
+    }
+    return rows == s[2] && width == s[3] && axes == s[4] && bytes == frame.size();
+}
+
+// room_after: context positions after this chunk (capacity - pos - length).
 template<class Eng>
-void embed_frame_round(Eng& eng, Channel& ch, std::vector<std::uint32_t>& prompt, bool sender, std::uint64_t capacity) {
+void embed_frame_round(Eng& eng, Channel& ch, std::vector<std::uint32_t>& prompt, bool sender, std::uint64_t capacity,
+                       std::uint64_t room_after) {
     if constexpr (requires(std::span<const std::byte> f) { eng.embed_frame(std::span<const std::uint32_t>{}); eng.embed_frame_received(f, prompt); }) {
         if (!ch.paired()) return;
         std::vector<std::byte> frame;
@@ -478,6 +527,7 @@ void embed_frame_round(Eng& eng, Channel& ch, std::vector<std::uint32_t>& prompt
         if constexpr (requires { eng.embed_row_width(); }) max_width = static_cast<std::uint32_t>(eng.embed_row_width());
         const std::size_t expected_spans = strix::pair::embed_frame_handles(std::span<const std::uint32_t>(prompt)).size();
         if (length == 0 || length > kEmbedFrameMaxBytes || spans == 0 || spans != expected_spans || rows > capacity ||
+            rows > embed_frame_rows_bound(std::span<const std::uint32_t>(prompt), room_after) ||
             width > max_width || axes > kEmbedFrameMaxAxes || (rows != 0 && width == 0))
             throw ProtocolError("control channel: embed frame summary out of range");
         const std::uint64_t most = std::uint64_t{strix::pair::kEmbedFrameHeaderBytes} +
@@ -492,6 +542,11 @@ void embed_frame_round(Eng& eng, Channel& ch, std::vector<std::uint32_t>& prompt
         ch.tokens(words, n, sender, kEmbedFrameMessage + 1U);
         if (!sender) {
             const auto bytes = std::as_bytes(std::span<const std::uint32_t>(words)).first(length);
+            std::array<std::uint32_t, kEmbedFrameSummaryWords> agreed{};
+            std::copy(summary.begin(), summary.end(), agreed.begin());
+            bool same = false;
+            try { same = embed_frame_matches_summary(bytes, agreed, max_width); } catch (const std::exception&) {}
+            if (!same) throw ProtocolError("control channel: embed frame does not match its summary");
             try {
                 eng.embed_frame_received(bytes, prompt);
             } catch (const std::exception& e) {  // a frame the follower cannot apply leaves the ranks apart: fatal for the pair
@@ -500,6 +555,7 @@ void embed_frame_round(Eng& eng, Channel& ch, std::vector<std::uint32_t>& prompt
         }
     } else {
         (void)capacity;
+        (void)room_after;
         throw ProtocolError("control channel: this engine takes no embedding rows");
     }
 }
@@ -647,7 +703,7 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             if (c.plen == 0 || c.ppos >= capacity || c.plen >= capacity - c.ppos)
                 throw ProtocolError("control channel: prompt chunk out of range");
             ch.tokens(prompt, c.plen, sender);
-            if ((c.pflags & kPrefillEmbeds) != 0U) embed_frame_round(eng, ch, prompt, sender, capacity);
+            if ((c.pflags & kPrefillEmbeds) != 0U) embed_frame_round(eng, ch, prompt, sender, capacity, capacity - c.ppos - c.plen);
             const std::span<const std::uint32_t> p(prompt);
             if ((c.pflags & kPrefillUnits) != 0U) {
                 if ((c.pflags & kPrefillMtp) == 0U || c.budget == 0)

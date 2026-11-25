@@ -78,7 +78,7 @@ void sample_pair_rows(std::uint32_t mask, bool lead, std::size_t follower_width,
 
 // The lead's message after each row of a window: [kPairWindowMore] while another row follows, then
 // [kPairWindowDone, n, accepted, token 0 .. token n-1, 0 ...] (accepted: the leading drafts the acceptance rule
-// accepted, n - 1 or n).
+// accepted, n - 1, or n only when n == max_rows).
 inline constexpr std::size_t kPairWindowMaxRows = 8;
 inline constexpr std::size_t kPairWindowWords = kPairWindowMaxRows + 3U;
 inline constexpr std::uint32_t kPairWindowDone = 0, kPairWindowMore = 1;
@@ -118,7 +118,10 @@ PairWindowDecision decide_pair_window(bool lead, std::size_t follower_width, std
             words(std::span<const std::uint32_t>(send), std::span<std::uint32_t>(receive));
             if (receive[0] == kPairWindowMore && row + 1U < max_rows) continue;
             const std::uint32_t n = receive[1], accepted = receive[2];
-            if (receive[0] != kPairWindowDone || n != row + 1U || accepted > n || accepted + 1U < n)
+            // Every drafted row the lead decides either rejects (the window ends with it) or accepts and continues, so an
+            // all-accepted window ends only at max_rows: an all-accepted DONE before it leaves a row undecided.
+            if (receive[0] != kPairWindowDone || n != row + 1U || accepted > n || accepted + 1U < n ||
+                (accepted == n && n < max_rows))
                 throw std::runtime_error("pair window: the lead's decision message is out of protocol");
             return {{receive.begin() + 3, receive.begin() + 3 + n}, accepted};
         }

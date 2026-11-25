@@ -307,6 +307,29 @@ void test_window_follower_bound() {
         refused = true;
     }
     check(refused, "follower: max_rows above 8 refused before any read");
+    // A DONE that claims every decided row accepted its draft before max_rows leaves the next row undecided: refused.
+    // At max_rows the same claim is the protocol's all-accepted window.
+    for (const std::uint32_t max_rows : {3U, 1U}) {
+        refused = false;
+        reads = 0;
+        sv::PairWindowDecision got;
+        try {
+            got = sv::decide_pair_window(false, kFollow, 0, nullptr, 0, {}, max_rows,
+                [&](std::size_t r) { ++reads; return std::span<const float>(rows.follow.at(r)); },
+                [](std::span<const float>, std::span<float>) {},
+                [](std::span<const std::uint32_t>, std::span<std::uint32_t> in) {
+                    in[0] = sv::kPairWindowDone;
+                    in[1] = 1;  // n
+                    in[2] = 1;  // accepted
+                    in[3] = 7;
+                });
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        if (max_rows == 3U) check(refused && reads == 1, "follower: all-accepted DONE before max_rows refused");
+        else check(!refused && got.accepted == 1 && got.tokens.size() == 1 && got.tokens[0] == 7,
+                   "follower: all-accepted DONE at max_rows accepted");
+    }
 }
 
 void test_window_rejection() {

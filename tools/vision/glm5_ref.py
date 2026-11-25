@@ -134,14 +134,15 @@ def images(out):
 
 
 MAX_DUMP_BYTES = 1 << 30
+MAX_WIDTH = 1 << 16  # floats per row: above any hidden width the tool compares; one batch row stays at most 256 KiB
 
 
 def compare(args):
     # Width and both file sizes are checked on the open handles before anything is read; the rows are then compared in
     # bounded batches (no whole-file copies). A zero-norm row has no cosine and an all-zero reference no relative L2:
     # both refuse instead of passing, and every metric must be finite before a threshold is judged.
-    if args.width <= 0:
-        sys.exit("--width must be positive")
+    if args.width <= 0 or args.width > MAX_WIDTH:
+        sys.exit(f"--width must be 1 .. {MAX_WIDTH}")
     with open(args.a, "rb") as fa, open(args.b, "rb") as fb:
         sizes = []
         for f in (fa, fb):

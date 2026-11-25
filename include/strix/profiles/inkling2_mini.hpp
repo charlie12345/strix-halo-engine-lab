@@ -6,6 +6,7 @@
 #include "strix/weight/registry.hpp"
 
 #include <array>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,6 +37,57 @@ inline constexpr weight::WeightLoadDecision kMiniWeightLoadRows[] = {
       65536}},
 };
 inline constexpr std::span<const weight::WeightLoadDecision> kMiniWeightLoadDecisions{kMiniWeightLoadRows};
+// FAST weight mix (data): the head alone in q4_g64 from the calibrated pack, every other role BF16. It loads only
+// through a FAST row, and there is none: on the held-out decode gate (39 windows, prose / code / structured, 8K-64K) the
+// head row passed every class and the pooled bars but failed dNLL on two prose windows, so FAST keeps the BF16 image
+// and the q4 head is part of the TURBO mix only.
+inline constexpr weight::WeightLoadPolicy kMiniFastWeightPolicy = weight::kHeadQ4Policy;
+// The explicit TURBO lever can admit this mix through a matching low-bit decision row.
+inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo@1";
+inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
+inline constexpr weight::WeightLoadPolicy kMiniTurboWeightPolicy = weight::kAttentionHeadQ4Policy;
+// The row covers decode steps only. The low-bit copies are resident beside the BF16 image used for
+// prefill, verify and decode widths outside the receipt.
+inline constexpr std::string_view kMiniWeightRegime = weight::kDecodeRegime;
+
+// The calibrated pack the TURBO row was measured with (strix-lowbit-calib-pack, technique both, damp 0.1, q4 for the
+// attention projections and the head; docs/engine/lowbit-calibration.md). The evidence belongs to this
+// identity. Qualification accepts an explicit pack via STRIX_LOWBIT_PACK.
+inline constexpr weight::Digest256 kMiniLowBitPackIdentity =
+    weight::digest_from_hex("b0bd0103dcdd9ffd89e65ae06a3d86663d516c5eb09f263346555d2376bf658e");
+
+// Served receipt (gfx1151, 16 slots, context 16384, 256 tokens per request): EXACT (= FAST) B=1 decode 23.36 tok/s,
+// C8 53.76, C16 66.74; TURBO row, q4 attention and head, 27.03 / 68.48 / 86.60 tok/s. 8K prefill 14.15 s EXACT,
+// 14.38 s TURBO (neutral to slower), so prompt chunks keep the BF16 image and the row is decode-only, banded to the
+// step widths the receipt measured a gain at (kMiniLowBitStepBand rows). Its quality against BF16 is stated in the
+// row: decode gate, 39 held-out windows, 2457 rows, scored on the production route (the BF16 image prefills the
+// teacher prefix, the q4 copies run the decode steps). The q4 head alone fails the FAST bar on two prose windows.
+inline constexpr weight::Digest256 kMiniLowBitBuild =
+    weight::digest_from_hex("89665a6147dd8ca5eefcf4fbc4306f56a4c9e5e35bea774943d22ea08dd60f03");
+inline constexpr weight::Digest256 kMiniCheckpoint =
+    weight::digest_from_hex("65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1");
+inline constexpr std::uint32_t kMiniLowBitStepBand = 16U;
+inline constexpr weight::WeightLoadExtent kMiniLowBitMeasuredExtent{16384U, 16U};
+
+// The receipt measured these active decode widths. Configured context and lanes must also be known
+// and within the row's evidence caps.
+inline constexpr bool mini_lowbit_receipt_width(std::uint32_t rows) noexcept {
+    return rows == 1U || rows == 8U || rows == kMiniLowBitStepBand;
+}
+
+inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisionRows{{
+    {kMiniTurboWeightPolicy.id,
+     {weight::Backend::hip, "gfx1151", "hip-clang-24.0", kMiniWeightRegime, kMiniLowBitBuild, kMiniCheckpoint},
+     {},
+     weight::digest_from_hex("54182047338baf7005882cf2062d334aea4b8bb662d6cb484f1ccfce6926508b"),
+     {.receipt = "docs/engine/lowbit-calibration.md", .date = "2026-11-24", .rows = 2457,
+      .max_context = kMiniLowBitMeasuredExtent.context, .max_lanes = kMiniLowBitMeasuredExtent.lanes,
+      .speedup = 27.03 / 23.36,  // smallest measured gain against BF16 across widths 1, 8 and 16
+      .tier = profile::Name::turbo, .max_rows = kMiniLowBitStepBand},
+     "vs BF16 decode (bf16 prefill, q4 decode) kl=0.0033 top1=0.980 dnll=+0.0027 flips=0.00x windows_failed=0/39 "
+     "pack=b0bd0103dcdd9ffd"},
+}};
+inline constexpr std::span<const weight::WeightLoadDecision> kMiniLowBitDecisions{kMiniWeightLoadDecisionRows};
 
 // `extent`: what the instance holds, the same rule for the CLI and the server: context = the resident positions
 // (serial CLI: prompt + generated tokens of its one sequence; server: its configured context), lanes = concurrent
@@ -120,7 +172,7 @@ inline constexpr std::string_view kMiniVerifyRows = "inkling2-mini-verify-rows@1
 // mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 11> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -148,7 +200,6 @@ inline constexpr std::array<profile::Lever, 11> kMiniLevers{{
      {}, {true, true, true, true}, "1", "0",
      "awaits device identity on the landing head (logits, ids and state bitwise the image route) before any default",
      false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
-    // Appended after main's rows (main's row positions unchanged); the block-candidate row stays last.
     {.name = kMiniServedCliRoute, .env = "STRIX_INK_SERVED_CLI_ROUTE", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::bit_changing, .ready = {false, false, false, false},
@@ -162,6 +213,11 @@ inline constexpr std::array<profile::Lever, 11> kMiniLevers{{
      .runnable = {true, true, true, true}, .target = "1", .off = "0",
      .source = "awaits the RTX identity receipt on the landing head (greedy ids against the full head, CLI and served) "
                "before any default",
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
+    {.name = kMiniLowBitTurbo, .env = "STRIX_INK_LOWBIT_TURBO", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
+     .ready = {}, .runnable = {false, false, false, true}, .target = "1", .off = "0",
+     .source = "docs/engine/lowbit-calibration.md (calibrated HIP decode at widths 1, 8 and 16)",
      .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniVerifyRows, .env = "STRIX_INK_VERIFY_ROWS", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",

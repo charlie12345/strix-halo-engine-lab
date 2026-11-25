@@ -86,6 +86,7 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
     options.tier = resolve_mini_profile(options.weights, native && !generation.tokenize_file);
+    options.weights.lowbit_turbo = mini_lowbit_turbo(options.tier);
     mini_cli_decline_served_route(options.tier);
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");
@@ -204,11 +205,18 @@ inline void write_profile(const profile::Resolution& tier, std::ostream& output,
         if (!entry.ladder.empty()) output << entry.ladder << '\n';
 }
 
-// The one writer of the weight receipts of a command-line run (device stderr and gate receipt files): the plan line and
-// exactly one regime line.
+// The one writer of the weight receipts of a command-line run (device stderr and gate receipt files): the plan line,
+// the quality receipt when present, and exactly one regime line.
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {
     output << "strix-weight-load/v1 " << plan.policy.name << '@' << plan.policy.revision
-           << ' ' << plan.storage.name << '@' << plan.storage.revision << '\n';
+           << ' ' << plan.storage.name << '@' << plan.storage.revision;
+    if (plan.head_storage != plan.storage)
+        output << " head " << plan.head_storage.name << '@' << plan.head_storage.revision;
+    output << '\n';
+    // A TURBO row states its measured quality against BF16 (it did not pass the FAST gate).
+    if (!plan.turbo_quality.empty())
+        output << "strix-weight-load-quality/v1 " << plan.policy.name << '@' << plan.policy.revision << ' '
+               << plan.turbo_quality << '\n';
     output << weight::weight_load_regime_receipt(plan) << '\n';
 }
 

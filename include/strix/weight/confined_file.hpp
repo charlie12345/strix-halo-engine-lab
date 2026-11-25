@@ -19,7 +19,8 @@ public:
     [[nodiscard]] std::shared_ptr<const Source> open(const std::filesystem::path& name) const;
     [[nodiscard]] std::optional<std::string> read(const std::filesystem::path& name, std::size_t max_bytes,
                                                   bool missing_ok = false,
-                                                  std::optional<std::size_t> exact_bytes = {}) const;
+                                                  std::optional<std::size_t> exact_bytes = {},
+                                                  std::optional<FileKey>* key = nullptr) const;  // of the read handle
 private:
     struct Impl;
     std::unique_ptr<Impl> directory_;

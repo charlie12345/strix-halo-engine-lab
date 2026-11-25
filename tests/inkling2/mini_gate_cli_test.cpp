@@ -320,6 +320,10 @@ void test_options() {
     expect_invalid([] { (void)parse({"1", "--profile", "turbo", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "fast", "--no-weight-q8", "--qualify-q8"}); });
     expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--profile", "fast", "--qualify-q8"}); });
+    require(parse({"1", "--profile", "turbo", "--qualify-weights", "weights.attention_head.q4_g64@1"}).weights.qualify ==
+                &strix::weight::kAttentionHeadQ4Policy, "expected low-bit TURBO qualification arm");
+    expect_invalid([] { (void)parse({"1", "--qualify-weights", "weights.attention_head.q4_g64@1"}); });
+    expect_invalid([] { (void)parse({"1", "--profile", "fast", "--qualify-weights", "weights.unknown@1"}); });
     require(parse({"1"}).generation.packed_decode, "expected packed default");
     require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
     expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
@@ -429,18 +433,33 @@ void test_weight_receipt_once() {
         for (auto at = text.find(key); at != std::string::npos; at = text.find(key, at + key.size())) ++n;
         return n;
     };
-    const strix::weight::WeightLoadPlan plan{};
+    namespace weight = strix::weight;
+    const auto& policy = weight::kAttentionQ4HeadQ6Policy;
+    weight::WeightLoadPlan plan{};
+    plan.policy = policy.id;
+    plan.storage = policy.target;
+    plan.head_storage = policy.head_target();
+    plan.turbo_quality = "fixture quality";
+    const auto check = [&](const std::string& text) {
+        constexpr std::string_view plan_and_quality =
+            "strix-weight-load/v1 weights.attention_q4_g64.head_q6_g64@1 strix.q4_g64@1 head strix.q6_g64@1\n"
+            "strix-weight-load-quality/v1 weights.attention_q4_g64.head_q6_g64@1 fixture quality\n"
+            "strix-weight-load-regimes/v1 ";
+        require(count(text, "strix-weight-load/v1 ") == 1U, "one weight plan record");
+        require(count(text, "strix-weight-load-quality/v1 ") == 1U, "one weight quality record");
+        require(count(text, "strix-weight-load-regimes/v1 ") == 1U, "one weight regime record");
+        require(text.find(plan_and_quality) != std::string::npos,
+                "weight plan with head storage, then quality, then regimes");
+    };
     std::ostringstream gate;
     cli::write_gate_receipt(gate, plan, "{\"version\":1}");
-    require(count(gate.str(), "strix-weight-load/v1 ") == 1U, "gate receipt: one weight plan record");
-    require(count(gate.str(), "strix-weight-load-regimes/v1 ") == 1U, "gate receipt: one weight regime record");
+    check(gate.str());
     require(count(gate.str(), "strix-route-file/v1 ") == 1U, "gate receipt: one route record");
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
     for (const char* tier : {"exact", "fast", "turbo"}) {
         std::ostringstream run;
         cli::write_run_receipt(parse({"1", "--profile", tier}).tier, plan, run);
-        require(count(run.str(), "strix-weight-load/v1 ") == 1U, "run receipt: one weight plan record");
-        require(count(run.str(), "strix-weight-load-regimes/v1 ") == 1U, "run receipt: one weight regime record");
+        check(run.str());
     }
 #endif
 }
@@ -454,7 +473,7 @@ int main() {
         test_projected_bias_lever();
         test_screened_head_lever();
         test_native_w4a4_admission();
-    test_cuda_route_options();
+        test_cuda_route_options();
 #endif
         test_windows(directory.path);
     } catch (const std::exception& error) {

@@ -4,6 +4,7 @@
 #include "core/row_transforms.hpp"
 #include "strix/device/runtime.hpp"
 #include "strix/env_flags.hpp"
+#include "inkling2_mini_calibration.hpp"
 #include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_residual_device.hpp"
@@ -85,13 +86,14 @@ struct MiniResidentGqaBackend : Base {
 #if !defined(__HIPCC__)
                     , this->big_context
 #endif
-                );
+                    , kMiniLowBitArithmetic);
             },
             [&](std::span<const MiniAttentionLinear> group) {
                 return Base::linear_admitted(input, width, rows, group);
             },
             [&](std::span<const core::ResidentRowProjection> group) {
-                return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(input, width, rows, group);
+                return core::resident_q8_projections_admitted<MiniProjectionWeights::role_count>(
+                    input, width, rows, group, kMiniLowBitArithmetic);
             });
     }
 
@@ -249,6 +251,29 @@ public:
         invalidate_cohort_graphs();
         gate_route_tap_ = tap;
     }
+    // Calibration input statistics (strix/weight/calib_moments.hpp, off when null): every eager chunk run while a
+    // registered calibration window is open hands its attention / output-projection / head input rows to the set,
+    // attributed to that window (host-synchronous; step graphs stay off). Rows outside an open window (for example
+    // decode steps of generated tokens) belong to no declared window and are not captured.
+    void set_calibration_moments(weight::calib::MomentSet* moments) {
+        graph_.invalidate();
+        invalidate_cohort_graphs();
+        calibration_ = moments;
+        calibration_window_.reset();
+    }
+    void set_calibration_window(std::optional<std::size_t> window) { calibration_window_ = window; }
+    [[nodiscard]] weight::calib::MomentSet* calibration_moments() const noexcept {
+        return calibration_window_ ? calibration_ : nullptr;
+    }
+    void capture_calibration(const float* rows_device, std::size_t rows, std::span<weight::calib::InputMoments* const> targets) {
+        if (!calibration_ || !calibration_window_ || targets.empty() || rows == 0U) return;
+        const std::size_t width = targets.front()->width;
+        calibration_rows_.resize(rows * width);
+        mini_gpu::copy(calibration_rows_.data(), rows_device, calibration_rows_.size() * sizeof(float), mini_gpu::device_to_host,
+                       stream_);
+        mini_gpu::synchronize(stream_);
+        calibration_->add(*calibration_window_, targets, calibration_rows_.data(), rows);
+    }
     void set_gate_order_null(bool enabled) {
         graph_.invalidate();
         invalidate_cohort_graphs();
@@ -367,10 +392,18 @@ public:
 #endif
     }
 
-    void start_chunk(unsigned rows, MiniAppendKind kind) {
+    [[nodiscard]] bool lowbit_applies(MiniAppendKind kind, unsigned rows) const noexcept {
+        if (!weights_.compact() && !weights_.compact_head_bound()) return false;
+        if (!weights_.bf16_bound()) return true;
+        return kind == MiniAppendKind::decode && mini_lowbit_receipt_width(rows);
+    }
+    // The current chunk reads the compact roles (attention projections here, the head in the decoder).
+    [[nodiscard]] bool lowbit_chunk() const noexcept { return lowbit_chunk_; }
+
+    void start_chunk(unsigned rows, MiniAppendKind kind, unsigned decode_cohort_width = 0U) {
         // Route capture/replay reads or writes host data synchronously. The step graph itself is
         // decided by try_step_graph; the route only picks the row geometry here.
-        select_route(rows, kind);
+        select_route(rows, kind, decode_cohort_width);
         clear_flags();
     }
 
@@ -405,7 +438,7 @@ public:
     // False: nothing ran (programs off, a gate tap or order-null arm, or this width declined); run eagerly.
     template <class MakeLanes, class Work>
     bool try_cohort_graph(bool enabled, const exec::StepBlock& block, MakeLanes make_lanes, Work& work) {
-        return cohort_graphs_.try_launch(stream_, enabled && step_graphs_, !gate_route_tap_ && !gate_order_null_, block,
+        return cohort_graphs_.try_launch(stream_, enabled && step_graphs_, host_taps_off(), block,
             [&] {
                 struct Leave {
                     std::optional<MiniCohortLanes>& active;
@@ -426,7 +459,7 @@ public:
         // Layout and workspace addresses are fixed for this backend's lifetime. A route tap and the
         // order-null gate perform host-synchronous reads and writes.
         if (graph_.try_launch(stream_, step_graphs_, chunk.rows, step_token_.has_value(),
-                              !gate_route_tap_ && !gate_order_null_,
+                              host_taps_off(),
                               {chunk.first_position, step_token_.value_or(0U)}, [&] {
             clear_flags();
             work();
@@ -880,8 +913,13 @@ private:
             check(attn_core::enqueue_prepared_gqa_output<MiniPreparedGqaShape>(
                 adapter, rows, weights.projection(MiniAttentionProjection::output), attended, prep.gate_logits,
                 gated, output.data(), weights.output_row_bytes));
+            if (auto* moments = calibration_moments(); moments && single) {
+                weight::calib::InputMoments* const target =
+                    &mini_calibration_input(*moments, MiniCalibrationInput::output, visit.physical_layer);
+                capture_calibration(gated, rows, std::span(&target, 1U));
+            }
         };
-        if (weights_.compact()) {
+        if (weights_.compact() && lowbit_chunk_) {
             auto weights = weights_.compact_attention(visit.physical_layer);
             weights.key_convolution = lag;
             weights.value_convolution = lag + kKvWidth * kConvTaps;
@@ -999,7 +1037,13 @@ private:
     // The row geometry of a chunk and the prompt-row rule of the bound W4A4 class (mini_resident_chunk_route). The class
     // quantises each token row on its own and sums each (row, output) in a fixed K order, so a prompt row's bits do not
     // depend on how the prompt is chunked.
-    void select_route(unsigned rows, MiniAppendKind kind) {
+    void select_route(unsigned rows, MiniAppendKind kind, unsigned decode_cohort_width = 0U) {
+        // Cohorts may schedule independent decode lanes with the verify kernel form. The receipt still names
+        // the full decode cohort and the active width of this pass.
+        const auto weight_kind = decode_cohort_width ? MiniAppendKind::decode : kind;
+        lowbit_chunk_ = lowbit_applies(weight_kind, rows) &&
+                        (!weights_.bf16_bound() || decode_cohort_width == 0U ||
+                         mini_lowbit_receipt_width(decode_cohort_width));
         route_ = mini_resident_chunk_route(kind, rows, packed_decode_, moe_w4a4_bound(), cohort_rows_);
 #if !defined(__HIPCC__)
         chunk_w4a4_ = mini_w4a4_rows(moe_w4a4_, kind);
@@ -1136,6 +1180,11 @@ private:
     std::uint64_t null_applications_{};
     std::optional<unsigned> step_token_;
     strix::moe::RouteTap* gate_route_tap_{};
+    bool lowbit_chunk_{};
+    weight::calib::MomentSet* calibration_{};
+    std::optional<std::size_t> calibration_window_;
+    std::vector<float> calibration_rows_;
+    [[nodiscard]] bool host_taps_off() const noexcept { return !gate_route_tap_ && !gate_order_null_ && !calibration_; }
     unsigned tiles_;
     mini_gpu::Buffer<float> controller_, attention_;
 #if defined(__HIPCC__)

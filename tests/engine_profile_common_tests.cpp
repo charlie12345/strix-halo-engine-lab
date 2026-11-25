@@ -1,6 +1,7 @@
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
+#include "strix/profiles/hy4.hpp"
 
 #include <iostream>
 #include <map>
@@ -285,6 +286,64 @@ int main() try {
         require(weighted.weights.effective == turbo::Source::onfly, "onfly weights admitted");
         require(weighted.tier_notice().find("uses onfly-int4-rtn-g32 weights (not the exact column)") != std::string::npos,
                 "no false EXACT equivalence when TURBO changes weights");
+    }
+    {
+        namespace hy = strix::hy4::profile;
+        Inputs in;
+        vars.clear();
+        in.env = env;
+        for (const auto regime : {hy::Regime{}, hy::Regime{hy::Device::gfx1151, hy::Topology::one_node, 8192},
+                                  hy::Regime{hy::Device::gfx1151, hy::Topology::pair, 8192}}) {
+            in.profile = Name::fast;
+            const auto fast = hy::resolve(regime, in);
+            in.profile = Name::turbo;
+            const auto turbo = hy::resolve(regime, in);
+            for (const auto& entry : fast->resolution.entries) {
+                const auto* selected = turbo->find(entry.lever->name);
+                require(selected != nullptr && selected->value == entry.value, "Hy4 TURBO inherits FAST");
+            }
+            in.allow_pending = true;
+            const auto allow_pending = hy::resolve(regime, in);
+            const auto* iu4 = allow_pending->find("decode_iu4");
+            require(iu4 != nullptr && iu4->status == Status::pending && iu4->value == "off",
+                    "Hy4 TURBO IU4 stays off and pending even with --allow-pending");
+            in.allow_pending = false;
+        }
+
+        constexpr std::pair<const char*, const char*> switches[] = {
+            {"pf_a8_producer", "STRIX_HY4_PF_A8_PRODUCER"},
+            {"q8_store_epilogue", "STRIX_HY4_Q8_STORE_EPILOGUE"},
+            {"pf_store_epilogue", "STRIX_HY4_PF_STORE_EPILOGUE"},
+        };
+        struct FlagCase {
+            const char* raw;
+            std::string_view effective;
+            Status status;
+        };
+        constexpr FlagCase cases[] = {
+            {nullptr, "1", Status::builtin}, {"", "1", Status::explicit_env},
+            {"0", "0", Status::off}, {"1", "1", Status::explicit_env},
+            {"off", "1", Status::explicit_env}, {"0legacy", "0", Status::off},
+            {"1legacy", "1", Status::explicit_env},
+        };
+        bool receipts_match = true;
+        for (const auto& [lever, key] : switches) {
+            for (const auto& test : cases) {
+                if (test.raw != nullptr) vars[key] = test.raw;
+                const auto resolved = hy::resolve({}, in);
+                const auto* entry = resolved->find(lever);
+                if (entry == nullptr || entry->value != test.effective || entry->status != test.status ||
+                    entry->requested != (test.raw != nullptr ? test.raw : "")) {
+                    std::cerr << key << " raw=" << (test.raw != nullptr ? json_string(test.raw) : "<unset>")
+                              << " expected " << test.effective << ' ' << status_name(test.status);
+                    if (entry != nullptr) std::cerr << ", got " << json_string(entry->value) << ' ' << status_name(entry->status);
+                    std::cerr << '\n';
+                    receipts_match = false;
+                }
+                vars.erase(key);
+            }
+        }
+        require(receipts_match, "Hy4 exact switch receipts match the runtime readers");
     }
     std::cout << "common profile/receipt tests passed\n";
 } catch (const std::exception& error) {

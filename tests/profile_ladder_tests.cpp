@@ -712,6 +712,17 @@ void hy4_new_quality_rows() {
     timings[0].timing.over = hy4_reference;
     const auto resolved = h::resolve(beyond, in, rows, h::incumbent_grants, timings);
     require(resolved->find("prompt_rows")->value == "4096", "a matching timing row admits the new band");
+    auto switched = in;
+    switched.env = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_HY4_PF_A8_PRODUCER" ? "off" : nullptr;
+    };
+    require(h::resolve(beyond, switched, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "4096",
+            "legacy flag spelling with the same runtime value keeps the timing match");
+    switched.env = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_HY4_PF_A8_PRODUCER" ? "0legacy" : nullptr;
+    };
+    require(h::resolve(beyond, switched, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "0",
+            "changing the effective Hy4 flag value invalidates the timing match");
     auto other = beyond;
     --other.prompt_tokens;
     require(h::resolve(other, in, rows, h::incumbent_grants, timings)->find("prompt_rows")->value == "0",

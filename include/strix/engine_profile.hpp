@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/env_flags.hpp"
 #include "strix/fnv.hpp"
 #include "strix/turbo.hpp"
 
@@ -62,6 +63,8 @@ struct Lever {
     // a window-invariant prefill: choosing among them is scheduling, so an explicit member shares the qualification of a
     // ready column whose value is in the list. Empty: every value is its own class. Not part of the fingerprint.
     std::string_view same_bits{};
+    // For 0/1 environment switches, match the runtime flag parser with `builtin` as its default.
+    std::optional<EnvFlagMatch> env_flag_match{};
 };
 
 // True when `value` is one whole item of the comma list `list`.
@@ -1253,11 +1256,16 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     // 'quality' without quality rows is the default column; an empty turbo cell is the fast cell.
     const auto profile_column = out.quality_fallback() ? Name::standard : out.profile;
     const bool preset = model_preset();
+    const auto effective_env_value = [](const Lever& lever, const char* raw) -> std::string_view {
+        if (!lever.env_flag_match) return raw;
+        return envcfg::parse_flag(raw, lever.builtin == "1", *lever.env_flag_match) ? "1" : "0";
+    };
     const auto arms = ladder_arms(engine.table, engine.ladder, inputs.regime,
         [&](const Lever& lever, unsigned c) { return column_admission(lever, c, out.allow_pending, preset); },
         [&](const Lever& lever) -> std::optional<std::string_view> {
             if (const auto* cli = last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
-            if (const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env)) return env;
+            if (const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env))
+                return effective_env_value(lever, env);
             return std::nullopt;
         }, out.allow_pending);
     for (const auto& lever : engine.table) {
@@ -1268,7 +1276,8 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
         if (cli != nullptr || env != nullptr) {  // a set variable is explicit even when empty (the app judges it)
             entry.requested = cli != nullptr ? *cli : std::string(env);
-            entry.value = cli != nullptr ? *cli : std::string(env);
+            if (cli != nullptr) entry.value = *cli;
+            else entry.value = effective_env_value(lever, env);
             entry.status = cli != nullptr ? Status::explicit_cli : Status::explicit_env;
             if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
         } else if (wanted.empty() || wanted == lever.builtin) {

@@ -11,8 +11,7 @@
 // --prompt-rows, stamped "unqualified"). The layer split (pair cut, windows crossing as FP32 rows) changes no bit and is
 // not a profile lever; on the pair, when no width is given, the width and the interleaved stage map per prompt length
 // come from the shared planner over the measured pair cost (src/hy4/hip/hy4_hip_plan.hpp pair_stage_plan; the resolver
-// stamps the width). No TURBO version: turbo is
-// refused. Promoting a regime after its gate is one `qualified` row, never code. Host-only.
+// stamps the width). TURBO inherits FAST while no higher cell has evidence. Host-only.
 #include "strix/engine_profile.hpp"
 
 #include <cstdint>
@@ -47,6 +46,18 @@ inline constexpr sp::Lever table[] = {
      .source = "K_b^T re-quantised once (core::q8_0::transpose), A8 latent, bf16 K / V images; FAST gate v2 per regime: "
                "see `qualified`",
      .provisional = {false, false, false, false}},
+    {.name = "decode_iu4", .env = "", .option = "", .value = {"", "", "", "attn_gate+attn_q_b+indexer.attn_q_b"},
+     .builtin = "off", .kind = sp::Kind::pack, .target = "GPTQ IU4 attention projection copies", .off = "off",
+     .source = "pending the GPTQ pack and the production IU4 loader/dispatch binding", .omit_builtin_fingerprint = true},
+    {.name = "pf_a8_producer", .env = "STRIX_HY4_PF_A8_PRODUCER", .option = "", .value = {}, .builtin = "1",
+     .kind = sp::Kind::exact, .target = "", .off = "0", .source = "produce identical A8 rows in the prefill epilogue",
+     .omit_builtin_fingerprint = true, .env_flag_match = EnvFlagMatch::first_character},
+    {.name = "q8_store_epilogue", .env = "STRIX_HY4_Q8_STORE_EPILOGUE", .option = "", .value = {}, .builtin = "1",
+     .kind = sp::Kind::exact, .target = "", .off = "0", .source = "fuse the decode store epilogue",
+     .omit_builtin_fingerprint = true, .env_flag_match = EnvFlagMatch::first_character},
+    {.name = "pf_store_epilogue", .env = "STRIX_HY4_PF_STORE_EPILOGUE", .option = "", .value = {}, .builtin = "1",
+     .kind = sp::Kind::exact, .target = "", .off = "0", .source = "fuse the prefill BF16 store epilogue",
+     .omit_builtin_fingerprint = true, .env_flag_match = EnvFlagMatch::first_character},
 };
 
 // Regime of a run, known before the forward loads. An unknown device resolves every FAST cell to pending.
@@ -135,7 +146,7 @@ inline constexpr Qualified incumbent_grants[] = {
 
 // The static engine (rows as declared, every FAST cell pending): option names for take_options; runs resolve below.
 [[nodiscard]] inline const sp::Engine& engine() {
-    static const sp::Engine e{"hy4-hip", "STRIX_HY4_PROFILE_ALLOW_PENDING", table};
+    static const sp::Engine e{"hy4-hip", "STRIX_HY4_PROFILE_ALLOW_PENDING", table, false, "hy4-turbo-v1"};
     return e;
 }
 

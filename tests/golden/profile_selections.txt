@@ -112,7 +112,17 @@ A qwen35-hip-spec turbo throws qwen35-hip-spec: --profile turbo is not declared 
 A hy4-hip fast prompt_rows=0 s4
 A hy4-hip fast head_q8=0 s4
 A hy4-hip fast pf_mha=0 s4
-A hy4-hip turbo throws hy4-hip: --profile turbo is not declared for this engine
+A hy4-hip fast decode_iu4=off s3
+A hy4-hip fast pf_a8_producer=1 s3
+A hy4-hip fast q8_store_epilogue=1 s3
+A hy4-hip fast pf_store_epilogue=1 s3
+A hy4-hip turbo prompt_rows=0 s4
+A hy4-hip turbo head_q8=0 s4
+A hy4-hip turbo pf_mha=0 s4
+A hy4-hip turbo decode_iu4=off s4
+A hy4-hip turbo pf_a8_producer=1 s3
+A hy4-hip turbo q8_store_epilogue=1 s3
+A hy4-hip turbo pf_store_epilogue=1 s3
 A inkling2-mini fast inkling2-mini-moe-w4a4@1=0 s4
 A inkling2-mini fast inkling2-mini-combine-down-image@1=0 s3
 A inkling2-mini fast inkling2-mini-prepared-round-fold@1=0 s3
@@ -763,67 +773,227 @@ F glm-rtx fast dsa_index_mma=fp32 s3
 G hy4 fast d0 t0 ctx=0 prompt_rows=0 s4
 G hy4 fast d0 t0 ctx=0 head_q8=0 s4
 G hy4 fast d0 t0 ctx=0 pf_mha=0 s4
+G hy4 fast d0 t0 ctx=0 decode_iu4=off s3
+G hy4 fast d0 t0 ctx=0 pf_a8_producer=1 s3
+G hy4 fast d0 t0 ctx=0 q8_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=0 pf_store_epilogue=1 s3
 G hy4 fast d0 t0 ctx=4096 prompt_rows=0 s4
 G hy4 fast d0 t0 ctx=4096 head_q8=0 s4
 G hy4 fast d0 t0 ctx=4096 pf_mha=0 s4
+G hy4 fast d0 t0 ctx=4096 decode_iu4=off s3
+G hy4 fast d0 t0 ctx=4096 pf_a8_producer=1 s3
+G hy4 fast d0 t0 ctx=4096 q8_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=4096 pf_store_epilogue=1 s3
 G hy4 fast d0 t0 ctx=8192 prompt_rows=0 s4
 G hy4 fast d0 t0 ctx=8192 head_q8=0 s4
 G hy4 fast d0 t0 ctx=8192 pf_mha=0 s4
+G hy4 fast d0 t0 ctx=8192 decode_iu4=off s3
+G hy4 fast d0 t0 ctx=8192 pf_a8_producer=1 s3
+G hy4 fast d0 t0 ctx=8192 q8_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=8192 pf_store_epilogue=1 s3
 G hy4 fast d0 t0 ctx=32768 prompt_rows=0 s4
 G hy4 fast d0 t0 ctx=32768 head_q8=0 s4
 G hy4 fast d0 t0 ctx=32768 pf_mha=0 s4
+G hy4 fast d0 t0 ctx=32768 decode_iu4=off s3
+G hy4 fast d0 t0 ctx=32768 pf_a8_producer=1 s3
+G hy4 fast d0 t0 ctx=32768 q8_store_epilogue=1 s3
+G hy4 fast d0 t0 ctx=32768 pf_store_epilogue=1 s3
 G hy4 fast d0 t1 ctx=0 prompt_rows=0 s4
 G hy4 fast d0 t1 ctx=0 head_q8=0 s4
 G hy4 fast d0 t1 ctx=0 pf_mha=0 s4
+G hy4 fast d0 t1 ctx=0 decode_iu4=off s3
+G hy4 fast d0 t1 ctx=0 pf_a8_producer=1 s3
+G hy4 fast d0 t1 ctx=0 q8_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=0 pf_store_epilogue=1 s3
 G hy4 fast d0 t1 ctx=4096 prompt_rows=0 s4
 G hy4 fast d0 t1 ctx=4096 head_q8=0 s4
 G hy4 fast d0 t1 ctx=4096 pf_mha=0 s4
+G hy4 fast d0 t1 ctx=4096 decode_iu4=off s3
+G hy4 fast d0 t1 ctx=4096 pf_a8_producer=1 s3
+G hy4 fast d0 t1 ctx=4096 q8_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=4096 pf_store_epilogue=1 s3
 G hy4 fast d0 t1 ctx=8192 prompt_rows=0 s4
 G hy4 fast d0 t1 ctx=8192 head_q8=0 s4
 G hy4 fast d0 t1 ctx=8192 pf_mha=0 s4
+G hy4 fast d0 t1 ctx=8192 decode_iu4=off s3
+G hy4 fast d0 t1 ctx=8192 pf_a8_producer=1 s3
+G hy4 fast d0 t1 ctx=8192 q8_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=8192 pf_store_epilogue=1 s3
 G hy4 fast d0 t1 ctx=32768 prompt_rows=0 s4
 G hy4 fast d0 t1 ctx=32768 head_q8=0 s4
 G hy4 fast d0 t1 ctx=32768 pf_mha=0 s4
+G hy4 fast d0 t1 ctx=32768 decode_iu4=off s3
+G hy4 fast d0 t1 ctx=32768 pf_a8_producer=1 s3
+G hy4 fast d0 t1 ctx=32768 q8_store_epilogue=1 s3
+G hy4 fast d0 t1 ctx=32768 pf_store_epilogue=1 s3
 G hy4 fast d1 t0 ctx=0 prompt_rows=4096 s0
 G hy4 fast d1 t0 ctx=0 head_q8=1 s0
 G hy4 fast d1 t0 ctx=0 pf_mha=1 s0
+G hy4 fast d1 t0 ctx=0 decode_iu4=off s3
+G hy4 fast d1 t0 ctx=0 pf_a8_producer=1 s3
+G hy4 fast d1 t0 ctx=0 q8_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=0 pf_store_epilogue=1 s3
 G hy4 fast d1 t0 ctx=4096 prompt_rows=4096 s0
 G hy4 fast d1 t0 ctx=4096 head_q8=1 s0
 G hy4 fast d1 t0 ctx=4096 pf_mha=1 s0
+G hy4 fast d1 t0 ctx=4096 decode_iu4=off s3
+G hy4 fast d1 t0 ctx=4096 pf_a8_producer=1 s3
+G hy4 fast d1 t0 ctx=4096 q8_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=4096 pf_store_epilogue=1 s3
 G hy4 fast d1 t0 ctx=8192 prompt_rows=4096 s0
 G hy4 fast d1 t0 ctx=8192 head_q8=1 s0
 G hy4 fast d1 t0 ctx=8192 pf_mha=1 s0
+G hy4 fast d1 t0 ctx=8192 decode_iu4=off s3
+G hy4 fast d1 t0 ctx=8192 pf_a8_producer=1 s3
+G hy4 fast d1 t0 ctx=8192 q8_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=8192 pf_store_epilogue=1 s3
 G hy4 fast d1 t0 ctx=32768 prompt_rows=0 s4
 G hy4 fast d1 t0 ctx=32768 head_q8=1 s0
 G hy4 fast d1 t0 ctx=32768 pf_mha=0 s4
+G hy4 fast d1 t0 ctx=32768 decode_iu4=off s3
+G hy4 fast d1 t0 ctx=32768 pf_a8_producer=1 s3
+G hy4 fast d1 t0 ctx=32768 q8_store_epilogue=1 s3
+G hy4 fast d1 t0 ctx=32768 pf_store_epilogue=1 s3
 G hy4 fast d1 t1 ctx=0 prompt_rows=4096 s0
 G hy4 fast d1 t1 ctx=0 head_q8=1 s0
 G hy4 fast d1 t1 ctx=0 pf_mha=0 s4
+G hy4 fast d1 t1 ctx=0 decode_iu4=off s3
+G hy4 fast d1 t1 ctx=0 pf_a8_producer=1 s3
+G hy4 fast d1 t1 ctx=0 q8_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=0 pf_store_epilogue=1 s3
 G hy4 fast d1 t1 ctx=4096 prompt_rows=4096 s0
 G hy4 fast d1 t1 ctx=4096 head_q8=1 s0
 G hy4 fast d1 t1 ctx=4096 pf_mha=0 s4
+G hy4 fast d1 t1 ctx=4096 decode_iu4=off s3
+G hy4 fast d1 t1 ctx=4096 pf_a8_producer=1 s3
+G hy4 fast d1 t1 ctx=4096 q8_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=4096 pf_store_epilogue=1 s3
 G hy4 fast d1 t1 ctx=8192 prompt_rows=4096 s0
 G hy4 fast d1 t1 ctx=8192 head_q8=1 s0
 G hy4 fast d1 t1 ctx=8192 pf_mha=0 s4
+G hy4 fast d1 t1 ctx=8192 decode_iu4=off s3
+G hy4 fast d1 t1 ctx=8192 pf_a8_producer=1 s3
+G hy4 fast d1 t1 ctx=8192 q8_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=8192 pf_store_epilogue=1 s3
 G hy4 fast d1 t1 ctx=32768 prompt_rows=0 s4
 G hy4 fast d1 t1 ctx=32768 head_q8=1 s0
 G hy4 fast d1 t1 ctx=32768 pf_mha=0 s4
-G hy4 turbo d0 t0 ctx=0 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d0 t0 ctx=4096 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d0 t0 ctx=8192 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d0 t0 ctx=32768 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d0 t1 ctx=0 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d0 t1 ctx=4096 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d0 t1 ctx=8192 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d0 t1 ctx=32768 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d1 t0 ctx=0 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d1 t0 ctx=4096 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d1 t0 ctx=8192 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d1 t0 ctx=32768 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d1 t1 ctx=0 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d1 t1 ctx=4096 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d1 t1 ctx=8192 throws hy4-hip: --profile turbo is not declared for this engine
-G hy4 turbo d1 t1 ctx=32768 throws hy4-hip: --profile turbo is not declared for this engine
+G hy4 fast d1 t1 ctx=32768 decode_iu4=off s3
+G hy4 fast d1 t1 ctx=32768 pf_a8_producer=1 s3
+G hy4 fast d1 t1 ctx=32768 q8_store_epilogue=1 s3
+G hy4 fast d1 t1 ctx=32768 pf_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=0 prompt_rows=0 s4
+G hy4 turbo d0 t0 ctx=0 head_q8=0 s4
+G hy4 turbo d0 t0 ctx=0 pf_mha=0 s4
+G hy4 turbo d0 t0 ctx=0 decode_iu4=off s4
+G hy4 turbo d0 t0 ctx=0 pf_a8_producer=1 s3
+G hy4 turbo d0 t0 ctx=0 q8_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=0 pf_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=4096 prompt_rows=0 s4
+G hy4 turbo d0 t0 ctx=4096 head_q8=0 s4
+G hy4 turbo d0 t0 ctx=4096 pf_mha=0 s4
+G hy4 turbo d0 t0 ctx=4096 decode_iu4=off s4
+G hy4 turbo d0 t0 ctx=4096 pf_a8_producer=1 s3
+G hy4 turbo d0 t0 ctx=4096 q8_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=4096 pf_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=8192 prompt_rows=0 s4
+G hy4 turbo d0 t0 ctx=8192 head_q8=0 s4
+G hy4 turbo d0 t0 ctx=8192 pf_mha=0 s4
+G hy4 turbo d0 t0 ctx=8192 decode_iu4=off s4
+G hy4 turbo d0 t0 ctx=8192 pf_a8_producer=1 s3
+G hy4 turbo d0 t0 ctx=8192 q8_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=8192 pf_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=32768 prompt_rows=0 s4
+G hy4 turbo d0 t0 ctx=32768 head_q8=0 s4
+G hy4 turbo d0 t0 ctx=32768 pf_mha=0 s4
+G hy4 turbo d0 t0 ctx=32768 decode_iu4=off s4
+G hy4 turbo d0 t0 ctx=32768 pf_a8_producer=1 s3
+G hy4 turbo d0 t0 ctx=32768 q8_store_epilogue=1 s3
+G hy4 turbo d0 t0 ctx=32768 pf_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=0 prompt_rows=0 s4
+G hy4 turbo d0 t1 ctx=0 head_q8=0 s4
+G hy4 turbo d0 t1 ctx=0 pf_mha=0 s4
+G hy4 turbo d0 t1 ctx=0 decode_iu4=off s4
+G hy4 turbo d0 t1 ctx=0 pf_a8_producer=1 s3
+G hy4 turbo d0 t1 ctx=0 q8_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=0 pf_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=4096 prompt_rows=0 s4
+G hy4 turbo d0 t1 ctx=4096 head_q8=0 s4
+G hy4 turbo d0 t1 ctx=4096 pf_mha=0 s4
+G hy4 turbo d0 t1 ctx=4096 decode_iu4=off s4
+G hy4 turbo d0 t1 ctx=4096 pf_a8_producer=1 s3
+G hy4 turbo d0 t1 ctx=4096 q8_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=4096 pf_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=8192 prompt_rows=0 s4
+G hy4 turbo d0 t1 ctx=8192 head_q8=0 s4
+G hy4 turbo d0 t1 ctx=8192 pf_mha=0 s4
+G hy4 turbo d0 t1 ctx=8192 decode_iu4=off s4
+G hy4 turbo d0 t1 ctx=8192 pf_a8_producer=1 s3
+G hy4 turbo d0 t1 ctx=8192 q8_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=8192 pf_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=32768 prompt_rows=0 s4
+G hy4 turbo d0 t1 ctx=32768 head_q8=0 s4
+G hy4 turbo d0 t1 ctx=32768 pf_mha=0 s4
+G hy4 turbo d0 t1 ctx=32768 decode_iu4=off s4
+G hy4 turbo d0 t1 ctx=32768 pf_a8_producer=1 s3
+G hy4 turbo d0 t1 ctx=32768 q8_store_epilogue=1 s3
+G hy4 turbo d0 t1 ctx=32768 pf_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=0 prompt_rows=4096 s0
+G hy4 turbo d1 t0 ctx=0 head_q8=1 s0
+G hy4 turbo d1 t0 ctx=0 pf_mha=1 s0
+G hy4 turbo d1 t0 ctx=0 decode_iu4=off s4
+G hy4 turbo d1 t0 ctx=0 pf_a8_producer=1 s3
+G hy4 turbo d1 t0 ctx=0 q8_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=0 pf_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=4096 prompt_rows=4096 s0
+G hy4 turbo d1 t0 ctx=4096 head_q8=1 s0
+G hy4 turbo d1 t0 ctx=4096 pf_mha=1 s0
+G hy4 turbo d1 t0 ctx=4096 decode_iu4=off s4
+G hy4 turbo d1 t0 ctx=4096 pf_a8_producer=1 s3
+G hy4 turbo d1 t0 ctx=4096 q8_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=4096 pf_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=8192 prompt_rows=4096 s0
+G hy4 turbo d1 t0 ctx=8192 head_q8=1 s0
+G hy4 turbo d1 t0 ctx=8192 pf_mha=1 s0
+G hy4 turbo d1 t0 ctx=8192 decode_iu4=off s4
+G hy4 turbo d1 t0 ctx=8192 pf_a8_producer=1 s3
+G hy4 turbo d1 t0 ctx=8192 q8_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=8192 pf_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=32768 prompt_rows=0 s4
+G hy4 turbo d1 t0 ctx=32768 head_q8=1 s0
+G hy4 turbo d1 t0 ctx=32768 pf_mha=0 s4
+G hy4 turbo d1 t0 ctx=32768 decode_iu4=off s4
+G hy4 turbo d1 t0 ctx=32768 pf_a8_producer=1 s3
+G hy4 turbo d1 t0 ctx=32768 q8_store_epilogue=1 s3
+G hy4 turbo d1 t0 ctx=32768 pf_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=0 prompt_rows=4096 s0
+G hy4 turbo d1 t1 ctx=0 head_q8=1 s0
+G hy4 turbo d1 t1 ctx=0 pf_mha=0 s4
+G hy4 turbo d1 t1 ctx=0 decode_iu4=off s4
+G hy4 turbo d1 t1 ctx=0 pf_a8_producer=1 s3
+G hy4 turbo d1 t1 ctx=0 q8_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=0 pf_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=4096 prompt_rows=4096 s0
+G hy4 turbo d1 t1 ctx=4096 head_q8=1 s0
+G hy4 turbo d1 t1 ctx=4096 pf_mha=0 s4
+G hy4 turbo d1 t1 ctx=4096 decode_iu4=off s4
+G hy4 turbo d1 t1 ctx=4096 pf_a8_producer=1 s3
+G hy4 turbo d1 t1 ctx=4096 q8_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=4096 pf_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=8192 prompt_rows=4096 s0
+G hy4 turbo d1 t1 ctx=8192 head_q8=1 s0
+G hy4 turbo d1 t1 ctx=8192 pf_mha=0 s4
+G hy4 turbo d1 t1 ctx=8192 decode_iu4=off s4
+G hy4 turbo d1 t1 ctx=8192 pf_a8_producer=1 s3
+G hy4 turbo d1 t1 ctx=8192 q8_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=8192 pf_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=32768 prompt_rows=0 s4
+G hy4 turbo d1 t1 ctx=32768 head_q8=1 s0
+G hy4 turbo d1 t1 ctx=32768 pf_mha=0 s4
+G hy4 turbo d1 t1 ctx=32768 decode_iu4=off s4
+G hy4 turbo d1 t1 ctx=32768 pf_a8_producer=1 s3
+G hy4 turbo d1 t1 ctx=32768 q8_store_epilogue=1 s3
+G hy4 turbo d1 t1 ctx=32768 pf_store_epilogue=1 s3
 H minimax fast msa_flash=1 router_wmma=1 bundle=1 id=prefill_msa=msa-flash-bf16-l40-v1;prefill_router=mm-pf-router-wmma-v1-l40-59;prefill_order=mmx-pf-linear-s1-v1
 H minimax fast msa_flash=1 s0
 H minimax fast msa_flash_layers=40-59 s1

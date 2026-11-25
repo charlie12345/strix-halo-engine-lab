@@ -61,7 +61,13 @@ struct VisionStack {
     budget.exact_bytes = check_projector_bytes(header);
     budget.max_bytes = budget.exact_bytes;
     auto st = std::make_unique<VisionStack>(vision::GgufWeights{file, vision_gguf_limits(), budget});
-    st->model = model;
+    // The bytes actually loaded (and hashed below) are judged again from their own tensor table: a same-length
+    // replacement between the header read and the load must pass the same schema, language match and byte budget, and
+    // the stack's configuration is the loaded file's.
+    st->model = validate_vision(st->source.info());
+    require_vision_matches_language(st->model, kLanguageHidden, kLanguageVocab, kImageToken);
+    if (check_projector_bytes(st->source.info()) != budget.exact_bytes)
+        throw std::invalid_argument("GLM vision: the projector file changed while it was read");
     const auto sha = strix::sha256_bytes_fast(std::span<const std::byte>(st->source.bytes()));
     // The template text of an image must be the three vocabulary tokens the adapter was written for.
     if (encode(kImageText) != std::vector<std::uint32_t>{kImageToken} ||

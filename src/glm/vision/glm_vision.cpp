@@ -224,6 +224,13 @@ std::uint64_t check_projector_bytes(const gguf::FileInfo& info) {
         last = std::max(last, t.absolute_end);
     }
     require(info.file_size - last <= kMaxProjectorTrailingBytes, "the projector file has bytes after its last tensor");
+    // The file's length is bounded on its own, whatever offsets the header declares: a header of at most
+    // kMaxProjectorHeaderBytes, the tensors, at most one alignment pad (capped) per tensor and the trailing allowance.
+    // A sparse gap before or between tensors is refused here, before the host budget takes the file's length.
+    require(info.data_offset <= kMaxProjectorHeaderBytes, "the projector header exceeds " + std::to_string(kMaxProjectorHeaderBytes) + " bytes");
+    const std::uint64_t pad = std::min<std::uint64_t>(std::max<std::uint64_t>(info.alignment, 1U), kMaxProjectorAlignment);
+    const std::uint64_t slack = info.data_offset + kMaxProjectorTrailingBytes + pad * info.tensors.size();
+    require(info.file_size - total <= slack, "the projector file has unaccounted bytes (a gap before or between tensors)");
     return info.file_size;
 }
 

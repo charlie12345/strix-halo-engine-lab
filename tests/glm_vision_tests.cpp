@@ -469,6 +469,24 @@ void test_projector_bytes() {
     CHECK(throws([&] { (void)glm::check_projector_bytes(mutated([](gguf::FileInfo& i) { i.tensors.front().byte_size = glm::kMaxProjectorTensorBytes + 1U; })); },
                  "exceed"));
     CHECK(throws([&] { (void)glm::check_projector_bytes(mutated([](gguf::FileInfo& i) { i.data_offset = i.file_size + 1U; })); }, "shorter than its header"));
+    // A large aligned gap before the tensors or between two of them: every tensor still lies inside the file and the
+    // tail is within the allowance, but the length is not accounted for by the header and tensors.
+    constexpr std::uint64_t gap = std::uint64_t{1} << 30U;
+    const auto shift_from = [&](std::size_t first) {
+        return mutated([&](gguf::FileInfo& i) {
+            for (std::size_t t = first; t < i.tensors.size(); ++t) {
+                i.tensors[t].absolute_offset += gap;
+                i.tensors[t].absolute_end += gap;
+            }
+            i.file_size += gap;
+        });
+    };
+    CHECK(throws([&] { (void)glm::check_projector_bytes(shift_from(0)); }, "unaccounted bytes"));
+    if (info.tensors.size() > 1) CHECK(throws([&] { (void)glm::check_projector_bytes(shift_from(1)); }, "unaccounted bytes"));
+    CHECK(throws([&] { (void)glm::check_projector_bytes(mutated([](gguf::FileInfo& i) {
+                     i.data_offset = glm::kMaxProjectorHeaderBytes + 1U;
+                     i.file_size += glm::kMaxProjectorHeaderBytes + 1U;
+                 })); }, "header exceeds"));
 }
 
 }  // namespace

@@ -69,6 +69,11 @@ struct VisionConfig {
 // std::invalid_argument.
 inline constexpr std::uint64_t kMaxProjectorTensorBytes = std::uint64_t{4} << 30U;
 inline constexpr std::uint64_t kMaxProjectorTrailingBytes = std::uint64_t{1} << 20U;
+// The file length is also capped independently of the declared offsets: header (metadata and tensor table) at most
+// kMaxProjectorHeaderBytes, and every byte not in a tensor accounted for by the header, one alignment pad per tensor
+// (at most kMaxProjectorAlignment) or the trailing allowance, so no gap before or between tensors can grow the file.
+inline constexpr std::uint64_t kMaxProjectorHeaderBytes = std::uint64_t{64} << 20U;
+inline constexpr std::uint64_t kMaxProjectorAlignment = 4096;
 std::uint64_t check_projector_bytes(const gguf::FileInfo& info);
 // The tower must belong to the language model: projection width and a token id inside the vocabulary.
 void require_vision_matches_language(const VisionConfig& vision, std::uint32_t hidden, std::uint32_t vocab,

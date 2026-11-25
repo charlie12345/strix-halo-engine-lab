@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include "strix/engine_profile.hpp"
+#include "core/layer_set.hpp"
 #include "strix/session/kv_precision.hpp"
 #include "xport/split_frame.hpp"
 #include "xport/exchange_format.hpp"
@@ -67,6 +68,8 @@ std::vector<Resolved> resolve(const Lookup& env);  // pure: same order as items(
 // config and the rank agreement all call it. Invalid member values throw std::invalid_argument naming the variable.
 struct PrefillPolicy {
     std::map<std::string, std::string> canonical;  // expanded bundle switch and members (strix/fast_profile.hpp)
+    bool fast_i4 = false;
+    strix::core::LayerSet iu4_layers;
     unsigned msa_flash = 0;                        // 0 exact in-block kernel, 1 one-term BF16, 2 two-term operands
     unsigned msa_flash_requested = 0;              // selected before static execution guards
     std::string msa_flash_layers;                  // layer set text the engine parses (builtin kMsaFlashLayers)

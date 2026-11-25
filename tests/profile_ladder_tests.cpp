@@ -648,34 +648,16 @@ void incumbents(const char* golden, bool write) {
     for (std::size_t i = 0; i < before.size() && i < now.size(); ++i)
         require(before[i] == now[i], "selection moved: '" + before[i] + "' -> '" + now[i] + "'");
 }
-// TURBO columns that leave a FAST member off are compatibility opt-outs kept from before the ladder rule, not measured
-// claims: the nested rule (TURBO over the admitted FAST set) does not hold for them. The exact list is pinned here; a new
-// opt-out must be a deliberate change of this list, and an off cell without the opt-out receipt is a defect.
-void compatibility_opt_outs(std::span<const p::Engine> engines) {
-    std::set<std::string> found;
+// TURBO nests FAST: no TURBO column of any engine table leaves a FAST member off (a TURBO cell spelling the builtin
+// over a FAST value). An empty TURBO cell runs the FAST cell.
+void turbo_nests_fast(std::span<const p::Engine> engines) {
     for (const auto& engine : engines)
-        for (const auto& row : engine.ladder) {
-            if (!row.incumbent || row.tier != p::Name::turbo) continue;
-            const p::Lever* lever = nullptr;
-            for (const auto& candidate : engine.table)
-                if (candidate.name == row.lever) lever = &candidate;
-            if (lever == nullptr) continue;
-            const auto fast = lever->value[static_cast<unsigned>(p::Name::fast)];
-            const auto turbo = lever->value[static_cast<unsigned>(p::Name::turbo)];
-            const bool leaves_fast_off = !fast.empty() && !turbo.empty() && turbo != fast && turbo == lever->builtin;
-            const bool opt_out_receipt = row.receipt == p::kTurboOffBeforeLadder;
-            require(leaves_fast_off == opt_out_receipt, std::string(engine.tag) + "/" + std::string(row.lever) +
-                    ": a TURBO cell that leaves a FAST member off must carry the compatibility opt-out receipt");
-            if (opt_out_receipt) found.insert(std::string(engine.tag) + "/" + std::string(row.lever));
+        for (const auto& lever : engine.table) {
+            const auto fast = lever.value[static_cast<unsigned>(p::Name::fast)];
+            const auto turbo = lever.value[static_cast<unsigned>(p::Name::turbo)];
+            require(fast.empty() || turbo.empty() || turbo == fast || turbo != lever.builtin,
+                    std::string(engine.tag) + "/" + std::string(lever.name) + ": a TURBO cell leaves a FAST member off");
         }
-    const std::set<std::string> expected{"deepseek41-pair/fast_prefill", "deepseek41-pair/engram_f16wmma",
-                                         "deepseek41-pair/shared_f16", "deepseek41-pair/moe_f16wmma",
-                                         "minimax-pair/router_wmma"};
-    if (found != expected) {
-        std::string got;
-        for (const auto& item : found) got += " " + item;
-        require(false, "compatibility opt-out list changed:" + got);
-    }
 }
 
 // A paired decision is admitted only by a row measured on the pair (LadderRow::joint): single-cell rows of either half
@@ -1399,7 +1381,7 @@ int main(int argc, char** argv) try {
                     return engine.tag == tag || (tag == "hy4" && engine.tag == "hy4-hip");
                 }), "profile registry entry must be covered: " + tag);
     }
-    compatibility_opt_outs(engines);
+    turbo_nests_fast(engines);
     paired_rows();
     hy4_new_quality_rows();
     for (const auto& engine : engines) walk(engine);

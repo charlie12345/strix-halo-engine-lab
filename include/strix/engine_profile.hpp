@@ -262,13 +262,6 @@ struct LadderRow {
 // Receipts of incumbent grants for cells that ran before the ladder rule without a quality gate of their own.
 inline constexpr std::string_view kProvisionalBeforeLadder =
     "provisional cell selected before the ladder rule; the row's source names the qualification in progress";
-// Compatibility opt-out, not a measured claim: a TURBO column that leaves a FAST member off ("0" over the FAST "1") ran
-// that way before the ladder rule and keeps doing so. The nested rule (TURBO resolves over the admitted FAST set) does not
-// hold for these cells; each table lists them as incumbent grants with this receipt (DeepSeek 4.1 pair: fast_prefill,
-// engram_f16wmma, shared_f16, moe_f16wmma; MiniMax: router_wmma) and a test pins the exact list.
-inline constexpr std::string_view kTurboOffBeforeLadder =
-    "compatibility opt-out kept from before the ladder rule: this TURBO column leaves the FAST member off; no measured claim against FAST";
-
 // An incumbent grant row (LadderRow::incumbent). `value` empty: the tier's cell.
 [[nodiscard]] constexpr LadderRow incumbent_cell(std::string_view lever, std::string_view value, Name tier,
                                                  std::string_view receipt) noexcept {

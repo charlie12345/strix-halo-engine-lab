@@ -100,8 +100,8 @@ inline constexpr std::array<strix::profile::Lever, 10> profile_table{{
     // Explicit only: 32K quality gate failed; no profile selects f16.
     strix::xport::exchange_format_lever(),
     // Prefill only: router product of the listed MoE layers on the FP16 WMMA core; sigmoid, bias and selection unchanged.
-    // fast: member of mm-fast-pf-v2 (see msa_flash). Turbo cell "0" = builtin: turbo keeps its pre-bundle rows.
-    {"router_wmma", "STRIX_MM_PF_ROUTER_WMMA", "", {"", "1", "", "0"}, "0", strix::profile::Kind::bit_changing,
+    // fast: member of mm-fast-pf-v2 (see msa_flash); TURBO nests FAST (empty cell).
+    {"router_wmma", "STRIX_MM_PF_ROUTER_WMMA", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, true, true, false}, {true, true, true, false}, "", "0",
      "mm-pf-router-wmma-v1, bundle mm-fast-pf-v2 (gate PASS 8K KL 0.0020 and 32K with the bundle)", false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {"router_wmma_layers", "STRIX_MM_PF_ROUTER_WMMA_LAYERS", "", {"", "", "", ""}, kRouterWmmaLayers, strix::profile::Kind::bit_changing,
@@ -116,13 +116,11 @@ inline constexpr std::array<strix::profile::Lever, 10> profile_table{{
 }};
 
 // Ladder rows (strix::profile::LadderRow): incumbent grants for the mm-fast-pf-v2 bundle members the resolver ran before
-// the ladder rule, and the turbo cell that keeps the router member off: a compatibility opt-out (kTurboOffBeforeLadder),
-// not a measured claim; TURBO of this table does not resolve over the admitted FAST set for router_wmma.
+// the ladder rule. TURBO nests FAST (it resolves over the admitted FAST set).
 inline constexpr strix::profile::LadderRow ladder_rows[] = {
     strix::profile::incumbent_cell("msa_flash", "1", strix::profile::Name::fast,
                                    "bundle mm-fast-pf-v2: EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029"),
     strix::profile::incumbent_cell("router_wmma", "1", strix::profile::Name::fast,
-                                   "bundle mm-fast-pf-v2: gate PASS 8K KL 0.0020 and 32K with the bundle"),
-    strix::profile::incumbent_cell("router_wmma", "0", strix::profile::Name::turbo, strix::profile::kTurboOffBeforeLadder)};
+                                   "bundle mm-fast-pf-v2: gate PASS 8K KL 0.0020 and 32K with the bundle")};
 
 }  // namespace strix::minimax::defaults

@@ -14,26 +14,27 @@ namespace strix::deepseek41::pair_defaults {
 
 inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
     // Prefill only (device prefill of the serve and the prefill app). FP32 softmax statistics.
-    {"attention_f16wmma", "STRIX_DS41_FAST_ATTN", "", {"", "1", "", "2"}, "0", strix::profile::Kind::bit_changing,
+    {"attention_f16wmma", "STRIX_DS41_FAST_ATTN", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, true}, "ds41-attn-f16wmma-v1", "0",
-     "pending: qualification receipt for ds41-attn-f16wmma-v1 (f16 WMMA sparse attention); runnable with --allow-pending; turbo = 2 (ds41-attn-bf16flash-v1, the FAST bundle member)",
-     false, {false, false, false, true}, false, {}, {{{"0", "v1"}, {"1", "ds41-attn-f16wmma-v1"}, {"2", "ds41-attn-f16wmma-v1"}}}},
+     "pending: qualification receipt for ds41-attn-f16wmma-v1 (f16 WMMA sparse attention); runnable with --allow-pending; fast and turbo run 2 (ds41-attn-bf16flash-v1) through the FAST bundle",
+     false, {false, false, false, false}, false, {}, {{{"0", "v1"}, {"1", "ds41-attn-f16wmma-v1"}, {"2", "ds41-attn-f16wmma-v1"}}}},
     // Prefill only: routed MoE IQ2_XXS gate/up + Q2_K down with FMA accumulation in ascending group order. Applied by
     // 'fast' while its qualification runs (provisional, never stamped qualified); 'default' and 'quality' never set it.
     {"moe_relaxed", "STRIX_DS41_FAST_MOE", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
      "selected for fast ahead of its qualification receipt (ds41-moe-relaxed-v1, in progress); changes logits",
      false, {false, true, false, false}, false, {}, {{{"0", "v1"}, {"1", "v1"}}}},
-    {"dense_f16", "STRIX_DS41_FAST_DENSE", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, true}, "", "0", "FAST dense (ds41-dense-f16-v1), selected by turbo ahead of qualification; the exact dense guard stays (dense_min_rows 128)", false,
-     {false, false, false, true}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
+    {"dense_f16", "STRIX_DS41_FAST_DENSE", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, true}, "", "0", "FAST dense (ds41-dense-f16-v1), a member of the FAST bundle (fast and turbo run it through the bundle); the exact dense guard stays (dense_min_rows 128)", false,
+     {false, false, false, false}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     // FAST prefill bundle ds41-fast-pf-v1 (attention bf16flash-v1 + moe-relaxed-v1 + dense-f16-v1, strix/ds41_fast_profile.hpp).
     // 'fast' selects it (expanded exactly as the switch: src/deepseek41_pair_defaults.cpp resolve); a set switch wins.
     // The fast cells of this row and of engram_f16wmma / shared_f16 / moe_f16wmma are selected for fast ahead of a full
     // receipt (provisional): the FAST gate v2 of exactly this resolved set (no replay, tools/strix-gate/gate_v2.py) is
     // final PASS for prompts <= 8,192 (882 rows) and provisional above (32K class 126 rows < 800). The ledger
-    // `fast_gates` below holds the receipt; the row flips to qualified when the 32K class is final. Turbo keeps "0".
-    {"fast_prefill", "STRIX_DS41_FAST_PREFILL", "", {"", "1", "", "0"}, "0", strix::profile::Kind::bit_changing,
+    // `fast_gates` below holds the receipt; the row flips to qualified when the 32K class is final. TURBO nests FAST: its
+    // empty cells run the same bundle and members, each set once (by the bundle).
+    {"fast_prefill", "STRIX_DS41_FAST_PREFILL", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
      "FAST bundle ds41-fast-pf-v1 with the three levers below; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800)",
      false, {false, true, false, false}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
@@ -49,18 +50,18 @@ inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
      "explicit FAST policy ds41-decoder-replay-bounded-v1, R >= 256 (smaller bounds refused); not qualified on its key floor round_down(T - R, 256) (the R = 256 gate ran on the floor T - R), so no profile sets it; turbo R=128 (ds41-replay-r128) pending", false, {}, true, {}, {{{"0", "v1"}, {"128", "v1"}}}},
     // Prefill only: the Engram KV projection on the shared FP16 WMMA core (ds41-engram-f16wmma-v1); views whose x would overflow FP16
     // keep the exact kernel. Not a bundle member (the env bundle ds41-fast-pf-v1 keeps its identity); 'fast' selects it.
-    {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "1", "", "0"}, "0", strix::profile::Kind::bit_changing,
+    {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
      "FAST Engram projection ds41-engram-f16wmma-v1 in the fast set; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800); not a turbo member",
      false, {false, true, false, false}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     // Prefill only: the shared expert's three Q8_0 x A8 products on the FAST dense core (ds41-shared-f16-v1). Not a bundle
     // member; 'fast' selects it.
-    {"shared_f16", "STRIX_DS41_FAST_SHARED", "", {"", "1", "", "0"}, "0", strix::profile::Kind::bit_changing,
+    {"shared_f16", "STRIX_DS41_FAST_SHARED", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
      "FAST shared expert ds41-shared-f16-v1 (#720) in the fast set; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800)",
      false, {false, true, false, false}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     // Prefill only, with fast_moe: the relaxed routed-expert kernels' FP16-operand form (ds41-moe-f16wmma-v1); 'fast' selects it.
-    {"moe_f16wmma", "STRIX_DS41_FAST_MOE_F16", "", {"", "1", "", "0"}, "0", strix::profile::Kind::bit_changing,
+    {"moe_f16wmma", "STRIX_DS41_FAST_MOE_F16", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
      "FAST MoE down FP16 operands ds41-moe-f16wmma-v1 (#721) in the fast set; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800)",
      false, {false, true, false, false}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
@@ -74,8 +75,7 @@ inline constexpr strix::profile::FastGate fast_gates[] = {
     {"shared_f16", "1", kFastGateD1},   {"moe_f16wmma", "1", kFastGateD1}};
 
 // Ladder rows (strix::profile::LadderRow): incumbent grants for the cells the resolver ran before the ladder rule.
-// The four TURBO "0" rows are compatibility opt-outs (kTurboOffBeforeLadder), not measured claims: TURBO of this table
-// does not resolve over the admitted FAST set for fast_prefill, engram_f16wmma, shared_f16 and moe_f16wmma.
+// TURBO nests FAST: its column is empty for every member, so it resolves over the admitted FAST set.
 namespace ladder_detail {
 namespace sp = ::strix::profile;
 inline constexpr auto kFast = sp::Name::fast;
@@ -87,12 +87,6 @@ inline constexpr strix::profile::LadderRow ladder_rows[] = {
     strix::profile::incumbent_cell("shared_f16", "1", ladder_detail::kFast, kFastGateD1),
     strix::profile::incumbent_cell("moe_f16wmma", "1", ladder_detail::kFast, kFastGateD1),
     strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kFast, strix::profile::kProvisionalBeforeLadder),
-    strix::profile::incumbent_cell("attention_f16wmma", "2", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder),
-    strix::profile::incumbent_cell("dense_f16", "1", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder),
-    strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder),
-    strix::profile::incumbent_cell("fast_prefill", "0", ladder_detail::kTurbo, strix::profile::kTurboOffBeforeLadder),
-    strix::profile::incumbent_cell("engram_f16wmma", "0", ladder_detail::kTurbo, strix::profile::kTurboOffBeforeLadder),
-    strix::profile::incumbent_cell("shared_f16", "0", ladder_detail::kTurbo, strix::profile::kTurboOffBeforeLadder),
-    strix::profile::incumbent_cell("moe_f16wmma", "0", ladder_detail::kTurbo, strix::profile::kTurboOffBeforeLadder)};
+    strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder)};
 
 }  // namespace strix::deepseek41::pair_defaults

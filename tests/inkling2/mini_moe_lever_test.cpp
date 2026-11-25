@@ -3,7 +3,9 @@
 
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <string>
 
@@ -59,8 +61,10 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 7U,
-            "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias and block-candidate");
+    require(mini::kMiniProfile.table.size() == 8U,
+            "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, block-candidate "
+            "and the image recipe");
+    require(mini::kMiniLevers.back().name == mini::kMiniVisionRecipe, "image recipe is the last row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -334,11 +338,50 @@ void test_narrow_experts() {
     }
     require(refused, "malformed narrow switch must be refused");
 }
+// r65 #1162.1 and the text-only property: with the image recipe unset, every profile resolves to exactly what the
+// table without the row resolves (receipt, notice, qualification, fingerprint), so a text run's identity is unchanged;
+// an explicit axial@1 is refused by the shared resolve_mini_profile under exact (before any load) and runs, named and
+// stamped unqualified, under fast and turbo.
+void test_vision_recipe_row() {
+    const std::span<const profile::Lever> before(mini::kMiniLevers.data(), mini::kMiniLevers.size() - 1U);
+    profile::Engine without_row = mini::kMiniProfile;
+    without_row.table = before;
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        options.tier = inputs(tier);
+        const auto with = mini::resolve_mini_profile(options, true);
+        const auto old = profile::resolve(without_row, inputs(tier));
+        require(with.summary() == old.summary() && with.tier_notice() == old.tier_notice() &&
+                    with.qualification() == old.qualification() && with.fingerprint() == old.fingerprint(),
+                "unset image recipe: the text-only resolution is the table's without the row");
+        for (const char* recipe : {"axial@1", "legacy"}) {
+            options.tier = inputs(tier);
+            options.tier.env = [recipe](const char* key) -> const char* {
+                return std::strcmp(key, "STRIX_INKLING2_VISION_RECIPE") == 0 ? recipe : nullptr;
+            };
+            bool refused = false;
+            try {
+                const auto resolved = mini::resolve_mini_profile(options, true);
+                require(mini::mini_vision_axial(resolved) == (std::string_view(recipe) == "axial@1"), "recipe value");
+                if (std::string_view(recipe) == "legacy")
+                    require(resolved.fingerprint() == with.fingerprint(), "explicit legacy keeps the identity");
+                else
+                    require(resolved.qualification().find("unqualified: inkling2-vision-recipe") != std::string::npos,
+                            "axial is stamped unqualified");
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            require(refused == (tier == profile::Name::standard && std::string_view(recipe) == "axial@1"),
+                    "EXACT refuses only the unqualified axial recipe");
+        }
+    }
+}
 }  // namespace
 
 int main() {
     try {
         test_row();
+        test_vision_recipe_row();
         test_resolution();
         test_combine_image();
         test_controller_planes();

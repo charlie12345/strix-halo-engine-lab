@@ -278,7 +278,6 @@ int main(int argc, char** argv) {
         family.prefill_tail_divisor =
             strix::env_flag_default_on("STRIX_INKLING_PREFILL_TAIL") ? strix::inkling2::cli::kMiniPrefillTailDivisor : 0U;
 #if defined(STRIX_INKLING2_MEDIA)
-        family.media = cli::open_mini_media;
         family.render_media_messages = serve::render_inkling2_chat_media_request;
 #endif
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
@@ -287,6 +286,9 @@ int main(int argc, char** argv) {
         auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family, true);
 #else
         auto options = cli::parse(argc, argv, family, true);
+#endif
+#if defined(STRIX_INKLING2_MEDIA)
+        family.media = cli::mini_media_opener(options.tier, std::cerr);  // image recipe: this run's resolution
 #endif
         if (!options.generation.prefill_chunk_explicit) {  // the declared chunk of this backend and profile
             family.default_prefill_chunk = strix::inkling2::mini_cli_prefill_rows(cli::kMiniPrefillBackend, options.tier.profile);

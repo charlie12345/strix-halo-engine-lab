@@ -184,22 +184,6 @@ std::string VisionRecipe::id() const {
     return buf;
 }
 
-VisionIdentity resolve_vision_identity(const profile::Lookup& env) {
-    static constexpr profile::Lever recipe{
-        "vision-recipe", "STRIX_INKLING2_VISION_RECIPE", "",
-        {"legacy", "legacy", "legacy", "legacy"}, "legacy", profile::Kind::bit_changing,
-        {true, true, true, true}, {}, "", "legacy", "Axial recipe pending complete CLI qualification"
-    };
-    static constexpr profile::Engine engine{"inkling2-mini-vision", "", std::span(&recipe, 1U)};
-    profile::Inputs input;
-    input.env = env;
-    const auto resolution = profile::resolve(engine, input);
-    const auto& value = resolution.entries.front().value;
-    if (value == "legacy") return VisionIdentity::legacy;
-    if (value == "axial@1") return VisionIdentity::axial_v1;
-    bad("STRIX_INKLING2_VISION_RECIPE must be legacy or axial@1");
-}
-
 VisionAdapter::VisionAdapter(VisionSpec spec, std::string weights_digest, VisionRecipe recipe)
     : VisionAdapter(spec, std::move(weights_digest), VisionIdentity::legacy, recipe.max_tokens) {
     if (!recipe.min_side_cells) bad("zero minimum cell count");

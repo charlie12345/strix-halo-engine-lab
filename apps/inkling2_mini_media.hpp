@@ -4,6 +4,7 @@
 // shared vision::SerialMedia. Model-specific only in what it names.
 #include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_vision.hpp"
+#include "strix/profiles/inkling2_mini.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/vision/serial_media.hpp"
 #include "strix/vision/encoder.hpp"
@@ -12,7 +13,9 @@
 #endif
 
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <ostream>
 #include <string>
 
 namespace strix::inkling2::cli {
@@ -44,8 +47,18 @@ inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(const std::strin
         });
 }
 
-inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::string& checkpoint) {
-    return make_mini_media(checkpoint, VisionSpec{}, resolve_vision_identity());
+// The image opener of one run (SerialGenerationFamily::media): the recipe is the run's own resolution of the row
+// inkling2-vision-recipe (kMiniProfile, the resolver the CLI and the server share), never a second lookup. It is
+// called only for a request with image parts; each call writes the effective image identity to `receipt`.
+using MiniMediaOpener = std::function<std::unique_ptr<serve::SerialMediaInput>(const std::string& checkpoint)>;
+inline MiniMediaOpener mini_media_opener(const profile::Resolution& tier, std::ostream& receipt,
+                                         const VisionSpec& config = {}) {
+    const auto identity = mini_vision_axial(tier) ? VisionIdentity::axial_v1 : VisionIdentity::legacy;
+    return [identity, &receipt, config](const std::string& checkpoint) {
+        auto media = make_mini_media(checkpoint, config, identity);
+        receipt << "image identity " << media->adapter().identity() << '\n';
+        return media;
+    };
 }
 
 }  // namespace strix::inkling2::cli

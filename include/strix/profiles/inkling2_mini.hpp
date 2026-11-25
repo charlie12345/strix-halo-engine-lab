@@ -6,6 +6,8 @@
 #include "strix/weight/registry.hpp"
 
 #include <array>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace strix::inkling2 {
@@ -81,7 +83,16 @@ inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepar
 inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-projected-bias@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
-inline constexpr std::array<profile::Lever, 7> kMiniLevers{{
+// Image pre-processing recipe of the one vision adapter (src/inkling2/inkling2_vision.*), resolved here with the other
+// rows by the resolver the CLI and the server share. "legacy" (builtin, image identity inkling2-vision-v1) or "axial@1"
+// (the reference-checked axial recipe, image identity inkling2-vision-axial@1: checkerboard alpha, symmetric
+// normalisation, cell-major patches, leading class row, axial RoPE; it can change the prompt length). Bit-changing and
+// not qualified yet: no column selects it, an explicit STRIX_INKLING2_VISION_RECIPE=axial@1 runs under --profile fast
+// or turbo stamped "unqualified", and every other profile refuses it until a ready column carries the value (the row's
+// own identity evidence, Resolution::explicit_value_qualified). Only the image opener reads it (mini_vision_axial); at
+// its builtin the row stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
+inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
+inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -110,11 +121,31 @@ inline constexpr std::array<profile::Lever, 7> kMiniLevers{{
      "awaits device identity on the landing head (logits, ids and state bitwise the image route) before any default",
      false, {}, true},
     spec::kBlockDraftLever,
+    {kMiniVisionRecipe, "STRIX_INKLING2_VISION_RECIPE", "", {}, "legacy", profile::Kind::bit_changing,
+     {}, {false, true, false, true}, "axial@1", "legacy",
+     "awaits the real-checkpoint reference gate (patches, hidden and projected rows) and CLI image identity on HIP "
+     "and CUDA",
+     false, {}, true},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
 inline constexpr profile::Engine kMiniProfile{
     "inkling2-mini", "", kMiniLevers, false, "inkling2-mini-turbo-v1",
 };
+
+// The image recipe of a resolved run: true selects axial@1. A value the row does not qualify is admitted only under
+// --profile fast or turbo; anything but legacy / axial@1 is refused. The one reader of the row (image opener and the
+// early check of resolve_mini_profile).
+inline bool mini_vision_axial(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniVisionRecipe);
+    if (entry == nullptr || entry->value == "legacy") return false;
+    if (entry->value != "axial@1")
+        throw std::invalid_argument("STRIX_INKLING2_VISION_RECIPE must be legacy or axial@1");
+    if (!profile::Resolution::explicit_value_qualified(*entry) && tier.profile != profile::Name::fast &&
+        tier.profile != profile::Name::turbo)
+        throw std::invalid_argument("image recipe axial@1 is an unqualified bit-changing image identity: not admitted "
+                                    "under --profile " + std::string(tier.word()) + " (admitted: fast, turbo)");
+    return true;
+}
 
 }  // namespace strix::inkling2

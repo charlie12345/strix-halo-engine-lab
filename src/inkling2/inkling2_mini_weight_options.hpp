@@ -145,6 +145,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
     static_cast<void>(mini_attn_projected_bias(tier));
+    static_cast<void>(mini_vision_axial(tier));  // the image recipe row: refused before any load, as for every row
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
     spec::require_block_draft_execution(spec::block_draft_selection(tier));

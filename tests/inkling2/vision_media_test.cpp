@@ -4,7 +4,10 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
 
@@ -53,13 +56,59 @@ void write_tower(const std::filesystem::path& path, const ink::VisionSpec& spec)
     require(static_cast<bool>(output), "write tiny safetensors tower");
 }
 
-void test_serial_rgba() {
-    const auto empty_env = [](const char*) -> const char* { return nullptr; };
-    const auto axial_env = [](const char* key) -> const char* {
-        return std::string_view(key) == "STRIX_INKLING2_VISION_RECIPE" ? "axial@1" : nullptr;
+// The run's resolution of the model table (the CLI and server resolver), hermetic: only the image recipe switch.
+profile::Resolution resolve_tier(std::optional<profile::Name> tier, const char* recipe) {
+    profile::Inputs in;
+    in.profile = tier;
+    in.env = [recipe](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_INKLING2_VISION_RECIPE" ? recipe : nullptr;
     };
-    const auto incumbent = ink::resolve_vision_identity(empty_env);
-    const auto selected = ink::resolve_vision_identity(axial_env);
+    return profile::resolve(ink::kMiniProfile, in);
+}
+
+ink::VisionIdentity resolved_identity(std::optional<profile::Name> tier, const char* recipe) {
+    return ink::mini_vision_axial(resolve_tier(tier, recipe)) ? ink::VisionIdentity::axial_v1 : ink::VisionIdentity::legacy;
+}
+
+// r65 #1162.1: the image recipe is a row of the model table. Unset or legacy keeps the incumbent under every profile;
+// axial@1 is refused under exact (explicit or default) and quality, admitted (unqualified) under fast / turbo.
+void test_recipe_admission() {
+    using profile::Name;
+    for (const auto tier : {std::optional<Name>{}, std::optional{Name::standard}, std::optional{Name::fast},
+                            std::optional{Name::quality}, std::optional{Name::turbo}}) {
+        require(resolved_identity(tier, nullptr) == ink::VisionIdentity::legacy, "unset recipe is the incumbent");
+        require(resolved_identity(tier, "legacy") == ink::VisionIdentity::legacy, "legacy is the incumbent");
+        bool refused = false;
+        try {
+            require(resolved_identity(tier, "axial@1") == ink::VisionIdentity::axial_v1, "admitted axial runs axial");
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        const bool admits = tier == Name::fast || tier == Name::turbo;
+        require(refused != admits, "axial@1 is admitted only under fast or turbo");
+        bool malformed = false;
+        try {
+            static_cast<void>(resolved_identity(tier, "axial"));
+        } catch (const std::invalid_argument&) {
+            malformed = true;
+        }
+        require(malformed, "an undeclared recipe value is refused");
+    }
+    // The effective profile receipt names the explicit unqualified row; the incumbent receipt and fingerprint do not.
+    const auto fast_axial = resolve_tier(profile::Name::fast, "axial@1");
+    const auto fast_unset = resolve_tier(profile::Name::fast, nullptr);
+    require(fast_axial.summary().find("inkling2-vision-recipe=axial@1") != std::string::npos, "receipt names axial");
+    require(fast_axial.qualification().find("unqualified: inkling2-vision-recipe") != std::string::npos,
+            "receipt stamps axial unqualified");
+    require(fast_axial.fingerprint() != fast_unset.fingerprint(), "axial enters the fingerprint");
+    require(fast_unset.summary().find("inkling2-vision-recipe") == std::string::npos, "builtin stays out of the receipt");
+    require(resolve_tier(profile::Name::fast, "legacy").fingerprint() == fast_unset.fingerprint(),
+            "explicit legacy is the incumbent identity");
+}
+
+void test_serial_rgba() {
+    const auto incumbent = resolved_identity(std::nullopt, nullptr);
+    const auto selected = resolved_identity(profile::Name::fast, "axial@1");
     require(incumbent == ink::VisionIdentity::legacy, "incumbent image recipe");
     require(selected == ink::VisionIdentity::axial_v1, "explicit axial image recipe");
 
@@ -81,6 +130,18 @@ void test_serial_rgba() {
     auto& bridge = serial->adapter();
     require(bridge.identity().find("inkling2-vision-axial@1|") == 0, "explicit media identity");
     require(legacy_serial->adapter().identity().find("inkling2-vision-v1|") == 0, "legacy media identity");
+    // The CLI opener takes the recipe from the run's resolution and prints the effective image identity.
+    std::ostringstream receipt;
+    const auto opener = ink::cli::mini_media_opener(resolve_tier(profile::Name::fast, "axial@1"), receipt, spec);
+    require(opener(shard.string())->adapter().identity() == bridge.identity(), "opener runs the resolved recipe");
+    require(receipt.str() == "image identity " + bridge.identity() + "\n", "image run prints its image identity");
+    bool exact_refused = false;
+    try {
+        static_cast<void>(ink::cli::mini_media_opener(resolve_tier(profile::Name::standard, "axial@1"), receipt, spec));
+    } catch (const std::invalid_argument&) {
+        exact_refused = true;
+    }
+    require(exact_refused, "explicit EXACT refuses the axial image opener");
     std::ifstream png(std::filesystem::path(STRIX_VISION_FIXTURE_DIR) / "rgba_noise.png", std::ios::binary);
     serve::media::MediaItem item;
     item.bytes.assign(std::istreambuf_iterator<char>(png), std::istreambuf_iterator<char>());
@@ -117,6 +178,7 @@ void test_serial_rgba() {
 }  // namespace
 
 int main() try {
+    test_recipe_admission();
     test_serial_rgba();
     return 0;
 } catch (const std::exception& error) {

@@ -17,7 +17,6 @@
 // second MLP linears (FP32, before the device builds its FP16 panels); q, k and v are concatenated.
 #include "strix/vision/adapter.hpp"
 #include "strix/vision/preprocess.hpp"
-#include "strix/engine_profile.hpp"
 #include "strix/weight/tensor_access.hpp"
 
 #include <cstdint>
@@ -69,10 +68,10 @@ struct VisionRecipe {
     std::uint32_t placeholder_token = 200054;      // <|unused_200054|> after <|content_image|> in the chat template
     [[nodiscard]] std::string id() const;
 };
+// The image identity the adapter runs. Production entry points never pick it here: it comes from the row
+// inkling2-vision-recipe of the model's profile table (include/strix/profiles/inkling2_mini.hpp, mini_vision_axial),
+// resolved with the run's other rows; the direct constructor is for the adapter's own tests and the reference gate.
 enum class VisionIdentity { legacy, axial_v1 };
-
-// Resolve the model recipe on first image input, using the shared profile resolver.
-[[nodiscard]] VisionIdentity resolve_vision_identity(const profile::Lookup& env = {});
 
 class VisionAdapter final : public vision::VisionAdapter {
 public:

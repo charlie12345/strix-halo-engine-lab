@@ -57,9 +57,14 @@ struct VisionStack {
     const gguf::FileInfo header = gguf::read_file(file, vision_gguf_limits());
     const VisionConfig model = validate_vision(header);
     require_vision_matches_language(model, kLanguageHidden, kLanguageVocab, kImageToken);
-    vision::HostBudget budget;
+    vision::HostBudget budget;  // max_bytes keeps the independent whole-file budget (4 GiB)
     budget.exact_bytes = check_projector_bytes(header);
-    budget.max_bytes = budget.exact_bytes;
+    // The file opened for the load is judged by the same schema, language match and byte layout from its own header
+    // before any of its bytes are allocated or read (a same-length replacement is refused without a full read).
+    budget.admit = [exact = budget.exact_bytes](const gguf::FileInfo& opened) {
+        require_vision_matches_language(validate_vision(opened), kLanguageHidden, kLanguageVocab, kImageToken);
+        if (check_projector_bytes(opened) != exact) throw std::invalid_argument("GLM vision: the projector file changed while it was read");
+    };
     auto st = std::make_unique<VisionStack>(vision::GgufWeights{file, vision_gguf_limits(), budget});
     // The bytes actually loaded (and hashed below) are judged again from their own tensor table: a same-length
     // replacement between the header read and the load must pass the same schema, language match and byte budget, and

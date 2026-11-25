@@ -246,6 +246,7 @@ struct EngineOps {
     void bind_embeds(std::shared_ptr<const strix::session::EmbedTable> table) { embeds.bind(std::move(table)); }
     std::vector<std::byte> embed_frame(std::span<const std::uint32_t> ids) { return embeds.frame(ids); }
     void embed_frame_received(std::span<const std::byte> frame, std::vector<std::uint32_t>& ids) { embeds.received(frame, ids); }
+    static constexpr std::uint32_t embed_row_width() noexcept { return gs::PromptEmbeds::row_width(); }
     std::span<const std::uint32_t> provide(std::span<const std::uint32_t> tokens, bool mtp) {
         if (!gs::PromptEmbeds::holds_virtual_ids(tokens)) return tokens;
         // The reference MTP bootstrap runs decode steps, where no row can be provided (startup refuses --vision with it).

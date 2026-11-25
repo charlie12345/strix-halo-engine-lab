@@ -1138,7 +1138,7 @@ void test_sampled_mtp_replay() {
         const bool threw = throws_with([&] { first = gs::replay(units, solo, pf, prompt, true, 2, 64, nullptr, choice); }, "");
         CHECK(!threw && first.size() == 1 && first[0] == gs::kPrefillPending);
     }
-    CHECK(gs::kControlVersion == 11);
+    CHECK(gs::kControlVersion == 12);
     std::printf("sampled MTP replay: flags and the lead's sampler reach the engine; unknown flags and engines refused\n");
 }
 

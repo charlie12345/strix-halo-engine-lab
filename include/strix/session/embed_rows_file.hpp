@@ -14,6 +14,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <ios>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -80,6 +82,9 @@ inline void write_embed_rows_file(const std::filesystem::path& path, const Embed
         throw std::invalid_argument("embed rows file: " + name + " has rows of width " + std::to_string(rows.width) +
                                     ", the model takes " + std::to_string(width));
     const std::uint64_t payload = std::uint64_t{rows.rows} * rows.width * 2U;
+    if (payload > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()) ||
+        payload / 2U > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t)))
+        throw std::invalid_argument("embed rows file: " + name + " is too large for this platform");
     if (static_cast<std::uint64_t>(end) != kEmbedRowsFileHeader + payload)
         throw std::invalid_argument("embed rows file: " + name + " has a length other than its header states");
     rows.data.resize(std::size_t{rows.rows} * rows.width);

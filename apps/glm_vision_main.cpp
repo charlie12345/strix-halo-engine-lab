@@ -137,7 +137,9 @@ int encode(int argc, char** argv) {
 
 int expand(int argc, char** argv) {
     if (argc != 5) throw std::invalid_argument("expand IN.u32 OUT.u32 A.rows[,B.rows,...]");
-    const std::vector<std::byte> raw = read_bytes(argv[2], std::uint64_t{1} << 30U);
+    // A prompt of at most 16 M ids in and out, and at most 1024 rows files.
+    constexpr std::size_t kMaxTokens = std::size_t{1} << 24U;
+    const std::vector<std::byte> raw = read_bytes(argv[2], std::uint64_t{kMaxTokens} * 4U);
     if (raw.size() % 4U != 0) throw std::invalid_argument("the prompt is not a list of 32-bit ids");
     std::vector<std::uint32_t> in(raw.size() / 4U);
     std::memcpy(in.data(), raw.data(), raw.size());
@@ -145,6 +147,7 @@ int expand(int argc, char** argv) {
     const std::string list = argv[4];
     for (std::size_t a = 0; a <= list.size();) {
         const std::size_t b = std::min(list.find(',', a), list.size());
+        if (rows.size() == 1024U) throw std::invalid_argument("more than 1024 rows files");
         const auto span = strix::session::read_embed_rows_file(list.substr(a, b - a), glm::kLanguageHidden);
         if (span.real_token_id != glm::kImageToken) throw std::invalid_argument("a rows file was made for another image token");
         rows.push_back(span.rows);
@@ -154,12 +157,14 @@ int expand(int argc, char** argv) {
     std::size_t image = 0;
     for (std::size_t i = 0; i < in.size(); ++i) {
         if (in[i] != glm::kImageToken) {
+            if (out.size() == kMaxTokens) throw std::invalid_argument("the expanded prompt exceeds 16 M ids");
             out.push_back(in[i]);
             continue;
         }
         if (i + 1U < in.size() && in[i + 1U] == glm::kImageToken)
             throw std::invalid_argument("the prompt holds consecutive image tokens: it is already expanded");
         if (image == rows.size()) throw std::invalid_argument("the prompt holds more image tokens than rows files were given");
+        if (out.size() + rows[image] + 2U > kMaxTokens) throw std::invalid_argument("the expanded prompt exceeds 16 M ids");
         if (out.empty() || out.back() != glm::kImageBeginToken) out.push_back(glm::kImageBeginToken);
         out.insert(out.end(), rows[image++], glm::kImageToken);
         if (i + 1U == in.size() || in[i + 1U] != glm::kImageEndToken) out.push_back(glm::kImageEndToken);

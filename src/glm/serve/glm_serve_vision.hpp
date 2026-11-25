@@ -80,6 +80,9 @@ class PromptEmbeds {
 public:
     explicit PromptEmbeds(pair::EmbedFrameCrc crc = nullptr) : crc_(crc) {}
 
+    // The width of every provided row: the language model's hidden size (bounds a peer's embed frame before it is read).
+    [[nodiscard]] static constexpr std::uint32_t row_width() noexcept { return kLanguageHidden; }
+
     // The lead: the table of the request whose prompt is in prefill (GenerationJob::embeds).
     void bind(std::shared_ptr<const session::EmbedTable> table) { table_ = std::move(table); }
     // The lead: the frame of a chunk's spans; only spans the peer does not hold yet carry their rows.

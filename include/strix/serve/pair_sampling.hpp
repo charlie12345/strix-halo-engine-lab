@@ -77,40 +77,54 @@ void sample_pair_rows(std::uint32_t mask, bool lead, std::size_t follower_width,
 }
 
 // The lead's message after each row of a window: [kPairWindowMore] while another row follows, then
-// [kPairWindowDone, n, token 0 .. token n-1, 0 ...].
-inline constexpr std::size_t kPairWindowWords = 10;
+// [kPairWindowDone, n, accepted, token 0 .. token n-1, 0 ...] (accepted: the leading drafts the acceptance rule
+// accepted, n - 1 or n).
+inline constexpr std::size_t kPairWindowMaxRows = 8;
+inline constexpr std::size_t kPairWindowWords = kPairWindowMaxRows + 3U;
 inline constexpr std::uint32_t kPairWindowDone = 0, kPairWindowMore = 1;
+
+// What one sampled verify window decided, the same on both ranks. A rejected row's token can equal its draft (coupled
+// acceptance keeps the plain sample; a forced rejection keeps it too), so a caller commits drafts by `accepted`, never
+// by comparing tokens with drafts: rows 0 .. accepted - 1 accepted their drafts, row `accepted` (when n > accepted)
+// decided the window's last token.
+struct PairWindowDecision {
+    std::vector<std::uint32_t> tokens;
+    std::uint32_t accepted = 0;
+};
 
 // One sampled verify window across the pair. Row r of the window decides the token at first_position + r with
 // TokenSampler::decide_rows (drafts[r] is the draft row r checks; no EOS stop): it stops after the first row without
 // a draft, the first rejected draft or max_rows rows. Under coupled acceptance a draft only needs its token; under
 // rejection it needs the distribution it was drawn from. Every row the lead reaches is assembled from both ranks'
 // vocabulary slices (the follower's slice moves as in sample_pair_rows); after each row the lead tells the follower
-// whether another follows, then sends the decided tokens. Both ranks return the same tokens (the lead's sampler
-// counts the decisions). The follower ignores sampler, first_position, drafts and max_rows. follower_width 0: one
-// node, no exchange. `words` exchanges kPairWindowWords words (the follower sends zeros).
+// whether another follows, then sends the decision. Both ranks pass the same max_rows (1 .. kPairWindowMaxRows, from
+// replicated data): the follower never reads a row at or past it and refuses a lead that asks for one. The lead's
+// sampler counts the decisions; the follower ignores sampler, first_position and drafts. follower_width 0: one node,
+// no exchange. `words` exchanges kPairWindowWords words (the follower sends zeros).
 template<class Read, class ExchangeFloats, class ExchangeWords>
-std::vector<std::uint32_t> decide_pair_window(bool lead, std::size_t follower_width, std::size_t vocabulary,
-                                              TokenSampler* sampler, std::uint64_t first_position,
-                                              std::span<const TokenDraft> drafts, std::uint32_t max_rows,
-                                              Read&& read, ExchangeFloats&& exchange, ExchangeWords&& words) {
+PairWindowDecision decide_pair_window(bool lead, std::size_t follower_width, std::size_t vocabulary,
+                                      TokenSampler* sampler, std::uint64_t first_position,
+                                      std::span<const TokenDraft> drafts, std::uint32_t max_rows,
+                                      Read&& read, ExchangeFloats&& exchange, ExchangeWords&& words) {
     const bool paired = follower_width != 0;
+    if (max_rows == 0 || max_rows > kPairWindowMaxRows)
+        throw std::invalid_argument("pair window: max_rows must be 1 .. 8");
     std::vector<float> scratch, full;
     std::array<std::uint32_t, kPairWindowWords> send{}, receive{};
     if (!lead) {
         if (!paired) throw std::logic_error("pair window: a follower needs a vocabulary slice");
-        for (std::size_t row = 0;; ++row) {
+        for (std::uint32_t row = 0;; ++row) {
             detail::move_pair_slice(false, read(row), follower_width, full, scratch, exchange);
             words(std::span<const std::uint32_t>(send), std::span<std::uint32_t>(receive));
-            if (receive[0] == kPairWindowMore) continue;
-            if (receive[0] != kPairWindowDone || receive[1] != row + 1U || receive[1] > kPairWindowWords - 2U)
+            if (receive[0] == kPairWindowMore && row + 1U < max_rows) continue;
+            const std::uint32_t n = receive[1], accepted = receive[2];
+            if (receive[0] != kPairWindowDone || n != row + 1U || accepted > n || accepted + 1U < n)
                 throw std::runtime_error("pair window: the lead's decision message is out of protocol");
-            return {receive.begin() + 2, receive.begin() + 2 + receive[1]};
+            return {{receive.begin() + 3, receive.begin() + 3 + n}, accepted};
         }
     }
     if (sampler == nullptr) throw std::logic_error("pair window: missing lead sampler");
-    if (max_rows == 0 || max_rows > kPairWindowWords - 2U || drafts.size() + 1U < max_rows)
-        throw std::invalid_argument("pair window: max_rows must be 1 .. drafts + 1 (at most 8)");
+    if (drafts.size() + 1U < max_rows) throw std::invalid_argument("pair window: max_rows must be at most drafts + 1");
     std::uint32_t reached = 0;
     const auto logits = [&](std::uint32_t row) -> std::span<const float> {
         if (row != reached) throw std::logic_error("pair window: rows out of order");
@@ -126,17 +140,19 @@ std::vector<std::uint32_t> decide_pair_window(bool lead, std::size_t follower_wi
         return std::span<const float>(full).first(std::min(vocabulary, full.size()));
     };
     const auto decisions = sampler->decide_rows(max_rows, first_position, drafts, {}, logits);
-    std::vector<std::uint32_t> tokens;
-    tokens.reserve(decisions.size());
-    for (const auto& d : decisions) tokens.push_back(d.token);
+    PairWindowDecision out;
+    out.tokens.reserve(decisions.size());
+    for (const auto& d : decisions) out.tokens.push_back(d.token);
+    while (out.accepted < decisions.size() && decisions[out.accepted].drafted && decisions[out.accepted].accepted) ++out.accepted;
     if (paired) {
         send.fill(0);
         send[0] = kPairWindowDone;
-        send[1] = static_cast<std::uint32_t>(tokens.size());
-        std::copy(tokens.begin(), tokens.end(), send.begin() + 2);
+        send[1] = static_cast<std::uint32_t>(out.tokens.size());
+        send[2] = out.accepted;
+        std::copy(out.tokens.begin(), out.tokens.end(), send.begin() + 3);
         words(std::span<const std::uint32_t>(send), std::span<std::uint32_t>(receive));
     }
-    return tokens;
+    return out;
 }
 
 // One sampled draft across the pair: the follower sends its vocabulary slice of the drafter row (`read_row()`), the

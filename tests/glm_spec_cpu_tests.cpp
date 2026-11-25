@@ -247,6 +247,21 @@ void test_accept() {
     const std::uint32_t d1[] = {5, 6, 7}, t1[] = {5, 6, 7, 8};
     auto a = accept_greedy(d1, t1);
     check(a.m == 3 && a.bonus == 8, "accept_greedy: all drafts accepted, bonus = last target");
+    // sampled windows commit by the sampler's accepted count: row 0 rejected with its token equal to the draft (5)
+    // ends the window at row 0, although row 1's (undecided) token equals draft 2
+    a = accept_decided(d1, t1, 0);
+    check(a.m == 0 && a.has_bonus && a.bonus == 5 && a.rows == 1, "accept_decided: same-token rejection at row 0 commits one row");
+    a = accept_decided(d1, t1, 2, kNoFlag, Terminal{kNoFlag, 9});
+    check(a.m == 2 && a.has_bonus && a.bonus == 7 && a.rows == 3, "accept_decided: two accepted, row 2 decides the last token");
+    a = accept_decided(d1, t1, 3, kNoFlag, Terminal{kNoFlag, 2});
+    check(a.m == 2 && a.stop && a.rows == 2, "accept_decided: the budget still ends the window");
+    bool refused = false;
+    try { (void)accept_decided(d1, std::span<const std::uint32_t>(t1), 4); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "accept_decided: more accepted rows than drafts refused");
+    refused = false;
+    const std::uint32_t t_bad[] = {5, 9, 7, 8};
+    try { (void)accept_decided(d1, t_bad, 2); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "accept_decided: an accepted row whose token is not its draft refused");
     const std::uint32_t t2[] = {5, 9, 7, 8};
     a = accept_greedy(d1, t2);
     check(a.m == 1 && a.bonus == 9, "accept_greedy: first mismatch at depth 2 (later equal drafts ignored)");

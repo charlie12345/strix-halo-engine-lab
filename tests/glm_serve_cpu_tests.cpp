@@ -868,15 +868,16 @@ struct SampledFake : FakeEng {
                 xs.push_back(fold(x, d));
             }
             for (const auto x : xs) ids.push_back(peak(x));
-            const auto tokens = sv::decide_pair_window(run.sampler != nullptr, paired ? kFakeSlice : 0U, kFakeVocab, run.sampler,
+            const auto window = sv::decide_pair_window(run.sampler != nullptr, paired ? kFakeSlice : 0U, kFakeVocab, run.sampler,
                 first, td, std::min(k + 1U, remaining),
                 [&](std::size_t r) { local = slice(xs.at(r), paired); return std::span<const float>(local); },
                 [&](std::span<const float> a, std::span<float> b) { run.ch->exchange_sampling_logits(a, b, chunk++); },
                 [&](std::span<const std::uint32_t> a, std::span<std::uint32_t> b) { run.ch->exchange_sampling_words(a, b, chunk++); });
-            window_rows += tokens.size();
-            std::copy(tokens.begin(), tokens.end(), ids.begin());
-            const auto acc = strix::glm::spec::accept_greedy(drafts, ids, strix::glm::spec::kNoFlag,
-                                                             strix::glm::spec::Terminal{strix::glm::spec::kNoFlag, remaining});
+            window_rows += window.tokens.size();
+            std::copy(window.tokens.begin(), window.tokens.end(), ids.begin());
+            // as the engine's cycle (glm_spec_run): commit by the window's accepted count, not by token equality
+            const auto acc = strix::glm::spec::accept_decided(drafts, ids, window.accepted, strix::glm::spec::kNoFlag,
+                                                              strix::glm::spec::Terminal{strix::glm::spec::kNoFlag, remaining});
             for (unsigned j = 0; j < acc.rows; ++j) (void)row(s, inputs[j]);
             if (run.sampler) {
                 lead_accepted = run.sampler->stats().accepted;
@@ -911,7 +912,8 @@ struct SampledServe {
 };
 // One pair (loopback) serving `jobs`; sequential = one request at a time (the C1 route), otherwise all queued at once.
 SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool sampled_mtp, bool sequential, bool g2 = false,
-                           strix::SampledAcceptance accept = strix::SampledAcceptance::coupled) {
+                           strix::SampledAcceptance accept = strix::SampledAcceptance::coupled,
+                           std::uint32_t force_reject_row = strix::TokenSamplerOptions::forced_rejection_off) {
     SampledServe out;
     Loopback lb;
     SampledFake e0(4), e1(4);
@@ -939,6 +941,7 @@ SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool samp
     lc.sampling = c0.hello(h, true);
     lc.sampled_mtp = sampled_mtp;
     lc.sampler_options.acceptance = accept;
+    lc.sampler_options.force_reject_row = force_reject_row;
     try {
         gs::Lead<SampledFake> lead(e0, c0, queue, lc, stop);
         std::thread runner([&] {
@@ -1046,6 +1049,12 @@ void test_sampled_mtp_serve() {
     CHECK(plain.tokens == spec.tokens);
     for (const auto& t : spec.tokens) CHECK(t.size() == 40);
     CHECK(plain.mtp_rounds == 0 && plain.sampled_runs == 0);  // switch off: sampled requests decode by plain steps
+    // a rejection whose token equals its draft (coupled, forced at row 0 of every window): the row after it was never
+    // decided, so nothing past the rejected row may be committed; the tokens stay those of plain sampling
+    const auto forced = serve_sampled(jobs, true, true, false, strix::SampledAcceptance::coupled, 0);
+    CHECK(forced.error.empty() && forced.tokens == plain.tokens && forced.lead_rejected > 0);
+    if (!forced.error.empty()) std::fprintf(stderr, "forced rejection serve error: %s
+", forced.error.c_str());
     CHECK(spec.mtp_rounds > 0 && spec.sampled_runs > 0);
     // the sampled prefill's seed (drawn from its greedy first token) is never used: the decoder opens from mtp_enter
     unsigned enters = 0, seed_enters = 0;

@@ -792,7 +792,9 @@ struct EngineOps {
         }
         return token;
     }
-    void pick_window(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first, std::span<std::uint32_t> ids) {
+    // Decides the window's rows into ids[0 .. n) and returns how many leading drafts the acceptance rule accepted
+    // (the commit follows that count, not token equality: a rejected row's token can equal its draft).
+    unsigned pick_window(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first, std::span<std::uint32_t> ids) {
         const bool lead = sample_lead();
         auto& ch = *sample_run.ch;
         const std::size_t width = eng.vocab_slice();
@@ -807,16 +809,18 @@ struct EngineOps {
             td[i].position = first + i;  // coupled: only the draft token is read
             td[i].token = drafts[i];
         }
-        const auto tokens = sv::decide_pair_window(lead, ch.paired() ? width : 0, sampling_vocab, sample_run.sampler, first,
+        const auto window = sv::decide_pair_window(lead, ch.paired() ? width : 0, sampling_vocab, sample_run.sampler, first,
             std::span<const strix::TokenDraft>(td), rows,
             [&](std::size_t row) { return sample_row(row); },
             [&](std::span<const float> send, std::span<float> receive) { ch.exchange_sampling_logits(send, receive, sample_chunk++); },
             [&](std::span<const std::uint32_t> send, std::span<std::uint32_t> receive) {
                 ch.exchange_sampling_words(send, receive, sample_chunk++);
             });
-        if (tokens.empty() || tokens.size() > rows || tokens.size() > ids.size())
+        const auto& tokens = window.tokens;
+        if (tokens.empty() || tokens.size() > rows || tokens.size() > ids.size() || window.accepted > drafts.size())
             throw std::logic_error("sampled MTP: the window decided no row or too many");
         std::copy(tokens.begin(), tokens.end(), ids.begin());
+        return window.accepted;
     }
     std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles, gs::SampledRun run) {
         if (dec && dec_flags != run.flags) throw std::logic_error("mtp_run: the open decoder was opened with other sampling flags");
@@ -828,7 +832,7 @@ struct EngineOps {
             if (pol.spec_arbiter) pol.context = &context.at(slot);
             if ((run.flags & gs::kRunSample) != 0)
                 pol.pick_targets = [this](std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first,
-                                          std::span<std::uint32_t> ids) { pick_window(drafts, rows, first, ids); };
+                                          std::span<std::uint32_t> ids) { return pick_window(drafts, rows, first, ids); };
             if ((run.flags & gs::kRunSampleDrafts) != 0)
                 pol.pick_draft = [this](unsigned row, std::uint64_t position, unsigned index) { return pick_draft_row(row, position, index); };
             if ((run.flags & gs::kRunRejection) != 0) pol.spec_arbiter = false;  // lookup drafts carry no distribution

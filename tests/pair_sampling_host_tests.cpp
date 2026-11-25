@@ -153,6 +153,7 @@ strix::TokenSamplerOptions window_options(strix::SampledAcceptance a) {
 
 struct WindowRun {
     std::vector<std::uint32_t> lead, follow;
+    std::uint32_t lead_accepted = 0, follow_accepted = 0;
     std::size_t follower_rows = 0;
 };
 // Runs both ranks of one window on two threads.
@@ -163,16 +164,20 @@ WindowRun run_window(strix::TokenSampler& sampler, const WindowRows& rows, std::
     std::exception_ptr error;
     std::thread follower([&] {
         try {
-            out.follow = sv::decide_pair_window(false, kFollow, 0, nullptr, 0, {}, 0,
+            auto w = sv::decide_pair_window(false, kFollow, 0, nullptr, 0, {}, max_rows,
                 [&](std::size_t r) { ++out.follower_rows; return std::span<const float>(rows.follow.at(r)); },
                 d.floats(1), d.words(1));
+            out.follow = std::move(w.tokens);
+            out.follow_accepted = w.accepted;
         } catch (...) {
             error = std::current_exception();
         }
     });
     try {
-        out.lead = sv::decide_pair_window(true, kFollow, kVocab, &sampler, first, drafts, max_rows,
+        auto w = sv::decide_pair_window(true, kFollow, kVocab, &sampler, first, drafts, max_rows,
             [&](std::size_t r) { return std::span<const float>(rows.lead.at(r)); }, d.floats(0), d.words(0));
+        out.lead = std::move(w.tokens);
+        out.lead_accepted = w.accepted;
     } catch (...) {
         follower.join();
         throw;
@@ -202,6 +207,7 @@ void test_window_coupled() {
         check(run.lead == expect, "coupled window: the lead's tokens differ from plain sampling");
         check(run.follow == expect, "coupled window: the follower's tokens differ from the lead's");
         check(run.follower_rows == wrong + 1, "coupled window: the follower sent rows the lead never decided");
+        check(run.lead_accepted == wrong && run.follow_accepted == wrong, "coupled window: accepted drafts not agreed");
         check(sampler.stats().accepted == wrong && sampler.stats().rejected == (wrong < 3 ? 1U : 0U),
               "coupled window: decisions not counted");
     }
@@ -249,7 +255,58 @@ void test_window_world1() {
         [&](std::size_t r) { return std::span<const float>(rows.full.at(r)); },
         [](std::span<const float>, std::span<float>) { throw std::runtime_error("one node exchanged logits"); },
         [](std::span<const std::uint32_t>, std::span<std::uint32_t>) { throw std::runtime_error("one node exchanged words"); });
-    check(tokens.size() == 2 && tokens[0] == drafts[0].token && tokens[1] == expect1, "one node: rows decided locally");
+    check(tokens.tokens.size() == 2 && tokens.tokens[0] == drafts[0].token && tokens.tokens[1] == expect1 && tokens.accepted == 1,
+          "one node: rows decided locally");
+}
+
+// A rejected row can keep a token equal to its draft (coupled acceptance keeps the plain sample; here the test-only
+// forced rejection of row 0). The window must report 0 accepted drafts on both ranks, so a caller never commits the
+// draft by token equality and then the next row's undecided token.
+void test_window_same_token_rejection() {
+    const WindowRows rows(4, 11);
+    const std::uint64_t first = 30;
+    strix::TokenSampler oracle(window_policy(), window_options(strix::SampledAcceptance::coupled));
+    std::vector<strix::TokenDraft> drafts;
+    for (unsigned r = 0; r < 3; ++r) {
+        strix::TokenDraft dr;
+        dr.position = first + r;
+        dr.token = oracle.decide(rows.full[r], first + r, nullptr).token;
+        drafts.push_back(std::move(dr));
+    }
+    auto options = window_options(strix::SampledAcceptance::coupled);
+    options.force_reject_row = 0;
+    strix::TokenSampler sampler(window_policy(), options);
+    const auto run = run_window(sampler, rows, first, drafts, 4);
+    check(run.lead.size() == 1 && run.lead[0] == drafts[0].token && run.follow == run.lead,
+          "same-token rejection: one row decided, its token is the draft's");
+    check(run.lead_accepted == 0 && run.follow_accepted == 0, "same-token rejection: no draft accepted on either rank");
+    check(run.follower_rows == 1 && sampler.stats().rejected == 1 && sampler.stats().forced == 1,
+          "same-token rejection: one row read, counted as a rejection");
+}
+
+// The follower holds the agreed max_rows: a lead that asks for one more row is refused before the follower reads it.
+void test_window_follower_bound() {
+    const WindowRows rows(4, 12);
+    std::size_t reads = 0;
+    bool refused = false;
+    try {
+        (void)sv::decide_pair_window(false, kFollow, 0, nullptr, 0, {}, 2,
+            [&](std::size_t r) { ++reads; return std::span<const float>(rows.follow.at(r)); },
+            [](std::span<const float>, std::span<float>) {},
+            [](std::span<const std::uint32_t>, std::span<std::uint32_t> in) { in[0] = sv::kPairWindowMore; });
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    check(refused && reads == 2, "follower: MORE at max_rows must be refused without reading row max_rows");
+    refused = false;
+    try {
+        (void)sv::decide_pair_window(false, kFollow, 0, nullptr, 0, {}, 9,
+            [](std::size_t) -> std::span<const float> { throw std::logic_error("read"); },
+            [](std::span<const float>, std::span<float>) {}, [](std::span<const std::uint32_t>, std::span<std::uint32_t>) {});
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    check(refused, "follower: max_rows above 8 refused before any read");
 }
 
 void test_window_rejection() {
@@ -338,6 +395,8 @@ int main() try {
     test_window_coupled();
     test_window_cuts();
     test_window_world1();
+    test_window_same_token_rejection();
+    test_window_follower_bound();
     test_window_rejection();
     test_draft_pick();
     std::puts("pair draft: both ranks hold the lead's draft, distribution kept, coupled draft == row decision, one node local");

@@ -99,9 +99,11 @@ void synthetic_table() {
             pr::resolve(pr::Name::fast, pr::App::engine, absent, synthetic).find("route")->ladder_reference;
         auto present = absent;
         present.assets = {{"draft", "/models/e4b/drafter-mtp"}};
-        check(pr::resolve(pr::Name::fast, pr::App::engine, present, synthetic).find("route")->ladder_reference.empty() &&
-                  absent_reference.find("draft=off{v1}") != std::string::npos,
-              "drafter present and absent spell different keys (present: none)");
+        const std::string present_reference =
+            pr::resolve(pr::Name::fast, pr::App::engine, present, synthetic).find("route")->ladder_reference;
+        check(present_reference.empty() && absent_reference.find(",draft=0{v1};") != std::string::npos,
+              "drafter present and absent spell different keys (present: none): absent '" + absent_reference +
+                  "' present '" + present_reference + "'");
         strix::profile::LadderRow drafter_timing = route_timing;
         drafter_timing.over = absent_reference;
         absent.ladder = std::span(&drafter_timing, 1);

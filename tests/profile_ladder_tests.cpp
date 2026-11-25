@@ -165,9 +165,16 @@ void verdicts() {
                 "pending/unavailable TURBO replacement keeps the FAST export and records the refusal");
     }
 
+    // TURBO nests FAST (review r75 P1-a): a same-value TURBO cell its column refuses (pending, runnable or not) keeps the
+    // FAST cell, its status and its export; it never drops the FAST member to the builtin.
     refused_rows[0].value[3] = "a8";
-    require(resolve(refused, p::Name::turbo, measured).find(kLever)->status == p::Status::pending,
-            "a same-value TURBO binding explicitly unavailable in this composition remains pending");
+    for (const bool runnable : {true, false}) {
+        refused_rows[0].runnable[3] = runnable;
+        const auto same = resolve(refused, p::Name::turbo, measured);
+        require(same.find(kLever)->value == "a8" && same.find(kLever)->status == fast_run.find(kLever)->status &&
+                    exported(same),
+                "a same-value TURBO binding unavailable in this composition keeps the FAST cell");
+    }
 
     // An explicit setting is the user's own: it runs as set in every regime.
     p::Inputs in;

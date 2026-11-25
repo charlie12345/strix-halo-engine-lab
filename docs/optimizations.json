@@ -2958,9 +2958,9 @@
     "flag_or_env": "STRIX_GLM_SERVE_SAMPLED_MTP",
     "default": "off (explicit opt-in under every profile; pair gates of this tree pending)",
     "exact": "Coupled acceptance: tokens equal plain sampling of the same seed when verify rows equal plain-step rows bitwise; both ranks commit by the window's accepted-draft count. Host fake pair on this tree: 3 sampled requests x 40 tokens equal plain sampling (greedy drafts, drawn drafts, rejection forced at row 0, beside a greedy request with G2 on). Rejection acceptance: exact in distribution only, admitted by --profile fast / turbo. Pair gates of this tree pending; historical receipts of the contributor build c1f5686e (before the merge) in the doc section do not qualify it.",
-    "gain": "Historical, contributor build c1f5686e before the merge (one USB4 cable shared with thunderbolt_net, 29K-token prompt then 1,024-token answers, 3 per cell, not interleaved): plain steps 24.0-24.3 tok/s; coupled 33.5-38.3 at T 0.6 and 30.1-34.3 at T 1.0; rejection 30.1-34.5 at T 1.0. Not re-measured on this tree.",
+    "gain": "Not measured on this tree; published with its pair gates.",
     "preconditions": "strix-glm5-serve with MTP on and sampling available; one sampled request decoding (C1); never in batched verify (G2).",
-    "off_switch": "STRIX_GLM_SERVE_SAMPLED_MTP=0 (plain steps); STRIX_MTP_SAMPLED_ACCEPT=rejection with --profile fast or turbo opts into rejection sampling (exact in distribution, not token-equal to plain sampling)",
+    "off_switch": "STRIX_GLM_SERVE_SAMPLED_MTP=0 or unset (plain steps); =coupled keeps the tokens of plain sampling; =rejection (--profile fast or turbo only) selects rejection sampling, exact in distribution, not token-equal to plain sampling.",
     "doc_anchor": "docs/optimizations.md#glm-serve-sampled-mtp"
   },
   {

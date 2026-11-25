@@ -266,22 +266,11 @@ storage) and the eight images of `images`, on one x86 host, CPU only.
 |---|---|
 | Strict validation of files written by the format's own writer | pass |
 | Host tests (`glm5-vision`): projector against a direct FP64 computation, fused equals separate bit for bit, canvas table, patch order and padding, refusals | pass |
-| Preprocessing against the reference rows, 32 file x image cases | canvas sizes equal, normalised pixels bit-equal |
-| FP32 rows against the reference rows, 32 cases | row cosine at least 0.99989, relative L2 at most 5.6e-3 |
-| `--reference-f16-conv` arm against the reference rows, 32 cases | row cosine at least 0.9999999, relative L2 at most 1.2e-4 |
-| The real projector file | run on the pair through the server (`mmproj-F16.gguf`, 2026-11-24, contributor build); not compared against the reference rows |
+| The real projector file | pending on this build (qualification with a real projector on the command line and the server) |
 | Server host half (`glm5-serve-vision`): file to bridge to interned rows, embed frame lead to follower, both ranks' chunk resolution | pass: identical tokens and row bytes on both ranks for chunks that cut a span; an image's rows travel once |
 | Pair protocol on a fake engine (`strix-glm5-serve-cpu-tests --image-only`): whole prompt, chunks beside a decoding request, MTP, prefill units | pass: the same tokens in every arm, equal call logs on both ranks, no prefix cache entry, `session_id` refused |
 | Device splice into the GLM prefill (`Engine::set_embed_rows` in `prefill` and `prefill_mtp`, `--embed-rows`, `apps/glm_serve_main.cpp`) | compiles for gfx1151; the server path runs on the pair (whole short image prompts); `--embed-rows`, prompts that span chunks or units, and text-prompt identity against the previous build **not run** |
 | Language model answers on images | pass on two synthetic images, greedy and sampled (red \| blue halves: "The left side is red and the right side is blue."; filled circle beside an outlined square: "A solid black filled circle sits on the left, while an unfilled square outline appears on the right.") |
-
-Reference rows: an independent implementation of the same file format, run on the same machine on the same
-file and the same RGB pixels (CPU backend, its own preprocessing and encoder, flash attention off); its version
-and command are kept with the private records of this gate.
-
-The two arms separate the sources of the difference: with the FP16 convolution inputs modelled the rows agree to
-1e-4, so the remaining 5e-3 of the default arm is that rounding of the reference, not a wiring difference. What is
-left in the FP16 arm is the reference's FP16 convolution kernels and its FP32 accumulation.
 
 ## Image rows in the language model prefill
 

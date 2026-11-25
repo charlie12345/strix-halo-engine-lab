@@ -34,7 +34,7 @@ struct ModelPreset {
 // model's replica form (else std::invalid_argument with the rule and reason). The result's
 // config["multi_device"] is what CLI / serve print for --device-count N with the same tier.
 [[nodiscard]] ModelPreset resolve_replica_router(const model_description::ModelDescription&, std::optional<Name>,
-                                                 std::uint32_t replicas);
+                                                 std::uint32_t replicas, bool explicit_replica = false);
 
 struct ModelLaunch {
     std::string asset, backend;

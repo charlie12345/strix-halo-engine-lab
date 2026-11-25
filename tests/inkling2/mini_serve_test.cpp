@@ -542,6 +542,29 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         else require(rc == 2 && !created && error.str().find(reason) != std::string::npos,
                      "--block-drafter value was not refused with its reason before native load");
     }
+    // One strix-serve process serves one worker. An explicit replica placement resolves the model's two-device form, which only
+    // strix-router executes: with real model arguments (a checkpoint) the shell refuses before the adapter validates or
+    // creates anything. This is the documented standalone entry point (the `strix` CLI has no Inkling route).
+    {
+        std::ostringstream out, error;
+        strings.emplace_back("--device-count");
+        strings.emplace_back("2");
+        strings.emplace_back("--placement");
+        strings.emplace_back("replica");
+        require(run({}, out, error) == 2 && !created && error.str().find("runs behind strix-router") != std::string::npos,
+                "two-device Inkling launch with a checkpoint was not refused by strix-serve");
+        strings.resize(strings.size() - 4U);
+        // The same query inspected (no model arguments) reports the replica placement and its executor.
+        std::vector<std::string> inspection{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
+                                            "--device-count", "2", "--placement", "replica", "--print-effective-config"};
+        std::vector<char*> argv;
+        for (auto& arg : inspection) argv.push_back(arg.data());
+        std::ostringstream inspected, inspect_error;
+        require(sv::run(static_cast<int>(argv.size()), argv.data(), factories, inspected, inspect_error, {}) == 0 &&
+                inspected.str().find("\"form\":\"replica\"") != std::string::npos &&
+                inspected.str().find("\"executed_by\":\"router\"") != std::string::npos && !created,
+                "two-device Inkling inspection did not report the replica placement");
+    }
     sv::ServeShell shell;
     shell.serve = [qualify_q8, sample_capable, fast = std::string_view(tier_name) == "fast"](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
         std::exception_ptr failure;

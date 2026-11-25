@@ -114,9 +114,10 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
 }
 
 ModelPreset resolve_replica_router(const model_description::ModelDescription& description, std::optional<Name> tier,
-                                   std::uint32_t replicas) {
+                                   std::uint32_t replicas, bool explicit_replica) {
     multi_device::Query query;
     query.devices = replicas;
+    if (explicit_replica) query.placement = multi_device::Form::replica;
     auto preset = resolve_model_preset(description, tier, {}, query);
     if (preset.placement.form != multi_device::Form::replica)
         throw std::invalid_argument("model does not resolve the replica form for " + std::to_string(replicas) +

@@ -274,12 +274,13 @@ serial decode. A family without `media` keeps its renderer, which refuses image 
 
 ### Inkling 2 Mini
 
-The image tower is read from the same checkpoint as the text weights and its geometry from the checkpoint's
-`config.json` in the same directory (a regular file of at most 1 MiB, not a link); nothing else is loaded or
-configured. Image input is on in `strix-inkling2-mini-hip`, `strix-inkling2-mini-cuda` and the CPU reference
-`strix-inkling2-mini-cpu` whenever they are built with the vision targets (default). Put the image in the
-`--messages` file as an OpenAI-style `image_url` part with a base64 `data:` URL (PNG or JPEG); the CLI fetches no
-`http(s)` URL:
+On the first image, the CLI opens the tower weights from the checkpoint shard and validates any adjacent
+`config.json` against the supported tower geometry. It opens both files within one held checkpoint directory.
+The shard and sidecar must be regular files without symlinks or reparse points at their names. The sidecar has
+a 1 MiB cap. A directory containing only the shard uses the binding's fixed geometry. Image input is on in
+`strix-inkling2-mini-hip`, `strix-inkling2-mini-cuda` and the CPU reference `strix-inkling2-mini-cpu` whenever
+they are built with the vision targets (default). Put the image in the `--messages` file as an OpenAI-style
+`image_url` part with a base64 `data:` URL (PNG or JPEG). The CLI fetches no `http(s)` URL.
 
 ```json
 {"messages": [{"role": "user", "content": [

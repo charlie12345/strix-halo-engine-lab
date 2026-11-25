@@ -7,52 +7,44 @@
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/vision/serial_media.hpp"
 #include "strix/vision/encoder.hpp"
+#include "strix/weight/confined_file.hpp"
 #if defined(__CUDACC__)
 #include "strix/vision/encoder_cuda.hpp"
 #endif
 
 #include <filesystem>
-#include <fstream>
-#include <stdexcept>
-#include <system_error>
 #include <memory>
 #include <string>
 
 namespace strix::inkling2::cli {
 
-// The tower geometry of the checkpoint's own config.json (vision_config, checked by parse_vision_spec). The checkpoint
-// and its config are one authorized set: config.json must be a regular file, not a link, at most 1 MiB, in the same
-// real directory as the checkpoint.
-inline VisionSpec read_mini_vision_spec(const std::string& checkpoint) {
-    namespace fs = std::filesystem;
-    const fs::path dir = fs::canonical(checkpoint).parent_path();
-    const fs::path path = dir / "config.json";
-    std::error_code ec;
-    if (fs::is_symlink(path, ec) || !fs::is_regular_file(path, ec))
-        throw std::runtime_error("Inkling 2 image input needs config.json (a regular file) beside the checkpoint");
-    if (fs::canonical(path, ec).parent_path() != dir || ec)
-        throw std::runtime_error("Inkling 2 image input: config.json resolves outside the checkpoint directory");
-    const auto size = fs::file_size(path, ec);
-    if (ec || size > (std::uintmax_t{1} << 20U))
-        throw std::runtime_error("Inkling 2 image input: config.json is unreadable or larger than 1 MiB");
-    std::ifstream in(path, std::ios::binary);
-    std::string text(static_cast<std::size_t>(size), ' ');
-    if (!in.read(text.data(), static_cast<std::streamsize>(size)))
-        throw std::runtime_error("Inkling 2 image input: short read of config.json");
-    return parse_vision_spec(text);
+inline constexpr std::size_t kMiniVisionConfigBytes = 1U << 20U;
+
+struct MiniVisionCheckpoint {
+    VisionSpec spec;
+    std::shared_ptr<const weight::Source> shard;
+};
+
+inline MiniVisionCheckpoint read_mini_vision_checkpoint(const weight::ConfinedDirectory& directory,
+                                                         const std::filesystem::path& basename) {
+    auto shard = directory.open(basename);
+    const auto sidecar = directory.read("config.json", kMiniVisionConfigBytes, true);
+    return {sidecar ? parse_vision_spec(*sidecar) : VisionSpec{}, std::move(shard)};
 }
 
-inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(const std::string& checkpoint, const VisionSpec& config,
+inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(std::shared_ptr<const weight::Source> checkpoint,
+                                                               const VisionSpec& config,
                                                                VisionIdentity identity) {
     vision::SerialMediaSpec spec;
-    spec.shard = checkpoint;
+    const auto shard_bytes = checkpoint->size();
+    spec.shard_source = std::move(checkpoint);
     spec.tensors = vision_tensor_specs(config);
     spec.ignored_prefix = std::string(kVisionIgnoredPrefix);
     spec.placeholder = std::string(serve::kInkling2ImagePlaceholder);
     spec.lm_width = config.text_width;
     // Weight identity of the embed rows: the shard's size (no cross-run cache, so no content hash is needed).
     auto adapter = std::make_unique<VisionAdapter>(
-        config, "shard-bytes-" + std::to_string(std::filesystem::file_size(checkpoint)), identity);
+        config, "shard-bytes-" + std::to_string(shard_bytes), identity);
     return std::make_unique<vision::SerialMedia>(std::move(adapter), std::move(spec),
         [](const vision::EncoderConfig& c, const vision::EncoderWeights& w) -> std::unique_ptr<vision::EncoderBackend> {
 #if defined(__HIPCC__)
@@ -70,7 +62,11 @@ inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(const std::strin
 }
 
 inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::string& checkpoint) {
-    return make_mini_media(checkpoint, read_mini_vision_spec(checkpoint), resolve_vision_identity());
+    const std::filesystem::path model(checkpoint);
+    const auto parent = model.has_parent_path() ? model.parent_path() : std::filesystem::path(".");
+    const weight::ConfinedDirectory directory(std::filesystem::canonical(parent));
+    auto assets = read_mini_vision_checkpoint(directory, model.filename());
+    return make_mini_media(std::move(assets.shard), assets.spec, resolve_vision_identity());
 }
 
 }  // namespace strix::inkling2::cli

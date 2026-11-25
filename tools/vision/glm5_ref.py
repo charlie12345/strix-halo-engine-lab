@@ -11,7 +11,9 @@ dump comes from another implementation of the file format run on the same file a
 `synth` writes files of language width 4096 (the engine refuses another width); every other size is small.
 """
 import argparse
+import math
 import os
+import stat
 import sys
 
 import numpy as np
@@ -135,26 +137,52 @@ MAX_DUMP_BYTES = 1 << 30
 
 
 def compare(args):
-    # Width and both file sizes are checked before anything is loaded.
+    # Width and both file sizes are checked on the open handles before anything is read; the rows are then compared in
+    # bounded batches (no whole-file copies). A zero-norm row has no cosine and an all-zero reference no relative L2:
+    # both refuse instead of passing, and every metric must be finite before a threshold is judged.
     if args.width <= 0:
         sys.exit("--width must be positive")
-    sizes = [os.path.getsize(p) if os.path.isfile(p) else -1 for p in (args.a, args.b)]
-    if sizes[0] != sizes[1] or sizes[0] <= 0 or sizes[0] > MAX_DUMP_BYTES or sizes[0] % (4 * args.width):
-        sys.exit(f"dumps must be regular files of equal size, whole rows of width {args.width}, at most 1 GiB: {sizes}")
-    a = np.fromfile(args.a, np.float32)
-    b = np.fromfile(args.b, np.float32)
-    if a.size != b.size or a.size == 0 or a.size % args.width:
-        sys.exit(f"dump sizes differ or are not rows of width {args.width}: {a.size} and {b.size}")
-    a = a.reshape(-1, args.width).astype(np.float64)
-    b = b.reshape(-1, args.width).astype(np.float64)
-    if not (np.isfinite(a).all() and np.isfinite(b).all()):
-        sys.exit("a dump holds a non-finite value")
-    cos = (a * b).sum(1) / np.sqrt((a * a).sum(1) * (b * b).sum(1))
-    rel = float(np.sqrt(((a - b) ** 2).sum() / (b * b).sum()))
-    print(f"rows {a.shape[0]} cos_min {cos.min():.9f} cos_mean {cos.mean():.9f} rel_l2 {rel:.3e} max_abs {np.abs(a - b).max():.3e}")
-    if args.min_cos is not None and cos.min() < args.min_cos:
-        sys.exit(f"FAIL: row cosine {cos.min():.9f} under {args.min_cos}")
-    if args.max_rel_l2 is not None and rel > args.max_rel_l2:
+    with open(args.a, "rb") as fa, open(args.b, "rb") as fb:
+        sizes = []
+        for f in (fa, fb):
+            st = os.fstat(f.fileno())
+            sizes.append(st.st_size if stat.S_ISREG(st.st_mode) else -1)
+        if sizes[0] != sizes[1] or sizes[0] <= 0 or sizes[0] > MAX_DUMP_BYTES or sizes[0] % (4 * args.width):
+            sys.exit(f"dumps must be regular files of equal size, whole rows of width {args.width}, at most 1 GiB: {sizes}")
+        rows = sizes[0] // (4 * args.width)
+        batch = max(1, (16 << 20) // (4 * args.width))  # 16 MiB of each dump per step
+        cos_min, cos_sum, diff2, ref2, max_abs = math.inf, 0.0, 0.0, 0.0, 0.0
+        done = 0
+        while done < rows:
+            n = min(batch, rows - done)
+            a = np.fromfile(fa, np.float32, n * args.width)
+            b = np.fromfile(fb, np.float32, n * args.width)
+            if a.size != n * args.width or b.size != n * args.width:
+                sys.exit("a dump changed size while it was read")
+            a = a.reshape(n, args.width).astype(np.float64)
+            b = b.reshape(n, args.width).astype(np.float64)
+            if not (np.isfinite(a).all() and np.isfinite(b).all()):
+                sys.exit("a dump holds a non-finite value")
+            na, nb = (a * a).sum(1), (b * b).sum(1)
+            if (na == 0).any() or (nb == 0).any():
+                sys.exit(f"a zero-norm row near row {done}: its cosine is undefined")
+            cos = (a * b).sum(1) / np.sqrt(na * nb)
+            cos_min = min(cos_min, float(cos.min()))
+            cos_sum += float(cos.sum())
+            diff2 += float(((a - b) ** 2).sum())
+            ref2 += float(nb.sum())
+            max_abs = max(max_abs, float(np.abs(a - b).max()))
+            done += n
+    if ref2 == 0:
+        sys.exit("the reference dump is all zero: relative L2 is undefined")
+    rel = math.sqrt(diff2 / ref2)
+    cos_mean = cos_sum / rows
+    if not all(math.isfinite(x) for x in (cos_min, cos_mean, rel, max_abs)):
+        sys.exit("a comparison metric is not finite")
+    print(f"rows {rows} cos_min {cos_min:.9f} cos_mean {cos_mean:.9f} rel_l2 {rel:.3e} max_abs {max_abs:.3e}")
+    if args.min_cos is not None and not cos_min >= args.min_cos:
+        sys.exit(f"FAIL: row cosine {cos_min:.9f} under {args.min_cos}")
+    if args.max_rel_l2 is not None and not rel <= args.max_rel_l2:
         sys.exit(f"FAIL: relative L2 {rel:.3e} over {args.max_rel_l2}")
 
 

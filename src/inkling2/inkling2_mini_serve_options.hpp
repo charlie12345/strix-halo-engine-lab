@@ -47,6 +47,9 @@ struct MiniServeOptions {
     bool combine_image = false;
     // Resolved projected-bias attention lever (mini_attn_projected_bias), the value the CLI and the gate read.
     bool attn_projected_bias = false;
+    // Resolved verify rows lever (mini_verify_rows), the value the CLI and the gate read. A served lane decodes one row
+    // per step (no verify window): the server reports what its decoder admitted and runs the same steps either way.
+    bool verify_rows = false;
     bool controller_one_plane = false;
     // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
     bool screened_head = false;

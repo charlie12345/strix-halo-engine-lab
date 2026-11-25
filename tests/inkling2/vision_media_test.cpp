@@ -140,6 +140,40 @@ void test_serial_rgba() {
     const auto opener = ink::cli::mini_media_opener(resolve_tier(profile::Name::fast, "axial@1"), receipt, spec);
     require(opener(shard.string())->adapter().identity() == bridge.identity(), "opener runs the resolved recipe");
     require(receipt.str() == "image identity " + bridge.identity() + "\n", "image run prints its image identity");
+    // The opened input names the files it read (the CLI refuses them as outputs) and pins the shard: the language
+    // model checkpoint the CLI loads afterwards must be that file.
+    {
+        const auto opened = opener(shard.string());
+        const auto inputs = opened->inputs();
+        require(inputs.size() == 2 && inputs[0] == std::filesystem::canonical(shard) &&
+                inputs[1] == std::filesystem::canonical(shard).parent_path() / "config.json",
+                "the image input names its shard and config sidecar");
+        opened->verify_checkpoint(shard.string());
+        const auto other = fixture.path / "other.safetensors";
+        std::filesystem::copy_file(shard, other);
+        bool refused = false;
+        try {
+            opened->verify_checkpoint(other.string());
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        require(refused, "a checkpoint that is not the pinned shard is refused");
+        std::filesystem::remove(other);
+        std::error_code link_error;
+        std::filesystem::create_symlink(shard, fixture.path / "tower-link.safetensors", link_error);
+        if (!link_error) {  // a linked checkpoint opens its target, as the language model loader does
+            const auto linked = opener((fixture.path / "tower-link.safetensors").string());
+            require(linked->inputs()[0] == std::filesystem::canonical(shard), "a linked checkpoint names its target");
+            linked->verify_checkpoint((fixture.path / "tower-link.safetensors").string());
+        }
+    }
+    bool exact_refused = false;
+    try {
+        static_cast<void>(ink::cli::mini_media_opener(resolve_tier(profile::Name::standard, "axial@1"), receipt, spec));
+    } catch (const std::invalid_argument&) {
+        exact_refused = true;
+    }
+    require(exact_refused, "explicit EXACT refuses the axial image opener");
     std::ifstream png(std::filesystem::path(STRIX_VISION_FIXTURE_DIR) / "rgba_noise.png", std::ios::binary);
     serve::media::MediaItem item;
     item.bytes.assign(std::istreambuf_iterator<char>(png), std::istreambuf_iterator<char>());

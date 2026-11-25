@@ -6,8 +6,10 @@
 #include <vector>
 
 #include <cstdint>
+#include <filesystem>
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -84,7 +86,22 @@ class SerialMediaInput {
 public:
     virtual ~SerialMediaInput() = default;
     [[nodiscard]] virtual ApiMediaAdapter& adapter() = 0;
+    // Files the input read (config sidecars, weights): the CLI refuses a --logits output that is one of them,
+    // before any device work.
+    [[nodiscard]] virtual std::vector<std::filesystem::path> inputs() const { return {}; }
+    // Called after the language model is loaded from `checkpoint`: refuses a checkpoint that is not the file the
+    // input read its weights from.
+    virtual void verify_checkpoint(const std::string& checkpoint) const { static_cast<void>(checkpoint); }
 };
+
+// Device and file number of the file `path` names now (links followed; nullopt: nothing there). Equal keys name one
+// file, whatever the paths (hard links, links, aliases).
+struct FileKey {
+    std::uint64_t device{}, file{};
+    bool operator==(const FileKey&) const = default;
+};
+[[nodiscard]] std::optional<FileKey> file_key(const std::filesystem::path& path);
+[[nodiscard]] std::optional<FileKey> descriptor_file_key(int descriptor);  // of an open C runtime descriptor
 
 struct SerialGenerationFamily {
     std::string_view executable, diagnostic_name, checkpoint_argument;
@@ -136,6 +153,7 @@ struct SerialGenerationOptions {
     const char* tokenizer{};
     const char* tokenize_file{};
     const char* logits{};
+    bool logits_overwrite{};  // --logits-overwrite: an existing --logits file may be replaced
     std::uint32_t generate{}, prefill_chunk{};
     bool prefill_chunk_explicit{};
     bool packed_decode{};

@@ -26,6 +26,16 @@
 #include <stdexcept>
 #include <vector>
 
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#include <share.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace strix::serve {
 namespace {
 
@@ -80,9 +90,76 @@ Number parse_number(std::string_view value, const char* error) {
     return result;
 }
 
-void protect_asset(const char* output, const fs::path& asset, const char* error) {
-    if (output && fs::exists(output) && fs::equivalent(asset, output)) throw std::invalid_argument(error);
-}
+// The --logits file, opened before any input is read: created exclusively, or (--logits-overwrite) an existing file
+// opened without truncation. Every input is compared with the opened file's key, so an alias of an input (a link, a
+// hard link, another spelling) is refused before a byte is written; the file is truncated only by write().
+class LogitsOutput {
+public:
+    LogitsOutput(const fs::path& path, bool overwrite) : path_(path), created_(!overwrite) {
+#ifdef _WIN32
+        const int flags = _O_WRONLY | _O_BINARY | _O_NOINHERIT | _O_CREAT | (overwrite ? 0 : _O_EXCL);
+        if (_wsopen_s(&fd_, path.c_str(), flags, _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0) fd_ = -1;
+#else
+        fd_ = ::open(path.c_str(), O_WRONLY | O_CLOEXEC | O_CREAT | (overwrite ? 0 : O_EXCL), 0644);
+#endif
+        if (fd_ < 0)
+            throw std::invalid_argument(errno == EEXIST
+                ? "logits output exists (pass --logits-overwrite to replace it)" : "could not open logits output");
+        key_ = descriptor_file_key(fd_);
+        if (!key_) {
+            close();
+            throw std::runtime_error("could not identify logits output");
+        }
+    }
+    ~LogitsOutput() {  // a run that fails leaves no file it created (and an existing file untruncated)
+        close();
+        std::error_code ignored;
+        if (created_ && !written_ && file_key(path_) == key_) fs::remove(path_, ignored);
+    }
+    LogitsOutput(const LogitsOutput&) = delete;
+    LogitsOutput& operator=(const LogitsOutput&) = delete;
+
+    void refuse(const fs::path& input, const char* error) const {
+        if (file_key(input) == key_) throw std::invalid_argument(error);
+    }
+    void write(std::span<const float> logits) {
+        const auto bytes = session::logits_bytes(logits);
+#ifdef _WIN32
+        bool ok = _chsize_s(fd_, 0) == 0 && _lseeki64(fd_, 0, SEEK_SET) == 0;
+        for (std::size_t at = 0; ok && at < bytes.size();) {
+            const auto n = _write(fd_, bytes.data() + at, unsigned(std::min<std::size_t>(bytes.size() - at, 1U << 30U)));
+            ok = n > 0;
+            at += ok ? std::size_t(n) : 0U;
+        }
+#else
+        bool ok = ::ftruncate(fd_, 0) == 0 && ::lseek(fd_, 0, SEEK_SET) == 0;
+        for (std::size_t at = 0; ok && at < bytes.size();) {
+            const auto n = ::write(fd_, bytes.data() + at, bytes.size() - at);
+            ok = n > 0;
+            at += ok ? std::size_t(n) : 0U;
+        }
+#endif
+        ok = close() && ok;
+        written_ = ok;
+        if (!ok) throw std::runtime_error("could not write logits output");
+    }
+
+private:
+    bool close() {
+        if (fd_ < 0) return true;
+#ifdef _WIN32
+        const bool ok = _close(fd_) == 0;
+#else
+        const bool ok = ::close(fd_) == 0;
+#endif
+        fd_ = -1;
+        return ok;
+    }
+    fs::path path_;
+    bool created_ = false, written_ = false;
+    int fd_ = -1;
+    std::optional<FileKey> key_;
+};
 
 std::string read_text(const char* path) {
     std::ifstream input(path, std::ios::binary);
@@ -104,7 +181,8 @@ struct MediaPrompt {
 
 MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std::string& checkpoint,
                                 const BpeTokenizer& tokenizer, std::string_view body_text,
-                                std::uint32_t reserve_tokens, std::unique_ptr<SerialMediaInput>& media) {
+                                std::uint32_t reserve_tokens, std::unique_ptr<SerialMediaInput>& media,
+                                const LogitsOutput* output) {
     MediaPrompt out;
     auto body = parse_json(body_text);
     if (body.is_array()) {  // a bare messages array is the body {"messages": [...]}
@@ -119,6 +197,9 @@ MediaPrompt render_media_prompt(const SerialGenerationFamily& family, const std:
     }
     media = family.media(checkpoint);
     if (!media) throw std::runtime_error("the family opened no media input");
+    if (output)  // before the encoder runs: the output may be none of the files the media input read
+        for (const auto& input : media->inputs())
+            output->refuse(input, "logits output must differ from the image input files");
     auto& adapter = media->adapter();
     const auto placeholder_ids = tokenizer.encode(adapter.placeholder(), true);
     if (placeholder_ids.size() != 1U || session::is_embed_id(placeholder_ids[0]))
@@ -168,6 +249,7 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
             options.generate_requested = true;
         }
         else if (argument == "--logits") options.logits = value();
+        else if (argument == "--logits-overwrite") options.logits_overwrite = true;
         else if (family.supports_speculation && argument == "--speculation") {
             const std::string_view mode(value());
             if (mode == "off") options.speculation = CliSpeculation::off;
@@ -225,14 +307,19 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
 void run_serial_generation(const std::string& checkpoint, SerialGenerationOptions options,
                            const SerialGenerationFamily& family, std::ostream& out,
                            const std::function<void()>& on_loaded) {
-    protect_asset(options.logits, checkpoint, "logits output must differ from the checkpoint");
+    std::optional<LogitsOutput> output;  // opened first: every input below is checked against the opened file
+    if (options.logits) output.emplace(options.logits, options.logits_overwrite);
+    const auto protect_asset = [&](const fs::path& asset, const char* error) {
+        if (output) output->refuse(asset, error);
+    };
+    protect_asset(checkpoint, "logits output must differ from the checkpoint");
     std::shared_ptr<const BpeTokenizer> tokenizer;
     std::unique_ptr<SerialMediaInput> media;            // outlives the prefill: it owns the interned rows' adapter
     std::shared_ptr<const session::EmbedTable> embeds;  // rows of the virtual ids of an image prompt
     if (options.text || options.messages || options.tokenize_file) {
         const fs::path asset = options.tokenizer ? fs::path(options.tokenizer) :
             fs::path(checkpoint).parent_path() / "tokenizer.json";
-        protect_asset(options.logits, asset, "logits output must differ from the tokenizer");
+        protect_asset(asset, "logits output must differ from the tokenizer");
         tokenizer = family.load_tokenizer(asset.string());
         if (options.tokenize_file) {
             for (const auto id : tokenizer->encode(read_text(options.tokenize_file), false)) out << id << '\n';
@@ -240,10 +327,11 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             return;
         }
         if (options.messages) {
-            protect_asset(options.logits, options.messages, "logits output must differ from the messages file");
+            protect_asset(options.messages, "logits output must differ from the messages file");
             const auto body = read_text(options.messages);
             if (family.media && family.render_media_messages) {
-                auto prompt = render_media_prompt(family, checkpoint, *tokenizer, body, options.generate, media);
+                auto prompt = render_media_prompt(family, checkpoint, *tokenizer, body, options.generate, media,
+                                                  output ? &*output : nullptr);
                 options.prompt = std::move(prompt.tokens);
                 embeds = std::move(prompt.table);
             } else {
@@ -279,6 +367,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
                             verify_rows ? options.speculation : CliSpeculation::off,
                             prefill_tail_rows(prompt_size, rows, family.prefill_tail_divisor)});
     });
+    if (media) media->verify_checkpoint(checkpoint);  // the loaded model is the shard the image rows came from
     if (family.report_load_timing) session::write_load_timing(out, load_start);
     if (on_loaded) on_loaded();
 
@@ -290,7 +379,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     auto next = embeds ? decoder->prefill_embedded(options.prompt, embeds, logits) : decoder->prefill(options.prompt, logits);
     if (sampler) next = sampler->decide(logits, prompt_size, nullptr).token;
     const auto prefill_ms = session::cli_milliseconds(Clock::now() - prefill_start);
-    if (options.logits) session::write_logits(options.logits, logits);
+    if (output) output->write(logits);
     if (!sampler) logits.clear();
 
     out << "next_token " << next << '\n';
@@ -422,7 +511,7 @@ int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamil
         if (family.default_prefill_chunk) error << " [--prefill-chunk N]";
         if (family.supports_packed_decode) error << " [--packed-decode]";
         if (family.supports_speculation) error << " [--speculation " << speculation_modes << "]";
-        error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
+        error << " [--generate N] [--logits FILE [--logits-overwrite]] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
         return 2;
     }
     try {

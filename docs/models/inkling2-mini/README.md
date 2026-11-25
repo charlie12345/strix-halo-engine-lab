@@ -64,7 +64,8 @@ Chat files may carry images as base64 `image_url` parts; see
 [Inkling 2 Mini image input](../../engine/vision-adapters.md#inkling-2-mini).
 
 Generation defaults to greedy selection and can emit one FP32 prompt logits row
-with `--logits FILE`. CPU and device generation accept `--temperature`,
+with `--logits FILE` (created new; `--logits-overwrite` replaces an existing file, never an input of the
+run). CPU and device generation accept `--temperature`,
 `--top-k` and `--seed` through the shared sampler.
 
 ```sh

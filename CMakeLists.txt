@@ -1618,6 +1618,7 @@ add_library(strix_serve STATIC
     src/serve/hy4_chat.cpp
     src/serve/inkling2_chat.cpp
     src/serve/serial_generation_cli.cpp
+    src/serve/file_key.cpp
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp

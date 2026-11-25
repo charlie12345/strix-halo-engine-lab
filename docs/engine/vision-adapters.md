@@ -279,8 +279,12 @@ serial decode. A family without `media` keeps its renderer, which refuses image 
 ### Inkling 2 Mini
 
 On the first image, the CLI opens the tower weights from the checkpoint shard and validates any adjacent
-`config.json` against the supported tower geometry. It opens both files within one held checkpoint directory.
-The shard and sidecar must be regular files without symlinks or reparse points at their names. The sidecar has
+`config.json` against the supported tower geometry. A linked checkpoint path names its target (as for the
+language model); both files are opened within the target's held directory, and there the shard and sidecar must be
+regular files without symlinks or reparse points at their names. The shard is pinned by its file identity: the
+language model the CLI loads afterwards must be that same file, or the run is refused. `--logits` is opened before
+any input, created exclusively (`--logits-overwrite` replaces an existing file) and refused when it is the
+checkpoint, the tokenizer, the messages file or one of the image input files under any name. The sidecar has
 a 1 MiB cap. A directory containing only the shard uses the binding's fixed geometry. Image input is on in
 `strix-inkling2-mini-hip`, `strix-inkling2-mini-cuda` and the CPU reference `strix-inkling2-mini-cpu` whenever
 they are built with the vision targets (default). Put the image in the `--messages` file as an OpenAI-style

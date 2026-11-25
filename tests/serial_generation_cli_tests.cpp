@@ -18,12 +18,15 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <new>
 #include <optional>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -145,6 +148,10 @@ std::string text_render(std::string_view) { return "ab"; }
 std::vector<std::uint32_t> embedded_inputs;
 std::shared_ptr<const strix::session::EmbedTable> embedded_table;
 unsigned media_opens = 0;
+unsigned media_encodes = 0;
+unsigned media_verifies = 0;
+std::vector<std::filesystem::path> media_inputs;  // what the fake media input reports it read
+bool media_same_checkpoint = true;                 // whether the loaded checkpoint is the pinned one
 
 class MediaDecoder final : public SerialGenerationDecoder {
 public:
@@ -169,6 +176,7 @@ public:
     std::string placeholder() const override { return "<img>"; }
     std::uint32_t max_rows() const override { return 2; }
     ApiMediaSpan encode(const media::MediaItem& item, std::uint32_t budget) override {
+        ++media_encodes;
         check(budget >= 2 && item.width == 1 && item.height == 1, "image item and row budget");
         strix::session::EmbedRows rows;
         rows.digest[0] = 7;
@@ -187,6 +195,11 @@ private:
 class FakeMediaInput final : public SerialMediaInput {
 public:
     ApiMediaAdapter& adapter() override { return images_; }
+    std::vector<std::filesystem::path> inputs() const override { return media_inputs; }
+    void verify_checkpoint(const std::string&) const override {
+        ++media_verifies;
+        if (!media_same_checkpoint) throw std::runtime_error("not the shard the image tower was read from");
+    }
 private:
     FakeImages images_;
 };
@@ -246,6 +259,70 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
           embedded_inputs == std::vector<std::uint32_t>{'a', 'b'}, "text body is unchanged");
     std::filesystem::remove(image);
     std::filesystem::remove(text);
+}
+
+// --logits with an image prompt: the output is opened first (exclusively unless --logits-overwrite) and compared by
+// file key with every file the media input read, before the encoder runs; the loaded checkpoint must be the pinned one.
+void media_output_guards(const SerialGenerationFamily& with_media) {
+    namespace fs = std::filesystem;
+    std::random_device rd;
+    const auto dir = fs::temp_directory_path() / ("strix-serial-media-out-" + std::to_string(rd()));
+    fs::create_directories(dir);
+    const auto write = [&](const char* name, const std::string& text) {
+        std::ofstream(dir / name, std::ios::binary) << text;
+        return dir / name;
+    };
+    const auto read = [](const fs::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    };
+    const std::string png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const auto messages = write("messages.json",
+        R"({"messages":[{"role":"user","content":[{"type":"text","text":"q"},{"type":"image_url","image_url":{"url":")" +
+        png + R"("}}]}]})");
+    const auto sidecar = write("config.json", R"({"vision_config":{}})");
+    media_inputs = {sidecar};
+    const auto run_with = [&](const fs::path& output, bool overwrite) {
+        std::vector<std::string> owned{"fixture", "checkpoint", "--messages", messages.string(), "--logits",
+                                       output.string()};
+        if (overwrite) owned.emplace_back("--logits-overwrite");
+        std::vector<char*> argv;
+        for (auto& arg : owned) argv.push_back(arg.data());
+        std::ostringstream out, error;
+        const int code = run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), with_media, out, error);
+        return std::pair{code, error.str()};
+    };
+    const auto encodes = media_encodes;
+    // The validated sidecar named as the output: refused as an existing file, and (overwrite asked) as an input.
+    auto [code, error] = run_with(sidecar, false);
+    check(code != 0 && error.find("logits output exists") != std::string::npos, "existing output refused");
+    std::tie(code, error) = run_with(sidecar, true);
+    check(code != 0 && error.find("differ from the image input files") != std::string::npos, "sidecar output refused");
+    // Another name of the same file (a hard link) is the same file key.
+    std::error_code link_error;
+    fs::create_hard_link(sidecar, dir / "alias.json", link_error);
+    if (!link_error) {
+        std::tie(code, error) = run_with(dir / "alias.json", true);
+        check(code != 0 && error.find("differ from the image input files") != std::string::npos, "alias output refused");
+    }
+    check(read(sidecar) == R"({"vision_config":{}})" && media_encodes == encodes, "sidecar intact, no image encoded");
+    // A fresh output is created and written; it then exists, so a rerun needs --logits-overwrite.
+    const auto fresh = dir / "logits.f32";
+    std::tie(code, error) = run_with(fresh, false);
+    check(code == 0 && fs::file_size(fresh) == 16U && media_encodes == encodes + 1U, "fresh output written");
+    std::tie(code, error) = run_with(fresh, false);
+    check(code != 0 && error.find("logits output exists") != std::string::npos, "rerun refuses the existing output");
+    std::tie(code, error) = run_with(fresh, true);
+    check(code == 0 && fs::file_size(fresh) == 16U, "rerun replaces the output when asked");
+    // A checkpoint that is not the pinned shard is refused after the load; a created output is removed.
+    media_same_checkpoint = false;
+    const auto verifies = media_verifies;
+    std::tie(code, error) = run_with(dir / "other.f32", false);
+    check(code != 0 && error.find("not the shard") != std::string::npos && media_verifies == verifies + 1U &&
+          !fs::exists(dir / "other.f32"), "a different checkpoint is refused and leaves no output");
+    media_same_checkpoint = true;
+    media_inputs.clear();
+    fs::remove_all(dir);
 }
 
 // Implicit prefill chunk: one retry at the fallback rows, only after an allocation failure.
@@ -429,6 +506,7 @@ int main() try {
             if (outcome.code != 0) std::cerr << outcome.error;
             return std::pair{outcome.code, outcome.out};
         });
+        media_output_guards(family_with_media);
     }
     const auto greedy = run({"8", "4", "--generate", "4"});
     check(greedy.code == 0 && greedy.out.starts_with("next_token 1\ngenerated 1 2\n"), "greedy IDs and EOS");

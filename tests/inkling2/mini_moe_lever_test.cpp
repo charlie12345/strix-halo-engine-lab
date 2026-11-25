@@ -1,6 +1,7 @@
 #include "inkling2/inkling2_mini_resident_route.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -329,7 +330,8 @@ void test_projected_bias() {
 // switchable by STRIX_INK_VERIFY_ROWS, refused on a malformed value, and reaching the decoder through the one helper.
 // It is appended after main's rows; the block-candidate row stays last.
 void test_verify_rows() {
-    const auto& row = mini::kMiniLevers[mini::kMiniLevers.size() - 2U];
+    const auto& row = *std::find_if(mini::kMiniLevers.begin(), mini::kMiniLevers.end(),
+                                    [](const auto& lever) { return lever.name == mini::kMiniVerifyRows; });
     require(row.name == mini::kMiniVerifyRows && row.name == "inkling2-mini-verify-rows@1", "verify rows row identity");
     require(mini::kMiniLevers.back().name == strix::spec::kBlockDraftLever.name, "the block-candidate row stays last");
     require(row.env == "STRIX_INK_VERIFY_ROWS" && row.off == "0" && row.builtin == "0" &&

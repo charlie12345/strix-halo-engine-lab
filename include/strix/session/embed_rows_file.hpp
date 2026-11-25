@@ -53,8 +53,6 @@ inline void write_embed_rows_file(const std::filesystem::path& path, const Embed
     out.flush();
     if (!out) throw std::runtime_error("embed rows file: cannot write " + path.filename().string());
 }
-
-// width: the reader's LM hidden width (0: any). The file length must be exactly the header plus the rows. Throws
 // std::invalid_argument for a malformed or foreign file, std::runtime_error on I/O failure.
 // Header facts of a rows file, read without touching the payload (budget a set of files before materializing any).
 struct EmbedRowsFileInfo {
@@ -109,6 +107,8 @@ inline EmbedRowsFileInfo open_embed_rows_file(std::ifstream& in, const std::file
     return detail::open_embed_rows_file(in, path, width, scratch, fnv);
 }
 
+// width: the reader's LM hidden width (0: any). The file length must be exactly the header plus the rows. Throws
+// std::invalid_argument for a malformed or foreign file, std::runtime_error on I/O failure.
 [[nodiscard]] inline EmbedRows read_embed_rows_file(const std::filesystem::path& path, std::uint32_t width = 0) {
     const std::string name = path.filename().string();
     std::ifstream in;

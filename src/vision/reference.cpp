@@ -5,6 +5,7 @@
 #include "../attn_core/two_term_model.hpp"
 #include "encoder_layout.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/vision/host_math.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -82,21 +83,7 @@ void norm_ref(const EncoderConfig& c, const Tensor& w, const Tensor& b, const fl
     for (std::size_t i = 0; i < n; ++i) wv[i] = w.at(i);
     if (b)
         for (std::size_t i = 0; i < n; ++i) bv[i] = b.at(i);
-    for (std::size_t r = 0; r < rows; ++r) {
-        const float* xr = x + r * n;
-        double mean = 0.0, sq = 0.0;
-        if (c.norm == EncoderConfig::Norm::layernorm) {
-            for (std::size_t i = 0; i < n; ++i) mean += static_cast<double>(xr[i]);
-            mean /= static_cast<double>(n);
-        }
-        for (std::size_t i = 0; i < n; ++i) {
-            const double d = static_cast<double>(xr[i]) - mean;
-            sq += d * d;
-        }
-        const double inv = 1.0 / std::sqrt(sq / static_cast<double>(n) + static_cast<double>(c.eps));
-        for (std::size_t i = 0; i < n; ++i)
-            y[r * n + i] = static_cast<float>((static_cast<double>(xr[i]) - mean) * inv * static_cast<double>(wv[i]) + static_cast<double>(bv[i]));
-    }
+    norm_rows(x, rows, n, wv.data(), b ? bv.data() : nullptr, c.eps, c.norm == EncoderConfig::Norm::layernorm, y);
 }
 
 double activation(const EncoderConfig& c, double v) {
@@ -438,13 +425,8 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
             const double lim = static_cast<double>(c.swiglu_limit);
             for (std::size_t r = 0; r < N; ++r)
                 for (std::size_t j = 0; j < M; ++j) {
-                    double gate = static_cast<double>(mid[r * M1 + (c.swiglu_gate_first ? j : M + j)]);
-                    double up = static_cast<double>(mid[r * M1 + (c.swiglu_gate_first ? M + j : j)]);
-                    if (lim > 0.0) {
-                        gate = std::min(gate, lim);
-                        up = std::clamp(up, -lim, lim);
-                    }
-                    act[r * M + j] = static_cast<float>(gate / (1.0 + std::exp(-gate)) * up);
+                    act[r * M + j] = clamped_swiglu(mid[r * M1 + (c.swiglu_gate_first ? j : M + j)],
+                                                    mid[r * M1 + (c.swiglu_gate_first ? M + j : j)], lim);
                 }
         } else {
             for (std::size_t i = 0; i < N * M; ++i) act[i] = static_cast<float>(activation(c, static_cast<double>(mid[i])));

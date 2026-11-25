@@ -1,5 +1,6 @@
 #include "glm_vision.hpp"
 
+#include "strix/vision/host_math.hpp"
 #include "strix/vision/image.hpp"
 
 #include <algorithm>
@@ -593,36 +594,19 @@ std::vector<float> VisionAdapter::project_f32(const vision::EncoderOutput& hidde
     dense.linear(fc_w_, vision::Tensor{}, y.data(), T, z.data());
 
     // LayerNorm, then GELU (exact).
-    for (std::size_t t = 0; t < T; ++t) {
-        float* row = &z[t * P];
-        double mean = 0.0, sq = 0.0;
-        for (std::size_t i = 0; i < P; ++i) mean += static_cast<double>(row[i]);
-        mean /= static_cast<double>(P);
-        for (std::size_t i = 0; i < P; ++i) {
-            const double d = static_cast<double>(row[i]) - mean;
-            sq += d * d;
-        }
-        const double inv = 1.0 / std::sqrt(sq / static_cast<double>(P) + static_cast<double>(recipe_.post_norm_eps));
-        for (std::size_t i = 0; i < P; ++i) {
-            const double v = (static_cast<double>(row[i]) - mean) * inv * static_cast<double>(post_norm_w_.at(i)) +
-                             (post_norm_b_ ? static_cast<double>(post_norm_b_.at(i)) : 0.0);
-            row[i] = vision::activate(vision::Activation::gelu, static_cast<float>(v));
-        }
-    }
+    // The shared row norm (vision/host_math.hpp), then GELU per value.
+    std::vector<float> norm_w(P), norm_b(post_norm_b_ ? P : 0U);
+    copy_values(post_norm_w_, norm_w.data());
+    if (post_norm_b_) copy_values(post_norm_b_, norm_b.data());
+    vision::norm_rows(z.data(), T, P, norm_w.data(), post_norm_b_ ? norm_b.data() : nullptr, recipe_.post_norm_eps, true, z.data());
+    for (float& v : z) v = vision::activate(vision::Activation::gelu, v);
 
     // Clamped SwiGLU MLP: silu(min(gate, limit)) * clamp(up, -limit, limit), then the down projection.
     std::vector<float> gate(T * F), up(T * F);
     dense.linear(gate_w_, gate_b_, z.data(), T, gate.data());
     dense.linear(up_w_, up_b_, z.data(), T, up.data());
     const double limit = static_cast<double>(config_.swiglu_limit);
-    for (std::size_t i = 0; i < gate.size(); ++i) {
-        double g = static_cast<double>(gate[i]), u = static_cast<double>(up[i]);
-        if (limit > 0.0) {
-            g = std::min(g, limit);
-            u = std::clamp(u, -limit, limit);
-        }
-        gate[i] = static_cast<float>(g / (1.0 + std::exp(-g)) * u);
-    }
+    for (std::size_t i = 0; i < gate.size(); ++i) gate[i] = vision::clamped_swiglu(gate[i], up[i], limit);
     dense.linear(down_w_, down_b_, gate.data(), T, z.data());
     return z;
 }

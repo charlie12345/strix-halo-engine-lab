@@ -1,6 +1,7 @@
 // Host tests of the shared vision encoder: FP32 reference tower on synthetic towers (hand-computed rows and graph
 // invariants), default positions, the device plan, the embed cache and the row splice. No GPU, no checkpoint.
 #include "strix/vision/embed_cache.hpp"
+#include "strix/vision/host_math.hpp"
 
 #include "../src/attn_core/two_term_model.hpp"
 #include "../src/vision/encoder_layout.hpp"
@@ -140,6 +141,39 @@ std::vector<float> hand_single_row(const Tower& t, const PatchGrid& g, const Pos
     std::vector<float> out(x.size());
     for (std::size_t i = 0; i < x.size(); ++i) out[i] = static_cast<float>(x[i]);
     return out;
+}
+
+// The shared host row norm and clamped SwiGLU (vision/host_math.hpp), against the formulas written out in double.
+void test_host_math() {
+    const std::vector<float> x{1.0F, 2.0F, 3.0F, 4.0F, -2.0F, 0.5F, 8.0F, 1.0F};
+    const std::vector<float> w{1.0F, 0.5F, -2.0F, 3.0F}, b{0.25F, 0.0F, -1.0F, 2.0F};
+    const float eps = 1e-5F;
+    for (const bool center : {true, false}) {
+        for (const bool bias : {true, false}) {
+            std::vector<float> y(x.size()), inplace = x;
+            strix::vision::norm_rows(x.data(), 2, 4, w.data(), bias ? b.data() : nullptr, eps, center, y.data());
+            strix::vision::norm_rows(inplace.data(), 2, 4, w.data(), bias ? b.data() : nullptr, eps, center, inplace.data());
+            CHECK(y == inplace);
+            for (std::size_t r = 0; r < 2; ++r) {
+                double mean = 0.0, sq = 0.0;
+                if (center) {
+                    for (std::size_t i = 0; i < 4; ++i) mean += static_cast<double>(x[r * 4 + i]);
+                    mean /= 4.0;
+                }
+                for (std::size_t i = 0; i < 4; ++i) sq += (static_cast<double>(x[r * 4 + i]) - mean) * (static_cast<double>(x[r * 4 + i]) - mean);
+                const double inv = 1.0 / std::sqrt(sq / 4.0 + static_cast<double>(eps));
+                for (std::size_t i = 0; i < 4; ++i)
+                    CHECK(y[r * 4 + i] == static_cast<float>((static_cast<double>(x[r * 4 + i]) - mean) * inv * static_cast<double>(w[i]) +
+                                                             (bias ? static_cast<double>(b[i]) : 0.0)));
+            }
+        }
+    }
+    // Clamped gate: the gate is capped above only, the up value on both sides; limit 0 is unclamped.
+    const auto silu_mul = [](double g, double u) { return static_cast<float>(g / (1.0 + std::exp(-g)) * u); };
+    CHECK(strix::vision::clamped_swiglu(10.0F, -9.0F, 7.0) == silu_mul(7.0, -7.0));
+    CHECK(strix::vision::clamped_swiglu(-10.0F, 9.0F, 7.0) == silu_mul(-10.0, 7.0));
+    CHECK(strix::vision::clamped_swiglu(10.0F, -9.0F, 0.0) == silu_mul(10.0, -9.0));
+    CHECK(strix::vision::clamped_swiglu(0.5F, 0.25F, 7.0) == silu_mul(0.5, 0.25));
 }
 
 void test_bf16() {
@@ -1140,6 +1174,7 @@ int main(int argc, char** argv) {
             CHECK(std::strcmp(Encoder::effective_arithmetic(2U), device ? "vision-f16-attn2-v1-project-device-f64-v1" : "vision-f16-attn2-v1") == 0);
             return failures ? 1 : 0;
         }
+        test_host_math();
         test_bf16();
         test_validate();
         test_positions();

@@ -985,11 +985,6 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     try {
-        // One resolver for the sampler options (shared STRIX_MTP_SAMPLED_ACCEPT); sampled MTP (opt-in) makes coupled
-        // acceptance the unset default so it keeps the tokens of plain sampling.
-        const bool sampled_mtp_requested = rd::sampled_mtp_switch(rd::process_env());
-        const auto sampler_options = strix::validate_sampling_startup_environment(
-            sampled_mtp_requested ? strix::SampledAcceptance::coupled : strix::SampledAcceptance::rejection);
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
                                  "[--host H] [--port P] [--profile default|fast|quality] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
@@ -1145,9 +1140,11 @@ int main(int argc, char** argv) {
         // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). Automatic
         // max-rows runs the CLI's load-time admission (rd::admit_auto_rows) and a row merge between the two ranks.
         auto eff = rd::resolve_serve(rank_args, serve_mtp, rd::process_env(), rd::probe_model_mtp(argv[1]));
-        // Tier admission of sampled MTP (shared profile resolution): coupled under any profile, rejection fast / turbo only.
-        const std::string sampled_route =
-            rd::admit_sampled_mtp(eff, sampled_mtp_requested, sampler_options.acceptance == strix::SampledAcceptance::rejection);
+        // Sampled MTP is resolved and admitted inside that resolution (row serve_sampled_mtp; coupled under any profile,
+        // rejection fast / turbo only); execution and the receipt read eff.sampled_mtp only. The sampler options are
+        // validated here, before any rank connects or the model loads, with the acceptance rule the row resolved (off:
+        // the shared default, as on main).
+        const auto sampler_options = strix::validate_sampling_startup_environment(eff.sampled_mtp.acceptance());
         const bool mtp_on = eff.mtp_spec.value == "1" && (eff.prefill == "gemv" || eff.prefill == "ref");
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = mtp_on; opt.spec = mtp_on;
@@ -1177,9 +1174,10 @@ int main(int argc, char** argv) {
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
                         prefill_chunk_mtp ? 1 : 0,
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
-            // Sampled requests through MTP at C1 (coupled acceptance; opt-in until its pair gates pass).
-            std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP) sampled-accept=%s (STRIX_MTP_SAMPLED_ACCEPT)\n",
-                        sampled_mtp_requested ? (mtp_on ? sampled_route.c_str() : "off (MTP off)") : "off",
+            // Sampled requests through MTP at C1 (resolved row serve_sampled_mtp; opt-in until its pair gates pass).
+            std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP, identity %s) sampled-accept=%s\n",
+                        eff.sampled_mtp.on() ? (mtp_on ? eff.sampled_mtp.name() : "off (MTP off)") : "off",
+                        eff.sampled_mtp.identity(),
                         sampler_options.acceptance == strix::SampledAcceptance::rejection ? "rejection" : "coupled");
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
             // prefill; off unless --rtx-prefill / --import-listen are given).
@@ -1477,7 +1475,7 @@ int main(int argc, char** argv) {
         lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
         lc.sampling = sampling;
-        lc.sampled_mtp = sampled_mtp_requested;
+        lc.sampled_mtp = eff.sampled_mtp.on();  // the resolved row (rd::resolve_sampled_mtp), nothing else
         lc.sampler_options = sampler_options;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;

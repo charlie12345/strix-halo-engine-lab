@@ -10,6 +10,7 @@
 #include <functional>
 #include <iostream>
 #include <set>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -119,6 +120,29 @@ void glm() {
               cli.mtp.value == expected && server.mtp.value == expected && server.prefill == "gemv",
               "GLM complete/missing assets and opt-out select intended MTP/prefill route");
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
+    }
+    // Sampled MTP (row serve_sampled_mtp): both entry points resolve and admit it in rd::resolve, so the same request
+    // gives the same route, the same receipt line and the same refusals (the command line reports it inapplicable).
+    for (const char* profile : {"exact", "fast", "turbo", "quality"})
+    for (const char* route : {"0", "coupled", "rejection"}) {
+        const rd::EnvGet env = [route](const char* k) -> const char* {
+            return std::string(k) == "STRIX_GLM_SERVE_SAMPLED_MTP" ? route : nullptr;
+        };
+        auto profile_request = request;
+        profile_request.insert(profile_request.end(), {"--profile", profile});
+        auto cli_args = profile_request;
+        cli_args.insert(cli_args.end(), {"--decode", "64"});
+        std::string cli_error, server_error;
+        std::optional<rd::Effective> cli, server;
+        try { cli = rd::resolve(rd::scan(cli_args), env); } catch (const std::invalid_argument& e) { cli_error = e.what(); }
+        try { server = rd::resolve_serve(profile_request, true, env); } catch (const std::invalid_argument& e) { server_error = e.what(); }
+        const bool admitted = std::string(route) != "rejection" || std::string(profile) == "fast" || std::string(profile) == "turbo";
+        check(cli_error == server_error && admitted == cli_error.empty(), "GLM sampled MTP: same admission on CLI and server");
+        if (!cli || !server) continue;
+        check(cli->sampled_mtp.route == server->sampled_mtp.route &&
+              std::string(server->sampled_mtp.name()) == (std::string(route) == "0" ? "off" : route),
+              "GLM sampled MTP: same resolved route on CLI and server");
+        gate("glm", values(sp::from_lines(rd::print(*cli))), values(sp::from_lines(rd::print(*server))), allowed);
     }
 }
 #endif

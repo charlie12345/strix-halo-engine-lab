@@ -21,11 +21,13 @@ inline constexpr std::array<strix::profile::Lever, 4> product_profile_table{{
     {"kda_state16", "STRIX_GLM_PF_KDA_STATE16", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {false, false, false, false}, "", "0",
      "pending: KDA recurrent state in 16-bit (not covered by STRIX_GLM_PF_WMMA)"},
-    // Server: sampled requests decode through MTP (explicit opt-in only; no profile selects it). Coupled acceptance keeps
-    // the tokens of plain sampling; rejection acceptance changes per-seed tokens and is admitted by fast / turbo only
-    // (rank_defaults::admit_sampled_mtp). Additive row: the builtin fingerprint stays the legacy one.
+    // Server: sampled requests decode through MTP (explicit opt-in only; no profile selects it). Values 0 (off), coupled
+    // (keeps the tokens of plain sampling), rejection (changes per-seed tokens: admitted by fast / turbo only); the value
+    // enters the fingerprint, so the two rules never share a resolution identity. Resolved and admitted by
+    // rank_defaults::resolve_sampled_mtp for the command line and the server alike; execution reads only that result.
+    // Additive row: the builtin fingerprint stays the legacy one.
     {"serve_sampled_mtp", "STRIX_GLM_SERVE_SAMPLED_MTP", "", {"", "", "", ""}, "0", strix::profile::Kind::exact,
-     {false, false, false, false}, {true, true, true, true}, "1", "0",
+     {false, false, false, false}, {true, true, true, true}, "coupled", "0",
      "pending: pair gates of sampled MTP (coupled: seeded tokens and committed rows == plain sampling, forced rejection, "
      "batch handover, prefix restore, stops; rejection: acceptance/state oracle + distribution gate)",
      false, {}, true},

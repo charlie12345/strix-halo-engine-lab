@@ -167,12 +167,12 @@ struct LeadConfig {
     bool import_dsa_once = false;
     bool sampling = false;
     // Sampled requests (temperature > 0) decode through MTP at one request (C1): the lead's sampler decides every verify
-    // row with the resolved acceptance (strix::serve::decide_pair_window); coupled, the default when sampled MTP is on,
-    // keeps the tokens of plain sampling of the same seed when verify rows equal plain-step rows bit for bit (gate SP1a).
-    // Never in batched verify (G2). Off: plain steps.
+    // row with the resolved acceptance (strix::serve::decide_pair_window); coupled keeps the tokens of plain sampling of
+    // the same seed when verify rows equal plain-step rows bit for bit (gate SP1a). Never in batched verify (G2). Off:
+    // plain steps. Set only from the resolved row serve_sampled_mtp (rank_defaults::resolve_sampled_mtp).
     bool sampled_mtp = false;
-    // The entry point's resolved sampler options (strix::validate_sampling_startup_environment): the acceptance rule of
-    // drafted rows (STRIX_MTP_SAMPLED_ACCEPT; unset: coupled with sampled MTP on, else rejection, which plain steps ignore).
+    // The entry point's sampler options (strix::validate_sampling_startup_environment with the acceptance rule the row
+    // resolved: coupled or rejection with sampled MTP on; off: the shared default, which plain steps ignore).
     TokenSamplerOptions sampler_options{};
 };
 

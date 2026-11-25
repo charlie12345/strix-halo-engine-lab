@@ -72,6 +72,7 @@ private:
     EmbedCache* cache_;
     session::EmbedInterner& interner_;
     ApiMediaOptions options_;
+    ColorPolicy color_;
     std::string identity_;
     mutable std::mutex mutex_;
     bool started_ = false;

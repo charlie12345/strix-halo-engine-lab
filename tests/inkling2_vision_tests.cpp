@@ -4,20 +4,28 @@
 // concatenation, LayerScale folding), the projector against a direct computation, the span layout, the token rule
 // and the refusals. The reference encoder runs the tower end to end.
 #include "inkling2/inkling2_vision.hpp"
+#include "inkling2/vision_test_dir.hpp"
+#include "inkling2_vision_gate_checks.hpp"
 
 #include "strix/vision/encoder.hpp"
 #include "strix/vision/image.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <fstream>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 namespace {
 
@@ -159,7 +167,7 @@ void test_tokens() {
 }
 
 void test_patches() {
-    ink::VisionAdapter adapter(tiny(), "test");
+    ink::VisionAdapter adapter(tiny(), "test", ink::VisionIdentity::axial_v1);
     const auto im = image(5, 3);  // 4-pixel cells: 2 x 1 tokens, 4 x 2 patches
     const auto g = adapter.patches(im);
     CHECK(g.grid_h == 2U && g.grid_w == 4U && g.rows == 1U + 8U && g.patch_dim == 12U);
@@ -188,7 +196,7 @@ void test_patches() {
     CHECK(order);
     CHECK(values);
     // A larger image under a tight limit is scaled to fit it.
-    ink::VisionAdapter small(tiny(), "test", 6U);
+    ink::VisionAdapter small(tiny(), "test", ink::VisionIdentity::axial_v1, 6U);
     const auto big = small.patches(image(40, 10));
     const auto bt = small.token_grid(big);
     CHECK(bt.rows * bt.cols <= 6U);
@@ -197,7 +205,7 @@ void test_patches() {
 void test_weights_and_positions() {
     const auto spec = tiny();
     MemoryWeights source(spec);
-    ink::VisionAdapter adapter(spec, "test");
+    ink::VisionAdapter adapter(spec, "test", ink::VisionIdentity::axial_v1);
     vision::EncoderWeights w;
     adapter.bind(source, w);
     const auto cfg = adapter.config();
@@ -295,7 +303,7 @@ void test_weights_and_positions() {
 
 void test_refusals() {
     const auto spec = tiny();
-    ink::VisionAdapter adapter(spec, "test", 4U);
+    ink::VisionAdapter adapter(spec, "test", ink::VisionIdentity::axial_v1, 4U);
     auto g = adapter.patches(image(8, 4));  // 2 x 1 tokens
     auto odd = g;
     odd.grid_w = 3U;
@@ -315,6 +323,91 @@ void test_refusals() {
     CHECK(throws([&] { (void)adapter.patches(empty); }, "invalid image"));
 }
 
+void test_reference_admission() {
+    namespace fs = std::filesystem;
+    namespace gate = ink::gate;
+    const auto write = [](const fs::path& path, std::string_view data) {
+        std::ofstream out(path, std::ios::binary);
+        out.write(data.data(), static_cast<std::streamsize>(data.size()));
+        if (!out) throw std::runtime_error("write reference fixture");
+    };
+    VisionTestDir fixture;
+    const auto root = fixture.path / "ref";
+    fs::create_directory(root);
+    const weight::ConfinedDirectory ref(root);
+    write(root / "rows.f32", std::string(8, '\0'));
+    const auto zero = gate::read_f32(ref, "rows.f32", 2);
+    const std::array<float, 2> nonzero{1.0F, 0.0F};
+    const auto zero_error = gate::compare_rows(zero, zero, 2);
+    const auto mismatch = gate::compare_rows(nonzero, zero, 2);
+    CHECK(gate::passes(0.0, zero_error, zero_error, 0.02));
+    CHECK(!gate::passes(0.0, mismatch, zero_error, 0.02));  // hidden mismatch alone fails
+    CHECK(!gate::passes(0.0, zero_error, mismatch, 0.02));  // all-zero reference cannot bless a nonzero candidate
+    CHECK(!gate::passes(0.0, zero_error, zero_error, std::numeric_limits<double>::infinity()));
+    const std::array<float, 2> invalid{std::numeric_limits<float>::quiet_NaN(), 0.0F};
+    CHECK(throws([&] { (void)gate::compare_rows(invalid, zero, 2); }, "non-finite"));
+
+    const auto shape = gate::shape(serve::parse_json(R"({"rows":2,"cols":1,"tokens":2})"), tiny());
+    CHECK(shape.patches == 9 && shape.hidden() == 9U * 64U && shape.projected() == 2U * 24U);
+    vision::PatchGrid patch_grid;
+    patch_grid.rows = shape.patches;
+    patch_grid.patch_dim = shape.patch_dim;
+    patch_grid.data.resize(std::size_t{shape.patches} * shape.patch_dim);
+    shape.check_patches(patch_grid, 2, 1);
+    patch_grid.data[0] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(throws([&] { shape.check_patches(patch_grid, 2, 1); }, "class patch"));
+    vision::EncoderOutput truncated;
+    truncated.rows = 8;
+    truncated.width = shape.hidden_width;
+    truncated.hidden.resize(8U * truncated.width);
+    CHECK(throws([&] { shape.check_hidden(truncated); }, "grid/spec"));
+    vision::ProjectedRows wrong_width;
+    wrong_width.rows = 1;
+    wrong_width.width = 2U * shape.projected_width;
+    wrong_width.bf16.resize(shape.projected());
+    CHECK(throws([&] { shape.check_projected(wrong_width); }, "grid/spec"));
+    CHECK(throws([&] { (void)gate::shape(serve::parse_json(R"({"rows":103,"cols":103})"), tiny()); }, "token limit"));
+    CHECK(!gate::simple_name("../rows") && !gate::simple_name("x:y") && gate::simple_name("rgba_noise"));
+    for (const std::size_t size : {7U, 9U}) {
+        write(root / "wrong.f32", std::string(size, '\0'));
+        CHECK(throws([&] { (void)gate::read_f32(ref, "wrong.f32", 2); }, "length"));
+    }
+    write(root / "nan.f32", std::string{"\0\0\xc0\x7f", 4});
+    CHECK(throws([&] { (void)gate::read_f32(ref, "nan.f32", 1); }, "non-finite"));
+    write(fixture.path / "other", "outside");
+    CHECK(throws([&] { (void)ref.read("../other", 16); }, "basename"));
+    fs::create_directory(root / "directory");
+    CHECK(throws([&] { (void)ref.read("directory", 16); }));
+#ifndef _WIN32
+    CHECK(::mkfifo((root / "fifo").c_str(), 0600) == 0);
+    CHECK(throws([&] { (void)ref.read("fifo", 16); }));
+#endif
+    std::error_code link_error;
+    fs::create_symlink(fixture.path / "other", root / "link", link_error);
+#ifndef _WIN32
+    CHECK(!link_error);
+#endif
+    if (!link_error) CHECK(throws([&] { (void)ref.read("link", 16); }));
+    else std::printf("symbolic link fixture unavailable: %s\n", link_error.message().c_str());
+
+    link_error.clear();
+    fs::create_directory_symlink(root, fixture.path / "ref-link", link_error);
+#ifndef _WIN32
+    CHECK(!link_error);
+#endif
+    if (!link_error) CHECK(throws([&] { (void)weight::ConfinedDirectory(fixture.path / "ref-link"); }));
+
+    // Replacing a directory name cannot retarget opens below its held handle.
+    fs::rename(root, fixture.path / "moved");
+    fs::create_directory(root);
+    write(root / "rows.f32", "replacement");
+    CHECK(gate::read_f32(ref, "rows.f32", 2) == zero);
+    const auto source = ref.open("rows.f32");
+    fs::resize_file(fixture.path / "moved" / "rows.f32", 7);
+    std::array<weight::Byte, 8> data{};
+    CHECK(!source->read({0, data.size()}, data));
+}
+
 }  // namespace
 
 int main() {
@@ -325,6 +418,7 @@ int main() {
         test_patches();
         test_weights_and_positions();
         test_refusals();
+        test_reference_admission();
     } catch (const std::exception& e) {
         std::printf("FAIL exception: %s\n", e.what());
         return 1;

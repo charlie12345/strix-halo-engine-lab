@@ -10,13 +10,14 @@
 // exact GELU MLP, axial rotary positions (width angles then height angles, adjacent channel pairs, base 10000), a
 // LayerNorm before block 0 and no final norm. The class row is dropped; the four patch rows of a cell are
 // concatenated (slot-major, slot = dy * 2 + dx) and projected by proj_in (4096 -> 4096), GELU, proj_out
-// (4096 -> 2304), no biases. The rows replace the image placeholder token 200054 and skip the token embedding norm.
+// (4096 -> 2304), no biases. The rows replace the image placeholder token 200054 and still pass through the LM embedding norm.
 //
 // Mapping onto the shared tower (no shared-kernel change): the class token is patch row 0 with zero pixels (the patch
 // embedding has no bias) and its embedding as that row's position addend; LayerScale is folded into the out and
 // second MLP linears (FP32, before the device builds its FP16 panels); q, k and v are concatenated.
 #include "strix/vision/adapter.hpp"
-#include "strix/vision/image.hpp"
+#include "strix/vision/preprocess.hpp"
+#include "strix/engine_profile.hpp"
 #include "strix/weight/tensor_access.hpp"
 
 #include <cstdint>
@@ -52,10 +53,33 @@ struct VisionSize {
 };
 [[nodiscard]] VisionSize vision_fit(unsigned width, unsigned height, unsigned max_tokens, unsigned cell = kVisionCell);
 
+// Processing policy as data. Fields marked UNCONFIRMED are not stated by the checkpoint files on this machine
+// (no processor or modelling code ships with it); each default is the assumption, documented as such.
+struct VisionRecipe {
+    std::array<float, 3> mean{0.48145466F, 0.4578275F, 0.40821073F};    // UNCONFIRMED
+    std::array<float, 3> stddev{0.26862954F, 0.26130258F, 0.27577711F};  // UNCONFIRMED
+    vision::Resampler resampler{vision::Filter::bicubic, true};          // only used when an image exceeds the limits
+    std::uint8_t pad_fill = 0;                     // UNCONFIRMED: grey of the bottom / right margin up to the 40 px cells
+    std::uint32_t max_tokens = 4096;               // UNCONFIRMED: cells per image; larger images are scaled down
+    std::uint32_t min_side_cells = 1;
+    bool class_row = true;                         // UNCONFIRMED: the class row takes part in attention
+    bool merge_slot_major = true;                  // UNCONFIRMED: proj_in input index = (dy * 2 + dx) * W + c
+    vision::Activation projector_activation = vision::Activation::gelu;  // UNCONFIRMED (between proj_in and proj_out)
+    vision::EncoderConfig::Mlp mlp = vision::EncoderConfig::Mlp::gelu;  // UNCONFIRMED (exact erf GELU)
+    std::uint32_t placeholder_token = 200054;      // <|unused_200054|> after <|content_image|> in the chat template
+    [[nodiscard]] std::string id() const;
+};
+enum class VisionIdentity { legacy, axial_v1 };
+
+// Resolve the model recipe on first image input, using the shared profile resolver.
+[[nodiscard]] VisionIdentity resolve_vision_identity(const profile::Lookup& env = {});
+
 class VisionAdapter final : public vision::VisionAdapter {
 public:
     // weights_digest: identity of the checkpoint's vision tensors (part of the cache key; required).
-    VisionAdapter(VisionSpec spec, std::string weights_digest, unsigned max_tokens = kVisionDefaultMaxTokens);
+    VisionAdapter(VisionSpec spec, std::string weights_digest, VisionRecipe recipe = {});
+    VisionAdapter(VisionSpec spec, std::string weights_digest, VisionIdentity identity,
+                  unsigned max_tokens = kVisionDefaultMaxTokens);
 
     vision::EncoderConfig config() const override;
     std::string identity() const override;
@@ -67,14 +91,13 @@ public:
     void project(vision::EncoderOutput&, const vision::PatchGrid&, vision::DenseOps&, vision::ProjectedRows&) override;
     vision::SpanLayout layout(const vision::PatchGrid&) const override;
     std::vector<std::pair<vision::Tensor, vision::Tensor>> projector_linears() const override;
-    unsigned max_encoder_rows() const override { return 1U + 4U * max_tokens_; }
+    unsigned max_encoder_rows() const override { return spec_.merge * spec_.merge * max_tokens_ + (identity_ == VisionIdentity::axial_v1 || legacy_.class_row ? 1U : 0U); }
 
-    // Colour policy of the decoder for this tower (alpha over the 8-pixel checkerboard).
-    static vision::ColorPolicy color_policy() {
-        vision::ColorPolicy p;
-        p.alpha = vision::AlphaPolicy::checkerboard;
-        return p;
-    }
+    vision::ColorPolicy color_policy() const override;
+    [[nodiscard]] vision::Size scaled(int width, int height) const;
+    [[nodiscard]] vision::Size canvas(int width, int height) const;
+    [[nodiscard]] unsigned tokens(int width, int height) const;
+    [[nodiscard]] const VisionRecipe& recipe() const noexcept { return legacy_; }
     // Merged grid (token rows, token columns) of a patch grid made by patches().
     struct TokenGrid {
         unsigned rows = 0, cols = 0;
@@ -82,12 +105,16 @@ public:
     TokenGrid token_grid(const vision::PatchGrid&) const;
 
 private:
+    [[nodiscard]] vision::PatchGrid legacy_patches(const vision::Image&) const;
+    [[nodiscard]] vision::PatchGrid image_grid(const vision::PatchGrid&) const;
     VisionSpec spec_;
+    VisionIdentity identity_;
+    VisionRecipe legacy_;
     std::string digest_;
     unsigned max_tokens_;
     std::vector<float> class_row_;  // class_embedding + cls_position_embedding
     vision::Tensor proj_in_, proj_out_;
-    vision::Tensor pos_embed_;
+
 };
 
 }  // namespace strix::inkling2

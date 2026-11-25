@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
-#include <cstring>
+#include <cstdio>
 #include <sstream>
 #include <stdexcept>
 
@@ -14,6 +14,15 @@ namespace strix::inkling2 {
 namespace {
 
 [[noreturn]] void bad(const std::string& what) { throw std::invalid_argument("Inkling vision: " + what); }
+
+const char* filter_name(vision::Filter f) {
+    switch (f) {
+        case vision::Filter::bilinear: return "bilinear";
+        case vision::Filter::bicubic: return "bicubic";
+        case vision::Filter::lanczos: return "lanczos";
+    }
+    return "?";
+}
 
 std::string bits(float v) {
     std::ostringstream s;
@@ -70,7 +79,7 @@ vision::Tensor need(vision::WeightSource& source, const std::string& name, std::
 }  // namespace
 
 VisionSpec parse_vision_spec(const std::string& text) {
-    const auto root = serve::parse_json(text);
+    const auto root = serve::parse_json_unique(text, 1U << 20U, 65536U);
     const auto* vc = root.find("vision_config");
     if (!vc || !vc->is_object()) bad("config.json has no vision_config");
     const auto num = [&](const char* key, double fallback) {
@@ -99,7 +108,8 @@ VisionSpec parse_vision_spec(const std::string& text) {
     if (const auto* eps = vc->find("layer_norm_eps")) spec.eps = static_cast<float>(eps->as_double());
     if (spec.eps != want.eps) bad("unsupported vision_config.layer_norm_eps");
     if (const auto* pb = vc->find("projector_bias"); pb && (!pb->is_bool() || pb->as_bool())) bad("projector biases are not supported");
-    if (const auto* rp = vc->find("rope_parameters"); rp && rp->is_object()) {
+    if (const auto* rp = vc->find("rope_parameters"); rp && !rp->is_null()) {
+        if (!rp->is_object()) bad("vision_config.rope_parameters is not an object");
         if (const auto* th = rp->find("rope_theta")) spec.rope_theta = static_cast<float>(th->as_double());
     }
     if (spec.rope_theta != want.rope_theta) bad("unsupported vision rope_theta");
@@ -136,7 +146,7 @@ std::vector<weight::TensorSpec> vision_tensor_specs(const VisionSpec& s) {
             add(p + "self_attn." + n + ".bias", {D});
         }
     }
-    add("model.visual.proj_in.weight", {s.projection, 4U * D});
+    add("model.visual.proj_in.weight", {s.projection, D * s.merge * s.merge});
     add("model.visual.proj_out.weight", {s.text_width, s.projection});
     return v;
 }
@@ -161,12 +171,49 @@ VisionSize vision_fit(unsigned width, unsigned height, unsigned max_tokens, unsi
             std::max(1U, static_cast<unsigned>(std::floor(height * lo)))};
 }
 
-VisionAdapter::VisionAdapter(VisionSpec spec, std::string weights_digest, unsigned max_tokens)
-    : spec_(spec), digest_(std::move(weights_digest)), max_tokens_(max_tokens) {
+std::string VisionRecipe::id() const {
+    char buf[512];
+    std::snprintf(buf, sizeof buf,
+                  "mean=%.8g,%.8g,%.8g;std=%.8g,%.8g,%.8g;resample=%s%s;pad=%u;max_tokens=%u;min_cells=%u;cls=%d;"
+                  "slot_major=%d;proj_act=%u;mlp=%u;placeholder=%u",
+                  static_cast<double>(mean[0]), static_cast<double>(mean[1]), static_cast<double>(mean[2]),
+                  static_cast<double>(stddev[0]), static_cast<double>(stddev[1]), static_cast<double>(stddev[2]),
+                  filter_name(resampler.filter), resampler.antialias ? "+aa" : "", unsigned{pad_fill}, max_tokens,
+                  min_side_cells, class_row ? 1 : 0, merge_slot_major ? 1 : 0, static_cast<unsigned>(projector_activation),
+                  static_cast<unsigned>(mlp), placeholder_token);
+    return buf;
+}
+
+VisionIdentity resolve_vision_identity(const profile::Lookup& env) {
+    static constexpr profile::Lever recipe{
+        "vision-recipe", "STRIX_INKLING2_VISION_RECIPE", "",
+        {"legacy", "legacy", "legacy", "legacy"}, "legacy", profile::Kind::bit_changing,
+        {true, true, true, true}, {}, "", "legacy", "Axial recipe pending complete CLI qualification"
+    };
+    static constexpr profile::Engine engine{"inkling2-mini-vision", "", std::span(&recipe, 1U)};
+    profile::Inputs input;
+    input.env = env;
+    const auto resolution = profile::resolve(engine, input);
+    const auto& value = resolution.entries.front().value;
+    if (value == "legacy") return VisionIdentity::legacy;
+    if (value == "axial@1") return VisionIdentity::axial_v1;
+    bad("STRIX_INKLING2_VISION_RECIPE must be legacy or axial@1");
+}
+
+VisionAdapter::VisionAdapter(VisionSpec spec, std::string weights_digest, VisionRecipe recipe)
+    : VisionAdapter(spec, std::move(weights_digest), VisionIdentity::legacy, recipe.max_tokens) {
+    if (!recipe.min_side_cells) bad("zero minimum cell count");
+    legacy_ = std::move(recipe);
+    vision::validate(config());
+}
+
+VisionAdapter::VisionAdapter(VisionSpec spec, std::string weights_digest, VisionIdentity identity, unsigned max_tokens)
+    : spec_(spec), identity_(identity), digest_(std::move(weights_digest)), max_tokens_(max_tokens) {
     if (max_tokens_ == 0U || max_tokens_ > 16384U) bad("token limit outside 1..16384");
     if (spec_.patch == 0U || spec_.merge == 0U || spec_.width == 0U || spec_.heads == 0U || spec_.width % spec_.heads)
         bad("invalid tower geometry");
     if (digest_.empty()) bad("the weights digest is part of the cache identity and must be stated");
+    legacy_.max_tokens = max_tokens_;
 }
 
 vision::EncoderConfig VisionAdapter::config() const {
@@ -183,6 +230,12 @@ vision::EncoderConfig VisionAdapter::config() const {
     c.pos = vision::EncoderConfig::Pos::rope2d_plus_learned;
     c.rope_theta = spec_.rope_theta;
     c.rope_pairing = vision::EncoderConfig::RopePairing::adjacent;
+    if (identity_ == VisionIdentity::legacy) {
+        c.pos = vision::EncoderConfig::Pos::learned_interp;
+        c.rope_theta = vision::EncoderConfig{}.rope_theta;
+        c.rope_pairing = vision::EncoderConfig{}.rope_pairing;
+        c.mlp = legacy_.mlp;
+    }
     c.pos_grid = spec_.pos_grid;
     c.patch = spec_.patch;
     c.temporal = 1U;
@@ -193,7 +246,8 @@ vision::EncoderConfig VisionAdapter::config() const {
 }
 
 std::string VisionAdapter::identity() const {
-    return "inkling2-vision-v1|" + digest_ + "|cell=" + std::to_string(spec_.patch * spec_.merge) +
+    if (identity_ == VisionIdentity::legacy) return "inkling2-vision-v1|" + digest_ + "|" + legacy_.id();
+    return "inkling2-vision-axial@1|" + digest_ + "|cell=" + std::to_string(spec_.patch * spec_.merge) +
            "|max_tokens=" + std::to_string(max_tokens_) + "|eps=" + bits(spec_.eps) + "|theta=" + bits(spec_.rope_theta) +
            "|ls=folded-f32|pad=-1|alpha=checker8";
 }
@@ -202,7 +256,7 @@ vision::ResizeRule VisionAdapter::resize() const {
     vision::ResizeRule r;
     const std::uint64_t cell = std::uint64_t{spec_.patch} * spec_.merge;
     r.multiple = static_cast<unsigned>(cell);
-    r.min_pixels = 1U;
+    r.min_pixels = identity_ == VisionIdentity::legacy ? cell * cell : 1U;
     r.max_pixels = std::uint64_t{max_tokens_} * cell * cell;
     r.max_rows = max_tokens_;
     return r;
@@ -217,7 +271,105 @@ VisionAdapter::TokenGrid VisionAdapter::token_grid(const vision::PatchGrid& g) c
     return t;
 }
 
+vision::ColorPolicy VisionAdapter::color_policy() const {
+    vision::ColorPolicy policy;
+    if (identity_ == VisionIdentity::axial_v1) policy.alpha = vision::AlphaPolicy::checkerboard;
+    return policy;
+}
+
+vision::Size VisionAdapter::scaled(int width, int height) const {
+    if (width <= 0 || height <= 0) bad("empty image");
+    const unsigned cell = spec_.patch * spec_.merge;
+    const auto cell_count = [cell](double w, double h) {
+        return std::uint64_t{cells(static_cast<unsigned>(w), cell)} * cells(static_cast<unsigned>(h), cell);
+    };
+    if (cell_count(width, height) <= legacy_.max_tokens) return {width, height};
+    // Scale both sides by one factor until the padded cell count fits; the aspect ratio is kept.
+    double s = std::sqrt(static_cast<double>(legacy_.max_tokens) * cell * cell / (static_cast<double>(width) * height));
+    for (;;) {
+        const int w = std::max(1, static_cast<int>(std::floor(width * s)));
+        const int h = std::max(1, static_cast<int>(std::floor(height * s)));
+        if (cell_count(w, h) <= legacy_.max_tokens) return {w, h};
+        s *= 0.995;
+    }
+}
+
+vision::Size VisionAdapter::canvas(int width, int height) const {
+    const vision::Size s = scaled(width, height);
+    const unsigned cell = spec_.patch * spec_.merge;
+    const unsigned cw = std::max(legacy_.min_side_cells, cells(static_cast<unsigned>(s.width), cell));
+    const unsigned ch = std::max(legacy_.min_side_cells, cells(static_cast<unsigned>(s.height), cell));
+    return {static_cast<int>(cw * cell), static_cast<int>(ch * cell)};
+}
+
+unsigned VisionAdapter::tokens(int width, int height) const {
+    const vision::Size c = canvas(width, height);
+    const auto cell = static_cast<int>(spec_.patch * spec_.merge);
+    return static_cast<unsigned>(c.width / cell) * static_cast<unsigned>(c.height / cell);
+}
+
+vision::PatchGrid VisionAdapter::legacy_patches(const vision::Image& image) const {
+    if (image.width <= 0 || image.height <= 0 || image.rgb.size() != image.pixels() * 3U) bad("empty image");
+    const vision::Size s = scaled(image.width, image.height);
+    const vision::Size c = canvas(image.width, image.height);
+    const unsigned P = spec_.patch;
+    vision::check_grid_axes(static_cast<std::uint64_t>(c.height) / P, static_cast<std::uint64_t>(c.width) / P);
+    vision::Image src = (s.width == image.width && s.height == image.height)
+                            ? image
+                            : vision::resize(image, s.width, s.height, legacy_.resampler);
+    // The picture at the top left, the margin up to whole 40 px cells filled with pad_fill.
+    vision::Image padded;
+    padded.width = c.width;
+    padded.height = c.height;
+    padded.rgb.assign(padded.pixels() * 3U, legacy_.pad_fill);
+    for (int y = 0; y < src.height; ++y)
+        std::copy_n(&src.rgb[std::size_t(y) * std::size_t(src.width) * 3U], std::size_t(src.width) * 3U,
+                    &padded.rgb[std::size_t(y) * std::size_t(c.width) * 3U]);
+    const std::vector<float> pixels = vision::normalize_div255(padded, legacy_.mean, legacy_.stddev, false);
+    const float* frame = pixels.data();
+    vision::PatchSpec spec;
+    spec.patch = static_cast<int>(P);
+    spec.temporal = 1;
+    spec.merge = 1;  // raster order: the 2 x 2 grouping happens in project()
+    vision::Patches p = vision::patchify(std::span<const float* const>(&frame, 1), c.height, c.width, spec);
+
+    vision::PatchGrid g;
+    g.grid_h = static_cast<unsigned>(p.grid_h);
+    g.grid_w = static_cast<unsigned>(p.grid_w);
+    const unsigned n = g.grid_h * g.grid_w;
+    (void)vision::checked_merged_grid({n, static_cast<unsigned>(p.feature), g.grid_h, g.grid_w, {}, {}, {}, {}},
+                                      spec_.merge, legacy_.max_tokens);
+    g.rows = n + (legacy_.class_row ? 1U : 0U);
+    g.patch_dim = static_cast<unsigned>(p.feature);
+    g.data = std::move(p.data);
+    g.data.resize(std::size_t{g.rows} * g.patch_dim, 0.0F);  // the class row: zero pixels
+    g.y.resize(g.rows, 0);
+    g.x.resize(g.rows, 0);
+    for (unsigned r = 0; r < n; ++r) {
+        g.y[r] = static_cast<std::uint16_t>(r / g.grid_w);
+        g.x[r] = static_cast<std::uint16_t>(r % g.grid_w);
+    }
+    return g;
+}
+
+vision::PatchGrid VisionAdapter::image_grid(const vision::PatchGrid& tower) const {
+    vision::check_grid_axes(tower.grid_h, tower.grid_w);
+    const auto n = std::uint64_t{tower.grid_h} * tower.grid_w;
+    if (tower.rows != n + (legacy_.class_row ? 1U : 0U) ||
+        tower.y.size() != tower.rows || tower.x.size() != tower.rows)
+        bad("tower rows or coordinates differ from the image grid");
+    vision::PatchGrid g;
+    g.rows = static_cast<unsigned>(n);
+    g.patch_dim = tower.patch_dim;
+    g.grid_h = tower.grid_h;
+    g.grid_w = tower.grid_w;
+    g.y.assign(tower.y.begin(), tower.y.begin() + static_cast<std::ptrdiff_t>(n));
+    g.x.assign(tower.x.begin(), tower.x.begin() + static_cast<std::ptrdiff_t>(n));
+    return g;
+}
+
 vision::PatchGrid VisionAdapter::patches(const vision::Image& input) const {
+    if (identity_ == VisionIdentity::legacy) return legacy_patches(input);
     if (input.width <= 0 || input.height <= 0 || input.rgb.size() != input.pixels() * 3U) bad("invalid image");
     const unsigned cell = spec_.patch * spec_.merge;
     const auto fit = vision_fit(static_cast<unsigned>(input.width), static_cast<unsigned>(input.height), max_tokens_, cell);
@@ -263,12 +415,13 @@ vision::PatchGrid VisionAdapter::patches(const vision::Image& input) const {
 }
 
 void VisionAdapter::bind(vision::WeightSource& source, vision::EncoderWeights& w) {
+    w = {};
     const auto& s = spec_;
     const std::string root = "model.visual.backbone.";
     const std::size_t D = s.width, F = s.mlp_width;
     w.patch_w = need(source, root + "embeddings.patch_embedding.weight", D, 3U * s.patch * s.patch);
     w.pos_embed = need(source, root + "embeddings.position_embedding", std::size_t{s.pos_grid} * s.pos_grid, D);
-    pos_embed_ = w.pos_embed;
+
     const auto cls = need(source, root + "embeddings.class_embedding", D, 1);
     const auto cls_pos = need(source, root + "embeddings.cls_position_embedding", D, 1);
     class_row_.resize(D);
@@ -307,14 +460,34 @@ void VisionAdapter::bind(vision::WeightSource& source, vision::EncoderWeights& w
         b.mlp2_w = owned(w, scaled_rows(fc2, &ls2), D, F);
         b.mlp2_b = owned(w, scaled_rows(fc2_b, &ls2), D, 1);
     }
-    proj_in_ = need(source, "model.visual.proj_in.weight", s.projection, 4U * D);
+    const std::size_t rr = std::size_t{s.merge} * s.merge;
+    const std::size_t in = rr * D;
+    proj_in_ = need(source, "model.visual.proj_in.weight", s.projection, in);
+    if (identity_ == VisionIdentity::legacy && legacy_.merge_slot_major) {
+        // Legacy raster unshuffle reads channel-major features, in that accumulation order.
+        std::vector<float> permuted(s.projection * in);
+        for (std::size_t o = 0; o < s.projection; ++o)
+            for (std::size_t slot = 0; slot < rr; ++slot)
+                for (std::size_t c = 0; c < D; ++c)
+                    permuted[o * in + c * rr + slot] = proj_in_.at(o * in + slot * D + c);
+        proj_in_ = owned(w, std::move(permuted), s.projection, in);
+    }
     proj_out_ = need(source, "model.visual.proj_out.weight", s.text_width, s.projection);
     vision::validate(config(), w);
 }
 
 vision::PositionInputs VisionAdapter::positions(const vision::EncoderConfig& c, const vision::EncoderWeights& w,
                                                 const vision::PatchGrid& g) const {
+    if (identity_ == VisionIdentity::legacy) {
+        auto p = vision::default_positions(c, w, image_grid(g));
+        if (legacy_.class_row) {
+            if (class_row_.size() != c.width) bad("positions before bind");
+            p.addend.insert(p.addend.end(), class_row_.begin(), class_row_.end());
+        }
+        return p;
+    }
     (void)token_grid(g);
+    if (g.y.size() != g.rows || g.x.size() != g.rows) bad("positions require one coordinate per row");
     if (class_row_.size() != c.width || !w.pos_embed) bad("positions before bind");
     vision::PositionInputs p;
     const unsigned D = c.width, G = c.pos_grid;
@@ -352,20 +525,34 @@ vision::PositionInputs VisionAdapter::positions(const vision::EncoderConfig& c, 
 
 void VisionAdapter::project(vision::EncoderOutput& hidden, const vision::PatchGrid& g, vision::DenseOps& dense,
                             vision::ProjectedRows& out) {
-    const auto t = token_grid(g);
-    const unsigned D = spec_.width, tokens = t.rows * t.cols;
-    if (hidden.width != D || hidden.rows != g.rows || hidden.hidden.size() != std::size_t{g.rows} * D)
-        bad("encoder output does not match the patch grid");
     if (!proj_in_ || !proj_out_) bad("project before bind");
-    // Drop the class row; the four patch rows of a cell are consecutive, so the merged input is the contiguous rest.
-    const float* merged = hidden.hidden.data() + D;
-    std::vector<float> mid(std::size_t{tokens} * spec_.projection);
-    dense.linear(proj_in_, {}, merged, tokens, mid.data());
-    for (auto& v : mid) v = vision::activate(vision::Activation::gelu, v);
+    if (hidden.width != spec_.width || hidden.rows != g.rows ||
+        (hidden.device_epoch == 0 && hidden.hidden.size() != std::size_t{g.rows} * spec_.width))
+        bad("encoder output does not match the patch grid");
+    vision::MergeProjector projector;
+    projector.ratio = spec_.merge;
+    projector.w1 = proj_in_;
+    projector.w2 = proj_out_;
+    unsigned tokens = 0;
+    if (identity_ == VisionIdentity::legacy) {
+        const auto image = image_grid(g);
+        tokens = vision::checked_merged_grid(image, spec_.merge, max_tokens_).tokens;
+        // Preserve the legacy trailing class row and its channel-major projection order.
+        hidden.rows = image.rows;
+        if (!hidden.hidden.empty()) hidden.hidden.resize(std::size_t{image.rows} * spec_.width);
+        for (auto& tap : hidden.taps) tap.resize(std::min(tap.size(), std::size_t{image.rows} * spec_.width));
+        projector.act = legacy_.projector_activation;
+    } else {
+        const auto t = token_grid(g);
+        tokens = t.rows * t.cols;
+        projector.layout = vision::MergeProjector::Layout::packed_cells;
+        projector.row_offset = 1;
+    }
     std::vector<float> rows(std::size_t{tokens} * spec_.text_width);
-    dense.linear(proj_out_, {}, mid.data(), tokens, rows.data());
-    for (const float v : rows)
-        if (!std::isfinite(v)) throw std::runtime_error("Inkling vision: non-finite image rows");
+    dense.merge_project(hidden, g.grid_h, g.grid_w, projector, rows.data());
+    if (identity_ == VisionIdentity::axial_v1)
+        for (const float v : rows)
+            if (!std::isfinite(v)) throw std::runtime_error("Inkling vision: non-finite image rows");
     out.rows = tokens;
     out.width = spec_.text_width;
     out.bf16 = vision::to_bf16_rows(rows.data(), rows.size());
@@ -373,13 +560,17 @@ void VisionAdapter::project(vision::EncoderOutput& hidden, const vision::PatchGr
 }
 
 vision::SpanLayout VisionAdapter::layout(const vision::PatchGrid& g) const {
-    const auto t = token_grid(g);
+    const auto t = [&] {
+        if (identity_ == VisionIdentity::axial_v1) return token_grid(g);
+        const auto merged = vision::checked_merged_grid(image_grid(g), spec_.merge, max_tokens_);
+        return TokenGrid{merged.grid_h, merged.grid_w};
+    }();
     vision::SpanLayout s;
     const unsigned n = t.rows * t.cols;
     s.role.assign(n, vision::SpanLayout::Role::image);
     s.lm_pos.resize(n);
     for (unsigned i = 0; i < n; ++i) s.lm_pos[i] = {i, 0U, 0U};
-    s.real_token_id = kVisionImageTokenId;
+    s.real_token_id = identity_ == VisionIdentity::legacy ? legacy_.placeholder_token : kVisionImageTokenId;
     s.grid_h = t.rows;
     s.grid_w = t.cols;
     return s;

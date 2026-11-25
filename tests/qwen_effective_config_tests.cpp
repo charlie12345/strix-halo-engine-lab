@@ -3776,6 +3776,87 @@ int main(int argc, char** arguments) {
         return resolve_w7_case(value,model,info,manifest,validated_model_content_identity,capabilities,observation);
     };
     {
+        namespace p = strix::profile;
+        namespace q = strix::qwen::profile;
+        constexpr auto key = "STRIX_QPF2K_MOE_ROUTE_PRUNE";
+        constexpr auto owned = "STRIX_QWEN_PROFILE_OWNED_moe_route_prune";
+        // Exercise route admission even while the shipped candidate has no promotion evidence.
+        auto rows = std::vector(q::levers().begin(), q::levers().end());
+        for (auto& row : rows) if (row.name == "moe_route_prune") row.ready[3] = true;
+        q::Inputs inputs;
+        inputs.env = [](const char*) -> const char* { return nullptr; };
+        inputs.regime = {p::Phase::prefill, 8192U, 1U, "fixture", "fixture-exec"};
+        const auto unpriced = q::resolve(q::Name::turbo, inputs, rows);
+        const auto* pending = unpriced.find("moe_route_prune");
+        expect(pending && !pending->ladder_reference.empty(), "cap9 fixture has a bound execution");
+        p::LadderRow receipt{"moe_route_prune", "cap9", p::Name::turbo, p::Phase::prefill,
+            "fixture", 8192U, 8192U, 1U, 1U, 1.1, 0.01, "host fixture"};
+        if (pending) receipt.over = pending->ladder_reference;
+        inputs.ladder = std::span(&receipt, 1);
+        auto selected = request;
+        selected.options.tokens.resize(8192U);
+        selected.options.product_profile = q::resolve(q::Name::turbo, inputs, rows);
+        const auto admitted = resolve(selected, memory);
+        const auto* kept = admitted.options.product_profile.find("moe_route_prune");
+        expect(admitted.admitted && admitted.environment.contains(key) && kept &&
+            p::applied(kept->status) && kept->value == "cap9", "eligible route retains a qualified cap9 proposal");
+        auto without_receipt = inputs;
+        without_receipt.ladder = {};
+        const auto without_prune = [&](RequestedOptions control) {
+            control.options.product_profile = q::resolve(q::Name::turbo, without_receipt, rows);
+            return control;
+        };
+        const auto expect_decline = [&](const EffectiveConfig& got, const EffectiveConfig& control,
+                                        std::string_view reason) {
+            const auto* row = got.options.product_profile.find("moe_route_prune");
+            Environment exported, inherited{{key, "cap9"}, {owned, q::marker(p::Name::turbo, p::Status::set, "cap9")}};
+            q::apply(got.options.product_profile, [&](const char* name, const char* value) {
+                exported[name] = value; return true;
+            });
+            q::withdraw_declined(got.options.product_profile, [&](const char* name) -> const char* {
+                const auto it = inherited.find(name); return it == inherited.end() ? nullptr : it->second.c_str();
+            }, [&](const char* name) { return inherited.erase(name) != 0U; });
+            expect(got.admitted == control.admitted && got.error == control.error &&
+                row && row->status == p::Status::pending &&
+                row->value == "off" && row->reason.find(reason) != std::string::npos &&
+                !got.environment.contains(key) && !exported.contains(key) && !exported.contains(owned) && inherited.empty(),
+                "incompatible automatic cap9 falls back with a reason and withdraws its export");
+        };
+        for (const auto* setting : {"STRIX_QPF2K_MOE_MC", "STRIX_QPF2K_MOE_DA16", "STRIX_QPF2K_MOE_ROUTE"}) {
+            auto incompatible = selected;
+            incompatible.environment[setting] = "0";
+            const auto control = resolve(without_prune(incompatible), memory);
+            const bool mc = std::string_view(setting) == "STRIX_QPF2K_MOE_MC";
+            if (mc) expect(control.admitted && control.error.empty(), "the base route still runs with MC=0");
+            expect_decline(resolve(incompatible, memory), control,
+                mc ? "requires DA16=1, ROUTE=14, MC=1" : "full-row known-prefix fast FP16 MoE prefill required");
+        }
+        auto paired = selected;
+        paired.paired_prefill = true;
+        expect_decline(resolve(paired, memory), resolve(without_prune(paired), memory), "pair prefill is unsupported");
+        auto wrong_format = manifest;
+        ManifestTensor expert_down;
+        expert_down.name = "blk.0.ffn_down_exps.weight";
+        expert_down.ggml_type = 14U;
+        wrong_format.tensors.push_back(expert_down);
+        expect(!moe_da16_writer_supported(model, wrong_format), "the K-quant down writer cannot certify pruning");
+        expect_decline(resolve_w7_case(selected, model, info, wrong_format, validated_model_content_identity, capabilities, memory),
+            resolve_w7_case(without_prune(selected), model, info, wrong_format, validated_model_content_identity, capabilities, memory),
+            "full-row known-prefix fast FP16 MoE prefill required");
+        auto unmeasured = selected;
+        unmeasured.environment[key] = "cap9";
+        expect(!resolve(without_prune(unmeasured), memory).environment.contains(key), "pending cap9 clears a staged inherited export");
+
+        auto explicit_prune = selected;
+        explicit_prune.environment["STRIX_QPF2K_MOE_MC"] = "0";
+        inputs.cli = {{"moe_route_prune", "cap9"}};
+        explicit_prune.options.product_profile = q::resolve(q::Name::turbo, inputs, rows);
+        const auto explicit_config = resolve(explicit_prune, memory);
+        const auto* cli = explicit_config.options.product_profile.find("moe_route_prune");
+        expect(cli && cli->status == p::Status::explicit_cli && cli->value == "cap9" &&
+            explicit_config.environment.contains(key), "explicit cap9 still reaches the launcher's hard refusal");
+    }
+    {
         constexpr auto candidate_key = "STRIX_QPF2K_MOE_ROUTE_BF16";
         const auto base = resolve(request,memory);
         expect(!base.options.prefill_moe_route_bf16 && base.error.empty(),"route BF16 default off");

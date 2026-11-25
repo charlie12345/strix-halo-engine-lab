@@ -934,7 +934,8 @@ template <class Row, class Admission>
 
 // The effective EXACT and FAST arms in `regime`: for every lossy lever of `table` (in table order) whose cell is not
 // its builtin, "lever=value" joined by ','. `admit_of(lever, column)` is the adapter's column admission and
-// `explicit_of(lever)` its explicit CLI / env setting of the lever (std::nullopt: none), which runs in every tier.
+// `explicit_of(lever)` its explicit CLI / env setting of the lever (std::nullopt: none), which runs in every tier; the
+// "off" alias is spelled as the lever's off value, so switching off a lever that is off by default leaves the arm as is.
 template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
 [[nodiscard]] inline LadderArms ladder_arms(std::span<const Row> table, std::span<const LadderRow> rows,
                                             const Regime& regime, const AdmitOf& admit_of,
@@ -945,8 +946,12 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
         for (const auto& lever : table) {
             if (lever.kind == decltype(lever.kind)::exact) continue;
             std::string_view value;
-            if (const auto set = explicit_of(lever)) value = *set;
-            else value = ladder_cell(lever, rows, tier, regime, [&](unsigned c) { return admit_of(lever, c); }, false,
+            if (const auto set = explicit_of(lever)) {
+                value = *set;
+                // The "off" alias switches the lever off: it runs the lever's own off value.
+                if constexpr (requires { lever.off; })
+                    if (value == "off" && !lever.off.empty()) value = lever.off;
+            } else value = ladder_cell(lever, rows, tier, regime, [&](unsigned c) { return admit_of(lever, c); }, false,
                                      arms).value;
             if (value == lever.builtin) continue;
             if (!arm.empty()) arm += ',';

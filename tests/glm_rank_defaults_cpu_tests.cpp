@@ -807,9 +807,36 @@ void test_pf_variants() {
     CHECK(sb.find("STRIX_GLM_PF_OBAR=2 (baseline, item pf-obar-v10; resolved v2)\n") != std::string::npos);
 }
 
+// Sampled MTP on the server: a strict 0|1 switch; coupled acceptance under any profile, rejection (per-seed tokens
+// differ from plain sampling) only under fast / turbo, named as an engine override of the resolution.
+void test_sampled_mtp_admission() {
+    CHECK(!rd::sampled_mtp_switch(getter({})) && !rd::sampled_mtp_switch(getter({{"STRIX_GLM_SERVE_SAMPLED_MTP", "0"}})));
+    CHECK(rd::sampled_mtp_switch(getter({{"STRIX_GLM_SERVE_SAMPLED_MTP", "1"}})));
+    bool refused = false;
+    try { (void)rd::sampled_mtp_switch(getter({{"STRIX_GLM_SERVE_SAMPLED_MTP", "yes"}})); } catch (const std::invalid_argument&) { refused = true; }
+    CHECK(refused);
+    auto exact = resolve(cat(kDeploy, kDecodeWork), {});
+    CHECK(rd::admit_sampled_mtp(exact, false, true) == "off" && rd::admit_sampled_mtp(exact, true, false) == "coupled");
+    refused = false;
+    try { (void)rd::admit_sampled_mtp(exact, true, true); } catch (const std::invalid_argument&) { refused = true; }
+    CHECK(refused);
+    auto quality = resolve(cat(cat(kDeploy, kDecodeWork), {"--profile", "quality"}), {});
+    refused = false;
+    try { (void)rd::admit_sampled_mtp(quality, true, true); } catch (const std::invalid_argument&) { refused = true; }
+    CHECK(refused);
+    auto fast = resolve(cat(cat(kDeploy, kDecodeWork), {"--profile", "fast"}), {});
+    CHECK(rd::admit_sampled_mtp(fast, true, true) == "rejection");
+    CHECK(fast.product && fast.product->engine_overrides.size() == 1 &&
+          fast.product->engine_overrides[0] == "STRIX_MTP_SAMPLED_ACCEPT=rejection");
+    // the lever row is additive: the exact resolution's fingerprint does not depend on it while unset
+    const auto* row = fast.product->find("serve_sampled_mtp");
+    CHECK(row != nullptr && row->value == "0");
+}
+
 }  // namespace
 
 int main() {
+    test_sampled_mtp_admission();
     test_pf_variants();
     test_mtp_default();
     test_plain_equals_receipt();

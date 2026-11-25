@@ -386,6 +386,29 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     return e;
 }
 
+// Server switch STRIX_GLM_SERVE_SAMPLED_MTP (lever row serve_sampled_mtp of the pair profile table): unset, empty or 0
+// = off (plain sampled decode), 1 = sampled requests through MTP; anything else is refused at startup.
+inline bool sampled_mtp_switch(const EnvGet& env) {
+    const char* v = env("STRIX_GLM_SERVE_SAMPLED_MTP");
+    if (v == nullptr || *v == ' ' || std::string(v) == "0") return false;
+    if (std::string(v) == "1") return true;
+    throw std::invalid_argument("STRIX_GLM_SERVE_SAMPLED_MTP must be 0 or 1");
+}
+// Tier admission of sampled MTP: coupled acceptance keeps the tokens of plain sampling (every profile); rejection
+// acceptance changes per-seed tokens (exact in distribution only), so only --profile fast / turbo admit it and the
+// resolution names it as an engine override (the tier notice then never claims the exact column). Returns the
+// resolved identity of the decode route: "off", "coupled" or "rejection".
+inline std::string admit_sampled_mtp(Effective& e, bool on, bool rejection) {
+    if (!on) return "off";
+    if (!rejection) return "coupled";
+    const auto profile = e.product ? e.product->profile : strix::profile::Name::standard;
+    if (profile != strix::profile::Name::fast && profile != strix::profile::Name::turbo)
+        throw std::invalid_argument("STRIX_GLM_SERVE_SAMPLED_MTP=1 with STRIX_MTP_SAMPLED_ACCEPT=rejection changes per-seed tokens: "
+                                    "only --profile fast or turbo admits it (coupled acceptance keeps plain sampling's tokens)");
+    e.product->engine_overrides.push_back("STRIX_MTP_SAMPLED_ACCEPT=rejection");
+    return "rejection";
+}
+
 inline constexpr unsigned kAutoMaxRows = 8192, kFallbackMaxRows = 4096;
 inline constexpr std::uint64_t kMaxRowsSafetyBytes = std::uint64_t{8} << 30;
 inline bool max_rows_auto(const Effective& e) {

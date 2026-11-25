@@ -987,7 +987,7 @@ int main(int argc, char** argv) {
     try {
         // One resolver for the sampler options (shared STRIX_MTP_SAMPLED_ACCEPT); sampled MTP (opt-in) makes coupled
         // acceptance the unset default so it keeps the tokens of plain sampling.
-        const bool sampled_mtp_requested = strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP");
+        const bool sampled_mtp_requested = rd::sampled_mtp_switch(rd::process_env());
         const auto sampler_options = strix::validate_sampling_startup_environment(
             sampled_mtp_requested ? strix::SampledAcceptance::coupled : strix::SampledAcceptance::rejection);
         if (argc < 2) {
@@ -1145,6 +1145,9 @@ int main(int argc, char** argv) {
         // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). Automatic
         // max-rows runs the CLI's load-time admission (rd::admit_auto_rows) and a row merge between the two ranks.
         auto eff = rd::resolve_serve(rank_args, serve_mtp, rd::process_env(), rd::probe_model_mtp(argv[1]));
+        // Tier admission of sampled MTP (shared profile resolution): coupled under any profile, rejection fast / turbo only.
+        const std::string sampled_route =
+            rd::admit_sampled_mtp(eff, sampled_mtp_requested, sampler_options.acceptance == strix::SampledAcceptance::rejection);
         const bool mtp_on = eff.mtp_spec.value == "1" && (eff.prefill == "gemv" || eff.prefill == "ref");
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = mtp_on; opt.spec = mtp_on;
@@ -1176,7 +1179,7 @@ int main(int argc, char** argv) {
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
             // Sampled requests through MTP at C1 (coupled acceptance; opt-in until its pair gates pass).
             std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP) sampled-accept=%s (STRIX_MTP_SAMPLED_ACCEPT)\n",
-                        sampled_mtp_requested ? (mtp_on ? "on" : "off (MTP off)") : "off",
+                        sampled_mtp_requested ? (mtp_on ? sampled_route.c_str() : "off (MTP off)") : "off",
                         sampler_options.acceptance == strix::SampledAcceptance::rejection ? "rejection" : "coupled");
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
             // prefill; off unless --rtx-prefill / --import-listen are given).

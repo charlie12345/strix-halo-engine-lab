@@ -48,9 +48,12 @@ constexpr p::Lever kRows[] = {
 constexpr p::Regime kRegime{p::Phase::prefill, 8, 1, "fixture"};
 constexpr p::LadderRow kTiming[] = {
     {"flash", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
-    {"replay", "128", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
+    // TURBO rows were measured over the FAST arm that runs in the regime (LadderRow::over).
+    {"replay", "128", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
+     "flash=1,dense=1"},
     {"dense", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
-    {"dense", "0", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
+    {"dense", "0", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
+     "flash=1,dense=1"},
 };
 const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, kTiming};
 const p::Engine kNoTurbo{"no-turbo-fixture", "", kRows, false};

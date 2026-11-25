@@ -78,15 +78,16 @@ int main() {
         };
         const auto off = run(app, with_fast, user_env);
         require(a4(off).value == "none" && !sp::applied(a4(off).status), "an explicit STRIX_DENSE_A4W4_LAYERS wins over fast");
-        // Allow-pending authorizes a quality experiment; a profile-owned cell still needs timing evidence.
+        // allow-pending (flag and env, benchmarks only) applies the runnable pending cell in an unmeasured regime, in front
+        // of the user's options, stamped unqualified (main's contract; the route line says it is a benchmark arm).
         Args allow{"--profile", "fast", "--allow-pending"};
         const auto applied = run(app, allow);
-        require(applied.args.empty(), "allow-pending does not invent timing evidence");
-        require(win(applied, app).status == sp::Status::pending, "unmeasured window remains pending");
+        require(applied.args == Args{opt, "64"}, "fast --allow-pending adds the 64-row option in front");
+        require(win(applied, app).status == sp::Status::unqualified, "allow-pending is stamped unqualified");
         const sp::Lookup allow_env = [](const char* key) -> const char* {
             return std::string(key) == std::string(hp::kAllowEnv) ? "1" : nullptr;
         };
-        require(run(app, with_fast, allow_env).args.size() == user.size(), "allow-pending env still needs a timing receipt");
+        require(run(app, with_fast, allow_env).args.size() == user.size() + 2U, "allow-pending env applies the cell");
         // explicit option wins over the word and stays in the user's arguments.
         Args explicit_args{"--profile", "fast", "--allow-pending", opt, "16", "--gen", "8"};
         const auto won = run(app, explicit_args);

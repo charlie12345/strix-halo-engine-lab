@@ -206,9 +206,13 @@ position table, a class token with its own position embedding, a 2 x 2 merge int
 token 200054 and pass through the language model's `embed_norm` in CPU and device prefill.
 
 The default image identity is `inkling2-vision-v1` under every profile. It uses per-channel normalization, zero RGB
-padding, raster patches, a trailing class row and learned positions. The CLI selects the candidate recipe only with
-`STRIX_INKLING2_VISION_RECIPE=axial@1`. The candidate has identity `inkling2-vision-axial@1`, can change the prompt
-length above the token cap and is pending complete CLI qualification. The Inkling 2 HTTP server currently accepts text.
+padding, raster patches, a trailing class row and learned positions. The recipe is the row `inkling2-vision-recipe`
+of the Inkling 2 Mini profile table (`include/strix/profiles/inkling2_mini.hpp`), resolved with the other rows by the
+resolver the CLI and the server share. `STRIX_INKLING2_VISION_RECIPE=axial@1` selects the candidate under
+`--profile fast` or `turbo` only; the receipt names the row and stamps it unqualified, and every other profile,
+including `exact`, refuses it before loading until a qualified column carries the value. The candidate has identity
+`inkling2-vision-axial@1` and can change the prompt length above the token cap. An image run prints
+`image identity <id>` on stderr. The Inkling 2 HTTP server currently accepts text.
 
 The reference is the model's own definition (`Inkling2VisionModel`, `Inkling2ImageProcessor` in the transformers
 package, Apache-2.0); `tools/vision/inkling2_vision_ref.py` runs it in FP32 on the checkpoint's vision tensors and

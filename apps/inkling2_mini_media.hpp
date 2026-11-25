@@ -4,6 +4,7 @@
 // shared vision::SerialMedia. Model-specific only in what it names.
 #include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_vision.hpp"
+#include "strix/profiles/inkling2_mini.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 #include "strix/vision/serial_media.hpp"
 #include "strix/vision/encoder.hpp"
@@ -13,7 +14,10 @@
 #endif
 
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <ostream>
 #include <string>
 
 namespace strix::inkling2::cli {
@@ -61,12 +65,29 @@ inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(std::shared_ptr<
         });
 }
 
-inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::string& checkpoint) {
+// Opens the checkpoint's image assets: the shard and its config.json sidecar, read through one held directory.
+// `config` overrides the sidecar (host fixtures).
+inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::string& checkpoint, VisionIdentity identity,
+                                                                const std::optional<VisionSpec>& config = {}) {
     const std::filesystem::path model(checkpoint);
     const auto parent = model.has_parent_path() ? model.parent_path() : std::filesystem::path(".");
     const weight::ConfinedDirectory directory(std::filesystem::canonical(parent));
     auto assets = read_mini_vision_checkpoint(directory, model.filename());
-    return make_mini_media(std::move(assets.shard), assets.spec, resolve_vision_identity());
+    return make_mini_media(std::move(assets.shard), config ? *config : assets.spec, identity);
+}
+
+// The image opener of one run (SerialGenerationFamily::media): the recipe is the run's own resolution of the row
+// inkling2-vision-recipe (kMiniProfile, the resolver the CLI and the server share), never a second lookup. It is
+// called only for a request with image parts; each call writes the effective image identity to `receipt`.
+using MiniMediaOpener = std::function<std::unique_ptr<serve::SerialMediaInput>(const std::string& checkpoint)>;
+inline MiniMediaOpener mini_media_opener(const profile::Resolution& tier, std::ostream& receipt,
+                                         std::optional<VisionSpec> config = {}) {
+    const auto identity = mini_vision_axial(tier) ? VisionIdentity::axial_v1 : VisionIdentity::legacy;
+    return [identity, &receipt, config](const std::string& checkpoint) {
+        auto media = open_mini_media(checkpoint, identity, config);
+        receipt << "image identity " << media->adapter().identity() << '\n';
+        return media;
+    };
 }
 
 }  // namespace strix::inkling2::cli

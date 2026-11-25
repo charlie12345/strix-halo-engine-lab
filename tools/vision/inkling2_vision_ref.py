@@ -91,6 +91,28 @@ def directory(path):
 
 
 @contextmanager
+def output_directory(path):
+    # The output leaf is created (if missing) and opened relative to its held parent without following a link, so a
+    # symlink at the leaf, or one swapped in after creation, is refused instead of redirecting the case files.
+    parent_path, leaf = os.path.split(os.path.normpath(path))
+    if leaf in ("", ".", ".."):
+        sys.exit(f"{path}: name the output directory itself")
+    with directory(parent_path or ".") as parent:
+        try:
+            os.mkdir(leaf, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        except OSError as error:
+            sys.exit(f"{path}: the output must be a real directory, not a link ({error.strerror})")
+        try:
+            yield fd
+        finally:
+            os.close(fd)
+
+
+@contextmanager
 def regular_input(parent, name, cap):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     with os.fdopen(os.open(name, flags, dir_fd=parent), "rb") as stream:
@@ -154,8 +176,7 @@ def main():
         sys.exit("reference generation requires Linux with procfs")
     dtype = getattr(torch, a.dtype)
     torch.set_num_threads(os.cpu_count() or 8)
-    os.makedirs(a.out, exist_ok=True)
-    with directory(a.checkpoint) as checkpoint, directory(a.out) as output:
+    with directory(a.checkpoint) as checkpoint, output_directory(a.out) as output:
         write_cases(a, checkpoint, output, dtype)
 
 

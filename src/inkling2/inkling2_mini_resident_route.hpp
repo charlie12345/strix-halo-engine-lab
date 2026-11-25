@@ -1,10 +1,25 @@
 #pragma once
 
+#include "strix/serve/decode_form.hpp"
+
 #include <string_view>
 
 namespace strix::inkling2 {
 
 inline constexpr unsigned kMiniMaxVerifyRows = 8U;
+
+// Decode expert form default of the command line (and of a server running its route through the served route lever,
+// kMiniServedCliRoute): the packed one-row form (moe_core::microscaled_r1), whose row bits equal a one-row launch at any
+// cohort width. --grouped-decode selects the grouped tile kernel on the command line. Without the lever a server keeps
+// its incumbent grouped decode and takes no form flag.
+inline constexpr bool kMiniPackedDecodeDefault = true;
+
+// The same value from the two flags, through the resolver the command line also calls (serve::resolve_decode_form).
+constexpr bool mini_packed_decode(bool packed_flag, bool grouped_flag) {
+    return ::strix::serve::resolve_decode_form(packed_flag, grouped_flag, kMiniPackedDecodeDefault);
+}
+
+constexpr const char* mini_decode_form_name(bool packed_decode) noexcept { return packed_decode ? "packed" : "grouped"; }
 
 enum class MiniAppendKind { prefill, decode, verify };
 
@@ -14,14 +29,24 @@ struct MiniResidentRoute {
     bool step_graph;
 };
 
+// With packed decode a lone decode row and every verify row run the packed expert form. A multi-row decode (a cohort
+// of more than kMiniMaxVerifyRows lanes) runs it only with packed cohort rows (the served route lever); prefill chunks
+// of more than one row keep the grouped tile kernel.
 constexpr MiniResidentRoute mini_resident_route(MiniAppendKind kind, unsigned rows,
-                                                bool packed_decode, bool allow_graph) {
+                                                bool packed_decode, bool allow_graph, bool cohort_rows = false) {
     const bool verify = kind == MiniAppendKind::verify;
     return {
         verify ? 1U : rows,
-        packed_decode && (rows == 1U || verify),
+        packed_decode && (rows == 1U || verify || (cohort_rows && kind == MiniAppendKind::decode)),
         allow_graph && rows == 1U && kind != MiniAppendKind::prefill,
     };
+}
+
+// Row cap of one batched cohort decode pass of the served route lever (decode_slots_served; 0 = the whole cohort in one
+// pass, serve::plan_cohort_passes). Packed decode promises that a lane's bits do not depend on the cohort width, so it
+// runs passes of at most the backend's one-row cap (the dense rows family keeps its one-row body up to that many rows).
+constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one_row_cap) noexcept {
+    return packed_decode ? backend_one_row_cap : 0U;
 }
 
 // HIP targets the exact down-image lever (inkling2-mini-combine-down-image@1) is qualified on: the NaN identity fixture and

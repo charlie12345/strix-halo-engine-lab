@@ -3,7 +3,10 @@
 
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <stdexcept>
+#include <string_view>
+#include <vector>
 #include <utility>
 #include <string>
 
@@ -59,8 +62,10 @@ void test_controller_planes() {
 // The engine resolves the W4A4 row: an unbound table would ignore STRIX_INK_MOE_W4A4 at every prompt length.
 void test_row() {
     require(mini::kMiniProfile.table.size() == mini::kMiniLevers.size(), "Inkling lever table bound to the engine");
-    require(mini::kMiniProfile.table.size() == 7U,
-            "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias and block-candidate");
+    require(mini::kMiniProfile.table.size() == 9U,
+            "W4A4, down image, prepared round fold, narrow experts, controller planes, projected-bias, served route, "
+            "image recipe and the block-candidate row");
+    require(mini::kMiniLevers[7].name == mini::kMiniVisionRecipe, "image recipe sits before the block-candidate row");
     const auto& lever = mini::kMiniProfile.table.front();
     require(lever.name == mini::kMiniMoeW4a4 && lever.name == "inkling2-mini-moe-w4a4@1", "w4a4 identity");
     require(lever.env == "STRIX_INK_MOE_W4A4" && lever.off == "0" && lever.builtin == "0", "w4a4 off switch");
@@ -334,11 +339,108 @@ void test_narrow_experts() {
     }
     require(refused, "malformed narrow switch must be refused");
 }
+// r65 #1162.1 and the text-only property: with the image recipe unset, every profile resolves to exactly what the
+// table without the row resolves (receipt, notice, qualification, fingerprint), so a text run's identity is unchanged;
+// an explicit axial@1 is refused by the shared resolve_mini_profile under exact (before any load) and runs, named and
+// stamped unqualified, under fast and turbo.
+void test_vision_recipe_row() {
+    std::vector<profile::Lever> before;
+    for (const auto& lever : mini::kMiniLevers)
+        if (lever.name != mini::kMiniVisionRecipe) before.push_back(lever);
+    require(before.size() + 1U == mini::kMiniLevers.size(), "one image recipe row");
+    profile::Engine without_row = mini::kMiniProfile;
+    without_row.table = before;
+    mini::MiniWeightOptions options;
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        options.tier = inputs(tier);
+        const auto with = mini::resolve_mini_profile(options, true);
+        const auto old = profile::resolve(without_row, inputs(tier));
+        require(with.summary() == old.summary() && with.tier_notice() == old.tier_notice() &&
+                    with.qualification() == old.qualification() && with.fingerprint() == old.fingerprint(),
+                "unset image recipe: the text-only resolution is the table's without the row");
+        for (const char* recipe : {"axial@1", "legacy"}) {
+            options.tier = inputs(tier);
+            options.tier.env = [recipe](const char* key) -> const char* {
+                return std::strcmp(key, "STRIX_INKLING2_VISION_RECIPE") == 0 ? recipe : nullptr;
+            };
+            bool refused = false;
+            try {
+                const auto resolved = mini::resolve_mini_profile(options, true);
+                require(mini::mini_vision_axial(resolved) == (std::string_view(recipe) == "axial@1"), "recipe value");
+                if (std::string_view(recipe) == "legacy")
+                    require(resolved.fingerprint() == with.fingerprint(), "explicit legacy keeps the identity");
+                else
+                    require(resolved.qualification().find("unqualified: inkling2-vision-recipe") != std::string::npos,
+                            "axial is stamped unqualified");
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            require(refused == (tier == profile::Name::standard && std::string_view(recipe) == "axial@1"),
+                    "EXACT refuses only the unqualified axial recipe");
+        }
+    }
+}
 }  // namespace
+
+// The served route row: opt-in in every profile column (EXACT, FAST and TURBO keep the incumbent served route), an
+// explicit 1 selects it and labels the run unqualified until its migration is qualified, 0 keeps it off.
+void test_served_route() {
+    const profile::Lever* lever = nullptr;
+    for (const auto& row : mini::kMiniProfile.table)
+        if (row.name == mini::kMiniServedCliRoute) lever = &row;
+    require(lever != nullptr && lever->name == "inkling2-mini-served-cli-route@1" &&
+                lever->env == "STRIX_INK_SERVED_CLI_ROUTE" && lever->builtin == "0" && lever->off == "0" &&
+                lever->kind == profile::Kind::bit_changing && lever->omit_builtin_fingerprint,
+            "served route row identity");
+    for (const auto tier : {profile::Name::standard, profile::Name::fast, profile::Name::turbo}) {
+        require(lever->value[static_cast<unsigned>(tier)].empty() && !lever->ready[static_cast<unsigned>(tier)],
+                "served route: no profile column selects it");
+        for (const char* value : {static_cast<const char*>(nullptr), "0", "1"}) {
+            mini::MiniWeightOptions options;
+            options.tier.profile = tier;
+            options.tier.env = [value](const char* key) -> const char* {
+                return std::strcmp(key, "STRIX_INK_SERVED_CLI_ROUTE") == 0 ? value : nullptr;
+            };
+            const auto resolution = mini::resolve_mini_profile(options, true);
+            const bool on = value != nullptr && std::strcmp(value, "1") == 0;
+            require(mini::mini_served_cli_route(resolution) == on, "served route: explicit opt-in only");
+            require((resolution.qualification() == "qualified") == !on, "served route: an opt-in run is unqualified");
+            // The command line's resolution: the request stays visible on its own line, never as an effective lever.
+            auto cli = resolution;
+            mini::mini_cli_decline_served_route(cli);
+            require(!mini::mini_served_cli_route(cli) && cli.qualification() == "qualified" &&
+                        cli.summary().find("served-cli-route") == std::string::npos,
+                    "served route: the command line's summary and qualification carry no server-only setting");
+            require(mini::mini_served_route_cli_line(cli) ==
+                        std::string("strix-served-route/v1 requested ") + (on ? "1" : "0") +
+                            " effective n/a (strix-serve only; the command line runs its own route)",
+                    "served route: the command line reports the lever as not applicable to its route");
+        }
+        // A malformed setting is the server's refusal only: the shared resolution (the command line's) does not abort.
+        mini::MiniWeightOptions options;
+        options.tier.profile = tier;
+        options.tier.env = [](const char* key) -> const char* {
+            return std::strcmp(key, "STRIX_INK_SERVED_CLI_ROUTE") == 0 ? "2" : nullptr;
+        };
+        const auto resolution = mini::resolve_mini_profile(options, true);
+        bool refused = false;
+        try {
+            (void)mini::mini_served_cli_route(resolution);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        auto cli = resolution;
+        mini::mini_cli_decline_served_route(cli);
+        require(refused && mini::mini_served_route_cli_line(cli).find("requested 2 effective n/a") != std::string::npos,
+                "served route: a malformed setting is refused by the server and reported by the command line");
+    }
+}
 
 int main() {
     try {
         test_row();
+        test_vision_recipe_row();
+        test_served_route();
         test_resolution();
         test_combine_image();
         test_controller_planes();

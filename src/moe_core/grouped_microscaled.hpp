@@ -190,10 +190,12 @@ struct SmallTile {
     unsigned* bf16_rows;
     mutable unsigned range_mask{};
 
+    __device__ __forceinline__ unsigned columns() const { return outputs; }
     __device__ __forceinline__ typename Operand::Row row(unsigned column) const { return Operand::row(weights, column); }
-    __device__ __forceinline__ AChunk load_a(unsigned r, unsigned k, bool in) const {
+    __device__ __forceinline__ AChunk load_a(unsigned r, unsigned k, unsigned kl, bool in) const {
+        if (!in) return {};  // a row past the tile stages zeros
         const std::size_t base = (map ? std::size_t{map[r]} : std::size_t{r}) * input_row;
-        return {in ? *reinterpret_cast<const gemm::U4*>(input + base + k) : gemm::U4{}};
+        return {*reinterpret_cast<const gemm::U4*>(input + base + k + kl)};
     }
     // Record rows that need the original BF16 operands while staging the small form.
     __device__ __forceinline__ gemm::U4 pack_a(const AChunk& x, unsigned row) const {
@@ -201,8 +203,8 @@ struct SmallTile {
         bool needs_bf16 = false;
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) {
-            needs_bf16 |= small_f16_needs_bf16(static_cast<std::uint16_t>(x.v[i])) |
-                          small_f16_needs_bf16(static_cast<std::uint16_t>(x.v[i] >> 16U));
+            needs_bf16 = needs_bf16 || small_f16_needs_bf16(static_cast<std::uint16_t>(x.v[i])) ||
+                         small_f16_needs_bf16(static_cast<std::uint16_t>(x.v[i] >> 16U));
             out[i] = gemm::detail::pack(__builtin_bit_cast(float, x.v[i] << 16U),
                                         __builtin_bit_cast(float, x.v[i] & 0xFFFF0000U));
         }
@@ -255,7 +257,7 @@ __global__ __launch_bounds__(128) void small_kernel(Args args, const std::uint32
         t.input = args.rebase_to + (rows.input - args.rebase_from);
     }
     const unsigned col0 = blockIdx.x * kSmallOutputs;
-    gemm::small_m::run<typename SmallTile<Format>::Operand, RowTiles, 1U>(t, r0, col0);
+    gemm::small_m::run<typename SmallTile<Format>::Operand, RowTiles>(t, blockIdx.y % row_blocks, col0);
     const unsigned mask = t.range_mask;
     if (mask != 0U) {
         static_assert(NarrowSchedule::kThreads == 128U && NarrowSchedule::kRows >= 16U * RowTiles);

@@ -54,7 +54,6 @@ namespace packed = strix::weight::microscaled;
 using lowbit_f16::Words4;
 using lowbit_f16::Words4G;
 using lowbit_f16::WordsG;
-using Words2G = const std::uint16_t __attribute__((address_space(1), aligned(2)));
 
 // One weight row of a microscaled matrix: its code bytes and its scale bytes.
 struct Row {
@@ -93,35 +92,29 @@ struct Operand {
     static constexpr unsigned kGroup = kNvfp4 ? 16U : 32U, kUnits = kGroup / 16U, kSuperK = 128U;
     static_assert(kGroup == packed::PackedOperand<Format>::kBlockColumns);
     using Row = microscaled_f16::Row;
-    // Code and scale bytes of 64 Groups elements: NVFP4 32 Groups code bytes + 4 Groups scale bytes, MXFP8 64 Groups code
-    // bytes + 2 Groups scale bytes.
-    static constexpr unsigned code_bytes(unsigned groups) { return (kNvfp4 ? 32U : 64U) * groups; }
-    template <unsigned Groups>
+    // One superblock (128 elements) of a column: NVFP4 64 code bytes + 8 scale bytes, MXFP8 128 code bytes + 4 scale bytes.
+    static constexpr unsigned kCodeBytes = kNvfp4 ? 64U : 128U;
     struct Words {
-        Words4 c[code_bytes(Groups) / 16U];
-        std::uint32_t scale[kNvfp4 ? Groups : 1U];
+        Words4 c[kCodeBytes / 16U];
+        std::uint32_t scale[kNvfp4 ? 2U : 1U];
     };
 
-    template <unsigned Groups>
-    __device__ __forceinline__ static Words<Groups> load(Row row, unsigned index) {
-        Words<Groups> w{};
-        const auto* codes = row.codes + std::size_t{index} * code_bytes(Groups);
+    __device__ __forceinline__ static Words load(Row row, unsigned index) {
+        Words w{};
+        const auto* codes = row.codes + std::size_t{index} * kCodeBytes;
 #pragma unroll
-        for (unsigned i = 0; i < code_bytes(Groups) / 16U; ++i) w.c[i] = *(Words4G*)(codes + 16U * i);
+        for (unsigned i = 0; i < kCodeBytes / 16U; ++i) w.c[i] = *(Words4G*)(codes + 16U * i);
         if constexpr (kNvfp4) {
 #pragma unroll
-            for (unsigned i = 0; i < Groups; ++i) w.scale[i] = *(WordsG*)(row.scales + 4U * (Groups * index + i));
-        } else if constexpr (Groups == 2U) {
-            w.scale[0] = *(WordsG*)(row.scales + 4U * index);
+            for (unsigned i = 0; i < 2U; ++i) w.scale[i] = *(WordsG*)(row.scales + 4U * (2U * index + i));
         } else {
-            w.scale[0] = *(Words2G*)(row.scales + 2U * index);
+            w.scale[0] = *(WordsG*)(row.scales + 4U * index);
         }
         return w;
     }
 
     // Unit u of group gi = elements kGroup gi + 16 u .. + 16 of the block.
-    template <unsigned Groups>
-    __device__ __forceinline__ static void unit(const Words<Groups>& w, unsigned gi, unsigned u, std::uint32_t (&words)[8]) {
+    __device__ __forceinline__ static void unit(const Words& w, unsigned gi, unsigned u, std::uint32_t (&words)[8]) {
         if constexpr (kNvfp4) {
             const unsigned word = 2U * gi;  // 8 code bytes per unit
             e2m1_pairs(w.c[word / 4U][word % 4U], words);
@@ -133,8 +126,7 @@ struct Operand {
         }
     }
 
-    template <unsigned Groups>
-    __device__ __forceinline__ static auto scale(const Words<Groups>& w, unsigned gi) {
+    __device__ __forceinline__ static auto scale(const Words& w, unsigned gi) {
         const auto byte = static_cast<std::uint8_t>(w.scale[gi / 4U] >> (8U * (gi % 4U)));
         if constexpr (kNvfp4) {
             // E4M3 scale x 2^-8 as FP16 bits, widened exactly and scaled back by 2^8.

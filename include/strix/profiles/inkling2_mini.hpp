@@ -52,7 +52,7 @@ inline weight::WeightLoadPlan resolve_mini_weight_load(
 // FAST lever: W4A4 experts. Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4
 // operand class (moe_core/grouped_w4a4.hpp, identity grouped-nvfp4-w4a4-f32-v1: activations quantised once per projection
 // input by the family NVFP4 rule, sm_120 block-scaled FP4 MMA, weights used as stored). MXFP8 layers, decode, verify and
-// one-row calls keep the BF16 tile. CUDA sm_120 only (HIP ignores it). Runnable, not ready: opt in with
+// one-row calls keep the BF16 tile. CUDA sm_120 only (HIP refuses a selected class). Runnable, not ready: opt in with
 // STRIX_INK_MOE_W4A4=1 until the FAST gate (prefill regime) and a prefill receipt exist. Off switch: STRIX_INK_MOE_W4A4=0.
 inline constexpr std::string_view kMiniMoeW4a4 = "inkling2-mini-moe-w4a4@1";
 // Narrow expert image: the checkpoint's MXFP8 expert layers are transcoded to NVFP4 at load (shared
@@ -90,6 +90,15 @@ inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-p
 inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
+// Exact lever (opt-in): CUDA greedy picks that return no score row run the shared EXACT screened head
+// (cuda/core/head_screened.cuh over the BF16 unembed.weight, 8-bit plane built at load): the token and status of the full
+// head by construction (rigorous bound, every possible argmax is rescored by the incumbent row body and picked by the
+// incumbent rule). Steps that return or read scores (host logits, sampled lanes, verify rows, cohort programs) keep the
+// full head; a plane that cannot be built, or (served) would cost a KV slot, keeps the full head. CUDA only: HIP keeps its
+// own binding (screened by default, STRIX_SCREENED_HEAD=0 = full head). Off in every tier (builtin "0": the full head);
+// an explicit 1 selects it and is a distinct identity until an RTX identity receipt makes it a default.
+// Switch: STRIX_INK_SCREENED_HEAD=0/1.
+inline constexpr std::string_view kMiniScreenedHead = "inkling2-mini-screened-head@1";
 // Image pre-processing recipe of the one vision adapter (src/inkling2/inkling2_vision.*), resolved here with the other
 // rows by the resolver the CLI and the server share. "legacy" (builtin, image identity inkling2-vision-v1) or "axial@1"
 // (the reference-checked axial recipe, image identity inkling2-vision-axial@1: checkerboard alpha, symmetric
@@ -100,7 +109,7 @@ inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-control
 // mini_vision_media_tier); a text-only run never applies it (mini_defer_vision_recipe), and at its builtin the row
 // stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 9> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 10> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -135,6 +144,13 @@ inline constexpr std::array<profile::Lever, 9> kMiniLevers{{
      .runnable = {true, true, true, true}, .target = "", .off = "0",
      .source = "waits for the served migration identity (served lanes against the incumbent served route); device "
                "evidence so far: served cohort lanes == the same served decoder's lone lane at cohort widths 2..17",
+     .omit_builtin_fingerprint = true},
+    {.name = kMiniScreenedHead, .env = "STRIX_INK_SCREENED_HEAD", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0",
+     .kind = profile::Kind::exact, .ready = {false, false, false, false},
+     .runnable = {true, true, true, true}, .target = "1", .off = "0",
+     .source = "awaits the RTX identity receipt on the landing head (greedy ids against the full head, CLI and served) "
+               "before any default",
      .omit_builtin_fingerprint = true},
     {kMiniVisionRecipe, "STRIX_INKLING2_VISION_RECIPE", "", {}, "legacy", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "axial@1", "legacy",

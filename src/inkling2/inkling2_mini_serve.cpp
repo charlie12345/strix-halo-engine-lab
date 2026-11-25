@@ -62,12 +62,12 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     }
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
-    out.moe_w4a4 = mini_moe_w4a4_class(resolution);
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
     out.served_route_requested = mini_served_cli_route(resolution);
     out.attn_projected_bias = mini_attn_projected_bias(resolution);
+    out.screened_head = mini_screened_head(resolution);
     out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
@@ -76,6 +76,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
+    out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
     // server declines it (requested stays in the receipt, mini_served_route_startup_field).
     out.served_cli_route = mini_served_prefill_emits_first(resolved.backend == "hip", out.served_route_requested);
@@ -130,6 +132,11 @@ public:
     }
     void handle(const serve::HttpRequest& request, serve::HttpResponseWriter& writer) override {
         api_.handle(request, writer);
+    }
+    // The command line's projected-bias observation, once the owner has stopped: what the served requests submitted.
+    void stopped() override {
+        if (device_.projected_bias_dispatches)
+            std::cerr << mini_projected_bias_dispatches_line(device_.projected_bias_dispatches()) << std::endl;
     }
 
 private:

@@ -253,7 +253,7 @@ if(BUILD_TESTING)
     add_executable(strix-cuda-inkling2-mini-projected-bias-test ${_cc_root}/tests/inkling2/mini_projected_bias_cuda.cu)
     target_link_libraries(strix-cuda-inkling2-mini-projected-bias-test PRIVATE strix_cuda_core_kernels)
     add_executable(strix-cuda-resident-lowbit-refusal-test ${_cc_root}/tests/cuda/resident_lowbit_refusal_tests.cu)
-    target_link_libraries(strix-cuda-resident-lowbit-refusal-test PRIVATE strix_cuda_core_kernels)
+    target_link_libraries(strix-cuda-resident-lowbit-refusal-test PRIVATE strix_cuda_core_kernels strix-weight)
     set(_cc_mini_tests strix-cuda-inkling2-mini-short-conv-test strix-cuda-inkling2-mini-attention-test
         strix-cuda-inkling2-mini-dense-test strix-cuda-inkling2-mini-residual-test strix-cuda-inkling2-mini-step-graph-test
         strix-cuda-inkling2-mini-projected-bias-test

@@ -613,8 +613,7 @@ int main(int argc, char** argv) {
         constexpr bool hip_backend = false;
 #endif
         const bool admitted = inkling2::mini_served_prefill_emits_first(hip_backend, served_route);
-        if (served_route && !admitted) std::cout << "NOTE served route lever declined by this backend
-";
+        if (served_route && !admitted) std::cout << "NOTE served route lever declined by this backend\n";
         return inkling2::test::cohort_lanes(argv[1], storage, served_route, admitted);
     } catch (const std::exception& error) {
         std::cerr << "FAIL Inkling Mini cohort lanes: " << error.what() << '\n';

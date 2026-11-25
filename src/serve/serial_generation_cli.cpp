@@ -217,13 +217,29 @@ public:
         rename->RootDirectory = dir_;
         rename->FileNameLength = DWORD(name.size() * sizeof(wchar_t));
         std::copy(name.begin(), name.end(), rename->FileName);
-        if (SetFileInformationByHandle(file, FileRenameInfo, rename, DWORD(buffer.size()))) {
+        // NtSetInformationFile, not SetFileInformationByHandle: the latter refuses RootDirectory and resolves a relative
+        // name against the process's current directory.
+        struct IoStatus {
+            union {
+                LONG status;
+                PVOID pointer;
+            };
+            ULONG_PTR information;
+        } io{};
+        using SetInformation = LONG(NTAPI*)(HANDLE, IoStatus*, PVOID, ULONG, int);
+        const auto set_information = reinterpret_cast<SetInformation>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile")));
+        constexpr int file_rename_information = 10;
+        constexpr LONG name_collision = LONG(0xC0000035L);  // STATUS_OBJECT_NAME_COLLISION
+        const LONG status = set_information ? set_information(file, &io, rename, ULONG(buffer.size()),
+                                                              file_rename_information)
+                                            : name_collision + 1;
+        if (status == 0) {
             FILE_DISPOSITION_INFO_EX keep{};
             keep.Flags = FILE_DISPOSITION_FLAG_ON_CLOSE;  // without FILE_DISPOSITION_FLAG_DELETE: clears delete-on-close
             published = SetFileInformationByHandle(file, FileDispositionInfoEx, &keep, sizeof(keep)) != 0;
         } else {
-            const auto error = GetLastError();
-            taken = error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS;
+            taken = status == name_collision;
         }
 #else
         const auto self = "/proc/self/fd/" + std::to_string(fd_);

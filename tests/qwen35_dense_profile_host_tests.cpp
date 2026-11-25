@@ -184,9 +184,10 @@ int main() {
         const Options d = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 32768, {{"prefill_attn8", "off"}, {"prefill_arith", "exact"}});
         check(d.prefill_arith == PrefillArith::exact && !d.prefill_attn8, "explicit off switches under fast");
         // every engine spelling passes the resolver (the CLI path once kept a second spelling list that refused chunk16tc);
-        // chunk16 (the f32 scan) stays reachable under fast as an explicit choice
+        // chunk16 (the f32 scan) stays reachable under fast as an explicit choice; the explicit setting is part of the lower
+        // arm, so FAST timing rows measured over the builtin arm no longer decide (stale evidence) and their cells stay EXACT
         const Options e = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192, {{"prefill_gdn", "chunk16"}});
-        check(e.prefill_arith == PrefillArith::fast4 && e.prefill_gdn == PrefillGdn::chunk16, "explicit --prefill-gdn chunk16 under fast");
+        check(e.prefill_arith == PrefillArith::exact && e.prefill_gdn == PrefillGdn::chunk16, "explicit --prefill-gdn chunk16 under fast");
         const Options f = run(std::nullopt, TurboWeights::converted, qp::Route::large_prefill, 0,
                               {{"prefill_arith", "fast4"}, {"prefill_gdn", "chunk16tc"}, {"prefill_hid", "bf16"}});
         check(f.prefill_arith == PrefillArith::fast4 && f.prefill_gdn == PrefillGdn::chunk16tc && f.prefill_hid == PrefillHid::bf16,

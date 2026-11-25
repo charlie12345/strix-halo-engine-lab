@@ -212,20 +212,14 @@ template <class Context, class Lanes>
            ladder_band(regime.context, row.min_context, row.max_context, regime.lanes, row.min_lanes, row.max_lanes);
 }
 
-// `declined`: the regime is not known when the entry point resolves (context 0: a server or an adapter that resolves
-// once before any request) and timing rows decide this cell per regime, so neither the grant nor a row can be honoured.
-enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower, incumbent, declined };
+enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower, incumbent };
 [[nodiscard]] constexpr std::string_view rung_name(Rung rung) noexcept {
     return rung == Rung::applies ? "applies" : rung == Rung::unmeasured ? "unmeasured regime"
-        : rung == Rung::within_noise ? "within noise" : rung == Rung::slower ? "slower"
-        : rung == Rung::incumbent ? "incumbent"
-        : "declined at startup (resolved before the request: no prompt length; timing rows decide this cell per regime)";
+        : rung == Rung::within_noise ? "within noise" : rung == Rung::slower ? "slower" : "incumbent";
 }
-// No measurement decides the regime (unmeasured there, or unknown at startup): the only rungs --allow-pending may run
-// as a benchmark arm. A measured slower or within-noise verdict is never overridden.
-[[nodiscard]] constexpr bool rung_unmeasured(Rung rung) noexcept {
-    return rung == Rung::unmeasured || rung == Rung::declined;
-}
+// No measurement decides the regime: the only rung --allow-pending may run as a benchmark arm. A measured slower or
+// within-noise verdict is never overridden.
+[[nodiscard]] constexpr bool rung_unmeasured(Rung rung) noexcept { return rung == Rung::unmeasured; }
 // The cell runs in its own tier (a measured gain or an incumbent grant).
 [[nodiscard]] constexpr bool rung_runs(Rung rung) noexcept { return rung == Rung::applies || rung == Rung::incumbent; }
 struct LadderVerdict {
@@ -236,10 +230,10 @@ struct LadderVerdict {
 };
 
 // The verdict of `value` of `lever` in `tier` for `regime`: applies only when every covering timing row shows a gain;
-// with no timing row covering the regime, an incumbent grant with a receipt keeps the cell (Rung::incumbent), except in
-// an unknown regime (context 0) when timing rows exist for the cell: the startup resolution declines it
-// (Rung::declined). `arm` (the lower arm that runs, ladder_arms()) binds ordinary rows: a row whose `over` differs does
-// not cover the regime (stale evidence; a grant does not run over it either). Paired rows bind through `joint_scope`.
+// with no timing row covering the regime, an incumbent grant with a receipt keeps the cell (Rung::incumbent). An
+// unknown regime (context 0: an entry point that resolves before the request) is inside no timing band, so there only
+// grants run. `arm` (the lower arm that runs, ladder_arms()) binds ordinary rows: a row whose `over` differs does not
+// cover the regime (stale evidence; a grant does not run over it either). Paired rows bind through `joint_scope`.
 [[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
                                                    std::string_view value, Name tier, const Regime& regime,
                                                    std::string_view joint = {},
@@ -247,7 +241,6 @@ struct LadderVerdict {
                                                    const std::string_view* arm = nullptr) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
-    bool timed = false;  // a timing row names this cell (in any regime)
     bool stale = false;
     for (const auto& row : rows) {
         if (row.joint != joint) continue;  // a paired receipt is read only by the pair's own judge
@@ -256,7 +249,6 @@ struct LadderVerdict {
             if (!grant && !row.receipt.empty() && ladder_names(row, lever, value, tier)) grant = &row;
             continue;
         }
-        timed = timed || ladder_names(row, lever, value, tier);
         if (!ladder_covers(row, lever, value, tier, regime)) continue;
         if (joint.empty() && arm != nullptr && row.over != *arm) {
             stale = true;
@@ -266,7 +258,6 @@ struct LadderVerdict {
             return {Rung::unmeasured, nullptr, tier_below(tier)};
         if (!worst || row.speedup - row.noise < worst->speedup - worst->noise) worst = &row;
     }
-    if (!worst && grant && timed && regime.context == 0) return {Rung::declined, grant, tier_below(tier)};
     if (!worst)
         return grant && !stale ? LadderVerdict{Rung::incumbent, grant, tier}
                                : LadderVerdict{Rung::unmeasured, nullptr, tier_below(tier), stale};

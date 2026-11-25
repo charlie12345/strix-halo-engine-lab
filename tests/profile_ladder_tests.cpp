@@ -574,7 +574,7 @@ void hy4_new_quality_rows() {
 }
 
 // Ordinary timing rows decide only the comparison they measured (LadderRow::over), --allow-pending never runs a measured
-// loser, and a startup resolution (context 0) declines a grant that timing rows decide per regime.
+// loser, and a startup resolution (context 0) runs grants only.
 void bound_evidence() {
     const auto run = [](const p::Engine& engine, p::Name tier, p::Regime regime, p::Pairs cli = {},
                         bool allow_pending = false) {
@@ -656,17 +656,19 @@ void bound_evidence() {
         }
     }
     {
-        // Startup (context 0): a grant that timing rows decide per regime is declined; a grant without rows keeps.
+        // Startup (context 0): no timing band holds an unknown regime, so a grant keeps its cell (timed or not) and an
+        // ungranted timed cell stays below; once the prompt is known the rows decide.
         const std::array granted{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant")};
         const p::Engine grant_only{"grant", "", kRows, false, "grant-v1", {}, {}, granted};
         const p::Regime startup = p::startup_prefill_regime("dev");
         require(value_of(run(grant_only, p::Name::fast, startup), kLever) == "a8", "untimed grant keeps its cell at startup");
         const std::array timed_grant{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant"), fast_a8};
         const p::Engine timed{"grant", "", kRows, false, "grant-v1", {}, {}, timed_grant};
-        const auto res = run(timed, p::Name::fast, startup);
-        require(value_of(res, kLever) == "off" && route_of(res, kLever).find("declined at startup") != std::string::npos,
-                "timed grant declined at startup: " + route_of(res, kLever));
-        require(value_of(run(timed, p::Name::fast, at4k), kLever) == "a8", "the row decides once the prompt is known");
+        require(value_of(run(timed, p::Name::fast, startup), kLever) == "a8", "timed grant keeps its cell at startup");
+        const std::array timed_only{fast_a8};
+        const p::Engine ungranted{"grant", "", kRows, false, "grant-v1", {}, {}, timed_only};
+        require(value_of(run(ungranted, p::Name::fast, startup), kLever) == "off", "ungranted timed cell stays below at startup");
+        require(value_of(run(ungranted, p::Name::fast, at4k), kLever) == "a8", "the row decides once the prompt is known");
         require(value_of(run(timed, p::Name::fast, {p::Phase::prefill, 16384, 1, "dev"}), kLever) == "a8",
                 "outside the timed bands the grant keeps its cell");
     }

@@ -55,7 +55,11 @@ int main() {
     ok &= check(toolkit == "hip-clang-24.0.0git-d6f6cb691863", "HIP toolkit id from the device compiler text");
     ok &= check(weight::hip_clang_compiler_id("20.0.0") == "hip-clang-20.0.0", "HIP toolkit id without a commit");
     weight::WeightLoadScope scope{weight::Backend::hip, "gfx1151", toolkit, "resident", impl, checkpoint};
-    const std::array rows{weight::WeightLoadDecision{policy, scope, gate, gain}};
+    // The point lookup takes the ladder's timing decision: a row selects with a measured gain beyond noise.
+    const weight::WeightLoadEvidence measured{"receipts/timing", "2026-11-24", 16, 0, 0, 1.10, 0.02};
+    const std::array untimed_rows{weight::WeightLoadDecision{policy, scope, gate, gain}};
+    ok &= check(!weight::find_weight_load_decision(policy, scope, untimed_rows), "a gain digest without a speedup never selects");
+    const std::array rows{weight::WeightLoadDecision{policy, scope, gate, gain, measured}};
     ok &= check(weight::find_weight_load_decision(policy, scope, rows) == rows.data(), "matching scope selects the row");
     auto other = scope;
     other.build = weight::implementation_identity(bumped);

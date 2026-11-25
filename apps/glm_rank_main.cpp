@@ -400,12 +400,18 @@ int main(int argc, char** argv) {
         strix::session::EmbedSplice embed_splice;
         if (!embed_rows_arg.empty()) {
             if (decode_prompts.size() != 1) throw std::invalid_argument("--embed-rows takes --decode N with one --prompt");
-            std::vector<strix::session::EmbedRows> spans;
+            // Headers first: the files' rows and bytes are budgeted against the prompt before any payload is read.
+            std::vector<std::string> row_files;
+            std::vector<strix::session::EmbedRowsFileInfo> row_infos;
             for (std::size_t a = 0; a <= embed_rows_arg.size();) {
                 const auto b = std::min(embed_rows_arg.find(',', a), embed_rows_arg.size());
-                spans.push_back(strix::session::read_embed_rows_file(embed_rows_arg.substr(a, b - a), strix::glm::kHidden));
+                row_files.push_back(embed_rows_arg.substr(a, b - a));
+                row_infos.push_back(strix::session::read_embed_rows_file_info(row_files.back(), strix::glm::kHidden));
                 a = b + 1;
             }
+            ge::check_embed_row_headers(decode_prompts[0], row_infos, strix::glm::kHidden);
+            std::vector<strix::session::EmbedRows> spans;
+            for (const auto& file : row_files) spans.push_back(strix::session::read_embed_rows_file(file, strix::glm::kHidden));
             embed_splice = ge::prompt_embed_splice(decode_prompts[0], std::move(spans), strix::glm::kHidden);
             for (const auto& seg : embed_splice.segments) {
                 const std::uint64_t h = strix::session::embed_rows_fnv(seg.data, static_cast<std::size_t>(seg.rows) * strix::glm::kHidden);

@@ -4,6 +4,7 @@
 // sequence-parallel prefill a rank embeds only the rows it owns (glm_seqpar.hpp), so it splices only those; the two
 // ranks together write every provided row exactly once.
 #include "glm/xfer/glm_seqpar.hpp"
+#include "strix/session/embed_rows_file.hpp"
 #include "strix/session/embed_splice.hpp"
 
 #include <algorithm>
@@ -51,6 +52,46 @@ struct EmbedPiece {
 [[nodiscard]] inline session::EmbedSplice mtp_pair_splice(const session::EmbedSplice& run, std::size_t c0, std::size_t pairs) {
     if (run.empty()) return {};
     return run.slice(c0 + 1U, c0 + 1U + pairs);
+}
+
+// Cap on the summed payload of all --embed-rows files: the rows stay in host memory for the whole run. 1 GiB is
+// 131072 BF16 rows of the 4096-wide model, more than any prompt this engine prefills; a larger sum is a wrong file.
+inline constexpr std::uint64_t kEmbedRowsByteCap = std::uint64_t{1} << 30U;
+
+// Budget of the rows files from their headers alone, before any payload is read: the files must be exactly the
+// prompt's runs of the spans' image token (count and lengths), so their rows never exceed the prompt's virtual
+// positions, and the summed payload must fit byte_cap. Throws std::invalid_argument naming the mismatch.
+inline void check_embed_row_headers(std::span<const std::uint32_t> prompt, std::span<const session::EmbedRowsFileInfo> infos,
+                                    std::uint32_t width, std::uint64_t byte_cap = kEmbedRowsByteCap) {
+    const auto fail = [](const std::string& what) { throw std::invalid_argument("embed rows: " + what); };
+    if (infos.empty()) fail("no rows given");
+    std::uint64_t rows = 0, bytes = 0;
+    for (const auto& info : infos) {
+        if (info.width != width) fail("a span does not have rows of the model's width");
+        if (info.real_token_id != infos.front().real_token_id) fail("the spans were made for different image tokens");
+        rows += info.rows;
+        bytes += info.payload_bytes;
+        if (rows > prompt.size()) fail("the rows files hold more rows than the prompt has positions (" + std::to_string(prompt.size()) + ")");
+        if (bytes > byte_cap) fail("the rows files hold more than " + std::to_string(byte_cap) + " bytes");
+    }
+    const std::uint32_t token = infos.front().real_token_id;
+    std::size_t next = 0;
+    for (std::size_t i = 0; i < prompt.size();) {
+        if (prompt[i] != token) {
+            ++i;
+            continue;
+        }
+        std::size_t end = i;
+        while (end < prompt.size() && prompt[end] == token) ++end;
+        if (next == infos.size()) fail("the prompt holds more image spans than rows were given (" + std::to_string(infos.size()) + ")");
+        if (end - i != infos[next].rows)
+            fail("image span " + std::to_string(next) + " of the prompt has " + std::to_string(end - i) + " tokens, its rows file has " +
+                 std::to_string(infos[next].rows) + " rows");
+        ++next;
+        i = end;
+    }
+    if (next != infos.size())
+        fail("the prompt holds " + std::to_string(next) + " image spans, " + std::to_string(infos.size()) + " rows files were given");
 }
 
 // The splice of a tokenized prompt whose image spans are runs of the spans' image token: the n-th run takes spans[n]

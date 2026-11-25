@@ -56,17 +56,27 @@ inline void write_embed_rows_file(const std::filesystem::path& path, const Embed
 
 // width: the reader's LM hidden width (0: any). The file length must be exactly the header plus the rows. Throws
 // std::invalid_argument for a malformed or foreign file, std::runtime_error on I/O failure.
-[[nodiscard]] inline EmbedRows read_embed_rows_file(const std::filesystem::path& path, std::uint32_t width = 0) {
+// Header facts of a rows file, read without touching the payload (budget a set of files before materializing any).
+struct EmbedRowsFileInfo {
+    std::uint32_t rows = 0;
+    std::uint32_t width = 0;
+    std::uint32_t real_token_id = 0;
+    std::uint64_t payload_bytes = 0;  // rows * width * 2, equal to the file length minus the header
+};
+
+namespace detail {
+// Opens the file, parses and validates the header and the file length; leaves `in` at the first payload byte.
+inline EmbedRowsFileInfo open_embed_rows_file(std::ifstream& in, const std::filesystem::path& path, std::uint32_t width, EmbedRows& rows,
+                                              std::uint64_t& fnv) {
     const std::string name = path.filename().string();
-    std::ifstream in(path, std::ios::binary);
+    in.open(path, std::ios::binary);
     if (!in) throw std::runtime_error("embed rows file: cannot open " + name);
     in.seekg(0, std::ios::end);
     const auto end = in.tellg();
     in.seekg(0, std::ios::beg);
     char magic[8];
     std::uint32_t head[4];
-    EmbedRows rows;
-    std::uint64_t fnv = 0;
+    fnv = 0;
     in.read(magic, 8);
     in.read(reinterpret_cast<char*>(head), sizeof head);
     in.read(reinterpret_cast<char*>(rows.digest.data()), static_cast<std::streamsize>(rows.digest.size()));
@@ -87,6 +97,24 @@ inline void write_embed_rows_file(const std::filesystem::path& path, const Embed
         throw std::invalid_argument("embed rows file: " + name + " is too large for this platform");
     if (static_cast<std::uint64_t>(end) != kEmbedRowsFileHeader + payload)
         throw std::invalid_argument("embed rows file: " + name + " has a length other than its header states");
+    return {rows.rows, rows.width, rows.real_token_id, payload};
+}
+}  // namespace detail
+
+// Validates the header and the file length only; reads and allocates no rows.
+[[nodiscard]] inline EmbedRowsFileInfo read_embed_rows_file_info(const std::filesystem::path& path, std::uint32_t width = 0) {
+    std::ifstream in;
+    EmbedRows scratch;
+    std::uint64_t fnv = 0;
+    return detail::open_embed_rows_file(in, path, width, scratch, fnv);
+}
+
+[[nodiscard]] inline EmbedRows read_embed_rows_file(const std::filesystem::path& path, std::uint32_t width = 0) {
+    const std::string name = path.filename().string();
+    std::ifstream in;
+    EmbedRows rows;
+    std::uint64_t fnv = 0;
+    const std::uint64_t payload = detail::open_embed_rows_file(in, path, width, rows, fnv).payload_bytes;
     rows.data.resize(std::size_t{rows.rows} * rows.width);
     in.read(reinterpret_cast<char*>(rows.data.data()), static_cast<std::streamsize>(payload));
     if (!in) throw std::runtime_error("embed rows file: short read of " + name);

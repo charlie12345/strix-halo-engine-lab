@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -148,6 +149,55 @@ void test_prompt_splice() {
     CHECK(refused(prompt, {axes, span_of(2, I, 200)}, "plain content rows"));
 }
 
+bool headers_refused(const std::vector<std::uint32_t>& prompt, const std::vector<session::EmbedRowsFileInfo>& infos, const char* needle,
+                     std::uint64_t cap = glm::engine::kEmbedRowsByteCap) {
+    try {
+        glm::engine::check_embed_row_headers(prompt, infos, kWidth, cap);
+    } catch (const std::invalid_argument& e) {
+        return std::string(e.what()).find(needle) != std::string::npos;
+    }
+    return false;
+}
+
+session::EmbedRowsFileInfo info_of(std::uint32_t rows, std::uint32_t token, std::uint32_t width = kWidth) {
+    return {rows, width, token, std::uint64_t{rows} * width * 2U};
+}
+
+// --embed-rows budget from the headers alone, and a header read that never touches the payload.
+void test_header_budget() {
+    constexpr std::uint32_t I = 9, B = 5, E = 6;
+    const std::vector<std::uint32_t> prompt{1, 2, B, I, I, I, E, 3, B, I, I, E, 4};
+    glm::engine::check_embed_row_headers(prompt, std::vector{info_of(3, I), info_of(2, I)}, kWidth);  // fits: no throw
+    CHECK(headers_refused(prompt, {}, "no rows given"));
+    CHECK(headers_refused(prompt, {info_of(3, I, kWidth + 1), info_of(2, I)}, "model's width"));
+    CHECK(headers_refused(prompt, {info_of(3, I), info_of(2, I + 1)}, "different image tokens"));
+    CHECK(headers_refused(prompt, {info_of(3, I), info_of(2, I), info_of(9, I)}, "more rows than the prompt has positions"));
+    CHECK(headers_refused(prompt, {info_of(3, I), info_of(2, I)}, "more than 30 bytes", 30));
+    CHECK(headers_refused(prompt, {info_of(3, I)}, "more image spans than rows"));
+    CHECK(headers_refused(prompt, {info_of(2, I), info_of(3, I)}, "has 3 tokens, its rows file has 2 rows"));
+    CHECK(headers_refused({1, 2, 3}, {info_of(3, I)}, "0 image spans, 1 rows files"));
+
+    // A file whose length does not match its header is refused without a payload read; a good header yields its facts.
+    const auto path = std::filesystem::temp_directory_path() / "strix_glm_embed_header_budget.bin";
+    session::EmbedRows rows;
+    rows.rows = 3;
+    rows.width = kWidth;
+    rows.real_token_id = 9;
+    rows.data.assign(std::size_t{3} * kWidth, 7);
+    session::write_embed_rows_file(path, rows);
+    const auto info = session::read_embed_rows_file_info(path, kWidth);
+    CHECK(info.rows == 3 && info.width == kWidth && info.real_token_id == 9 && info.payload_bytes == 3U * kWidth * 2U);
+    std::filesystem::resize_file(path, session::kEmbedRowsFileHeader + 4);
+    bool length_refused = false;
+    try {
+        (void)session::read_embed_rows_file_info(path, kWidth);
+    } catch (const std::invalid_argument& e) {
+        length_refused = std::string(e.what()).find("length") != std::string::npos;
+    }
+    CHECK(length_refused);
+    std::filesystem::remove(path);
+}
+
 // MTP teacher forcing: drafter pair j of the piece at c0 embeds prompt row c0 + j + 1. Over every piece of a chunked
 // prompt, each prompt row but the first is embedded once, with the provided row where the run has one; the last
 // piece has one pair fewer (its last row pairs with the generated token).
@@ -211,6 +261,7 @@ int main() {
         CHECK(r1.size() == 1 && r1[0].run_row == 20 && r1[0].rows == 3 && r1[0].staged_row == 5);
         CHECK(embed_pieces(session::EmbedSplice{}, 32, true, 2, 1).empty());
         test_prompt_splice();
+        test_header_budget();
         test_mtp_pairs();
     } catch (const std::exception& e) {
         std::printf("FAIL exception: %s\n", e.what());

@@ -81,7 +81,9 @@ struct Lever {
 template <class Row>
 inline unsigned value_column(const Row& lever, Name profile) {
     const auto column = static_cast<unsigned>(profile);
-    if (column >= std::size(lever.value) || (profile == Name::turbo && lever.value[column].empty()))
+    // Legacy adapters have only default/fast/quality columns and refuse TURBO.
+    if (column >= std::size(lever.value)) throw std::invalid_argument("profile column is not available on this adapter");
+    if (profile == Name::turbo && lever.value[column].empty())
         return static_cast<unsigned>(Name::fast);
     return column;
 }
@@ -1101,6 +1103,8 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
                 return {value, tier, {}};
             }
             const auto lower = tier == Name::standard ? LadderCell{} : arms.cells[LadderArms::slot(tier_below(tier))][i];
+            // Legacy adapters still build the common arms to resolve FAST. They cannot select TURBO.
+            if (tier == Name::turbo && static_cast<unsigned>(tier) >= std::size(lever.value)) return lower;
             return ladder_cell(lever, judged, tier, regime, [&](unsigned c) { return admit_of(lever, c); },
                                allow_pending, arms, lower);
         };
@@ -1147,8 +1151,9 @@ template <class Row, class Admission>
 inline LadderCell select_profile_cell(const Row& lever, std::span<const LadderRow> rows, Name tier,
                                       const Regime& regime, const Admission& admit, bool allow_pending,
                                       const LadderArms& arms) {
+    const auto column = value_column(lever, tier);
     if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo))
-        return {lever.value[value_column(lever, tier)], tier, {}};
+        return {lever.value[column], tier, {}};
     // The cell the arms resolved (the one their references were spelled over). A lever outside those arms is judged
     // over its own lower cells, and no ordinary row matches it (LadderArms::over()).
     const auto at = arms.index(lever.name);

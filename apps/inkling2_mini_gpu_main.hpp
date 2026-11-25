@@ -130,8 +130,6 @@ inline void run_gate(const char* checkpoint, const Options& options, std::span<c
     std::cerr << "Inkling down_image " << mini_down_image_name(levers.down_image, mini_combine_image(options.tier)) << '\n';
     std::cerr << "Inkling prepared_round_fold "
               << mini_round_fold_name(levers.prepared_round_fold, mini_prepared_round_fold(options.tier)) << '\n';
-    if (mini_moe_w4a4(options.tier))
-        std::cerr << "strix-moe-w4a4 class " << moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '\n';
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
     std::optional<MiniCudaProgramDecoder> program;
     if (step_program) program.emplace(decoder, epilogue_fusion, mini_latency_forms(latency_forms));
@@ -284,9 +282,9 @@ int main(int argc, char** argv) {
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         std::vector<char*> arguments(argv, argv + argc);
         const auto program_options = cli::extract_step_program(arguments);
-        auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family, true);
+        auto options = cli::parse(static_cast<int>(arguments.size()), arguments.data(), family, kMiniBuildBackend);
 #else
-        auto options = cli::parse(argc, argv, family, true);
+        auto options = cli::parse(argc, argv, family, kMiniBuildBackend);
 #endif
         if (!options.generation.prefill_chunk_explicit) {  // the declared chunk of this backend and profile
             family.default_prefill_chunk = mini_prefill_schedule(cli::kMiniHipSchedule, options.tier.profile).chunk;
@@ -349,6 +347,12 @@ int main(int argc, char** argv) {
             const auto& scope = resolved.scope;
             cli::write_profile(options.tier, std::cerr, true);
             cli::write_weight_load_plan(std::cerr, plan);
+            // The admitted W4A4 class of the prompt that loaded (mini_prompt_moe), the same identity the gate prints
+            // and the server reports as moe_prefill.
+            if (mini_moe_w4a4(options.tier))
+                std::cerr << "strix-moe-w4a4 class "
+                          << strix::moe_core::grouped_w4a4::identity(mini_moe_w4a4_class(options.tier)) << '
+';
             std::cerr << "strix-prefill-route/v1 chunk " << options.generation.prefill_chunk << " tail_divisor "
                       << family.prefill_tail_divisor << " first_id prefill\n";
             std::cerr << "strix-decode-route/v1 moe_decode " << mini_decode_form_name(options.generation.packed_decode)

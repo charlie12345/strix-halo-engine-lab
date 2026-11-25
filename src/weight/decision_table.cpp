@@ -33,17 +33,28 @@ Digest256 implementation_identity(std::span<const ArithmeticId> consumers) {
 
 namespace {
 // The one scope rule of every lookup: a complete request scope, and a row of the same backend, device, toolkit,
-// regime, consumer identity and checkpoint with a gate v2 PASS.
+// regime, consumer identity and checkpoint.
 bool complete_scope(const WeightLoadScope& scope) {
     return !scope.device_class.empty() && !scope.compiler_id.empty() && !scope.regime.empty() &&
            !(scope.build == Digest256{}) && !(scope.checkpoint == Digest256{});
 }
 
-bool same_scope_pass(const WeightLoadDecision& row, const WeightLoadScope& scope) {
+bool same_scope(const WeightLoadDecision& row, const WeightLoadScope& scope) {
     const auto& s = row.scope;
     return s.backend == scope.backend && s.device_class == scope.device_class && s.compiler_id == scope.compiler_id &&
-           s.regime == scope.regime && s.build == scope.build && s.checkpoint == scope.checkpoint &&
-           !(row.gate_v2_pass == Digest256{});
+           s.regime == scope.regime && s.build == scope.build && s.checkpoint == scope.checkpoint;
+}
+
+// Same scope and a gate v2 PASS (the rows a FAST image may take).
+bool same_scope_pass(const WeightLoadDecision& row, const WeightLoadScope& scope) {
+    return same_scope(row, scope) && !(row.gate_v2_pass == Digest256{});
+}
+
+// Same scope and a row the tier may take: a gate v2 PASS, or for TURBO a row with its quality against BF16 stated
+// (a TURBO-only row; its gain is judged like any other timed row).
+bool same_scope_qualifies(const WeightLoadDecision& row, const WeightLoadScope& scope, profile::Name tier) {
+    return same_scope_pass(row, scope) ||
+           (tier == profile::Name::turbo && same_scope(row, scope) && !row.turbo_quality.empty());
 }
 
 // The one timing decision of the point and extent lookups. A row is timed when it carries a measured-gain digest; it
@@ -72,7 +83,7 @@ const WeightLoadDecision* losing_overlap(SamePolicy same_policy, const WeightLoa
                                          std::span<const WeightLoadDecision> decisions, const WeightLoadEvidence& win,
                                          WeightLoadExtent first, WeightLoadExtent last) {
     for (const auto& row : decisions)
-        if (same_policy(row.policy) && same_scope_pass(row, scope) && row.evidence.tier == win.tier &&
+        if (same_policy(row.policy) && same_scope_qualifies(row, scope, win.tier) && row.evidence.tier == win.tier &&
             row.evidence.reference == win.reference && timed(row) && !timed_win(row) &&
             bands_overlap(row.evidence, first, last))
             return &row;
@@ -105,21 +116,26 @@ const WeightLoadDecision* find_weight_load_decision(const WeightLoadPolicy& poli
 
 const WeightLoadDecision* find_weight_load_gate(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
                                                 std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent,
-                                                const WeightLoadDecision** outside_band) {
+                                                const WeightLoadDecision** outside_band, bool turbo) {
     if (outside_band) *outside_band = nullptr;
     if (!complete_scope(scope)) return nullptr;
     const WeightLoadDecision* gate_only = nullptr;
+    const WeightLoadDecision* turbo_row = nullptr;
     for (const auto& row : decisions) {
-        if (!policy_has_id(policy, row.policy) || !same_scope_pass(row, scope)) continue;
+        if (!policy_has_id(policy, row.policy) || !same_scope(row, scope)) continue;
+        const bool pass = !(row.gate_v2_pass == Digest256{});
+        const bool gains = weight_load_gain_covers_lanes(row.evidence, extent.lanes) &&
+                           !(row.measured_gain == Digest256{});
+        if (!pass && (!turbo || !gains || row.turbo_quality.empty())) continue;
         if (!weight_load_context_in_band(row.evidence, extent.context)) {
             if (outside_band && !*outside_band) *outside_band = &row;
             continue;
         }
-        if (!(row.measured_gain == Digest256{}) && weight_load_gain_covers_lanes(row.evidence, extent.lanes))
-            return &row;
-        if (!gate_only) gate_only = &row;
+        if (pass && gains) return &row;
+        if (pass && !gate_only) gate_only = &row;
+        if (!pass && !turbo_row) turbo_row = &row;
     }
-    return gate_only;
+    return turbo_row ? turbo_row : gate_only;
 }
 
 void match_weight_load_evidence(const WeightLoadPolicy& policy, const WeightLoadScope& scope,
@@ -134,7 +150,7 @@ void match_weight_load_evidence(const WeightLoadPolicy& policy, const WeightLoad
     const WeightLoadDecision* blocking = nullptr;
     for (const auto& row : decisions) {
         const auto& e = row.evidence;
-        if (!same_policy(row.policy) || !same_scope_pass(row, scope) ||
+        if (!same_policy(row.policy) || !same_scope_qualifies(row, scope, request.tier) ||
             e.tier != request.tier || e.reference != reference) continue;
         const bool contexts = weight_load_context_in_band(e, first.context) &&
                               weight_load_context_in_band(e, last.context);
@@ -150,7 +166,10 @@ void match_weight_load_evidence(const WeightLoadPolicy& policy, const WeightLoad
             continue;
         }
         const bool selects = faster && lanes && first.context != 0U && first.lanes != 0U;
-        if (!entry.row || (selects && !entry.faster)) {
+        // A gate v2 PASS row is preferred to a TURBO-only row of the same regime.
+        const bool pass_over_turbo = selects && entry.faster && !(row.gate_v2_pass == Digest256{}) &&
+                                     entry.row->gate_v2_pass == Digest256{};
+        if (!entry.row || (selects && !entry.faster) || pass_over_turbo) {
             entry.row = &row;
             entry.gain_outside_lanes = row_timed && !lanes;
         }

@@ -461,6 +461,21 @@ void test_profile() {
         auto fast_args = plain_args;
         fast_args.insert(fast_args.end(), {"--profile", "fast"});
         const auto f = w.run(app, fast_args);
+        auto turbo_args = plain_args;
+        turbo_args.insert(turbo_args.end(), {"--profile", "turbo", "--allow-pending"});
+        const auto turbo = w.run(app, turbo_args);
+        const auto* i4 = turbo.profile->find("moe_iu4");
+        check(i4 && i4->status == pr::Status::pending && i4->value == "0",
+              "IU4 stays off under TURBO (even --allow-pending) without a measured prefill row over FAST");
+        auto i4_world = w;
+        i4_world.env["STRIX_DS41_FAST_I4"] = "1";
+        for (const auto* profile : {"fast", "turbo"}) {
+            auto args = plain_args;
+            args.insert(args.end(), {"--profile", profile});
+            const auto explicit_i4 = i4_world.run(app, args);
+            check(explicit_i4.profile->find("moe_iu4")->value == "1", "explicit IU4 runs as set");
+            check(explicit_i4.profile->find("moe_relaxed")->value == "0", "explicit IU4 replaces the profile's relaxed MoE");
+        }
         auto fast_env = base.set_env;
         const std::vector<std::pair<std::string, std::string>> fast_set{
             {"STRIX_DS41_FAST_PREFILL", "1"}, {"STRIX_DS41_FAST_ATTN", "2"}, {"STRIX_DS41_FAST_MOE", "1"},

@@ -16,6 +16,7 @@
 //   default  exact g4-v1 decode, MTP drafter (auto), exact prefill
 //   fast     named bit-changing identities (int8 activations, WMMA prefill) + drafter, once qualified
 //   quality  EXL3 pack route + drafter
+//   turbo    inherits fast until a faster composition has a measured regime
 // Each lever is one table row (profile.cpp). A profile column that is not qualified yet
 // (`ready = false`: owner branch not merged, gate not passed, promotion open) is pending: it is never
 // applied and never makes the profile refuse; the builtin keeps running, the receipt lists the row with
@@ -37,11 +38,11 @@ struct Lever {
     std::string_view name{};               // receipt key
     std::string_view env{};                // switch the profile sets (or reads only, see `off`)
     std::string_view option{};             // CLI option that overrides the lever
-    std::array<std::string_view, 3> value{}; // per profile (default, fast, quality); empty: left alone
+    std::array<std::string_view, strix::profile::kProfileColumns> value{}; // default, fast, quality, turbo
     std::string_view builtin{};            // behaviour of this build with the switch unset
-    std::array<bool, 3> required{};        // asset levers: refuse when the asset is missing
-    std::array<bool, 3> ready{};           // qualified and present; false: pending
-    std::array<bool, 3> runnable{};        // a pending column's implementation exists in this build
+    std::array<bool, strix::profile::kProfileColumns> required{}; // asset levers: refuse when the asset is missing
+    std::array<bool, strix::profile::kProfileColumns> ready{};    // qualified and present; false: pending
+    std::array<bool, strix::profile::kProfileColumns> runnable{}; // a pending column's implementation exists in this build
     Kind kind = Kind::exact;
     unsigned apps = 0;                     // mask of App values the lever concerns
     bool asset = false;                    // the value is a path the app supplies (option or discovery)
@@ -82,7 +83,7 @@ struct Resolution {
     [[nodiscard]] std::string qualification() const;
 };
 
-[[nodiscard]] Name parse(std::string_view value); // default|fast|quality, else throws
+[[nodiscard]] Name parse(std::string_view value); // shared tier words
 [[nodiscard]] const char* app_name(App app);
 
 using strix::profile::Lookup;

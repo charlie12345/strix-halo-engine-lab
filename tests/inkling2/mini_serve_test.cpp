@@ -340,7 +340,7 @@ void profile_parity() {
         args.insert(args.end(), {"--profile", tier});
         std::vector<char*> argv;
         for (auto& arg : args) argv.push_back(arg.data());
-        return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, true);
+        return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, "cuda");
     };
     const auto refuses = [](const auto& action, std::string_view diagnostic) {
         try { action(); }
@@ -634,6 +634,35 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         socket_startup(*factory, backend, sample_capable);
     }
 }
+
+// A selected W4A4 class on the HIP backend (no W4A4 tile there) is refused before any device work: the server never
+// starts a BF16 run whose startup line reports the class.
+void hip_refuses(const char* root, W4a4 selected) {
+    sv::ServiceFactories factories;
+    bool created = false;
+    mini::MiniServeBackends backends;
+    backends.hip = [&](const mini::MiniServeOptions&) -> mini::MiniServeCohort {
+        created = true;
+        throw std::logic_error("HIP adapter constructed for a W4A4 class");
+    };
+    mini::install_mini_service(factories, std::move(backends),
+        [](const std::string&) {
+            return sv::BpeTokenizer::from_parts({"a", "b"}, {1, 1}, {}, "o200k");
+        },
+        [](const sv::Json&, const sv::Json&, const sv::Json&) { return std::string("a"); });
+    const char* args[]{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
+                       "--checkpoint", "MODEL.safetensors", "--backend", "hip",
+                       "--profile", "fast", "--speculation", "off"};
+    std::vector<std::string> strings(std::begin(args), std::end(args));
+    std::vector<char*> argv;
+    for (auto& arg : strings) argv.push_back(arg.data());
+    std::ostringstream out, error;
+    const auto rc = sv::run(static_cast<int>(argv.size()), argv.data(), factories, out, error, {});
+    require(rc != 0 && !created, "HIP served a selected W4A4 class");
+    require(error.str().find(strix::moe_core::grouped_w4a4::identity(selected)) != std::string::npos &&
+                error.str().find("CUDA only") != std::string::npos,
+            "HIP refusal does not name the W4A4 class");
+}
 } // namespace
 
 int main(int argc, char** argv) try {
@@ -659,10 +688,16 @@ int main(int argc, char** argv) try {
     wiring(argv[1], "cuda", false, false, W4a4::bf16, false, false, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
-                                          std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up}}) {
+                                          std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up},
+                                          std::pair{"mse-r2-gate-up", W4a4::nvfp4_mse_r2_gate_up},
+                                          std::pair{"mse-r2", W4a4::nvfp4_mse_r2},
+                                          std::pair{"r2", W4a4::nvfp4_r2}}) {
         set_w4a4_env(value);
         wiring(argv[1], "cuda", false, false, expected);
+        hip_refuses(argv[1], expected);
     }
+    set_w4a4_env("0");
+    wiring(argv[1], "hip", false);  // the off switch still serves HIP
     set_w4a4_env(nullptr);
     // Both selections are off by default (no profile selects them); an explicit 1 reaches the adapter, an explicit 0 keeps it off.
     set_round_fold_env(nullptr);

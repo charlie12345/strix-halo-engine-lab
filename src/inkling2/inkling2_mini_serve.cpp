@@ -59,7 +59,6 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     }
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
-    out.moe_w4a4 = mini_moe_w4a4_class(resolution);
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
@@ -73,6 +72,8 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
+    out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     return resolved;
 }
 

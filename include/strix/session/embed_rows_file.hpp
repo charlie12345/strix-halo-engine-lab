@@ -53,7 +53,7 @@ inline void write_embed_rows_file(const std::filesystem::path& path, const Embed
     out.flush();
     if (!out) throw std::runtime_error("embed rows file: cannot write " + path.filename().string());
 }
-// std::invalid_argument for a malformed or foreign file, std::runtime_error on I/O failure.
+
 // Header facts of a rows file, read without touching the payload (budget a set of files before materializing any).
 struct EmbedRowsFileInfo {
     std::uint32_t rows = 0;

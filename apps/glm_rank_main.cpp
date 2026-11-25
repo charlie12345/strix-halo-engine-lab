@@ -411,7 +411,10 @@ int main(int argc, char** argv) {
             }
             ge::check_embed_row_headers(decode_prompts[0], row_infos, strix::glm::kHidden);
             std::vector<strix::session::EmbedRows> spans;
-            for (const auto& file : row_files) spans.push_back(strix::session::read_embed_rows_file(file, strix::glm::kHidden));
+            // The payload pass holds each file to its admitted header (a replacement in between is refused before
+            // any row is allocated).
+            for (std::size_t f = 0; f < row_files.size(); ++f)
+                spans.push_back(strix::session::read_embed_rows_file(row_files[f], row_infos[f]));
             embed_splice = ge::prompt_embed_splice(decode_prompts[0], std::move(spans), strix::glm::kHidden);
             for (const auto& seg : embed_splice.segments) {
                 const std::uint64_t h = strix::session::embed_rows_fnv(seg.data, static_cast<std::size_t>(seg.rows) * strix::glm::kHidden);

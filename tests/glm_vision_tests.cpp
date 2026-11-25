@@ -420,6 +420,16 @@ void test_rows_file() {
     CHECK(back.rows == rows.rows && back.width == rows.width && back.real_token_id == kToken && back.digest == digest &&
           back.data == rows.data);
     CHECK(throws([&] { (void)session::read_embed_rows_file(path, kP + 1); }, "the model takes"));
+    {  // the payload pass holds the admitted header: a file replaced by a larger valid one in between is refused
+        const auto admitted = session::read_embed_rows_file_info(path, kP);
+        CHECK(session::read_embed_rows_file(path, admitted).data == rows.data);
+        session::EmbedRows larger = rows;
+        larger.rows = rows.rows * 2U;
+        larger.data.resize(std::size_t{larger.rows} * larger.width, 0x3C00U);
+        session::write_embed_rows_file(path, larger);
+        CHECK(throws([&] { (void)session::read_embed_rows_file(path, admitted); }, "changed after its header was admitted"));
+        session::write_embed_rows_file(path, rows);
+    }
     {  // one flipped payload bit fails the checksum; a cut file fails the length
         std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
         f.seekg(static_cast<std::streamoff>(session::kEmbedRowsFileHeader + 5));

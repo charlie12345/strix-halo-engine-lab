@@ -213,6 +213,19 @@ VisionConfig validate_vision(const gguf::FileInfo& info) {
     return c;
 }
 
+std::uint64_t check_projector_bytes(const gguf::FileInfo& info) {
+    require(info.data_offset <= info.file_size, "the projector file is shorter than its header");
+    std::uint64_t total = 0, last = info.data_offset;
+    for (const auto& t : info.tensors) {
+        require(t.absolute_end <= info.file_size && t.absolute_offset <= t.absolute_end, "tensor " + t.name + " lies outside the file");
+        require(t.byte_size <= kMaxProjectorTensorBytes - total, "the projector tensors exceed " + std::to_string(kMaxProjectorTensorBytes) + " bytes");
+        total += t.byte_size;
+        last = std::max(last, t.absolute_end);
+    }
+    require(info.file_size - last <= kMaxProjectorTrailingBytes, "the projector file has bytes after its last tensor");
+    return info.file_size;
+}
+
 void require_vision_matches_language(const VisionConfig& vision, std::uint32_t hidden, std::uint32_t vocab,
                                      std::uint32_t image_token_id) {
     require(vision.projection == hidden, "projection width differs from the language hidden size");

@@ -61,6 +61,15 @@ struct VisionConfig {
 // (names, shapes, FP32 / FP16 / BF16 storage; no unknown tensor). Throws std::invalid_argument naming the first
 // violation.
 [[nodiscard]] VisionConfig validate_vision(const gguf::FileInfo& info);
+// Byte budget of a projector file, judged from its header after validate_vision (so before any tensor byte is read or
+// hashed): every tensor lies inside the file, the tensors sum to at most kMaxProjectorTensorBytes and the file ends
+// within kMaxProjectorTrailingBytes of its last tensor (no padded or sparse tail). The tensor cap is 4 GiB: one
+// billion parameters at FP32, a ceiling above any tower the validated schema is meant for, not a measured size; the
+// generic host budget of GgufWeights (also 4 GiB) then applies to the whole file. Returns the file size. Throws
+// std::invalid_argument.
+inline constexpr std::uint64_t kMaxProjectorTensorBytes = std::uint64_t{4} << 30U;
+inline constexpr std::uint64_t kMaxProjectorTrailingBytes = std::uint64_t{1} << 20U;
+std::uint64_t check_projector_bytes(const gguf::FileInfo& info);
 // The tower must belong to the language model: projection width and a token id inside the vocabulary.
 void require_vision_matches_language(const VisionConfig& vision, std::uint32_t hidden, std::uint32_t vocab,
                                      std::uint32_t image_token_id);

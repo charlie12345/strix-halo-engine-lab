@@ -51,10 +51,18 @@ struct VisionStack {
 [[nodiscard]] inline std::unique_ptr<VisionStack> make_vision_stack(
     const std::filesystem::path& file, const std::function<std::vector<std::uint32_t>(const std::string&)>& encode,
     const strix::serve::media::Limits& limits) {
-    auto st = std::make_unique<VisionStack>(vision::GgufWeights{file, vision_gguf_limits()});
+    // Header first: schema (names, shapes, dtypes), the language-model match and the projector byte budget are judged
+    // from the bounded header; only then are the file's bytes read (at exactly the length the header was judged at)
+    // and hashed.
+    const gguf::FileInfo header = gguf::read_file(file, vision_gguf_limits());
+    const VisionConfig model = validate_vision(header);
+    require_vision_matches_language(model, kLanguageHidden, kLanguageVocab, kImageToken);
+    vision::HostBudget budget;
+    budget.exact_bytes = check_projector_bytes(header);
+    budget.max_bytes = budget.exact_bytes;
+    auto st = std::make_unique<VisionStack>(vision::GgufWeights{file, vision_gguf_limits(), budget});
+    st->model = model;
     const auto sha = strix::sha256_bytes_fast(std::span<const std::byte>(st->source.bytes()));
-    st->model = validate_vision(st->source.info());
-    require_vision_matches_language(st->model, kLanguageHidden, kLanguageVocab, kImageToken);
     // The template text of an image must be the three vocabulary tokens the adapter was written for.
     if (encode(kImageText) != std::vector<std::uint32_t>{kImageToken} ||
         encode(kImageBeginText) != std::vector<std::uint32_t>{kImageBeginToken} ||

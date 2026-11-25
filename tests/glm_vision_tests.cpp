@@ -190,6 +190,9 @@ void test_patches_and_layout() {
     CHECK(values);
 
     const vision::SpanLayout s = a.layout(g);
+    // The row count from the size alone (before any pixel exists) is the layout's row count.
+    CHECK(a.rows_for_size(10, 7) == s.rows());
+    CHECK(throws([&] { (void)a.rows_for_size(0, 7); }, "empty image"));
     CHECK(s.rows() == 6 && s.grid_w == 3 && s.grid_h == 2 && s.real_token_id == kToken);
     CHECK(std::all_of(s.role.begin(), s.role.end(), [](auto role) { return role == vision::SpanLayout::Role::image; }));
     CHECK(s.lm_pos[5][0] == 5);
@@ -439,10 +442,30 @@ void test_rows_file() {
     CHECK(throws([&] { session::write_embed_rows_file(path, deep); }, "plain content rows"));
 }
 
+// The projector byte budget is judged from the parsed header alone (no tensor byte is needed).
+void test_projector_bytes() {
+    const auto file = small_file(false, true);
+    const gguf::FileInfo& info = file.info();
+    CHECK(glm::check_projector_bytes(info) == info.file_size);
+    const auto mutated = [&](const std::function<void(gguf::FileInfo&)>& edit) {
+        gguf::FileInfo copy = info;
+        edit(copy);
+        return copy;
+    };
+    CHECK(throws([&] { (void)glm::check_projector_bytes(mutated([](gguf::FileInfo& i) { i.tensors.front().absolute_end = i.file_size + 1U; })); },
+                 "outside the file"));
+    CHECK(throws([&] { (void)glm::check_projector_bytes(mutated([](gguf::FileInfo& i) { i.file_size += glm::kMaxProjectorTrailingBytes + 1U; })); },
+                 "after its last tensor"));
+    CHECK(throws([&] { (void)glm::check_projector_bytes(mutated([](gguf::FileInfo& i) { i.tensors.front().byte_size = glm::kMaxProjectorTensorBytes + 1U; })); },
+                 "exceed"));
+    CHECK(throws([&] { (void)glm::check_projector_bytes(mutated([](gguf::FileInfo& i) { i.data_offset = i.file_size + 1U; })); }, "shorter than its header"));
+}
+
 }  // namespace
 
 int main() {
     try {
+        test_projector_bytes();
         test_validate();
         test_canvas();
         test_patches_and_layout();

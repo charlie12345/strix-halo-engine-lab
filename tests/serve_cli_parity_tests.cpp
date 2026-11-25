@@ -139,9 +139,16 @@ void glm() {
         const bool admitted = std::string(route) != "rejection" || std::string(profile) == "fast" || std::string(profile) == "turbo";
         check(cli_error == server_error && admitted == cli_error.empty(), "GLM sampled MTP: same admission on CLI and server");
         if (!cli || !server) continue;
-        check(cli->sampled_mtp.route == server->sampled_mtp.route &&
-              std::string(server->sampled_mtp.name()) == (std::string(route) == "0" ? "off" : route),
-              "GLM sampled MTP: same resolved route on CLI and server");
+        // The receipt line is what both entry points print (and the server hashes into its hello); read it back.
+        const auto receipt = [](const rd::Effective& e) {
+            const auto s = rd::print(e);
+            const auto at = s.find("effective serve-sampled-mtp=");
+            return at == std::string::npos ? std::string() : s.substr(at, s.find('\n', at) - at);
+        };
+        const std::string want = std::string("effective serve-sampled-mtp=") + (std::string(route) == "0" ? "off" : route) + " (";
+        check(receipt(*cli) == receipt(*server) && receipt(*server).rfind(want, 0) == 0 &&
+              receipt(*cli).find("inapplicable") != std::string::npos,
+              "GLM sampled MTP: same resolved route on CLI and server, in the receipt");
         gate("glm", values(sp::from_lines(rd::print(*cli))), values(sp::from_lines(rd::print(*server))), allowed);
     }
 }

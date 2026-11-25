@@ -358,25 +358,34 @@ void test_vision_recipe_row() {
         require(with.summary() == old.summary() && with.tier_notice() == old.tier_notice() &&
                     with.qualification() == old.qualification() && with.fingerprint() == old.fingerprint(),
                 "unset image recipe: the text-only resolution is the table's without the row");
-        for (const char* recipe : {"axial@1", "legacy"}) {
+        for (const char* recipe : {"axial@1", "legacy", "axial"}) {
             options.tier = inputs(tier);
             options.tier.env = [recipe](const char* key) -> const char* {
                 return std::strcmp(key, "STRIX_INKLING2_VISION_RECIPE") == 0 ? recipe : nullptr;
             };
+            // The image-only row never reaches a text-only run: startup is not refused and the summary, notice,
+            // qualification and fingerprint are those of the unset row, under every profile and for any value.
+            const auto resolved = mini::resolve_mini_profile(options, true);
+            require(resolved.summary() == with.summary() && resolved.tier_notice() == with.tier_notice() &&
+                        resolved.qualification() == with.qualification() &&
+                        resolved.fingerprint() == with.fingerprint() && !mini::mini_vision_axial(resolved),
+                    "an image recipe setting leaves the text-only resolution unchanged");
+            // An image request re-admits the setting: axial@1 runs (stamped unqualified) only under fast / turbo.
             bool refused = false;
             try {
-                const auto resolved = mini::resolve_mini_profile(options, true);
-                require(mini::mini_vision_axial(resolved) == (std::string_view(recipe) == "axial@1"), "recipe value");
+                const auto media = mini::mini_vision_media_tier(resolved);
+                require(mini::mini_vision_axial(media) == (std::string_view(recipe) == "axial@1"), "recipe value");
                 if (std::string_view(recipe) == "legacy")
-                    require(resolved.fingerprint() == with.fingerprint(), "explicit legacy keeps the identity");
+                    require(media.fingerprint() == with.fingerprint(), "explicit legacy keeps the identity");
                 else
-                    require(resolved.qualification().find("unqualified: inkling2-vision-recipe") != std::string::npos,
+                    require(media.qualification().find("unqualified: inkling2-vision-recipe") != std::string::npos,
                             "axial is stamped unqualified");
             } catch (const std::invalid_argument&) {
                 refused = true;
             }
-            require(refused == (tier == profile::Name::standard && std::string_view(recipe) == "axial@1"),
-                    "EXACT refuses only the unqualified axial recipe");
+            require(refused == (std::string_view(recipe) == "axial" ||
+                                (tier == profile::Name::standard && std::string_view(recipe) == "axial@1")),
+                    "an image request under EXACT refuses only the unqualified axial recipe; a malformed value is refused");
         }
     }
 }

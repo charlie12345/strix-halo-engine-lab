@@ -130,18 +130,34 @@ void test_serial_rgba() {
     auto& bridge = serial->adapter();
     require(bridge.identity().find("inkling2-vision-axial@1|") == 0, "explicit media identity");
     require(legacy_serial->adapter().identity().find("inkling2-vision-v1|") == 0, "legacy media identity");
-    // The CLI opener takes the recipe from the run's resolution and prints the effective image identity.
+    // The CLI hands the opener its text resolution, where the image row is deferred (mini_defer_vision_recipe, as in
+    // resolve_mini_profile); an image request re-admits it, runs it and prints the image identity and qualification.
+    const auto text_tier = [](profile::Name tier, const char* recipe) {
+        auto resolved = resolve_tier(tier, recipe);
+        ink::mini_defer_vision_recipe(resolved);
+        return resolved;
+    };
     std::ostringstream receipt;
-    const auto opener = ink::cli::mini_media_opener(resolve_tier(profile::Name::fast, "axial@1"), receipt, spec);
+    const auto opener = ink::cli::mini_media_opener(text_tier(profile::Name::fast, "axial@1"), receipt, spec);
     require(opener(shard.string())->adapter().identity() == bridge.identity(), "opener runs the resolved recipe");
-    require(receipt.str() == "image identity " + bridge.identity() + "\n", "image run prints its image identity");
+    require(receipt.str().rfind("image identity " + bridge.identity() + "\n", 0) == 0 &&
+                receipt.str().find("image profile inkling2-vision-recipe=axial@1 qualification ") != std::string::npos &&
+                receipt.str().find("unqualified: inkling2-vision-recipe") != std::string::npos,
+            "image run prints its image identity and the row's qualification");
+    std::ostringstream incumbent_receipt;
+    static_cast<void>(ink::cli::mini_media_opener(text_tier(profile::Name::fast, nullptr), incumbent_receipt, spec)(
+        shard.string()));
+    require(incumbent_receipt.str() == "image identity " + legacy_serial->adapter().identity() + "\n",
+            "the incumbent image run prints only its image identity");
+    // EXACT: building the opener (startup, text-only runs) is not refused; an image request is.
+    const auto exact_opener = ink::cli::mini_media_opener(text_tier(profile::Name::standard, "axial@1"), receipt, spec);
     bool exact_refused = false;
     try {
-        static_cast<void>(ink::cli::mini_media_opener(resolve_tier(profile::Name::standard, "axial@1"), receipt, spec));
-    } catch (const std::invalid_argument&) {
-        exact_refused = true;
+        static_cast<void>(exact_opener(shard.string()));
+    } catch (const std::invalid_argument& error) {
+        exact_refused = std::string_view(error.what()).find("not admitted") != std::string_view::npos;
     }
-    require(exact_refused, "explicit EXACT refuses the axial image opener");
+    require(exact_refused, "explicit EXACT refuses the axial image request");
     std::ifstream png(std::filesystem::path(STRIX_VISION_FIXTURE_DIR) / "rgba_noise.png", std::ios::binary);
     serve::media::MediaItem item;
     item.bytes.assign(std::istreambuf_iterator<char>(png), std::istreambuf_iterator<char>());

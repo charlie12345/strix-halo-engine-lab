@@ -49,14 +49,20 @@ inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(const std::strin
 
 // The image opener of one run (SerialGenerationFamily::media): the recipe is the run's own resolution of the row
 // inkling2-vision-recipe (kMiniProfile, the resolver the CLI and the server share), never a second lookup. It is
-// called only for a request with image parts; each call writes the effective image identity to `receipt`.
+// called only for a request with image parts, and only then admits the row (mini_vision_media_tier: a text-only run
+// never validates or applies it); each call writes the effective image identity to `receipt`, and for a recipe other
+// than the incumbent the row's value and the image run's qualification.
 using MiniMediaOpener = std::function<std::unique_ptr<serve::SerialMediaInput>(const std::string& checkpoint)>;
 inline MiniMediaOpener mini_media_opener(const profile::Resolution& tier, std::ostream& receipt,
                                          const VisionSpec& config = {}) {
-    const auto identity = mini_vision_axial(tier) ? VisionIdentity::axial_v1 : VisionIdentity::legacy;
-    return [identity, &receipt, config](const std::string& checkpoint) {
-        auto media = make_mini_media(checkpoint, config, identity);
+    return [tier, &receipt, config](const std::string& checkpoint) {
+        const auto media_tier = mini_vision_media_tier(tier);
+        const bool axial = mini_vision_axial(media_tier);
+        auto media = make_mini_media(checkpoint, config, axial ? VisionIdentity::axial_v1 : VisionIdentity::legacy);
         receipt << "image identity " << media->adapter().identity() << '\n';
+        if (axial)
+            receipt << "image profile " << kMiniVisionRecipe << "=axial@1 qualification " << media_tier.qualification()
+                    << '\n';
         return media;
     };
 }

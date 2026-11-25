@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <cerrno>
+#include <cstdio>
 #include <fcntl.h>
 #include <sys/stat.h>
 #ifdef _WIN32
@@ -91,30 +92,43 @@ Number parse_number(std::string_view value, const char* error) {
     return result;
 }
 
-// The --logits file, opened before any input is read and published only when the run succeeds. Without
-// --logits-overwrite the name is created exclusively (an existing file is refused) and a run that fails removes it.
-// With --logits-overwrite the dump goes to a new exclusive file beside the name and is renamed over it on success:
-// no existing file (nor what a link or another name of it reaches) is ever truncated or written, and a run that fails
-// leaves it unchanged. Inputs are compared by the key of their opened handle with the opened output and with the file
-// the name held when the run started, so an alias of an input (a link, a hard link, another spelling) is refused.
+// The --logits file. The dump is staged under a private name created exclusively in the destination directory (held
+// open on POSIX: every operation on the two names is relative to it) before any input is read, and it is published
+// only when the run succeeds, by an operation that never replaces: a hard link of the staged file under the name (or a
+// no-replace rename where the file system has no hard links; on Windows a rename, which never replaces), after which
+// the staged name is removed. A name that exists (a file, a link, even a dangling one) is refused at the start and,
+// if it appeared during the run, at publication. A run that fails, or whose name was taken meanwhile, removes the
+// staged file and leaves the name as it was. No existing file is ever truncated or written, so no input can be lost
+// through the output; inputs are still compared by the key of their opened handle with the staged file.
 class LogitsOutput {
 public:
-    LogitsOutput(const fs::path& path, bool overwrite) : path_(path), file_(path), overwrite_(overwrite) {
-        if (overwrite) target_ = file_key(path);
+    explicit LogitsOutput(const fs::path& path)
+        : path_(path), directory_(path.has_parent_path() ? path.parent_path() : fs::path(".")) {
+        const auto name = path.filename();
+        if (name.empty() || name == "." || name == "..") throw std::invalid_argument("logits output must name a file");
+#ifndef _WIN32
+        dir_ = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_ < 0) throw std::invalid_argument("could not open the logits output directory");
+#endif
+        if (name_taken()) {
+            discard();
+            throw std::invalid_argument("logits output exists (an existing file is never replaced)");
+        }
         for (unsigned attempt = 0; fd_ < 0; ++attempt) {
-            if (overwrite)
-                file_ = path.parent_path() / ("." + path.filename().string() + ".partial-" +
-                                              std::to_string(process_id()) + "-" + std::to_string(attempt));
+            staged_ = "." + name.string() + ".partial-" + std::to_string(process_id()) + "-" + std::to_string(attempt);
 #ifdef _WIN32
             const int flags = _O_WRONLY | _O_BINARY | _O_NOINHERIT | _O_CREAT | _O_EXCL;
-            if (_wsopen_s(&fd_, file_.c_str(), flags, _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0) fd_ = -1;
+            const int code = _wsopen_s(&fd_, staged_path().c_str(), flags, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+            if (code != 0) fd_ = -1;
+            const bool clash = code == EEXIST;
 #else
-            fd_ = ::open(file_.c_str(), O_WRONLY | O_CLOEXEC | O_CREAT | O_EXCL, 0644);
+            fd_ = ::openat(dir_, staged_.c_str(), O_WRONLY | O_CLOEXEC | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+            const bool clash = fd_ < 0 && errno == EEXIST;
 #endif
             if (fd_ >= 0) break;
-            if (overwrite && errno == EEXIST && attempt < 15U) continue;
-            throw std::invalid_argument(!overwrite && errno == EEXIST
-                ? "logits output exists (pass --logits-overwrite to replace it)" : "could not open logits output");
+            if (clash && attempt < 15U) continue;
+            discard();
+            throw std::invalid_argument("could not create the logits output");
         }
         key_ = descriptor_file_key(fd_);
         if (!key_) {
@@ -127,10 +141,10 @@ public:
     LogitsOutput& operator=(const LogitsOutput&) = delete;
 
     void refuse(const std::optional<FileKey>& input, const char* error) const {
-        if (input && (input == key_ || input == target_)) throw std::invalid_argument(error);
+        if (input && input == key_) throw std::invalid_argument(error);
     }
     void refuse(const fs::path& input, const char* error) const { refuse(file_key(input), error); }
-    void write(std::span<const float> logits) {  // into the new file only; visible under the name after publish()
+    void write(std::span<const float> logits) {  // into the staged file only; visible under the name after publish()
         const auto bytes = session::logits_bytes(logits);
         bool ok = fd_ >= 0;
         for (std::size_t at = 0; ok && at < bytes.size();) {
@@ -146,14 +160,28 @@ public:
         if (!ok) throw std::runtime_error("could not write logits output");
         written_ = true;
     }
-    void publish() {  // the success boundary of the run
+    void publish() {  // the success boundary of the run: never replaces a name that exists
         if (!written_) return;
-        if (overwrite_) {
-            std::error_code error;
-            fs::rename(file_, path_, error);
-            if (error) throw std::runtime_error("could not publish logits output");
+#ifdef _WIN32
+        const bool moved = _wrename(staged_path().c_str(), path_.c_str()) == 0;  // fails when the name exists
+#else
+        const auto name = path_.filename();
+        const bool linked = ::linkat(dir_, staged_.c_str(), dir_, name.c_str(), 0) == 0;
+        bool moved = linked;
+#if defined(RENAME_NOREPLACE)
+        if (!linked && errno != EEXIST)  // no hard links on this file system
+            moved = ::renameat2(dir_, staged_.c_str(), dir_, name.c_str(), RENAME_NOREPLACE) == 0;
+#endif
+        if (linked) (void)::unlinkat(dir_, staged_.c_str(), 0);
+#endif
+        if (!moved) {
+            const bool taken = errno == EEXIST || name_taken();
+            discard();
+            throw std::runtime_error(taken ? "logits output exists (it appeared during the run and is never replaced)"
+                                           : "could not publish logits output");
         }
         published_ = true;
+        discard();  // closes the directory; the published file stays
     }
 
 private:
@@ -162,6 +190,16 @@ private:
         return static_cast<long long>(_getpid());
 #else
         return static_cast<long long>(::getpid());
+#endif
+    }
+    fs::path staged_path() const { return directory_ / staged_; }
+    bool name_taken() const {  // anything under the name, a dangling link included
+#ifdef _WIN32
+        std::error_code ignored;
+        return fs::symlink_status(path_, ignored).type() != fs::file_type::not_found;
+#else
+        struct stat info {};
+        return ::fstatat(dir_, path_.filename().c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT;
 #endif
     }
     bool close() {
@@ -174,15 +212,29 @@ private:
         fd_ = -1;
         return ok;
     }
-    void discard() {
+    void discard() {  // removes the staged file unless published (only while it is still the file this run created)
         close();
-        std::error_code ignored;
-        if (!published_ && key_ && file_key(file_) == key_) fs::remove(file_, ignored);
+        if (!published_ && key_ && !staged_.empty()) {
+#ifdef _WIN32
+            std::error_code ignored;
+            if (file_key(staged_path()) == key_) fs::remove(staged_path(), ignored);
+#else
+            struct stat info {};
+            if (::fstatat(dir_, staged_.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0 &&
+                FileKey{std::uint64_t(info.st_dev), std::uint64_t(info.st_ino)} == key_)
+                (void)::unlinkat(dir_, staged_.c_str(), 0);
+#endif
+        }
+#ifndef _WIN32
+        if (dir_ >= 0) ::close(dir_);
+        dir_ = -1;
+#endif
     }
-    fs::path path_, file_;
-    bool overwrite_ = false, written_ = false, published_ = false;
-    int fd_ = -1;
-    std::optional<FileKey> key_, target_;
+    fs::path path_, directory_;
+    std::string staged_;
+    bool written_ = false, published_ = false;
+    int fd_ = -1, dir_ = -1;
+    std::optional<FileKey> key_;
 };
 
 struct TextInput {
@@ -294,7 +346,6 @@ SerialGenerationOptions parse_serial_generation_cli(int argc, char** argv, const
             options.generate_requested = true;
         }
         else if (argument == "--logits") options.logits = value();
-        else if (argument == "--logits-overwrite") options.logits_overwrite = true;
         else if (family.supports_speculation && argument == "--speculation") {
             const std::string_view mode(value());
             if (mode == "off") options.speculation = CliSpeculation::off;
@@ -353,7 +404,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
                            const SerialGenerationFamily& family, std::ostream& out,
                            const std::function<void()>& on_loaded) {
     std::optional<LogitsOutput> output;  // opened first: every input below is checked against the opened file
-    if (options.logits) output.emplace(options.logits, options.logits_overwrite);
+    if (options.logits) output.emplace(options.logits);
     const auto protect_asset = [&](const fs::path& asset, const char* error) {
         if (output) output->refuse(asset, error);
     };
@@ -562,7 +613,7 @@ int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamil
         if (family.default_prefill_chunk) error << " [--prefill-chunk N]";
         if (family.supports_packed_decode) error << " [--packed-decode]";
         if (family.supports_speculation) error << " [--speculation " << speculation_modes << "]";
-        error << " [--generate N] [--logits FILE [--logits-overwrite]] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
+        error << " [--generate N] [--logits FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
         return 2;
     }
     try {

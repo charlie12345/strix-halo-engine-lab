@@ -65,9 +65,8 @@ Chat files may carry images as base64 `image_url` parts; see
 
 Generation defaults to greedy selection and can emit one FP32 prompt logits row
 with `--logits FILE`. The file is created new and appears only when the run succeeds (a failed run leaves none);
-`--logits-overwrite` replaces an existing file at the end of a successful run by renaming the new dump over its name
-(a failed run leaves it unchanged; a link is replaced, its target is not written). An input of the run is refused
-as the output. Repeating the example below with the same file needs `--logits-overwrite` or a new name. CPU and device generation accept `--temperature`,
+an existing file is never replaced: a name that exists at the start, or that appears during the run, fails the run
+and keeps its bytes. Repeating the example below needs a new name (or removing the previous file). CPU and device generation accept `--temperature`,
 `--top-k` and `--seed` through the shared sampler.
 
 ```sh

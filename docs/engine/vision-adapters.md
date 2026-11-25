@@ -288,9 +288,10 @@ regular files without symlinks or reparse points at their names. The language mo
 opened shard (a second lookup of the checkpoint name is not used), or the run is refused. `--logits` is opened
 before any input and refused when it is the checkpoint, the tokenizer, the messages file or one of the image input
 files under any name (compared by the identity of the opened files). The dump becomes visible under its name only
-when the whole run succeeds: without `--logits-overwrite` the name is created exclusively and removed if the run
-fails; with it the dump is written to a new file beside the name and renamed over it at the end, so an existing
-file (or what a link or another name of it reaches) is never written and is left unchanged by a failed run. The sidecar has
+when the whole run succeeds: it is written to a new private file created in the destination directory and then
+published under the name by an operation that never replaces (a hard link, or a no-replace rename), so an existing
+name is refused at the start and, if it appears during the run, at publication; nothing existing is ever written,
+and a failed run leaves no file behind. The sidecar has
 a 1 MiB cap. A directory containing only the shard uses the binding's fixed geometry. Image input is on in
 `strix-inkling2-mini-hip`, `strix-inkling2-mini-cuda` and the CPU reference `strix-inkling2-mini-cpu` whenever
 they are built with the vision targets (default). Put the image in the `--messages` file as an OpenAI-style

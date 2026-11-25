@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
     family.render_media_messages = serve::render_inkling2_chat_media_request;
 #endif
     if (argc < 3) {
-        std::cerr << "usage: strix-inkling2-mini-cpu MODEL.safetensors TOKEN [TOKEN ...] [--profile exact|fast|turbo] [--generate N] [--logits FILE [--logits-overwrite]]"
+        std::cerr << "usage: strix-inkling2-mini-cpu MODEL.safetensors TOKEN [TOKEN ...] [--profile exact|fast|turbo] [--generate N] [--logits FILE]"
                      " [--speculation off|auto|verify|lookup] [--dspark FILE] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--seed N]\n";
         return 2;
     }

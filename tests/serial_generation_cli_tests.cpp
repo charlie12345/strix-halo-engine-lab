@@ -273,8 +273,9 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
     std::filesystem::remove(text);
 }
 
-// --logits with an image prompt: the output is opened first (exclusively unless --logits-overwrite) and compared by
-// file key with every file the media input read, before the encoder runs; the loaded checkpoint must be the pinned one.
+// --logits with an image prompt: the dump is staged in a private new file of the destination directory before any
+// input is read and published, only when the run succeeds, by an operation that never replaces. An existing name (an
+// input under any name, a link, one that appears during the run) fails the run and keeps its bytes.
 void media_output_guards(const SerialGenerationFamily& with_media) {
     namespace fs = std::filesystem;
     std::random_device rd;
@@ -292,12 +293,13 @@ void media_output_guards(const SerialGenerationFamily& with_media) {
     const auto messages = write("messages.json",
         R"({"messages":[{"role":"user","content":[{"type":"text","text":"q"},{"type":"image_url","image_url":{"url":")" +
         png + R"("}}]}]})");
-    const auto sidecar = write("config.json", R"({"vision_config":{}})");
+    const std::string config = R"({"vision_config":{}})";
+    const auto sidecar = write("config.json", config);
     media_inputs = {sidecar};
-    const auto run_with = [&](const fs::path& output, bool overwrite) {
+    const auto run_with = [&](const fs::path& output, std::vector<std::string> extra = {}) {
         std::vector<std::string> owned{"fixture", "checkpoint", "--messages", messages.string(), "--logits",
                                        output.string()};
-        if (overwrite) owned.emplace_back("--logits-overwrite");
+        owned.insert(owned.end(), extra.begin(), extra.end());
         std::vector<char*> argv;
         for (auto& arg : owned) argv.push_back(arg.data());
         std::ostringstream out, error;
@@ -305,81 +307,58 @@ void media_output_guards(const SerialGenerationFamily& with_media) {
         return std::pair{code, error.str()};
     };
     const auto encodes = media_encodes;
-    // The validated sidecar named as the output: refused as an existing file, and (overwrite asked) as an input.
-    auto [code, error] = run_with(sidecar, false);
+    // An existing name is refused before any input is read: the validated sidecar, another name of it, a link (even
+    // a dangling one). There is no option that replaces an existing file.
+    auto [code, error] = run_with(sidecar);
     check(code != 0 && error.find("logits output exists") != std::string::npos, "existing output refused");
-    std::tie(code, error) = run_with(sidecar, true);
-    check(code != 0 && error.find("differ from the image input files") != std::string::npos, "sidecar output refused");
-    // Another name of the same file (a hard link) is the same file key.
+    std::tie(code, error) = run_with(sidecar, {"--logits-overwrite"});
+    check(code != 0, "there is no --logits-overwrite");
     std::error_code link_error;
     fs::create_hard_link(sidecar, dir / "alias.json", link_error);
     if (!link_error) {
-        std::tie(code, error) = run_with(dir / "alias.json", true);
-        check(code != 0 && error.find("differ from the image input files") != std::string::npos, "alias output refused");
+        std::tie(code, error) = run_with(dir / "alias.json");
+        check(code != 0 && error.find("logits output exists") != std::string::npos, "alias output refused");
     }
-    check(read(sidecar) == R"({"vision_config":{}})" && media_encodes == encodes, "sidecar intact, no image encoded");
-    // A fresh output is created and written; it then exists, so a rerun needs --logits-overwrite.
+    fs::create_symlink(dir / "absent.f32", dir / "dangling.f32", link_error);
+    if (!link_error) {
+        std::tie(code, error) = run_with(dir / "dangling.f32");
+        check(code != 0 && error.find("logits output exists") != std::string::npos && !fs::exists(dir / "absent.f32"),
+              "a dangling link is refused and its target is not created");
+    }
+    check(read(sidecar) == config && media_encodes == encodes, "sidecar intact, no image encoded");
+    // A fresh output is published on success; it then exists, so a rerun is refused.
     const auto fresh = dir / "logits.f32";
-    std::tie(code, error) = run_with(fresh, false);
+    std::tie(code, error) = run_with(fresh);
     check(code == 0 && fs::file_size(fresh) == 16U && media_encodes == encodes + 1U, "fresh output written");
-    std::tie(code, error) = run_with(fresh, false);
-    check(code != 0 && error.find("logits output exists") != std::string::npos, "rerun refuses the existing output");
-    std::tie(code, error) = run_with(fresh, true);
-    check(code == 0 && fs::file_size(fresh) == 16U, "rerun replaces the output when asked");
-    // A checkpoint that is not the pinned shard is refused after the load; a created output is removed, and an
-    // existing one (overwrite asked) is left as it was.
+    std::tie(code, error) = run_with(fresh);
+    check(code != 0 && error.find("logits output exists") != std::string::npos && fs::file_size(fresh) == 16U,
+          "rerun refuses the existing output");
+    // A checkpoint that is not the pinned shard is refused after the load and nothing is published.
     media_same_checkpoint = false;
     const auto verifies = media_verifies;
-    std::tie(code, error) = run_with(dir / "other.f32", false);
+    std::tie(code, error) = run_with(dir / "other.f32");
     check(code != 0 && error.find("not the shard") != std::string::npos && media_verifies == verifies + 1U &&
           !fs::exists(dir / "other.f32"), "a different checkpoint is refused and leaves no output");
-    const auto existing = write("existing.f32", "keep");
-    std::tie(code, error) = run_with(existing, true);
-    check(code != 0 && read(existing) == "keep", "a failed run leaves an existing output unchanged");
     media_same_checkpoint = true;
-    // The logits are published only at the end of a successful run: a decode failure after they were written leaves
-    // no new file and an existing one unchanged.
+    // A decode failure after the logits were written publishes nothing.
     media_decode_fails = true;
-    const auto run_generate = [&](const fs::path& output, bool overwrite) {
-        std::vector<std::string> owned{"fixture", "checkpoint", "--messages", messages.string(), "--generate", "2",
-                                       "--logits", output.string()};
-        if (overwrite) owned.emplace_back("--logits-overwrite");
-        std::vector<char*> argv;
-        for (auto& arg : owned) argv.push_back(arg.data());
-        std::ostringstream out, err;
-        return run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), with_media, out, err);
-    };
-    check(run_generate(dir / "late.f32", false) != 0 && !fs::exists(dir / "late.f32"),
-          "a run failing after the logits were written leaves no new output");
-    check(run_generate(existing, true) != 0 && read(existing) == "keep",
-          "a run failing after the logits were written leaves an existing output unchanged");
+    std::tie(code, error) = run_with(dir / "late.f32", {"--generate", "2"});
+    check(code != 0 && !fs::exists(dir / "late.f32"), "a run failing after the logits were written leaves no output");
     media_decode_fails = false;
-    // --logits-overwrite never writes into the file the name reaches: another name of a file (hard link) or a link
-    // is replaced by the new dump, and the file it reached keeps its bytes.
-    const auto other = write("other.bin", "other");
-    fs::create_hard_link(other, dir / "hard.f32", link_error);
-    if (!link_error) {
-        std::tie(code, error) = run_with(dir / "hard.f32", true);
-        check(code == 0 && fs::file_size(dir / "hard.f32") == 16U && read(other) == "other",
-              "overwrite replaces a hard-linked name without writing the linked file");
-    }
-    fs::create_symlink(other, dir / "link.f32", link_error);
-    if (!link_error) {
-        std::tie(code, error) = run_with(dir / "link.f32", true);
-        check(code == 0 && !fs::is_symlink(dir / "link.f32") && fs::file_size(dir / "link.f32") == 16U &&
-              read(other) == "other", "overwrite replaces a link without writing its target");
-    }
-    // The validated sidecar's name replaced after the input read it: the output still names the file the input read
-    // (its key was taken when the run started), so it is refused, and the validated file keeps its bytes.
-    const auto validated = dir / "validated.json";
-    media_after_read = [&] {
-        fs::rename(sidecar, validated);
-        std::ofstream(sidecar, std::ios::binary) << R"({"vision_config":{"swapped":1}})";
-    };
-    std::tie(code, error) = run_with(sidecar, true);
+    // The name appears during the run (a file, or a link to the validated sidecar): publication never replaces it, the
+    // run fails and what appeared keeps its bytes.
+    const auto raced = dir / "raced.f32";
+    media_after_read = [&] { std::ofstream(raced, std::ios::binary) << "raced"; };
+    std::tie(code, error) = run_with(raced);
+    check(code != 0 && error.find("appeared during the run") != std::string::npos && read(raced) == "raced",
+          "a name that appears during the run is not replaced");
+    const auto linked = dir / "linked.f32";
+    media_after_read = [&] { fs::create_symlink(sidecar, linked, link_error); };
+    std::tie(code, error) = run_with(linked);
+    if (!link_error)
+        check(code != 0 && error.find("appeared during the run") != std::string::npos && read(sidecar) == config,
+              "a link to the sidecar that appears during the run is not replaced, the sidecar keeps its bytes");
     media_after_read = nullptr;
-    check(code != 0 && error.find("differ from the image input files") != std::string::npos &&
-          read(validated) == R"({"vision_config":{}})", "a swapped sidecar name never exposes the validated file");
     for (const auto& entry : fs::directory_iterator(dir))
         check(entry.path().filename().string().find(".partial-") == std::string::npos, "no staged dump is left");
     media_inputs.clear();

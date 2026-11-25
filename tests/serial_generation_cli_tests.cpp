@@ -152,6 +152,8 @@ unsigned media_encodes = 0;
 unsigned media_verifies = 0;
 std::vector<std::filesystem::path> media_inputs;  // what the fake media input reports it read
 bool media_same_checkpoint = true;                 // whether the loaded checkpoint is the pinned one
+bool media_decode_fails = false;                   // decode throws (a run that fails after its logits were written)
+std::function<void()> media_after_read;            // runs after the fake input keyed its files (a name swap)
 
 class MediaDecoder final : public SerialGenerationDecoder {
 public:
@@ -167,7 +169,10 @@ public:
         embedded_table = table;
         return 1;
     }
-    std::uint32_t decode(std::uint32_t, std::span<float>) override { return 2; }
+    std::uint32_t decode(std::uint32_t, std::span<float>) override {
+        if (media_decode_fails) throw std::runtime_error("decode failed");
+        return 2;
+    }
 };
 
 class FakeImages final : public ApiMediaAdapter {
@@ -195,13 +200,20 @@ private:
 class FakeMediaInput final : public SerialMediaInput {
 public:
     ApiMediaAdapter& adapter() override { return images_; }
-    std::vector<std::filesystem::path> inputs() const override { return media_inputs; }
-    void verify_checkpoint(const std::string&) const override {
+    FakeMediaInput() {  // keys the files when it "opens" them, as a held handle would
+        for (const auto& input : media_inputs)
+            if (const auto key = file_key(input)) keys_.push_back(*key);
+        if (media_after_read) media_after_read();
+    }
+    std::vector<FileKey> input_keys() const override { return keys_; }
+    void load_checkpoint(const std::string&, const std::function<void()>& load) const override {
         ++media_verifies;
+        load();
         if (!media_same_checkpoint) throw std::runtime_error("not the shard the image tower was read from");
     }
 private:
     FakeImages images_;
+    std::vector<FileKey> keys_;
 };
 
 SerialGenerationFamily media_family() {
@@ -314,13 +326,62 @@ void media_output_guards(const SerialGenerationFamily& with_media) {
     check(code != 0 && error.find("logits output exists") != std::string::npos, "rerun refuses the existing output");
     std::tie(code, error) = run_with(fresh, true);
     check(code == 0 && fs::file_size(fresh) == 16U, "rerun replaces the output when asked");
-    // A checkpoint that is not the pinned shard is refused after the load; a created output is removed.
+    // A checkpoint that is not the pinned shard is refused after the load; a created output is removed, and an
+    // existing one (overwrite asked) is left as it was.
     media_same_checkpoint = false;
     const auto verifies = media_verifies;
     std::tie(code, error) = run_with(dir / "other.f32", false);
     check(code != 0 && error.find("not the shard") != std::string::npos && media_verifies == verifies + 1U &&
           !fs::exists(dir / "other.f32"), "a different checkpoint is refused and leaves no output");
+    const auto existing = write("existing.f32", "keep");
+    std::tie(code, error) = run_with(existing, true);
+    check(code != 0 && read(existing) == "keep", "a failed run leaves an existing output unchanged");
     media_same_checkpoint = true;
+    // The logits are published only at the end of a successful run: a decode failure after they were written leaves
+    // no new file and an existing one unchanged.
+    media_decode_fails = true;
+    const auto run_generate = [&](const fs::path& output, bool overwrite) {
+        std::vector<std::string> owned{"fixture", "checkpoint", "--messages", messages.string(), "--generate", "2",
+                                       "--logits", output.string()};
+        if (overwrite) owned.emplace_back("--logits-overwrite");
+        std::vector<char*> argv;
+        for (auto& arg : owned) argv.push_back(arg.data());
+        std::ostringstream out, err;
+        return run_serial_generation_cli(static_cast<int>(argv.size()), argv.data(), with_media, out, err);
+    };
+    check(run_generate(dir / "late.f32", false) != 0 && !fs::exists(dir / "late.f32"),
+          "a run failing after the logits were written leaves no new output");
+    check(run_generate(existing, true) != 0 && read(existing) == "keep",
+          "a run failing after the logits were written leaves an existing output unchanged");
+    media_decode_fails = false;
+    // --logits-overwrite never writes into the file the name reaches: another name of a file (hard link) or a link
+    // is replaced by the new dump, and the file it reached keeps its bytes.
+    const auto other = write("other.bin", "other");
+    fs::create_hard_link(other, dir / "hard.f32", link_error);
+    if (!link_error) {
+        std::tie(code, error) = run_with(dir / "hard.f32", true);
+        check(code == 0 && fs::file_size(dir / "hard.f32") == 16U && read(other) == "other",
+              "overwrite replaces a hard-linked name without writing the linked file");
+    }
+    fs::create_symlink(other, dir / "link.f32", link_error);
+    if (!link_error) {
+        std::tie(code, error) = run_with(dir / "link.f32", true);
+        check(code == 0 && !fs::is_symlink(dir / "link.f32") && fs::file_size(dir / "link.f32") == 16U &&
+              read(other) == "other", "overwrite replaces a link without writing its target");
+    }
+    // The validated sidecar's name replaced after the input read it: the output still names the file the input read
+    // (its key was taken when the run started), so it is refused, and the validated file keeps its bytes.
+    const auto validated = dir / "validated.json";
+    media_after_read = [&] {
+        fs::rename(sidecar, validated);
+        std::ofstream(sidecar, std::ios::binary) << R"({"vision_config":{"swapped":1}})";
+    };
+    std::tie(code, error) = run_with(sidecar, true);
+    media_after_read = nullptr;
+    check(code != 0 && error.find("differ from the image input files") != std::string::npos &&
+          read(validated) == R"({"vision_config":{}})", "a swapped sidecar name never exposes the validated file");
+    for (const auto& entry : fs::directory_iterator(dir))
+        check(entry.path().filename().string().find(".partial-") == std::string::npos, "no staged dump is left");
     media_inputs.clear();
     fs::remove_all(dir);
 }

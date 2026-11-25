@@ -21,6 +21,16 @@ void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
 
+template <class Call>
+bool rejects(const Call& call, std::string_view expected) {
+    try {
+        call();
+    } catch (const std::exception& error) {
+        return std::string_view(error.what()).find(expected) != std::string_view::npos;
+    }
+    return false;
+}
+
 void write_tower(const std::filesystem::path& path, const ink::VisionSpec& spec) {
     auto header = serve::Json::object();
     std::string data;
@@ -140,31 +150,41 @@ void test_serial_rgba() {
     const auto opener = ink::cli::mini_media_opener(resolve_tier(profile::Name::fast, "axial@1"), receipt, spec);
     require(opener(shard.string())->adapter().identity() == bridge.identity(), "opener runs the resolved recipe");
     require(receipt.str() == "image identity " + bridge.identity() + "\n", "image run prints its image identity");
-    // The opened input names the files it read (the CLI refuses them as outputs) and pins the shard: the language
-    // model checkpoint the CLI loads afterwards must be that file.
+    // The opened input keys the handles it read (the CLI refuses those files as outputs) and the language model
+    // loads from that same opened shard: while it loads, open_source of the checkpoint name returns the held file even
+    // after the name was replaced, and a load that does not open the name is refused.
     {
         const auto opened = opener(shard.string());
-        const auto inputs = opened->inputs();
-        require(inputs.size() == 2 && inputs[0] == std::filesystem::canonical(shard) &&
-                inputs[1] == std::filesystem::canonical(shard).parent_path() / "config.json",
-                "the image input names its shard and config sidecar");
-        opened->verify_checkpoint(shard.string());
-        const auto other = fixture.path / "other.safetensors";
-        std::filesystem::copy_file(shard, other);
-        bool refused = false;
-        try {
-            opened->verify_checkpoint(other.string());
-        } catch (const std::runtime_error&) {
-            refused = true;
-        }
-        require(refused, "a checkpoint that is not the pinned shard is refused");
-        std::filesystem::remove(other);
+        const auto keys = opened->input_keys();
+        const auto shard_key = serve::file_key(shard);
+        require(keys.size() == 1U && shard_key && keys[0] == *shard_key, "the image input keys its opened shard");
+        const auto original = fixture.path / "original.safetensors";
+        std::filesystem::rename(shard, original);
+        std::filesystem::copy_file(original, shard);  // the name now reaches another file
+        std::shared_ptr<const weight::Source> loaded;
+        opened->load_checkpoint(shard.string(), [&] {
+            require(static_cast<bool>(weight::open_source(shard.string(), loaded)), "language model opens the name");
+        });
+        const auto loaded_key = weight::source_file_key(*loaded);
+        require(loaded_key && loaded_key->file == shard_key->file && loaded_key->device == shard_key->device,
+                "the language model reads the shard the tower read, not the replaced name");
+        require(loaded->shard_name() == "tower.safetensors", "the held shard keeps the name's shard namespace");
+        require(rejects([&] { opened->load_checkpoint(shard.string(), [] {}); }, "did not load the shard"),
+                "a load that does not open the pinned shard is refused");
+        loaded.reset();
+        std::filesystem::remove(shard);
+        std::filesystem::rename(original, shard);
         std::error_code link_error;
-        std::filesystem::create_symlink(shard, fixture.path / "tower-link.safetensors", link_error);
+        const auto link = fixture.path / "tower-link.safetensors";
+        std::filesystem::create_symlink(shard, link, link_error);
         if (!link_error) {  // a linked checkpoint opens its target, as the language model loader does
-            const auto linked = opener((fixture.path / "tower-link.safetensors").string());
-            require(linked->inputs()[0] == std::filesystem::canonical(shard), "a linked checkpoint names its target");
-            linked->verify_checkpoint((fixture.path / "tower-link.safetensors").string());
+            const auto linked = opener(link.string());
+            require(linked->input_keys()[0] == *serve::file_key(shard), "a linked checkpoint keys its target");
+            linked->load_checkpoint(link.string(), [&] {
+                require(static_cast<bool>(weight::open_source(link.string(), loaded)), "load through the link");
+            });
+            require(loaded->shard_name() == "tower-link.safetensors", "the link name keeps its shard namespace");
+            loaded.reset();
         }
     }
     bool exact_refused = false;
@@ -214,14 +234,6 @@ void test_checkpoint_admission() {
         stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         require(static_cast<bool>(stream), "write checkpoint fixture");
     };
-    const auto rejects = [](const auto& call, std::string_view expected) {
-        try {
-            call();
-        } catch (const std::exception& error) {
-            return std::string_view(error.what()).find(expected) != std::string_view::npos;
-        }
-        return false;
-    };
     constexpr std::string_view valid = R"({"vision_config":{"model_type":"inkling2_vision"}})";
     VisionTestDir fixture;
     const auto model_dir = fixture.path / "model";
@@ -237,6 +249,12 @@ void test_checkpoint_admission() {
     capped.resize(ink::cli::kMiniVisionConfigBytes, ' ');
     write(config, capped);
     require(open().spec.width == 1024U, "accept config at the one-MiB boundary");
+    {
+        const auto assets = open();
+        const auto config_key = serve::file_key(config);
+        require(assets.keys.size() == 2U && config_key && assets.keys[1] == *config_key,
+                "the sidecar is keyed by the handle it was read from");
+    }
     capped.push_back(' ');
     write(config, capped);
     require(rejects([&] { (void)open(); }, "length"), "refuse config over one MiB");

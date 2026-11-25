@@ -28,13 +28,21 @@ inline constexpr std::size_t kMiniVisionConfigBytes = 1U << 20U;
 struct MiniVisionCheckpoint {
     VisionSpec spec;
     std::shared_ptr<const weight::Source> shard;
+    std::vector<serve::FileKey> keys;  // of the handles read: the shard, then the sidecar when there is one
 };
 
 inline MiniVisionCheckpoint read_mini_vision_checkpoint(const weight::ConfinedDirectory& directory,
                                                          const std::filesystem::path& basename) {
-    auto shard = directory.open(basename);
-    const auto sidecar = directory.read("config.json", kMiniVisionConfigBytes, true);
-    return {sidecar ? parse_vision_spec(*sidecar) : VisionSpec{}, std::move(shard)};
+    MiniVisionCheckpoint out;
+    out.shard = directory.open(basename);
+    const auto shard_key = weight::source_file_key(*out.shard);
+    if (!shard_key) throw std::runtime_error("could not identify the checkpoint shard");
+    out.keys.push_back({shard_key->device, shard_key->file});
+    std::optional<weight::FileKey> sidecar_key;
+    const auto sidecar = directory.read("config.json", kMiniVisionConfigBytes, true, {}, &sidecar_key);
+    if (sidecar_key) out.keys.push_back({sidecar_key->device, sidecar_key->file});
+    out.spec = sidecar ? parse_vision_spec(*sidecar) : VisionSpec{};
+    return out;
 }
 
 inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(std::shared_ptr<const weight::Source> checkpoint,
@@ -66,40 +74,41 @@ inline std::unique_ptr<serve::SerialMediaInput> make_mini_media(std::shared_ptr<
         });
 }
 
-// One image input of a run: the shared SerialMedia plus the files it read. The CLI refuses an output that is one of
-// them (before any device work) and a language model that is not the shard the tower was read from.
+// One image input of a run: the shared SerialMedia plus the handles it read. The CLI refuses an output that is one of
+// those files (before any device work), and the language model loads from the same opened shard as the tower: while
+// it loads, open_source of the checkpoint name returns the held shard (weight::SourcePin), and a load that did not
+// open it is refused.
 class MiniMediaInput final : public serve::SerialMediaInput {
 public:
-    MiniMediaInput(std::unique_ptr<serve::SerialMediaInput> media, std::vector<std::filesystem::path> inputs,
-                   serve::FileKey shard)
-        : media_(std::move(media)), inputs_(std::move(inputs)), shard_(shard) {}
+    MiniMediaInput(std::unique_ptr<serve::SerialMediaInput> media, std::vector<serve::FileKey> keys,
+                   std::shared_ptr<const weight::Source> shard)
+        : media_(std::move(media)), keys_(std::move(keys)), shard_(std::move(shard)) {}
     [[nodiscard]] serve::ApiMediaAdapter& adapter() override { return media_->adapter(); }
-    [[nodiscard]] std::vector<std::filesystem::path> inputs() const override { return inputs_; }
-    void verify_checkpoint(const std::string& checkpoint) const override {
-        if (serve::file_key(checkpoint) != shard_)
-            throw std::runtime_error("the language model checkpoint is not the shard the image tower was read from");
+    [[nodiscard]] std::vector<serve::FileKey> input_keys() const override { return keys_; }
+    void load_checkpoint(const std::string& checkpoint, const std::function<void()>& load) const override {
+        const weight::SourcePin pin(checkpoint, shard_);
+        load();
+        if (pin.uses() == 0U)
+            throw std::runtime_error("the language model did not load the shard the image tower was read from");
     }
 
 private:
     std::unique_ptr<serve::SerialMediaInput> media_;
-    std::vector<std::filesystem::path> inputs_;
-    serve::FileKey shard_;
+    std::vector<serve::FileKey> keys_;
+    std::shared_ptr<const weight::Source> shard_;
 };
 
-// Opens the checkpoint's image assets: a linked checkpoint names its target (as the language model loader opens
-// it), the shard and its config.json sidecar are read through the target's held directory, and the shard is pinned
-// by its file key (a replacement while it is opened is refused). `config` overrides the sidecar (host fixtures).
+// Opens the checkpoint's image assets: a linked checkpoint names its target, and the shard and its config.json
+// sidecar are read through the target's held directory. The language model later loads from this same opened shard
+// (MiniMediaInput::load_checkpoint). `config` overrides the sidecar (host fixtures).
 inline std::unique_ptr<serve::SerialMediaInput> open_mini_media(const std::string& checkpoint, VisionIdentity identity,
                                                                 const std::optional<VisionSpec>& config = {}) {
     const auto model = std::filesystem::canonical(checkpoint);
     const weight::ConfinedDirectory directory(model.parent_path());
-    const auto pinned = serve::file_key(model);
     auto assets = read_mini_vision_checkpoint(directory, model.filename());
-    if (!pinned || serve::file_key(model) != pinned)
-        throw std::runtime_error("the checkpoint changed while its image tower was opened");
+    auto shard = assets.shard;
     auto media = make_mini_media(std::move(assets.shard), config ? *config : assets.spec, identity);
-    return std::make_unique<MiniMediaInput>(std::move(media),
-        std::vector<std::filesystem::path>{model, model.parent_path() / "config.json"}, *pinned);
+    return std::make_unique<MiniMediaInput>(std::move(media), std::move(assets.keys), std::move(shard));
 }
 
 // The image opener of one run (SerialGenerationFamily::media): the recipe is the run's own resolution of the row

@@ -82,18 +82,6 @@ struct SerialGenerationLoad {
 
 // Image input of --messages: owns the family's media adapter (e.g. vision::ApiMediaBridge over its VisionAdapter,
 // encoder backend, weights and interner) for one run.
-class SerialMediaInput {
-public:
-    virtual ~SerialMediaInput() = default;
-    [[nodiscard]] virtual ApiMediaAdapter& adapter() = 0;
-    // Files the input read (config sidecars, weights): the CLI refuses a --logits output that is one of them,
-    // before any device work.
-    [[nodiscard]] virtual std::vector<std::filesystem::path> inputs() const { return {}; }
-    // Called after the language model is loaded from `checkpoint`: refuses a checkpoint that is not the file the
-    // input read its weights from.
-    virtual void verify_checkpoint(const std::string& checkpoint) const { static_cast<void>(checkpoint); }
-};
-
 // Device and file number of the file `path` names now (links followed; nullopt: nothing there). Equal keys name one
 // file, whatever the paths (hard links, links, aliases).
 struct FileKey {
@@ -102,6 +90,21 @@ struct FileKey {
 };
 [[nodiscard]] std::optional<FileKey> file_key(const std::filesystem::path& path);
 [[nodiscard]] std::optional<FileKey> descriptor_file_key(int descriptor);  // of an open C runtime descriptor
+
+class SerialMediaInput {
+public:
+    virtual ~SerialMediaInput() = default;
+    [[nodiscard]] virtual ApiMediaAdapter& adapter() = 0;
+    // Keys of the handles the input read (config sidecars, weights): the CLI refuses a --logits output that is one of
+    // those files, before any device work.
+    [[nodiscard]] virtual std::vector<FileKey> input_keys() const { return {}; }
+    // Runs the language model load of `checkpoint`. An input that read weights from the checkpoint makes the load
+    // read that same opened file (not a second lookup of the name) and refuses a load that did not.
+    virtual void load_checkpoint(const std::string& checkpoint, const std::function<void()>& load) const {
+        static_cast<void>(checkpoint);
+        load();
+    }
+};
 
 struct SerialGenerationFamily {
     std::string_view executable, diagnostic_name, checkpoint_argument;

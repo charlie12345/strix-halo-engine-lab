@@ -159,10 +159,10 @@ const std::string* lookup(const Pairs& pairs, std::string_view key) {
 // before the ladder rule.
 constexpr strix::profile::LadderRow ladder_rows[] = {
     strix::profile::incumbent_cell("decode_identity", "g4-a8-v1", strix::profile::Name::fast,
-                                   "g4-a8-v1: held-out fidelity bands met"),
-    strix::profile::incumbent_cell("prefill_route", "fast", strix::profile::Name::fast, fast_prefill_receipt),
+                                   "g4-a8-v1: held-out fidelity bands met", "v1"),
+    strix::profile::incumbent_cell("prefill_route", "fast", strix::profile::Name::fast, fast_prefill_receipt, "g4-wmma-pf-v1"),
     strix::profile::incumbent_cell("prefill_route_attention", "flash", strix::profile::Name::fast,
-                                   fast_prefill_attention_receipt),
+                                   fast_prefill_attention_receipt, "g4-flash-attn-v1"),
 };
 } // namespace
 
@@ -309,7 +309,10 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
             if ((given && off(*given)) || (!given && exported && off(exported))) return std::string_view("off");
             if (given) return std::string_view(*given);
             if (exported && !lever.asset) return std::string_view(exported);
-            if (exported) {
+            // An asset lever runs what discovery resolved, requested or not (dispatch below: the asset found, else the
+            // builtin): its arm spells that, never the column word, so a present and a missing asset are two keys. A
+            // discovered asset has no declared identity, so its arm spells no key and no timing receipt decides there.
+            if (lever.asset) {
                 const auto* asset = lookup(inputs.assets, lever.name);
                 return asset ? std::string_view(*asset) : std::string_view(lever.builtin);
             }

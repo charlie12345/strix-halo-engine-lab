@@ -110,17 +110,23 @@ inline constexpr Qualified qualified[] = {
 // bands they ran in (FAST value 4096 only; same shape as `qualified`). A grant keeps the cell applying where no timing row covers the regime; it
 // is NOT derived from `qualified`, so a new gate row (or a wider band) leaves its cell at the tier below until a timing row
 // is registered. Do not add rows here.
-inline constexpr Qualified incumbent_grants[] = {
-    {Device::gfx1151, Topology::one_node, {"prompt_rows", "4096", 0, 32568,
-     "frozen incumbent: bitwise == prompt_rows 2048, prompts <= 32,568"}},
-    {Device::gfx1151, Topology::pair, {"prompt_rows", "4096", 0, 32568,
-     "frozen incumbent: pair logits_fnv64 == one node at the same width, prompts <= 32,568"}},
-    {Device::gfx1151, Topology::one_node, {"head_q8", "1", 0, kNoPromptBound,
-     "frozen incumbent: gate v2 head copy, 5 windows, 1,000 held-out rows"}},
-    {Device::gfx1151, Topology::pair, {"head_q8", "1", 0, kNoPromptBound,
-     "frozen incumbent: same head numerics as one node"}},
-    {Device::gfx1151, Topology::one_node, {"pf_mha", "1", 0, 32568,
-     "frozen incumbent: gate v2 FAST composition, 10 windows PASS, prompts <= 32,568"}},
+// A grant names the implementation identity it was given to (Lever::identity of the FAST value): a changed
+// implementation under the same value is not granted.
+struct IncumbentGrant {
+    Qualified qualified;
+    std::string_view identity;
+};
+inline constexpr IncumbentGrant incumbent_grants[] = {
+    {{Device::gfx1151, Topology::one_node, {"prompt_rows", "4096", 0, 32568,
+     "frozen incumbent: bitwise == prompt_rows 2048, prompts <= 32,568"}}, "v1"},
+    {{Device::gfx1151, Topology::pair, {"prompt_rows", "4096", 0, 32568,
+     "frozen incumbent: pair logits_fnv64 == one node at the same width, prompts <= 32,568"}}, "v1"},
+    {{Device::gfx1151, Topology::one_node, {"head_q8", "1", 0, kNoPromptBound,
+     "frozen incumbent: gate v2 head copy, 5 windows, 1,000 held-out rows"}}, "v1"},
+    {{Device::gfx1151, Topology::pair, {"head_q8", "1", 0, kNoPromptBound,
+     "frozen incumbent: same head numerics as one node"}}, "v1"},
+    {{Device::gfx1151, Topology::one_node, {"pf_mha", "1", 0, 32568,
+     "frozen incumbent: gate v2 FAST composition, 10 windows PASS, prompts <= 32,568"}}, "v1"},
 };
 
 [[nodiscard]] inline const Qualified* qualification(std::string_view lever, std::string_view value, const Regime& regime,
@@ -161,7 +167,7 @@ struct Resolved {
 // The CLI and the server call this one function with the same Inputs and Regime (ONE RESOLVER).
 [[nodiscard]] inline std::unique_ptr<Resolved> resolve(const Regime& regime, const sp::Inputs& inputs,
                                                        std::span<const Qualified> rows = qualified,
-                                                       std::span<const Qualified> grants = incumbent_grants,
+                                                       std::span<const IncumbentGrant> grants = incumbent_grants,
                                                        std::span<const Measured> timings = measured) {
     auto out = std::make_unique<Resolved>();
     out->regime = regime;
@@ -174,9 +180,14 @@ struct Resolved {
         const auto* q = qualification(lever.name, lever.value[fast], regime, rows);
         row.ready[fast] = q != nullptr;
         // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
-        if (const auto* grant = qualification(lever.name, lever.value[fast], regime, grants);
-            grant != nullptr && lever.kind != sp::Kind::exact)
-            out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[fast], sp::Name::fast, grant->gate.receipt));
+        if (lever.kind != sp::Kind::exact)
+            for (const auto& grant : grants)
+                if (!grant.identity.empty() && sp::declared_identity(lever.identity, lever.value[fast]) == grant.identity &&
+                    qualification(lever.name, lever.value[fast], regime, std::span(&grant.qualified, 1)) != nullptr) {
+                    out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[fast], sp::Name::fast,
+                                                             grant.qualified.gate.receipt, grant.identity));
+                    break;
+                }
         out->rows.push_back(row);
     }
     out->engine = engine();

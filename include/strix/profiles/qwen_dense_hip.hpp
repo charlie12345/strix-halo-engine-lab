@@ -55,7 +55,7 @@ inline constexpr sp::FastGate kFastGates[] = {
 // Ladder rows: incumbent grant of the qualified fast cell the resolver ran before the ladder rule.
 inline constexpr sp::LadderRow kLadderRows[] = {
     sp::incumbent_cell("a4w4_layers", "48-63", sp::Name::fast,
-                       "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)"),
+                       "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)", "v1"),
 };
 
 // One engine per app: each app owns only its own spelling of the window lever; both take the A4W4 layer table.

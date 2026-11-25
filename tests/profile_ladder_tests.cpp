@@ -348,6 +348,17 @@ void walk(const p::Engine& registered) {
     require(p::ladder_defect(registered).empty(), p::ladder_defect(registered));
     // Every shipped timing row is judged at its own band on its own execution: a row left behind by a changed builtin,
     // schedule, lower cell or column admission would silently stop deciding.
+    // Every shipped grant names the identity its table declares for the granted value today (review r75 P1-b).
+    for (const auto& row : registered.ladder) {
+        if (!row.incumbent) continue;
+        for (const auto& lever : registered.table)
+            if (lever.name == row.lever)
+                require(row.identity == p::declared_identity(lever.identity, row.value.empty()
+                                                                                  ? lever.value[p::value_column(lever, row.tier)]
+                                                                                  : row.value),
+                        std::string(registered.tag) + "/" + std::string(row.lever) + " grant identity '" +
+                            std::string(row.identity) + "' is not the declared identity of its value");
+    }
     for (const auto& row : registered.ladder) {
         if (row.incumbent || !row.joint.empty()) continue;
         const auto defect = shipped_row_defect(registered, row);
@@ -695,7 +706,7 @@ void paired_rows() {
     const p::LadderRow both[] = {joint, plain};
     require(p::ladder_judge_pair(std::span(&plain, 1), "shadow", "fp8", p::Name::turbo, regime, "reader", scope).rung !=
                 p::Rung::applies, "a single-cell row admitted the pair");
-    require(p::ladder_judge(std::span(&joint, 1), "shadow", "fp8", p::Name::turbo, regime, regime.execution).rung != p::Rung::applies,
+    require(p::ladder_judge(std::span(&joint, 1), "shadow", "fp8", p::Name::turbo, regime, regime.execution, "v1").rung != p::Rung::applies,
             "a joint row decided the plain cell");
     const auto verdict = p::ladder_judge_pair(both, "shadow", "fp8", p::Name::turbo, regime, "reader", scope);
     require(verdict.rung == p::Rung::applies && verdict.row == &both[0], "the joint row decides the pair");
@@ -804,7 +815,7 @@ void bound_evidence() {
         table[1].env = "STRIX_FIXTURE_OTHER";
         table[1].value = {"", "on", "", ""};
         table[1].identity = {{{"off", "v1"}, {"on", "v1"}}};
-        const auto grant = p::incumbent_cell(kOther, "on", p::Name::fast, "r/other-grant");
+        const auto grant = p::incumbent_cell(kOther, "on", p::Name::fast, "r/other-grant", "v1");
         const auto fast_row = [](double speedup, std::string_view over, std::string_view receipt) {
             return measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, speedup, 0.02,
                                   receipt}, over);
@@ -870,16 +881,28 @@ void bound_evidence() {
     {
         // Startup (context 0): no timing band holds an unknown regime, so a grant keeps its cell (timed or not) and an
         // ungranted timed cell stays below; once the prompt is known the rows decide.
-        const std::array granted{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant")};
+        const std::array granted{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant", "v1")};
         const p::Engine grant_only{"grant", "", kRows, false, "grant-v1", {}, {}, granted};
         const p::Regime startup = p::startup_prefill_regime("dev");
         require(value_of(run(grant_only, p::Name::fast, startup), kLever) == "a8", "untimed grant keeps its cell at startup");
-        const std::array timed_grant{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant"), fast_a8};
+        const std::array timed_grant{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant", "v1"), fast_a8};
         const p::Engine timed{"grant", "", kRows, false, "grant-v1", {}, {}, timed_grant};
         require(value_of(run(timed, p::Name::fast, startup), kLever) == "a8", "timed grant keeps its cell at startup");
         const std::array timed_only{fast_a8};
         const p::Engine ungranted{"grant", "", kRows, false, "grant-v1", {}, {}, timed_only};
         require(value_of(run(ungranted, p::Name::fast, startup), kLever) == "off", "ungranted timed cell stays below at startup");
+        // Review r75 P1-b: a grant binds the implementation identity it was given to. The same grant over a row whose
+        // declared identity of the granted value changed (no new receipt) grants nothing: the cell resolves below.
+        auto bumped = kRows;
+        for (auto& item : bumped[0].identity)
+            if (item.value == "a8") item.identity = "v2";
+        const p::Engine stale{"grant", "", bumped, false, "grant-v1", {}, {}, granted};
+        require(value_of(run(stale, p::Name::fast, startup), kLever) == "off",
+                "r75 P1-b a fixed grant does not admit a changed implementation identity");
+        require(p::ladder_judge(granted, kLever, "a8", p::Name::fast, startup, {}, "v1").rung == p::Rung::incumbent &&
+                    p::ladder_judge(granted, kLever, "a8", p::Name::fast, startup, {}, "v2").rung == p::Rung::unmeasured &&
+                    p::ladder_judge(granted, kLever, "a8", p::Name::fast, startup, {}, {}).rung == p::Rung::unmeasured,
+                "r75 P1-b a grant matches on its identity only");
         require(value_of(run(ungranted, p::Name::fast, at4k), kLever) == "a8", "the row decides once the prompt is known");
         require(value_of(run(timed, p::Name::fast, {p::Phase::prefill, 16384, 1, "dev", "fixture-exec"}), kLever) == "a8",
                 "outside the timed bands the grant keeps its cell");
@@ -1113,6 +1136,20 @@ void enumerate(const p::Engine& registered, EnumerationCount& count) {
     engine.table = rows;
     engine.ladder = grants;
     const auto none = spelled_resolution(engine, regime);
+    // Review r75 P1-b: a grant whose identity is not the one the table declares for its value grants nothing: every cell
+    // resolves exactly as with that grant removed.
+    for (std::size_t g = 0; g < grants.size(); ++g) {
+        std::vector<p::LadderRow> with = grants, without;
+        with[g].identity = keep(std::string(grants[g].identity) + "-changed");
+        for (std::size_t i = 0; i < grants.size(); ++i)
+            if (i != g) without.push_back(grants[i]);
+        auto changed = engine, removed = engine;
+        changed.ladder = with;
+        removed.ladder = without;
+        require(spelled_resolution(changed, regime) == spelled_resolution(removed, regime),
+                tag + "/" + std::string(grants[g].lever) + ": a grant of another identity still decides");
+        ++count.mutations;
+    }
     const auto admit = [](const p::Lever& l, unsigned c) { return p::column_admission(l, c, false, false); };
     const auto arms = p::ladder_arms(std::span<const p::Lever>(rows), std::span<const p::LadderRow>(grants), regime, admit);
     const auto outcome = [&](const p::LadderRow& r, const p::Engine& base, const p::Regime& run) {
@@ -1315,7 +1352,7 @@ void r63_reproductions() {
     }
     // (3) An out-of-scope timing row never revokes the frozen FAST grant prefill_arith=fast4.
     {
-        const std::vector<p::LadderRow> grant_only{p::incumbent_cell("prefill_arith", "fast4", p::Name::fast, "r63/frozen")};
+        const std::vector<p::LadderRow> grant_only{p::incumbent_cell("prefill_arith", "fast4", p::Name::fast, "r63/frozen", "nvfp4-tile-mma-f32-v1")};
         const auto arms = p::ladder_arms(std::span<const p::Lever>(rows), std::span<const p::LadderRow>(grant_only), run128, admit);
         for (const double speedup : {1.2, 0.8}) {
             p::LadderRow timed{"prefill_arith", "fast4", p::Name::fast, p::Phase::prefill, "sm_120", 1, p::kNoContextBound,
@@ -1340,7 +1377,7 @@ void r63_reproductions() {
         p::LadderRow gain{"drafter_window", "15", p::Name::turbo, p::Phase::prefill, "sm_120", 1, p::kNoContextBound, 1,
                           p::kNoLaneBound, 1.2, 0.01, "r63/drafter"};
         // split_k runs its FAST value through its incumbent grant (as in the adapter), so the schedule's key spells it.
-        const auto split_grant = p::incumbent_cell("split_k", "fast", p::Name::fast, "r63/split-k-grant");
+        const auto split_grant = p::incumbent_cell("split_k", "fast", p::Name::fast, "r63/split-k-grant", "nvfp4-splitk-fast-v1");
         const std::vector<p::LadderRow> granted{split_grant};
         const auto with_split = p::ladder_arms(std::span<const p::Lever>(rows), std::span<const p::LadderRow>(granted),
                                                run128, admit);

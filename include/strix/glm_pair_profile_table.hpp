@@ -25,7 +25,7 @@ inline constexpr std::array<strix::profile::Lever, 3> product_profile_table{{
 // Ladder rows (strix::profile::LadderRow): incumbent grant for the turbo cell the resolver ran before the ladder rule.
 inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
     strix::profile::incumbent_cell("pf_wmma", "1", strix::profile::Name::turbo,
-                                   "glm-pf-wmma-x turbo cell ready before the ladder rule (docs/optimizations.md#glm-pf-wmma-x)")};
+                                   "glm-pf-wmma-x turbo cell ready before the ladder rule (docs/optimizations.md#glm-pf-wmma-x)", "v1")};
 inline const strix::profile::Engine product_profile_engine{"glm-pair", "", product_profile_table, false, "glm-turbo-v1",
                                                            {}, {}, product_ladder_rows};
 

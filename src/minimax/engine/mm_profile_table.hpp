@@ -119,8 +119,8 @@ inline constexpr std::array<strix::profile::Lever, 10> profile_table{{
 // the ladder rule. TURBO nests FAST (it resolves over the admitted FAST set).
 inline constexpr strix::profile::LadderRow ladder_rows[] = {
     strix::profile::incumbent_cell("msa_flash", "1", strix::profile::Name::fast,
-                                   "bundle mm-fast-pf-v2: EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029"),
+                                   "bundle mm-fast-pf-v2: EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029", "v1"),
     strix::profile::incumbent_cell("router_wmma", "1", strix::profile::Name::fast,
-                                   "bundle mm-fast-pf-v2: gate PASS 8K KL 0.0020 and 32K with the bundle")};
+                                   "bundle mm-fast-pf-v2: gate PASS 8K KL 0.0020 and 32K with the bundle", "v1")};
 
 }  // namespace strix::minimax::defaults

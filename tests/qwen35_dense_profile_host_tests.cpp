@@ -583,9 +583,14 @@ int main() {
         check(qp::incumbent_grant(changed, regime, qp::incumbent_grants) == nullptr,
               "a replacement FAST value cannot inherit the incumbent grant");
         changed = qp::table[0];
-        changed.target = "fast4 (nvfp4-tile-mma-f32-v2)";
+        for (auto& item : changed.identity)
+            if (item.value == "fast4") item.identity = "nvfp4-tile-mma-f32-v2";
         check(qp::incumbent_grant(changed, regime, qp::incumbent_grants) == nullptr,
-              "a revised FAST identity cannot inherit the incumbent grant");
+              "a revised FAST identity cannot inherit the incumbent grant (review r75 P1-b: the declared identity binds)");
+        changed = qp::table[0];
+        changed.target = "fast4 (display text revised)";
+        check(qp::incumbent_grant(changed, regime, qp::incumbent_grants) != nullptr,
+              "the display target is not the identity the grant binds");
         const auto shipped = qp::resolve(Name::fast, regime, {});
         check(lever_value(*shipped, "prefill_arith") == "fast4" && lever_value(*shipped, "prefill_gdn") == "chunk16tc" &&
                   lever_value(*shipped, "prefill_attn8") == "on" && lever_value(*shipped, "prefill_hid") == "f32",

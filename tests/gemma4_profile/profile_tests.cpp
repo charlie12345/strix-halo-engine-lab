@@ -89,6 +89,28 @@ void synthetic_table() {
     measured.ladder = std::span(&route_timing, 1);
     r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic);
     check(status(r, "route") == pr::Status::set && value(r, "route") == "b" && r.active("route"), "fast sets ready lever");
+    // Review r75 P2: the arm spells the drafter discovery actually resolved. A receipt measured with the drafter absent
+    // decides only that case: with a discovered drafter the key is not the same (it spells no key: the asset has no
+    // declared identity), so the fixed receipt has no effect there.
+    {
+        auto absent = measured;
+        absent.ladder = {};
+        const std::string absent_reference =
+            pr::resolve(pr::Name::fast, pr::App::engine, absent, synthetic).find("route")->ladder_reference;
+        auto present = absent;
+        present.assets = {{"draft", "/models/e4b/drafter-mtp"}};
+        check(pr::resolve(pr::Name::fast, pr::App::engine, present, synthetic).find("route")->ladder_reference.empty() &&
+                  absent_reference.find("draft=off{v1}") != std::string::npos,
+              "drafter present and absent spell different keys (present: none)");
+        strix::profile::LadderRow drafter_timing = route_timing;
+        drafter_timing.over = absent_reference;
+        absent.ladder = std::span(&drafter_timing, 1);
+        present.ladder = std::span(&drafter_timing, 1);
+        check(value(pr::resolve(pr::Name::fast, pr::App::engine, absent, synthetic), "route") == "b",
+              "the receipt decides the drafter-absent run it was measured on");
+        check(value(pr::resolve(pr::Name::fast, pr::App::engine, present, synthetic), "route") == "a",
+              "the same receipt has no effect with a discovered drafter");
+    }
     // An explicit request for a value whose code is not in the build is refused (it would otherwise be ignored).
     refuses([] { (void)pr::resolve(pr::Name::fast, pr::App::engine, in({}, {}, lookup({{"TEST_NAMED", "x8"}})), synthetic); },
             "TEST_NAMED=x8 is not in this build", "explicit request for missing code refused");

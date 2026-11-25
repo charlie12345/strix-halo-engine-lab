@@ -156,21 +156,21 @@ inline constexpr Qualified qualified[] = {
 // a wider band) leaves its cell at the tier below until a matching timing row is registered. Do not add rows here.
 struct IncumbentGrant {
     Qualified qualified;
-    std::string_view identity;
+    std::string_view identity;  // the declared implementation identity granted (Lever::identity of the FAST value)
 };
 inline constexpr IncumbentGrant incumbent_grants[] = {
     {{Weights::nvfp4_rtn, Route::large_prefill, {"prefill_arith", "fast4", 0, sp::kNoPromptBound,
      "frozen incumbent: 52dd7d1f0 FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack)"}},
-     "fast4 (nvfp4-tile-mma-f32-v1, identity -pf-fast4)"},
+     "nvfp4-tile-mma-f32-v1"},
     {{Weights::nvfp4_rtn, Route::large_prefill, {"prefill_gdn", "chunk16tc", 0, sp::kNoPromptBound,
      "frozen incumbent: gdn-chunk16-tf32-v2 with fast4 gate 8K / 32K PASS"}},
-     "chunk16tc (gdn-chunk16-tf32-v2: split-TF32 tensor-core chunk scan, identity -gdnc16t2)"},
+     "gdn-chunk16-tf32-v2"},
     {{Weights::nvfp4_rtn, Route::large_prefill, {"prefill_attn8", "on", 8192, sp::kNoPromptBound,
      "frozen incumbent: with fast4 + chunk16 / chunk16tc gate 8K / 32K 2/2 windows PASS"}},
-     "on (e4m3 flash over an e4m3 KV shadow, identity -a8)"},
+     "prefill-attn8-e4m3-v1"},
     {{Weights::nvfp4_rtn, Route::windows, {"split_k", "fast", 0, sp::kNoPromptBound,
      "frozen incumbent: nvfp4-splitk-fast-v1 gate EXACT -> FAST pooled KL 0.00000 top-1 0.9990, spec ids == FAST serial x1200"}},
-     "fast (nvfp4-splitk-fast-v1, identity -skf1)"},
+     "nvfp4-splitk-fast-v1"},
 };
 
 inline bool offered(std::string_view lever, Route route, bool drafter = false) {
@@ -188,9 +188,12 @@ inline const Qualified* qualification(std::string_view lever, std::string_view v
 
 inline const IncumbentGrant* incumbent_grant(const Lever& lever, const Regime& regime,
                                              std::span<const IncumbentGrant> grants) {
+    // Bound to the declared implementation identity of the FAST value (Lever::identity, not the display target): a
+    // changed implementation under the same value is not granted.
+    const auto fast_value = lever.value[static_cast<unsigned>(Name::fast)];
     for (const auto& grant : grants)
-        if (lever.target == grant.identity && qualification(lever.name, lever.value[static_cast<unsigned>(Name::fast)],
-                                                          regime, std::span(&grant.qualified, 1)))
+        if (!grant.identity.empty() && sp::declared_identity(lever.identity, fast_value) == grant.identity &&
+            qualification(lever.name, fast_value, regime, std::span(&grant.qualified, 1)))
             return &grant;
     return nullptr;
 }
@@ -322,7 +325,7 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
         // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
         if (const auto* grant = incumbent_grant(lever, regime, grants); grant != nullptr && lever.kind != Kind::exact)
             out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[static_cast<unsigned>(Name::fast)], Name::fast,
-                                                     grant->qualified.gate.receipt));
+                                                     grant->qualified.gate.receipt, grant->identity));
         TurboAdmission result;
         if (turbo && !row.value[kTurboColumn].empty()) {
             result = admission(row);

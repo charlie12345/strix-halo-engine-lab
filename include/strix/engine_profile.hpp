@@ -257,20 +257,27 @@ struct LadderRow {
     // tier, phase, device class and band: ladder_receipt_matches()); any other run is outside the row, which then has
     // no effect at all there. Paired rows bind through `joint_scope` instead.
     std::string_view over{};
+    // Incumbent grants only: the implementation identity the grant was given to (Lever::identity of the granted value).
+    // The grant keeps the cell only while the table declares exactly that identity for the value the cell runs; a
+    // changed implementation under the same value is not granted (it needs its own timing receipt). Never empty on a
+    // grant (ladder_defect()).
+    std::string_view identity{};
 };
 
 // Receipts of incumbent grants for cells that ran before the ladder rule without a quality gate of their own.
 inline constexpr std::string_view kProvisionalBeforeLadder =
     "provisional cell selected before the ladder rule; the row's source names the qualification in progress";
-// An incumbent grant row (LadderRow::incumbent). `value` empty: the tier's cell.
+// An incumbent grant row (LadderRow::incumbent). `value` empty: the tier's cell. `identity`: the declared implementation
+// identity of the granted value (LadderRow::identity).
 [[nodiscard]] constexpr LadderRow incumbent_cell(std::string_view lever, std::string_view value, Name tier,
-                                                 std::string_view receipt) noexcept {
+                                                 std::string_view receipt, std::string_view identity) noexcept {
     LadderRow row{};
     row.lever = lever;
     row.value = value;
     row.tier = tier;
     row.receipt = receipt;
     row.incumbent = true;
+    row.identity = identity;
     return row;
 }
 
@@ -296,7 +303,8 @@ template <class Context, class Lanes>
 }
 // The key a timing receipt must equal to decide one cell in one regime. `reference` is the complete ordinary key
 // (LadderArms::over()); `joint` / `joint_scope` the complete paired key. Empty reference or incomplete scope: no
-// receipt matches.
+// receipt matches. `identity` is the declared implementation identity of `value` (Lever::identity): an incumbent grant
+// keeps the cell only for exactly that identity (LadderRow::identity); empty: no grant applies.
 struct ReceiptKey {
     std::string_view lever, value;
     Name tier = Name::fast;
@@ -304,6 +312,7 @@ struct ReceiptKey {
     std::string_view reference{};
     std::string_view joint{};
     const JointLadderScope* joint_scope = nullptr;
+    std::string_view identity{};
 };
 // The one matching rule of every timing receipt (ordinary and paired): equality of the lever, the measured value, the
 // tier, the phase and the device class, the regime inside the row's band, and EXACT equality of the complete key (the
@@ -341,13 +350,15 @@ struct LadderVerdict {
 
 // The verdict over the receipts matching `key` (ladder_receipt_matches()): applies only when every matching receipt
 // shows a gain; with no matching receipt, an incumbent grant with a receipt keeps the cell (Rung::incumbent), and
-// otherwise the cell resolves to the tier below (unmeasured). Receipts that do not match are ignored entirely.
+// otherwise the cell resolves to the tier below (unmeasured). A grant is matched on lever, value, tier, receipt AND the
+// declared implementation identity of the value (ReceiptKey::identity). Receipts that do not match are ignored entirely.
 [[nodiscard]] constexpr LadderVerdict ladder_verdict(std::span<const LadderRow> rows, const ReceiptKey& key) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
     for (const auto& row : rows) {
         if (row.incumbent) {
-            if (!grant && key.joint.empty() && !row.receipt.empty() && ladder_names(row, key.lever, key.value, key.tier))
+            if (!grant && key.joint.empty() && !row.receipt.empty() && !row.identity.empty() &&
+                row.identity == key.identity && ladder_names(row, key.lever, key.value, key.tier))
                 grant = &row;
             continue;
         }
@@ -364,11 +375,12 @@ struct LadderVerdict {
     return {slower ? Rung::slower : Rung::within_noise, worst, tier_below(key.tier)};
 }
 // The verdict of `value` of `lever` in `tier` for `regime` over `arm`, the complete reference of the execution that runs
-// (LadderArms::over(); required: an empty arm matches no timing receipt, so only an incumbent grant can run the cell).
+// (LadderArms::over(); required: an empty arm matches no timing receipt, so only an incumbent grant can run the cell)
+// and `identity` the declared implementation identity of `value` (Lever::identity; only a grant of that identity runs).
 [[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
                                                    std::string_view value, Name tier, const Regime& regime,
-                                                   std::string_view arm) noexcept {
-    return ladder_verdict(rows, {lever, value, tier, &regime, arm});
+                                                   std::string_view arm, std::string_view identity) noexcept {
+    return ladder_verdict(rows, {lever, value, tier, &regime, arm, {}, nullptr, identity});
 }
 // The verdict of a paired cell (LadderRow::joint): only receipts of the same pair with the same complete scope match;
 // grants never admit a pair.
@@ -1106,7 +1118,9 @@ template <class Row, class Admission>
     // The complete key of the execution that runs under this cell (the lower cell of this lever included): only a
     // receipt of exactly that key decides; any other receipt has no effect here.
     const std::string reference = arms.over(tier, lever.name, wanted);
-    const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime, reference);
+    std::string_view identity{};
+    if constexpr (requires { lever.identity; }) identity = declared_identity(lever.identity, wanted);
+    const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime, reference, identity);
     step += rung_name(verdict.rung);
     if (verdict.row) {
         if (!verdict.row->incumbent) {
@@ -1370,6 +1384,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             return where + ": ladder row value is not the tier's cell";
         if (row.incumbent) {
             if (row.receipt.empty()) return where + ": incumbent grant without a receipt";
+            if (row.identity.empty()) return where + ": incumbent grant without the implementation identity it granted";
             if (!row.joint.empty()) return where + ": incumbent grant cannot be a paired row";
             continue;
         }

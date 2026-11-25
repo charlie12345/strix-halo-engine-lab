@@ -154,14 +154,14 @@ inline constexpr Lever table[] = {
 inline std::span<const Lever> levers() { return table; }
 // Ladder rows of this table: incumbent grants of the cells the resolver ran (provisional) before the ladder rule.
 inline constexpr ::strix::profile::LadderRow ladder_rows[] = {
-    ::strix::profile::incumbent_cell("expert_fast", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder),
-    ::strix::profile::incumbent_cell("hc_mma", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder),
-    ::strix::profile::incumbent_cell("qsa_mma", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder),
-    ::strix::profile::incumbent_cell("expert_fast", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
-    ::strix::profile::incumbent_cell("expert_turbo", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
-    ::strix::profile::incumbent_cell("expert_turbo_rows", "512", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
-    ::strix::profile::incumbent_cell("hc_mma", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
-    ::strix::profile::incumbent_cell("qsa_mma", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder),
+    ::strix::profile::incumbent_cell("expert_fast", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder, "gsq-iq-bf16mma-cuda-v1"),
+    ::strix::profile::incumbent_cell("hc_mma", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder, "qwen-cuda-hc-f16mma-v2"),
+    ::strix::profile::incumbent_cell("qsa_mma", "1", ::strix::profile::Name::fast, ::strix::profile::kProvisionalBeforeLadder, "qwen-cuda-qsa-bf16mma-v2"),
+    ::strix::profile::incumbent_cell("expert_fast", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "gsq-iq-bf16mma-cuda-v1"),
+    ::strix::profile::incumbent_cell("expert_turbo", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "gsq-iq-i8mma-turbo-cuda-v1"),
+    ::strix::profile::incumbent_cell("expert_turbo_rows", "512", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "v1"),
+    ::strix::profile::incumbent_cell("hc_mma", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "qwen-cuda-hc-f16mma-v2"),
+    ::strix::profile::incumbent_cell("qsa_mma", "1", ::strix::profile::Name::turbo, ::strix::profile::kProvisionalBeforeLadder, "qwen-cuda-qsa-bf16mma-v2"),
 };
 
 // The RTX Qwen FAST bundle = the fast column above: its members are the rows the fast profile selects, qualified TOGETHER

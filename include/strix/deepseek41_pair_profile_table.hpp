@@ -17,7 +17,7 @@ inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
     {"attention_f16wmma", "STRIX_DS41_FAST_ATTN", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, true}, "ds41-attn-f16wmma-v1", "0",
      "pending: qualification receipt for ds41-attn-f16wmma-v1 (f16 WMMA sparse attention); runnable with --allow-pending; fast and turbo run 2 (ds41-attn-bf16flash-v1) through the FAST bundle",
-     false, {false, false, false, false}, false, {}, {{{"0", "v1"}, {"1", "ds41-attn-f16wmma-v1"}, {"2", "ds41-attn-f16wmma-v1"}}}},
+     false, {false, false, false, false}, false, {}, {{{"0", "v1"}, {"1", "ds41-attn-f16wmma-v1"}, {"2", "ds41-attn-bf16flash-v1"}}}},
     // Prefill only: routed MoE IQ2_XXS gate/up + Q2_K down with FMA accumulation in ascending group order. Applied by
     // 'fast' while its qualification runs (provisional, never stamped qualified); 'default' and 'quality' never set it.
     {"moe_relaxed", "STRIX_DS41_FAST_MOE", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
@@ -82,11 +82,11 @@ inline constexpr auto kFast = sp::Name::fast;
 inline constexpr auto kTurbo = sp::Name::turbo;
 }  // namespace ladder_detail
 inline constexpr strix::profile::LadderRow ladder_rows[] = {
-    strix::profile::incumbent_cell("fast_prefill", "1", ladder_detail::kFast, kFastGateD1),
-    strix::profile::incumbent_cell("engram_f16wmma", "1", ladder_detail::kFast, kFastGateD1),
-    strix::profile::incumbent_cell("shared_f16", "1", ladder_detail::kFast, kFastGateD1),
-    strix::profile::incumbent_cell("moe_f16wmma", "1", ladder_detail::kFast, kFastGateD1),
-    strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kFast, strix::profile::kProvisionalBeforeLadder),
-    strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder)};
+    strix::profile::incumbent_cell("fast_prefill", "1", ladder_detail::kFast, kFastGateD1, "v1"),
+    strix::profile::incumbent_cell("engram_f16wmma", "1", ladder_detail::kFast, kFastGateD1, "v1"),
+    strix::profile::incumbent_cell("shared_f16", "1", ladder_detail::kFast, kFastGateD1, "v1"),
+    strix::profile::incumbent_cell("moe_f16wmma", "1", ladder_detail::kFast, kFastGateD1, "v1"),
+    strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kFast, strix::profile::kProvisionalBeforeLadder, "v1"),
+    strix::profile::incumbent_cell("moe_relaxed", "1", ladder_detail::kTurbo, strix::profile::kProvisionalBeforeLadder, "v1")};
 
 }  // namespace strix::deepseek41::pair_defaults

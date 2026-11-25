@@ -82,7 +82,9 @@ void synthetic_table() {
     auto measured = in();
     measured.regime = {strix::profile::Phase::prefill, 4096, 1, "fixture"};
     // The row is measured over the reference the adapter runs under the cell (LadderArms::over).
-    route_timing.over = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic).find("route")->ladder_reference;
+    const std::string route_reference =  // owned: LadderRow::over is a view
+        pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic).find("route")->ladder_reference;
+    route_timing.over = route_reference;
     check(route_timing.over.starts_with("ladder-arm/v2;"), "Gemma reports the reference of the route cell");
     measured.ladder = std::span(&route_timing, 1);
     r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic);

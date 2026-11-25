@@ -68,6 +68,28 @@ Options run(std::optional<Name> profile, TurboWeights w, qp::Route route, std::u
             ladder.push_back({row.gate.lever, row.gate.value, Name::fast, strix::profile::Phase::prefill, regime.arch,
                               std::max<std::uint64_t>(1, row.gate.min_prompt_tokens), row.gate.max_prompt_tokens,
                               1, 1, 1.1, 0.02, "fixture timing"});
+    // Each timing row names its measured FAST value and the execution it was measured over (LadderArms::over): the
+    // default FAST execution without explicit settings (an explicit override makes the row stale). Cells of one tier
+    // compose in table order, so the references settle within one pass per row.
+    for (auto& row : ladder)
+        if (row.value.empty())
+            for (const auto& lever : qp::table)
+                if (lever.name == row.lever) row.value = lever.value[static_cast<unsigned>(Name::fast)];
+    std::vector<std::string> references(ladder.size());
+    const bool lossy = profile && (*profile == Name::fast || *profile == Name::turbo);
+    for (std::size_t pass = 0; lossy && pass <= ladder.size(); ++pass) {
+        const qp::TurboEvidence measured[] = {{regime.weights, route, {}, {}, ladder}};
+        const auto fast = qp::resolve(Name::fast, regime, {}, rows, measured);
+        bool settled = true;
+        for (std::size_t i = 0; i < ladder.size(); ++i) {
+            const auto* entry = fast->find(ladder[i].lever);
+            if (entry == nullptr || entry->ladder_reference == references[i]) continue;
+            references[i] = entry->ladder_reference;
+            ladder[i].over = references[i];
+            settled = false;
+        }
+        if (settled) break;
+    }
     const qp::TurboEvidence evidence[] = {{regime.weights, route, {}, {}, ladder}};
     const auto r = qp::resolve(profile, regime, cli, rows, evidence);
     qp::apply(o, *r);
@@ -324,30 +346,35 @@ int main() {
             return qp::resolve(Name::turbo, r, opts, qp::qualified, evidence);
         };
         const auto reference = qp::joint_execution(fast->resolution);
-        const auto candidate_base = qp::joint_execution(resolve(regime)->resolution);
+        std::string candidate_base = qp::joint_execution(resolve(regime)->resolution);
         gains[0].joint_scope = {regime.cost_device, reference, candidate_base, qp::kKvIdentity, qp::kAttnIdentity,
                                 regime.workload, "on"};
         // Single-cell rows name their TURBO value and the reference that runs under them (LadderArms::over: cells of
-        // the tier compose in table order, so a later cell is measured over the earlier ones).
+        // the tier compose in table order, so a later cell is measured over the earlier ones); the joint receipt names
+        // the TURBO execution it was measured in, which carries those cells. Both settle together.
         std::array<std::string, identities.size()> references{};
         for (std::size_t i = 1; i < gains.size(); ++i)
             for (const auto& lever : qp::table)
                 if (lever.name == keys[i]) gains[i].value = lever.value[static_cast<unsigned>(Name::turbo)];
-        for (std::size_t pass = 0; pass < gains.size(); ++pass)
+        for (std::size_t pass = 0; pass < gains.size(); ++pass) {
+            candidate_base = qp::joint_execution(resolve(regime)->resolution);
+            gains[0].joint_scope.candidate_base = candidate_base;
             for (std::size_t i = 1; i < gains.size(); ++i) {
-                const auto* entry = resolve(regime)->find(keys[i]);
+                const auto resolved = resolve(regime);  // the entry lives in this resolution
+                const auto* entry = resolved->find(keys[i]);
                 if (entry == nullptr || entry->ladder_reference.empty()) continue;
                 references[i] = entry->ladder_reference;
                 gains[i].over = references[i];
             }
-        check(references[2].starts_with("ladder-arm/v2;"), "Qwen dense reports the TURBO dense reference: " + references[2]);
+        }
+        check(references[2].starts_with("ladder-arm/v2;"), ("Qwen dense reports the TURBO dense reference: " + references[2]).c_str());
         const auto admitted = resolve(regime);
         qp::apply(options, *admitted);
         kv = qp::resolve_kv(Name::turbo, {}, regime.route, explicit_arms);
         qp::observe_kv(kv, *admitted);
         check(admitted->find("split_k")->value == "fast" && admitted->find("drafter_window")->value == "15" &&
                   options.decode_attn8 && options.dense_activation && kv.source == qp::kvp::Source::tier,
-              "matching receipts enable all four TURBO cells on top of FAST");
+              ("matching receipts enable all four TURBO cells on top of FAST: " + qp::describe(*admitted)).c_str());
         check(resolve(regime, {{"decode_attn8", "off"}})->find("kv_fp8")->value == "native", "off switch disables the paired default");
         auto different_work = regime;
         different_work.cost_device = "another product with the same sm_120";
@@ -377,18 +404,19 @@ int main() {
         gates[1].tier = Name::fast;
         check(resolve(regime)->find("kv_fp8")->value == "native", "paired default needs both TURBO records");
         gates[1].tier = Name::turbo;
-        check(resolve(regime)->find("kv_fp8")->value == "fp8", "a valid joint receipt admits the pair again");
+        check(resolve(regime)->find("kv_fp8")->value == "fp8",
+              ("a valid joint receipt admits the pair again: " + resolve(regime)->find("kv_fp8")->ladder).c_str());
         {   // r32 P1-a: a refused pair leaves both halves exactly as the standalone FAST resolution (qualified FAST reader).
             std::vector<qp::Qualified> reader(std::begin(qp::qualified), std::end(qp::qualified));
             reader.push_back({regime.weights, regime.route,
                               {"decode_attn8", "", 0, p::kNoPromptBound, "fixture FAST reader receipt"}});
-            const std::string reader_reference = qp::resolve(Name::fast, regime, {}, reader)->find("decode_attn8")->ladder_reference;
-            check(reader_reference.starts_with("ladder-arm/v2;"), "Qwen dense reports the FAST reader reference");
+            const std::string fast_reader_reference = qp::resolve(Name::fast, regime, {}, reader)->find("decode_attn8")->ladder_reference;
+            check(fast_reader_reference.starts_with("ladder-arm/v2;"), "Qwen dense reports the FAST reader reference");
             const auto fast_reader = [&](Name tier) {
                 std::vector<p::LadderRow> ladder(gains.begin(), gains.end());  // the evidence as it stands now
                 ladder.push_back({"decode_attn8", "on", Name::fast, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
                                   1.05, 0.01, "fixture FAST reader gain"});
-                ladder.back().over = reader_reference;
+                ladder.back().over = fast_reader_reference;
                 const qp::TurboEvidence reader_evidence[] = {{regime.weights, regime.route, "fixture", gates, ladder}};
                 return qp::resolve(tier, regime, {}, reader, reader_evidence);
             };
@@ -521,7 +549,7 @@ int main() {
                                   1.04, 0.01, "fixture timing"}};
         // Measured over the reference that runs under the cell (LadderArms::over).
         const std::string hid_reference = extended->find("prefill_hid")->ladder_reference;
-        check(hid_reference.starts_with("ladder-arm/v2;"), "Qwen dense reports the prefill_hid reference: " + hid_reference);
+        check(hid_reference.starts_with("ladder-arm/v2;"), ("Qwen dense reports the prefill_hid reference: " + hid_reference).c_str());
         timing[0].over = hid_reference;
         const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, {}, {}, timing}};
         check(lever_value(*qp::resolve(Name::fast, regime, {}, rows, evidence), "prefill_hid") == "bf16",

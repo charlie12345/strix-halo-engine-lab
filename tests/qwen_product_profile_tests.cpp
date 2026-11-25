@@ -1,5 +1,6 @@
 #include "../apps/qwen_effective_config.hpp"
 #include "strix/session_state_cache.hpp"
+#include <array>
 #include <iostream>
 #include <map>
 #ifndef _WIN32
@@ -142,15 +143,24 @@ void resolver() {
     auto r = pr::resolve(pr::Name::fast, inputs, synthetic);
     check(r.find("ready")->status == pr::Status::set, "ready row applies");
     check(r.find("pending")->status == pr::Status::pending && r.find("absent")->status == pr::Status::pending, "pending never refuses");
-    // Ladder rule: --allow-pending runs a runnable pending cell only in a regime where a timing row shows its gain.
+    // Ladder rule (shared benchmark contract): --allow-pending runs a runnable pending cell stamped unqualified where no
+    // timing row decides the regime, and never where a matching row measured it slower or within noise.
     inputs.allow_pending = true;
     inputs.regime = {::strix::profile::Phase::prefill, 8, 1, "fixture"};
     r = pr::resolve(pr::Name::fast, inputs, synthetic);
-    check(r.find("pending")->status == pr::Status::pending && r.find("absent")->status == pr::Status::pending,
-          "allow-pending without a timing row keeps the cell pending");
-    const ::strix::profile::LadderRow timing{"pending", "1", ::strix::profile::Name::fast, ::strix::profile::Phase::prefill,
-                                             "fixture", 8, 8, 1, 1, 1.1, 0.01, "host fixture"};
+    check(r.find("pending")->status == pr::Status::unqualified && r.find("absent")->status == pr::Status::pending,
+          "allow-pending without a timing row runs the runnable cell as an unqualified benchmark");
+    ::strix::profile::LadderRow timing{"pending", "1", ::strix::profile::Name::fast, ::strix::profile::Phase::prefill,
+                                       "fixture", 8, 8, 1, 1, 0.90, 0.01, "host fixture"};
+    const std::string pending_reference = r.find("pending")->ladder_reference;  // the execution the row is measured over
+    timing.over = pending_reference;
     const std::span<const ::strix::profile::LadderRow> timed(&timing, 1);
+    check(pr::resolve(pr::Name::fast, inputs, synthetic, timed).find("pending")->status == pr::Status::pending,
+          "allow-pending never runs a cell measured slower");
+    timing.speedup = 1.005;
+    check(pr::resolve(pr::Name::fast, inputs, synthetic, timed).find("pending")->status == pr::Status::pending,
+          "allow-pending never runs a cell measured within noise");
+    timing.speedup = 1.1;
     r = pr::resolve(pr::Name::fast, inputs, synthetic, timed);
     check(r.find("pending")->status == pr::Status::unqualified && r.find("absent")->status == pr::Status::pending, "only runnable pending applies");
     check(r.qualification() == "unqualified: pending", "unqualified stamp names executed rows");
@@ -194,10 +204,28 @@ void provisional_resolution() {
     pr::Inputs inputs{{}, lookup(env), true};
     // Ladder rule: both lossy cells run in the measured regime of their timing rows.
     inputs.regime = {::strix::profile::Phase::prefill, 8, 1, "fixture"};
-    constexpr ::strix::profile::LadderRow measured[] = {
+    std::array<::strix::profile::LadderRow, 3> measured{{
         {"pending", "1", ::strix::profile::Name::fast, ::strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "host fixture"},
         {"provisional", "1", ::strix::profile::Name::fast, ::strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01,
-         "host fixture"}};
+         "host fixture (pending cell runs)"},
+        {"provisional", "1", ::strix::profile::Name::fast, ::strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01,
+         "host fixture (pending cell at builtin)"}}};
+    // Each row names the execution it was measured over (LadderArms::over); cells of one tier compose in table order.
+    // With --allow-pending the pending cell runs before provisional, so provisional is timed over both executions.
+    std::array<std::string, 3> references{};
+    const auto bind = [&](bool allow, std::size_t first, std::size_t last) {
+        inputs.allow_pending = allow;
+        for (std::size_t pass = 0; pass < measured.size(); ++pass) {
+            const auto unmeasured = pr::resolve(pr::Name::fast, inputs, rows, measured);
+            for (std::size_t i = first; i < last; ++i) {
+                const auto* entry = unmeasured.find(measured[i].lever);
+                references[i] = entry ? entry->ladder_reference : std::string();
+                measured[i].over = references[i];
+            }
+        }
+    };
+    bind(false, 2, 3);
+    bind(true, 0, 2);
     const auto mixed = pr::resolve(pr::Name::fast, inputs, rows, measured);
     check(mixed.qualification() == "qualification in progress: provisional; unqualified: pending",
         "mixed qualification deterministically reports provisional then unqualified rows");
@@ -205,8 +233,11 @@ void provisional_resolution() {
     check(pr::resolve(pr::Name::fast, inputs, rows, measured).json() == mixed.json(), "mixed provenance survives resolution");
     env.clear(); inputs.allow_pending = false;
     const auto automatic = pr::resolve(pr::Name::fast, inputs, rows, measured);
+    const std::string statuses = std::string(pr::status_name(automatic.find("provisional")->status)) + "/" +
+                                 std::string(pr::status_name(automatic.find("pending")->status)) + " " +
+                                 automatic.find("provisional")->ladder;
     check(automatic.find("provisional")->status == pr::Status::provisional &&
-        automatic.find("pending")->status == pr::Status::pending, "provisional does not enable pending rows");
+        automatic.find("pending")->status == pr::Status::pending, ("provisional does not enable pending rows: " + statuses).c_str());
     rows.back().runnable[1] = false;
     check(pr::resolve(pr::Name::fast, inputs, rows, measured).find("provisional")->status == pr::Status::pending,
         "provisional still requires runnable code");

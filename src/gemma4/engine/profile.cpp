@@ -314,7 +314,7 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
                 return asset ? std::string_view(*asset) : std::string_view(lever.builtin);
             }
             return std::nullopt;
-        });
+        }, out.allow_pending);
     for (const auto& lever : levers) {
         if (!(lever.apps & unsigned(app))) continue;
         const auto& wanted = lever.value[column];

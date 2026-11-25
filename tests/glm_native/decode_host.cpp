@@ -1086,12 +1086,19 @@ void profile_tests(){
     check(bench.qualification()=="unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,mtp_self_spec,lookup_drafts,prefill_tile_large","the receipt is stamped unqualified");
     {
         namespace shared = strix::profile;
-        const shared::LadderRow timing{"prefill_tile_large", "8192", shared::Name::fast, shared::Phase::prefill,
-                                        "fixture", 8192, 8192, 1, 1, 1.10, 0.02, "fixture timing"};
+        shared::LadderRow timing{"prefill_tile_large", "8192", shared::Name::fast, shared::Phase::prefill,
+                                  "fixture", 8192, 8192, 1, 1, 1.10, 0.02, "fixture timing"};
         rp::Inputs measured;
         measured.args = {"--profile", "fast", "--allow-pending"};
         measured.env = lookup({});
         measured.regime = {shared::Phase::prefill, 8192, 1, "fixture"};
+        // The row is measured over the execution that runs under the cell (LadderArms::over), the --allow-pending
+        // benchmark cells included.
+        const auto unmeasured = rp::resolve(rp::App::decode_service, measured);
+        const auto* unmeasured_tile = unmeasured.find("prefill_tile_large");
+        const std::string tile_reference = unmeasured_tile ? unmeasured_tile->ladder_reference : std::string();
+        check(tile_reference.starts_with("ladder-arm/v2;"), "GLM reports the reference of the tile cell");
+        timing.over = tile_reference;
         measured.ladder = std::span(&timing, 1);
         const auto experiment = rp::resolve(rp::App::decode_service, measured);
         const auto* tile = experiment.find("prefill_tile_large");

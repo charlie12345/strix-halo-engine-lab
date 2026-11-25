@@ -273,7 +273,8 @@ void cuda_cli_server() {
     request.profile = p::Name::fast;
     // The reference the adapter runs under the cell (LadderArms::over): the row is measured over it.
     const auto reference_of = [&](std::string_view lever) {
-        const auto* entry = qo::resolve(request, qo::Entry::cli).resolution.find(lever);
+        const auto resolved = qo::resolve(request, qo::Entry::cli);  // the entry lives in this resolution
+        const auto* entry = resolved.resolution.find(lever);
         return entry ? entry->ladder_reference : std::string();
     };
     request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture"};
@@ -303,8 +304,9 @@ void cuda_cli_server() {
     request.inputs.max_prompt_tokens = 4096;
     request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture"};
     const std::string route_reference = reference_of("moe_route_bf16");
-    require(route_reference.find("expert_fast=off") != std::string::npos,
-            "the explicit expert_fast=off is part of the reference: " + route_reference);
+    // The explicit switch is spelled as the lever's off value; the lever runs after the judged cell, at the tier below.
+    require(route_reference.find(",expert_fast=0,") != std::string::npos,
+            "the explicit expert_fast=off is part of the reference as its off value: " + route_reference);
     candidate.over = route_reference;
     request.inputs.ladder = std::span(&candidate, 1);
     const auto profile_selects_storage = [](const qo::Resolved& r) {
@@ -803,6 +805,32 @@ void bound_evidence() {
         const auto both = run(joint_wins, p::Name::turbo, at4k);
         require(value_of(both, kLever) == "a4" && value_of(both, kSecond) == "b4",
                 "a combination measured over the first cell runs both");
+    }
+    {
+        // An --allow-pending benchmark cell runs, so it is part of the reference of every later cell: a FAST row
+        // measured over the default execution (the pending cell at its builtin) does not qualify the later cell there.
+        constexpr std::string_view kLater = "fixture-later@1";
+        std::array<p::Lever, 2> table{kRows[0], kRows[0]};
+        table[0].value = {"", "a8", "", ""};
+        table[0].ready = {true, false, false, true};
+        table[0].target = "fixture pending";
+        table[1].name = kLater;
+        table[1].env = "STRIX_FIXTURE_LATER";
+        table[1].value = {"", "b8", "", ""};
+        const std::array rows{measured_over({kLater, "b8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
+                                             1.10, 0.02, "r/b8-over-default"},
+                                            "ladder-arm/v2;fixture-w4a4@1=off,fixture-later@1=off")};
+        const p::Engine engine{"benchmark-arm", "", table, false, "benchmark-arm-v1", {}, {}, rows};
+        const auto plain = run(engine, p::Name::fast, at4k);
+        require(value_of(plain, kLever) == "off" && plain.find(kLater)->status == p::Status::set &&
+                    value_of(plain, kLater) == "b8",
+                "the row over the default execution qualifies the later cell: " + route_of(plain, kLater));
+        const auto bench = run(engine, p::Name::fast, at4k, {}, true);
+        require(value_of(bench, kLever) == "a8" && bench.find(kLever)->status == p::Status::unqualified,
+                "--allow-pending runs the pending cell as an unqualified benchmark");
+        require(bench.find(kLater)->ladder_reference == "ladder-arm/v2;fixture-w4a4@1=a8,fixture-later@1=off" &&
+                    bench.find(kLater)->status != p::Status::set,
+                "the benchmark cell is part of the later cell's reference: " + route_of(bench, kLater));
     }
 }
 }  // namespace

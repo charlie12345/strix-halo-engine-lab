@@ -50,7 +50,8 @@ int main() try {
         Kind::bit_changing, {}, {false, true, false}, "candidate", "0", "pending"};
     const std::array table{pending};
     constexpr Regime measured{Phase::prefill, 8, 1, "fixture"};
-    const LadderRow timing{"item", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
+    const LadderRow timing{"item", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                           false, {}, {}, "ladder-arm/v2;item=0"};
     const Engine engine{"test", "ALLOW", table, false, {}, {}, {}, std::span(&timing, 1)};
     Inputs inputs;
     inputs.env = env;
@@ -207,7 +208,8 @@ int main() try {
                   .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false}, .target = "x",
                   .off = "", .source = "gate pending"},
         };
-        static constexpr LadderRow applied_timing{"applied", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
+        static constexpr LadderRow applied_timing{"applied", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                                                  false, {}, {}, "ladder-arm/v2;applied=0,waiting=0"};
         in.regime = measured;
         static constexpr Engine two{.tag = "two-engine", .allow_env = "STRIX_TEST_ALLOW", .table = rows,
                                     .quality_rows = false, .turbo_version = "two-turbo-v1", .ladder = std::span(&applied_timing, 1)};
@@ -261,7 +263,8 @@ int main() try {
                       .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false},
                       .runnable = {true, true, true, true}, .target = "x", .off = "", .source = "gate pending"},
             };
-            static constexpr LadderRow candidate_timing{"runnable", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
+            static constexpr LadderRow candidate_timing{"runnable", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                                                          false, {}, {}, "ladder-arm/v2;runnable=0"};
             static constexpr Engine unqualified{.tag = "unq-engine", .allow_env = "STRIX_TEST_ALLOW",
                                                 .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1", .ladder = std::span(&candidate_timing, 1)};
             Inputs pending_in = in;

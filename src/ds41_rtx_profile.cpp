@@ -334,7 +334,7 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
             const auto& chosen = selections[static_cast<std::size_t>(&lever - table.data())].value;
             if (chosen.source == strix::profile::DefaultSource::on) return std::nullopt;
             return std::string_view(chosen.value);
-        });
+        }, allow_pending);
     for (const auto& lever : table) {
         if (!(lever.apps & unsigned(app))) continue;
         Entry entry{&lever, {}, Status::profile, {}};

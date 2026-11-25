@@ -972,10 +972,11 @@ template <class Row, class Admission>
 // admission and `explicit_of(lever)` its explicit CLI / env setting of the lever (std::nullopt: none), which runs in
 // every tier; the "off" alias is spelled as the lever's off value. Tiers resolve bottom up and, within a tier, in
 // table order, so every cell is judged over the reference that actually runs under it (LadderArms::over()).
+// `allow_pending` is the run's --allow-pending: an unqualified benchmark cell it runs is part of the reference too.
 template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
 [[nodiscard]] inline LadderArms ladder_arms(std::span<const Row> table, std::span<const LadderRow> rows,
                                             const Regime& regime, const AdmitOf& admit_of,
-                                            const ExplicitOf& explicit_of = {}) {
+                                            const ExplicitOf& explicit_of = {}, bool allow_pending = false) {
     LadderArms arms;
     for (const auto& lever : table) arms.levers.emplace_back(lever.name);
     for (const Name tier : {Name::standard, Name::fast, Name::turbo}) {
@@ -987,8 +988,8 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
                 // The "off" alias switches the lever off: it runs the lever's own off value.
                 if constexpr (requires { lever.off; })
                     if (value == "off" && !lever.off.empty()) value = lever.off;
-            } else value = ladder_cell(lever, rows, tier, regime, [&](unsigned c) { return admit_of(lever, c); }, false,
-                                     arms).value;
+            } else value = ladder_cell(lever, rows, tier, regime, [&](unsigned c) { return admit_of(lever, c); },
+                                     allow_pending, arms).value;
             values.emplace_back(value);
         }
     }
@@ -1110,7 +1111,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             for (const auto& [key, value] : inputs.cli) if (key == lever.name) return std::string_view(value);
             if (const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env)) return env;
             return std::nullopt;
-        });
+        }, out.allow_pending);
     for (const auto& lever : engine.table) {
         const auto column = value_column(lever, profile_column);
         const std::string* cli = nullptr;

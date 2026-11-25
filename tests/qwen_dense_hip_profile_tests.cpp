@@ -65,9 +65,15 @@ int main() {
         require(put == std::vector<std::pair<std::string, std::string>>{{"STRIX_DENSE_A4W4_LAYERS", "48-63"}},
                 "fast exports exactly STRIX_DENSE_A4W4_LAYERS=48-63");
         put.clear();
-        const sp::LadderRow timing{"a4w4_layers", "48-63", sp::Name::fast, sp::Phase::prefill, "fixture",
-                                   8192, 8192, 1, 1, 1.04, 0.01, "fixture"};
+        sp::LadderRow timing{"a4w4_layers", "48-63", sp::Name::fast, sp::Phase::prefill, "fixture",
+                             8192, 8192, 1, 1, 1.04, 0.01, "fixture"};
         auto engine = hp::engine(app);
+        // The row is measured over the execution that runs under the cell (LadderArms::over).
+        const auto granted = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture"});
+        const auto* granted_entry = granted.resolution.find("a4w4_layers");
+        const std::string reference = granted_entry ? granted_entry->ladder_reference : std::string();
+        require(reference.starts_with("ladder-arm/v2;"), "Qwen dense HIP reports the reference of the layer table");
+        timing.over = reference;
         engine.ladder = std::span(&timing, 1);
         const auto measured = hp::resolve_args(engine, with_fast, no_env, {sp::Phase::prefill, 8192, 1, "fixture"});
         sp::apply(measured.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });

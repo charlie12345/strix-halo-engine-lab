@@ -47,13 +47,16 @@ constexpr p::Lever kRows[] = {
 };
 constexpr p::Regime kRegime{p::Phase::prefill, 8, 1, "fixture"};
 constexpr p::LadderRow kTiming[] = {
-    {"flash", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
-    // TURBO rows were measured over the FAST arm that runs in the regime (LadderRow::over).
+    // Every row names the execution it was measured over (LadderRow::over): the levers before it at its tier (cells of
+    // one tier compose in table order), itself and the later levers at the tier below.
+    {"flash", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
+     "ladder-arm/v2;flash=0,replay=256,dense=0,head=default"},
     {"replay", "128", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "flash=1,dense=1"},
-    {"dense", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture"},
+     "ladder-arm/v2;flash=1,replay=256,dense=1,head=default"},
+    {"dense", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
+     "ladder-arm/v2;flash=1,replay=256,dense=0,head=default"},
     {"dense", "0", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "flash=1,dense=1"},
+     "ladder-arm/v2;flash=1,replay=128,dense=1,head=default"},
 };
 const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, kTiming};
 const p::Engine kNoTurbo{"no-turbo-fixture", "", kRows, false};

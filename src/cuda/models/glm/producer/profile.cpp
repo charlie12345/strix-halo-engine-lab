@@ -318,7 +318,7 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
             if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
             if (const auto set = cli_value(lever)) return set;
             return env_value(lever);
-        });
+        }, allow_pending);
     for (const auto& lever : table) {
         if (!(lever.apps & unsigned(app))) continue;
         Entry entry{&lever, {}, Status::profile, {}};

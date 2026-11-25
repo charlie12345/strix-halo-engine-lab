@@ -200,7 +200,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
             if (env && !inherited_env(lever, env)) return env;
             return std::nullopt;
-        });
+        }, allow_pending);
     for (const auto& lever : rows) {
         const auto column = ::strix::profile::value_column(lever, profile);  // empty turbo cell: the fast cell
         const std::string* cli = nullptr;

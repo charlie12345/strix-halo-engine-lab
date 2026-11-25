@@ -541,14 +541,20 @@ void test_profile() {
         }};
         constexpr pr::Regime measured{pr::Phase::prefill, 4096, 1, "fixture"};
         // Each row names the reference it was measured over (every lever, explicit settings included): env_ready is
-        // timed with and without the explicit --rows 2048, cli_ready over the FAST env_ready.
+        // timed with the explicit --rows 2048, with the explicit --rows 8192 (the profile's own cell, which an explicit
+        // setting also holds in the arm below) and without, cli_ready over the FAST env_ready, without and with the
+        // --allow-pending benchmark cell env_pending (which runs before it).
         constexpr std::array timing{
             pr::LadderRow{"env_ready", "1", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02,
                           "fixture/env-rows2048", false, {}, {}, "ladder-arm/v2;env_ready=0,env_pending=0,cli_ready=2048"},
             pr::LadderRow{"env_ready", "1", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02,
+                          "fixture/env-rows8192", false, {}, {}, "ladder-arm/v2;env_ready=0,env_pending=0,cli_ready=8192"},
+            pr::LadderRow{"env_ready", "1", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02,
                           "fixture/env", false, {}, {}, "ladder-arm/v2;env_ready=0,env_pending=0,cli_ready=4096"},
             pr::LadderRow{"cli_ready", "8192", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02,
-                          "fixture/cli", false, {}, {}, "ladder-arm/v2;env_ready=1,env_pending=0,cli_ready=4096"}};
+                          "fixture/cli", false, {}, {}, "ladder-arm/v2;env_ready=1,env_pending=0,cli_ready=4096"},
+            pr::LadderRow{"cli_ready", "8192", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02,
+                          "fixture/cli-with-pending", false, {}, {}, "ladder-arm/v2;env_ready=1,env_pending=1,cli_ready=4096"}};
         const pr::Engine engine{"test-pair", "X_ALLOW", table, false, {}, {}, {}, timing};
         std::map<std::string, std::string> env;
         const auto lookup = [&](const char* n) -> const char* { const auto it = env.find(n); return it == env.end() ? nullptr : it->second.c_str(); };
@@ -601,7 +607,8 @@ void test_profile() {
         const auto rf = pr::resolve(engine, fast_in), rd0 = pr::resolve(engine, default_in), ra = pr::resolve(engine, allow_in),
                    rx = pr::resolve(engine, explicit_in);
         check(pair_check(rf, rf) && pair_check(rd0, rd0), "same profile on both ranks: agree");
-        check(pair_check(rf, rx), "an explicit value equal to the profile's is the same run");
+        // The explicit value runs in every tier, so env_ready is decided by the row measured with --rows 8192.
+        check(pair_check(rf, rx), "an explicit value equal to the profile's is the same run (its own matching receipt)");
         check(!pair_check(rf, rd0) && !pair_check(rf, ra), "fast vs default, or --allow-pending on one rank only: refused");
         bool threw = false;
         std::vector<std::string> typo{"m", "--profile", "fastt"};

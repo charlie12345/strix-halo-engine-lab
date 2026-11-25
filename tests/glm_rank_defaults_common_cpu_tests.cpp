@@ -198,14 +198,18 @@ void test_common_profile_admission() {
         rows[4].provisional[1] = true;
         return rows;
     }();
-    // Each row names its reference (every lever in table order; cells earlier in the table at FAST).
+    // Each row names its reference (every lever in table order; cells earlier in the table at FAST). provisional is
+    // timed over the default FAST execution and over the --allow-pending one, where the pending cell runs before it.
     constexpr std::array timing{
         profile::LadderRow{"qualified", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
                            1, 4096, 1, 1, 1.10, 0.02, "fixture/qualified", false, {}, {},
                            "ladder-arm/v2;qualified=0,pending=0,unavailable=0,provisional=0,provisional-unavailable=0"},
         profile::LadderRow{"provisional", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
                            1, 4096, 1, 1, 1.10, 0.02, "fixture/provisional", false, {}, {},
-                           "ladder-arm/v2;qualified=1,pending=0,unavailable=0,provisional=0,provisional-unavailable=0"}};
+                           "ladder-arm/v2;qualified=1,pending=0,unavailable=0,provisional=0,provisional-unavailable=0"},
+        profile::LadderRow{"provisional", "1", profile::Name::fast, profile::Phase::prefill, "fixture",
+                           1, 4096, 1, 1, 1.10, 0.02, "fixture/provisional-with-pending", false, {}, {},
+                           "ladder-arm/v2;qualified=1,pending=1,unavailable=0,provisional=0,provisional-unavailable=0"}};
     const profile::Engine engine{"glm-host-test", "ALLOW_PENDING", levers, false, {}, {}, {}, timing};
     const Env absent;
     profile::Inputs input;

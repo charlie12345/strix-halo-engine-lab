@@ -19,6 +19,8 @@
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
 #include <algorithm>
+#include <array>
+#include <string>
 #include <iostream>
 #include <fstream>
 #include "strix/prompt_terminal_diagnostics.hpp"
@@ -158,12 +160,21 @@ qwen::profile::Inputs measured_profile(qwen::profile::Inputs inputs = {}) {
     using strix::profile::LadderRow;
     using strix::profile::Name;
     using strix::profile::Phase;
-    constexpr static LadderRow rows[] = {
+    static std::array<LadderRow, 3> rows{{
         {"qsa_budget", "1536", Name::fast, Phase::prefill, "fixture", 1, 1, 1, 1, 1.1, 0.01, "fixture"},
         {"moe_route_bf16", "1", Name::fast, Phase::prefill, "fixture", 1, 1, 1, 1, 1.1, 0.01, "fixture"},
         {"gdn_fp16_chunk", "1", Name::fast, Phase::prefill, "fixture", 1, 1, 1, 1, 1.1, 0.01, "fixture"},
-    };
+    }};
+    // Each row names the execution it was measured over (LadderArms::over) under these inputs.
+    static std::array<std::string, 3> references{};
     inputs.regime = {Phase::prefill, 1, 1, "fixture"};
+    inputs.ladder = {};
+    const auto unmeasured = qwen::profile::resolve(Name::fast, inputs);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto* entry = unmeasured.find(rows[i].lever);
+        references[i] = entry ? entry->ladder_reference : std::string();
+        rows[i].over = references[i];
+    }
     inputs.ladder = rows;
     return inputs;
 }

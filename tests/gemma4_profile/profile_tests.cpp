@@ -77,10 +77,13 @@ void synthetic_table() {
     }
     check(status(r, "route") == pr::Status::pending && value(r, "route") == "a",
           "ready route declines outside a measured regime");
-    const strix::profile::LadderRow route_timing{"route", "b", pr::Name::fast, strix::profile::Phase::prefill,
-                                                "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/route"};
+    strix::profile::LadderRow route_timing{"route", "b", pr::Name::fast, strix::profile::Phase::prefill,
+                                          "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/route"};
     auto measured = in();
     measured.regime = {strix::profile::Phase::prefill, 4096, 1, "fixture"};
+    // The row is measured over the reference the adapter runs under the cell (LadderArms::over).
+    route_timing.over = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic).find("route")->ladder_reference;
+    check(route_timing.over.starts_with("ladder-arm/v2;"), "Gemma reports the reference of the route cell");
     measured.ladder = std::span(&route_timing, 1);
     r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic);
     check(status(r, "route") == pr::Status::set && value(r, "route") == "b" && r.active("route"), "fast sets ready lever");
@@ -316,9 +319,12 @@ void product_table() {
         check(status(r, "decode_attention") == pr::Status::unqualified && value(r, "decode_attention") == "g4-dattn-f2",
               "allow-pending runs g4-dattn-f2 unqualified");
         namespace shared = strix::profile;
-        const shared::LadderRow timing{"decode_attention", "g4-dattn-f2", shared::Name::fast, shared::Phase::decode,
-                                        "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture timing"};
+        shared::LadderRow timing{"decode_attention", "g4-dattn-f2", shared::Name::fast, shared::Phase::decode,
+                                  "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture timing"};
         pending_ok.regime = {shared::Phase::decode, 4096, 1, "fixture"};
+        const std::string reference = pr::resolve(pr::Name::fast, app, pending_ok).find("decode_attention")->ladder_reference;
+        check(reference.starts_with("ladder-arm/v2;"), "Gemma reports the decode attention reference");
+        timing.over = reference;
         pending_ok.ladder = std::span(&timing, 1);
         r = pr::resolve(pr::Name::fast, app, pending_ok);
         check(status(r, "decode_attention") == pr::Status::unqualified &&

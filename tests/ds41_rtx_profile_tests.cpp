@@ -178,16 +178,34 @@ int main() {
     CHECK(value(syn({}, false, pf::Name::standard), "ready_lever") == "off");
     CHECK(status(syn({}, false), "runnable_pending") == "pending" && value(syn({}, false), "runnable_pending") == "off");
     CHECK(syn({}, false).qualification() == "qualified");
-    // Ladder rule: --allow-pending runs a runnable pending cell only in a regime where a timing row shows its gain.
-    CHECK(status(syn({}, true), "runnable_pending") == "pending" && value(syn({}, true), "runnable_pending") == "off");
-    CHECK(syn({}, true).qualification() == "qualified");
+    // Ladder rule (the shared resolver's contract): --allow-pending runs a runnable pending cell as an unqualified
+    // benchmark arm where no timing row decides the regime, and where a timing row shows its gain; never where a row
+    // measured it slower or within noise.
+    CHECK(status(syn({}, true), "runnable_pending") == "unqualified" && value(syn({}, true), "runnable_pending") == "on");
+    CHECK(syn({}, true).qualification() == "unqualified: runnable_pending");
     {
-        const strix::profile::LadderRow timing{"runnable_pending", "on", strix::profile::Name::fast,
-                                               strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test"};
-        auto measured = in({});
-        measured.regime = {strix::profile::Phase::prefill, 8, 1, "fixture"};
-        measured.ladder = std::span(&timing, 1);
-        const auto r = pf::resolve(pf::Name::fast, true, pf::App::replica, std::move(measured), synthetic);
+        // The reference the FAST cell is measured over: ready_lever (exact, earlier in the table) already at FAST.
+        constexpr std::string_view over = "ladder-arm/v2;ready_lever=on,runnable_pending=off";
+        const auto timed = [&](double speedup, double noise) {
+            strix::profile::LadderRow row{"runnable_pending", "on", strix::profile::Name::fast,
+                                          strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, speedup, noise, "test"};
+            row.over = over;
+            return row;
+        };
+        const auto run_with = [&](const strix::profile::LadderRow& timing) {
+            auto measured = in({});
+            measured.regime = {strix::profile::Phase::prefill, 8, 1, "fixture"};
+            measured.ladder = std::span(&timing, 1);
+            return pf::resolve(pf::Name::fast, true, pf::App::replica, std::move(measured), synthetic);
+        };
+        const auto slower = timed(0.90, 0.01), noise = timed(1.005, 0.01);
+        for (const auto* refused : {&slower, &noise}) {
+            const auto r = run_with(*refused);
+            CHECK(status(r, "runnable_pending") == "pending" && value(r, "runnable_pending") == "off");
+            CHECK(r.qualification() == "qualified");
+        }
+        const auto gain = timed(1.1, 0.01);
+        const auto r = run_with(gain);
         CHECK(status(r, "runnable_pending") == "unqualified" && value(r, "runnable_pending") == "on");
         CHECK(r.qualification() == "unqualified: runnable_pending");
     }

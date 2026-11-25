@@ -62,6 +62,7 @@ struct Entry {
     Status status = Status::set;
     std::string target{}; // pending: the declared target that is not applied yet
     std::string ladder{};
+    std::string ladder_reference{};  // the reference its timing rows must name (LadderRow::over)
 };
 struct Resolution {
     Name name = Name::standard;

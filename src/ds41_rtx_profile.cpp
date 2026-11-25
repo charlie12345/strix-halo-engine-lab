@@ -355,8 +355,18 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
             };
             const auto admission = admit(column);
             auto cell = strix::profile::select_profile_cell(lever, inputs.ladder, profile, inputs.regime, admit,
-                                                            false, arms);
+                                                            allow_pending, arms);
             entry.ladder = std::move(cell.route);
+            entry.ladder_reference = std::move(cell.reference);
+            if (cell.benchmark) {
+                // --allow-pending where no timing row decides the regime: the cell runs as an unqualified benchmark
+                // arm (the shared resolver's rule); a measured slower or within-noise row never reaches here.
+                entry.value = cell.value;
+                entry.wanted = std::string(wanted);
+                entry.status = Status::unqualified;
+                out.entries.push_back(std::move(entry));
+                continue;
+            }
             // The ladder ran a lower cell: the status is that cell's admission (the builtin: pending, with the
             // wanted cell named). Otherwise the column's own admission stands, as before the ladder rule.
             const bool lowered = !entry.ladder.empty() && cell.value != wanted;

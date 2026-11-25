@@ -56,23 +56,32 @@ int main() {
     ok &= check(weight::hip_clang_compiler_id("20.0.0") == "hip-clang-20.0.0", "HIP toolkit id without a commit");
     weight::WeightLoadScope scope{weight::Backend::hip, "gfx1151", toolkit, "resident", impl, checkpoint};
     // The point lookup takes the ladder's timing decision: a row selects with a measured gain beyond noise.
+    // Every point lookup below names a known regime: an unknown context or lane count never selects (see below).
+    constexpr weight::WeightLoadExtent known{4096, 1};
     const weight::WeightLoadEvidence point_timing{"receipts/timing", "2026-11-24", 16, 0, 0, 1.10, 0.02};
     const std::array untimed_rows{weight::WeightLoadDecision{policy, scope, gate, gain}};
-    ok &= check(!weight::find_weight_load_decision(policy, scope, untimed_rows), "a gain digest without a speedup never selects");
+    ok &= check(!weight::find_weight_load_decision(policy, scope, untimed_rows, known), "a gain digest without a speedup never selects");
     const std::array rows{weight::WeightLoadDecision{policy, scope, gate, gain, point_timing}};
-    ok &= check(weight::find_weight_load_decision(policy, scope, rows) == rows.data(), "matching scope selects the row");
+    ok &= check(weight::find_weight_load_decision(policy, scope, rows, known) == rows.data(), "matching scope selects the row");
+    // Point and extent lookups share the known-endpoint rule: an unknown context or lane count (0) never selects
+    // storage, even for a winning row with unbounded bands.
+    for (const weight::WeightLoadExtent unknown : {weight::WeightLoadExtent{}, weight::WeightLoadExtent{4096, 0},
+                                                   weight::WeightLoadExtent{0, 1}}) {
+        ok &= check(!weight::find_weight_load_decision(policy, scope, rows, unknown),
+                    "an unknown point never selects an unbounded win");
+    }
     auto other = scope;
     other.build = weight::implementation_identity(bumped);
-    ok &= check(!weight::find_weight_load_decision(policy, other, rows), "row retired by a consumer revision bump");
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows, known), "row retired by a consumer revision bump");
     other.build = weight::implementation_identity({});
-    ok &= check(!weight::find_weight_load_decision(policy, other, rows), "zero implementation identity never matches");
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows, known), "zero implementation identity never matches");
     other = scope;
     other.checkpoint = gate;
-    ok &= check(!weight::find_weight_load_decision(policy, other, rows), "another checkpoint never matches");
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows, known), "another checkpoint never matches");
     const auto runtime_compiler = weight::current_compiler_id();
     other = scope;
     other.compiler_id = runtime_compiler;
-    ok &= check(!weight::find_weight_load_decision(policy, other, rows),
+    ok &= check(!weight::find_weight_load_decision(policy, other, rows, known),
                 "the runtime compiler id cannot match a HIP weight-load row");
 
     // Generic weight-load lever ids: one shared policy per role set and format; a model binds it and keeps the
@@ -116,15 +125,15 @@ int main() {
     const weight::WeightLoadEvidence timed{"receipts/timing", "2026-11-24", 16, 0, 0, 1.10, 0.02};
     const std::array renamed{weight::WeightLoadDecision{legacy, scope, gate, gain, timed},
                              weight::WeightLoadDecision{attention_head.id, scope, gate, gain, timed}};
-    ok &= check(weight::find_weight_load_decision(attention_head, scope, renamed) == renamed.data(),
+    ok &= check(weight::find_weight_load_decision(attention_head, scope, renamed, known) == renamed.data(),
                 "legacy decision row matches the generic policy");
-    ok &= check(weight::find_weight_load_decision(attention_head, scope, std::span(renamed).last(1)) == &renamed[1],
+    ok &= check(weight::find_weight_load_decision(attention_head, scope, std::span(renamed).last(1), known) == &renamed[1],
                 "generic decision row matches");
-    ok &= check(!weight::find_weight_load_decision(head, scope, renamed), "another policy never matches");
-    ok &= check(!weight::find_weight_load_decision(attention_head.id, scope, std::span(renamed).first(1)),
+    ok &= check(!weight::find_weight_load_decision(head, scope, renamed, known), "another policy never matches");
+    ok &= check(!weight::find_weight_load_decision(attention_head.id, scope, std::span(renamed).first(1), known),
                 "the plain id lookup accepts no alias");
     const std::array bumped_legacy{weight::WeightLoadDecision{{legacy.name, 2}, scope, gate, gain}};
-    ok &= check(!weight::find_weight_load_decision(attention_head, scope, bumped_legacy),
+    ok &= check(!weight::find_weight_load_decision(attention_head, scope, bumped_legacy, known),
                 "another legacy revision never matches");
 
     // The resolver and its receipt line use the generic id, whatever key the decision row was stored under.

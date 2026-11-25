@@ -351,6 +351,7 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
             auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit, out.allow_pending,
                                                             arms);
             entry.ladder = std::move(cell.route);
+            entry.ladder_reference = std::move(cell.reference);
             const auto admission = cell.benchmark ? strix::profile::Status::unqualified : admit(column);
             if ((!entry.ladder.empty() && cell.value == lever.builtin) ||
                 admission == strix::profile::Status::pending) {

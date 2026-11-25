@@ -59,20 +59,23 @@ constexpr p::LadderRow measured_over(p::LadderRow row, std::string_view arm) {
     row.over = arm;
     return row;
 }
-// The FAST arm of the fixture where its FAST cell runs (ladder_arms spelling).
-constexpr std::string_view kFastArm = "fixture-w4a4@1=a8";
+// The references of the one-lever fixture (LadderArms::over spelling): a FAST row is measured over EXACT (the builtin
+// off), a TURBO row over the FAST arm where its FAST cell runs.
+constexpr std::string_view kExactArm = "ladder-arm/v2;fixture-w4a4@1=off";
+constexpr std::string_view kFastArm = "ladder-arm/v2;fixture-w4a4@1=a8";
 
 void verdicts() {
-    constexpr p::LadderRow fast_pf{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.20, 0.02, "r/fast-pf"};
+    constexpr p::LadderRow fast_pf = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.20,
+                                                    0.02, "r/fast-pf"}, kExactArm);
     constexpr p::LadderRow turbo_pf = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 2049, 4096, 1,
                                                      1, 1.30, 0.02, "r/turbo-pf-4k"}, kFastArm);
     constexpr p::LadderRow turbo_pf_noise = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 4097,
                                                            8192, 1, 1, 1.003, 0.02, "r/turbo-pf-8k"}, kFastArm);
     // Measured where FAST is not measured (decode at 8-16 lanes): over the builtin FAST arm, which runs there.
-    constexpr p::LadderRow turbo_dec_slow{kLever, "a4", p::Name::turbo, p::Phase::decode, "dev", 1, 65536, 8, 16, 0.95,
-                                          0.02, "r/turbo-dec"};
-    constexpr p::LadderRow fast_dec_slow{kLever, "a8", p::Name::fast, p::Phase::decode, "dev", 1, 65536, 1, 1, 0.97, 0.01,
-                                         "r/fast-dec"};
+    constexpr p::LadderRow turbo_dec_slow = measured_over({kLever, "a4", p::Name::turbo, p::Phase::decode, "dev", 1, 65536, 8,
+                                                           16, 0.95, 0.02, "r/turbo-dec"}, kExactArm);
+    constexpr p::LadderRow fast_dec_slow = measured_over({kLever, "a8", p::Name::fast, p::Phase::decode, "dev", 1, 65536, 1,
+                                                          1, 0.97, 0.01, "r/fast-dec"}, kExactArm);
     constexpr p::LadderRow turbo_dec_b1 = measured_over({kLever, "a4", p::Name::turbo, p::Phase::decode, "dev", 1, 65536,
                                                          1, 1, 1.25, 0.02, "r/turbo-dec-b1"}, kFastArm);
     constexpr std::array rows{fast_pf, turbo_pf, turbo_pf_noise, turbo_dec_slow, fast_dec_slow, turbo_dec_b1};
@@ -168,9 +171,20 @@ void defects() {
         const p::Engine engine{"fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, rows};
         return p::ladder_defect(engine);
     };
-    const p::LadderRow good{kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 4096, 1, 1, 1.3, 0.02, "r"};
+    const p::LadderRow good = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 4096, 1, 1, 1.3, 0.02,
+                                             "r"}, kFastArm);
     require(defect(good).empty(), "good row");
     auto row = good;
+    row.value = {};
+    require(!defect(row).empty(), "timing row naming no value (it would match every value)");
+    row = good;
+    for (const std::string_view unbound : {std::string_view{}, std::string_view{"fixture-w4a4@1=a8"},
+                                           std::string_view{"ladder-arm/v1;fixture-w4a4@1=a8"},
+                                           std::string_view{"ladder-arm/v2"}}) {
+        row.over = unbound;
+        require(!defect(row).empty(), "timing row without a versioned reference: " + std::string(unbound));
+    }
+    row = good;
     row.lever = "missing";
     require(!defect(row).empty(), "row naming no lever");
     row = good;
@@ -204,6 +218,16 @@ void defects() {
 // test fail if a first binding can export the value before a timing receipt is registered.
 void walk(const p::Engine& registered) {
     require(p::ladder_defect(registered).empty(), p::ladder_defect(registered));
+    // Every shipped timing row names the reference that runs at its own band: a row left behind by a changed builtin,
+    // schedule or lower cell would silently stop deciding.
+    for (const auto& row : registered.ladder) {
+        if (row.incumbent || !row.joint.empty()) continue;
+        const auto actual = resolve(registered, row.tier, {row.phase, row.min_context, row.min_lanes, row.device});
+        const auto* entry = actual.find(row.lever);
+        require(entry != nullptr && entry->ladder.find("measured over another") == std::string::npos,
+                std::string(registered.tag) + "/" + std::string(row.lever) + " shipped timing row is stale (" +
+                    std::string(row.receipt) + "): reference " + (entry ? entry->ladder_reference : std::string()));
+    }
     std::vector<p::Lever> rows(registered.table.begin(), registered.table.end());
     auto engine = registered;
     engine.table = rows;
@@ -239,15 +263,24 @@ void walk(const p::Engine& registered) {
 
 void cuda_cli_server() {
     namespace qo = strix::cuda::qwen_options;
-    const p::LadderRow timing{"qsa_mma", "1", p::Name::fast, p::Phase::prefill, "fixture", 4096, 4096,
-                              1, 1, 1.02, 0.005, "fixture-qsa"};
+    p::LadderRow timing{"qsa_mma", "1", p::Name::fast, p::Phase::prefill, "fixture", 4096, 4096,
+                        1, 1, 1.02, 0.005, "fixture-qsa"};
     qo::Request request;
     request.engine.model_gguf = "model.gguf";
     request.engine.tables_dir = "tables";
     request.engine.rope_table = "rope";
     request.inputs.env = [](const char*) -> const char* { return nullptr; };
-    request.inputs.ladder = std::span(&timing, 1);
     request.profile = p::Name::fast;
+    // The reference the adapter runs under the cell (LadderArms::over): the row is measured over it.
+    const auto reference_of = [&](std::string_view lever) {
+        const auto* entry = qo::resolve(request, qo::Entry::cli).resolution.find(lever);
+        return entry ? entry->ladder_reference : std::string();
+    };
+    request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture"};
+    const std::string qsa_reference = reference_of("qsa_mma");
+    require(qsa_reference.starts_with("ladder-arm/v2;"), "Qwen CUDA reports the reference: " + qsa_reference);
+    timing.over = qsa_reference;
+    request.inputs.ladder = std::span(&timing, 1);
     for (const auto context : {4096U, 4097U}) {
         request.inputs.regime = {p::Phase::prefill, context, 1, "fixture"};
         const auto cli = qo::resolve(request, qo::Entry::cli);
@@ -262,13 +295,18 @@ void cuda_cli_server() {
     }
     // Provide evidence for a non-incumbent row through the native options adapter.
     const p::RegimeGate gate{"moe_route_bf16", "1", 4096, 4097, "fixture gate"};
-    const p::LadderRow candidate{"moe_route_bf16", "1", p::Name::fast, p::Phase::prefill, "fixture", 4096, 4096,
-                                  1, 1, 1.02, 0.005, "fixture route storage"};
+    p::LadderRow candidate{"moe_route_bf16", "1", p::Name::fast, p::Phase::prefill, "fixture", 4096, 4096,
+                           1, 1, 1.02, 0.005, "fixture route storage"};
     request.inputs.cli = {{"expert_fast", "off"}};
     request.inputs.regimes = std::span(&gate, 1);
-    request.inputs.ladder = std::span(&candidate, 1);
+    request.inputs.ladder = {};
     request.inputs.max_prompt_tokens = 4096;
     request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture"};
+    const std::string route_reference = reference_of("moe_route_bf16");
+    require(route_reference.find("expert_fast=off") != std::string::npos,
+            "the explicit expert_fast=off is part of the reference: " + route_reference);
+    candidate.over = route_reference;
+    request.inputs.ladder = std::span(&candidate, 1);
     const auto profile_selects_storage = [](const qo::Resolved& r) {
         const auto* entry = r.resolution.find("moe_route_bf16");
         return entry && entry->value == "1" && entry->status == p::Status::set;
@@ -287,8 +325,8 @@ void cuda_cli_server() {
 
 void custom_adapters() {
     constexpr p::Regime regime{p::Phase::prefill, 4096, 1, "dev"};
-    constexpr p::LadderRow sample{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
-                                 1.008, 0.002, "r/fast"};
+    constexpr p::LadderRow sample = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
+                                                   1.008, 0.002, "r/fast"}, kExactArm);
     for (unsigned probe = 0; probe < 4; ++probe) {
         auto row = sample;
         switch (probe) {
@@ -557,9 +595,13 @@ void hy4_new_quality_rows() {
             "a new quality row beyond the frozen band must leave the cell at the lower tier without a timing row");
     require(h::resolve(inside, in, rows)->find("prompt_rows")->value == "4096", "the frozen band keeps its cell");
     // Exercise the same adapter as CLI and serve, including its input shape and topology checks.
-    const h::Measured timings[]{{h::Topology::one_node,
+    h::Measured timings[]{{h::Topology::one_node,
         {"prompt_rows", "4096", p::Name::fast, p::Phase::prefill, "gfx1151", 40000, 65536, 1, 1, 1.05, 0.01,
          "fixture timing"}}};
+    // Measured over the reference the adapter runs there (LadderArms::over).
+    const std::string hy4_reference = h::resolve(beyond, in, rows)->find("prompt_rows")->ladder_reference;
+    require(hy4_reference.starts_with("ladder-arm/v2;"), "Hy4 reports the reference: " + hy4_reference);
+    timings[0].timing.over = hy4_reference;
     const auto resolved = h::resolve(beyond, in, rows, h::incumbent_grants, timings);
     require(resolved->find("prompt_rows")->value == "4096", "a matching timing row admits the new band");
     auto other = beyond;
@@ -595,7 +637,8 @@ void bound_evidence() {
         return entry ? entry->ladder : std::string();
     };
     const p::Regime at4k{p::Phase::prefill, 4096, 1, "dev"};
-    constexpr p::LadderRow fast_a8{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.20, 0.02, "r/a8"};
+    constexpr p::LadderRow fast_a8 = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.20,
+                                                    0.02, "r/a8"}, kExactArm);
     constexpr p::LadderRow turbo_a4 = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 8192, 1, 1,
                                                      1.30, 0.02, "r/a4-over-a8"}, kFastArm);
     {
@@ -606,8 +649,8 @@ void bound_evidence() {
         require(value_of(run(before, p::Name::turbo, at4k), kLever) == "a4", "TURBO row over the running FAST arm applies");
         auto requalified = kRows;
         requalified[0].value[1] = "a6";
-        constexpr p::LadderRow fast_a6{kLever, "a6", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.15, 0.02,
-                                       "r/a6"};
+        constexpr p::LadderRow fast_a6 = measured_over({kLever, "a6", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1,
+                                                        1.15, 0.02, "r/a6"}, kExactArm);
         constexpr std::array after_rows{fast_a6, turbo_a4};
         const p::Engine after{"bound", "", requalified, false, "bound-v1", {}, {}, after_rows};
         const auto res = run(after, p::Name::turbo, at4k);
@@ -617,7 +660,7 @@ void bound_evidence() {
         // Re-timed over the new FAST arm, the TURBO cell runs again.
         constexpr std::array retimed_rows{fast_a6, measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1,
                                                                   8192, 1, 1, 1.25, 0.02, "r/a4-over-a6"},
-                                                                 "fixture-w4a4@1=a6")};
+                                                                 "ladder-arm/v2;fixture-w4a4@1=a6")};
         const p::Engine retimed{"bound", "", requalified, false, "bound-v1", {}, {}, retimed_rows};
         require(value_of(run(retimed, p::Name::turbo, at4k), kLever) == "a4", "TURBO row re-timed over a6 applies");
     }
@@ -629,8 +672,9 @@ void bound_evidence() {
         table[1].name = kOther;
         table[1].env = "STRIX_FIXTURE_OTHER";
         table[1].value = {"", "on", "", ""};
-        constexpr std::string_view kBoth = "fixture-w4a4@1=a8,fixture-other@1=on";
-        const std::array rows{fast_a8, p::incumbent_cell(kOther, "on", p::Name::fast, "r/other-grant"),
+        constexpr std::string_view kBoth = "ladder-arm/v2;fixture-w4a4@1=a8,fixture-other@1=on";
+        const std::array rows{measured_over(fast_a8, "ladder-arm/v2;fixture-w4a4@1=off,fixture-other@1=off"),
+                              p::incumbent_cell(kOther, "on", p::Name::fast, "r/other-grant"),
                               measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.30,
                                              0.02, "r/a4-over-both"}, kBoth)};
         const p::Engine engine{"override", "", table, false, "override-v1", {}, {}, rows};
@@ -642,8 +686,8 @@ void bound_evidence() {
     {
         // --allow-pending runs only cells no measurement decides: measured slower / within noise stay below.
         for (const double speedup : {0.98, 1.005}) {
-            const std::array rows{p::LadderRow{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 4096, 1, 1, speedup,
-                                               0.01, "r/a8-loser"}};
+            const std::array rows{measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 4096, 1, 1, speedup,
+                                                 0.01, "r/a8-loser"}, kExactArm)};
             const p::Engine engine{"bench", "", kRows, false, "bench-v1", {}, {}, rows};
             const auto res = run(engine, p::Name::fast, at4k, {}, true);
             require(value_of(res, kLever) == "off" &&
@@ -671,6 +715,94 @@ void bound_evidence() {
         require(value_of(run(ungranted, p::Name::fast, at4k), kLever) == "a8", "the row decides once the prompt is known");
         require(value_of(run(timed, p::Name::fast, {p::Phase::prefill, 16384, 1, "dev"}), kLever) == "a8",
                 "outside the timed bands the grant keeps its cell");
+    }
+    {
+        // r51: the reference names every lever with its effective value, builtins included. A FAST row measured over
+        // the builtin off stops deciding once the builtin itself is another execution.
+        constexpr std::array rows{fast_a8};
+        const p::Engine engine{"builtin", "", kRows, false, "builtin-v1", {}, {}, rows};
+        require(value_of(run(engine, p::Name::fast, at4k), kLever) == "a8", "FAST row over the builtin off applies");
+        auto rebuilt = kRows;
+        rebuilt[0].builtin = "a2";
+        const p::Engine changed{"builtin", "", rebuilt, false, "builtin-v1", {}, {}, rows};
+        const auto res = run(changed, p::Name::fast, at4k);
+        require(value_of(res, kLever) == "a2" &&
+                    route_of(res, kLever).find("timing rows measured over another default arm") != std::string::npos,
+                "a changed builtin makes the FAST receipt stale: " + route_of(res, kLever));
+    }
+    {
+        // An exact schedule lever is part of the reference: overriding it changes the timing denominator.
+        constexpr std::string_view kSchedule = "fixture-schedule@1";
+        std::array<p::Lever, 2> table{kRows[0], kRows[0]};
+        table[1].name = kSchedule;
+        table[1].env = "STRIX_FIXTURE_SCHEDULE";
+        table[1].value = {"", "", "", ""};
+        table[1].builtin = "1";
+        table[1].off = {};
+        table[1].kind = p::Kind::exact;
+        const std::array rows{measured_over(fast_a8, "ladder-arm/v2;fixture-w4a4@1=off,fixture-schedule@1=1")};
+        const p::Engine engine{"schedule", "", table, false, "schedule-v1", {}, {}, rows};
+        require(value_of(run(engine, p::Name::fast, at4k), kLever) == "a8", "FAST row over the default schedule applies");
+        const auto res = run(engine, p::Name::fast, at4k, {{std::string(kSchedule), "2"}});
+        require(value_of(res, kLever) == "off" && value_of(res, kSchedule) == "2",
+                "an exact schedule override makes the FAST receipt stale: " + route_of(res, kLever));
+        require(res.find(kLever)->ladder_reference == "ladder-arm/v2;fixture-w4a4@1=off,fixture-schedule@1=2",
+                "the reference spells the override: " + res.find(kLever)->ladder_reference);
+    }
+    {
+        // A timing row names its value: an empty value covers no cell (it would also match a6).
+        p::LadderRow any = fast_a8;
+        any.value = {};
+        const std::array rows{any};
+        const p::Engine engine{"any", "", kRows, false, "any-v1", {}, {}, rows};
+        require(value_of(run(engine, p::Name::fast, at4k), kLever) == "off" && !p::ladder_defect(engine).empty(),
+                "an ordinary row without a value never decides and is a defect");
+    }
+    {
+        // A TURBO row explicitly measured over the builtin off applies when the FAST a8 candidate is measured slower
+        // and FAST runs off (the reference that actually runs; no projected-column recheck).
+        const std::array rows{measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 0.95,
+                                             0.01, "r/a8-loses"}, kExactArm),
+                              measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.30,
+                                             0.02, "r/a4-over-off"}, kExactArm)};
+        const p::Engine engine{"over-off", "", kRows, false, "over-off-v1", {}, {}, rows};
+        require(value_of(run(engine, p::Name::fast, at4k), kLever) == "off", "FAST a8 measured slower runs off");
+        require(value_of(run(engine, p::Name::turbo, at4k), kLever) == "a4", "TURBO row over the running off applies");
+    }
+    {
+        // Two isolated TURBO wins over the same FAST arm do not admit their unmeasured combination: cells of one tier
+        // compose in table order, so the second cell decides only on a row measured over the first.
+        constexpr std::string_view kSecond = "fixture-second@1";
+        std::array<p::Lever, 2> table{kRows[0], kRows[0]};
+        table[0].value = {"", "", "", "a4"};
+        table[1].name = kSecond;
+        table[1].env = "STRIX_FIXTURE_SECOND";
+        table[1].value = {"", "", "", "b4"};
+        constexpr std::string_view kBase = "ladder-arm/v2;fixture-w4a4@1=off,fixture-second@1=off";
+        constexpr std::string_view kWithFirst = "ladder-arm/v2;fixture-w4a4@1=a4,fixture-second@1=off";
+        const auto turbo_row = [](std::string_view lever, std::string_view value, double speedup, std::string_view over,
+                                  std::string_view receipt) {
+            return measured_over({lever, value, p::Name::turbo, p::Phase::prefill, "dev", 4096, 4096, 1, 1, speedup, 0.02,
+                                  receipt}, over);
+        };
+        const std::array isolated{turbo_row(kLever, "a4", 1.10, kBase, "r/a4-alone"),
+                                  turbo_row(kSecond, "b4", 1.10, kBase, "r/b4-alone")};
+        const p::Engine alone{"compose", "", table, false, "compose-v1", {}, {}, isolated};
+        const auto two = run(alone, p::Name::turbo, at4k);
+        require(value_of(two, kLever) == "a4" && value_of(two, kSecond) == "off" &&
+                    route_of(two, kSecond).find("timing rows measured over another fast arm") != std::string::npos,
+                "two isolated wins: only the first measured cell runs: " + route_of(two, kSecond));
+        const std::array losing{isolated[0], isolated[1], turbo_row(kSecond, "b4", 0.95, kWithFirst, "r/b4-joint-loses")};
+        const p::Engine joint_loses{"compose", "", table, false, "compose-v1", {}, {}, losing};
+        const auto lost = run(joint_loses, p::Name::turbo, at4k);
+        require(value_of(lost, kLever) == "a4" && value_of(lost, kSecond) == "off" &&
+                    route_of(lost, kSecond).find("slower") != std::string::npos,
+                "a losing joint result keeps the combination off: " + route_of(lost, kSecond));
+        const std::array winning{isolated[0], turbo_row(kSecond, "b4", 1.05, kWithFirst, "r/b4-joint-wins")};
+        const p::Engine joint_wins{"compose", "", table, false, "compose-v1", {}, {}, winning};
+        const auto both = run(joint_wins, p::Name::turbo, at4k);
+        require(value_of(both, kLever) == "a4" && value_of(both, kSecond) == "b4",
+                "a combination measured over the first cell runs both");
     }
 }
 }  // namespace

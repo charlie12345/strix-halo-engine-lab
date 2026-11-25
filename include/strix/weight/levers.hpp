@@ -137,8 +137,8 @@ struct WeightLoadEvidence {
 };
 
 // What an instance holds when it resolves its image: resident context capacity in tokens and concurrent decode lanes
-// (serial CLI: 1; server: its slot cap). 0 = unknown: context-banded rows then never apply and lane-banded gains
-// never select.
+// (serial CLI: 1; server: its slot cap). 0 = unknown: context-banded rows then never apply, and no measured gain
+// selects storage (point and extent lookups alike, unbounded bands included).
 struct WeightLoadExtent {
     std::uint32_t context = 0, lanes = 0;
 };
@@ -247,7 +247,7 @@ struct WeightLoadPlan {
 
 // A gate v2 PASS row with measured gain inside both bands for the given extent. Its receipts must come from the
 // same consumer implementation identity, checkpoint, backend, device, compiler and regime. The default extent
-// leaves context and lanes unknown, so only unbanded gains can select.
+// leaves context and lanes unknown, so no gain selects (the extent lookup's known-endpoint rule).
 const WeightLoadDecision* find_weight_load_decision(Id, const WeightLoadScope&,
                                                   std::span<const WeightLoadDecision>, WeightLoadExtent extent = {});
 // As above, also matching rows recorded under the policy's legacy id.

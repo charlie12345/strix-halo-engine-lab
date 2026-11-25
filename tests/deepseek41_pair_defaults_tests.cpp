@@ -540,9 +540,15 @@ void test_profile() {
             {"cli_ready", "", "--rows", {"", "8192", ""}, "4096", pr::Kind::bit_changing, {true, true, true}, {true, true, true}, "", "", "r2"},
         }};
         constexpr pr::Regime measured{pr::Phase::prefill, 4096, 1, "fixture"};
+        // Each row names the reference it was measured over (every lever, explicit settings included): env_ready is
+        // timed with and without the explicit --rows 2048, cli_ready over the FAST env_ready.
         constexpr std::array timing{
-            pr::LadderRow{"env_ready", "1", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/env"},
-            pr::LadderRow{"cli_ready", "8192", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/cli"}};
+            pr::LadderRow{"env_ready", "1", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02,
+                          "fixture/env-rows2048", false, {}, {}, "ladder-arm/v2;env_ready=0,env_pending=0,cli_ready=2048"},
+            pr::LadderRow{"env_ready", "1", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02,
+                          "fixture/env", false, {}, {}, "ladder-arm/v2;env_ready=0,env_pending=0,cli_ready=4096"},
+            pr::LadderRow{"cli_ready", "8192", pr::Name::fast, pr::Phase::prefill, "fixture", 4096, 4096, 1, 1, 1.10, 0.02,
+                          "fixture/cli", false, {}, {}, "ladder-arm/v2;env_ready=1,env_pending=0,cli_ready=4096"}};
         const pr::Engine engine{"test-pair", "X_ALLOW", table, false, {}, {}, {}, timing};
         std::map<std::string, std::string> env;
         const auto lookup = [&](const char* n) -> const char* { const auto it = env.find(n); return it == env.end() ? nullptr : it->second.c_str(); };

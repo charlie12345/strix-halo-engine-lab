@@ -153,12 +153,15 @@ struct LadderRow {
     // a pair. Empty: an ordinary single-cell row.
     std::string_view joint{};
     JointLadderScope joint_scope{};
-    // The lower arm an ordinary row was measured over (its denominator): the effective cells of the tier below in the
-    // regime, spelled as ladder_arms() spells them ("lever=value,..." in table order, every lossy lever whose cell is
-    // not its builtin, explicit settings included; empty: every lower cell is its builtin). The row decides only while
-    // the lower arm that runs is that arm: a newly qualified or overridden lower cell anywhere in the table makes the
-    // row stale (it no longer covers the regime). The candidate is that arm plus this one cell; cells whose gains
-    // interact are timed together on one paired row (`joint`). Paired rows bind through `joint_scope` instead.
+    // The reference execution an ordinary row was measured over (its denominator), spelled as LadderArms::over()
+    // spells it: kLadderArmVersion, then "lever=value" for EVERY lever of the table in table order (builtin values,
+    // exact schedule levers and explicit settings included), each lever before this one at the row's tier and this one
+    // and every later lever at the tier below. The candidate is that execution with this lever at `value` (which an
+    // ordinary row must name). The row decides only while the reference that runs is that spelling: a changed builtin,
+    // an exact schedule override, a newly qualified or overridden cell anywhere in the table makes the row stale (it no
+    // longer covers the regime). Cells of one tier compose in table order: a second timed cell is measured over the
+    // execution that already carries the first, so the cells a tier exports are always one measured chain. Paired rows
+    // bind through `joint_scope` instead.
     std::string_view over{};
 };
 
@@ -204,10 +207,11 @@ template <class Context, class Lanes>
                                           Name tier) noexcept {
     return row.lever == lever && (row.value.empty() || row.value == value) && row.tier == tier;
 }
-// A timing row covering the regime (incumbent grants are not timing rows).
+// A timing row covering the regime (incumbent grants are not timing rows). A timing row names its measured value: an
+// empty value never covers a cell (it would match another execution of the same lever).
 [[nodiscard]] constexpr bool ladder_covers(const LadderRow& row, std::string_view lever, std::string_view value,
                                            Name tier, const Regime& regime) noexcept {
-    return !row.incumbent && ladder_names(row, lever, value, tier) &&
+    return !row.incumbent && !row.value.empty() && ladder_names(row, lever, value, tier) &&
            row.phase == regime.phase && !row.device.empty() && row.device == regime.device &&
            ladder_band(regime.context, row.min_context, row.max_context, regime.lanes, row.min_lanes, row.max_lanes);
 }
@@ -413,6 +417,7 @@ struct Entry {
     std::string requested{};    // what the profile column or the explicit setting asked for (empty: builtin)
     std::string ladder{};       // effective tier decision for this regime
     bool ladder_lowered = false;  // the ladder ran a lower cell than the column's (its route line is a notice)
+    std::string ladder_reference{};  // the reference the deciding timing rows must name (LadderRow::over)
 };
 
 struct Inputs;
@@ -864,13 +869,47 @@ struct LadderCell {
     Name tier = Name::standard;
     std::string route;
     bool benchmark = false;
+    std::string reference{};  // LadderArms::over() of the highest judged step (what its timing rows must name)
 };
 
-// The effective lower arms of a regime (ladder_arms()): what an ordinary FAST row (`exact`) or TURBO row (`fast`)
-// names in LadderRow::over.
+// Version of the reference spelling (LadderRow::over). Bumped when the spelling rule changes, so a receipt written
+// under another rule never matches.
+inline constexpr std::string_view kLadderArmVersion = "ladder-arm/v2";
+
+// The effective executions of a regime (ladder_arms()): the value every lever of the table runs in EXACT, FAST and
+// TURBO, in table order (builtin values, exact schedule levers and explicit settings included).
 struct LadderArms {
-    std::string exact, fast;
-    [[nodiscard]] std::string_view below(Name tier) const noexcept { return tier == Name::turbo ? fast : exact; }
+    std::vector<std::string> levers;
+    std::array<std::vector<std::string>, 3> values;  // standard, fast, turbo; values[t][i] = lever i in tier t
+
+    [[nodiscard]] static constexpr std::size_t slot(Name tier) noexcept {
+        return tier == Name::turbo ? 2U : tier == Name::fast ? 1U : 0U;
+    }
+    // The reference an ordinary row of `lever` in `tier` is measured over (LadderRow::over): every lever before
+    // `lever` at `tier` (cells of one tier compose in table order), `lever` and every later lever at the tier below.
+    // Empty when `lever` is not in the table these arms were built from: no ordinary row matches it.
+    [[nodiscard]] std::string over(Name tier, std::string_view lever) const {
+        std::size_t at = levers.size();
+        for (std::size_t i = 0; i < levers.size(); ++i)
+            if (levers[i] == lever) at = i;
+        if (at == levers.size()) return {};
+        const auto& upper = values[slot(tier)];
+        const auto& lower = values[slot(tier_below(tier))];
+        std::string out(kLadderArmVersion);
+        for (std::size_t i = 0; i < levers.size(); ++i) {
+            const auto& value = i < at ? upper[i] : lower[i];
+            out.append(i == 0 ? ";" : ",").append(levers[i]).append("=").append(value);
+        }
+        return out;
+    }
+    // The whole execution of `tier` (receipts and fixtures): every lever at `tier`.
+    [[nodiscard]] std::string arm(Name tier) const {
+        std::string out(kLadderArmVersion);
+        const auto& at = values[slot(tier)];
+        for (std::size_t i = 0; i < levers.size() && i < at.size(); ++i)
+            out.append(i == 0 ? ";" : ",").append(levers[i]).append("=").append(at[i]);
+        return out;
+    }
 };
 // No explicit setting (adapters without CLI / env overrides of lossy levers).
 struct NoExplicitSetting {
@@ -903,16 +942,11 @@ template <class Row, class Admission>
     if (!eligible || (tier == Name::turbo && column == static_cast<unsigned>(Name::fast)) ||
         wanted == lower.value) return lower;
     std::string step = " " + std::string(name(tier)) + "=" + std::string(wanted) + " ";
-    const std::string_view arm = arms.below(tier);
+    // The reference that runs under this cell (the lower cell of this lever included): a row measured over any other
+    // execution is stale here.
+    const std::string reference = arms.over(tier, lever.name);
+    const std::string_view arm = reference;
     const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime, {}, {}, &arm);
-    const auto reference_column = value_column(lever, below);
-    const auto reference = lever.value[reference_column];
-    const auto expected = !reference.empty() && applied(admit(reference_column)) ? reference : lever.builtin;
-    if (verdict.rung == Rung::applies && lower.value != expected) {
-        lower.route = step + "measured over " + std::string(name(below)) + "=" +
-                      std::string(expected) + ", which does not run here" + lower.route;
-        return lower;
-    }
     step += rung_name(verdict.rung);
     if (verdict.stale) step += " (timing rows measured over another " + std::string(name(below)) + " arm)";
     if (verdict.row) {
@@ -923,28 +957,30 @@ template <class Row, class Admission>
         }
         step += " (" + std::string(verdict.row->receipt) + ")";
     }
-    if (rung_runs(verdict.rung)) return {wanted, tier, step};
+    if (rung_runs(verdict.rung)) return {wanted, tier, step, false, reference};
     // The explicit benchmark arm can collect the evidence the default needs where no measurement decides the regime.
     // It never claims qualification, and never runs a cell measured slower or within noise.
     if (tier == Name::fast && allow_pending && lever.runnable[column] && rung_unmeasured(verdict.rung))
-        return {wanted, tier, step + " (unqualified benchmark opt-in)", true};
+        return {wanted, tier, step + " (unqualified benchmark opt-in)", true, reference};
     lower.route = step + lower.route;
+    lower.reference = reference;
     return lower;
 }
 
-// The effective EXACT and FAST arms in `regime`: for every lossy lever of `table` (in table order) whose cell is not
-// its builtin, "lever=value" joined by ','. `admit_of(lever, column)` is the adapter's column admission and
-// `explicit_of(lever)` its explicit CLI / env setting of the lever (std::nullopt: none), which runs in every tier; the
-// "off" alias is spelled as the lever's off value, so switching off a lever that is off by default leaves the arm as is.
+// The effective EXACT, FAST and TURBO executions in `regime`: the value of every lever of `table` (in table order,
+// exact schedule levers and builtin values included) per tier. `admit_of(lever, column)` is the adapter's column
+// admission and `explicit_of(lever)` its explicit CLI / env setting of the lever (std::nullopt: none), which runs in
+// every tier; the "off" alias is spelled as the lever's off value. Tiers resolve bottom up and, within a tier, in
+// table order, so every cell is judged over the reference that actually runs under it (LadderArms::over()).
 template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
 [[nodiscard]] inline LadderArms ladder_arms(std::span<const Row> table, std::span<const LadderRow> rows,
                                             const Regime& regime, const AdmitOf& admit_of,
                                             const ExplicitOf& explicit_of = {}) {
     LadderArms arms;
-    for (const Name tier : {Name::standard, Name::fast}) {
-        std::string arm;
+    for (const auto& lever : table) arms.levers.emplace_back(lever.name);
+    for (const Name tier : {Name::standard, Name::fast, Name::turbo}) {
+        auto& values = arms.values[LadderArms::slot(tier)];
         for (const auto& lever : table) {
-            if (lever.kind == decltype(lever.kind)::exact) continue;
             std::string_view value;
             if (const auto set = explicit_of(lever)) {
                 value = *set;
@@ -953,11 +989,8 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
                     if (value == "off" && !lever.off.empty()) value = lever.off;
             } else value = ladder_cell(lever, rows, tier, regime, [&](unsigned c) { return admit_of(lever, c); }, false,
                                      arms).value;
-            if (value == lever.builtin) continue;
-            if (!arm.empty()) arm += ',';
-            arm.append(lever.name).append("=").append(value);
+            values.emplace_back(value);
         }
-        (tier == Name::standard ? arms.exact : arms.fast) = std::move(arm);
     }
     return arms;
 }
@@ -991,6 +1024,7 @@ inline void apply_ladder(Entry& entry, std::span<const LadderRow> rows, Name tie
     if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo)) return;
     auto cell = select_profile_cell(lever, rows, tier, regime, admit, allow_pending, arms);
     entry.ladder = std::move(cell.route);
+    entry.ladder_reference = std::move(cell.reference);
     entry.ladder_lowered = !entry.ladder.empty() && cell.tier != tier;
     if (cell.benchmark) {
         entry.value = cell.value;
@@ -1138,6 +1172,10 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
             if (partner == engine.table.end() || partner->kind == Kind::exact || row.joint == row.lever)
                 return where + ": paired row names no other lossy lever of the table";
         }
+        if (row.joint.empty() && row.value.empty()) return where + ": timing row names no measured value";
+        if (row.joint.empty() && !(row.over.starts_with(kLadderArmVersion) && row.over.size() > kLadderArmVersion.size() &&
+                                   row.over[kLadderArmVersion.size()] == ';'))
+            return where + ": timing row without a versioned reference execution (LadderArms::over spelling)";
         if (row.device.empty() || row.receipt.empty()) return where + ": ladder row without device or receipt";
         if (!valid_ladder_measurement(row.speedup, row.noise)) return where + ": invalid speedup or noise";
         if (row.min_context < 1 || row.min_context > row.max_context || row.min_lanes < 1 || row.min_lanes > row.max_lanes)

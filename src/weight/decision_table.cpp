@@ -82,7 +82,9 @@ const WeightLoadDecision* losing_overlap(SamePolicy same_policy, const WeightLoa
 template <class SamePolicy>
 const WeightLoadDecision* find_decision(SamePolicy same_policy, const WeightLoadScope& scope,
                                         std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
-    if (!complete_scope(scope)) return nullptr;
+    // A timed win selects storage only at a known point: an unknown context or lane count (0) may land anywhere, as
+    // in match_weight_load_evidence (the extent lookup), even under unbounded bands.
+    if (!complete_scope(scope) || extent.context == 0U || extent.lanes == 0U) return nullptr;
     for (const auto& row : decisions)
         if (same_policy(row.policy) && same_scope_pass(row, scope) && weight_load_gain_selects(row, extent) &&
             timed_win(row) && !losing_overlap(same_policy, scope, decisions, row.evidence, extent, extent))

@@ -327,6 +327,20 @@ int main() {
         const auto candidate_base = qp::joint_execution(resolve(regime)->resolution);
         gains[0].joint_scope = {regime.cost_device, reference, candidate_base, qp::kKvIdentity, qp::kAttnIdentity,
                                 regime.workload, "on"};
+        // Single-cell rows name their TURBO value and the reference that runs under them (LadderArms::over: cells of
+        // the tier compose in table order, so a later cell is measured over the earlier ones).
+        std::array<std::string, identities.size()> references{};
+        for (std::size_t i = 1; i < gains.size(); ++i)
+            for (const auto& lever : qp::table)
+                if (lever.name == keys[i]) gains[i].value = lever.value[static_cast<unsigned>(Name::turbo)];
+        for (std::size_t pass = 0; pass < gains.size(); ++pass)
+            for (std::size_t i = 1; i < gains.size(); ++i) {
+                const auto* entry = resolve(regime)->find(keys[i]);
+                if (entry == nullptr || entry->ladder_reference.empty()) continue;
+                references[i] = entry->ladder_reference;
+                gains[i].over = references[i];
+            }
+        check(references[2].starts_with("ladder-arm/v2;"), "Qwen dense reports the TURBO dense reference: " + references[2]);
         const auto admitted = resolve(regime);
         qp::apply(options, *admitted);
         kv = qp::resolve_kv(Name::turbo, {}, regime.route, explicit_arms);
@@ -368,10 +382,13 @@ int main() {
             std::vector<qp::Qualified> reader(std::begin(qp::qualified), std::end(qp::qualified));
             reader.push_back({regime.weights, regime.route,
                               {"decode_attn8", "", 0, p::kNoPromptBound, "fixture FAST reader receipt"}});
+            const std::string reader_reference = qp::resolve(Name::fast, regime, {}, reader)->find("decode_attn8")->ladder_reference;
+            check(reader_reference.starts_with("ladder-arm/v2;"), "Qwen dense reports the FAST reader reference");
             const auto fast_reader = [&](Name tier) {
                 std::vector<p::LadderRow> ladder(gains.begin(), gains.end());  // the evidence as it stands now
                 ladder.push_back({"decode_attn8", "on", Name::fast, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
                                   1.05, 0.01, "fixture FAST reader gain"});
+                ladder.back().over = reader_reference;
                 const qp::TurboEvidence reader_evidence[] = {{regime.weights, regime.route, "fixture", gates, ladder}};
                 return qp::resolve(tier, regime, {}, reader, reader_evidence);
             };
@@ -500,8 +517,12 @@ int main() {
         check(lever_value(*extended, "prefill_hid") == "f32" && !p::applied(extended->find("prefill_hid")->status),
               "a new quality PASS without a timing row leaves prefill_hid at the lower tier");
         check(lever_value(*extended, "prefill_arith") == "fast4", "the new row leaves the incumbent cells alone");
-        const p::LadderRow timing[] = {{"prefill_hid", "bf16", Name::fast, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
-                                        1.04, 0.01, "fixture timing"}};
+        p::LadderRow timing[] = {{"prefill_hid", "bf16", Name::fast, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
+                                  1.04, 0.01, "fixture timing"}};
+        // Measured over the reference that runs under the cell (LadderArms::over).
+        const std::string hid_reference = extended->find("prefill_hid")->ladder_reference;
+        check(hid_reference.starts_with("ladder-arm/v2;"), "Qwen dense reports the prefill_hid reference: " + hid_reference);
+        timing[0].over = hid_reference;
         const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, {}, {}, timing}};
         check(lever_value(*qp::resolve(Name::fast, regime, {}, rows, evidence), "prefill_hid") == "bf16",
               "a matching timing row admits the newly qualified cell");

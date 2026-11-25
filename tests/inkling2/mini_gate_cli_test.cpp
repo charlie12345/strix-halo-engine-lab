@@ -79,7 +79,7 @@ struct Decoder {
 };
 
 #if defined(STRIX_INKLING2_APP_CLI_TEST)
-cli::Options parse(std::initializer_list<std::string> arguments, std::string_view backend = {}) {
+cli::Options parse(std::initializer_list<std::string> arguments, std::string_view backend = "cuda") {
     std::vector<std::string> storage{"mini", "model"};
     storage.insert(storage.end(), arguments);
     std::vector<char*> argv;

@@ -334,13 +334,14 @@ void profile_parity() {
     const sv::SerialGenerationFamily family{"mini", "Mini", "MODEL", 8U, 8U, 16U, 0U, nullptr, 8U,
         true, false, [](const std::string&) -> std::shared_ptr<const sv::BpeTokenizer> { return {}; },
         true, {}, true};
-    const auto parse_cli = [&](const char* tier, std::initializer_list<const char*> input = {"1", "--generate", "2"}) {
+    const auto parse_cli = [&](const char* tier, std::string_view backend,
+                               std::initializer_list<const char*> input = {"1", "--generate", "2"}) {
         std::vector<std::string> args{"mini", "MODEL.safetensors"};
         args.insert(args.end(), input.begin(), input.end());
         args.insert(args.end(), {"--profile", tier});
         std::vector<char*> argv;
         for (auto& arg : args) argv.push_back(arg.data());
-        return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, "cuda");
+        return mini::cli::parse(static_cast<int>(argv.size()), argv.data(), family, backend);
     };
     const auto refuses = [](const auto& action, std::string_view diagnostic) {
         try { action(); }
@@ -372,42 +373,52 @@ void profile_parity() {
         selection.arguments[3] = backend;
         for (const auto* tier : {"fast", "turbo", "exact"}) {
             const bool exact = std::string_view(tier) == "exact";
-            set_w4a4_env(exact ? nullptr : "mse");
+            set_w4a4_env(exact || std::string_view(backend) == "hip" ? nullptr : "mse");
             selection.arguments.back() = tier;
             for (const auto* value : {static_cast<const char*>(nullptr), "0", "1"}) {
                 set_expert_env(value);
                 loaded.reset();
                 if (exact && value && std::string_view(value) == "1") {
-                    const bool cli_refused = refuses([&] { (void)parse_cli(tier); }, exact_error);
+                    const bool cli_refused = refuses([&] { (void)parse_cli(tier, backend); }, exact_error);
                     const bool server_refused = refuses([&] { (void)factory->create(selection); }, exact_error);
                     require(cli_refused && server_refused && !loaded, "CLI and server must refuse narrow EXACT");
                     continue;
                 }
-                const auto cli = parse_cli(tier);
+                const auto cli = parse_cli(tier, backend);
                 const auto service = factory->create(selection);
                 const bool narrow = value && std::string_view(value) == "1";
                 require(service && loaded && loaded->checkpoint == "MODEL.safetensors" &&
                         loaded->tier == cli.tier.profile &&
                         loaded->experts_nvfp4 == narrow && loaded->experts_nvfp4 == mini::mini_experts_nvfp4(cli.tier) &&
-                        loaded->moe_w4a4 == mini::mini_moe_w4a4_class(cli.tier) &&
+                        loaded->moe_w4a4 == cli.moe_w4a4 &&
                         loaded->combine_image == mini::mini_combine_image(cli.tier),
                         "CLI and server selected different decoder inputs");
             }
         }
     }
+    set_expert_env(nullptr);
+    set_w4a4_env("mse");
+    selection.arguments[3] = "hip";
+    selection.arguments.back() = "fast";
+    loaded.reset();
+    require(refuses([&] { (void)parse_cli("fast", "hip"); }, "CUDA only") &&
+            refuses([&] { (void)factory->create(selection); }, "CUDA only") && !loaded,
+            "CLI and server must refuse the same HIP W4A4 class before loading");
+
+    set_w4a4_env(nullptr);
     set_expert_env("1");
-    require(refuses([&] { (void)parse_cli("fast", {"--tokenize", "input.txt"}); }, consumer_error),
+    require(refuses([&] { (void)parse_cli("fast", "cuda", {"--tokenize", "input.txt"}); }, consumer_error),
             "tokenize-only CLI must refuse the narrow image");
     require(refuses([&] {
-        (void)parse_cli("exact", {"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "NULL",
+        (void)parse_cli("exact", "cuda", {"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "NULL",
                                 "--gate-rows", "2", "--gate-mode", "decode", "--gate-order-null", "--no-step-graph"});
     }, exact_error), "the evaluation-order null must use the checkpoint image");
     const auto cuda_route = [](const mini::cli::Options& options) {
         return mini::cli::resolve_cuda_step_route(options, {}, strix::weight::kBf16WeightStorage, false);
     };
-    require(refuses([&] { (void)cuda_route(parse_cli("fast")); }, consumer_error),
+    require(refuses([&] { (void)cuda_route(parse_cli("fast", "cuda")); }, consumer_error),
             "CUDA step program must refuse an image it cannot load");
-    const auto resident = parse_cli("fast", {"1", "--generate", "2", "--no-step-graph"});
+    const auto resident = parse_cli("fast", "cuda", {"1", "--generate", "2", "--no-step-graph"});
     require(!cuda_route(resident).program && mini::mini_experts_nvfp4(resident.tier),
             "CUDA resident replay must keep the explicit narrow image");
     std::cout << "inkling2-mini-profile-parity: ok\n";

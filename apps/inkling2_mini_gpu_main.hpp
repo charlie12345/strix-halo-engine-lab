@@ -5,6 +5,7 @@
 #include "inkling2_mini_media.hpp"
 #endif
 
+#include "inkling2/inkling2_mini_prefill_rows.hpp"
 #include "inkling2/inkling2_mini_resident_decoder.hpp"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
 #include "inkling2/inkling2_mini_program_cuda.hpp"
@@ -27,21 +28,18 @@
 
 namespace strix::inkling2::cli {
 
-// Prefill chunk rows. The logits are chunk-invariant (same bits for every chunk), so this is a schedule choice only.
-// gfx1151 (prose prompts, one chunk size per run, 2048 -> 8192 rows): 4K 3.47 -> 3.13 s, 8K 7.27 -> 6.23 s,
-// 16K 15.69 -> 14.06 s, 32K 35.6 -> 35.8 s. CUDA keeps 2048 rows until it is measured there.
+// Prefill chunk rows: a schedule choice, declared per backend and profile as data (inkling2::mini_cli_prefill_rows).
 // Tail absorption (serve::prefill_tail_rows): a remainder of up to chunk / 8 rows rides in the final chunk. Every
-// chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound: gfx1151 8K prose
-// (8236 = 8192 + 44 rows) 5,021 -> 4,810 ms with one chunk, logits bitwise equal; equal halves (4160 + 4076) 5,069 ms.
+// chunk re-streams all expert weights of every layer, so a short tail chunk is weight-bound.
 // The decoder admits only a tail that takes the same route forms in both schedules (inkling2::mini_prefill_tail_rows:
 // more rows than the key-split bound, chunk a multiple of the 16-position wave tile, enlarged chunk admitted by the
 // device); any other tail runs as its own chunk. CUDA keeps greedy chunks until it is measured there.
 #if defined(__HIPCC__)
-inline constexpr unsigned kMiniDefaultPrefillChunk = 8192U;
 inline constexpr unsigned kMiniPrefillTailDivisor = 8U;
+inline constexpr auto kMiniPrefillBackend = strix::inkling2::MiniPrefillBackend::hip;
 #else
-inline constexpr unsigned kMiniDefaultPrefillChunk = 2048U;
 inline constexpr unsigned kMiniPrefillTailDivisor = 0U;
+inline constexpr auto kMiniPrefillBackend = strix::inkling2::MiniPrefillBackend::cuda;
 #endif
 
 class DeviceCliDecoder final : public serve::SerialGenerationDecoder {
@@ -270,7 +268,8 @@ int main(int argc, char** argv) {
             executable, "Inkling 2 Mini", "MODEL.safetensors",
             kVocabulary, kOutputVocabulary, kMaxContext, kMiniEosToken,
             {},
-            strix::inkling2::cli::kMiniDefaultPrefillChunk, true, true,
+            // The parse default; the profile's own value is applied after parsing (mini_cli_prefill_rows).
+            strix::inkling2::mini_cli_prefill_rows(cli::kMiniPrefillBackend, strix::profile::Name::standard), true, true,
             [](const std::string& path) {
                 return serve::BpeTokenizer::load_hf_json(path, serve::inkling2_mini_tokenizer_identity);
             },
@@ -289,6 +288,10 @@ int main(int argc, char** argv) {
 #else
         auto options = cli::parse(argc, argv, family, true);
 #endif
+        if (!options.generation.prefill_chunk_explicit) {  // the declared chunk of this backend and profile
+            family.default_prefill_chunk = strix::inkling2::mini_cli_prefill_rows(cli::kMiniPrefillBackend, options.tier.profile);
+            options.generation.prefill_chunk = family.default_prefill_chunk;
+        }
         // The serial CLI resolves its one lane at load using prompt + generated positions. A gate knows its
         // resident context from the manifest. CUDA step routing precedes serial loading and has no banded CUDA row.
         struct ResolvedWeights {

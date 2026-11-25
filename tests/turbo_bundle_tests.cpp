@@ -81,19 +81,25 @@ void families() {
     const std::map<std::string, std::string> none;
     p::Resolution r;
     generic(ds, p::Name::turbo, none, r);
-    require(find(r, "attention_f16wmma") != nullptr && find(r, "attention_f16wmma")->value == "2", "ds41 turbo attention = bf16flash");
-    require(find(r, "dense_f16") != nullptr && find(r, "dense_f16")->value == "1", "ds41 turbo dense f16");
+    // TURBO nests FAST: the prefill bundle (attention bf16flash, relaxed MoE, f16 dense, set once by the bundle) and the
+    // Engram / shared expert / MoE f16 members run in TURBO as in FAST.
     require(profile_table.size() == 9, "ds41 keeps nine rows (pending Engram replaced, opt-in shared_f16 and moe_f16wmma added)");
-    require(find(r, "shared_f16") == nullptr || find(r, "shared_f16")->value != "1", "ds41 turbo does not turn on shared_f16");
-    require(find(r, "moe_f16wmma") == nullptr || find(r, "moe_f16wmma")->value != "1", "ds41 turbo does not turn on moe_f16wmma");
+    for (const char* lever : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"})
+        require(find(r, lever) != nullptr && find(r, lever)->value == "1" && p::applied(find(r, lever)->status),
+                (std::string("ds41 turbo runs the fast member ") + lever).c_str());
+    {
+        p::Resolution fast;
+        generic(ds, p::Name::fast, none, fast);
+        for (const auto& e : fast.entries) {
+            const std::string lever(e.lever->name);
+            require(find(r, lever.c_str()) != nullptr && find(r, lever.c_str())->value == e.value,
+                    ("ds41 turbo resolves every cell to its fast value: " + lever).c_str());
+        }
+    }
     std::size_t engram_rows = 0;
     for (const auto& row : profile_table)
         if (std::string_view(row.env) == "STRIX_DS41_FAST_ENGRAM") ++engram_rows;
     require(engram_rows == 1 && find(r, "engram_wmma") == nullptr, "one real Engram row per env");
-    const auto* engram = find(r, "engram_f16wmma");
-    require(engram != nullptr && engram->status == p::Status::builtin && engram->value == "0" &&
-                engram->lever->value[3] == engram->lever->builtin && !engram->lever->runnable[3],
-            "ds41 Engram is not a turbo member (turbo cell = builtin; fast selects it)");
     require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
     generic(ds, p::Name::fast, none, r);
     require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
@@ -105,9 +111,11 @@ void families() {
     generic(mm, p::Name::turbo, none, r);
     require(strix::minimax::defaults::profile_table.size() == 10,
             "minimax retains six base rows, the FAST router rows, the explicit-only TP2 exchange row and the dense tail opt-in");
-    for (const char* lever : {"idx_wmma", "idx_wmma_layers", "router_wmma", "router_wmma_layers", "pf_dense_tail_fixed"}) {
+    require(find(r, "router_wmma")->value == "1" && p::applied(find(r, "router_wmma")->status),
+            "minimax turbo runs the fast router member (TURBO nests FAST)");
+    for (const char* lever : {"idx_wmma", "idx_wmma_layers", "router_wmma_layers", "pf_dense_tail_fixed"}) {
         const auto* e = find(r, lever);
-        // turbo cell empty or the builtin (router_wmma: "0", so turbo does not inherit its fast cell)
+        // turbo cell empty or the builtin
         require(e != nullptr && e->status == p::Status::builtin && e->value == e->lever->builtin &&
                     (std::string_view(e->lever->value[3]).empty() || e->lever->value[3] == e->lever->builtin) &&
                     !e->lever->runnable[3],
@@ -126,6 +134,8 @@ void families() {
     const std::map<std::string, std::string> mm_env{{md::kProductProfileEnv, "turbo"}};
     const auto admitted = md::profile_resolution(env_of(mm_env));
     const auto execution = md::prefill_policy(env_of(mm_env));
+    require(execution.router_wmma && !execution.msa_flash && find(admitted, "router_wmma")->value == "1",
+            "MiniMax TURBO dispatches the router member its receipt states (flash partner refused)");
     require(find(admitted, "msa_flash")->value == std::to_string(execution.msa_flash),
             "MiniMax actual adapter receipt matches engine flash mode");
     require(find(admitted, "msa_flash_layers")->value == execution.msa_flash_layers,

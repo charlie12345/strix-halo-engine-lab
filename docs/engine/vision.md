@@ -54,7 +54,7 @@ The server takes image parts of chat requests with `--vision` on rank 0 (rank 1 
 
 ```sh
 ./build/strix-glm5-serve MODEL_DIR --world 2 --rank 1 --transport usb4-auto
-./build/strix-glm5-serve MODEL_DIR --world 2 --rank 0 --transport usb4-auto --host 0.0.0.0 --port 8080 \
+./build/strix-glm5-serve MODEL_DIR --world 2 --rank 0 --transport usb4-auto --host 127.0.0.1 --port 8080 \
     --model-id glm-5.3-flash --vision MMPROJ.gguf
 ```
 

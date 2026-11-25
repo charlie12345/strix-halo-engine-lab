@@ -7,8 +7,8 @@
 // caches. Every tower computation runs in the shared encoder (strix/vision/encoder.hpp, host reference: the device
 // towers refuse per-head q/k norm) and the shared preprocessing (strix/vision/preprocess.hpp).
 //
-// Provenance: the file layout, the canvas rule and the graph follow the reference implementation of this file format,
-// ggml-org/llama.cpp tools/mtmd (MIT), see docs/reference/sources-ledger.md. No source is copied.
+// Provenance: the file contract (metadata keys, tensor names) is that of the format's writer, see the GLM-5.3 Flash
+// image tower row of docs/reference/sources-ledger.md. No source is copied.
 #include "strix/gguf_reader.hpp"
 #include "strix/model_data/glm_5_3_flash.hpp"
 #include "strix/vision/adapter.hpp"

@@ -86,6 +86,15 @@ inline bool mini_combine_image(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_COMBINE_IMAGE must be 0 or 1");
 }
 
+// Resolved state of the projected-bias attention lever (true: the CUDA prompt flash projects the relative bias; bitwise the
+// image route). One value for the CLI, the gate and the server: every entry point reads it from the resolution.
+inline bool mini_attn_projected_bias(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniAttnProjectedBias);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_ATTN_PROJECTED_BIAS must be 0 or 1");
+}
+
 inline bool mini_controller_one_plane(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniControllerPlanes);
     if (entry == nullptr || entry->value == "3") return false;
@@ -111,8 +120,9 @@ struct MiniDecoderLevers {
 // does not run is declined, not silently reported as on).
 template <class Decoder>
 MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a4::Activations moe_w4a4,
-                                         bool combine_image, bool prepared_round_fold) {
+                                         bool combine_image, bool prepared_round_fold, bool attn_projected_bias) {
     decoder.set_moe_w4a4(moe_w4a4);
+    decoder.set_attention_projected_bias(attn_projected_bias);
     MiniDecoderLevers levers;
     levers.prepared_round_fold = decoder.set_prepared_round_fold(prepared_round_fold);
     levers.down_image = decoder.set_combine_image(combine_image);
@@ -122,8 +132,9 @@ MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a
 template <class Decoder>
 MiniDecoderLevers configure_mini_decoder(Decoder& decoder, const profile::Resolution& tier) {
     return configure_mini_decoder(decoder, mini_moe_w4a4_class(tier), mini_combine_image(tier),
-                                  mini_prepared_round_fold(tier));
+                                  mini_prepared_round_fold(tier), mini_attn_projected_bias(tier));
 }
+
 
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);
@@ -133,6 +144,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_moe_w4a4(tier));  // refuse a malformed or unrunnable explicit switch early
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
+    static_cast<void>(mini_attn_projected_bias(tier));
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
     spec::require_block_draft_execution(spec::block_draft_selection(tier));

@@ -22,7 +22,7 @@ endif()
 
 strix_servespec_host_test(NAME inkling2-vision-media
     SOURCES tests/inkling2/vision_media_test.cpp
-    LIBS strix_inkling2_vision strix_vision_api_media)
+    LIBS strix_inkling2_vision strix_vision_api_media strix_serve)
 if(TARGET inkling2-vision-media)
     target_include_directories(inkling2-vision-media PRIVATE "${CMAKE_SOURCE_DIR}/apps")
     target_compile_definitions(inkling2-vision-media PRIVATE "STRIX_VISION_FIXTURE_DIR=\"${CMAKE_SOURCE_DIR}/tests/vision/fixtures\"")

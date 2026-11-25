@@ -8,6 +8,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 namespace {
 
@@ -16,6 +19,16 @@ namespace ink = strix::inkling2;
 
 void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
+}
+
+template <class Call>
+bool rejects(const Call& call, std::string_view expected) {
+    try {
+        call();
+    } catch (const std::exception& error) {
+        return std::string_view(error.what()).find(expected) != std::string_view::npos;
+    }
+    return false;
 }
 
 void write_tower(const std::filesystem::path& path, const ink::VisionSpec& spec) {
@@ -125,8 +138,10 @@ void test_serial_rgba() {
     VisionTestDir fixture;
     const auto shard = fixture.path / "tower.safetensors";
     write_tower(shard, spec);
-    auto serial = ink::cli::make_mini_media(shard.string(), spec, selected);
-    auto legacy_serial = ink::cli::make_mini_media(shard.string(), spec, incumbent);
+    const weight::ConfinedDirectory directory(fixture.path);
+    const auto assets = ink::cli::read_mini_vision_checkpoint(directory, shard.filename());
+    auto serial = ink::cli::make_mini_media(assets.shard, spec, selected);
+    auto legacy_serial = ink::cli::make_mini_media(assets.shard, spec, incumbent);
     auto& bridge = serial->adapter();
     require(bridge.identity().find("inkling2-vision-axial@1|") == 0, "explicit media identity");
     require(legacy_serial->adapter().identity().find("inkling2-vision-v1|") == 0, "legacy media identity");
@@ -149,6 +164,43 @@ void test_serial_rgba() {
         shard.string()));
     require(incumbent_receipt.str() == "image identity " + legacy_serial->adapter().identity() + "\n",
             "the incumbent image run prints only its image identity");
+    // The opened input keys the handles it read (the CLI refuses those files as outputs) and the language model
+    // loads from that same opened shard: while it loads, open_source of the checkpoint name returns the held file even
+    // after the name was replaced, and a load that does not open the name is refused.
+    {
+        const auto opened = opener(shard.string());
+        const auto keys = opened->input_keys();
+        const auto shard_key = serve::file_key(shard);
+        require(keys.size() == 1U && shard_key && keys[0] == *shard_key, "the image input keys its opened shard");
+        const auto original = fixture.path / "original.safetensors";
+        std::filesystem::rename(shard, original);
+        std::filesystem::copy_file(original, shard);  // the name now reaches another file
+        std::shared_ptr<const weight::Source> loaded;
+        opened->load_checkpoint(shard.string(), [&] {
+            require(static_cast<bool>(weight::open_source(shard.string(), loaded)), "language model opens the name");
+        });
+        const auto loaded_key = weight::source_file_key(*loaded);
+        require(loaded_key && loaded_key->file == shard_key->file && loaded_key->device == shard_key->device,
+                "the language model reads the shard the tower read, not the replaced name");
+        require(loaded->shard_name() == "tower.safetensors", "the held shard keeps the name's shard namespace");
+        require(rejects([&] { opened->load_checkpoint(shard.string(), [] {}); }, "did not load the shard"),
+                "a load that does not open the pinned shard is refused");
+        loaded.reset();
+        std::filesystem::remove(shard);
+        std::filesystem::rename(original, shard);
+        std::error_code link_error;
+        const auto link = fixture.path / "tower-link.safetensors";
+        std::filesystem::create_symlink(shard, link, link_error);
+        if (!link_error) {  // a linked checkpoint opens its target, as the language model loader does
+            const auto linked = opener(link.string());
+            require(linked->input_keys()[0] == *serve::file_key(shard), "a linked checkpoint keys its target");
+            linked->load_checkpoint(link.string(), [&] {
+                require(static_cast<bool>(weight::open_source(link.string(), loaded)), "load through the link");
+            });
+            require(loaded->shard_name() == "tower-link.safetensors", "the link name keeps its shard namespace");
+            loaded.reset();
+        }
+    }
     // EXACT: building the opener (startup, text-only runs) is not refused; an image request is.
     const auto exact_opener = ink::cli::mini_media_opener(text_tier(profile::Name::standard, "axial@1"), receipt, spec);
     bool exact_refused = false;
@@ -191,11 +243,89 @@ void test_serial_rgba() {
     require(legacy_span.lease.rows().data == encode(incumbent, rgb), "legacy media must keep alpha drop");
 }
 
+void test_checkpoint_admission() {
+    namespace fs = std::filesystem;
+    const auto write = [](const fs::path& name, std::string_view bytes) {
+        std::ofstream stream(name, std::ios::binary);
+        stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        require(static_cast<bool>(stream), "write checkpoint fixture");
+    };
+    constexpr std::string_view valid = R"({"vision_config":{"model_type":"inkling2_vision"}})";
+    VisionTestDir fixture;
+    const auto model_dir = fixture.path / "model";
+    fs::create_directory(model_dir);
+    const auto config = model_dir / "config.json";
+    write(model_dir / "tower.safetensors", "original");
+    const weight::ConfinedDirectory directory(model_dir);
+    const auto open = [&] { return ink::cli::read_mini_vision_checkpoint(directory, "tower.safetensors"); };
+    require(open().spec.width == 1024U, "a shard alone uses the fixed spec");
+    require(rejects([&] { (void)ink::cli::open_mini_media((model_dir / "tower.safetensors").string(), ink::VisionIdentity::legacy); },
+                    "tower tensors"), "the production opener reaches shard validation without a sidecar");
+    std::string capped(valid);
+    capped.resize(ink::cli::kMiniVisionConfigBytes, ' ');
+    write(config, capped);
+    require(open().spec.width == 1024U, "accept config at the one-MiB boundary");
+    {
+        const auto assets = open();
+        const auto config_key = serve::file_key(config);
+        require(assets.keys.size() == 2U && config_key && assets.keys[1] == *config_key,
+                "the sidecar is keyed by the handle it was read from");
+    }
+    capped.push_back(' ');
+    write(config, capped);
+    require(rejects([&] { (void)open(); }, "length"), "refuse config over one MiB");
+    write(config, valid.substr(0, valid.size() - 1U));
+    require(rejects([&] { (void)open(); }, ""), "refuse a truncated config document");
+    write(config, R"({"vision_config":{"model_type":"inkling2_vision","hidden_size":2}})");
+    require(rejects([&] { (void)open(); }, "hidden_size"), "refuse unsupported geometry");
+
+    fs::remove(config);
+    fs::create_directory(config);
+    require(rejects([&] { (void)open(); }, "config.json"), "refuse a directory in the config slot");
+    fs::remove(config);
+#ifndef _WIN32
+    require(::mkfifo(config.c_str(), 0600) == 0, "make fixture FIFO");
+    require(rejects([&] { (void)open(); }, "config.json"), "refuse a FIFO in the config slot");
+    fs::remove(config);
+#endif
+    write(fixture.path / "outside.json", valid);
+    std::error_code link_error;
+    fs::create_symlink(fixture.path / "outside.json", config, link_error);
+#ifndef _WIN32
+    require(!link_error, "create sidecar symlink fixture");
+#endif
+    if (!link_error) {
+        require(rejects([&] { (void)open(); }, "config.json"), "refuse a config symlink");
+        fs::create_symlink(fixture.path / "outside.json", model_dir / "shard-link");
+        require(rejects([&] { (void)ink::cli::read_mini_vision_checkpoint(directory, "shard-link"); },
+                        "shard-link"), "refuse a shard symlink");
+        fs::remove(config);
+        fs::create_symlink(fixture.path / "absent.json", config);
+        require(rejects([&] { (void)open(); }, "config.json"), "a dangling config symlink is not an absent sidecar");
+        fs::remove(config);
+    } else {
+        std::fprintf(stderr, "symbolic link fixture unavailable: %s\n", link_error.message().c_str());
+    }
+
+    write(config, valid);
+    fs::rename(model_dir, fixture.path / "held");
+    fs::create_directory(model_dir);
+    write(config, "{}");
+    write(model_dir / "tower.safetensors", "replacement");
+    const auto assets = open();
+    std::string contents(8, '\0');
+    require(assets.spec.width == 1024U &&
+            static_cast<bool>(assets.shard->read({0, contents.size()},
+                                                {reinterpret_cast<weight::Byte*>(contents.data()), contents.size()})) &&
+            contents == "original", "config and shard must open within the same held directory");
+}
+
 }  // namespace
 
 int main() try {
     test_recipe_admission();
     test_serial_rgba();
+    test_checkpoint_admission();
     return 0;
 } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());

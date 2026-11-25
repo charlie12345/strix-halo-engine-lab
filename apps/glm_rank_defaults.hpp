@@ -390,7 +390,7 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
 // = off (plain sampled decode), 1 = sampled requests through MTP; anything else is refused at startup.
 inline bool sampled_mtp_switch(const EnvGet& env) {
     const char* v = env("STRIX_GLM_SERVE_SAMPLED_MTP");
-    if (v == nullptr || *v == ' ' || std::string(v) == "0") return false;
+    if (v == nullptr || *v == '\0' || std::string(v) == "0") return false;
     if (std::string(v) == "1") return true;
     throw std::invalid_argument("STRIX_GLM_SERVE_SAMPLED_MTP must be 0 or 1");
 }

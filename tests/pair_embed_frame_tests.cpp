@@ -179,7 +179,7 @@ int main() {
         tiny.touch(ba.rows().digest, 64, &gone);
         tiny.touch(bb.rows().digest, 64, &gone);
         CHECK(tiny.size() == 1 && tiny.bytes() == 64 && gone.size() == 1 && gone[0] == ba.rows().digest);
-        CHECK(throws([] { pair::EmbedFrameLedger bad(4, 0); }));
+        CHECK(throws([] { pair::EmbedFrameLedger zero_budget(4, 0); (void)zero_budget; }));
     }
 
     // regime rule: an empty table (no receipts) is always rank0

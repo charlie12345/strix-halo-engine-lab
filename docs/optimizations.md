@@ -1421,11 +1421,10 @@ use only controls exposed by the current source and require the corresponding de
 Serving features that change no generated token: a stateless `POST /v1/responses` route translated onto the chat
 prompt path, a versioned `GET /v1/capabilities` document, the applied policy (requested vs effective sampling and
 output limit, each sampling filter with its source, the effective seed of a sampled request) at the start and end of
-every stream, and SSE keepalive comments while a stream waits. Sampling filters resolve request -> server default
-(`--http-default-temperature`, `--http-default-top-k`, `--http-default-top-p`, `--http-default-min-p`; a positive
-default temperature is a token-changing operator choice and needs `--http-sampling sample`) -> built-in greedy; an
-unseeded sampled request gets a seed, echoed in the receipt (stream receipts on), so the same request with that seed
-reproduces it.
+every stream, and SSE keepalive comments while a stream waits. Sampling filters resolve request -> built-in (no server-only
+defaults: the `--http-default-temperature/-top-k/-top-p/-min-p` flags are retired), and an omitted temperature is
+greedy whatever filters the request carries, as before. An unseeded sampled request takes the command line's seed
+(0), echoed in the receipt (stream receipts on), so the same request reproduces it.
 
 - **Preconditions:** `--http-serve` (Qwen) or the DeepSeek serve app.
 - **Automatic selection:** Always on in the server; a request disables its keepalive with `"strix":{"keepalive":false}`.
@@ -4925,7 +4924,7 @@ token), then sends the decided tokens back, and both ranks accept, commit and ca
 (the shared argmax gate) drafts are the drafter's greedy tokens; from 0.7 up each draft is drawn from the drafter's
 full row with the uniform of the position it proposes (`pick_pair_draft`: rank 1 sends its half of the drafter row,
 rank 0 draws and sends the token), so a drafter close to the target proposes the very token the row will sample.
-A sampled first token re-seeds the drafter from the prompt's last row (`mtp_enter`). `STRIX_GLM_SERVE_SAMPLED_ACCEPT=rejection`
+A sampled first token re-seeds the drafter from the prompt's last row (`mtp_enter`). `STRIX_MTP_SAMPLED_ACCEPT=rejection`
 selects speculative rejection sampling instead (drafts always drawn from the drafter rows, rank 0 keeps their
 distributions, the shared lookup arbiter is off for those requests): exact in distribution, but the tokens of a seed
 then depend on the drafts and are not those of plain sampling.
@@ -4934,7 +4933,7 @@ then depend on the drafts and are not those of plain sampling.
 - **Automatic selection:** none; batched MTP verify (G2) never takes a sampled request (with one decoding, the server uses batched plain steps).
 - **Fallback notice:** every sampled response carries `sampling_receipt`: its acceptance rule (`coupled` / `rejection`), drafted rows accepted and rejected (both zero when it decoded by plain steps) and drafts drawn from the drafter rows.
 - **Exactness evidence:** host fake pair: three sampled requests x 40 tokens equal plain sampling of the same seeds, with greedy drafts (T 0.5) and with drafts drawn from the drafter rows (T 0.9), also beside a greedy request with G2 on; rejection completes with accepted and rejected rows (not token-compared); shared tests: coupled windows equal plain sampling on both ranks, cut windows send no extra rows, rejection windows equal `decide_rows`, drafts picked across the pair equal the sampler's own draft. Pair gates, 2026-11-24 on `c1f5686e` (one USB4 cable shared with `thunderbolt_net`): **SP1a passed** (`strix-glm5-rank --spec 1 --spec-oracle 3 --pattern 3,0,1,2 --decode 64`: on both ranks tokens EQUAL, committed-row logits mismatches 0, flushed state EQUAL at frontier 113, 25 cycles, 39 drafts accepted); **served token equality passed** (`--slots 2 --capacity 131072`, 24 sampled requests one at a time: 4 prompts x T 0.5 / 0.9 / 1.0 x seeds 11 and 12345, `top_p` 0.95, 256 tokens each, `return_token_ids`: switch off and on give 24/24 equal token vectors; on: coupled receipts with 3,727 drafted rows accepted and 1,303 rejected; 24.7 vs 32.6 tok/s mean). Rank 1 prints no token vectors in the server, so served equality is checked on rank 0's output (rank 0 decides each sampled row and sends the token). Rejection acceptance is not token-compared by design.
-- **Off switch:** unset or `STRIX_GLM_SERVE_SAMPLED_MTP=0` (plain steps); `STRIX_GLM_SERVE_SAMPLED_ACCEPT=coupled` (default) restores coupled acceptance; `STRIX_GLM_SERVE_MTP=0` turns off MTP for every request
+- **Off switch:** unset or `STRIX_GLM_SERVE_SAMPLED_MTP=0` (plain steps); `STRIX_MTP_SAMPLED_ACCEPT=coupled` (default) restores coupled acceptance; `STRIX_GLM_SERVE_MTP=0` turns off MTP for every request
 - **Measured gain:** 2026-11-24, build `c1f5686e`, a pair with **one** USB4 cable shared with `thunderbolt_net` (one host stream), `--slots 2 --capacity 131072`; agent-style bench: a 29,167-token code prompt, then 1,024-token answers on top of it (prefix cache hits of 28,672), 3 answers per cell, arms one after another in fresh processes (not ABAB-interleaved), `top_p` 1. Decode tok/s:
 
   | Arm | T 0.6 | T 1.0 |

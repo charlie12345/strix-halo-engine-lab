@@ -167,12 +167,13 @@ struct LeadConfig {
     bool import_dsa_once = false;
     bool sampling = false;
     // Sampled requests (temperature > 0) decode through MTP at one request (C1): the lead's sampler decides every verify
-    // row with coupled acceptance (strix::serve::decide_pair_window), so the tokens equal plain sampling of the same seed
-    // when verify rows equal plain-step rows bit for bit (gate SP1a). Never in batched verify (G2). Off: plain steps.
+    // row with the resolved acceptance (strix::serve::decide_pair_window); coupled, the default when sampled MTP is on,
+    // keeps the tokens of plain sampling of the same seed when verify rows equal plain-step rows bit for bit (gate SP1a).
+    // Never in batched verify (G2). Off: plain steps.
     bool sampled_mtp = false;
-    // How a sampled request's drafted rows are decided (STRIX_GLM_SERVE_SAMPLED_ACCEPT): coupled keeps plain sampling's
-    // tokens; rejection (opt-in) is exact in distribution only (its tokens depend on the drafts) and accepts more.
-    strix::SampledAcceptance sampled_accept = strix::SampledAcceptance::coupled;
+    // The entry point's resolved sampler options (strix::validate_sampling_startup_environment): the acceptance rule of
+    // drafted rows (STRIX_MTP_SAMPLED_ACCEPT; unset: coupled with sampled MTP on, else rejection, which plain steps ignore).
+    TokenSamplerOptions sampler_options{};
 };
 
 // The sampled-MTP flags of a request's sampler: drafts are drawn from the drafter rows unless coupled acceptance draws
@@ -500,9 +501,7 @@ private:
             return reject(400, "context_length_exceeded",
                           "prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(cfg_.capacity) + " positions");
         std::optional<strix::TokenSampler> sampler;
-        // Coupled acceptance (default): a drafted row is decided as without its draft, so sampled MTP keeps plain
-        // sampling's tokens; rejection only on request (LeadConfig::sampled_accept).
-        try { sampler = strix::serve::make_pair_sampler(job, cfg_.sampled_accept); }
+        try { sampler = strix::serve::make_pair_sampler(job, cfg_.sampler_options); }
         catch (const std::invalid_argument& error) { return reject(400, "invalid_request", error.what()); }
         auto lease = runtime().activate(0, true); // retain original queue take timestamp
         const auto slot = table_.alloc();

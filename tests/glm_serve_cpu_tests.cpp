@@ -938,7 +938,7 @@ SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool samp
     lc.g2 = g2;
     lc.sampling = c0.hello(h, true);
     lc.sampled_mtp = sampled_mtp;
-    lc.sampled_accept = accept;
+    lc.sampler_options.acceptance = accept;
     try {
         gs::Lead<SampledFake> lead(e0, c0, queue, lc, stop);
         std::thread runner([&] {

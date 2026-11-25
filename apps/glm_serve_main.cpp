@@ -980,6 +980,11 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     try {
+        // One resolver for the sampler options (shared STRIX_MTP_SAMPLED_ACCEPT); sampled MTP (opt-in) makes coupled
+        // acceptance the unset default so it keeps the tokens of plain sampling.
+        const bool sampled_mtp_requested = strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP");
+        const auto sampler_options = strix::validate_sampling_startup_environment(
+            sampled_mtp_requested ? strix::SampledAcceptance::coupled : strix::SampledAcceptance::rejection);
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
                                  "[--host H] [--port P] [--profile default|fast|quality] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
@@ -1165,9 +1170,9 @@ int main(int argc, char** argv) {
                         prefill_chunk_mtp ? 1 : 0,
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
             // Sampled requests through MTP at C1 (coupled acceptance; opt-in until its pair gates pass).
-            std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP) sampled-accept=%s (STRIX_GLM_SERVE_SAMPLED_ACCEPT)\n",
-                        strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP") ? (mtp_on ? "on" : "off (MTP off)") : "off",
-                        strix::env_choice("STRIX_GLM_SERVE_SAMPLED_ACCEPT", 0, {"coupled", "rejection"}) == 1 ? "rejection" : "coupled");
+            std::printf("serve sampled-mtp=%s (STRIX_GLM_SERVE_SAMPLED_MTP) sampled-accept=%s (STRIX_MTP_SAMPLED_ACCEPT)\n",
+                        sampled_mtp_requested ? (mtp_on ? "on" : "off (MTP off)") : "off",
+                        sampler_options.acceptance == strix::SampledAcceptance::rejection ? "rejection" : "coupled");
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
             // prefill; off unless --rtx-prefill / --import-listen are given).
             std::printf("serve import-route=%s import-listen=%s wire=v%u index-rows=%s identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
@@ -1464,9 +1469,8 @@ int main(int argc, char** argv) {
         lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
         lc.sampling = sampling;
-        lc.sampled_mtp = strix::env_flag_default_off("STRIX_GLM_SERVE_SAMPLED_MTP");
-        lc.sampled_accept = strix::env_choice("STRIX_GLM_SERVE_SAMPLED_ACCEPT", 0, {"coupled", "rejection"}) == 1
-                                ? strix::SampledAcceptance::rejection : strix::SampledAcceptance::coupled;
+        lc.sampled_mtp = sampled_mtp_requested;
+        lc.sampler_options = sampler_options;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;
         lc.kmax = eff.kmax;
@@ -1823,7 +1827,7 @@ int main(int argc, char** argv) {
                                     " slots, " + (serial ? "serial" : "batched") + " decode" +
                                     (mtp_on ? ", MTP self-speculation at C1" : "") +
                                     (g2_on ? " and in the batch" : "") + ", greedy, exact per request" +
-                                    (lead.supports_sampling() ? (lc.sampled_mtp && mtp_on ? (lc.sampled_accept == strix::SampledAcceptance::coupled
+                                    (lead.supports_sampling() ? (lc.sampled_mtp && mtp_on ? (lc.sampler_options.acceptance == strix::SampledAcceptance::coupled
                                                                  ? "; sampling-v1 through MTP at C1 (coupled, tokens of plain sampling)"
                                                                  : "; sampling-v1 through MTP at C1 (rejection, exact in distribution)")
                                                               : "; sampling-v1 uses plain decode") : "") +

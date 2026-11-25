@@ -107,20 +107,37 @@ inline EmbedRowsFileInfo open_embed_rows_file(std::ifstream& in, const std::file
     return detail::open_embed_rows_file(in, path, width, scratch, fnv);
 }
 
-// width: the reader's LM hidden width (0: any). The file length must be exactly the header plus the rows. Throws
-// std::invalid_argument for a malformed or foreign file, std::runtime_error on I/O failure.
-[[nodiscard]] inline EmbedRows read_embed_rows_file(const std::filesystem::path& path, std::uint32_t width = 0) {
+namespace detail {
+inline EmbedRows read_embed_rows_payload(const std::filesystem::path& path, std::uint32_t width, const EmbedRowsFileInfo* admitted) {
     const std::string name = path.filename().string();
     std::ifstream in;
     EmbedRows rows;
     std::uint64_t fnv = 0;
-    const std::uint64_t payload = detail::open_embed_rows_file(in, path, width, rows, fnv).payload_bytes;
+    const auto info = detail::open_embed_rows_file(in, path, width, rows, fnv);
+    if (admitted != nullptr && (info.rows != admitted->rows || info.width != admitted->width ||
+                                info.real_token_id != admitted->real_token_id || info.payload_bytes != admitted->payload_bytes))
+        throw std::invalid_argument("embed rows file: " + name + " changed after its header was admitted");
+    const std::uint64_t payload = info.payload_bytes;
     rows.data.resize(std::size_t{rows.rows} * rows.width);
     in.read(reinterpret_cast<char*>(rows.data.data()), static_cast<std::streamsize>(payload));
     if (!in) throw std::runtime_error("embed rows file: short read of " + name);
     if (embed_rows_fnv(rows.data.data(), rows.data.size()) != fnv)
         throw std::invalid_argument("embed rows file: " + name + " fails its checksum");
     return rows;
+}
+}  // namespace detail
+
+// width: the reader's LM hidden width (0: any). The file length must be exactly the header plus the rows. Throws
+// std::invalid_argument for a malformed or foreign file, std::runtime_error on I/O failure.
+[[nodiscard]] inline EmbedRows read_embed_rows_file(const std::filesystem::path& path, std::uint32_t width = 0) {
+    return detail::read_embed_rows_payload(path, width, nullptr);
+}
+
+// The payload pass of a file whose header was admitted before (read_embed_rows_file_info + a budget): the reopened
+// header must state exactly the admitted shape before any row is allocated, so a file replaced between the two opens
+// is refused instead of growing the allocation past the admitted budget.
+[[nodiscard]] inline EmbedRows read_embed_rows_file(const std::filesystem::path& path, const EmbedRowsFileInfo& admitted) {
+    return detail::read_embed_rows_payload(path, admitted.width, &admitted);
 }
 
 } // namespace strix::session

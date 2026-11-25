@@ -743,6 +743,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-iu4a4-rot-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-iu4a4-rot-host-tests)
     add_test(NAME strix-iu4a4-rot-host-tests COMMAND strix-iu4a4-rot-host-tests)
+    add_executable(strix-iu4a4-projection-layout-tests tests/iu4a4_projection_layout_tests.cpp)
+    target_include_directories(strix-iu4a4-projection-layout-tests PRIVATE src)
+    target_compile_features(strix-iu4a4-projection-layout-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-iu4a4-projection-layout-tests)
+    add_test(NAME strix-iu4a4-projection-layout-tests COMMAND strix-iu4a4-projection-layout-tests)
     add_executable(strix-grouped-iu4a4-host-tests tests/grouped_iu4a4_host_tests.cpp)
     target_include_directories(strix-grouped-iu4a4-host-tests PRIVATE src include)
     target_compile_features(strix-grouped-iu4a4-host-tests PRIVATE cxx_std_20)
@@ -3953,6 +3958,17 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         set_target_properties(strix-hip-inkling2-mini-verify-rows-test PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # Serving cohort lanes vs each lane alone (bitwise logits, K/V rows, histories); needs the model checkpoint.
+        add_executable(strix-hip-inkling2-mini-cohort-lanes-test tests/inkling2/mini_cohort_lanes_hip.hip)
+        # strix_serve: the serving adapter the fixture drives (serve::FixedKvCohort over serve::CohortBackend).
+        target_link_libraries(strix-hip-inkling2-mini-cohort-lanes-test PRIVATE
+            strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_embed_splice_hip strix_serve strix_core)
+        strix_target_warnings(strix-hip-inkling2-mini-cohort-lanes-test)
+        target_compile_options(strix-hip-inkling2-mini-cohort-lanes-test PRIVATE
+            -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
+            -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
+        set_target_properties(strix-hip-inkling2-mini-cohort-lanes-test PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         # Sampled serving lanes read the scores of their own (screened) step; also needs the model checkpoint.
         add_executable(strix-hip-inkling2-mini-screened-scores-test tests/inkling2/mini_screened_scores_hip.hip)
         target_link_libraries(strix-hip-inkling2-mini-screened-scores-test PRIVATE
@@ -4539,6 +4555,12 @@ int main() { return 0; }"
             target_link_libraries(strix-hip-iu4a4-dense-tests PRIVATE strix_hip_runtime strix_core)
             target_include_directories(strix-hip-iu4a4-dense-tests PRIVATE src)
             add_test(NAME strix-hip-iu4a4-dense-tests COMMAND strix-hip-iu4a4-dense-tests)
+            # A4W4 projection-call trait (one image per call, split outputs, BF16 rounding, fused gate) vs the class
+            add_executable(strix-hip-iu4a4-projections-tests tests/hip_iu4a4_projections_tests.hip)
+            set_target_properties(strix-hip-iu4a4-projections-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            target_link_libraries(strix-hip-iu4a4-projections-tests PRIVATE strix_hip_runtime strix_core)
+            target_include_directories(strix-hip-iu4a4-projections-tests PRIVATE src include)
+            add_test(NAME strix-hip-iu4a4-projections-tests COMMAND strix-hip-iu4a4-projections-tests)
             # Shared FAST wide-window attention (flash over the dense_decode BF16 cache) vs the decode form
             add_executable(strix-hip-dense-decode-flash-tests tests/hip_dense_decode_flash_tests.hip)
             set_target_properties(strix-hip-dense-decode-flash-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")

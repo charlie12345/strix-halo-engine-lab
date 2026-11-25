@@ -98,7 +98,8 @@ public:
     virtual EncoderOptions device_options() const { return {}; }
     // Start-time preparation (prepare_backend): the projector linears (built and uploaded with the tower), the largest
     // tower input the adapter admits (0: unknown, the workspace grows on demand) and whether project() reads the
-    // hidden rows only through DenseOps::merge_project() (they may then stay on the device).
+    // hidden rows only through DenseOps::merge_project() (they may then stay on the device; only for the row-major
+    // projector: the packed-cell layout takes host rows and refuses a device-resident output).
     virtual std::vector<std::pair<Tensor, Tensor>> projector_linears() const { return {}; }
     virtual unsigned max_encoder_rows() const { return 0; }
     virtual bool device_resident_hidden() const { return false; }

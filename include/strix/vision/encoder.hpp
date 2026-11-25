@@ -160,7 +160,9 @@ class EncoderBackend : public DenseOps {
 public:
     virtual EncoderOutput encode(const PatchGrid&, const PositionInputs&) = 0;
     // encode() for a merge_project() of this backend that follows at once: a device backend may keep the hidden rows
-    // on the device (EncoderOutput::device_epoch). Default: encode().
+    // on the device (EncoderOutput::device_epoch). Default: encode(). A resident output feeds only the backend's
+    // row-major merge projector; the packed-cell layout (MergeProjector::Layout::packed_cells) takes host rows from
+    // encode() and refuses a resident output.
     virtual EncoderOutput encode_for_projection(const PatchGrid& g, const PositionInputs& p) { return encode(g, p); }
     // Start-time hook: hold the workspace of `rows` rows in `tiles` attention tiles from now on. Host: nothing.
     virtual void reserve(unsigned rows, unsigned tiles) {

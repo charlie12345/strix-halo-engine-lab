@@ -208,11 +208,14 @@ token 200054 and pass through the language model's `embed_norm` in CPU and devic
 The default image identity is `inkling2-vision-v1` under every profile. It uses per-channel normalization, zero RGB
 padding, raster patches, a trailing class row and learned positions. The recipe is the row `inkling2-vision-recipe`
 of the Inkling 2 Mini profile table (`include/strix/profiles/inkling2_mini.hpp`), resolved with the other rows by the
-resolver the CLI and the server share. `STRIX_INKLING2_VISION_RECIPE=axial@1` selects the candidate under
-`--profile fast` or `turbo` only; the receipt names the row and stamps it unqualified, and every other profile,
-including `exact`, refuses it before loading until a qualified column carries the value. The candidate has identity
-`inkling2-vision-axial@1` and can change the prompt length above the token cap. An image run prints
-`image identity <id>` on stderr. The Inkling 2 HTTP server currently accepts text.
+resolver the CLI and the server share. The row applies only to a request with image input: a text-only run (and the
+HTTP server, which currently accepts text) starts, resolves and fingerprints exactly as with the row unset, whatever
+the setting. For an image request, `STRIX_INKLING2_VISION_RECIPE=axial@1` selects the candidate under
+`--profile fast` or `turbo` only, and every other profile, including `exact`, refuses that request before the tower
+runs until a qualified column carries the value. The candidate has identity `inkling2-vision-axial@1` and can change
+the prompt length above the token cap.
+An image run prints `image identity <id>` on stderr; with the candidate it also prints
+`image profile inkling2-vision-recipe=axial@1 qualification <...>`, which stamps it unqualified.
 
 The reference is the model's own definition (`Inkling2VisionModel`, `Inkling2ImageProcessor` in the transformers
 package, Apache-2.0); `tools/vision/inkling2_vision_ref.py` runs it in FP32 on the checkpoint's vision tensors and
@@ -308,7 +311,7 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors --messages chat.json --gen
 |---|---|
 | Tower | HIP `vision::Encoder` (`vision-f16-v1`), CUDA `vision::CudaEncoder` (`vision-cuda-f32-v1`), CPU `ReferenceEncoder` (`vision-ref-f32`) |
 | Rows in the prompt | projected rows pass `embed_norm` like token rows (`MiniResidentDecoder::prefill_spliced`); text-only prompts are unchanged |
-| Profiles | `--profile exact` and `fast` both take images; the profile changes the language model weights only, not the tower or the splice |
+| Profiles | `--profile exact` and `fast` both take images; with the builtin recipe the profile changes the language model weights only, not the tower or the splice (exception: an explicit candidate recipe, see [Inkling 2](#inkling-2)) |
 | Decode | a prompt with image rows decodes serially (no speculative drafting for that request) |
 | Image size | scaled down, aspect kept, to at most 4096 cells of 40 px (pre-processing as in the Inkling 2 adapter section above) |
 | Several images | each image part gets its own rows within the context; only single-image prompts have been run on a device |

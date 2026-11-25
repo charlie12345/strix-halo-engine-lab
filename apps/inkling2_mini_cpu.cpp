@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        auto options = cli::parse(argc, argv, family, false);
+        auto options = cli::parse(argc, argv, family);
 #if defined(STRIX_INKLING2_MEDIA)
         family.media = cli::mini_media_opener(options.tier, std::cerr);  // image recipe: this run's resolution
 #endif

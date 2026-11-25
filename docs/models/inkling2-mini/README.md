@@ -100,6 +100,78 @@ before the first pass, the picks are published after the last one, and every
 lane of the cohort is retired if a pass fails. The packed route uses one kernel for gate/up with BF16
 activation and one for down with ordered expert combine.
 
+## Two nodes: replicas
+
+The model fits one node, so two nodes serve independent requests as
+replicas: one full `strix-serve` per node and `strix-router` in front. Each
+request runs on one node with the single-node identity. The
+`[multi_device]` section of `models/inkling2-mini.toml` declares this form;
+`single` remains the default. Use `--placement replica` to select the declared two-node form.
+
+Pin the same backend, profile, checkpoint and tokenizer on both workers: without `--backend` a build with HIP chooses HIP and a
+CUDA-only build chooses CUDA, and the router checks the endpoint count and the requested tier, not the backend, so a
+mixed pair would answer identical requests with different identities. `--backend` goes after `--` so it reaches the
+Inkling adapter's own parser (the top-level `strix-serve --backend` is read by the shell and not forwarded to the
+in-process arguments); `--profile` is a shell option and is forwarded to the adapter. Pass `--tokenizer PATH`
+explicitly too: without it each worker loads the `tokenizer.json` next to its own checkpoint, the loader only checks
+vocabulary size and EOS, and two tokenizers with different merges would tokenize the same request differently while
+the router, which sees only health and capacity, could not tell.
+
+```sh
+# on node A and on node B: one worker each, listening on that node's private address
+# (the listener defaults to 127.0.0.1, which the other node cannot reach); same --profile, --backend and checkpoint
+strix-serve --model inkling2-mini --profile exact --bind NODE_A_ADDRESS --port 18196 -- --checkpoint MODEL.safetensors --tokenizer TOKENIZER.json --backend hip   # node A
+strix-serve --model inkling2-mini --profile exact --bind NODE_B_ADDRESS --port 18196 -- --checkpoint MODEL.safetensors --tokenizer TOKENIZER.json --backend hip   # node B
+# identity check, before any traffic: on each node, the checkpoint and tokenizer hashes must be equal across the two nodes
+sha256sum MODEL.safetensors TOKENIZER.json
+# and the effective identity of each worker (backend, tier/profile) must be the same on both nodes: print it with the worker's own
+# command line plus --print-effective-config (the worker's listening line shows only its address; the checkpoint and
+# tokenizer paths are the ones on its command line, pinned by the hashes above)
+strix-serve --model inkling2-mini --profile exact --print-effective-config -- --checkpoint MODEL.safetensors --tokenizer TOKENIZER.json --backend hip
+# only then check that both workers answer from the router's node
+curl -fsS http://NODE_A_ADDRESS:18196/health && curl -fsS http://NODE_B_ADDRESS:18196/health
+# on the node that takes the API traffic (the same tier the workers run)
+strix-router --description models/inkling2-mini.toml --placement replica --profile exact \
+  --replica http://NODE_A_ADDRESS:18196 --replica http://NODE_B_ADDRESS:18196 --listen 0.0.0.0:8090
+# both endpoints must be listed (healthy, with capacity) before sending traffic
+curl -fsS http://ROUTER_ADDRESS:8090/router/status
+# then send independent requests through the router and check that both endpoints receive them
+```
+
+The router prints `effective-multi-device {...}` and refuses to start if
+the model data does not admit replicas for that many endpoints (one
+endpoint is refused, and so is the same `host:port` given twice: one worker
+is not two replicas). Only the router executes the replica form: each
+worker is a one-device launch, and `strix-serve --model inkling2-mini
+--device-count 2 --placement replica -- --checkpoint MODEL.safetensors` is refused, since one
+process would start one worker. Inkling has no native route in the `strix`
+CLI (`strix run|serve inkling2-mini` with model arguments is not a
+supported entry point; `strix inspect inkling2-mini` prints metadata
+only), so the standalone entry point is `strix-serve`.
+`strix-serve --model inkling2-mini --device-count 2 --placement replica
+--print-effective-config` prints the same placement as the router. To roll
+back, start the router without `--description`, or serve from one node.
+
+Dos nodos: cada nodo ejecuta un `strix-serve` completo, escuchando en su
+dirección privada (`--bind`; por defecto escucha en 127.0.0.1 y el otro
+nodo no lo alcanza), y `strix-router` reparte las peticiones; cada petición
+se resuelve en un solo nodo con la identidad de un nodo. Fija el mismo
+backend, perfil, checkpoint y tokenizador en los dos workers (`--profile exact` y, tras
+`--`, `--checkpoint ... --tokenizer RUTA --backend hip`; el `--backend` de nivel superior lo
+consume el shell y no llega al adaptador), porque el router comprueba el
+número de endpoints y el perfil, no el backend, y sin `--tokenizer` cada worker
+carga el `tokenizer.json` junto a su propio checkpoint (el cargador solo
+comprueba tamaño de vocabulario y EOS). Antes de enviar tráfico, comprueba que
+`sha256sum` del checkpoint y del tokenizador coincide en los dos nodos y que la
+identidad efectiva de cada worker (backend, perfil; `--print-effective-config`
+con la misma línea de comandos) es la misma; solo después comprueba que
+peticiones independientes llegan a ambos endpoints. Solo el router ejecuta la
+forma `replica`; `strix-serve --model inkling2-mini --device-count 2 --placement replica --
+--checkpoint MODEL.safetensors` se rechaza (la CLI `strix` no tiene ruta
+nativa para Inkling) y el mismo `host:puerto` repetido no cuenta como dos
+réplicas. Para volver atrás, arranca el router sin `--description` o sirve
+desde un nodo.
+
 On HIP, the command line prefills in chunks of 8192 rows (`--prefill-chunk`),
 and a remainder of up to chunk / 8 rows (and more than 16) rides in the final
 chunk (`STRIX_INKLING_PREFILL_TAIL=0` turns that off). A HIP server on the
@@ -108,11 +180,42 @@ reads the whole prompt by prefill and takes the first id from its final row, as
 the command line does. While another lane decodes it runs a prompt in 128-row
 pieces cut inside those chunks only at 16-row wave tiles and never shorter than
 17 rows, where every row keeps its route forms, so the answer does not depend
-on other requests. The CUDA command line prefills in 2048-row chunks. An
+on other requests. The CUDA command line prefills in 8192-row chunks on the
+EXACT profile and in 2048-row chunks on the others. An
 explicit `--prefill-rows` without `--slots` also caps the served lanes at that
 many rows, as before. The server's startup line prints `served_route` (`off`
 or `declined` on the existing route; `on` adds `prefill_chunk`, `prefill_tail`
 and `first_id prefill`); the command line prints `strix-prefill-route/v1`.
+
+Under memory pressure on CUDA, a GPU that cannot hold the 8192-row workspaces
+of the EXACT default loads with 2048-row chunks instead: the command line
+prints `strix-prefill-chunk 8192 -> 2048 (device memory)` (a shorter prompt
+names its own size in place of 8192) and the
+`strix-prefill-route/v1` line names the 2048-row chunk. EXACT output does not
+depend on the chunk, so the generated ids are the same. Only a refused device
+allocation selects the smaller chunk; any other load error is reported as is.
+An explicit `--prefill-chunk` is never changed, and `--prefill-chunk 2048`
+selects the smaller chunk up front. The CUDA server is not affected: it keeps
+its own 128-row prompt chunks (`--prefill-rows`).
+
+The greedy head stays the full head on CUDA in every profile. The exact switch
+`STRIX_INK_SCREENED_HEAD=1` (`inkling2-mini-screened-head@1`, off in every
+profile column, a distinct run identity when set) makes CUDA greedy picks that
+return no score row run the shared EXACT screened head
+(`cuda/core/head_screened.cuh`, an 8-bit plane of the BF16 head built at
+load): the same token and status as the full head. Steps that return or read
+scores (`--logits`, sampled lanes, verify rows, cohort programs) keep the
+full head; a sampled served lane reads the scores of its own step, projected
+on the first read. A compact head, a plane that cannot be built, or (served) a
+plane that would cost a KV slot keeps the full head. HIP keeps its own
+screened head (`STRIX_SCREENED_HEAD=0` turns it off) and ignores the switch.
+The command line, the gate and the server print `inkling2 head` with
+`screened lever`, `full lever-off`, `full build-refused`, `full kv-slot` or,
+on HIP, `screened hip-binding` / `full hip-binding`; the server's startup
+line carries the same `head` field. With the switch, the first screened pick
+prints `inkling2 head screened first pick`, the decoder prints `inkling2 head
+screened picks N` when it closes, and the CUDA step program's install line
+ends with `head=screened`.
 
 ## Execution and reuse
 

@@ -1,9 +1,13 @@
 #pragma once
 
+#include "inkling2_mini_resident_route.hpp"
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <cstdint>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace strix::inkling2 {
 
@@ -36,8 +40,10 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
 }
 
 // Resolved operand class of the W4A4 expert lever (multi-row prefill chunks run NVFP4 expert layers through the shared
-// grouped W4A4 class on CUDA): 0 = bf16 (off), 1 = nvfp4 (nearest@1), mse = nvfp4_mse, mse-gate-up = nvfp4_mse_gate_up.
-// mse / mse-gate-up are candidate values of the route-flip re-qualification, not yet gated.
+// grouped W4A4 class on CUDA): 0 = bf16 (off), 1 = nvfp4 (nearest@1), mse = nvfp4_mse, mse-gate-up = nvfp4_mse_gate_up,
+// mse-r2-gate-up = nvfp4_mse_r2_gate_up, mse-r2 = nvfp4_mse_r2 (two-term activation rule r2@1 of moe_core/nvfp4_act_rule.hpp),
+// r2 = nvfp4_r2 (two nearest@1 terms on both projections).
+// Every value but 0 / 1 is a candidate of the route-flip re-qualification, not yet gated.
 inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Resolution& tier) {
     using A = moe_core::grouped_w4a4::Activations;
     const auto* entry = tier.find(kMiniMoeW4a4);
@@ -45,7 +51,10 @@ inline moe_core::grouped_w4a4::Activations mini_moe_w4a4_class(const profile::Re
     if (entry->value == "1") return A::nvfp4;
     if (entry->value == "mse") return A::nvfp4_mse;
     if (entry->value == "mse-gate-up") return A::nvfp4_mse_gate_up;
-    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse or mse-gate-up");
+    if (entry->value == "mse-r2-gate-up") return A::nvfp4_mse_r2_gate_up;
+    if (entry->value == "mse-r2") return A::nvfp4_mse_r2;
+    if (entry->value == "r2") return A::nvfp4_r2;
+    throw std::invalid_argument("STRIX_INK_MOE_W4A4 must be 0, 1, mse, mse-gate-up, mse-r2-gate-up, mse-r2 or r2");
 }
 
 // Resolved state of the W4A4 expert lever (true: multi-row prefill chunks run NVFP4 expert layers as W4A4 on CUDA).
@@ -97,6 +106,22 @@ inline bool mini_attn_projected_bias(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_ATTN_PROJECTED_BIAS must be 0 or 1");
 }
 
+// The observed route of the projected-bias lever, one line for both entry points (with the lever selected): the
+// projected-bias appends the decoder submitted so far (0: every prompt chunk took the image route, whose bits are
+// equal). The command line prints it after each prefill, the server once when it stops.
+inline std::string mini_projected_bias_dispatches_line(std::uint64_t dispatches) {
+    return "Inkling attn_projected_bias dispatches " + std::to_string(dispatches);
+}
+
+// Resolved state of the screened-head lever (true: CUDA greedy picks without a score row run the EXACT screened head;
+// the same token and status as the full head). One value for the CLI, the gate and the server.
+inline bool mini_screened_head(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniScreenedHead);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_SCREENED_HEAD must be 0 or 1");
+}
+
 // Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
 // 0 or absent = off: the served incumbent route. Read (and validated) by the server only: the command line always runs
 // its own route and reports the lever as not applicable (mini_served_route_cli_line).
@@ -136,6 +161,7 @@ inline const char* mini_round_fold_name(bool active, bool selected) { return min
 struct MiniDecoderLevers {
     bool down_image = false;           // the BF16 down image route is active
     bool prepared_round_fold = false;  // the prepared-attention round fold runs
+    MiniHead head{};                   // the greedy head the decoder runs (screened-head lever) and why
 };
 
 // The one place a resident decoder takes its resolved profile levers; the serial CLI, the gate and the server all call
@@ -143,21 +169,46 @@ struct MiniDecoderLevers {
 // does not run is declined, not silently reported as on).
 template <class Decoder>
 MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a4::Activations moe_w4a4,
-                                         bool combine_image, bool prepared_round_fold, bool attn_projected_bias) {
+                                         bool combine_image, bool prepared_round_fold, bool attn_projected_bias,
+                                         bool screened_head) {
     decoder.set_moe_w4a4(moe_w4a4);
     decoder.set_attention_projected_bias(attn_projected_bias);
     MiniDecoderLevers levers;
     levers.prepared_round_fold = decoder.set_prepared_round_fold(prepared_round_fold);
     levers.down_image = decoder.set_combine_image(combine_image);
+    levers.head = decoder.set_screened_head(screened_head);
     return levers;
 }
 
 template <class Decoder>
 MiniDecoderLevers configure_mini_decoder(Decoder& decoder, const profile::Resolution& tier) {
     return configure_mini_decoder(decoder, mini_moe_w4a4_class(tier), mini_combine_image(tier),
-                                  mini_prepared_round_fold(tier), mini_attn_projected_bias(tier));
+                                  mini_prepared_round_fold(tier), mini_attn_projected_bias(tier),
+                                  mini_screened_head(tier));
 }
 
+// The W4A4 class a run on `backend` ("hip", "cuda") executes. Only the CUDA backend holds the grouped W4A4 tile: a
+// selected class that the backend cannot run is refused, never replaced by the BF16 tile under the class's name. Every
+// entry point (generation CLI, gate, step program, server) admits through here before it reports or binds the class.
+inline moe_core::grouped_w4a4::Activations admit_mini_moe_w4a4(moe_core::grouped_w4a4::Activations activations,
+                                                                std::string_view backend) {
+    if (activations != moe_core::grouped_w4a4::Activations::bf16 && backend != "cuda")
+        throw std::invalid_argument(std::string("STRIX_INK_MOE_W4A4 selects ") +
+                                    moe_core::grouped_w4a4::identity(activations) + ": the " + std::string(backend) +
+                                    " backend has no grouped W4A4 tile (CUDA only); select 0 to run the BF16 tile");
+    return activations;
+}
+
+inline moe_core::grouped_w4a4::Activations admit_mini_moe_w4a4(const profile::Resolution& tier, std::string_view backend) {
+    return admit_mini_moe_w4a4(mini_moe_w4a4_class(tier), backend);
+}
+
+// Backend of this translation unit's device build, for the entry points compiled once per backend.
+#if defined(__HIPCC__)
+inline constexpr std::string_view kMiniBuildBackend = "hip";
+#else
+inline constexpr std::string_view kMiniBuildBackend = "cuda";
+#endif
 
 inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options, bool native_execution) {
     auto tier = profile::resolve(kMiniProfile, options.tier);
@@ -168,7 +219,8 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_prepared_round_fold(tier));
     static_cast<void>(mini_combine_image(tier));
     static_cast<void>(mini_attn_projected_bias(tier));
-    static_cast<void>(mini_vision_axial(tier));  // the image recipe row: refused before any load, as for every row
+    static_cast<void>(mini_screened_head(tier));
+    mini_defer_vision_recipe(tier);  // image input only: re-admitted and checked by the image opener
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
     spec::require_block_draft_execution(spec::block_draft_selection(tier));

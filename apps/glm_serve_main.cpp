@@ -817,8 +817,13 @@ struct EngineOps {
                 ch.exchange_sampling_words(send, receive, sample_chunk++);
             });
         const auto& tokens = window.tokens;
-        if (tokens.empty() || tokens.size() > rows || tokens.size() > ids.size() || window.accepted > drafts.size())
-            throw std::logic_error("sampled MTP: the window decided no row or too many");
+        // The decided span is exact: rows 0 .. accepted - 1 accepted, row `accepted` decided the last token, or every one
+        // of `rows` rows accepted (no bonus row is read then). Anything else would leave a verify row's greedy id in
+        // place of a decision.
+        if (tokens.empty() || tokens.size() > rows || tokens.size() > ids.size() || window.accepted > drafts.size() ||
+            window.accepted > tokens.size() || window.accepted + 1U < tokens.size() ||
+            (window.accepted == tokens.size() && tokens.size() != rows))
+            throw std::logic_error("sampled MTP: the window decided no row, too many, or left a required row undecided");
         std::copy(tokens.begin(), tokens.end(), ids.begin());
         return window.accepted;
     }

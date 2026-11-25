@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/env_flags.hpp"
 #include "strix/fnv.hpp"
 #include "strix/turbo.hpp"
 
@@ -78,6 +79,8 @@ struct Lever {
     // An exact schedule (kind exact) whose non-builtin FAST / TURBO cell applies only where a matching timing receipt
     // shows a gain, judged in the shared chain like a lossy cell (ladder_judged()).
     bool timed = false;
+    // For 0/1 environment switches, match the runtime flag parser with `builtin` as its default.
+    std::optional<EnvFlagMatch> env_flag_match{};
 };
 
 // True when `value` is one whole item of the comma list `list`.
@@ -92,12 +95,14 @@ struct Lever {
 }
 
 // Column of `lever` that `profile` reads: an empty turbo cell takes the fast cell (TURBO includes every FAST lever
-// unless its turbo cell says otherwise); a table without a turbo column reads its fast cell the same way. Shared by
+// unless its turbo cell says otherwise); a direct query for an absent column is rejected. Shared by
 // every adapter whose rows carry `value` per profile.
 template <class Row>
 inline unsigned value_column(const Row& lever, Name profile) {
     const auto column = static_cast<unsigned>(profile);
-    if (column >= std::size(lever.value) || (profile == Name::turbo && lever.value[column].empty()))
+    // Legacy adapters have only default/fast/quality columns and refuse TURBO.
+    if (column >= std::size(lever.value)) throw std::invalid_argument("profile column is not available on this adapter");
+    if (profile == Name::turbo && lever.value[column].empty())
         return static_cast<unsigned>(Name::fast);
     return column;
 }
@@ -1169,6 +1174,8 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
                 return {value, tier, {}};
             }
             const auto lower = tier == Name::standard ? LadderCell{} : arms.cells[LadderArms::slot(tier_below(tier))][i];
+            // Legacy adapters still build the common arms to resolve FAST. They cannot select TURBO.
+            if (tier == Name::turbo && static_cast<unsigned>(tier) >= std::size(lever.value)) return lower;
             return ladder_cell(lever, judged, tier, regime, [&](unsigned c) { return admit_of(lever, c); },
                                allow_pending, arms, lower);
         };
@@ -1204,8 +1211,9 @@ template <class Row, class Admission>
 inline LadderCell select_profile_cell(const Row& lever, std::span<const LadderRow> rows, Name tier,
                                       const Regime& regime, const Admission& admit, bool allow_pending,
                                       const LadderArms& arms) {
+    const auto column = value_column(lever, tier);
     if (!ladder_judged(lever) || (tier != Name::fast && tier != Name::turbo))
-        return {lever.value[value_column(lever, tier)], tier, {}};
+        return {lever.value[column], tier, {}};
     // The cell the arms resolved (the one their references were spelled over). A lever outside those arms is judged
     // over its own lower cells, and no ordinary row matches it (LadderArms::over()).
     const auto at = arms.index(lever.name);
@@ -1305,11 +1313,16 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     // 'quality' without quality rows is the default column; an empty turbo cell is the fast cell.
     const auto profile_column = out.quality_fallback() ? Name::standard : out.profile;
     const bool preset = model_preset();
+    const auto effective_env_value = [](const Lever& lever, const char* raw) -> std::string_view {
+        if (!lever.env_flag_match) return raw;
+        return envcfg::parse_flag(raw, lever.builtin == "1", *lever.env_flag_match) ? "1" : "0";
+    };
     const auto arms = ladder_arms(engine.table, engine.ladder, inputs.regime,
         [&](const Lever& lever, unsigned c) { return column_admission(lever, c, out.allow_pending, preset); },
         [&](const Lever& lever) -> std::optional<std::string_view> {
             if (const auto* cli = last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
-            if (const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env)) return env;
+            if (const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env))
+                return effective_env_value(lever, env);
             return std::nullopt;
         }, out.allow_pending);
     for (const auto& lever : engine.table) {
@@ -1320,7 +1333,8 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
         if (cli != nullptr || env != nullptr) {  // a set variable is explicit even when empty (the app judges it)
             entry.requested = cli != nullptr ? *cli : std::string(env);
-            entry.value = cli != nullptr ? *cli : std::string(env);
+            if (cli != nullptr) entry.value = *cli;
+            else entry.value = effective_env_value(lever, env);
             entry.status = cli != nullptr ? Status::explicit_cli : Status::explicit_env;
             if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
         } else if (wanted.empty() || wanted == lever.builtin) {

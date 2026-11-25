@@ -12,7 +12,7 @@
 // (docs/optimizations.json). No quality pack: 'quality' runs default with one notice.
 namespace strix::deepseek41::pair_defaults {
 
-inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 13> profile_table{{
     // Prefill only (device prefill of the serve and the prefill app). FP32 softmax statistics.
     {"attention_f16wmma", "STRIX_DS41_FAST_ATTN", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, true}, "ds41-attn-f16wmma-v1", "0",
@@ -52,7 +52,7 @@ inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
     // keep the exact kernel. Not a bundle member (the env bundle ds41-fast-pf-v1 keeps its identity); 'fast' selects it.
     {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
-     "FAST Engram projection ds41-engram-f16wmma-v1 in the fast set; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800); not a turbo member",
+     "FAST Engram projection ds41-engram-f16wmma-v1 in the fast set; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800); TURBO inherits FAST",
      false, {false, true, false, false}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     // Prefill only: the shared expert's three Q8_0 x A8 products on the FAST dense core (ds41-shared-f16-v1). Not a bundle
     // member; 'fast' selects it.
@@ -65,6 +65,22 @@ inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
      {true, false, true, false}, {true, true, true, false}, "", "0",
      "FAST MoE down FP16 operands ds41-moe-f16wmma-v1 (#721) in the fast set; FAST gate v2 D1 on the resolved fast set (no replay): qualified for prompts <= 8,192 (8K class 14 windows, 882 rows, final PASS: KL 0.0116, top-1 0.962, dNLL -0.0072 se 0.0058); provisional above (32K class 126 rows < 800)",
      false, {false, true, false, false}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
+    // Prefill only: routed experts as IU4 codes x A4 activations (gguf-iu4-direct-v1; the stored IQ2_XXS / Q2_K weights
+    // are decoded inside the product, no pack). Automatic TURBO admission needs the actual request prefill regime
+    // and must replace relaxed MoE atomically for execution and prefix identity. Explicit STRIX_DS41_FAST_I4=1
+    // already displaces the profile-selected relaxed MoE.
+    {"moe_iu4", "STRIX_DS41_FAST_I4", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, false, true, true}, "gguf-iu4-direct-v1", "0",
+     "pending: TURBO prefill timing over FAST and quality (KL / top-1 / dNLL vs BF16) for gguf-iu4-direct-v1; "
+     "automatic admission requires the request prefill regime and atomic replacement of relaxed MoE", false,
+     {}, true, {}, {{{"0", "v1"}, {"1", "gguf-iu4-direct-v1"}}}},
+    {"moe_iu4_scope", "STRIX_DS41_FAST_I4_SCOPE", "", {"", "", "", ""}, "", strix::profile::Kind::bit_changing,
+     {}, {true, true, true, true}, "", "", "explicit IU4 projection scope: all (default) or gu", false, {}, true, {}, {{{"", "all-v1"}, {"all", "all-v1"}, {"gu", "gu-v1"}}}},
+    // Explicit diagnostics (construct-time switches of the device prefill): listed so receipts name them.
+    {"prefill_bf16_attention", "STRIX_DS41_PREFILL_BF16_ATTN", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {}, {true, true, true, true}, "", "0", "explicit BF16 hi/lo attention diagnostic", false, {}, true, {}, {{{"0", "v1"}, {"1", "bf16-hi-lo-v1"}}}},
+    {"prefill_fp16_dense_lt", "STRIX_DS41_PREFILL_FP16_DENSE", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {}, {}, "", "0", "explicit FP16 dense diagnostic; requires the optional hipBLASLt build", false, {}, true, {}, {{{"0", "v1"}, {"1", "fp16-hipblaslt-v1"}}}},
 }};
 
 // FAST gate ledger (strix::profile::FastGate, tests/profile_fast_set_tests.cpp): the gate receipt behind each fast cell.

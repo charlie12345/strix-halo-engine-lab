@@ -53,8 +53,14 @@ void qwen_rows() {
         require(find(def, lever) == nullptr || find(def, lever)->status == p::Status::builtin, "default keeps the lever off");
     }
     const auto* prune = find(turbo, "moe_route_prune");
-    require(prune != nullptr && prune->status == p::Status::pending && prune->target == "rel<f>[n] | topp<f>[n] | cap<k>[n]",
-            "calibrated route pruning is a pending turbo cell");
+    require(prune != nullptr && prune->status == p::Status::pending && prune->value == "off",
+            "TURBO reports pending route pruning when the prompt length is unknown");
+    q::Inputs measured = in;
+    measured.regime = {p::Phase::prefill, 8192, 1, "gfx1151"};
+    const auto turbo_8k = q::resolve(p::Name::turbo, measured);
+    const auto* cap9 = find(turbo_8k, "moe_route_prune");
+    require(cap9 != nullptr && cap9->status == p::Status::pending && cap9->value == "off",
+            "TURBO keeps cap9 pending at 8K until its composition has evidence");
     // One resolver: CLI spelling and serve-style inputs give the same fingerprint.
     const char* argv[] = {"app", "--profile", "turbo"};
     std::optional<p::Name> name;
@@ -83,7 +89,7 @@ void families() {
     generic(ds, p::Name::turbo, none, r);
     // TURBO nests FAST: the prefill bundle (attention bf16flash, relaxed MoE, f16 dense, set once by the bundle) and the
     // Engram / shared expert / MoE f16 members run in TURBO as in FAST.
-    require(profile_table.size() == 9, "ds41 keeps nine rows (pending Engram replaced, opt-in shared_f16 and moe_f16wmma added)");
+    require(profile_table.size() == 13, "ds41 keeps thirteen rows, including the IU4 candidate and explicit diagnostics");
     for (const char* lever : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"})
         require(find(r, lever) != nullptr && find(r, lever)->value == "1" && p::applied(find(r, lever)->status),
                 (std::string("ds41 turbo runs the fast member ") + lever).c_str());
@@ -96,10 +102,15 @@ void families() {
                     ("ds41 turbo resolves every cell to its fast value: " + lever).c_str());
         }
     }
+    require(find(r, "moe_iu4")->value == "0" && find(r, "moe_iu4")->status == p::Status::pending,
+            "DeepSeek IU4 remains pending in TURBO");
     std::size_t engram_rows = 0;
     for (const auto& row : profile_table)
         if (std::string_view(row.env) == "STRIX_DS41_FAST_ENGRAM") ++engram_rows;
     require(engram_rows == 1 && find(r, "engram_wmma") == nullptr, "one real Engram row per env");
+    const auto* engram = find(r, "engram_f16wmma");
+    require(engram != nullptr && engram->value == "1" && engram->lever->value[3].empty(),
+            "DeepSeek TURBO inherits the FAST Engram member");
     require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
     generic(ds, p::Name::fast, none, r);
     require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
@@ -109,8 +120,8 @@ void families() {
     const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1", {}, {},
                        strix::minimax::defaults::ladder_rows};  // the production engine (its incumbent grants)
     generic(mm, p::Name::turbo, none, r);
-    require(strix::minimax::defaults::profile_table.size() == 10,
-            "minimax retains six base rows, the FAST router rows, the explicit-only TP2 exchange row and the dense tail opt-in");
+    require(strix::minimax::defaults::profile_table.size() == 11,
+            "minimax retains the IU4 rows, the FAST router rows, the TP2 exchange row and the dense tail opt-in");
     require(find(r, "router_wmma")->value == "1" && p::applied(find(r, "router_wmma")->status),
             "minimax turbo runs the fast router member (TURBO nests FAST)");
     for (const char* lever : {"idx_wmma", "idx_wmma_layers", "router_wmma_layers", "pf_dense_tail_fixed"}) {
@@ -119,7 +130,7 @@ void families() {
         require(e != nullptr && e->status == p::Status::builtin && e->value == e->lever->builtin &&
                     (std::string_view(e->lever->value[3]).empty() || e->lever->value[3] == e->lever->builtin) &&
                     !e->lever->runnable[3],
-                "minimax index rows stay explicit-only outside turbo");
+                "MiniMax companion rows keep their builtin values");
     }
     // TURBO nests FAST: the pending TURBO flash proposal (mode 1 on 0-59) leaves the FAST member (mode 1 on its FAST
     // layer set); only the 0-59 layer proposal stays pending.
@@ -127,7 +138,9 @@ void families() {
                 find(r, "msa_flash_layers")->status == p::Status::pending &&
                 find(r, "msa_flash_layers")->value == std::string(strix::minimax::defaults::kMsaFlashLayers),
             "minimax turbo runs the FAST flash member on the FAST layer set; 0-59 stays pending");
-    require(find(r, "moe_invariant")->status == p::Status::pending, "minimax moe invariant pending");
+    require(find(r, "iu4_layers")->status == p::Status::pending && find(r, "iu4_layers")->value == "none",
+            "minimax IU4 layer set pending (TURBO candidate without a timing row)");
+    require(find(r, "model_format")->value == "exl3" && find(r, "iu4_a8")->value == "0", "minimax IU4 format rows explicit-only");
     generic(mm, p::Name::fast, none, r);
     // fast = the qualified bundle mm-fast-pf-v2: its two members' cells (the index rows stay explicit-only, above).
     require(find(r, "msa_flash")->status == p::Status::set && find(r, "msa_flash")->value == "1" &&
@@ -181,6 +194,8 @@ void families() {
         require(exported.contains(key) == fast_exported.contains(key) &&
                     (!exported.contains(key) || exported[key] == fast_exported[key]),
                 "MiniMax TURBO exports the FAST bundle members exactly as FAST (the 0-59 proposal never escapes)");
+    require(!exported.contains("STRIX_MM_PF_MSA_FLASH_LAYERS"),
+            "MiniMax never exports the pending wider layer set");
     p::Inputs allow;
     allow.profile = p::Name::turbo;
     allow.allow_pending = true;
@@ -191,8 +206,8 @@ void families() {
 
     generic(strix::glm::rank_defaults::product_profile_engine, p::Name::turbo, none, r);
     require(find(r, "pf_wmma")->value == "1", "glm turbo inherits pf_wmma");
-    require(find(r, "kda_state16")->status == p::Status::pending && find(r, "router_indexer_wmma")->status == p::Status::pending,
-            "glm router/indexer and KDA16 pending");
+    require(find(r, "kda_state16")->status == p::Status::pending && find(r, "router_wmma")->status == p::Status::pending &&
+                find(r, "idxproj_wmma")->status == p::Status::pending, "GLM router/indexer and KDA16 pending");
 }
 }  // namespace
 

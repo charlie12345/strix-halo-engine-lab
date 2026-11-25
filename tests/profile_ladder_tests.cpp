@@ -649,15 +649,35 @@ void incumbents(const char* golden, bool write) {
         require(before[i] == now[i], "selection moved: '" + before[i] + "' -> '" + now[i] + "'");
 }
 // TURBO nests FAST: no TURBO column of any engine table leaves a FAST member off (a TURBO cell spelling the builtin
-// over a FAST value). An empty TURBO cell runs the FAST cell.
+// over a FAST value). An empty TURBO cell runs the FAST cell. Beyond the spelling, the RESOLVED cells nest in every
+// probed regime with the production admission: wherever FAST runs a non-builtin value, TURBO runs it too or runs an
+// admitted replacement of its own; a TURBO proposal its column refuses (pending, not runnable) never resolves the
+// cell below FAST (review r75: the MiniMax TURBO flash proposal dropped the FAST flash member).
 void turbo_nests_fast(std::span<const p::Engine> engines) {
-    for (const auto& engine : engines)
+    for (const auto& engine : engines) {
         for (const auto& lever : engine.table) {
             const auto fast = lever.value[static_cast<unsigned>(p::Name::fast)];
             const auto turbo = lever.value[static_cast<unsigned>(p::Name::turbo)];
             require(fast.empty() || turbo.empty() || turbo == fast || turbo != lever.builtin,
                     std::string(engine.tag) + "/" + std::string(lever.name) + ": a TURBO cell leaves a FAST member off");
         }
+        if (engine.turbo_version.empty()) continue;
+        auto probes = p::ladder_probes(engine);
+        probes.push_back({});
+        for (const auto& regime : probes) {
+            const auto f = resolve(engine, p::Name::fast, regime);
+            const auto t = resolve(engine, p::Name::turbo, regime);
+            require(f.entries.size() == t.entries.size(), std::string(engine.tag) + ": FAST and TURBO entry counts");
+            for (std::size_t i = 0; i < f.entries.size() && i < t.entries.size(); ++i) {
+                const auto& fe = f.entries[i];
+                const auto& te = t.entries[i];
+                if (!p::applied(fe.status) || fe.value == fe.lever->builtin) continue;
+                require(p::applied(te.status) && te.value != te.lever->builtin,
+                        std::string(engine.tag) + "/" + std::string(fe.lever->name) + ": TURBO resolves '" + te.value +
+                            "' (status " + p::status_name(te.status) + ") where FAST runs '" + fe.value + "'");
+            }
+        }
+    }
 }
 
 // A paired decision is admitted only by a row measured on the pair (LadderRow::joint): single-cell rows of either half

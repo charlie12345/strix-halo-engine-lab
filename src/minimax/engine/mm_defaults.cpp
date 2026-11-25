@@ -236,7 +236,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     p.bundle_column = profile_column_selects_bundle(env);
     p.bundle_from_profile = p.bundle_column && !fp::set(env(kFastBundle.env));
     if (p.bundle_from_profile && baseline(env))
-        throw std::invalid_argument(std::string("--profile fast selects the FAST bundle ") + kFastBundle.profile + "; " +
+        throw std::invalid_argument(std::string("--profile ") + env(kProductProfileEnv) + " selects the FAST bundle " + kFastBundle.profile + "; " +
                                     kBaselineEnv + "=1 (--baseline) is the exact baseline: drop one of the two");
     const fp::Getenv bundle_env = fp::profile_switch(kFastBundle, p.bundle_from_profile ? "1" : "", env);
     p.canonical = fp::expand(kFastBundle, bundle_env, [&](const fp::Member&) { return !i4; });
@@ -271,7 +271,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                          ? std::string(msa_flash_policy(p.msa_flash_layers))
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : p.msa_flash == 3 ? "-rg4" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(bundle_env(kFastBundle.env)) && !fp::set(raw))
-        p.note = std::string(flash.policy) + " not selected by " + (p.bundle_from_profile ? "--profile fast" : kFastBundle.env) +
+        p.note = std::string(flash.policy) + " not selected by " + (p.bundle_from_profile ? std::string("--profile ") + env(kProductProfileEnv) : std::string(kFastBundle.env)) +
                  " on STRIX_MMX_MODEL_FORMAT=fast_i4";
     // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).
     const char* iw = env("STRIX_MM_PF_IDX_WMMA");
@@ -314,11 +314,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     const auto rmask = strix::core::parse_layer_set(fp::set(rlayers) ? rlayers : kRouterWmmaLayers, 0, kMsaLayers,
                                                     "STRIX_MM_PF_ROUTER_WMMA_LAYERS");
     p.router_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return rmask.test(l); });
-    // A column that applies the router member on its own (TURBO over the FAST cell, its flash member refused) runs it
-    // as the word's selection, admitted like the bundle member; an explicit value wins.
-    const fp::Member& router_member = kFastMembers[1];
-    p.router_column = !p.bundle_column && !fp::set(router) && !i4 && profile_column_applies_member(env, router_member);
-    p.router_wmma = ((rit != p.canonical.end() && rit->second == "1") || p.router_column) && rmask.count() != 0;
+    p.router_wmma = rit != p.canonical.end() && rit->second == "1" && rmask.count() != 0;
     return p;
 }
 
@@ -386,8 +382,8 @@ profile::Resolution profile_resolution(const Lookup& env) {
             return p.idx_wmma ? p.idx_wmma_layers.c_str() : nullptr;
         // The same for the FAST router product: unset or 0 is the builtin, its layer set counts only while it runs.
         if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA") == 0) {
-            if (!p.router_wmma) return p.bundle_column || p.router_column ? "0" : nullptr;
-            return (p.bundle_from_profile || p.router_column) && !strix::fast_profile::set(env(key)) ? nullptr : "1";
+            if (!p.router_wmma) return p.bundle_column ? "0" : nullptr;
+            return p.bundle_from_profile && !strix::fast_profile::set(env(key)) ? nullptr : "1";
         }
         if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA_LAYERS") == 0) return p.router_wmma ? p.router_wmma_layers.c_str() : nullptr;
         return base(key);
@@ -398,21 +394,20 @@ profile::Resolution profile_resolution(const Lookup& env) {
 }
 
 bool profile_column_selects_bundle(const Lookup& env) {
-    // The word's column alone (no environment): it selects the bundle when it applies every member's bundle value.
-    return std::all_of(std::begin(kFastBundle.members), std::end(kFastBundle.members),
-                       [&](const strix::fast_profile::Member& m) { return profile_column_applies_member(env, m); });
-}
-
-bool profile_column_applies_member(const Lookup& env, const strix::fast_profile::Member& member) {
     const char* name = env(kProductProfileEnv);
     if (name == nullptr || *name == 0 || !profile::is_name(name)) return false;
+    // The word's column alone (no environment): it selects the bundle when it applies every member's bundle value.
     profile::Inputs in;
     in.profile = profile::parse(name);
     in.env = [](const char*) -> const char* { return nullptr; };
     const auto r = profile::resolve(profile_engine(), in);
-    for (const auto& e : r.entries)
-        if (e.lever->env == member.env) return profile::applied(e.status) && e.value == member.value;
-    return false;
+    for (const auto& m : kFastBundle.members) {
+        bool applied = false;
+        for (const auto& e : r.entries)
+            if (e.lever->env == m.env) applied = profile::applied(e.status) && e.value == m.value;
+        if (!applied) return false;
+    }
+    return true;
 }
 
 bool fast_profile_selects_bundle(const Lookup& env) {

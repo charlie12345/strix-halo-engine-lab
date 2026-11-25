@@ -1090,11 +1090,12 @@ template <class Row, class Admission>
 
     lower.measured = false;  // the lower step's own verdict is not this tier's
     if (!wanted.empty() && !eligible) {
-        // An unavailable binding for the same value can represent a different tier-specific composition
-        // (for example a required companion layer set). Only an actual replacement can bypass that refusal.
-        if (tier == Name::turbo && column == static_cast<unsigned>(Name::turbo) && lower.value != lever.builtin &&
-            (wanted != lower.value || lever.runnable[column])) {
-            lower.route = " turbo=" + std::string(wanted) + " refused by column admission" + lower.route;
+        // TURBO nests FAST: a TURBO proposal its column does not admit (pending, or not runnable in this build) leaves
+        // the cell FAST resolved, whatever value the proposal spells (a companion setting of the proposal stays
+        // pending in its own row); it never drops an admitted FAST member. FAST falls back to the builtin.
+        if (tier == Name::turbo) {
+            if (lower.value != lever.builtin)
+                lower.route = " turbo=" + std::string(wanted) + " refused by column admission" + lower.route;
             return lower;
         }
         return {lever.builtin, Name::standard, {}};

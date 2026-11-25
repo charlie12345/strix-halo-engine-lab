@@ -20,7 +20,6 @@
 #include <string>
 #include <vector>
 #include "strix/engine_profile.hpp"
-#include "strix/fast_profile.hpp"
 #include "strix/session/kv_precision.hpp"
 #include "xport/split_frame.hpp"
 #include "xport/exchange_format.hpp"
@@ -82,7 +81,6 @@ struct PrefillPolicy {
     std::string note;                              // why a bundle member does not run; empty: none
     bool bundle_column = false;                    // the product profile's column applies the bundle members
     bool bundle_from_profile = false;              // ... and the switch is unset: the word selected the bundle
-    bool router_column = false;                    // the column applies the router member without the bundle (unset)
     // STRIX_TP2_EXCHANGE_FMT (shared trait, xport/exchange_format.hpp): an explicit f16 = named FAST policy
     // tp2-xchg-f16-v0 (throws under STRIX_MM_BASELINE=1); default f32 in every profile (the FAST bundle does not select it).
     strix::xport::ExchangeFormat exchange_fmt = strix::xport::ExchangeFormat::f32;
@@ -105,12 +103,9 @@ profile::Resolution profile_resolution(const Lookup& env);
 // '--timing-profile NAME:PROMPT.u32:STEPS'; the old '--profile NAME:PROMPT.u32:STEPS' stays accepted with one notice.
 inline constexpr const char* kProductProfileEnv = "STRIX_MM_PRODUCT_PROFILE";
 // The product profile's column (shared resolver, profile_table, no environment) applies every member of the FAST bundle
-// mm-fast-pf-v2 with its bundle value: today 'fast' (qualified cells, gate PASS 8K + 32K); default / quality never,
-// turbo not while its cells are pending.
+// mm-fast-pf-v2 with its bundle value: 'fast' (qualified cells, gate PASS 8K + 32K) and 'turbo', which nests FAST (its
+// pending proposals leave the FAST cells); default / quality never.
 bool profile_column_selects_bundle(const Lookup& env);
-// The column alone applies `member` with its bundle value (a TURBO column over a FAST member whose bundle partner it
-// refuses runs that member on its own).
-bool profile_column_applies_member(const Lookup& env, const strix::fast_profile::Member& member);
 // ... and the bundle switch (STRIX_MM_FAST_PREFILL) is unset: prefill_policy() then expands the bundle from the word
 // (fast_profile::profile_switch), the same members, admission and prefill identity as the switch; nothing is exported.
 // A set switch, "0" included, wins. With STRIX_MM_BASELINE=1 prefill_policy() refuses the word (exact baseline).

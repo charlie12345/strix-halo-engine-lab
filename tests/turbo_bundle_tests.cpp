@@ -121,8 +121,12 @@ void families() {
                     !e->lever->runnable[3],
                 "minimax index rows stay explicit-only outside turbo");
     }
-    require(find(r, "msa_flash")->status == p::Status::pending && find(r, "msa_flash_layers")->status == p::Status::pending,
-            "minimax turbo flash waits for adapter admission/export");
+    // TURBO nests FAST: the pending TURBO flash proposal (mode 1 on 0-59) leaves the FAST member (mode 1 on its FAST
+    // layer set); only the 0-59 layer proposal stays pending.
+    require(find(r, "msa_flash")->value == "1" && p::applied(find(r, "msa_flash")->status) &&
+                find(r, "msa_flash_layers")->status == p::Status::pending &&
+                find(r, "msa_flash_layers")->value == std::string(strix::minimax::defaults::kMsaFlashLayers),
+            "minimax turbo runs the FAST flash member on the FAST layer set; 0-59 stays pending");
     require(find(r, "moe_invariant")->status == p::Status::pending, "minimax moe invariant pending");
     generic(mm, p::Name::fast, none, r);
     // fast = the qualified bundle mm-fast-pf-v2: its two members' cells (the index rows stay explicit-only, above).
@@ -133,22 +137,57 @@ void families() {
     namespace md = strix::minimax::defaults;
     const std::map<std::string, std::string> mm_env{{md::kProductProfileEnv, "turbo"}};
     const auto admitted = md::profile_resolution(env_of(mm_env));
-    const auto execution = md::prefill_policy(env_of(mm_env));
-    require(execution.router_wmma && !execution.msa_flash && find(admitted, "router_wmma")->value == "1",
-            "MiniMax TURBO dispatches the router member its receipt states (flash partner refused)");
+    // Review r75 P1: the actual prefill policy of TURBO is the admitted FAST bundle (both members, the FAST flash layer
+    // set), and every control that turns the bundle off in FAST turns it off in TURBO.
+    const auto same_policy = [&](std::map<std::string, std::string> extra, const char* what) {
+        auto fast_env = extra, turbo_env = extra;
+        fast_env[md::kProductProfileEnv] = "fast";
+        turbo_env[md::kProductProfileEnv] = "turbo";
+        std::string fast_error, turbo_error;
+        md::PrefillPolicy f, t;
+        try { f = md::prefill_policy(env_of(fast_env)); } catch (const std::exception& e) { fast_error = e.what(); }
+        try { t = md::prefill_policy(env_of(turbo_env)); } catch (const std::exception& e) { turbo_error = e.what(); }
+        require(fast_error.empty() == turbo_error.empty(), what);
+        require(f.msa_flash == t.msa_flash && f.msa_flash_layers == t.msa_flash_layers && f.router_wmma == t.router_wmma &&
+                    f.router_wmma_layers == t.router_wmma_layers && f.policies == t.policies && f.canonical == t.canonical &&
+                    f.bundle_column == t.bundle_column && f.bundle_from_profile == t.bundle_from_profile,
+                what);
+        return t;
+    };
+    const auto execution = same_policy({}, "MiniMax TURBO prefill policy equals FAST (default)");
+    require(execution.bundle_from_profile && execution.msa_flash == 1 && execution.router_wmma &&
+                execution.msa_flash_layers == md::kMsaFlashLayers && find(admitted, "router_wmma")->value == "1",
+            "MiniMax TURBO dispatches the whole FAST bundle (flash on the FAST layer set + router)");
     require(find(admitted, "msa_flash")->value == std::to_string(execution.msa_flash),
             "MiniMax actual adapter receipt matches engine flash mode");
     require(find(admitted, "msa_flash_layers")->value == execution.msa_flash_layers,
             "MiniMax actual adapter receipt matches engine layer set");
-    std::map<std::string, std::string> exported;
+    const auto off = same_policy({{"STRIX_MM_FAST_PREFILL", "0"}}, "MiniMax TURBO bundle switch 0 equals FAST");
+    require(off.msa_flash == 0 && !off.router_wmma, "MiniMax STRIX_MM_FAST_PREFILL=0 turns both members off in TURBO");
+    const auto i4 = same_policy({{"STRIX_MMX_MODEL_FORMAT", "fast_i4"}}, "MiniMax TURBO on FAST_I4 equals FAST");
+    require(i4.msa_flash == 0 && !i4.router_wmma, "MiniMax FAST_I4 admits no bundle member in TURBO");
+    bool refused = false;
+    try {
+        (void)md::prefill_policy(env_of({{md::kProductProfileEnv, "turbo"}, {md::kBaselineEnv, "1"}}));
+    } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "MiniMax --baseline --profile turbo is refused like --baseline --profile fast");
+    (void)same_policy({{md::kBaselineEnv, "1"}}, "MiniMax baseline: TURBO and FAST refuse alike");
+    std::map<std::string, std::string> exported, fast_exported;
     p::apply(admitted, [&](const char* key, const char* value) { exported[key] = value; return true; });
-    require(!exported.contains("STRIX_MM_PF_MSA_FLASH") && !exported.contains("STRIX_MM_PF_MSA_FLASH_LAYERS"),
-            "pending MiniMax proposals never escape through the shared exporter");
+    p::apply(md::profile_resolution(env_of({{md::kProductProfileEnv, "fast"}})),
+             [&](const char* key, const char* value) { fast_exported[key] = value; return true; });
+    for (const char* key : {"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_PF_ROUTER_WMMA",
+                            "STRIX_MM_PF_ROUTER_WMMA_LAYERS"})
+        require(exported.contains(key) == fast_exported.contains(key) &&
+                    (!exported.contains(key) || exported[key] == fast_exported[key]),
+                "MiniMax TURBO exports the FAST bundle members exactly as FAST (the 0-59 proposal never escapes)");
     p::Inputs allow;
     allow.profile = p::Name::turbo;
     allow.allow_pending = true;
     const auto pending = p::resolve(mm, allow);
-    require(find(pending, "msa_flash")->status == p::Status::pending, "allow-pending cannot bypass missing MiniMax adapter");
+    require(find(pending, "msa_flash_layers")->status == p::Status::pending &&
+                find(pending, "msa_flash_layers")->value != "0-59",
+            "allow-pending cannot bypass the missing MiniMax 0-59 adapter");
 
     generic(strix::glm::rank_defaults::product_profile_engine, p::Name::turbo, none, r);
     require(find(r, "pf_wmma")->value == "1", "glm turbo inherits pf_wmma");

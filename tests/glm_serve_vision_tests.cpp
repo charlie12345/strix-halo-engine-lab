@@ -4,6 +4,7 @@
 #include "../src/glm/serve/glm_serve_vision.hpp"
 
 #include "glm_vision_toy.hpp"
+#include "private_test_dir.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -54,11 +55,13 @@ std::vector<std::uint32_t> encode(const std::string& text) {
     return {1, 2, 3};
 }
 
-std::filesystem::path write_file(const glm_vision_toy::File& f, const char* name) {
-    const auto path = std::filesystem::temp_directory_path() / name;
+// A new file in the run's private directory (never an existing path).
+std::filesystem::path write_file(const strix::test::PrivateTestDir& dir, const glm_vision_toy::File& f, const char* name) {
+    const auto path = dir.fresh(name);
     const std::string bytes = f.bytes();
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    std::ofstream out(path, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!out) throw std::runtime_error("cannot write " + path.string());
     return path;
 }
 
@@ -93,7 +96,8 @@ bool same_rows(const session::ResolvedEmbedRun& a, const session::ResolvedEmbedR
 }
 
 void test_stack_and_frames(const std::string& fixtures) {
-    const auto path = write_file(glm_vision_toy::small_file(false, true, glm::kLanguageHidden), "strix_glm_serve_vision_test.gguf");
+    const strix::test::PrivateTestDir dir("strix-glm-serve-vision");
+    const auto path = write_file(dir, glm_vision_toy::small_file(false, true, glm::kLanguageHidden), "vision.gguf");
     serve::media::Limits limits;
     auto stack = gs::make_vision_stack(path, encode, limits);
     CHECK(stack->bridge->placeholder() == "<|image|>");
@@ -180,10 +184,8 @@ void test_stack_and_frames(const std::string& fixtures) {
     // A tokenizer without the model's image tokens, or a file of another language width, is refused at start.
     CHECK(throws([&] { (void)gs::make_vision_stack(path, [](const std::string&) { return std::vector<std::uint32_t>{1}; }, limits); },
                  "image tokens"));
-    const auto narrow = write_file(glm_vision_toy::small_file(false, true), "strix_glm_serve_vision_narrow.gguf");
+    const auto narrow = write_file(dir, glm_vision_toy::small_file(false, true), "narrow.gguf");
     CHECK(throws([&] { (void)gs::make_vision_stack(narrow, encode, limits); }, "projection width"));
-    std::filesystem::remove(path);
-    std::filesystem::remove(narrow);
 }
 
 }  // namespace

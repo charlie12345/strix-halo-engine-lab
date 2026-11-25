@@ -3,6 +3,7 @@
 // the span layout, the cache key and the embed rows file. The tower is a small synthetic one with the real metadata
 // keys and tensor names.
 #include "glm_vision_toy.hpp"
+#include "private_test_dir.hpp"
 
 #include "strix/session/embed_rows_file.hpp"
 #include "strix/vision/embed_cache.hpp"
@@ -409,7 +410,8 @@ void test_rows_file() {
     const session::EmbedRows rows = vision::span_embed_rows(b.adapter.layout(g), *encoded.rows, digest);
     CHECK(rows.rows == 4 && rows.width == kP && rows.real_token_id == kToken && rows.axes == 0);
 
-    const auto path = std::filesystem::temp_directory_path() / "strix_glm_vision_rows_test.embed";
+    const strix::test::PrivateTestDir dir("strix-glm-vision-rows");
+    const auto path = dir.fresh("rows.embed");
     session::write_embed_rows_file(path, rows);
     const session::EmbedRows back = session::read_embed_rows_file(path, kP);
     CHECK(back.rows == rows.rows && back.width == rows.width && back.real_token_id == kToken && back.digest == digest &&
@@ -432,7 +434,6 @@ void test_rows_file() {
         f << "not an embed rows file, but long enough to hold a whole header of the format";
     }
     CHECK(throws([&] { (void)session::read_embed_rows_file(path); }, "version 1"));
-    std::filesystem::remove(path);
     session::EmbedRows deep = rows;
     deep.axes = 1;
     CHECK(throws([&] { session::write_embed_rows_file(path, deep); }, "plain content rows"));

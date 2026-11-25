@@ -237,7 +237,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
-                     " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE]"
+                     " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE [--logits-overwrite]]"
                      " [--speculation off|auto|verify|lookup] [--dspark FILE]"
                      " [--step-graph | --no-step-graph"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)

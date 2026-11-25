@@ -156,7 +156,7 @@ struct SerialGenerationOptions {
     const char* tokenizer{};
     const char* tokenize_file{};
     const char* logits{};
-    bool logits_overwrite{};  // --logits-overwrite: an existing --logits file may be replaced
+    bool logits_overwrite{};  // --logits-overwrite: an existing --logits file is replaced (renamed over) on success
     std::uint32_t generate{}, prefill_chunk{};
     bool prefill_chunk_explicit{};
     bool packed_decode{};

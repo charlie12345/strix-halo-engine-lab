@@ -255,6 +255,14 @@ void test_accept() {
     check(a.m == 2 && a.has_bonus && a.bonus == 7 && a.rows == 3, "accept_decided: two accepted, row 2 decides the last token");
     a = accept_decided(d1, t1, 3, kNoFlag, Terminal{kNoFlag, 2});
     check(a.m == 2 && a.stop && a.rows == 2, "accept_decided: the budget still ends the window");
+    // a sampled window that decided a stop id (the cycle passes it as the terminal): an accepted stop draft at row 0
+    // ends the request there (one row committed, no bonus), and row 1's non-finite flag is never required, as plain
+    // sampling never processes the stop token as input; without the terminal the same window aborts the request
+    const std::uint32_t d_stop[] = {154820, 6}, t_stop[] = {154820, 6};
+    a = accept_decided(d_stop, t_stop, 1, 1, Terminal{154820, 9});
+    check(!a.abort && a.stop && a.m == 1 && !a.has_bonus && a.rows == 1, "accept_decided: accepted stop at row 0 ends before a flagged row 1");
+    a = accept_decided(d_stop, t_stop, 1, 1, Terminal{kNoFlag, 9});
+    check(a.abort && a.rows == 1, "accept_decided: without the stop terminal the flagged row 1 aborts");
     bool refused = false;
     try { (void)accept_decided(d1, std::span<const std::uint32_t>(t1), 4); } catch (const std::invalid_argument&) { refused = true; }
     check(refused, "accept_decided: more accepted rows than drafts refused");

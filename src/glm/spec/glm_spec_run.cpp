@@ -211,8 +211,10 @@ bool GreedyDecoder::cycle() {
     Accepted acc;
     const unsigned rows_needed = std::min({rec.k + 1U, first_flag, remaining});
     if (policy.pick_targets && rows_needed > 0) {  // sampled: the lead's sampler decides the rows plain decoding processes
-        const unsigned accepted = policy.pick_targets(drafts, rows_needed, p + 1, std::span<std::uint32_t>(v.id));
-        acc = accept_decided(drafts, v.id, accepted, first_flag, Terminal{kNoFlag, remaining});
+        // a decided stop id is terminal: no row after it is committed or caught up, and a flagged row after it is
+        // never required (plain sampling stops there too)
+        const auto picked = policy.pick_targets(drafts, rows_needed, p + 1, std::span<std::uint32_t>(v.id));
+        acc = accept_decided(drafts, v.id, picked.accepted, first_flag, Terminal{picked.stop, remaining});
     } else {
         acc = accept_greedy(drafts, v.id, first_flag, Terminal{kNoFlag, remaining});
     }

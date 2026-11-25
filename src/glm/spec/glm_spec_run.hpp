@@ -33,11 +33,17 @@ struct DecodePolicy {
     // Sampled decoding (serve, kRunSample): after each verify both ranks call this with the window's drafts, the rows
     // plain decoding processes (min(K + 1, first flagged row, tokens left), > 0) and the position row 0 decides (p + 1).
     // It overwrites ids[0 .. n) with the decided tokens, the same on both ranks; n <= rows (it stops after the first
-    // rejected draft), and returns how many leading drafts the acceptance rule accepted. The cycle commits exactly
-    // those drafts and row `accepted`'s token (accept_decided), never by token equality: a rejected row can keep a
-    // token equal to its draft. Empty: greedy (merged argmax, accept_greedy).
-    std::function<unsigned(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first_position,
-                           std::span<std::uint32_t> ids)> pick_targets{};
+    // rejected draft or the first stop id of the request), and returns how many leading drafts the acceptance rule
+    // accepted and, when ids[n - 1] is a stop id, that id. The cycle commits exactly those drafts and row `accepted`'s
+    // token (accept_decided), never by token equality: a rejected row can keep a token equal to its draft; at a stop
+    // id it commits and catches up nothing after that row and the decoder ends. Empty: greedy (merged argmax,
+    // accept_greedy).
+    struct Picked {
+        unsigned accepted = 0;
+        std::uint32_t stop = kNoFlag;  // ids[n - 1] when it is a stop id of the request
+    };
+    std::function<Picked(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first_position,
+                         std::span<std::uint32_t> ids)> pick_targets{};
     // Sampled drafts (serve, kRunSampleDrafts): both ranks call this after each drafter call whose row `row` becomes
     // draft `index` of the window (an extension step, or the seed after a catch-up), for the token at `position`; it
     // returns the draft drawn from that row (the same on both ranks). Empty: the merged argmax draft.

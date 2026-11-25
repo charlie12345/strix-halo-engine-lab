@@ -739,6 +739,9 @@ struct SampledFake : FakeEng {
     std::vector<RowAt> last_sampled;  // rows of the last step / prefill call (sample_outputs reads them)
     bool last_prefill = false;
     std::uint64_t sampled_runs = 0, window_rows = 0, draft_picks = 0, sampled_enters = 0;
+    // windows that ended at an accepted stop draft in row 0 with more rows allowed; the frontier at each mtp_leave
+    std::uint64_t stop_cuts_row0 = 0;
+    std::vector<std::uint64_t> leave_frontier;
     std::uint64_t lead_accepted = 0, lead_rejected = 0;
     bool lead_coupled = true;
     std::uint32_t dec_flags = 0;
@@ -837,7 +840,7 @@ struct SampledFake : FakeEng {
         const bool paired = run.ch->paired();
         std::uint64_t chunk = 0;
         std::vector<std::uint32_t> out;
-        for (std::uint32_t c = 0; c < n && dec->emitted < dec->budget; ++c) {
+        for (std::uint32_t c = 0; c < n && dec->emitted < dec->budget && !dec_stopped; ++c) {
             const unsigned remaining = dec->budget - dec->emitted;
             const unsigned k = std::min(1U + static_cast<unsigned>(h[s] % 3U), remaining - 1U);
             std::vector<std::uint32_t> inputs{dec->last}, drafts, ids;
@@ -869,15 +872,18 @@ struct SampledFake : FakeEng {
             }
             for (const auto x : xs) ids.push_back(peak(x));
             const auto window = sv::decide_pair_window(run.sampler != nullptr, paired ? kFakeSlice : 0U, kFakeVocab, run.sampler,
-                first, td, std::min(k + 1U, remaining),
+                first, td, std::min(k + 1U, remaining), run.stops,
                 [&](std::size_t r) { local = slice(xs.at(r), paired); return std::span<const float>(local); },
                 [&](std::span<const float> a, std::span<float> b) { run.ch->exchange_sampling_logits(a, b, chunk++); },
                 [&](std::span<const std::uint32_t> a, std::span<std::uint32_t> b) { run.ch->exchange_sampling_words(a, b, chunk++); });
             window_rows += window.tokens.size();
+            if (window.stop && window.accepted == 1U && window.tokens.size() == 1U && std::min(k + 1U, remaining) > 1U) ++stop_cuts_row0;
             std::copy(window.tokens.begin(), window.tokens.end(), ids.begin());
-            // as the engine's cycle (glm_spec_run): commit by the window's accepted count, not by token equality
+            // as the engine's cycle (glm_spec_run): commit by the window's accepted count, not by token equality; a
+            // decided stop id is terminal
             const auto acc = strix::glm::spec::accept_decided(drafts, ids, window.accepted, strix::glm::spec::kNoFlag,
-                                                              strix::glm::spec::Terminal{strix::glm::spec::kNoFlag, remaining});
+                strix::glm::spec::Terminal{window.stop ? window.tokens.back() : strix::glm::spec::kNoFlag, remaining});
+            if (acc.stop) dec_stopped = true;
             for (unsigned j = 0; j < acc.rows; ++j) (void)row(s, inputs[j]);
             if (run.sampler) {
                 lead_accepted = run.sampler->stats().accepted;
@@ -895,9 +901,12 @@ struct SampledFake : FakeEng {
         log.push_back("sampled run " + std::to_string(s) + " -> " + std::to_string(out.size()));
         return out;
     }
+    bool dec_stopped = false;
     void mtp_leave(std::uint32_t s) {
+        leave_frontier.push_back(frontier.at(s));
         FakeEng::mtp_leave(s);
         dec_flags = 0;
+        dec_stopped = false;
     }
 };
 
@@ -909,6 +918,8 @@ struct SampledServe {
     bool lead_coupled = true;
     std::vector<std::string> receipts;  // each request's sampling_receipt ("" when none)
     std::string error;
+    std::uint64_t window_rows = 0, stop_cuts_row0 = 0;
+    std::vector<std::uint64_t> leave_frontier0, leave_frontier1;  // the committed frontier at each mtp_leave, per rank
 };
 // One pair (loopback) serving `jobs`; sequential = one request at a time (the C1 route), otherwise all queued at once.
 SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool sampled_mtp, bool sequential, bool g2 = false,
@@ -993,6 +1004,10 @@ SampledServe serve_sampled(const std::vector<sv::GenerationJob>& jobs, bool samp
     out.lead_accepted = e0.lead_accepted;
     out.lead_rejected = e0.lead_rejected;
     out.lead_coupled = e0.lead_coupled;
+    out.window_rows = e0.window_rows;
+    out.stop_cuts_row0 = e0.stop_cuts_row0;
+    out.leave_frontier0 = e0.leave_frontier;
+    out.leave_frontier1 = e1.leave_frontier;
     return out;
 }
 
@@ -1076,6 +1091,42 @@ void test_sampled_mtp_serve() {
                 static_cast<unsigned long long>(both.g2_cycles));
 }
 
+// A sampled MTP window never decides, commits or catches up a row past a stop id of the request, on either rank: the
+// request's stop token is taken from its free-running output, so some window accepts it as the draft of row 0 while
+// more rows were allowed. The tokens are those of plain sampling (up to and including the stop), the lead decides no
+// row after it, and the frontier each rank holds when the decoder leaves never passes prompt + emitted - 1 (the stop
+// token is never processed as input).
+void test_sampled_mtp_stop() {
+    const sv::GenerationJob base = sampled_job(0, 0.9, 40);
+    const auto free_run = serve_sampled({base}, false, true);
+    CHECK(free_run.error.empty() && free_run.tokens.size() == 1 && free_run.tokens[0].size() == 40);
+    if (free_run.tokens.size() != 1 || free_run.tokens[0].size() != 40) return;
+    const auto& all = free_run.tokens[0];
+    unsigned tried = 0, cut_at = 0;
+    for (std::size_t k = 1; k + 1 < all.size() && cut_at == 0; ++k) {
+        if (std::find(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(k), all[k]) != all.begin() + static_cast<std::ptrdiff_t>(k))
+            continue;  // the stop must end the output at its first occurrence
+        auto job = base;
+        job.stop_tokens = {all[k]};
+        const std::vector<std::uint32_t> want(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(k) + 1);
+        const auto plain = serve_sampled({job}, false, true), spec = serve_sampled({job}, true, true);
+        ++tried;
+        CHECK(plain.error.empty() && spec.error.empty());
+        if (!plain.error.empty() || !spec.error.empty())
+            std::fprintf(stderr, "sampled stop errors: %s | %s\n", plain.error.c_str(), spec.error.c_str());
+        CHECK(plain.tokens.size() == 1 && plain.tokens[0] == want && spec.tokens.size() == 1 && spec.tokens[0] == want);
+        CHECK(spec.window_rows <= want.size());
+        const std::uint64_t bound = job.prompt.size() + want.size() - 1U;
+        CHECK(!spec.leave_frontier0.empty() && !spec.leave_frontier1.empty());
+        for (const auto f : spec.leave_frontier0) CHECK(f <= bound);
+        for (const auto f : spec.leave_frontier1) CHECK(f <= bound);
+        if (spec.stop_cuts_row0 > 0) cut_at = static_cast<unsigned>(k);
+    }
+    CHECK(cut_at > 0);
+    std::printf("sampled MTP stop: an accepted stop draft in row 0 ends the window (stop at output %u, %u stop ids tried); "
+                "tokens == plain sampling, no row past the stop on either rank\n", cut_at, tried);
+}
+
 // FakeEng with the sampled MTP entry points: records what replay hands them.
 struct SampledProbe : FakeEng {
     using FakeEng::FakeEng;
@@ -1146,7 +1197,7 @@ void test_sampled_mtp_replay() {
         const bool threw = throws_with([&] { first = gs::replay(units, solo, pf, prompt, true, 2, 64, nullptr, choice); }, "");
         CHECK(!threw && first.size() == 1 && first[0] == gs::kPrefillPending);
     }
-    CHECK(gs::kControlVersion == 13);
+    CHECK(gs::kControlVersion == 14);
     std::printf("sampled MTP replay: flags and the lead's sampler reach the engine; unknown flags and engines refused\n");
 }
 
@@ -1606,6 +1657,7 @@ void prefix_root_sibling() {
 int main(int argc, char** argv) {
     test_sampled_mtp_replay();
     test_sampled_mtp_serve();
+    test_sampled_mtp_stop();
     test_sampled_drafts_serve();
     if (argc == 2 && std::string(argv[1]) == "--prefix-root") {
         prefix_root_sibling();
@@ -2098,9 +2150,10 @@ int main(int argc, char** argv) {
             CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
-        // Builds of earlier layouts (v12: the 10-word sampled decision; v11: the contributor's; v9: main before this
-        // change) are refused at the first exchange on either rank, before any later field is read.
-        for (const std::uint32_t old : {12U, 11U, 9U})
+        // Builds of earlier layouts (v13: no stop decision in a sampled window; v12: the 10-word sampled decision; v11: the
+        // contributor's; v9: main before this change) are refused at the first exchange on either rank, before any later
+        // field is read.
+        for (const std::uint32_t old : {13U, 12U, 11U, 9U})
             for (const std::uint32_t rank : {0U, 1U}) {
                 gs::Channel ch(
                     [&](std::span<const std::byte> out, std::span<std::byte> in, std::uint32_t, std::uint64_t) {
@@ -2113,9 +2166,9 @@ int main(int argc, char** argv) {
                 gs::Control hello;
                 hello.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
                 CHECK(throws_with([&] { (void)ch.exchange(hello); },
-                                  "protocol version " + std::to_string(old) + " from the peer, expected 13"));
+                                  "protocol version " + std::to_string(old) + " from the peer, expected 14"));
             }
-        std::printf("v12 / v11 / v9 peers: refused at the first exchange on rank 0 and rank 1\n");
+        std::printf("v13 / v12 / v11 / v9 peers: refused at the first exchange on rank 0 and rank 1\n");
         std::vector<gs::WireRow> rows = {{0, 1, 3}, {1, 1, 3}, {2, 1, 9}};
         CHECK(gs::consecutive_slots(rows));
         gs::check_rows(rows, 8, 16);

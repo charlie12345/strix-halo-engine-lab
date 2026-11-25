@@ -794,7 +794,10 @@ struct EngineOps {
     }
     // Decides the window's rows into ids[0 .. n) and returns how many leading drafts the acceptance rule accepted
     // (the commit follows that count, not token equality: a rejected row's token can equal its draft).
-    unsigned pick_window(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first, std::span<std::uint32_t> ids) {
+    // A window ending at a stop id of the request (the lead's stop list, kPairWindowStop on the follower) returns it:
+    // the cycle commits nothing after that row and the decoder ends, on both ranks.
+    sp::DecodePolicy::Picked pick_window(std::span<const std::uint32_t> drafts, unsigned rows, std::uint64_t first,
+                                          std::span<std::uint32_t> ids) {
         const bool lead = sample_lead();
         auto& ch = *sample_run.ch;
         const std::size_t width = eng.vocab_slice();
@@ -810,7 +813,7 @@ struct EngineOps {
             td[i].token = drafts[i];
         }
         const auto window = sv::decide_pair_window(lead, ch.paired() ? width : 0, sampling_vocab, sample_run.sampler, first,
-            std::span<const strix::TokenDraft>(td), rows,
+            std::span<const strix::TokenDraft>(td), rows, sample_run.stops,
             [&](std::size_t row) { return sample_row(row); },
             [&](std::span<const float> send, std::span<float> receive) { ch.exchange_sampling_logits(send, receive, sample_chunk++); },
             [&](std::span<const std::uint32_t> send, std::span<std::uint32_t> receive) {
@@ -822,10 +825,10 @@ struct EngineOps {
         // place of a decision.
         if (tokens.empty() || tokens.size() > rows || tokens.size() > ids.size() || window.accepted > drafts.size() ||
             window.accepted > tokens.size() || window.accepted + 1U < tokens.size() ||
-            (window.accepted == tokens.size() && tokens.size() != rows))
+            (window.accepted == tokens.size() && tokens.size() != rows && !window.stop))
             throw std::logic_error("sampled MTP: the window decided no row, too many, or left a required row undecided");
         std::copy(tokens.begin(), tokens.end(), ids.begin());
-        return window.accepted;
+        return {window.accepted, window.stop ? tokens.back() : sp::kNoFlag};
     }
     std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles, gs::SampledRun run) {
         if (dec && dec_flags != run.flags) throw std::logic_error("mtp_run: the open decoder was opened with other sampling flags");

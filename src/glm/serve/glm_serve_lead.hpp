@@ -1208,6 +1208,7 @@ private:
         if (a.sampler) {
             c.pflags = sampled_run_flags(*a.sampler);
             choice.sampler = &*a.sampler;
+            choice.stops = a.stops;  // the window ends at a stop id: no row past it is decided or committed
         }
         const auto t0 = Clock::now();
         const auto out = engine_round(c, nullptr, choice.sampler ? std::span(&choice, 1) :

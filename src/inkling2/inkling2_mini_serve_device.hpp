@@ -26,13 +26,13 @@ inline MiniServeCohort make_mini_device_cohort(
     // The instance's extent for the weight rows: its configured context and its slot cap (0 = left to the memory
     // budget: lane-banded gains do not select).
     const weight::WeightLoadExtent extent{opt.context, opt.slots ? rows : 0U};
-    const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, opt.weight_options, extent);
     auto weight_options = opt.weight_options;
     const bool calibrated_row = mini_server_calibrated_row_allowed(weight_options.lowbit_turbo, opt.served_cli_route);
     if (weight_options.lowbit_turbo && !calibrated_row) {
         weight_options.lowbit_turbo = false;
         std::cerr << "strix-lowbit-pack/v2 declined (held-back served prompt route); using incumbent weights\n";
     }
+    const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, weight_options, extent);
     auto weights = resolve_mini_resident_weight_load(opt.tier, weight_options, scope.view(), extent);
     if (!(scope.checkpoint == weight::Digest256{})) std::cerr << weight::weight_load_scope_receipt(scope.view()) << '\n';
     std::uint64_t slot_bytes = 0;
@@ -63,8 +63,14 @@ inline MiniServeCohort make_mini_device_cohort(
 #endif
         // The cohort owns the decoder while the server observes its projected-bias dispatches.
         auto* observed = decoder.get();
-        auto candidate = std::make_unique<serve::FixedKvCohort<MiniResidentDecoder>>(
-            std::move(decoder), opt.context, rows, lanes);
+        using Cohort = serve::FixedKvCohort<MiniResidentDecoder>;
+        Cohort::PrefillPolicy policy;
+        if (!kMiniProfile.ladder.empty())
+            policy = [options = weight_options, device = scope.device_class](MiniResidentDecoder& resident,
+                                                                            std::uint64_t tokens, bool first) {
+                resident.set_moe_w4a4(mini_prompt_moe(options, device, tokens, first));
+            };
+        auto candidate = std::make_unique<Cohort>(std::move(decoder), opt.context, rows, lanes, std::move(policy));
         if (opt.attn_projected_bias)
             projected_bias_dispatches = [observed] { return observed->projected_attention_dispatches(); };
         return candidate;

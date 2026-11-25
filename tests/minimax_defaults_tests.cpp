@@ -1119,8 +1119,10 @@ void test_entry_points_host_defaults() {
 void test_fast_product_profile_bundle() {
     const char* pp = md::kProductProfileEnv;
     check(!md::fast_profile_selects_bundle(lookup(EnvMap{})), "product bundle: no profile, no bundle");
-    for (const char* name : {"default", "quality", "turbo", "junk"})
-        check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, name}})), "product bundle: only fast selects it");
+    for (const char* name : {"default", "quality", "junk"})
+        check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, name}})), "product bundle: only fast and turbo select it");
+    // TURBO nests FAST (review r75 P1-a): the TURBO word selects the same admitted bundle.
+    check(md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "turbo"}})), "product bundle: turbo selects the FAST bundle");
     check(md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "fast"}})), "product bundle: fast selects it");
     check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "fast"}, {"STRIX_MM_FAST_PREFILL", "0"}})),
           "product bundle: explicit 0 wins");

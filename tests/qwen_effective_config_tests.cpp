@@ -19,6 +19,8 @@
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
 #include <algorithm>
+#include <array>
+#include <string>
 #include <iostream>
 #include <fstream>
 #include "strix/prompt_terminal_diagnostics.hpp"
@@ -155,10 +157,37 @@ int failures = 0;
 void expect(bool ok, const char* message) {
     if (!ok) { ++failures; std::cerr << message << '\n'; }
 }
+// Fixture speed receipts isolate downstream storage and route-admission tests.
+qwen::profile::Inputs measured_profile(qwen::profile::Inputs inputs = {}) {
+    using strix::profile::LadderRow;
+    using strix::profile::Name;
+    using strix::profile::Phase;
+    static std::array<LadderRow, 3> rows{{
+        {"qsa_budget", "1536", Name::fast, Phase::prefill, "fixture", 1, 1, 1, 1, 1.1, 0.01, "fixture"},
+        {"moe_route_bf16", "1", Name::fast, Phase::prefill, "fixture", 1, 1, 1, 1, 1.1, 0.01, "fixture"},
+        {"gdn_fp16_chunk", "1", Name::fast, Phase::prefill, "fixture", 1, 1, 1, 1, 1.1, 0.01, "fixture"},
+    }};
+    // Each row names the execution it was measured over (LadderArms::over) under these inputs.
+    static std::array<std::string, 3> references{};
+    inputs.regime = {Phase::prefill, 1, 1, "fixture", "fixture-exec"};
+    inputs.ladder = {};
+    const auto unmeasured = qwen::profile::resolve(Name::fast, inputs);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto* entry = unmeasured.find(rows[i].lever);
+        references[i] = entry ? entry->ladder_reference : std::string();
+        rows[i].over = references[i];
+    }
+    inputs.ladder = rows;
+    return inputs;
+}
+
 Options parse(std::vector<std::string> args) {
     std::vector<char*> argv;
     for (auto& arg : args) argv.push_back(arg.data());
-    return parse_options(static_cast<int>(argv.size()), argv.data());
+    auto options = parse_options(static_cast<int>(argv.size()), argv.data());
+    if (options.product_profile_requested == qwen::profile::Name::fast)
+        options.product_profile = qwen::profile::resolve(qwen::profile::Name::fast, measured_profile(options.product_profile_inputs));
+    return options;
 }
 std::vector<std::string> mtp_fixture(){
     const std::string sha(64,'1');
@@ -1848,7 +1877,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         const auto off = resolve(plain,memory);
         expect(off.admitted && !off.options.prefill_moe_route_bf16,"YaRN long prompt candidate defaults off");
         auto fast = plain;
-        fast.options.product_profile = qwen::profile::resolve(qwen::profile::Name::fast, {});
+        fast.options.product_profile = qwen::profile::resolve(qwen::profile::Name::fast, measured_profile());
         const auto fast_config = resolve(fast, memory);
         Environment exported;
         qwen::profile::apply(fast_config.options.product_profile, [&](const char* name, const char* value) {
@@ -3756,7 +3785,7 @@ int main(int argc, char** arguments) {
                 qwen::profile::Inputs inputs;
                 inputs.env = [](const char*) -> const char* { return nullptr; };
                 inputs.allow_pending = allow;
-                selected.options.product_profile = qwen::profile::resolve(profile, inputs);
+                selected.options.product_profile = qwen::profile::resolve(profile, measured_profile(inputs));
                 const auto got = resolve(selected, memory);
                 const bool enabled = profile == qwen::profile::Name::fast;
                 Environment exported;
@@ -3949,7 +3978,10 @@ int main(int argc, char** arguments) {
                 "inspection profile reports the final route admission");
             unsigned notices = 0;
             for (const auto& notice : got.options.product_profile.notices())
-                if (notice.find("moe_route_bf16") != std::string::npos) {
+                if (notice.starts_with("strix-ladder/v1 moe_route_bf16")) {
+                    expect(notice.find(reason) != std::string::npos && notice.ends_with("-> default=0"),
+                           "ladder receipt includes the actual route decline");
+                } else if (notice.find("moe_route_bf16") != std::string::npos) {
                     ++notices;
                     expect(notice.find(" pending ") != std::string::npos && notice.find(reason) != std::string::npos &&
                         notice.find("is bit-changing") == std::string::npos,

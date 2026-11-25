@@ -33,12 +33,12 @@ inline constexpr sp::Lever table[] = {
                "1024 = 2048 at 4,096 and 8,192 tokens); FAST gate v2 per regime: see `qualified`",
      .provisional = {false, false, false, false},
      // the width is scheduling inside this class (the pair's flow-shop picker chooses it): same bits, same qualification
-     .same_bits = "1024,2048,4096"},
+     .same_bits = "1024,2048,4096", .identity = {{{"0", "v1"}, {"4096", "v1"}}}},
     {.name = "head_q8", .env = "", .option = "--head-q8", .value = {"", "1", "", ""}, .builtin = "0",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "1 (Q8_0 copy of the BF16 head for the decode head, weights.head.q8_0@1)", .off = "0",
      .source = "shared core::convert_bf16_q8_0 (ggml q8_0 rule) at load; FAST gate v2 per regime: see `qualified`",
-     .provisional = {false, false, false, false}},
+     .provisional = {false, false, false, false}, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     // Read by the forward as an environment switch: the profile exports it (strix::profile::apply) where qualified; an
     // explicit STRIX_HY4_PF_MHA=0|1 wins.
     {.name = "pf_mha", .env = "STRIX_HY4_PF_MHA", .option = "", .value = {"", "1", "", ""}, .builtin = "0",
@@ -46,7 +46,7 @@ inline constexpr sp::Lever table[] = {
      .target = "1 (expanded-MHA prompt attention for the sliding layers on the shared dense flash core)", .off = "0",
      .source = "K_b^T re-quantised once (core::q8_0::transpose), A8 latent, bf16 K / V images; FAST gate v2 per regime: "
                "see `qualified`",
-     .provisional = {false, false, false, false}},
+     .provisional = {false, false, false, false}, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
 };
 
 // Regime of a run, known before the forward loads. An unknown device resolves every FAST cell to pending.
@@ -56,6 +56,7 @@ struct Regime {
     Device device = Device::unknown;
     Topology topology = Topology::one_node;
     std::uint64_t prompt_tokens = 0;  // the prompt of this run (an entry point that resolves earlier: the longest it admits)
+    std::string_view execution{};     // sp::Regime::execution (caller-owned; empty: no ordinary timing row decides)
 };
 [[nodiscard]] inline Device device_of(std::string_view arch) {  // hipDeviceProp_t::gcnArchName; features after ':' ignored
     return arch.substr(0, arch.find(':')) == "gfx1151" ? Device::gfx1151 : Device::unknown;
@@ -105,6 +106,29 @@ inline constexpr Qualified qualified[] = {
      "prefill 8K 669.7 -> 693.1 tok/s (rows 2048)"}},
 };
 
+// Incumbent grants: the FAST cells main selected from a quality row before the ladder rule, frozen as data at the prompt
+// bands they ran in (FAST value 4096 only; same shape as `qualified`). A grant keeps the cell applying where no timing row covers the regime; it
+// is NOT derived from `qualified`, so a new gate row (or a wider band) leaves its cell at the tier below until a timing row
+// is registered. Do not add rows here.
+// A grant names the implementation identity it was given to (Lever::identity of the FAST value): a changed
+// implementation under the same value is not granted.
+struct IncumbentGrant {
+    Qualified qualified;
+    std::string_view identity;
+};
+inline constexpr IncumbentGrant incumbent_grants[] = {
+    {{Device::gfx1151, Topology::one_node, {"prompt_rows", "4096", 0, 32568,
+     "frozen incumbent: bitwise == prompt_rows 2048, prompts <= 32,568"}}, "v1"},
+    {{Device::gfx1151, Topology::pair, {"prompt_rows", "4096", 0, 32568,
+     "frozen incumbent: pair logits_fnv64 == one node at the same width, prompts <= 32,568"}}, "v1"},
+    {{Device::gfx1151, Topology::one_node, {"head_q8", "1", 0, kNoPromptBound,
+     "frozen incumbent: gate v2 head copy, 5 windows, 1,000 held-out rows"}}, "v1"},
+    {{Device::gfx1151, Topology::pair, {"head_q8", "1", 0, kNoPromptBound,
+     "frozen incumbent: same head numerics as one node"}}, "v1"},
+    {{Device::gfx1151, Topology::one_node, {"pf_mha", "1", 0, 32568,
+     "frozen incumbent: gate v2 FAST composition, 10 windows PASS, prompts <= 32,568"}}, "v1"},
+};
+
 [[nodiscard]] inline const Qualified* qualification(std::string_view lever, std::string_view value, const Regime& regime,
                                                     std::span<const Qualified> rows) {
     const Qualified* best = nullptr;
@@ -121,10 +145,17 @@ inline constexpr Qualified qualified[] = {
     return e;
 }
 
+struct Measured {
+    Topology topology;
+    sp::LadderRow timing;
+};
+inline constexpr std::span<const Measured> measured{};
+
 // Owns the per-regime rows the resolution points into (non-movable: entries hold pointers).
 struct Resolved {
     Regime regime;
     std::vector<sp::Lever> rows;
+    std::vector<sp::LadderRow> ladder;
     sp::Engine engine;
     sp::Resolution resolution;
     Resolved() = default;
@@ -135,18 +166,37 @@ struct Resolved {
 
 // The CLI and the server call this one function with the same Inputs and Regime (ONE RESOLVER).
 [[nodiscard]] inline std::unique_ptr<Resolved> resolve(const Regime& regime, const sp::Inputs& inputs,
-                                                       std::span<const Qualified> rows = qualified) {
+                                                       std::span<const Qualified> rows = qualified,
+                                                       std::span<const IncumbentGrant> grants = incumbent_grants,
+                                                       std::span<const Measured> timings = measured) {
     auto out = std::make_unique<Resolved>();
     out->regime = regime;
+    for (const auto& row : timings)
+        if (row.topology == regime.topology && !row.timing.incumbent)
+            out->ladder.push_back(row.timing);
     constexpr auto fast = static_cast<unsigned>(sp::Name::fast);
     for (const auto& lever : table) {
         sp::Lever row = lever;
-        row.ready[fast] = qualification(lever.name, lever.value[fast], regime, rows) != nullptr;
+        const auto* q = qualification(lever.name, lever.value[fast], regime, rows);
+        row.ready[fast] = q != nullptr;
+        // A frozen incumbent grant (not the quality row) keeps a cell that already ran before the ladder rule.
+        if (lever.kind != sp::Kind::exact)
+            for (const auto& grant : grants)
+                if (!grant.identity.empty() && sp::declared_identity(lever.identity, lever.value[fast]) == grant.identity &&
+                    qualification(lever.name, lever.value[fast], regime, std::span(&grant.qualified, 1)) != nullptr) {
+                    out->ladder.push_back(sp::incumbent_cell(lever.name, lever.value[fast], sp::Name::fast,
+                                                             grant.qualified.gate.receipt, grant.identity));
+                    break;
+                }
         out->rows.push_back(row);
     }
     out->engine = engine();
     out->engine.table = std::span<const sp::Lever>(out->rows);
-    out->resolution = sp::resolve(out->engine, inputs);
+    out->engine.ladder = std::span<const sp::LadderRow>(out->ladder);
+    auto scoped = inputs;
+    scoped.regime = {sp::Phase::prefill, regime.prompt_tokens, 1,
+                     regime.device == Device::unknown ? std::string_view{} : device_name(regime.device), regime.execution};
+    out->resolution = sp::resolve(out->engine, scoped);
     for (auto& entry : out->resolution.entries) {
         if (entry.status != sp::Status::pending && entry.status != sp::Status::unqualified) continue;
         std::string where;

@@ -10,10 +10,12 @@
 #include <iostream>
 
 #if defined(__HIPCC__)
+#include "device/hip_cost_identity.hpp"
 #include "strix/device/hip_enumerator.hpp"
 #include "strix/device/hip_gate.hpp"
 #include <hip/hip_runtime_api.h>
 #else
+#include "device/cuda_cost_identity.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #endif
 
@@ -27,13 +29,16 @@ namespace strix::inkling2 {
 // instance's context and its gain's lane band its lanes): a gate-only row, or a gain outside its band, never selects,
 // so it never costs a whole-checkpoint read (which also evicts the page cache of running servers on a node).
 // Owns the strings; view() builds the scope on use, so copies and moves never leave a view dangling.
+// device_class: the architecture (the profile ladder's device class); weight_device_class: the weight-load key, the
+// shared cost-device identity of the current device (device/{hip,cuda}_cost_identity.hpp: architecture, product name,
+// compute units, memory, clock, runtime and driver), so a residency receipt never crosses products or clock limits.
 struct MiniWeightScope {
     weight::Backend backend{};
-    std::string device_class, compiler_id;
+    std::string device_class, weight_device_class, compiler_id;
     std::string_view regime;
     weight::Digest256 build{}, checkpoint{};
     [[nodiscard]] weight::WeightLoadScope view() const {
-        return {backend, device_class, compiler_id, regime, build, checkpoint};
+        return {backend, weight_device_class, compiler_id, regime, build, checkpoint};
     }
 };
 
@@ -52,7 +57,7 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
         std::ranges::any_of(kMiniWeightLoadDecisions, [](const auto& row) { return row.scope.backend == kMiniWeightBackend; }));
     MiniWeightScope out;
     out.backend = kMiniWeightBackend;
-    if (!needed) return out;
+    if (!needed && (!compact_tier || kMiniProfile.ladder.empty())) return out;
     int ordinal = 0;
 #if defined(__HIPCC__)
     if (hipGetDevice(&ordinal) != hipSuccess) return out;
@@ -74,9 +79,17 @@ inline MiniWeightScope mini_weight_scope(const std::string& model, profile::Name
 #endif
     for (const auto& device : visible)
         if (device.ordinal == ordinal) out.device_class = device.arch;
+    // Empty when the runtime cannot describe the device: no weight row matches then.
+#if defined(__HIPCC__)
+    // The explicitly enabled calibrated row retains the scope of its historical gfx1151 receipt.
+    out.weight_device_class = row_requested ? out.device_class : device::hip_cost_device_identity();
+#else
+    out.weight_device_class = device::cuda_cost_device_identity();
+#endif
+    if (!needed) return out;
     out.build = identity;
     const auto row_matches = [&out, extent](const weight::WeightLoadDecision& row) {
-        return row.scope.backend == out.backend && row.scope.device_class == out.device_class &&
+        return row.scope.backend == out.backend && row.scope.device_class == out.weight_device_class &&
                row.scope.compiler_id == out.compiler_id && row.scope.build == out.build &&
                weight::weight_load_gain_selects(row, extent);
     };

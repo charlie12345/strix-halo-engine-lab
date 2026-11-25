@@ -80,8 +80,10 @@ inline constexpr std::array<weight::WeightLoadDecision, 1> kMiniWeightLoadDecisi
      {weight::Backend::hip, "gfx1151", "hip-clang-24.0", kMiniWeightRegime, kMiniLowBitBuild, kMiniCheckpoint},
      {},
      weight::digest_from_hex("54182047338baf7005882cf2062d334aea4b8bb662d6cb484f1ccfce6926508b"),
-     {"docs/engine/lowbit-calibration.md", "2026-11-24", 2457, kMiniLowBitMeasuredExtent.context,
-      kMiniLowBitMeasuredExtent.lanes, kMiniLowBitStepBand},
+     {.receipt = "docs/engine/lowbit-calibration.md", .date = "2026-11-24", .rows = 2457,
+      .max_context = kMiniLowBitMeasuredExtent.context, .max_lanes = kMiniLowBitMeasuredExtent.lanes,
+      .speedup = 27.03 / 23.36,  // smallest measured gain against BF16 across widths 1, 8 and 16
+      .tier = profile::Name::turbo, .max_rows = kMiniLowBitStepBand},
      "vs BF16 decode (bf16 prefill, q4 decode) kl=0.0033 top1=0.980 dnll=+0.0027 flips=0.00x windows_failed=0/39 "
      "pack=b0bd0103dcdd9ffd"},
 }};
@@ -90,13 +92,14 @@ inline constexpr std::span<const weight::WeightLoadDecision> kMiniLowBitDecision
 // `extent`: what the instance holds, the same rule for the CLI and the server: context = the resident positions
 // (serial CLI: prompt + generated tokens of its one sequence; server: its configured context), lanes = concurrent
 // decode lanes (serial CLI: 1; server: its slot cap, 0 when the slot count is left to the memory budget). A banded
-// row applies only inside its bands.
+// row applies only inside its bands. `first`: the lower endpoint of the resident image (0 = the `extent` value).
 inline weight::WeightLoadPlan resolve_mini_weight_load(
     profile::Name tier, const weight::WeightLoadScope& scope,
     std::span<const weight::FormatId> consumer_formats, bool enabled, bool qualify,
-    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions, weight::WeightLoadExtent extent = {}) {
+    std::span<const weight::WeightLoadDecision> decisions = kMiniWeightLoadDecisions, weight::WeightLoadExtent extent = {},
+    weight::WeightLoadExtent first = {}) {
     return weight::resolve_weight_load(weight::builtin_registry(), kMiniWeightLoadPolicy,
-        {tier, scope, consumer_formats, enabled, qualify, kMiniWeightLoadRegimes, extent}, decisions);
+        {tier, scope, consumer_formats, enabled, qualify, kMiniWeightLoadRegimes, extent, first}, decisions);
 }
 
 // FAST lever: W4A4 experts. Multi-row prompt-prefill chunks run the NVFP4 expert layers through the shared grouped W4A4
@@ -173,60 +176,60 @@ inline constexpr std::array<profile::Lever, 12> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
-     false, {}, true},
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {kMiniCombineImage, "STRIX_INK_COMBINE_IMAGE", "", {"", "", "", ""}, "0", profile::Kind::exact,
      {true, true, true, true}, {true, true, true, true}, "", "0",
      "BF16 down image + combine: output bits of the FP32 down rows (device A/B through the grouped down producer, NaN "
      "operand-position fixture); gfx1151 only",
-     false, {}, true},
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniPreparedRoundFold, .env = "STRIX_INK_PREPARED_ROUND_FOLD", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
      .source = "tests/core/round_fold_hip.hip (every store: the separate round's bits) and the isolated fold off/on "
                "identity ticket of the HIP prepared attention",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {kMiniExpertsNvfp4, "STRIX_MOE_EXPERTS_NVFP4", "", {"", "", "", "1"}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for gate v2 (decode and prefill, quality against BF16) and a served B=1 / C8 / C16 receipt",
-     false, {}, true},
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {kMiniControllerPlanes, "STRIX_INK_CONTROLLER_PLANES", "--controller-planes", {}, "3", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "3", "awaits CUDA device identity and model qualification",
-     true, {}, true},
+     true, {}, true, {}, {{{"3", "v1"}, {"1", "v1"}}}},
     {kMiniAttnProjectedBias, "STRIX_INK_ATTN_PROJECTED_BIAS", "", {}, "0", profile::Kind::exact,
      {}, {true, true, true, true}, "1", "0",
      "awaits device identity on the landing head (logits, ids and state bitwise the image route) before any default",
-     false, {}, true},
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniServedCliRoute, .env = "STRIX_INK_SERVED_CLI_ROUTE", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::bit_changing, .ready = {false, false, false, false},
      .runnable = {true, true, true, true}, .target = "", .off = "0",
      .source = "waits for the served migration identity (served lanes against the incumbent served route); device "
                "evidence so far: served cohort lanes == the same served decoder's lone lane at cohort widths 2..17",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniScreenedHead, .env = "STRIX_INK_SCREENED_HEAD", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::exact, .ready = {false, false, false, false},
      .runnable = {true, true, true, true}, .target = "1", .off = "0",
      .source = "awaits the RTX identity receipt on the landing head (greedy ids against the full head, CLI and served) "
                "before any default",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniLowBitTurbo, .env = "STRIX_INK_LOWBIT_TURBO", .option = "",
      .value = {"", "", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
      .ready = {}, .runnable = {false, false, false, true}, .target = "1", .off = "0",
      .source = "docs/engine/lowbit-calibration.md (calibrated HIP decode at widths 1, 8 and 16)",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = kMiniVerifyRows, .env = "STRIX_INK_VERIFY_ROWS", .option = "",
      .value = {"", "", "", ""}, .builtin = "0",
      .kind = profile::Kind::exact, .ready = {}, .runnable = {true, true, true, true}, .target = "1", .off = "0",
      .source = "awaits device identity on the landing head (verify score rows, picks and the continuation after a "
                "partial commit bitwise the per-row incumbent, BF16 and Q8_0 heads); HIP only",
-     .omit_builtin_fingerprint = true},
+     .omit_builtin_fingerprint = true, .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {kMiniVisionRecipe, "STRIX_INKLING2_VISION_RECIPE", "", {}, "legacy", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "axial@1", "legacy",
      "awaits the real-checkpoint reference gate (patches, hidden and projected rows) and CLI image identity on HIP "
      "and CUDA",
-     false, {}, true},
+     false, {}, true, {}, {{{"legacy", "v1"}, {"axial@1", "v1"}}}},
     spec::kBlockDraftLever,
 }};
 

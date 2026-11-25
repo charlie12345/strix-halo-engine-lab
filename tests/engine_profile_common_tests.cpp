@@ -19,7 +19,7 @@ void require(bool value, const char* message) {
 }
 }
 
-int main() {
+int main() try {
     using namespace strix::profile;
     static_assert(strix::host_fnv::text("") == 0xcbf29ce484222325ULL);
     static_assert(strix::host_fnv::text("hello") == 0xa430d84680aabd0bULL);
@@ -47,11 +47,15 @@ int main() {
     }
 
     const Lever pending{"item", "SWITCH", "--item", {"0", "1", ""}, "0",
-        Kind::bit_changing, {}, {false, true, false}, "candidate", "0", "pending"};
+        Kind::bit_changing, {}, {false, true, false}, "candidate", "0", "pending", false, {}, false, {}, {{{"0", "v1"}, {"1", "v1"}}}};
     const std::array table{pending};
-    const Engine engine{"test", "ALLOW", table};
+    constexpr Regime measured{Phase::prefill, 8, 1, "fixture", "fixture-exec"};
+    const LadderRow timing{"item", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                           false, {}, {}, "ladder-arm/v4;fixture-exec;item=0{v1};candidate=item=1{v1};tier=fast"};
+    const Engine engine{"test", "ALLOW", table, false, {}, {}, {}, std::span(&timing, 1)};
     Inputs inputs;
     inputs.env = env;
+    inputs.regime = measured;
     inputs.profile = Name::fast;
     const auto refused = resolve(engine, inputs);
     require(refused.entries[0].status == Status::pending, "FAST pending refusal");
@@ -72,13 +76,13 @@ int main() {
     {
         const Lever ready_fast{.name = "rows", .env = "", .option = "--rows", .value = {"", "64", "", ""}, .builtin = "0",
             .kind = Kind::bit_changing, .ready = {false, true, false, false}, .runnable = {true, true, false, false},
-            .target = "", .off = "0", .source = "gate receipt"};
+            .target = "", .off = "0", .source = "gate receipt", .identity = {{{"0", "v1"}, {"64", "v1"}}}};
         const Lever provisional_fast{.name = "window", .env = "", .option = "--window", .value = {"", "2048", "", ""},
             .builtin = "0", .kind = Kind::bit_changing, .ready = {}, .runnable = {true, true, false, false}, .target = "",
-            .off = "0", .source = "gate failed", .provisional = {false, true, false, false}};
+            .off = "0", .source = "gate failed", .provisional = {false, true, false, false}, .identity = {{{"0", "v1"}, {"2048", "v1"}}}};
         const Lever exact{.name = "order", .env = "", .option = "--order", .value = {"", "1", "", ""}, .builtin = "0",
             .kind = Kind::exact, .ready = {true, true, false, false}, .runnable = {true, true, false, false}, .target = "",
-            .off = "0", .source = "bitwise"};
+            .off = "0", .source = "bitwise", .identity = {{{"0", "v1"}, {"1", "v1"}}}};
         const std::array rows{ready_fast, provisional_fast, exact};
         const Engine e{"explicit", "ALLOW", rows};
         const Lookup none = [](const char*) -> const char* { return nullptr; };
@@ -103,10 +107,10 @@ int main() {
     {
         const Lever width{.name = "rows", .env = "", .option = "--rows", .value = {"", "4096", "", ""}, .builtin = "0",
             .kind = Kind::bit_changing, .ready = {false, true, false, false}, .runnable = {true, true, false, false},
-            .target = "", .off = "0", .source = "gate receipt; 1024 / 2048 / 4096 bitwise", .same_bits = "1024,2048,4096"};
+            .target = "", .off = "0", .source = "gate receipt; 1024 / 2048 / 4096 bitwise", .same_bits = "1024,2048,4096", .identity = {{{"0", "v1"}, {"4096", "v1"}}}};
         const Lever unready{.name = "window", .env = "", .option = "--window", .value = {"", "4096", "", ""}, .builtin = "0",
             .kind = Kind::bit_changing, .ready = {}, .runnable = {true, true, false, false}, .target = "", .off = "0",
-            .source = "pending", .same_bits = "2048,4096"};
+            .source = "pending", .same_bits = "2048,4096", .identity = {{{"0", "v1"}, {"4096", "v1"}}}};
         const std::array rows{width, unready};
         const Engine e{"same_bits", "ALLOW", rows};
         const Lookup none = [](const char*) -> const char* { return nullptr; };
@@ -134,8 +138,10 @@ int main() {
     require(legacy.fingerprint() == hash, "legacy fingerprint bytes");
     const Engine shipped{"deepseek41-pair", "ALLOW", strix::deepseek41::pair_defaults::profile_table};
     inputs.profile = Name::fast;
+    inputs.allow_pending = false;
     const auto shipped_fast = resolve(shipped, inputs);
-    require(shipped_fast.find("moe_relaxed")->status == Status::provisional, "shipped table positional compatibility");
+    require(shipped_fast.find("moe_relaxed")->status == Status::pending &&
+            shipped_fast.find("moe_relaxed")->value == "0", "unscoped shipped candidate declines");
     check_peer(legacy, [](auto out, auto in) { std::memcpy(in.data(), out.data(), out.size()); });
     bool mismatch = false;
     try {
@@ -197,13 +203,16 @@ int main() {
         static constexpr std::array<Lever, 2> rows{
             Lever{.name = "applied", .env = "STRIX_TEST_APPLIED", .option = "", .value = {"0", "1", "", ""},
                   .builtin = "0", .kind = Kind::bit_changing, .ready = {true, true, true, true}, .target = "",
-                  .off = "", .source = "test receipt"},
+                  .off = "", .source = "test receipt", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
             Lever{.name = "waiting", .env = "STRIX_TEST_WAITING", .option = "", .value = {"0", "1", "", ""},
                   .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false}, .target = "x",
-                  .off = "", .source = "gate pending"},
+                  .off = "", .source = "gate pending", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
         };
+        static constexpr LadderRow applied_timing{"applied", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                                                  false, {}, {}, "ladder-arm/v4;fixture-exec;applied=0{v1},waiting=0{v1};candidate=applied=1{v1};tier=fast"};
+        in.regime = measured;
         static constexpr Engine two{.tag = "two-engine", .allow_env = "STRIX_TEST_ALLOW", .table = rows,
-                                    .quality_rows = false, .turbo_version = "two-turbo-v1"};
+                                    .quality_rows = false, .turbo_version = "two-turbo-v1", .ladder = std::span(&applied_timing, 1)};
         const auto applied = resolve(two, in);
         require(applied.summary() == "profile fast levers applied=1", "applied lever listed, pending one not");
         require(applied.tier_notice().empty() && applied.receipt_lines().size() == 1U, "no loud line once applied");
@@ -252,10 +261,12 @@ int main() {
             static constexpr std::array<Lever, 1> runnable_rows{
                 Lever{.name = "runnable", .env = "STRIX_TEST_RUNNABLE", .option = "", .value = {"0", "1", "", ""},
                       .builtin = "0", .kind = Kind::bit_changing, .ready = {true, false, true, false},
-                      .runnable = {true, true, true, true}, .target = "x", .off = "", .source = "gate pending"},
+                      .runnable = {true, true, true, true}, .target = "x", .off = "", .source = "gate pending", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
             };
+            static constexpr LadderRow candidate_timing{"runnable", "1", Name::fast, Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "test",
+                                                          false, {}, {}, "ladder-arm/v4;fixture-exec;runnable=0{v1};candidate=runnable=1{v1};tier=fast"};
             static constexpr Engine unqualified{.tag = "unq-engine", .allow_env = "STRIX_TEST_ALLOW",
-                                                .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1"};
+                                                .table = runnable_rows, .quality_rows = false, .turbo_version = "u-turbo-v1", .ladder = std::span(&candidate_timing, 1)};
             Inputs pending_in = in;
             pending_in.allow_pending = true;
             const auto unq = resolve(unqualified, pending_in);
@@ -281,4 +292,7 @@ int main() {
                 "no false EXACT equivalence when TURBO changes weights");
     }
     std::cout << "common profile/receipt tests passed\n";
+} catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
 }

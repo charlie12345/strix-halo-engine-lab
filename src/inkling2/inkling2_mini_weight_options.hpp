@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iostream>
 #include <memory>
 #include <ostream>
 #include <span>
@@ -66,7 +67,7 @@ inline weight::WeightLoadPlan mini_lowbit_receipt_plan(
     const bool enabled = scope.backend == weight::Backend::hip && scope.regime == kMiniWeightRegime &&
                          extent.context != 0U && extent.lanes != 0U;
     return weight::resolve_weight_load(weight::builtin_registry(), policy, {tier, scope, formats, enabled, false,
-                                                                             {}, extent}, decisions);
+                                                                             {}, extent, {1, 1}}, decisions);
 }
 
 inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
@@ -371,6 +372,27 @@ inline void mini_cli_decline_served_route(profile::Resolution& tier) {
     }
 }
 
+// One scoped selection for serial CLI, the gate and each served prompt. Explicit
+// selection was already validated during parsing and keeps its precedence. `receipt` (the command line's resolution)
+// declines the served route lever as the command line's own resolution does.
+inline moe_core::grouped_w4a4::Activations mini_prompt_moe(const MiniWeightOptions& options,
+                                                         std::string_view device, std::uint64_t tokens,
+                                                         bool print = true, profile::Resolution* receipt = nullptr) {
+    auto inputs = options.tier;
+    inputs.regime = {profile::Phase::prefill, tokens, 1, device};
+    auto selected = profile::resolve(kMiniProfile, inputs);
+    if (print)
+        for (const auto& entry : selected.entries)
+            if (!entry.ladder.empty()) std::cerr << entry.ladder << '\n';
+    const auto arithmetic = admit_mini_moe_w4a4(mini_moe_w4a4_class(selected), kMiniBuildBackend);
+    if (receipt) {
+        mini_defer_vision_recipe(selected);
+        mini_cli_decline_served_route(selected);
+        *receipt = std::move(selected);
+    }
+    return arithmetic;
+}
+
 inline const char* mini_profile_name(profile::Name tier) {
     return tier == profile::Name::standard ? "exact" : profile::name(tier);
 }
@@ -400,8 +422,9 @@ inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name ti
         auto candidate = mini_lowbit_receipt_plan(tier, scope, extent);
         if (mini_lowbit_storage(candidate.head_storage)) return candidate;
     }
+    // The resident image serves every request from one position and one lane up to extent.
     auto plan = weight::resolve_weight_load(weight::builtin_registry(), policy,
-        {tier, scope, formats, !options.disable_q8, qualify, kMiniWeightLoadRegimes, extent}, kMiniWeightLoadDecisions);
+        {tier, scope, formats, !options.disable_q8, qualify, kMiniWeightLoadRegimes, extent, {1, 1}}, kMiniWeightLoadDecisions);
     if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
         throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
     return plan;

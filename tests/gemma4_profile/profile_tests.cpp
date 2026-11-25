@@ -40,16 +40,16 @@ constexpr unsigned all = 1 | 2 | 4;
 // a CLI asset lever QUALITY requires, and a discovered asset lever with an off switch.
 constexpr pr::Lever synthetic[] = {
     {.name = "route", .env = "TEST_ROUTE", .value = {"a", "b", "a"}, .builtin = "a", .required = {false, false, false},
-     .ready = {true, true, true}, .kind = pr::Kind::bit_changing, .apps = all, .source = "ready"},
+     .ready = {true, true, true}, .kind = pr::Kind::bit_changing, .apps = all, .source = "ready", .identity = {{{"a", "v1"}, {"b", "v1"}}}},
     {.name = "speed", .env = "TEST_SPEED", .value = {"1", "1", "1"}, .builtin = "0", .required = {false, false, false},
-     .ready = {false, false, false}, .kind = pr::Kind::exact, .apps = all, .source = "owner-branch"},
+     .ready = {false, false, false}, .kind = pr::Kind::exact, .apps = all, .source = "owner-branch", .identity = {{{"0", "v1"}, {"1", "v1"}}}},
     {.name = "named", .env = "TEST_NAMED", .value = {"", "x8", ""}, .builtin = "x0", .required = {false, true, false},
-     .ready = {true, false, true}, .kind = pr::Kind::bit_changing, .apps = 1, .source = "named-branch"},
+     .ready = {true, false, true}, .kind = pr::Kind::bit_changing, .apps = 1, .source = "named-branch", .identity = {{{"x0", "v1"}, {"x8", "v1"}}}},
     {.name = "pack", .option = "--pack", .value = {"", "", "pack"}, .builtin = "off", .required = {false, false, true},
-     .ready = {true, true, true}, .kind = pr::Kind::pack, .apps = all, .asset = true, .source = "pack-commit"},
+     .ready = {true, true, true}, .kind = pr::Kind::pack, .apps = all, .asset = true, .source = "pack-commit", .identity = {{{"off", "v1"}, {"pack", "v1"}}}},
     {.name = "draft", .env = "TEST_DRAFT", .option = "--draft-mtp", .value = {"on", "on", "on"}, .builtin = "off",
      .required = {false, false, false}, .ready = {true, false, true}, .kind = pr::Kind::exact, .apps = 1, .asset = true,
-     .off = "0", .source = "drafter"},
+     .off = "0", .source = "drafter", .identity = {{{"off", "v1"}, {"on", "v1"}, {"0", "v1"}}}},
 };
 
 void synthetic_table() {
@@ -67,13 +67,52 @@ void synthetic_table() {
     check(status(r, "named") == pr::Status::pending && value(r, "named") == "x0" && r.find("named")->target == "x8",
           "pending required row runs the builtin");
     {
-        unsigned named = 0, pending = 0;
+        unsigned named = 0, pending = 0, ladder = 0;
         for (const auto& line : r.notices()) named += line == "profile fast: named pending x8 (x0 runs)";
-        for (const auto& e : r.entries) pending += e.status == pr::Status::pending;
-        check(named == 1 && r.notices().size() == pending, "one notice per pending row");
+        for (const auto& e : r.entries) {
+            pending += e.status == pr::Status::pending;
+            ladder += !e.ladder.empty();
+        }
+        check(named == 1 && r.notices().size() == pending + ladder, "pending notices and ladder diagnostics");
     }
-    r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, in(), synthetic);
+    check(status(r, "route") == pr::Status::pending && value(r, "route") == "a",
+          "ready route declines outside a measured regime");
+    strix::profile::LadderRow route_timing{"route", "b", pr::Name::fast, strix::profile::Phase::prefill,
+                                          "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/route"};
+    auto measured = in();
+    measured.regime = {strix::profile::Phase::prefill, 4096, 1, "fixture", "fixture-exec"};
+    // The row is measured over the reference the adapter runs under the cell (LadderArms::over).
+    const std::string route_reference =  // owned: LadderRow::over is a view
+        pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic).find("route")->ladder_reference;
+    route_timing.over = route_reference;
+    check(route_timing.over.starts_with("ladder-arm/v4;"), "Gemma reports the reference of the route cell");
+    measured.ladder = std::span(&route_timing, 1);
+    r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic);
     check(status(r, "route") == pr::Status::set && value(r, "route") == "b" && r.active("route"), "fast sets ready lever");
+    // Review r75 P2: the arm spells the drafter discovery actually resolved. A receipt measured with the drafter absent
+    // decides only that case: with a discovered drafter the key is not the same (it spells no key: the asset has no
+    // declared identity), so the fixed receipt has no effect there.
+    {
+        auto absent = measured;
+        absent.ladder = {};
+        const std::string absent_reference =
+            pr::resolve(pr::Name::fast, pr::App::engine, absent, synthetic).find("route")->ladder_reference;
+        auto present = absent;
+        present.assets = {{"draft", "/models/e4b/drafter-mtp"}};
+        const std::string present_reference =
+            pr::resolve(pr::Name::fast, pr::App::engine, present, synthetic).find("route")->ladder_reference;
+        check(present_reference.empty() && absent_reference.find(",draft=0{v1};") != std::string::npos,
+              "drafter present and absent spell different keys (present: none): absent '" + absent_reference +
+                  "' present '" + present_reference + "'");
+        strix::profile::LadderRow drafter_timing = route_timing;
+        drafter_timing.over = absent_reference;
+        absent.ladder = std::span(&drafter_timing, 1);
+        present.ladder = std::span(&drafter_timing, 1);
+        check(value(pr::resolve(pr::Name::fast, pr::App::engine, absent, synthetic), "route") == "b",
+              "the receipt decides the drafter-absent run it was measured on");
+        check(value(pr::resolve(pr::Name::fast, pr::App::engine, present, synthetic), "route") == "a",
+              "the same receipt has no effect with a discovered drafter");
+    }
     // An explicit request for a value whose code is not in the build is refused (it would otherwise be ignored).
     refuses([] { (void)pr::resolve(pr::Name::fast, pr::App::engine, in({}, {}, lookup({{"TEST_NAMED", "x8"}})), synthetic); },
             "TEST_NAMED=x8 is not in this build", "explicit request for missing code refused");
@@ -287,9 +326,12 @@ void product_table() {
     }
     {
         const auto lines = r.notices();
-        unsigned pending = 0;
-        for (const auto& e : r.entries) pending += e.status == pr::Status::pending;
-        check(lines.size() == pending, "one stderr line per pending row, no more");
+        unsigned pending = 0, ladder = 0;
+        for (const auto& e : r.entries) {
+            pending += e.status == pr::Status::pending;
+            ladder += !e.ladder.empty();
+        }
+        check(lines.size() == pending + ladder, "one stderr line per pending row and ladder diagnostic");
     }
     // FAST decode attention at depth: pending until its receipt (exact runs), runnable with --allow-pending,
     // never in DEFAULT/QUALITY, STRIX_G4_DECODE_ATTN=exact switches it off.
@@ -302,6 +344,18 @@ void product_table() {
         r = pr::resolve(pr::Name::fast, app, pending_ok);
         check(status(r, "decode_attention") == pr::Status::unqualified && value(r, "decode_attention") == "g4-dattn-f2",
               "allow-pending runs g4-dattn-f2 unqualified");
+        namespace shared = strix::profile;
+        shared::LadderRow timing{"decode_attention", "g4-dattn-f2", shared::Name::fast, shared::Phase::decode,
+                                  "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture timing"};
+        pending_ok.regime = {shared::Phase::decode, 4096, 1, "fixture", "fixture-exec"};
+        const std::string reference = pr::resolve(pr::Name::fast, app, pending_ok).find("decode_attention")->ladder_reference;
+        check(reference.starts_with("ladder-arm/v4;"), "Gemma reports the decode attention reference");
+        timing.over = reference;
+        pending_ok.ladder = std::span(&timing, 1);
+        r = pr::resolve(pr::Name::fast, app, pending_ok);
+        check(status(r, "decode_attention") == pr::Status::unqualified &&
+              r.find("decode_attention")->ladder.find("applies x1.100") != std::string::npos,
+              "measured candidate remains unqualified until its quality gate passes");
         r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
         check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
         r = pr::resolve(pr::Name::standard, app, in());
@@ -397,7 +451,7 @@ void no_pending_executes() {
     constexpr pr::Lever fallback[] = {
         {.name = "bench_route", .env = "TEST_BENCH_ROUTE", .value = {"exact", "fast", "exact"}, .builtin = "fast",
          .required = {false, false, false}, .ready = {false, false, false}, .runnable = {false, true, false},
-         .apps = 1, .builtin_unqualified = true, .source = "pending: exact route"},
+         .apps = 1, .builtin_unqualified = true, .source = "pending: exact route", .identity = {{{"fast", "v1"}, {"exact", "v1"}}}},
     };
     refuses([&] { (void)pr::resolve(pr::Name::standard, pr::App::engine, in(), fallback); }, "pending: exact route",
             "unqualified builtin is never a silent fallback");
@@ -428,12 +482,12 @@ void parsing_and_apply() {
 
     // apply exports only profile-set plain switches, never over an existing value, never asset/off levers.
     constexpr pr::Lever exported[] = {
-        {.name = "one", .env = "STRIX_G4_PROFILE_TEST_ONE", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true}, .apps = 1, .source = "t"},
-        {.name = "two", .env = "STRIX_G4_PROFILE_TEST_TWO", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true}, .apps = 1, .source = "t"},
+        {.name = "one", .env = "STRIX_G4_PROFILE_TEST_ONE", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true}, .apps = 1, .source = "t", .identity = {{{"y", "v1"}, {"x", "v1"}}}},
+        {.name = "two", .env = "STRIX_G4_PROFILE_TEST_TWO", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true}, .apps = 1, .source = "t", .identity = {{{"y", "v1"}, {"x", "v1"}}}},
         {.name = "three", .env = "STRIX_G4_PROFILE_TEST_THREE", .value = {"x", "x", "x"}, .builtin = "y", .ready = {true, true, true},
-         .apps = 1, .asset = true, .off = "0", .source = "t"},
+         .apps = 1, .asset = true, .off = "0", .source = "t", .identity = {{{"y", "v1"}, {"x", "v1"}, {"0", "v1"}}}},
         {.name = "four", .env = "STRIX_G4_PROFILE_TEST_FOUR", .value = {"x", "x", "x"}, .builtin = "y", .required = {true, true, true},
-         .ready = {false, false, false}, .runnable = {true, true, true}, .apps = 1, .source = "pending: gate"},
+         .ready = {false, false, false}, .runnable = {true, true, true}, .apps = 1, .source = "pending: gate", .identity = {{{"y", "v1"}, {"x", "v1"}}}},
     };
 #ifdef _WIN32
     _putenv_s("STRIX_G4_PROFILE_TEST_TWO", "mine");

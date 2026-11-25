@@ -236,7 +236,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     p.bundle_column = profile_column_selects_bundle(env);
     p.bundle_from_profile = p.bundle_column && !fp::set(env(kFastBundle.env));
     if (p.bundle_from_profile && baseline(env))
-        throw std::invalid_argument(std::string("--profile fast selects the FAST bundle ") + kFastBundle.profile + "; " +
+        throw std::invalid_argument(std::string("--profile ") + env(kProductProfileEnv) + " selects the FAST bundle " + kFastBundle.profile + "; " +
                                     kBaselineEnv + "=1 (--baseline) is the exact baseline: drop one of the two");
     const fp::Getenv bundle_env = fp::profile_switch(kFastBundle, p.bundle_from_profile ? "1" : "", env);
     p.canonical = fp::expand(kFastBundle, bundle_env, [&](const fp::Member&) { return !i4; });
@@ -271,7 +271,7 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                          ? std::string(msa_flash_policy(p.msa_flash_layers))
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : p.msa_flash == 3 ? "-rg4" : "") + "-l" + p.msa_flash_layers;
     if (i4 && fp::switch_on(bundle_env(kFastBundle.env)) && !fp::set(raw))
-        p.note = std::string(flash.policy) + " not selected by " + (p.bundle_from_profile ? "--profile fast" : kFastBundle.env) +
+        p.note = std::string(flash.policy) + " not selected by " + (p.bundle_from_profile ? std::string("--profile ") + env(kProductProfileEnv) : std::string(kFastBundle.env)) +
                  " on STRIX_MMX_MODEL_FORMAT=fast_i4";
     // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).
     const char* iw = env("STRIX_MM_PF_IDX_WMMA");
@@ -336,7 +336,7 @@ strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows) {
 }
 
 const profile::Engine& profile_engine() {
-    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1"};
+    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1", {}, {}, ladder_rows};
     return engine;
 }
 

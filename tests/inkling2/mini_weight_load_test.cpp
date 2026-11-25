@@ -153,13 +153,16 @@ void test_selection() {
                   &weight::kAttentionHeadQ8Policy, "old Inkling receipts resolve to the shared policy");
     constexpr std::array formats{weight::kBf16WeightStorage, weight::kQ8WeightStorage};
     for (const auto backend : {weight::Backend::hip, weight::Backend::cuda}) {
-        const weight::WeightLoadScope scope{backend, "test-device", "test-compiler", "decode", digest(1), digest(2)};
-        // One image serves prefill and decode: a full decode row selects it once prefill has its gate row.
-        auto prefill = scope;
-        prefill.regime = weight::kPrefillRegime;
-        const weight::WeightLoadEvidence one_lane{"fixture", "2026-11-23", 800, 65536, 1};
-        const std::array receipts{weight::WeightLoadDecision{policy.id, scope, digest(3), digest(4), one_lane},
-                                  weight::WeightLoadDecision{policy.id, prefill, digest(6), {}}};
+        const weight::WeightLoadScope scope{backend, "test-device", "test-compiler", "resident", digest(1), digest(2)};
+        const auto phase = [&](std::string_view regime, double speedup = 1.10) {
+            auto at = scope;
+            at.regime = regime;
+            return weight::WeightLoadDecision{policy.id, at, digest(3), digest(4),
+                                              {"receipts/t", "2026-11-24", 16, 65536, 1, speedup, 0.02}};
+        };
+        // The resident image is consumed by prefill and decode: the production adapter asks both phases, and each
+        // needs a full row (gate v2 PASS and a measured gain) for the image to change.
+        const std::array receipts{phase(weight::kPrefillRegime), phase(weight::kDecodeRegime)};
         weight::WeightLoadRequest request{profile::Name::standard, scope, formats, true, true, {}, {8192U, 1U}};
         const auto resolve = [&] {
             return mini::resolve_mini_weight_load(request.tier, request.scope, request.consumer_formats,
@@ -172,6 +175,28 @@ void test_selection() {
                     weight::kBf16WeightStorage, "FAST default before gate and speed receipts");
         require(resolve().status == profile::Status::set && resolve().storage == weight::kQ8WeightStorage &&
                     resolve().gate_v2_pass == digest(3) && resolve().measured_gain == digest(4), "qualified FAST selection");
+        {   // r32 P2-c: a winning prefill row alone, or with a missing / losing decode row, never admits the image.
+            const auto with = [&](std::span<const weight::WeightLoadDecision> rows) {
+                return mini::resolve_mini_weight_load(profile::Name::fast, scope, formats, true, false, rows, {4096U, 1U}, {1U, 1U});
+            };
+            const std::array prefill_only{phase(weight::kPrefillRegime)};
+            const std::array decode_only{phase(weight::kDecodeRegime)};
+            const std::array losing_decode{phase(weight::kPrefillRegime), phase(weight::kDecodeRegime, 0.95)};
+            const std::array resident_label{phase("resident")};
+            require(with(prefill_only).storage == weight::kBf16WeightStorage &&
+                        with(prefill_only).status == profile::Status::pending, "prefill row without decode admitted the image");
+            require(with(decode_only).storage == weight::kBf16WeightStorage, "decode row without prefill admitted the image");
+            require(with(losing_decode).storage == weight::kBf16WeightStorage, "a losing decode row admitted the image");
+            require(with(resident_label).storage == weight::kBf16WeightStorage,
+                    "an aggregate resident receipt admitted the image");
+            require(with(receipts).storage == weight::kQ8WeightStorage && with(receipts).regime_count == 2,
+                    "both phases timed: the image is admitted over both regimes");
+            // the explicit, stamped qualification arm still selects the image without rows
+            const auto arm = mini::resolve_mini_weight_load(profile::Name::fast, scope, formats, true, true, prefill_only,
+                                                            {4096U, 1U}, {1U, 1U});
+            require(arm.status == profile::Status::unqualified && arm.storage == weight::kQ8WeightStorage,
+                    "qualification arm changed");
+        }
         request.extent = {65536U, 1U};
         require(resolve().storage == weight::kQ8WeightStorage, "one lane at the band edge");
         for (const weight::WeightLoadExtent extent : {weight::WeightLoadExtent{8192U, 8U}, {8192U, 0U}, {65537U, 1U}}) {
@@ -322,6 +347,7 @@ void test_lowbit_receipts() {
     auto fast = turbo;
     fast.policy = mini::kMiniFastWeightPolicy.id;
     fast.gate_v2_pass = digest(3);
+    fast.evidence.tier = profile::Name::fast;
     fast.turbo_quality = {};
     const auto fixture = std::span(&fast, 1U);
     const auto fast_pick = [&](weight::WeightLoadScope scope, weight::WeightLoadExtent shape) {

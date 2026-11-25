@@ -512,7 +512,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
                                            [&](std::uint32_t rows) {
             return family.load({checkpoint, positions, rows, options.packed_decode, verify_rows,
                                 verify_rows ? options.speculation : CliSpeculation::off,
-                                prefill_tail_rows(prompt_size, rows, family.prefill_tail_divisor)});
+                                prefill_tail_rows(prompt_size, rows, family.prefill_tail_divisor), prompt_size});
         });
     };
     if (media) media->load_checkpoint(checkpoint, load);  // the model reads the file the image rows came from

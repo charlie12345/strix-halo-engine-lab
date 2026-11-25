@@ -201,8 +201,12 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {
     output << tier.summary() << (device ? " reference BASE\n" : "\n");
     if (const auto notice = tier.tier_notice(); !notice.empty()) output << notice << '\n';
+    for (const auto& entry : tier.entries)
+        if (!entry.ladder.empty()) output << entry.ladder << '\n';
 }
 
+// The one writer of the weight receipts of a command-line run (device stderr and gate receipt files): the plan line,
+// the quality receipt when present, and exactly one regime line.
 inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoadPlan& plan) {
     output << "strix-weight-load/v1 " << plan.policy.name << '@' << plan.policy.revision
            << ' ' << plan.storage.name << '@' << plan.storage.revision;
@@ -213,6 +217,19 @@ inline void write_weight_load_plan(std::ostream& output, const weight::WeightLoa
     if (!plan.turbo_quality.empty())
         output << "strix-weight-load-quality/v1 " << plan.policy.name << '@' << plan.policy.revision << ' '
                << plan.turbo_quality << '\n';
+    output << weight::weight_load_regime_receipt(plan) << '\n';
+}
+
+// The receipts the GPU command line writes, composed here so a host fixture exercises the same path: the run's profile
+// receipt (profile summary, ladder decisions, weight plan) and one gate window's route receipt. Each holds exactly one
+// weight plan and one weight regime record (write_weight_load_plan is their only writer).
+inline void write_run_receipt(const profile::Resolution& tier, const weight::WeightLoadPlan& plan, std::ostream& output) {
+    write_profile(tier, output, true);
+    write_weight_load_plan(output, plan);
+}
+inline void write_gate_receipt(std::ostream& output, const weight::WeightLoadPlan& plan, std::string_view routes) {
+    write_weight_load_plan(output, plan);
+    output << "strix-route-file/v1 " << routes << '\n';
 }
 
 // The evaluation-order null receipt of one gate window. A null arm whose window

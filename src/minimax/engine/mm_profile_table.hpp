@@ -80,38 +80,47 @@ inline constexpr std::array<strix::profile::Lever, 10> profile_table{{
      {true, true, true, false}, {true, true, true, false}, "", "0",
      "msa-flash-bf16-l40-v1, bundle mm-fast-pf-v2 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029; docs/optimizations.md#fast-key-split-msa-attention-core-mm-pf-msa-flash); "
      "2 = two-term operands; pending turbo adapter admission/export for mode 1 on layers 0-59",
-     false, {}, true},
+     false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", "", "0-59"}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST MSA flash layer set (read only while msa_flash is on); pending turbo adapter admission/export for 0-59, then per-prompt qualification with scripts/bench/mmflash",
-     false, {}, true},
+     false, {}, true, {}, {{{kMsaFlashLayers, "v1"}, {"0-59", "v1"}}}},
     // PENDING turbo cells: the lever exists only on an open PR / has no per-layer selector yet (reason in `source`).
     {"moe_invariant", "STRIX_MM_MOE_INVARIANT", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {false, false, false, false}, "", "0",
-     "pending: rows-free MoE order (open PR #662, chunkinv/linear-contract); cell flips with that merge", false, {}, true},
+     "pending: rows-free MoE order (open PR #662, chunkinv/linear-contract); cell flips with that merge", false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {"iu4_layers", "STRIX_MM_IU4_LAYERS", "", {"", "", "", ""}, "", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {false, false, false, false}, "", "",
      "pending: transient IU4 per layer (fast_i4 is all-or-nothing today and fails the gate, KL 0.079); no per-layer selector yet; "
-     "never imposed where it slows", false, {}, true},
+     "never imposed where it slows", false, {}, true, {}, {{{"", "v1"}}}},
     // Prefill only: index projections of rows > 8 on the shared FP16 WMMA core; K/V caches and MSA attention unchanged.
     {"idx_wmma", "STRIX_MM_PF_IDX_WMMA", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, false}, "", "0", "minimax-index-proj-wmma-v1 (opt-in; FAST gate e3wire)", false, {}, true},
+     {true, false, true, false}, {true, true, true, false}, "", "0", "minimax-index-proj-wmma-v1 (opt-in; FAST gate e3wire)", false, {}, true, {}, {{{"0", "v1"}}}},
     {"idx_wmma_layers", "STRIX_MM_PF_IDX_WMMA_LAYERS", "", {"", "", "", ""}, kIdxWmmaLayers, strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, false}, "", "", "FAST index projection layer set (read only while idx_wmma is on)", false, {}, true},
+     {true, false, true, false}, {true, true, true, false}, "", "", "FAST index projection layer set (read only while idx_wmma is on)", false, {}, true, {}, {{{kIdxWmmaLayers, "v1"}}}},
     // Explicit only: 32K quality gate failed; no profile selects f16.
     strix::xport::exchange_format_lever(),
     // Prefill only: router product of the listed MoE layers on the FP16 WMMA core; sigmoid, bias and selection unchanged.
-    // fast: member of mm-fast-pf-v2 (see msa_flash). Turbo cell "0" = builtin: turbo keeps its pre-bundle rows.
-    {"router_wmma", "STRIX_MM_PF_ROUTER_WMMA", "", {"", "1", "", "0"}, "0", strix::profile::Kind::bit_changing,
+    // fast: member of mm-fast-pf-v2 (see msa_flash); TURBO nests FAST (empty cell).
+    {"router_wmma", "STRIX_MM_PF_ROUTER_WMMA", "", {"", "1", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, true, true, false}, {true, true, true, false}, "", "0",
-     "mm-pf-router-wmma-v1, bundle mm-fast-pf-v2 (gate PASS 8K KL 0.0020 and 32K with the bundle)", false, {}, true},
+     "mm-pf-router-wmma-v1, bundle mm-fast-pf-v2 (gate PASS 8K KL 0.0020 and 32K with the bundle)", false, {}, true, {}, {{{"0", "v1"}, {"1", "v1"}}}},
     {"router_wmma_layers", "STRIX_MM_PF_ROUTER_WMMA_LAYERS", "", {"", "", "", ""}, kRouterWmmaLayers, strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, false}, "", "", "FAST router layer set (read only while router_wmma is on)", false, {}, true},
+     {true, false, true, false}, {true, true, true, false}, "", "", "FAST router layer set (read only while router_wmma is on)", false, {}, true, {}, {{{kRouterWmmaLayers, "v1"}}}},
     // Prefill only, explicit opt-in (no profile selects it): dense MLP gate/up/down of layers 0-2 on the fixed K order
     // wherever the library split differs (identity mmx-pf-linear-s1-v2). Needs the invariant order; refused with the
     // adaptive order / baseline and with STRIX_MM_PREFILL_IDENTITY=fp32 (mm_defaults.cpp dense_tail_fixed).
     {"pf_dense_tail_fixed", "STRIX_MM_PF_DENSE_TAIL_FIXED", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
-     "mmx-pf-linear-s1-v2 opt-in; native two-rank identity and workload receipt pending", false, {}, true},
+     "mmx-pf-linear-s1-v2 opt-in; native two-rank identity and workload receipt pending", false, {}, true, {},
+     {{{"0", "v1"}, {"1", "mmx-pf-linear-s1-v2"}}}},
 }};
+
+// Ladder rows (strix::profile::LadderRow): incumbent grants for the mm-fast-pf-v2 bundle members the resolver ran before
+// the ladder rule. TURBO nests FAST (it resolves over the admitted FAST set).
+inline constexpr strix::profile::LadderRow ladder_rows[] = {
+    strix::profile::incumbent_cell("msa_flash", "1", strix::profile::Name::fast,
+                                   "bundle mm-fast-pf-v2: EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029", "v1"),
+    strix::profile::incumbent_cell("router_wmma", "1", strix::profile::Name::fast,
+                                   "bundle mm-fast-pf-v2: gate PASS 8K KL 0.0020 and 32K with the bundle", "v1")};
 
 }  // namespace strix::minimax::defaults

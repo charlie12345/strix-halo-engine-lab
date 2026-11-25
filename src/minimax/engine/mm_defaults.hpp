@@ -103,8 +103,8 @@ profile::Resolution profile_resolution(const Lookup& env);
 // '--timing-profile NAME:PROMPT.u32:STEPS'; the old '--profile NAME:PROMPT.u32:STEPS' stays accepted with one notice.
 inline constexpr const char* kProductProfileEnv = "STRIX_MM_PRODUCT_PROFILE";
 // The product profile's column (shared resolver, profile_table, no environment) applies every member of the FAST bundle
-// mm-fast-pf-v2 with its bundle value: today 'fast' (qualified cells, gate PASS 8K + 32K); default / quality never,
-// turbo not while its cells are pending.
+// mm-fast-pf-v2 with its bundle value: 'fast' (qualified cells, gate PASS 8K + 32K) and 'turbo', which nests FAST (its
+// pending proposals leave the FAST cells); default / quality never.
 bool profile_column_selects_bundle(const Lookup& env);
 // ... and the bundle switch (STRIX_MM_FAST_PREFILL) is unset: prefill_policy() then expands the bundle from the word
 // (fast_profile::profile_switch), the same members, admission and prefill identity as the switch; nothing is exported.

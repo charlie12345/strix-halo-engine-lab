@@ -197,6 +197,32 @@ int main() {
                         p.measured_gain == gain && p.regimes[0].qualification == weight::RegimeQualification::full &&
                         p.regimes[1].qualification == weight::RegimeQualification::full,
                     "a measured ladder gain in every regime selects the image");
+        {
+            // Point and extent lookups share one timing decision: a broad gain (1..65,536) with a measured losing
+            // 16,384..32,768 sub-band of the same comparison is refused at 20,000 by both entry points.
+            const weight::WeightLoadEvidence broad{"receipts/broad", "2026-11-25", 2457, 65536, 0, 1.10, 0.02};
+            const weight::WeightLoadEvidence losing{"receipts/losing", "2026-11-25", 2457, 32768, 0, 0.95, 0.02, 16384};
+            const std::array mixed{weight::WeightLoadDecision{q8.id, decode, gate, gain, broad},
+                                   weight::WeightLoadDecision{q8.id, decode, gate, gain, losing}};
+            ok &= check(weight::find_weight_load_decision(q8, decode, mixed, {20000, 1}) == nullptr &&
+                            weight::find_weight_load_decision(q8.id, decode, mixed, {20000, 1}) == nullptr,
+                        "point lookup: the losing sub-band vetoes the broad win at 20,000");
+            ok &= check(weight::find_weight_load_decision(q8, decode, mixed, {8192, 1}) == &mixed[0],
+                        "point lookup: outside the losing sub-band the broad win selects");
+            ok &= check(weight::find_weight_load_decision(q8, decode, std::span(mixed).last(1), {20000, 1}) == nullptr,
+                        "point lookup: a measured loser never selects itself");
+            auto at = r;
+            at.scope = decode;
+            at.regimes = {};
+            at.extent = {20000, 1};
+            weight::RegimeWeightLoad point{};
+            weight::match_weight_load_evidence(q8, decode, mixed, at, weight::kBf16WeightStorage, point);
+            ok &= check(!point.faster, "extent matcher refuses the same losing point");
+            at.extent = {8192, 1};
+            weight::RegimeWeightLoad clear{};
+            weight::match_weight_load_evidence(q8, decode, mixed, at, weight::kBf16WeightStorage, clear);
+            ok &= check(clear.faster && clear.row == &mixed[0], "extent matcher selects outside the losing sub-band");
+        }
         r.extent.context = 131072;
         p = resolve(full_both);
         ok &= check(p.storage == weight::kBf16WeightStorage && p.regimes[1].row == nullptr &&

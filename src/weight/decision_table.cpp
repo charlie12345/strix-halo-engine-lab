@@ -46,12 +46,47 @@ bool same_scope_pass(const WeightLoadDecision& row, const WeightLoadScope& scope
            !(row.gate_v2_pass == Digest256{});
 }
 
+// The one timing decision of the point and extent lookups. A row is timed when it carries a measured-gain digest; it
+// is a win only with a receipt and a speedup beyond its noise (the ladder rule).
+bool timed(const WeightLoadDecision& row) { return !(row.measured_gain == Digest256{}); }
+bool timed_win(const WeightLoadDecision& row) {
+    return timed(row) && !row.evidence.receipt.empty() && profile::ladder_gain(row.evidence.speedup, row.evidence.noise);
+}
+
+// The bands of `e` share a regime with the extent [first, last] (an unknown context or lane count, 0, overlaps every
+// band: the request may land anywhere).
+bool bands_overlap(const WeightLoadEvidence& e, WeightLoadExtent first, WeightLoadExtent last) {
+    if (e.min_context == 0U || e.min_lanes == 0U) return false;  // malformed bands never hold a regime
+    const auto max_context = e.max_context ? e.max_context : std::numeric_limits<std::uint32_t>::max();
+    const auto max_lanes = e.max_lanes ? e.max_lanes : std::numeric_limits<std::uint32_t>::max();
+    const bool contexts = first.context == 0U || last.context == 0U ||
+                          (first.context <= max_context && last.context >= e.min_context);
+    const bool lanes = first.lanes == 0U || last.lanes == 0U || (first.lanes <= max_lanes && last.lanes >= e.min_lanes);
+    return contexts && lanes;
+}
+
+// A timed row of the same policy, scope, tier and reference that is not a win and shares a regime with the extent:
+// it vetoes every win of that comparison over the extent (a measured losing sub-band inside a broad gain).
+template <class SamePolicy>
+const WeightLoadDecision* losing_overlap(SamePolicy same_policy, const WeightLoadScope& scope,
+                                         std::span<const WeightLoadDecision> decisions, const WeightLoadEvidence& win,
+                                         WeightLoadExtent first, WeightLoadExtent last) {
+    for (const auto& row : decisions)
+        if (same_policy(row.policy) && same_scope_pass(row, scope) && row.evidence.tier == win.tier &&
+            row.evidence.reference == win.reference && timed(row) && !timed_win(row) &&
+            bands_overlap(row.evidence, first, last))
+            return &row;
+    return nullptr;
+}
+
 template <class SamePolicy>
 const WeightLoadDecision* find_decision(SamePolicy same_policy, const WeightLoadScope& scope,
                                         std::span<const WeightLoadDecision> decisions, WeightLoadExtent extent) {
     if (!complete_scope(scope)) return nullptr;
     for (const auto& row : decisions)
-        if (same_policy(row.policy) && same_scope_pass(row, scope) && weight_load_gain_selects(row, extent)) return &row;
+        if (same_policy(row.policy) && same_scope_pass(row, scope) && weight_load_gain_selects(row, extent) &&
+            timed_win(row) && !losing_overlap(same_policy, scope, decisions, row.evidence, extent, extent))
+            return &row;
     return nullptr;
 }
 }  // namespace
@@ -93,24 +128,21 @@ void match_weight_load_evidence(const WeightLoadPolicy& policy, const WeightLoad
     const auto first = WeightLoadExtent{request.first.context ? request.first.context : last.context,
                                         request.first.lanes ? request.first.lanes : last.lanes};
     if (first.context > last.context || first.lanes > last.lanes) return;
+    const auto same_policy = [&policy](Id stored) { return policy_has_id(policy, stored); };
     const WeightLoadDecision* blocking = nullptr;
     for (const auto& row : decisions) {
         const auto& e = row.evidence;
-        if (!policy_has_id(policy, row.policy) || !same_scope_pass(row, scope) ||
+        if (!same_policy(row.policy) || !same_scope_pass(row, scope) ||
             e.tier != request.tier || e.reference != reference) continue;
         const bool contexts = weight_load_context_in_band(e, first.context) &&
                               weight_load_context_in_band(e, last.context);
         const bool lanes = weight_load_gain_covers_lanes(e, first.lanes) &&
                            weight_load_gain_covers_lanes(e, last.lanes);
-        const bool timed = row.measured_gain != Digest256{};
-        const bool faster = timed && !e.receipt.empty() && profile::ladder_gain(e.speedup, e.noise);
-        // A measured losing sub-band vetoes a covering win for the same fixed image.
-        const auto max_context = e.max_context ? e.max_context : std::numeric_limits<std::uint32_t>::max();
-        const auto max_lanes = e.max_lanes ? e.max_lanes : profile::kNoLaneBound;
-        const bool overlaps = profile::ladder_band(std::max(first.context, e.min_context), e.min_context,
-            std::min(last.context, max_context), std::max(first.lanes, e.min_lanes), e.min_lanes,
-            std::min(last.lanes, max_lanes));
-        if (timed && !faster && overlaps) blocking = &row;
+        const bool row_timed = timed(row);
+        const bool faster = timed_win(row);
+        // A measured losing sub-band vetoes a covering win for the same fixed image (the point lookups share it).
+        if (!blocking && row_timed && !faster)
+            blocking = losing_overlap(same_policy, scope, std::span(&row, 1), e, first, last);
         if (!contexts) {
             if (!entry.outside_band) entry.outside_band = &row;
             continue;
@@ -118,7 +150,7 @@ void match_weight_load_evidence(const WeightLoadPolicy& policy, const WeightLoad
         const bool selects = faster && lanes && first.context != 0U && first.lanes != 0U;
         if (!entry.row || (selects && !entry.faster)) {
             entry.row = &row;
-            entry.gain_outside_lanes = timed && !lanes;
+            entry.gain_outside_lanes = row_timed && !lanes;
         }
         entry.faster |= selects;
     }

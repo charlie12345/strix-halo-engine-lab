@@ -286,11 +286,10 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
     out.app = app;
     out.allow_pending = allow_pending;
     const auto column = unsigned(profile);
-    for (const auto& lever : table) {
-        if (!(lever.apps & unsigned(app))) continue;
-        Entry entry{&lever, {}, Status::profile, {}};
-        // the last of the lever's own options decides (the service parses them in order)
-        bool cli = false;
+    namespace shared = strix::profile;
+    // The last of the lever's own options decides (the service parses them in order).
+    const auto cli_value = [&](const Lever& lever) -> std::optional<std::string_view> {
+        std::optional<std::string_view> set;
         for (std::size_t i = 0; i < inputs.args.size(); ++i) {
             const auto& a = inputs.args[i];
             if (a == "--profile") { ++i; continue; }  // its argument
@@ -301,25 +300,43 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
                 if (takes_value(a, table)) ++i;  // another lever's option: skip its argument
                 continue;
             }
-            cli = true;
-            if (hit->value == "*") entry.value = ++i < inputs.args.size() ? inputs.args[i] : std::string();
-            else entry.value = std::string(hit->value);
+            if (hit->value == "*") set = ++i < inputs.args.size() ? std::string_view(inputs.args[i]) : std::string_view();
+            else set = hit->value;
         }
+        return set;
+    };
+    const auto env_value = [&](const Lever& lever) -> std::optional<std::string_view> {
         const char* own = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env).c_str());
+        if (!own || !*own) return std::nullopt;
+        const std::string_view v(own);
+        return v == "0" || v == "off" ? std::string_view("off") : v;
+    };
+    // The lower arms the ladder rows are bound to; a lever outside this app never runs (its builtin).
+    const auto arms = shared::ladder_arms(table, inputs.ladder, inputs.regime,
+        [&](const Lever& lever, unsigned c) { return shared::column_admission(lever, c, allow_pending, false); },
+        [&](const Lever& lever) -> std::optional<std::string_view> {
+            if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
+            if (const auto set = cli_value(lever)) return set;
+            return env_value(lever);
+        });
+    for (const auto& lever : table) {
+        if (!(lever.apps & unsigned(app))) continue;
+        Entry entry{&lever, {}, Status::profile, {}};
+        const auto cli = cli_value(lever);
+        const auto own = env_value(lever);
         const auto& wanted = lever.value[column];
         if (cli) {
+            entry.value = std::string(*cli);
             entry.status = Status::explicit_cli;
-        } else if (own && *own) {
-            const std::string_view v(own);
-            entry.value = v == "0" || v == "off" ? "off" : std::string(v);
+        } else if (own) {
+            entry.value = std::string(*own);
             entry.status = Status::explicit_env;
         } else if (wanted.empty()) {
             continue;  // the profile leaves it alone
         } else {
-            namespace shared = strix::profile;
             const auto admit = [&](unsigned c) { return shared::column_admission(lever, c, allow_pending, false); };
             auto cell = shared::select_profile_cell(lever, inputs.ladder, static_cast<shared::Name>(profile),
-                                                    inputs.regime, admit, allow_pending);
+                                                    inputs.regime, admit, allow_pending, arms);
             entry.ladder = std::move(cell.route);
             const auto admission = cell.benchmark ? shared::Status::unqualified : admit(column);
             if (admission == shared::Status::pending || (!entry.ladder.empty() && cell.value == lever.builtin)) {

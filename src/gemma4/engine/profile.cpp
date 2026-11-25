@@ -294,6 +294,27 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
     const auto* allow = environment(inputs.env, "STRIX_G4_PROFILE_ALLOW_PENDING");
     out.allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     const auto column = unsigned(profile);
+    // The lower arm the ladder rows are bound to: the explicit settings below run in every tier; a lever outside this
+    // app never runs (its builtin).
+    const auto arms = strix::profile::ladder_arms(levers, std::span<const strix::profile::LadderRow>(ladder),
+        inputs.regime,
+        [&](const Lever& lever, unsigned c) {
+            return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
+        },
+        [&](const Lever& lever) -> std::optional<std::string_view> {
+            if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
+            const auto off = [&](std::string_view v) { return !lever.off.empty() && (v == lever.off || v == "off"); };
+            const auto* given = lookup(inputs.cli, lever.name);
+            const char* exported = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env).c_str());
+            if ((given && off(*given)) || (!given && exported && off(exported))) return std::string_view("off");
+            if (given) return std::string_view(*given);
+            if (exported && !lever.asset) return std::string_view(exported);
+            if (exported) {
+                const auto* asset = lookup(inputs.assets, lever.name);
+                return asset ? std::string_view(*asset) : std::string_view(lever.builtin);
+            }
+            return std::nullopt;
+        });
     for (const auto& lever : levers) {
         if (!(lever.apps & unsigned(app))) continue;
         const auto& wanted = lever.value[column];
@@ -327,7 +348,8 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
         } else if (wanted.empty()) {
             continue;
         } else {
-            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit, out.allow_pending);
+            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit, out.allow_pending,
+                                                            arms);
             entry.ladder = std::move(cell.route);
             const auto admission = cell.benchmark ? strix::profile::Status::unqualified : admit(column);
             if ((!entry.ladder.empty() && cell.value == lever.builtin) ||

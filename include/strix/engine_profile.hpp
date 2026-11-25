@@ -153,6 +153,13 @@ struct LadderRow {
     // a pair. Empty: an ordinary single-cell row.
     std::string_view joint{};
     JointLadderScope joint_scope{};
+    // The lower arm an ordinary row was measured over (its denominator): the effective cells of the tier below in the
+    // regime, spelled as ladder_arms() spells them ("lever=value,..." in table order, every lossy lever whose cell is
+    // not its builtin, explicit settings included; empty: every lower cell is its builtin). The row decides only while
+    // the lower arm that runs is that arm: a newly qualified or overridden lower cell anywhere in the table makes the
+    // row stale (it no longer covers the regime). The candidate is that arm plus this one cell; cells whose gains
+    // interact are timed together on one paired row (`joint`). Paired rows bind through `joint_scope` instead.
+    std::string_view over{};
 };
 
 // Receipts of incumbent grants for cells that ran before the ladder rule without a quality gate of their own.
@@ -205,10 +212,19 @@ template <class Context, class Lanes>
            ladder_band(regime.context, row.min_context, row.max_context, regime.lanes, row.min_lanes, row.max_lanes);
 }
 
-enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower, incumbent };
+// `declined`: the regime is not known when the entry point resolves (context 0: a server or an adapter that resolves
+// once before any request) and timing rows decide this cell per regime, so neither the grant nor a row can be honoured.
+enum class Rung : std::uint8_t { applies, unmeasured, within_noise, slower, incumbent, declined };
 [[nodiscard]] constexpr std::string_view rung_name(Rung rung) noexcept {
     return rung == Rung::applies ? "applies" : rung == Rung::unmeasured ? "unmeasured regime"
-        : rung == Rung::within_noise ? "within noise" : rung == Rung::slower ? "slower" : "incumbent";
+        : rung == Rung::within_noise ? "within noise" : rung == Rung::slower ? "slower"
+        : rung == Rung::incumbent ? "incumbent"
+        : "declined at startup (resolved before the request: no prompt length; timing rows decide this cell per regime)";
+}
+// No measurement decides the regime (unmeasured there, or unknown at startup): the only rungs --allow-pending may run
+// as a benchmark arm. A measured slower or within-noise verdict is never overridden.
+[[nodiscard]] constexpr bool rung_unmeasured(Rung rung) noexcept {
+    return rung == Rung::unmeasured || rung == Rung::declined;
 }
 // The cell runs in its own tier (a measured gain or an incumbent grant).
 [[nodiscard]] constexpr bool rung_runs(Rung rung) noexcept { return rung == Rung::applies || rung == Rung::incumbent; }
@@ -216,16 +232,23 @@ struct LadderVerdict {
     Rung rung = Rung::unmeasured;
     const LadderRow* row = nullptr;  // the deciding row: the least favourable row covering the regime
     Name resolved = Name::standard;  // the tier whose cell the regime runs
+    bool stale = false;              // a row covered the regime but was measured over another lower arm
 };
 
 // The verdict of `value` of `lever` in `tier` for `regime`: applies only when every covering timing row shows a gain;
-// with no timing row covering the regime, an incumbent grant with a receipt keeps the cell (Rung::incumbent).
+// with no timing row covering the regime, an incumbent grant with a receipt keeps the cell (Rung::incumbent), except in
+// an unknown regime (context 0) when timing rows exist for the cell: the startup resolution declines it
+// (Rung::declined). `arm` (the lower arm that runs, ladder_arms()) binds ordinary rows: a row whose `over` differs does
+// not cover the regime (stale evidence; a grant does not run over it either). Paired rows bind through `joint_scope`.
 [[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
                                                    std::string_view value, Name tier, const Regime& regime,
                                                    std::string_view joint = {},
-                                                   const JointLadderScope& joint_scope = {}) noexcept {
+                                                   const JointLadderScope& joint_scope = {},
+                                                   const std::string_view* arm = nullptr) noexcept {
     const LadderRow* worst = nullptr;
     const LadderRow* grant = nullptr;
+    bool timed = false;  // a timing row names this cell (in any regime)
+    bool stale = false;
     for (const auto& row : rows) {
         if (row.joint != joint) continue;  // a paired receipt is read only by the pair's own judge
         if (!joint.empty() && (!joint_scope.complete() || row.value.empty() || row.joint_scope != joint_scope)) continue;
@@ -233,12 +256,20 @@ struct LadderVerdict {
             if (!grant && !row.receipt.empty() && ladder_names(row, lever, value, tier)) grant = &row;
             continue;
         }
+        timed = timed || ladder_names(row, lever, value, tier);
         if (!ladder_covers(row, lever, value, tier, regime)) continue;
+        if (joint.empty() && arm != nullptr && row.over != *arm) {
+            stale = true;
+            continue;
+        }
         if (row.receipt.empty() || !valid_ladder_measurement(row.speedup, row.noise))
             return {Rung::unmeasured, nullptr, tier_below(tier)};
         if (!worst || row.speedup - row.noise < worst->speedup - worst->noise) worst = &row;
     }
-    if (!worst) return grant ? LadderVerdict{Rung::incumbent, grant, tier} : LadderVerdict{Rung::unmeasured, nullptr, tier_below(tier)};
+    if (!worst && grant && timed && regime.context == 0) return {Rung::declined, grant, tier_below(tier)};
+    if (!worst)
+        return grant && !stale ? LadderVerdict{Rung::incumbent, grant, tier}
+                               : LadderVerdict{Rung::unmeasured, nullptr, tier_below(tier), stale};
     if (ladder_gain(worst->speedup, worst->noise)) return {Rung::applies, worst, tier};
     const bool slower = worst->speedup < 1.0 - worst->noise;
     return {slower ? Rung::slower : Rung::within_noise, worst, tier_below(tier)};
@@ -844,9 +875,21 @@ struct LadderCell {
     bool benchmark = false;
 };
 
+// The effective lower arms of a regime (ladder_arms()): what an ordinary FAST row (`exact`) or TURBO row (`fast`)
+// names in LadderRow::over.
+struct LadderArms {
+    std::string exact, fast;
+    [[nodiscard]] std::string_view below(Name tier) const noexcept { return tier == Name::turbo ? fast : exact; }
+};
+// No explicit setting (adapters without CLI / env overrides of lossy levers).
+struct NoExplicitSetting {
+    std::optional<std::string_view> operator()(const auto&) const noexcept { return std::nullopt; }
+};
+
 template <class Row, class Admission>
 [[nodiscard]] inline LadderCell ladder_cell(const Row& lever, std::span<const LadderRow> rows, Name tier,
-                                            const Regime& regime, const Admission& admit, bool allow_pending) {
+                                            const Regime& regime, const Admission& admit, bool allow_pending,
+                                            const LadderArms& arms) {
     const auto column = value_column(lever, tier);
     const auto wanted = lever.value[column];
     // A cell spelling the builtin runs without a qualification of its own (resolve() treats it as builtin).
@@ -855,7 +898,7 @@ template <class Row, class Admission>
         return {eligible ? wanted : lever.builtin, tier, {}};
 
     const auto below = tier_below(tier);
-    auto lower = ladder_cell(lever, rows, below, regime, admit, false);
+    auto lower = ladder_cell(lever, rows, below, regime, admit, false, arms);
     if (!wanted.empty() && !eligible) {
         // An unavailable binding for the same value can represent a different tier-specific composition
         // (for example a required companion layer set). Only an actual replacement can bypass that refusal.
@@ -869,7 +912,8 @@ template <class Row, class Admission>
     if (!eligible || (tier == Name::turbo && column == static_cast<unsigned>(Name::fast)) ||
         wanted == lower.value) return lower;
     std::string step = " " + std::string(name(tier)) + "=" + std::string(wanted) + " ";
-    const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime);
+    const std::string_view arm = arms.below(tier);
+    const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime, {}, {}, &arm);
     const auto reference_column = value_column(lever, below);
     const auto reference = lever.value[reference_column];
     const auto expected = !reference.empty() && applied(admit(reference_column)) ? reference : lever.builtin;
@@ -879,6 +923,7 @@ template <class Row, class Admission>
         return lower;
     }
     step += rung_name(verdict.rung);
+    if (verdict.stale) step += " (timing rows measured over another " + std::string(name(below)) + " arm)";
     if (verdict.row) {
         if (!verdict.row->incumbent) {
             char ratio[64];
@@ -888,11 +933,37 @@ template <class Row, class Admission>
         step += " (" + std::string(verdict.row->receipt) + ")";
     }
     if (rung_runs(verdict.rung)) return {wanted, tier, step};
-    // The explicit benchmark arm can collect the evidence the default needs. It never claims qualification.
-    if (tier == Name::fast && allow_pending && lever.runnable[column])
+    // The explicit benchmark arm can collect the evidence the default needs where no measurement decides the regime.
+    // It never claims qualification, and never runs a cell measured slower or within noise.
+    if (tier == Name::fast && allow_pending && lever.runnable[column] && rung_unmeasured(verdict.rung))
         return {wanted, tier, step + " (unqualified benchmark opt-in)", true};
     lower.route = step + lower.route;
     return lower;
+}
+
+// The effective EXACT and FAST arms in `regime`: for every lossy lever of `table` (in table order) whose cell is not
+// its builtin, "lever=value" joined by ','. `admit_of(lever, column)` is the adapter's column admission and
+// `explicit_of(lever)` its explicit CLI / env setting of the lever (std::nullopt: none), which runs in every tier.
+template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
+[[nodiscard]] inline LadderArms ladder_arms(std::span<const Row> table, std::span<const LadderRow> rows,
+                                            const Regime& regime, const AdmitOf& admit_of,
+                                            const ExplicitOf& explicit_of = {}) {
+    LadderArms arms;
+    for (const Name tier : {Name::standard, Name::fast}) {
+        std::string arm;
+        for (const auto& lever : table) {
+            if (lever.kind == decltype(lever.kind)::exact) continue;
+            std::string_view value;
+            if (const auto set = explicit_of(lever)) value = *set;
+            else value = ladder_cell(lever, rows, tier, regime, [&](unsigned c) { return admit_of(lever, c); }, false,
+                                     arms).value;
+            if (value == lever.builtin) continue;
+            if (!arm.empty()) arm += ',';
+            arm.append(lever.name).append("=").append(value);
+        }
+        (tier == Name::standard ? arms.exact : arms.fast) = std::move(arm);
+    }
+    return arms;
 }
 
 // Route line of one lever in one regime: 'strix-ladder/v1 <lever> <phase> ctx=<n> lanes=<n> dev=<device>:<steps>
@@ -909,19 +980,20 @@ template <class Row, class Admission>
 // Resolve a profile-owned FAST/TURBO cell before any adapter can export it.
 template <class Row, class Admission>
 inline LadderCell select_profile_cell(const Row& lever, std::span<const LadderRow> rows, Name tier,
-                                      const Regime& regime, const Admission& admit, bool allow_pending = false) {
+                                      const Regime& regime, const Admission& admit, bool allow_pending,
+                                      const LadderArms& arms) {
     if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo))
         return {lever.value[value_column(lever, tier)], tier, {}};
-    auto cell = ladder_cell(lever, rows, tier, regime, admit, allow_pending);
+    auto cell = ladder_cell(lever, rows, tier, regime, admit, allow_pending, arms);
     if (!cell.route.empty()) cell.route = ladder_route(lever.name, regime, cell);
     return cell;
 }
 
 inline void apply_ladder(Entry& entry, std::span<const LadderRow> rows, Name tier, const Regime& regime,
-                         const auto& admit, bool allow_pending) {
+                         const auto& admit, bool allow_pending, const LadderArms& arms) {
     const auto& lever = *entry.lever;
     if (lever.kind == decltype(lever.kind)::exact || (tier != Name::fast && tier != Name::turbo)) return;
-    auto cell = select_profile_cell(lever, rows, tier, regime, admit, allow_pending);
+    auto cell = select_profile_cell(lever, rows, tier, regime, admit, allow_pending, arms);
     entry.ladder = std::move(cell.route);
     entry.ladder_lowered = !entry.ladder.empty() && cell.tier != tier;
     if (cell.benchmark) {
@@ -1002,6 +1074,13 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     // 'quality' without quality rows is the default column; an empty turbo cell is the fast cell.
     const auto profile_column = out.quality_fallback() ? Name::standard : out.profile;
     const bool preset = model_preset();
+    const auto arms = ladder_arms(engine.table, engine.ladder, inputs.regime,
+        [&](const Lever& lever, unsigned c) { return column_admission(lever, c, out.allow_pending, preset); },
+        [&](const Lever& lever) -> std::optional<std::string_view> {
+            for (const auto& [key, value] : inputs.cli) if (key == lever.name) return std::string_view(value);
+            if (const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env)) return env;
+            return std::nullopt;
+        });
     for (const auto& lever : engine.table) {
         const auto column = value_column(lever, profile_column);
         const std::string* cli = nullptr;
@@ -1025,7 +1104,7 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         if (cli == nullptr && env == nullptr)
             apply_ladder(entry, engine.ladder, profile_column, inputs.regime, [&](unsigned c) {
                 return column_admission(lever, c, out.allow_pending, preset);
-            }, out.allow_pending);
+            }, out.allow_pending, arms);
         out.entries.push_back(std::move(entry));
     }
     out.admitted_ = Resolution::resolve_variants(engine, inputs, out);

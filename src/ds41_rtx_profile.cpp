@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 namespace strix::ds41::rtx::profile {
 namespace {
@@ -275,10 +276,14 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
     const auto column = unsigned(profile);
     const char* baseline_env = environment(inputs.env, "STRIX_DS41_RTX_BASELINE");
     const bool env_baseline = baseline_env && std::string_view(baseline_env) == "1";
-    for (const auto& lever : table) {
-        if (!(lever.apps & unsigned(app))) continue;
-        Entry entry{&lever, {}, Status::profile, {}};
-        // the last of the lever's own options and --baseline decides (the replica parses them in order)
+    // The value source of every lever of this app: the last of the lever's own options and --baseline decides (the
+    // replica parses them in order), then the legacy RTX policy (see below).
+    struct Selected {
+        strix::profile::DefaultValue value;
+        bool cli_baseline = false;
+    };
+    const auto select_of = [&](const Lever& lever) {
+        std::string value;
         bool cli = false, cli_baseline = false;
         for (std::size_t i = 0; i < inputs.args.size(); ++i) {
             const auto& a = inputs.args[i];
@@ -286,7 +291,7 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
             if (a == "--baseline") {
                 if (lever.baseline) {
                     cli = cli_baseline = true;
-                    entry.value = "off";
+                    value = "off";
                 }
                 continue;
             }
@@ -299,23 +304,42 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
             }
             cli = true;
             cli_baseline = false;
-            if (hit->value == "*") entry.value = ++i < inputs.args.size() ? inputs.args[i] : std::string();
-            else entry.value = std::string(hit->value);
+            if (hit->value == "*") value = ++i < inputs.args.size() ? inputs.args[i] : std::string();
+            else value = std::string(hit->value);
         }
         const char* own = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env).c_str());
-        const auto& wanted = lever.value[column];
         // Adapt legacy RTX policy before using the common value selector: empty
         // own variables are ignored, booleans map to on/off, and environment
         // baseline overrides the own variable. CLI ordering was resolved above.
-        const std::string row_name(lever.name), row_env(lever.env), row_on(wanted);
+        const std::string row_name(lever.name), row_env(lever.env), row_on(lever.value[column]);
         const strix::profile::DefaultItem row{row_name.c_str(), row_env.c_str(), row_on.c_str(), "off", "",
                                               true, lever.baseline};
         const Lookup own_env = [&](const char*) -> const char* {
             if ((env_baseline && lever.baseline) || !own || !*own) return nullptr;
             return std::string_view(own) == "0" ? "off" : "on";
         };
-        const auto selected = strix::profile::resolve_default(row, env_baseline, own_env,
-            cli ? std::optional<std::string_view>(entry.value) : std::nullopt);
+        return Selected{strix::profile::resolve_default(row, env_baseline, own_env,
+                            cli ? std::optional<std::string_view>(value) : std::nullopt), cli_baseline};
+    };
+    std::vector<Selected> selections(table.size());
+    for (std::size_t i = 0; i < table.size(); ++i)
+        if (table[i].apps & unsigned(app)) selections[i] = select_of(table[i]);
+    // The lower arm the ladder rows are bound to; a lever outside this app never runs (its builtin).
+    const auto arms = strix::profile::ladder_arms(table, inputs.ladder, inputs.regime,
+        [&](const Lever& lever, unsigned c) {
+            return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
+        },
+        [&](const Lever& lever) -> std::optional<std::string_view> {
+            if (!(lever.apps & unsigned(app))) return std::string_view(lever.builtin);
+            const auto& chosen = selections[static_cast<std::size_t>(&lever - table.data())].value;
+            if (chosen.source == strix::profile::DefaultSource::on) return std::nullopt;
+            return std::string_view(chosen.value);
+        });
+    for (const auto& lever : table) {
+        if (!(lever.apps & unsigned(app))) continue;
+        Entry entry{&lever, {}, Status::profile, {}};
+        const auto& wanted = lever.value[column];
+        const auto& [selected, cli_baseline] = selections[static_cast<std::size_t>(&lever - table.data())];
         entry.value = selected.value;
         if (selected.source == strix::profile::DefaultSource::cli) {
             entry.status = cli_baseline ? Status::baseline_cli : Status::explicit_cli;
@@ -330,7 +354,8 @@ Resolution resolve(Name profile, bool allow_pending, App app, const Inputs& inpu
                 return strix::profile::column_admission(lever, c, allow_pending, strix::profile::model_preset());
             };
             const auto admission = admit(column);
-            auto cell = strix::profile::select_profile_cell(lever, inputs.ladder, profile, inputs.regime, admit);
+            auto cell = strix::profile::select_profile_cell(lever, inputs.ladder, profile, inputs.regime, admit,
+                                                            false, arms);
             entry.ladder = std::move(cell.route);
             // The ladder ran a lower cell: the status is that cell's admission (the builtin: pending, with the
             // wanted cell named). Otherwise the column's own admission stands, as before the ladder rule.

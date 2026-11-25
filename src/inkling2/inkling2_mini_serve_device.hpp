@@ -37,7 +37,7 @@ inline MiniServeCohort make_mini_device_cohort(
               false, MiniResidentBackend::default_step_graphs, weights.storage, 0U, false, rows, 0U, opt.experts_nvfp4,
               opt.controller_one_plane);
     const auto levers = configure_mini_decoder(*decoder, opt.moe_w4a4, opt.combine_image, opt.prepared_round_fold,
-                                               opt.attn_projected_bias, opt.screened_head);
+                                               opt.attn_projected_bias, opt.screened_head, opt.verify_rows);
     const auto memory = mini_gpu::memory_info();
     const auto slot_bytes = decoder->slot_bytes();
     // The lever's screened plane (CUDA) stays only when it costs no KV slot; HIP's own binding keeps its budget.
@@ -58,6 +58,9 @@ inline MiniServeCohort make_mini_device_cohort(
               << " moe_prefill " << moe_core::grouped_w4a4::identity(opt.moe_w4a4)
               << " served_route " << mini_served_route_startup_field(opt, cohort->prompt_tail_rows())
               << " prepared_round_fold " << mini_round_fold_startup_field(opt, levers)
+              << " verify_rows "
+              << mini_verify_rows_name(mini_served_verify_rows(levers.verify_rows, opt.served_cli_route, lanes),
+                                       opt.verify_rows)
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " head " << mini_head_field(head)
               << " experts " << (opt.experts_nvfp4 ? "nvfp4" : "checkpoint")

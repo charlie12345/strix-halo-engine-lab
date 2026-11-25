@@ -153,6 +153,7 @@ unsigned media_verifies = 0;
 std::vector<std::filesystem::path> media_inputs;  // what the fake media input reports it read
 bool media_same_checkpoint = true;                 // whether the loaded checkpoint is the pinned one
 bool media_decode_fails = false;                   // decode throws (a run that fails after its logits were written)
+std::function<void()> media_during_decode;         // runs inside decode (the dump is written, not yet published)
 std::function<void()> media_after_read;            // runs after the fake input keyed its files (a name swap)
 
 class MediaDecoder final : public SerialGenerationDecoder {
@@ -170,7 +171,8 @@ public:
         return 1;
     }
     std::uint32_t decode(std::uint32_t, std::span<float>) override {
-        if (media_decode_fails) throw std::runtime_error("decode failed");
+        if (media_during_decode) media_during_decode();
+        if (media_decode_fails) throw std::runtime_error("injected decode failure");
         return 2;
     }
 };
@@ -273,8 +275,8 @@ void media_messages(const std::function<std::pair<int, std::string>(const std::s
     std::filesystem::remove(text);
 }
 
-// --logits with an image prompt: the dump is staged in a private new file of the destination directory before any
-// input is read and published, only when the run succeeds, by an operation that never replaces. An existing name (an
+// --logits with an image prompt: the dump is a file without a name in the held destination directory, created before
+// any input is read and given the name, only when the run succeeds, by an operation that never replaces. An existing name (an
 // input under any name, a link, one that appears during the run) fails the run and keeps its bytes.
 void media_output_guards(const SerialGenerationFamily& with_media) {
     namespace fs = std::filesystem;
@@ -311,8 +313,10 @@ void media_output_guards(const SerialGenerationFamily& with_media) {
     // a dangling one). There is no option that replaces an existing file.
     auto [code, error] = run_with(sidecar);
     check(code != 0 && error.find("logits output exists") != std::string::npos, "existing output refused");
-    std::tie(code, error) = run_with(sidecar, {"--logits-overwrite"});
-    check(code != 0, "there is no --logits-overwrite");
+    std::tie(code, error) = run_with(dir / "option.f32", {"--logits-overwrite"});
+    check(code != 0 && error.find("unknown option --logits-overwrite") != std::string::npos &&
+              !fs::exists(dir / "option.f32"),
+          "there is no --logits-overwrite (unknown option on a fresh output, nothing written)");
     std::error_code link_error;
     fs::create_hard_link(sidecar, dir / "alias.json", link_error);
     if (!link_error) {
@@ -340,11 +344,22 @@ void media_output_guards(const SerialGenerationFamily& with_media) {
     check(code != 0 && error.find("not the shard") != std::string::npos && media_verifies == verifies + 1U &&
           !fs::exists(dir / "other.f32"), "a different checkpoint is refused and leaves no output");
     media_same_checkpoint = true;
-    // A decode failure after the logits were written publishes nothing.
+    // While decode runs the dump is written but has no name; a decode failure then publishes nothing.
+    bool visible_during_decode = true;
+    media_during_decode = [&] { visible_during_decode = fs::exists(dir / "late.f32"); };
     media_decode_fails = true;
     std::tie(code, error) = run_with(dir / "late.f32", {"--generate", "2"});
-    check(code != 0 && !fs::exists(dir / "late.f32"), "a run failing after the logits were written leaves no output");
+    check(code != 0 && error.find("injected decode failure") != std::string::npos && !visible_during_decode &&
+              !fs::exists(dir / "late.f32"),
+          "the final name is absent while decode runs, and a failing decode leaves no output");
     media_decode_fails = false;
+    media_during_decode = nullptr;
+#ifndef _WIN32
+    // The destination name may be as long as the file system allows (255 bytes): no staging name is derived from it.
+    const auto longest = dir / (std::string(251, 'n') + ".f32");
+    std::tie(code, error) = run_with(longest);
+    check(code == 0 && fs::file_size(longest) == 16U, "a 255-byte destination name is published");
+#endif
     // The name appears during the run (a file, or a link to the validated sidecar): publication never replaces it, the
     // run fails and what appeared keeps its bytes.
     const auto raced = dir / "raced.f32";
@@ -360,7 +375,7 @@ void media_output_guards(const SerialGenerationFamily& with_media) {
               "a link to the sidecar that appears during the run is not replaced, the sidecar keeps its bytes");
     media_after_read = nullptr;
     for (const auto& entry : fs::directory_iterator(dir))
-        check(entry.path().filename().string().find(".partial-") == std::string::npos, "no staged dump is left");
+        check(entry.path().filename().string().find(".strix-logits-") == std::string::npos, "no staged dump is left");
     media_inputs.clear();
     fs::remove_all(dir);
 }

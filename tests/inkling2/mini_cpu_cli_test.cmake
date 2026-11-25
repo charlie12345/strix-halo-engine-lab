@@ -20,7 +20,7 @@ execute_process(COMMAND "${DECODER}" "${checkpoint}" 1 --logits "${output}"
 if(NOT code EQUAL 1 OR error MATCHES "filesystem error|logits output must differ" OR EXISTS "${output}")
     message(FATAL_ERROR "fresh logits path prevented checkpoint validation: ${error}")
 endif()
-file(GLOB staged "${directory}/.*partial*")
+file(GLOB staged "${directory}/.strix-logits-*")
 if(staged)
     message(FATAL_ERROR "a failed run left a staged logits dump: ${staged}")
 endif()

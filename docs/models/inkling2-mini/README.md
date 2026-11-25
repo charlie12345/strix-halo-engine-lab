@@ -64,9 +64,10 @@ Chat files may carry images as base64 `image_url` parts; see
 [Inkling 2 Mini image input](../../engine/vision-adapters.md#inkling-2-mini).
 
 Generation defaults to greedy selection and can emit one FP32 prompt logits row
-with `--logits FILE`. The file is created new and appears only when the run succeeds (a failed run leaves none);
-an existing file is never replaced: a name that exists at the start, or that appears during the run, fails the run
-and keeps its bytes. Repeating the example below needs a new name (or removing the previous file). CPU and device generation accept `--temperature`,
+with `--logits FILE`. The file appears only when the run succeeds (a failed run leaves none) and an existing file
+is never replaced: a name that exists at the start, or that appears during the run, fails the run and keeps its
+bytes. On Linux the output directory must be on a file system that supports `O_TMPFILE` (the dump has no name
+until the run succeeds). Repeating the example below needs a new name (or removing the previous file). CPU and device generation accept `--temperature`,
 `--top-k` and `--seed` through the shared sampler.
 
 ```sh

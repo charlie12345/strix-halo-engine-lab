@@ -23,7 +23,9 @@
 #include <numeric>
 #include <optional>
 #include <ostream>
+#include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <cerrno>
@@ -31,6 +33,13 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <io.h>
 #include <process.h>
 #include <share.h>
@@ -92,44 +101,76 @@ Number parse_number(std::string_view value, const char* error) {
     return result;
 }
 
-// The --logits file. The dump is staged under a private name created exclusively in the destination directory (held
-// open on POSIX: every operation on the two names is relative to it) before any input is read, and it is published
-// only when the run succeeds, by an operation that never replaces: a hard link of the staged file under the name (or a
-// no-replace rename where the file system has no hard links; on Windows a rename, which never replaces), after which
-// the staged name is removed. A name that exists (a file, a link, even a dangling one) is refused at the start and,
-// if it appeared during the run, at publication. A run that fails, or whose name was taken meanwhile, removes the
-// staged file and leaves the name as it was. No existing file is ever truncated or written, so no input can be lost
-// through the output; inputs are still compared by the key of their opened handle with the staged file.
+// The --logits file. The dump has no name until the run succeeds: on Linux it is an unnamed file (O_TMPFILE) of the
+// destination directory, which is held open from the start; on Windows a file under a bounded random name of that
+// directory, created exclusively, delete-on-close and not shareable for deletion or writing, whose handle stays open.
+// It is written (and flushed) through its descriptor only, and published on success by an operation that never
+// replaces: linkat of the descriptor under the name relative to the held directory (EEXIST when the name exists), or
+// a by-handle rename with ReplaceIfExists = FALSE relative to the held directory handle followed by clearing the
+// delete-on-close disposition. No name is resolved again after creation. A name that exists (a file, a link, even a
+// dangling one) is refused at the start and, if it appeared during the run, at publication, and is left untouched. A
+// run that fails publishes nothing and leaves nothing behind (closing the descriptor discards the dump). Linux needs a
+// file system with O_TMPFILE support in the destination directory; otherwise --logits is refused (no named fallback).
 class LogitsOutput {
 public:
     explicit LogitsOutput(const fs::path& path)
         : path_(path), directory_(path.has_parent_path() ? path.parent_path() : fs::path(".")) {
         const auto name = path.filename();
         if (name.empty() || name == "." || name == "..") throw std::invalid_argument("logits output must name a file");
-#ifndef _WIN32
-        dir_ = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (dir_ < 0) throw std::invalid_argument("could not open the logits output directory");
-#endif
+#ifdef _WIN32
+        dir_ = CreateFileW(directory_.c_str(), FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_TRAVERSE | SYNCHRONIZE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                           nullptr);
+        if (dir_ == INVALID_HANDLE_VALUE) throw std::invalid_argument("could not open the logits output directory");
         if (name_taken()) {
             discard();
             throw std::invalid_argument("logits output exists (an existing file is never replaced)");
         }
+        std::random_device random;
         for (unsigned attempt = 0; fd_ < 0; ++attempt) {
-            staged_ = "." + name.string() + ".partial-" + std::to_string(process_id()) + "-" + std::to_string(attempt);
-#ifdef _WIN32
-            const int flags = _O_WRONLY | _O_BINARY | _O_NOINHERIT | _O_CREAT | _O_EXCL;
-            const int code = _wsopen_s(&fd_, staged_path().c_str(), flags, _SH_DENYNO, _S_IREAD | _S_IWRITE);
-            if (code != 0) fd_ = -1;
-            const bool clash = code == EEXIST;
+            std::wstring staged = L".strix-logits-";
+            for (int part = 0; part < 4; ++part) {
+                wchar_t hex[9]{};
+                (void)swprintf(hex, 9, L"%08x", unsigned(random()));
+                staged += hex;
+            }
+            staged += L".tmp";
+            const HANDLE file = CreateFileW((directory_ / staged).c_str(), GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                                            FILE_SHARE_READ, nullptr, CREATE_NEW,
+                                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+            if (file == INVALID_HANDLE_VALUE) {
+                if (GetLastError() == ERROR_FILE_EXISTS && attempt < 15U) continue;
+                discard();
+                throw std::invalid_argument("could not create the logits output");
+            }
+            fd_ = _open_osfhandle(reinterpret_cast<intptr_t>(file), _O_WRONLY | _O_BINARY);
+            if (fd_ < 0) {
+                CloseHandle(file);  // delete-on-close: nothing is left
+                discard();
+                throw std::runtime_error("could not create the logits output");
+            }
+        }
 #else
-            fd_ = ::openat(dir_, staged_.c_str(), O_WRONLY | O_CLOEXEC | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
-            const bool clash = fd_ < 0 && errno == EEXIST;
-#endif
-            if (fd_ >= 0) break;
-            if (clash && attempt < 15U) continue;
+        dir_ = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_ < 0) throw std::invalid_argument("could not open the logits output directory");
+        if (name_taken()) {
             discard();
+            throw std::invalid_argument("logits output exists (an existing file is never replaced)");
+        }
+#ifdef O_TMPFILE
+        fd_ = ::openat(dir_, ".", O_TMPFILE | O_WRONLY | O_CLOEXEC, 0600);
+        const int error = errno;
+#else
+        const int error = EOPNOTSUPP;
+#endif
+        if (fd_ < 0) {
+            discard();
+            if (error == EOPNOTSUPP || error == EISDIR || error == ENOENT || error == EINVAL)
+                throw std::invalid_argument("--logits needs a file system that supports unnamed files (O_TMPFILE) in "
+                                            "the output directory; this one does not");
             throw std::invalid_argument("could not create the logits output");
         }
+#endif
         key_ = descriptor_file_key(fd_);
         if (!key_) {
             discard();
@@ -144,7 +185,7 @@ public:
         if (input && input == key_) throw std::invalid_argument(error);
     }
     void refuse(const fs::path& input, const char* error) const { refuse(file_key(input), error); }
-    void write(std::span<const float> logits) {  // into the staged file only; visible under the name after publish()
+    void write(std::span<const float> logits) {  // through the descriptor only; visible under the name after publish()
         const auto bytes = session::logits_bytes(logits);
         bool ok = fd_ >= 0;
         for (std::size_t at = 0; ok && at < bytes.size();) {
@@ -156,43 +197,46 @@ public:
             ok = n > 0;
             at += ok ? std::size_t(n) : 0U;
         }
-        ok = close() && ok;
+#ifdef _WIN32
+        ok = ok && _commit(fd_) == 0;
+#else
+        ok = ok && ::fsync(fd_) == 0;
+#endif
         if (!ok) throw std::runtime_error("could not write logits output");
         written_ = true;
     }
     void publish() {  // the success boundary of the run: never replaces a name that exists
         if (!written_) return;
+        bool taken = false, published = false;
 #ifdef _WIN32
-        const bool moved = _wrename(staged_path().c_str(), path_.c_str()) == 0;  // fails when the name exists
+        const HANDLE file = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
+        const std::wstring name = path_.filename().wstring();
+        std::vector<unsigned char> buffer(sizeof(FILE_RENAME_INFO) + name.size() * sizeof(wchar_t));
+        auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+        rename->ReplaceIfExists = FALSE;
+        rename->RootDirectory = dir_;
+        rename->FileNameLength = DWORD(name.size() * sizeof(wchar_t));
+        std::copy(name.begin(), name.end(), rename->FileName);
+        if (SetFileInformationByHandle(file, FileRenameInfo, rename, DWORD(buffer.size()))) {
+            FILE_DISPOSITION_INFO_EX keep{};
+            keep.Flags = FILE_DISPOSITION_FLAG_ON_CLOSE;  // without FILE_DISPOSITION_FLAG_DELETE: clears delete-on-close
+            published = SetFileInformationByHandle(file, FileDispositionInfoEx, &keep, sizeof(keep)) != 0;
+        } else {
+            const auto error = GetLastError();
+            taken = error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS;
+        }
 #else
-        const auto name = path_.filename();
-        const bool linked = ::linkat(dir_, staged_.c_str(), dir_, name.c_str(), 0) == 0;
-        bool moved = linked;
-#if defined(RENAME_NOREPLACE)
-        if (!linked && errno != EEXIST)  // no hard links on this file system
-            moved = ::renameat2(dir_, staged_.c_str(), dir_, name.c_str(), RENAME_NOREPLACE) == 0;
+        const auto self = "/proc/self/fd/" + std::to_string(fd_);
+        published = ::linkat(AT_FDCWD, self.c_str(), dir_, path_.filename().c_str(), AT_SYMLINK_FOLLOW) == 0;
+        taken = !published && errno == EEXIST;
 #endif
-        if (linked) (void)::unlinkat(dir_, staged_.c_str(), 0);
-#endif
-        if (!moved) {
-            const bool taken = errno == EEXIST || name_taken();
-            discard();
+        discard();  // closes the descriptor (an unpublished dump goes with it) and the directory
+        if (!published)
             throw std::runtime_error(taken ? "logits output exists (it appeared during the run and is never replaced)"
                                            : "could not publish logits output");
-        }
-        published_ = true;
-        discard();  // closes the directory; the published file stays
     }
 
 private:
-    static long long process_id() {
-#ifdef _WIN32
-        return static_cast<long long>(_getpid());
-#else
-        return static_cast<long long>(::getpid());
-#endif
-    }
-    fs::path staged_path() const { return directory_ / staged_; }
     bool name_taken() const {  // anything under the name, a dangling link included
 #ifdef _WIN32
         std::error_code ignored;
@@ -202,38 +246,26 @@ private:
         return ::fstatat(dir_, path_.filename().c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT;
 #endif
     }
-    bool close() {
-        if (fd_ < 0) return true;
+    void discard() {
 #ifdef _WIN32
-        const bool ok = _close(fd_) == 0;
+        if (fd_ >= 0) (void)_close(fd_);
+        if (dir_ != INVALID_HANDLE_VALUE) CloseHandle(dir_);
+        dir_ = INVALID_HANDLE_VALUE;
 #else
-        const bool ok = ::close(fd_) == 0;
-#endif
-        fd_ = -1;
-        return ok;
-    }
-    void discard() {  // removes the staged file unless published (only while it is still the file this run created)
-        close();
-        if (!published_ && key_ && !staged_.empty()) {
-#ifdef _WIN32
-            std::error_code ignored;
-            if (file_key(staged_path()) == key_) fs::remove(staged_path(), ignored);
-#else
-            struct stat info {};
-            if (::fstatat(dir_, staged_.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0 &&
-                FileKey{std::uint64_t(info.st_dev), std::uint64_t(info.st_ino)} == key_)
-                (void)::unlinkat(dir_, staged_.c_str(), 0);
-#endif
-        }
-#ifndef _WIN32
-        if (dir_ >= 0) ::close(dir_);
+        if (fd_ >= 0) (void)::close(fd_);
+        if (dir_ >= 0) (void)::close(dir_);
         dir_ = -1;
 #endif
+        fd_ = -1;
     }
     fs::path path_, directory_;
-    std::string staged_;
-    bool written_ = false, published_ = false;
-    int fd_ = -1, dir_ = -1;
+    bool written_ = false;
+    int fd_ = -1;
+#ifdef _WIN32
+    HANDLE dir_ = INVALID_HANDLE_VALUE;
+#else
+    int dir_ = -1;
+#endif
     std::optional<FileKey> key_;
 };
 

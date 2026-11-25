@@ -23,6 +23,16 @@ using MiniReadControllerBits = std::function<void(std::span<const std::uint16_t>
 [[nodiscard]] MiniControllerCertificate read_mini_controller_certificate(const weight::ResidentSlices& slices,
                                                                          const MiniReadControllerBits& read);
 
+// The staged BF16 tensor of a text tensor (name without the text prefix), and the copy of a slice of it into host
+// scratch (a device copy on CUDA).
+using MiniStagedLookup = std::function<std::span<const std::uint16_t>(std::string_view name)>;
+using MiniStagedRead = std::function<void(std::span<const std::uint16_t> staged, std::span<std::uint16_t> host)>;
+
+// The attention certificate over staged tensors: the shared scan (core/weight_certificate.hpp) over every attention
+// projection and layer norm gain the schema lists; empty (refusing) when the scan has no scratch.
+[[nodiscard]] MiniAttentionCertificate certify_mini_attention(core::Bf16StagedScan& scan, const MiniStagedLookup& staged,
+                                                              const MiniStagedRead& read);
+
 class MiniResidentWeightPlan {
 public:
     static constexpr std::size_t kAlignment = 256U;
@@ -78,10 +88,10 @@ public:
     [[nodiscard]] std::span<const MiniMoeExpert> experts(unsigned physical) const;
     [[nodiscard]] bool compact() const { return head_.has_value(); }
     // Certifies the attention operand class from the attention tensors this object holds (BF16 storage only; compact
-    // storage keeps the empty, refusing certificate): `read` copies a staged BF16 tensor to host memory (a device copy
-    // on CUDA). The certificate is a function of these bytes only.
-    void certify_attention(const std::function<void(std::span<const std::uint16_t> staged,
-                                                    std::span<std::uint16_t> host)>& read);
+    // storage keeps the empty, refusing certificate), through the shared bounded scan (core::Bf16StagedScan): `read`
+    // copies a slice of a staged BF16 tensor into the scan's scratch (a device copy on CUDA; its exceptions
+    // propagate). Without scratch the certificate stays empty. The certificate is a function of these bytes only.
+    void certify_attention(core::Bf16StagedScan& scan, const MiniStagedRead& read);
     [[nodiscard]] const MiniAttentionCertificate& attention_certificate() const { return attention_certificate_; }
     // True when the expert bank is the narrow image: every physical layer is NVFP4 (expert_format) and the MXFP8
     // layers are bound by attach_narrow, never from the resident slices.

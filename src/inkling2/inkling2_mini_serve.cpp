@@ -1,5 +1,6 @@
 #include "inkling2_mini_serve.hpp"
 #include "inkling2_mini_config.hpp"
+#include "inkling2_mini_schedule.hpp"
 
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
@@ -8,6 +9,7 @@
 #include <charconv>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <ostream>
 #include <string_view>
 
@@ -31,6 +33,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     ResolvedService resolved;
     auto& out = resolved.options;
     const auto& args = selection.arguments;
+    std::optional<unsigned> explicit_rows;  // --prefill-rows
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view name = args[i];
         if (name == "--dspark") throw std::invalid_argument("Inkling serving does not support --dspark");
@@ -50,7 +53,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         else if (name == "--device-id") out.device_id = value;
         else if (name == "--device-profile") out.device_profile = value;
         else if (name == "--context") out.context = static_cast<unsigned>(number(name, value, kMaxContext));
-        else if (name == "--prefill-rows") out.prefill_rows = static_cast<unsigned>(number(name, value, 65535U));
+        else if (name == "--prefill-rows") explicit_rows = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--slots") out.slots = static_cast<unsigned>(number(name, value, 65535U));
         else if (name == "--kv-bytes") out.kv_bytes = number(name, value, UINT64_MAX);
         else if (name == "--speculation") {
@@ -62,26 +65,44 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
+    out.served_route_requested = mini_served_cli_route(resolution);
     out.attn_projected_bias = mini_attn_projected_bias(resolution);
     out.controller_one_plane = mini_controller_one_plane(resolution);
     if (out.checkpoint.empty()) throw std::invalid_argument("Inkling requires --checkpoint FILE");
     if (out.tokenizer.empty())
         out.tokenizer = (std::filesystem::path(out.checkpoint).parent_path() / "tokenizer.json").string();
     if (out.context < 3U) throw std::invalid_argument("Inkling context must hold a prompt and a reply");
-    out.prefill_rows = std::min(out.prefill_rows, out.context);
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
+    // Backend admission of the served route lever (kMiniServedCliRoute): HIP runs the command line's route, a CUDA
+    // server declines it (requested stays in the receipt, mini_served_route_startup_field).
+    out.served_cli_route = mini_served_prefill_emits_first(resolved.backend == "hip", out.served_route_requested);
+    // The prompt chunk: --prefill-rows, else the route's (the incumbent 128-row held-back chunks without the lever,
+    // the command line's chunk and tail rule with it), clamped to the context. Lanes: mini_serve_lane_rows.
+    const auto schedule = mini_served_prefill_schedule_from_env(true, out.served_cli_route, out.tier);
+    out.prefill_rows = std::min(explicit_rows.value_or(schedule.chunk), out.context);
+    if (out.served_cli_route) {
+        if (out.prefill_rows == 0U) throw std::invalid_argument("--prefill-rows must be positive");
+        // An explicit chunk without --slots also caps the lanes (the clamped chunk), as on the incumbent route.
+        if (explicit_rows) out.lane_rows = out.prefill_rows;
+        out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
+    }
     return resolved;
 }
 
-serve::CohortConfig scheduling(const MiniServeOptions& opt) {
+serve::CohortConfig scheduling(const MiniServeOptions& opt, const serve::CohortBackend& backend) {
     serve::CohortConfig config;
     config.context_draft = false;
     config.max_draft = 0;
+    // A prompt runs as the command line's calls (whole chunks, the final one with its tail); beside a decoding lane
+    // the cohort cuts pieces of kMiniServeDecodingRows inside those chunks where the decoder's piece rule allows (HIP),
+    // so the bits never depend on other lanes (the backend's prompt_piece_rule; CUDA: none, whole chunks).
     config.prompt_slice = opt.prefill_rows;
+    config.prompt_slice_decoding = opt.served_cli_route && backend.prompt_piece_rule().cuttable() &&
+                                   opt.prefill_rows > kMiniServeDecodingRows ? kMiniServeDecodingRows : 0U;
     return config;
 }
 
@@ -91,14 +112,14 @@ public:
                 const MiniServeTokenizer& tokenizer, MiniChat chat)
         : tokenizer_(tokenizer(opt.tokenizer)), device_(backend(opt)),
           queue_(std::max(64U, device_.backend->lanes())),
-          cohort_(queue_, *device_.backend, scheduling(opt), [](const serve::GenerationJob& job) {
+          cohort_(queue_, *device_.backend, scheduling(opt, *device_.backend), [](const serve::GenerationJob& job) {
               if (job.copy_rows) throw std::invalid_argument("Inkling serving does not support copy_rows");
               if (job.window_rows) throw std::invalid_argument("Inkling serving does not support window_rows");
               if (job.prompt.size() < 2 ||
                   std::ranges::any_of(job.prompt, [](auto id) { return id >= kVocabulary; }))
                   throw std::invalid_argument("invalid Inkling prompt");
           }),
-          api_(api_config(model, opt.tier, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
+          api_(api_config(model, opt, std::move(chat)), tokenizer_, queue_, device_.backend->max_positions(),
                device_.backend->supports_final_logits()) {}
 
     serve::SessionRuntime& runtime() override { return cohort_.runtime(); }
@@ -113,13 +134,22 @@ public:
     }
 
 private:
-    serve::ApiConfig api_config(const std::string& model, profile::Name tier, MiniChat chat) {
+    serve::ApiConfig api_config(const std::string& model, const MiniServeOptions& opt, MiniChat chat) {
         serve::ApiConfig config;
         cohort_.configure_api(config);
-        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier,
+        config.capabilities_extra = [cohort = std::move(config.capabilities_extra), tier = opt.tier,
+                                     requested = opt.served_route_requested, admitted = opt.served_cli_route,
                                      weights = device_.weights](serve::Json& value) {
             cohort(value);
             value.set("profile", serve::Json(mini_profile_name(tier)));
+            // The served route lever, only when requested (absent: the incumbent route, as before the lever): what was
+            // requested, what this backend admitted, and the qualification of the admitted route.
+            if (requested)
+                value.set("served_route", serve::Json(serve::Json::Object{
+                    {"requested", serve::Json(true)},
+                    {"admitted", serve::Json(admitted)},
+                    {"qualification", serve::Json(admitted ? "unqualified" : "n/a")},
+                }));
             value.set("weight_load", serve::Json(serve::Json::Object{
                 {"storage", serve::Json(weights.storage.name)},
                 {"revision", serve::Json(static_cast<std::uint64_t>(weights.storage.revision))},
@@ -191,6 +221,7 @@ void install_mini_service(serve::ServiceFactories& factories, MiniServeBackends 
             const auto resolved = resolve(selection, backends);
             const auto& opt = resolved.options;
             out << "backend " << resolved.backend << " context " << opt.context << " prefill_rows " << opt.prefill_rows
+                << " served_route " << mini_served_route_startup_field(opt)
                 << " slot_cap " << opt.slots << " kv_budget_bytes " << opt.kv_bytes
                 << " profile " << mini_profile_name(opt.tier) << " speculation off";
             const auto backend = resolved.backend == "hip" ? weight::Backend::hip : weight::Backend::cuda;

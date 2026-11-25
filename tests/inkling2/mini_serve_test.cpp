@@ -1,7 +1,9 @@
 #include "inkling2/inkling2_mini_resident_route.hpp"
+#include "inkling2/inkling2_mini_schedule.hpp"
 #include "inkling2/inkling2_mini_serve.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
 #include "inkling2_mini_cli.hpp"
+#include "strix/model_data/inkling2_mini.hpp"
 #include "strix/serve/fixed_kv_cohort.hpp"
 #include "strix/serve/http_client.hpp"
 #include "strix/serve/replica_router.hpp"
@@ -309,6 +311,16 @@ void set_round_fold_env(const char* value) {
 #endif
 }
 
+// The served route lever value (process environment, as strix-serve reads it); nullptr clears it.
+void set_cli_route_env(const char* value) {
+#ifdef _WIN32
+    require(_putenv_s("STRIX_INK_SERVED_CLI_ROUTE", value ? value : "") == 0, "cannot set STRIX_INK_SERVED_CLI_ROUTE");
+#else
+    require((value ? setenv("STRIX_INK_SERVED_CLI_ROUTE", value, 1) : unsetenv("STRIX_INK_SERVED_CLI_ROUTE")) == 0,
+            "cannot set STRIX_INK_SERVED_CLI_ROUTE");
+#endif
+}
+
 // The served down-image lever value (process environment, as strix-serve reads it); nullptr clears it.
 void set_image_env(const char* value) {
 #ifdef _WIN32
@@ -318,6 +330,13 @@ void set_image_env(const char* value) {
             "cannot set STRIX_INK_COMBINE_IMAGE");
 #endif
 }
+
+// Shape of one served start: --prefill-rows / --context / --slots as given (nullopt: omitted).
+struct ServedShape {
+    std::optional<unsigned> prefill_rows;
+    std::optional<unsigned> context;
+    std::optional<unsigned> slots;
+};
 
 void set_expert_env(const char* value) {
 #ifdef _WIN32
@@ -424,9 +443,18 @@ void profile_parity() {
     std::cout << "inkling2-mini-profile-parity: ok\n";
 }
 
+// The native column the registry preset forwards for a served --profile (models/inkling2-mini.toml [presets.*]).
+strix::profile::Name served_native_tier(std::string_view tier_name) {
+    namespace presets = strix::model_data::inkling2_mini::presets;
+    return strix::profile::parse(tier_name == "exact" ? presets::exact::levers
+                                 : tier_name == "fast" ? presets::fast::levers
+                                                       : presets::turbo::levers);
+}
+
 void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_capable = false,
-            W4a4 w4a4 = W4a4::bf16, bool image = false, bool round_fold = false,
-            bool controller_one_plane = false, bool projected_bias = false, const char* tier_name = "fast") {
+            W4a4 w4a4 = W4a4::bf16, std::string_view tier_name = "fast", bool image = false, bool round_fold = false,
+            bool cli_route = false, ServedShape shape = {}, bool controller_one_plane = false,
+            bool projected_bias = false) {
     sv::ServiceFactories factories;
     bool created = false;
     const auto create = [&](const mini::MiniServeOptions& options) {
@@ -456,11 +484,58 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.controller_one_plane == controller_one_plane, "controller plane value did not reach native adapter");
-        // The served Inkling resolution maps the turbo word to its fast column (the profile resolver's decision).
-        const auto want = std::string_view(tier_name) == "exact" ? strix::profile::Name::standard
-                                                                 : strix::profile::Name::fast;
-        require(options.tier == want && options.weight_options.qualify_q8 == qualify_q8,
-                "profile request did not reach native adapter");
+        // The served route lever (opt-in in every profile column): a HIP server runs the command line's route only when
+        // STRIX_INK_SERVED_CLI_ROUTE=1 selects it; a CUDA server declines it and keeps the requested bit in its receipt.
+        const bool hip_backend = std::string_view(backend) == "hip";
+        const bool route = cli_route && hip_backend;
+        require(options.served_route_requested == cli_route && options.served_cli_route == route,
+                "served route lever: opt-in, HIP only");
+        const auto field = mini::mini_served_route_startup_field(options);
+        // Without a decoder the tail is the offered capacity; the startup line prints what the decoder admitted.
+        require(!route || (field.find(" prefill_tail_offered " + std::to_string(options.prefill_tail) + ' ') != std::string::npos &&
+                           mini::mini_served_route_startup_field(options, 0U).find(" prefill_tail 0 ") != std::string::npos),
+                "served route receipt: offered tail without a decoder, the decoder's admitted tail at startup");
+        require(route ? field.starts_with("on qualification unqualified moe_decode packed ")
+                      : field == (cli_route ? "declined" : "off"),
+                "served route receipt: off, declined or on with its qualification");
+        const unsigned context = shape.context.value_or(8192U);
+        require(options.context == context && options.slots == shape.slots.value_or(0U), "served shape options");
+        if (!route) {
+            // Without the lever the served shape is the incumbent one, written out here from the rule the server had
+            // before the lever existed: a 128-row chunk unless --prefill-rows, clamped to the context; lanes = --slots,
+            // else that clamped chunk; no tail; held-back prompt token; grouped decode.
+            const unsigned chunk = std::min(shape.prefill_rows.value_or(128U), context);
+            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : chunk;
+            require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
+                        options.prefill_tail == 0U && options.lane_rows == 0U,
+                    "lever off: the served chunk, lane cap and tail are the incumbent ones");
+        } else {
+            // With the lever: the command line's chunk and tail rule, emits-first; lanes = --slots, else an explicit
+            // (clamped) --prefill-rows, else the served lane cap.
+            const auto cli = mini::mini_prefill_schedule_from_env(true, options.tier);
+            const unsigned chunk = std::min(shape.prefill_rows.value_or(cli.chunk), context);
+            const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots
+                                   : shape.prefill_rows                ? chunk
+                                                                       : mini::kMiniServeLaneRows;
+            require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
+                        options.prefill_tail == mini::mini_prefill_tail_capacity(chunk, cli.tail_divisor, context) &&
+                        mini::mini_prefill_piece_rule(true).cuttable(),
+                    "lever on: the command line's schedule and the served lane cap");
+        }
+        // The served tier is the registry preset's native column for the requested --profile (models/inkling2-mini.toml:
+        // TURBO keeps the FAST column until this model has a qualified TURBO set), resolved by the native command line's
+        // resolver with the same lever classes.
+        const auto native = served_native_tier(tier_name);
+        mini::MiniWeightOptions cli_weights;
+        cli_weights.tier.profile = native;
+        cli_weights.qualify_q8 = qualify_q8;
+        const auto cli_tier = mini::resolve_mini_profile(cli_weights, true);
+        require(options.tier == native && options.tier == cli_tier.profile &&
+                    options.moe_w4a4 == mini::mini_moe_w4a4_class(cli_tier) &&
+                    options.combine_image == mini::mini_combine_image(cli_tier) &&
+                    options.prepared_round_fold == mini::mini_prepared_round_fold(cli_tier) &&
+                    options.weight_options.qualify_q8 == qualify_q8,
+                "served profile differs from the native command line's resolution of the same --profile");
         // The projected-bias attention lever resolves in the one shared resolver the CLI also reads.
         require(options.attn_projected_bias == projected_bias, "projected-bias lever did not reach native adapter");
         const auto kind = std::string_view(backend) == "hip" ? strix::weight::Backend::hip : strix::weight::Backend::cuda;
@@ -483,11 +558,16 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             require(effort.as_string() == "none", "wrong chat effort");
             return "a" + messages.as_array().back().find("content")->as_string();
         });
-    const char* args[]{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
-                       "--checkpoint", "MODEL.safetensors", "--backend", backend,
-                       "--profile", tier_name, "--speculation", "off"};
-    std::vector<std::string> strings(std::begin(args), std::end(args));
+    std::vector<std::string> strings{"strix-serve", "--model", "inkling2-mini", "--registry-root", root,
+                                     "--checkpoint", "MODEL.safetensors", "--backend", backend,
+                                     "--profile", std::string(tier_name), "--speculation", "off"};
     if (qualify_q8) strings.emplace_back("--qualify-q8");
+    for (const auto& [flag, value] : {std::pair{"--prefill-rows", shape.prefill_rows}, std::pair{"--context", shape.context},
+                                      std::pair{"--slots", shape.slots}}) {
+        if (!value) continue;
+        strings.emplace_back(flag);
+        strings.emplace_back(std::to_string(*value));
+    }
     if (controller_one_plane) strings.insert(strings.end(), {"--controller-planes", "1"});
     const auto run = [&](sv::ServeShell shell, std::ostream& out, std::ostream& error) {
         std::vector<char*> argv;
@@ -503,8 +583,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         require(!created, "Inkling profile inspection should run without device work");
         const auto expected = qualify_q8 ? "weight_storage gguf.q8_0@1 weight_status unqualified" :
                                            "weight_storage plain.bf16@1 weight_status pending";
-        // The FAST weight plan is what this check pins; the exact and turbo columns resolve their own plan.
-        if (std::string_view(tier_name) != "fast") return;
+        // The weight plan line is the FAST plan; the other tiers run the same wiring with their own plan.
+        if (tier_name != "fast") return;
         require(out.str().find(expected) != std::string::npos, "inspection weight plan differs from CLI plan");
         // The route line names the committed rows per regime (why the image stays BF16 on this backend).
         const bool hip = std::string_view(backend) == "hip";
@@ -534,14 +614,23 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
     }
-    // The block-candidate switch through the production start-up parser: an explicit OFF starts, every other value is
-    // refused before native load with the same reason as the CLI (EXACT refuses sampled verification by its profile).
-    const bool exact = std::string_view(tier_name) == "exact";
+    // The server takes no decode form flag: a served form is selected only through the served route lever's row.
+    for (const auto* flag : {"--packed-decode", "--grouped-decode"}) {
+        std::ostringstream out, error;
+        strings.emplace_back(flag);
+        require(run({}, out, error) == 2 && !created &&
+                    error.str().find(std::string("unknown Inkling argument ") + flag) != std::string::npos,
+                "a decode form flag reached the server outside the shared lever row");
+        strings.pop_back();
+    }
+    // The block-candidate switch through the production start-up parser (the tier under test; EXACT refuses sampled
+    // verification with its own reason, as in mini_block_drafter_test): an explicit OFF starts,
+    // every other value is refused before native load with the same reason as the CLI.
     for (const auto& [value, reason] : std::initializer_list<std::pair<const char*, const char*>>{
              {"off", ""},
              {"dflash2:8:greedy", "native forward and verify identity are not bound"},
-             {"dflash2:8:sampled", exact ? "EXACT permits only greedy-identical verification"
-                                          : "sampled rejection hook unqualified and unbound"},
+             {"dflash2:8:sampled", tier_name == "exact" ? "EXACT permits only greedy-identical verification"
+                                                        : "sampled rejection hook unqualified and unbound"},
              {"dflash2:7:greedy", "requires block 8"}}) {
         std::ostringstream out, error;
         strings.emplace_back("--block-drafter");
@@ -577,7 +666,8 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 "two-device Inkling inspection did not report the replica placement");
     }
     sv::ServeShell shell;
-    shell.serve = [qualify_q8, sample_capable, fast = std::string_view(tier_name) == "fast"](const sv::HttpServerConfig&, sv::HttpHandler handle, sv::SessionRuntime& owner) {
+    shell.serve = [qualify_q8, sample_capable, tier_name, cli_route, backend](const sv::HttpServerConfig&, sv::HttpHandler handle,
+                                                                          sv::SessionRuntime& owner) {
         std::exception_ptr failure;
         std::thread control([&] { try { owner.run(); } catch (...) { failure = std::current_exception(); } });
         try {
@@ -595,12 +685,19 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const auto effective = sv::parse_json(capabilities.body);
             const auto* profile = effective.find("profile");
             const auto* weights = effective.find("weight_load");
-            // The FAST column's plan is pinned here; the exact and turbo columns resolve their own weight plan.
-            require(capabilities.status == 200 && profile && weights &&
-                    (!fast || (profile->as_string() == "fast" &&
-                               weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
-                               weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
+            require(capabilities.status == 200 && profile && profile->as_string() == mini::mini_profile_name(served_native_tier(tier_name)) && weights &&
+                    (tier_name != "fast" ||  // the FAST plan; the other tiers carry their own weight plan
+                     (weights->find("storage")->as_string() == (qualify_q8 ? "gguf.q8_0" : "plain.bf16") &&
+                      weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
                     "Inkling capability response does not match the loaded plan");
+            // The served route lever: absent without a request (the incumbent capabilities), else requested / admitted
+            // (HIP only) / qualification of the admitted route.
+            const auto* route = effective.find("served_route");
+            const bool admitted = cli_route && std::string_view(backend) == "hip";
+            require((route != nullptr) == cli_route &&
+                        (!route || (route->find("requested")->as_bool() && route->find("admitted")->as_bool() == admitted &&
+                                    route->find("qualification")->as_string() == (admitted ? "unqualified" : "n/a"))),
+                    "Inkling capability response misreports the served route lever");
             const auto* sampling = effective.find("sampling");
             const auto* temperature = sampling ? sampling->find("positive_temperature") : nullptr;
             require(temperature && temperature->as_string() == (sample_capable ? "sample" : "reject"),
@@ -639,7 +736,9 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
     const auto rc = run(shell, out, error);
     if (rc != 0) throw std::runtime_error(error.str());
     require(created, "selected backend was not constructed");
-    if (!qualify_q8 && (std::string_view(backend) == "hip" || sample_capable)) {
+    // The socket startup re-creates the service with its own arguments (default shape).
+    if (!qualify_q8 && !shape.prefill_rows && !shape.context && !shape.slots && tier_name == "fast" &&
+        (std::string_view(backend) == "hip" || sample_capable)) {
         const auto* factory = factories.find("inkling2");
         require(factory != nullptr, "Inkling service factory was not registered");
         socket_startup(*factory, backend, sample_capable);
@@ -683,20 +782,29 @@ int main(int argc, char** argv) try {
     }
     if (argc == 3 && std::string_view(argv[2]) == "--controller-planes-only") {
         wiring(argv[1], "cuda", false);
-        wiring(argv[1], "cuda", false, false, W4a4::bf16, false, false, true);
+        wiring(argv[1], "cuda", false, false, W4a4::bf16, "fast", false, false, false, {}, true);
         return 0;
     }
     require(argc == 2, "expected repository root");
     set_image_env(nullptr);
     set_round_fold_env(nullptr);
+    set_cli_route_env(nullptr);
     admission();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
         wiring(argv[1], backend, false);
         wiring(argv[1], backend, true);
+        // The deployed TURBO preset with the served route switch unset: main's preset column, Q8 qualification included.
+        wiring(argv[1], backend, true, false, W4a4::bf16, "turbo");
+        // Every tier keeps the incumbent served shape without the lever, also for chunks above the context and
+        // explicit slots.
+        for (const auto* tier : {"exact", "fast", "turbo"})
+            for (const ServedShape shape : {ServedShape{}, ServedShape{{}, 15U, {}}, ServedShape{8192U, 15U, {}},
+                                            ServedShape{{}, 15U, 9U}, ServedShape{32U, {}, {}}, ServedShape{32U, {}, 4U}})
+                wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, false, shape);
     }
     wiring(argv[1], "cuda", false, true);
-    wiring(argv[1], "cuda", false, false, W4a4::bf16, false, false, true);
+    wiring(argv[1], "cuda", false, false, W4a4::bf16, "fast", false, false, false, {}, true);
     // Every lever value reaches the served decoder as its own class (mse used to run nearest@1 there).
     for (const auto& [value, expected] : {std::pair{"1", W4a4::nvfp4}, std::pair{"mse", W4a4::nvfp4_mse},
                                           std::pair{"mse-gate-up", W4a4::nvfp4_mse_gate_up},
@@ -715,21 +823,33 @@ int main(int argc, char** argv) try {
     set_image_env(nullptr);
     wiring(argv[1], "hip", false);
     set_round_fold_env("1");
-    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, false, true);
+    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, "fast", false, true);
     set_round_fold_env("0");
     wiring(argv[1], "hip", false);
     set_round_fold_env(nullptr);
     set_image_env("1");
-    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, true);
+    for (const auto* backend : {"hip", "cuda"})
+        wiring(argv[1], backend, false, false, W4a4::bf16, "fast", true);
     set_image_env("0");
     wiring(argv[1], "hip", false);
     set_image_env(nullptr);
+    // The served route lever: off by default in every tier (above); STRIX_INK_SERVED_CLI_ROUTE=1 selects the command
+    // line's route on HIP (CUDA declines it and keeps the incumbent shape) in any tier; an explicit 0 keeps it off.
+    set_cli_route_env("1");
+    for (const auto* backend : {"hip", "cuda"})
+        for (const auto* tier : {"exact", "fast", "turbo"})
+            for (const ServedShape shape : {ServedShape{}, ServedShape{{}, 15U, {}}, ServedShape{8192U, 15U, {}},
+                                            ServedShape{32U, {}, {}}, ServedShape{{}, {}, 9U}})
+                wiring(argv[1], backend, false, false, W4a4::bf16, tier, false, false, true, shape);
+    set_cli_route_env("0");
+    wiring(argv[1], "hip", false);
+    set_cli_route_env(nullptr);
     // The projected-bias lever per tier (opt-in): unset and 0 keep the image route, 1 selects the projected flash;
     // tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.
     for (const auto* tier : {"exact", "fast", "turbo"}) {
         for (const auto& [value, expected] : {std::pair<const char*, bool>{nullptr, false}, {"0", false}, {"1", true}}) {
             set_env("STRIX_INK_ATTN_PROJECTED_BIAS", value);
-            wiring(argv[1], "cuda", false, false, W4a4::bf16, false, false, false, expected, tier);
+            wiring(argv[1], "cuda", false, false, W4a4::bf16, tier, false, false, false, {}, false, expected);
         }
     }
     set_env("STRIX_INK_ATTN_PROJECTED_BIAS", nullptr);

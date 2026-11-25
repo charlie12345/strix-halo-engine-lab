@@ -3,6 +3,8 @@
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 
+#include <string>
+
 namespace strix::inkling2 {
 
 struct MiniWeightOptions {
@@ -95,6 +97,27 @@ inline bool mini_attn_projected_bias(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_ATTN_PROJECTED_BIAS must be 0 or 1");
 }
 
+// Resolved state of the served route lever (true: a HIP server runs the command line's route, kMiniServedCliRoute).
+// 0 or absent = off: the served incumbent route. Read (and validated) by the server only: the command line always runs
+// its own route and reports the lever as not applicable (mini_served_route_cli_line).
+inline bool mini_served_cli_route(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniServedCliRoute);
+    if (entry == nullptr || entry->value == "0") return false;
+    if (entry->value == "1") return true;
+    throw std::invalid_argument("STRIX_INK_SERVED_CLI_ROUTE must be 0 or 1");
+}
+
+// The command line's receipt of the served route lever: the requested value as the resolution holds it (unparsed, so a
+// malformed server setting never aborts the command line) and that it does not apply here.
+inline std::string mini_served_route_cli_line(const profile::Resolution& tier) {
+    const auto* entry = tier.find(kMiniServedCliRoute);
+    const std::string_view requested = entry == nullptr ? std::string_view("0")
+                                       : entry->requested.empty() ? std::string_view(entry->value)
+                                                                  : std::string_view(entry->requested);
+    return "strix-served-route/v1 requested " + std::string(requested) +
+           " effective n/a (strix-serve only; the command line runs its own route)";
+}
+
 inline bool mini_controller_one_plane(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniControllerPlanes);
     if (entry == nullptr || entry->value == "3") return false;
@@ -150,6 +173,20 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_controller_one_plane(tier));
     spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
+}
+
+// The command line's resolution never runs the served route lever (its own route is the command line's): an explicit
+// request stays visible as `requested` with the reason, and its effective value is the builtin, so the native summary,
+// qualification and fingerprint carry no server-only setting (mini_served_route_cli_line prints the request).
+inline void mini_cli_decline_served_route(profile::Resolution& tier) {
+    for (auto& entry : tier.entries) {
+        if (entry.lever == nullptr || entry.lever->name != kMiniServedCliRoute) continue;
+        if (entry.value == entry.lever->builtin && entry.requested.empty()) continue;
+        if (entry.requested.empty()) entry.requested = entry.value;
+        entry.value = std::string(entry.lever->builtin);
+        entry.status = profile::Status::off;
+        entry.reason = "strix-serve only: the command line runs its own route";
+    }
 }
 
 inline const char* mini_profile_name(profile::Name tier) {

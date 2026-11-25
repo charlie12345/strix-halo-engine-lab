@@ -81,6 +81,13 @@ inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepar
 // the image route); an explicit 1 selects it and is a distinct identity until device identity on the landing head
 // makes it a default. Switch: STRIX_INK_ATTN_PROJECTED_BIAS=0/1.
 inline constexpr std::string_view kMiniAttnProjectedBias = "inkling2-mini-attn-projected-bias@1";
+// Served route lever, opt-in: a HIP server runs the command line's route (packed decode unless a flag selects grouped,
+// the whole prompt by the command line's chunks and tail rule, the first id from the final prefill row), so a served
+// lane carries the bits of the same request on the command line at any cohort width. Off in every profile column (all
+// cells empty, builtin 0): the served default keeps its incumbent route (the last prompt token held back and decoded,
+// grouped cohort decode) until the migration is qualified against it. Select it with STRIX_INK_SERVED_CLI_ROUTE=1 (any
+// profile); a CUDA server declines it. The command line always runs this route and does not read the switch.
+inline constexpr std::string_view kMiniServedCliRoute = "inkling2-mini-served-cli-route@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
 // Image pre-processing recipe of the one vision adapter (src/inkling2/inkling2_vision.*), resolved here with the other
@@ -92,7 +99,7 @@ inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-control
 // own identity evidence, Resolution::explicit_value_qualified). Only the image opener reads it (mini_vision_axial); at
 // its builtin the row stays out of the fingerprint and the receipt, so a text-only run resolves as before the row.
 inline constexpr std::string_view kMiniVisionRecipe = "inkling2-vision-recipe";
-inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 9> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -120,12 +127,20 @@ inline constexpr std::array<profile::Lever, 8> kMiniLevers{{
      {}, {true, true, true, true}, "1", "0",
      "awaits device identity on the landing head (logits, ids and state bitwise the image route) before any default",
      false, {}, true},
-    spec::kBlockDraftLever,
+    // Appended after main's rows (main's row positions unchanged); the block-candidate row stays last.
+    {.name = kMiniServedCliRoute, .env = "STRIX_INK_SERVED_CLI_ROUTE", .option = "",
+     .value = {"", "", "", ""}, .builtin = "0",
+     .kind = profile::Kind::bit_changing, .ready = {false, false, false, false},
+     .runnable = {true, true, true, true}, .target = "", .off = "0",
+     .source = "waits for the served migration identity (served lanes against the incumbent served route); device "
+               "evidence so far: served cohort lanes == the same served decoder's lone lane at cohort widths 2..17",
+     .omit_builtin_fingerprint = true},
     {kMiniVisionRecipe, "STRIX_INKLING2_VISION_RECIPE", "", {}, "legacy", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "axial@1", "legacy",
      "awaits the real-checkpoint reference gate (patches, hidden and projected rows) and CLI image identity on HIP "
      "and CUDA",
      false, {}, true},
+    spec::kBlockDraftLever,
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

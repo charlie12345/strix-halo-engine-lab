@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/engine_profile.hpp"
+#include "strix/spec/block_draft_policy.hpp"
 #include "strix/weight/levers.hpp"
 #include "strix/weight/registry.hpp"
 
@@ -72,7 +73,7 @@ inline constexpr std::string_view kMiniCombineImage = "inkling2-mini-combine-dow
 inline constexpr std::string_view kMiniPreparedRoundFold = "inkling2-mini-prepared-round-fold@1";
 // Draft CUDA controller schedule. One plane requires explicit selection and a resident weight certificate.
 inline constexpr std::string_view kMiniControllerPlanes = "inkling2-mini-controller-planes@1";
-inline constexpr std::array<profile::Lever, 5> kMiniLevers{{
+inline constexpr std::array<profile::Lever, 6> kMiniLevers{{
     {kMiniMoeW4a4, "STRIX_INK_MOE_W4A4", "", {"", "1", "", ""}, "0", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "0",
      "waits for the FAST gate (prefill regime, routes replayed) and an RTX prefill receipt",
@@ -96,6 +97,7 @@ inline constexpr std::array<profile::Lever, 5> kMiniLevers{{
     {kMiniControllerPlanes, "STRIX_INK_CONTROLLER_PLANES", "--controller-planes", {}, "3", profile::Kind::bit_changing,
      {}, {false, true, false, true}, "1", "3", "awaits CUDA device identity and model qualification",
      true, {}, true},
+    spec::kBlockDraftLever,
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.

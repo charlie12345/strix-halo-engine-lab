@@ -21,6 +21,8 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         options.tier.profile = profile::parse(tier);
     } else if (native && argument == "--controller-planes") {
         options.tier.cli.emplace_back(kMiniControllerPlanes, value());
+    } else if (argument == "--block-drafter") {
+        options.tier.cli.emplace_back(std::string(spec::kBlockDraftLeverName), value());
     } else if (native && argument == "--qualify-q8") {
         options.qualify_q8 = true;
     } else if (native && argument == "--no-weight-q8") {
@@ -133,6 +135,7 @@ inline profile::Resolution resolve_mini_profile(const MiniWeightOptions& options
     static_cast<void>(mini_combine_image(tier));
     require_mini_expert_consumer(tier, native_execution);
     static_cast<void>(mini_controller_one_plane(tier));
+    spec::require_block_draft_execution(spec::block_draft_selection(tier));
     return tier;
 }
 

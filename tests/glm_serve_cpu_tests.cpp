@@ -1053,8 +1053,7 @@ void test_sampled_mtp_serve() {
     // decided, so nothing past the rejected row may be committed; the tokens stay those of plain sampling
     const auto forced = serve_sampled(jobs, true, true, false, strix::SampledAcceptance::coupled, 0);
     CHECK(forced.error.empty() && forced.tokens == plain.tokens && forced.lead_rejected > 0);
-    if (!forced.error.empty()) std::fprintf(stderr, "forced rejection serve error: %s
-", forced.error.c_str());
+    if (!forced.error.empty()) std::fprintf(stderr, "forced rejection serve error: %s\n", forced.error.c_str());
     CHECK(spec.mtp_rounds > 0 && spec.sampled_runs > 0);
     // the sampled prefill's seed (drawn from its greedy first token) is never used: the decoder opens from mtp_enter
     unsigned enters = 0, seed_enters = 0;

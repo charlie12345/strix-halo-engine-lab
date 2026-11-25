@@ -84,7 +84,9 @@ void test_selection() {
     }
     check(diverged, "different seeds must diverge on this fixture");
     check(!first->coupled(), "the pair sampler keeps rejection acceptance by default");
-    const auto coupled = sv::make_pair_sampler(job, strix::SampledAcceptance::coupled);
+    strix::TokenSamplerOptions coupled_options;
+    coupled_options.acceptance = strix::SampledAcceptance::coupled;
+    const auto coupled = sv::make_pair_sampler(job, coupled_options);
     check(coupled && coupled->coupled(), "the pair sampler must forward the acceptance rule");
 }
 

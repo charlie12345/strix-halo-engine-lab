@@ -27,6 +27,13 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
     core::Bf16Operand operand = core::Bf16Operand::fp32;
     int* planes_report = nullptr;  // receives the planes each linear() dispatch selected (qualification only)
 
+    bool linear_admitted(const float* input, unsigned width, unsigned rows,
+                         std::span<const MiniAttentionLinear> views) const {
+        return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, true, [&](auto group) {
+            return cuda_core::detail::valid_bf16_dense_row_group({input, width, group}, rows, arithmetic);
+        });
+    }
+
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, success,
             [&](std::span<const MiniAttentionLinear> group) {
@@ -39,6 +46,12 @@ struct MiniPreparedCudaBackend : attn_core::PreparedGqaRowsDevice<MiniPreparedGq
         const cuda_core::GroupedView layout{rows, kKvHeads, kHeadWidth};
         return cuda_core::rmsnorm_bf16(value, layout, nullptr, value, layout, MiniPreparedGqaShape::kAttentionEpsilon, stream);
     }
+};
+
+// The prompt route whose flash projects the relative bias (cuda_core::PreparedBf16Projection): the shared
+// preparation skips the [row][head][distance] image and its producer; the flash computes the same logits.
+struct MiniPreparedCudaProjectedBackend : MiniPreparedCudaBackend {
+    bool relative_bias_in_attention(unsigned) const { return true; }
 };
 
 // The resident decoder's attention backend: the one-plane operand class is declared only where the staged attention
@@ -58,6 +71,12 @@ struct MiniPreparedCudaProjectionBatch : MiniPreparedCudaBackend {
     mutable std::array<MiniAttentionLinear, core::rows::kMaxJobs> projections{};
     mutable std::array<cuda_core::Bf16DenseRowGroup, core::rows::kMaxJobs> groups{};
     mutable std::size_t projection_count = 0, group_count = 0;
+
+    bool linear_admitted(const float* input, unsigned width, unsigned rows,
+                         std::span<const MiniAttentionLinear> views) const {
+        return rows == row_count && views.size() <= projections.size() - projection_count &&
+               MiniPreparedCudaBackend::linear_admitted(input, width, rows, views);
+    }
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
         if (rows != row_count || views.size() > projections.size() - projection_count) return invalid;

@@ -196,7 +196,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
     };
     const auto arms = ::strix::profile::ladder_arms(rows, std::span<const ::strix::profile::LadderRow>(ladder),
         inputs.regime, admit_of, [&](const Lever& lever) -> std::optional<std::string_view> {
-            for (const auto& [key, value] : inputs.cli) if (key == lever.name) return std::string_view(value);
+            if (const auto* cli = ::strix::profile::last_setting(inputs.cli, lever.name)) return std::string_view(*cli);
             const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
             if (env && !inherited_env(lever, env)) return env;
             return std::nullopt;

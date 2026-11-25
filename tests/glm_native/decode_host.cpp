@@ -1091,13 +1091,13 @@ void profile_tests(){
         rp::Inputs measured;
         measured.args = {"--profile", "fast", "--allow-pending"};
         measured.env = lookup({});
-        measured.regime = {shared::Phase::prefill, 8192, 1, "fixture"};
+        measured.regime = {shared::Phase::prefill, 8192, 1, "fixture", "fixture-exec"};
         // The row is measured over the execution that runs under the cell (LadderArms::over), the --allow-pending
         // benchmark cells included.
         const auto unmeasured = rp::resolve(rp::App::decode_service, measured);
         const auto* unmeasured_tile = unmeasured.find("prefill_tile_large");
         const std::string tile_reference = unmeasured_tile ? unmeasured_tile->ladder_reference : std::string();
-        check(tile_reference.starts_with("ladder-arm/v2;"), "GLM reports the reference of the tile cell");
+        check(tile_reference.starts_with("ladder-arm/v3;"), "GLM reports the reference of the tile cell");
         timing.over = tile_reference;
         measured.ladder = std::span(&timing, 1);
         const auto experiment = rp::resolve(rp::App::decode_service, measured);

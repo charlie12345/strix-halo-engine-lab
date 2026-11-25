@@ -80,12 +80,12 @@ void synthetic_table() {
     strix::profile::LadderRow route_timing{"route", "b", pr::Name::fast, strix::profile::Phase::prefill,
                                           "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture/route"};
     auto measured = in();
-    measured.regime = {strix::profile::Phase::prefill, 4096, 1, "fixture"};
+    measured.regime = {strix::profile::Phase::prefill, 4096, 1, "fixture", "fixture-exec"};
     // The row is measured over the reference the adapter runs under the cell (LadderArms::over).
     const std::string route_reference =  // owned: LadderRow::over is a view
         pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic).find("route")->ladder_reference;
     route_timing.over = route_reference;
-    check(route_timing.over.starts_with("ladder-arm/v2;"), "Gemma reports the reference of the route cell");
+    check(route_timing.over.starts_with("ladder-arm/v3;"), "Gemma reports the reference of the route cell");
     measured.ladder = std::span(&route_timing, 1);
     r = pr::resolve(pr::Name::fast, pr::App::prefill_bench, measured, synthetic);
     check(status(r, "route") == pr::Status::set && value(r, "route") == "b" && r.active("route"), "fast sets ready lever");
@@ -323,9 +323,9 @@ void product_table() {
         namespace shared = strix::profile;
         shared::LadderRow timing{"decode_attention", "g4-dattn-f2", shared::Name::fast, shared::Phase::decode,
                                   "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture timing"};
-        pending_ok.regime = {shared::Phase::decode, 4096, 1, "fixture"};
+        pending_ok.regime = {shared::Phase::decode, 4096, 1, "fixture", "fixture-exec"};
         const std::string reference = pr::resolve(pr::Name::fast, app, pending_ok).find("decode_attention")->ladder_reference;
-        check(reference.starts_with("ladder-arm/v2;"), "Gemma reports the decode attention reference");
+        check(reference.starts_with("ladder-arm/v3;"), "Gemma reports the decode attention reference");
         timing.over = reference;
         pending_ok.ladder = std::span(&timing, 1);
         r = pr::resolve(pr::Name::fast, app, pending_ok);

@@ -169,7 +169,7 @@ qwen::profile::Inputs measured_profile(qwen::profile::Inputs inputs = {}) {
     }};
     // Each row names the execution it was measured over (LadderArms::over) under these inputs.
     static std::array<std::string, 3> references{};
-    inputs.regime = {Phase::prefill, 1, 1, "fixture"};
+    inputs.regime = {Phase::prefill, 1, 1, "fixture", "fixture-exec"};
     inputs.ladder = {};
     const auto unmeasured = qwen::profile::resolve(Name::fast, inputs);
     for (std::size_t i = 0; i < rows.size(); ++i) {

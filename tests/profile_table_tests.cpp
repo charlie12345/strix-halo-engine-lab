@@ -448,7 +448,7 @@ void catalogue() {
                                 8, 8, 1, 1, 1.01, 0.005, "fixture"};
     q::Inputs native_inputs;
     native_inputs.env = env();
-    native_inputs.regime = {p::Phase::prefill, 8, 1, "fixture"};
+    native_inputs.regime = {p::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
     const auto native = [&](auto rows) { return q::resolve(p::Name::fast, native_inputs, rows); };
     std::vector<q::Lever> storage;
     const auto off_cells = p::effective_cells(cli_result, bindings);
@@ -457,7 +457,7 @@ void catalogue() {
     const auto unmeasured = p::resolve_effective_profile(p::Name::fast, q::levers(), on_cells, storage, native);
     const std::string native_reference =
         unmeasured.find("index_proj_wmma") ? unmeasured.find("index_proj_wmma")->ladder_reference : std::string();
-    check(native_reference.starts_with("ladder-arm/v2;"), "the native adapter reports the reference of the cell");
+    check(native_reference.starts_with("ladder-arm/v3;"), "the native adapter reports the reference of the cell");
     fixture_timing.over = native_reference;
     native_inputs.ladder = std::span(&fixture_timing, 1);
     const auto off = p::resolve_effective_profile(p::Name::fast, q::levers(), off_cells, storage, native);

@@ -185,7 +185,7 @@ int main() {
     CHECK(syn({}, true).qualification() == "unqualified: runnable_pending");
     {
         // The reference the FAST cell is measured over: ready_lever (exact, earlier in the table) already at FAST.
-        constexpr std::string_view over = "ladder-arm/v2;ready_lever=on,runnable_pending=off";
+        constexpr std::string_view over = "ladder-arm/v3;fixture-exec;ready_lever=on,runnable_pending=off;candidate=runnable_pending=on";
         const auto timed = [&](double speedup, double noise) {
             strix::profile::LadderRow row{"runnable_pending", "on", strix::profile::Name::fast,
                                           strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, speedup, noise, "test"};
@@ -194,7 +194,7 @@ int main() {
         };
         const auto run_with = [&](const strix::profile::LadderRow& timing) {
             auto measured = in({});
-            measured.regime = {strix::profile::Phase::prefill, 8, 1, "fixture"};
+            measured.regime = {strix::profile::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
             measured.ladder = std::span(&timing, 1);
             return pf::resolve(pf::Name::fast, true, pf::App::replica, std::move(measured), synthetic);
         };

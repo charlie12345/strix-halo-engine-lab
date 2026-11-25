@@ -18,6 +18,7 @@
 #include "cuda/models/glm/producer/profile.hpp"
 
 #include <cstdio>
+#include <deque>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -54,31 +55,40 @@ p::Resolution resolve(const p::Engine& engine, p::Name tier, p::Regime regime = 
     return p::resolve(engine, in);
 }
 
-// The lower arm a timing row was measured over (LadderRow::over).
-constexpr p::LadderRow measured_over(p::LadderRow row, std::string_view arm) {
-    row.over = arm;
+// The execution every fixture regime runs outside the table (Regime::execution; the helpers below set it).
+constexpr std::string_view kExec = "fixture-exec";
+// Rows hold views: the spellings built here live for the whole test.
+std::string_view keep(std::string text) {
+    static std::deque<std::string> pool;
+    return pool.emplace_back(std::move(text));
+}
+// The reference execution a timing row was measured over, spelled as LadderArms::over() spells it: `levers` is the
+// table's "lever=value" list; the version, the execution and the candidate (the row's own lever and value) are added.
+p::LadderRow measured_over(p::LadderRow row, std::string_view levers, std::string_view execution = kExec) {
+    row.over = keep(std::string(p::kLadderArmVersion) + ";" + std::string(execution) + ";" + std::string(levers) +
+                    ";candidate=" + std::string(row.lever) + "=" + std::string(row.value));
     return row;
 }
 // The references of the one-lever fixture (LadderArms::over spelling): a FAST row is measured over EXACT (the builtin
 // off), a TURBO row over the FAST arm where its FAST cell runs.
-constexpr std::string_view kExactArm = "ladder-arm/v2;fixture-w4a4@1=off";
-constexpr std::string_view kFastArm = "ladder-arm/v2;fixture-w4a4@1=a8";
+constexpr std::string_view kExactArm = "fixture-w4a4@1=off";
+constexpr std::string_view kFastArm = "fixture-w4a4@1=a8";
 
 void verdicts() {
-    constexpr p::LadderRow fast_pf = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.20,
+    const p::LadderRow fast_pf = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.20,
                                                     0.02, "r/fast-pf"}, kExactArm);
-    constexpr p::LadderRow turbo_pf = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 2049, 4096, 1,
+    const p::LadderRow turbo_pf = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 2049, 4096, 1,
                                                      1, 1.30, 0.02, "r/turbo-pf-4k"}, kFastArm);
-    constexpr p::LadderRow turbo_pf_noise = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 4097,
+    const p::LadderRow turbo_pf_noise = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 4097,
                                                            8192, 1, 1, 1.003, 0.02, "r/turbo-pf-8k"}, kFastArm);
     // Measured where FAST is not measured (decode at 8-16 lanes): over the builtin FAST arm, which runs there.
-    constexpr p::LadderRow turbo_dec_slow = measured_over({kLever, "a4", p::Name::turbo, p::Phase::decode, "dev", 1, 65536, 8,
+    const p::LadderRow turbo_dec_slow = measured_over({kLever, "a4", p::Name::turbo, p::Phase::decode, "dev", 1, 65536, 8,
                                                            16, 0.95, 0.02, "r/turbo-dec"}, kExactArm);
-    constexpr p::LadderRow fast_dec_slow = measured_over({kLever, "a8", p::Name::fast, p::Phase::decode, "dev", 1, 65536, 1,
+    const p::LadderRow fast_dec_slow = measured_over({kLever, "a8", p::Name::fast, p::Phase::decode, "dev", 1, 65536, 1,
                                                           1, 0.97, 0.01, "r/fast-dec"}, kExactArm);
-    constexpr p::LadderRow turbo_dec_b1 = measured_over({kLever, "a4", p::Name::turbo, p::Phase::decode, "dev", 1, 65536,
+    const p::LadderRow turbo_dec_b1 = measured_over({kLever, "a4", p::Name::turbo, p::Phase::decode, "dev", 1, 65536,
                                                          1, 1, 1.25, 0.02, "r/turbo-dec-b1"}, kFastArm);
-    constexpr std::array rows{fast_pf, turbo_pf, turbo_pf_noise, turbo_dec_slow, fast_dec_slow, turbo_dec_b1};
+    const std::array rows{fast_pf, turbo_pf, turbo_pf_noise, turbo_dec_slow, fast_dec_slow, turbo_dec_b1};
     const p::Engine engine{"fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, rows};
     require(p::ladder_defect(engine).empty(), "fixture ladder is well formed: " + p::ladder_defect(engine));
 
@@ -101,26 +111,26 @@ void verdicts() {
         require(value == "off" ? setting == exported.end() : setting != exported.end() && setting->second == value,
                 "only the effective value is exported");
     };
-    check(p::Name::turbo, {p::Phase::prefill, 4096, 1, "dev"}, "a4", "applies x1.300");
-    check(p::Name::turbo, {p::Phase::prefill, 2049, 1, "dev"}, "a4", "-> turbo=a4");
-    check(p::Name::turbo, {p::Phase::prefill, 2048, 1, "dev"}, "a8", "-> fast=a8");
-    check(p::Name::turbo, {p::Phase::prefill, 4097, 1, "dev"}, "a8", "within noise");
-    check(p::Name::turbo, {p::Phase::prefill, 8193, 1, "dev"}, "off", "unmeasured regime");
-    check(p::Name::turbo, {p::Phase::prefill, 4096, 1, "other"}, "off", "unmeasured regime");
-    check(p::Name::turbo, {p::Phase::prefill, 4096, 2, "dev"}, "off", "unmeasured regime");
-    check(p::Name::turbo, {p::Phase::prefill, 0, 1, "dev"}, "off", "unmeasured regime");
-    check(p::Name::turbo, {p::Phase::decode, 4096, 8, "dev"}, "off", "slower");
+    check(p::Name::turbo, {p::Phase::prefill, 4096, 1, "dev", "fixture-exec"}, "a4", "applies x1.300");
+    check(p::Name::turbo, {p::Phase::prefill, 2049, 1, "dev", "fixture-exec"}, "a4", "-> turbo=a4");
+    check(p::Name::turbo, {p::Phase::prefill, 2048, 1, "dev", "fixture-exec"}, "a8", "-> fast=a8");
+    check(p::Name::turbo, {p::Phase::prefill, 4097, 1, "dev", "fixture-exec"}, "a8", "within noise");
+    check(p::Name::turbo, {p::Phase::prefill, 8193, 1, "dev", "fixture-exec"}, "off", "unmeasured regime");
+    check(p::Name::turbo, {p::Phase::prefill, 4096, 1, "other", "fixture-exec"}, "off", "unmeasured regime");
+    check(p::Name::turbo, {p::Phase::prefill, 4096, 2, "dev", "fixture-exec"}, "off", "unmeasured regime");
+    check(p::Name::turbo, {p::Phase::prefill, 0, 1, "dev", "fixture-exec"}, "off", "unmeasured regime");
+    check(p::Name::turbo, {p::Phase::decode, 4096, 8, "dev", "fixture-exec"}, "off", "slower");
     // FAST is measured slower in decode at one lane, so the FAST arm that runs there is not the arm the TURBO row was
     // measured over: the row is stale and the cell does not run.
-    check(p::Name::turbo, {p::Phase::decode, 4096, 1, "dev"}, "off", "timing rows measured over another fast arm");
-    check(p::Name::fast, {p::Phase::prefill, 4096, 1, "dev"}, "a8", "-> fast=a8");
-    check(p::Name::standard, {p::Phase::prefill, 4096, 1, "dev"}, "off", "");
+    check(p::Name::turbo, {p::Phase::decode, 4096, 1, "dev", "fixture-exec"}, "off", "timing rows measured over another fast arm");
+    check(p::Name::fast, {p::Phase::prefill, 4096, 1, "dev", "fixture-exec"}, "a8", "-> fast=a8");
+    check(p::Name::standard, {p::Phase::prefill, 4096, 1, "dev", "fixture-exec"}, "off", "");
 
     // A refused nonempty TURBO cell leaves the measured FAST cell and its exported status intact.
     auto refused_rows = kRows;
     refused_rows[0].ready[3] = false;
     const p::Engine refused{"refused", "", refused_rows, false, "refused-v1", {}, {}, rows};
-    const p::Regime measured{p::Phase::prefill, 4096, 1, "dev"};
+    const p::Regime measured{p::Phase::prefill, 4096, 1, "dev", "fixture-exec"};
     const auto fast_run = resolve(refused, p::Name::fast, measured);
     const auto exported = [](const p::Resolution& run) {
         const auto env = p::exports(run, std::set<std::string>{});
@@ -180,7 +190,10 @@ void defects() {
     row = good;
     for (const std::string_view unbound : {std::string_view{}, std::string_view{"fixture-w4a4@1=a8"},
                                            std::string_view{"ladder-arm/v1;fixture-w4a4@1=a8"},
-                                           std::string_view{"ladder-arm/v2"}}) {
+                                           std::string_view{"ladder-arm/v2;fixture-exec;fixture-w4a4@1=a8;candidate=fixture-w4a4@1=a4"},
+                                           std::string_view{"ladder-arm/v3"},
+                                           std::string_view{"ladder-arm/v3;;fixture-w4a4@1=a8;candidate=fixture-w4a4@1=a4"},
+                                           std::string_view{"ladder-arm/v3;fixture-exec;fixture-w4a4@1=a8"}}) {
         row.over = unbound;
         require(!defect(row).empty(), "timing row without a versioned reference: " + std::string(unbound));
     }
@@ -214,19 +227,99 @@ void defects() {
     require(!defect(row).empty(), "unordered lane band");
 }
 
+// The defect of one shipped ordinary timing row (empty: none). Resolved at its band corner on the execution it names,
+// its cell must be eligible and judged over exactly the reference the row names; an entry alone proves nothing (a cell
+// whose column admission is off has an entry with no judgment).
+std::string shipped_row_defect(const p::Engine& engine, const p::LadderRow& row) {
+    const auto actual = resolve(engine, row.tier, {row.phase, row.min_context, row.min_lanes, row.device,
+                                                   p::ladder_reference_execution(row.over)});
+    const auto* entry = actual.find(row.lever);
+    if (entry == nullptr) return "no entry for the lever";
+    const std::string step = " " + std::string(p::name(row.tier)) + "=" + std::string(row.value) + " ";
+    if (entry->ladder.find(step) == std::string::npos) return "the cell was not judged in its regime: " + entry->ladder;
+    if (entry->ladder_reference != row.over) return "judged over " + entry->ladder_reference + ", not the row's reference";
+    if (entry->ladder.find("measured over another") != std::string::npos) return "stale: " + entry->ladder;
+    return {};
+}
+
+// Controls of shipped_row_defect: a judged row passes; a mismatched reference and a row whose cell is never judged
+// (column admission off) are both reported.
+void shipped_rows() {
+    const auto good = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 4096, 1, 1, 1.2, 0.02,
+                                     "r/shipped"}, kExactArm);
+    const std::array rows{good};
+    const p::Engine engine{"shipped", "", kRows, false, "shipped-v1", {}, {}, rows};
+    require(shipped_row_defect(engine, good).empty(), "a judged shipped row: " + shipped_row_defect(engine, good));
+    const auto wrong = measured_over(good, "fixture-w4a4@1=a6");
+    const std::array wrong_rows{wrong};
+    const p::Engine mismatched{"shipped", "", kRows, false, "shipped-v1", {}, {}, wrong_rows};
+    require(!shipped_row_defect(mismatched, wrong).empty(), "a row naming a reference that never runs is reported");
+    auto closed = kRows;
+    closed[0].ready[1] = false;
+    closed[0].runnable[1] = false;
+    const p::Engine skipped{"shipped", "", closed, false, "shipped-v1", {}, {}, rows};
+    require(!shipped_row_defect(skipped, good).empty(), "a row whose cell is never judged is reported");
+}
+
+// Review r61 P1: a receipt binds the execution outside the table and the implementation identities of both executions.
+void execution_binding() {
+    const p::LadderExecution base{"cuda", "product-a", {8192, 16384, 1, 2048, 2048, 1, 0, 128}, "weights=x"};
+    const auto spelled = p::ladder_execution(base);
+    require(!spelled.empty() && spelled.find("product-a") != std::string::npos, "execution spelling: " + spelled);
+    const auto differs = [&](auto change, const char* what) {
+        auto other = base;
+        change(other);
+        require(p::ladder_execution(other) != spelled, std::string("execution spelling ignores ") + what);
+    };
+    differs([](p::LadderExecution& e) { e.device = "product-b"; }, "the device product");
+    differs([](p::LadderExecution& e) { e.backend = "hip"; }, "the backend");
+    differs([](p::LadderExecution& e) { e.workload.prompt_tokens = 4096; }, "the prompt");
+    differs([](p::LadderExecution& e) { e.workload.prefill_chunk = 8192; }, "the prefill chunk");
+    differs([](p::LadderExecution& e) { e.workload.decode_rows = 4; }, "the decode rows");
+    differs([](p::LadderExecution& e) { e.settings = "weights=y"; }, "the settings");
+    for (const auto unknown : {+[](p::LadderExecution& e) { e.device = {}; },
+                               +[](p::LadderExecution& e) { e.workload.prefill_chunk = 0; },
+                               +[](p::LadderExecution& e) { e.workload.context_capacity = 0; }}) {
+        auto other = base;
+        unknown(other);
+        require(p::ladder_execution(other).empty(), "an incomplete execution is not spelled");
+    }
+    static_assert(p::value_identity("a8 (impl-v1)", "a8") == "a8 (impl-v1)" && p::value_identity("a8 (impl-v1)", "a") .empty() &&
+                  p::value_identity("", "a8").empty() && p::value_identity("a8", "a8") == "a8");
+    // The candidate's implementation identity (the table's target) is part of the reference: the same receipt does not
+    // decide once the identity changes, and a receipt spelled without it never did.
+    constexpr std::string_view kSpelled =
+        "ladder-arm/v3;fixture-exec;fixture-w4a4@1=off;candidate=fixture-w4a4@1=a8{a8 (fixture-impl-v1)}";
+    p::LadderRow timed{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.2, 0.02, "r/impl"};
+    timed.over = kSpelled;
+    const std::array rows{timed};
+    const p::Regime at4k{p::Phase::prefill, 4096, 1, "dev", kExec};
+    auto table = kRows;
+    table[0].target = "a8 (fixture-impl-v1)";
+    const p::Engine v1{"identity", "", table, false, "identity-v1", {}, {}, rows};
+    const auto applied = resolve(v1, p::Name::fast, at4k);
+    require(applied.find(kLever)->value == "a8" && applied.find(kLever)->ladder_reference == kSpelled,
+            "a receipt over the declared implementation applies: " + applied.find(kLever)->ladder_reference);
+    table[0].target = "a8 (fixture-impl-v2)";
+    const p::Engine v2{"identity", "", table, false, "identity-v1", {}, {}, rows};
+    require(resolve(v2, p::Name::fast, at4k).find(kLever)->value == "off", "a new implementation identity retires the receipt");
+    const std::array unspelled{measured_over(timed, kExactArm)};
+    table[0].target = "a8 (fixture-impl-v1)";
+    const p::Engine bare{"identity", "", table, false, "identity-v1", {}, {}, unspelled};
+    require(resolve(bare, p::Name::fast, at4k).find(kLever)->value == "off", "a receipt without the identity never decides");
+}
+
 // Walk all declared rows, including currently pending candidates. Marking the candidate ready here makes this
 // test fail if a first binding can export the value before a timing receipt is registered.
 void walk(const p::Engine& registered) {
     require(p::ladder_defect(registered).empty(), p::ladder_defect(registered));
-    // Every shipped timing row names the reference that runs at its own band: a row left behind by a changed builtin,
-    // schedule or lower cell would silently stop deciding.
+    // Every shipped timing row is judged at its own band on its own execution: a row left behind by a changed builtin,
+    // schedule, lower cell or column admission would silently stop deciding.
     for (const auto& row : registered.ladder) {
         if (row.incumbent || !row.joint.empty()) continue;
-        const auto actual = resolve(registered, row.tier, {row.phase, row.min_context, row.min_lanes, row.device});
-        const auto* entry = actual.find(row.lever);
-        require(entry != nullptr && entry->ladder.find("measured over another") == std::string::npos,
-                std::string(registered.tag) + "/" + std::string(row.lever) + " shipped timing row is stale (" +
-                    std::string(row.receipt) + "): reference " + (entry ? entry->ladder_reference : std::string()));
+        const auto defect = shipped_row_defect(registered, row);
+        require(defect.empty(), std::string(registered.tag) + "/" + std::string(row.lever) + " shipped timing row (" +
+                                    std::string(row.receipt) + "): " + defect);
     }
     std::vector<p::Lever> rows(registered.table.begin(), registered.table.end());
     auto engine = registered;
@@ -277,13 +370,13 @@ void cuda_cli_server() {
         const auto* entry = resolved.resolution.find(lever);
         return entry ? entry->ladder_reference : std::string();
     };
-    request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture"};
+    request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture", "fixture-exec"};
     const std::string qsa_reference = reference_of("qsa_mma");
-    require(qsa_reference.starts_with("ladder-arm/v2;"), "Qwen CUDA reports the reference: " + qsa_reference);
+    require(qsa_reference.starts_with("ladder-arm/v3;"), "Qwen CUDA reports the reference: " + qsa_reference);
     timing.over = qsa_reference;
     request.inputs.ladder = std::span(&timing, 1);
     for (const auto context : {4096U, 4097U}) {
-        request.inputs.regime = {p::Phase::prefill, context, 1, "fixture"};
+        request.inputs.regime = {p::Phase::prefill, context, 1, "fixture", "fixture-exec"};
         const auto cli = qo::resolve(request, qo::Entry::cli);
         const auto server = qo::resolve(request, qo::Entry::serve);
         // Inside the timing band the row decides; outside it the incumbent grant keeps the cell main selected.
@@ -302,7 +395,7 @@ void cuda_cli_server() {
     request.inputs.regimes = std::span(&gate, 1);
     request.inputs.ladder = {};
     request.inputs.max_prompt_tokens = 4096;
-    request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture"};
+    request.inputs.regime = {p::Phase::prefill, 4096, 1, "fixture", "fixture-exec"};
     const std::string route_reference = reference_of("moe_route_bf16");
     // The explicit switch is spelled as the lever's off value; the lever runs after the judged cell, at the tier below.
     require(route_reference.find(",expert_fast=0,") != std::string::npos,
@@ -326,8 +419,8 @@ void cuda_cli_server() {
 }
 
 void custom_adapters() {
-    constexpr p::Regime regime{p::Phase::prefill, 4096, 1, "dev"};
-    constexpr p::LadderRow sample = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
+    constexpr p::Regime regime{p::Phase::prefill, 4096, 1, "dev", "fixture-exec"};
+    const p::LadderRow sample = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
                                                    1.008, 0.002, "r/fast"}, kExactArm);
     for (unsigned probe = 0; probe < 4; ++probe) {
         auto row = sample;
@@ -425,7 +518,7 @@ std::vector<std::string> selections() {
                 in.env = none;
                 in.max_prompt_tokens = tokens;
                 in.regimes = q::profile::fast_regimes;
-                in.regime = {p::Phase::prefill, tokens, 1, "gfx1151"};
+                in.regime = {p::Phase::prefill, tokens, 1, "gfx1151", "fixture-exec"};
                 lines(out, where, q::profile::resolve(static_cast<p::Name>(t), in));
             });
             const auto cuda = "B qwen-cuda " + tier(t);
@@ -555,7 +648,7 @@ void compatibility_opt_outs(std::span<const p::Engine> engines) {
 // A paired decision is admitted only by a row measured on the pair (LadderRow::joint): single-cell rows of either half
 // never read it, and the joint row is invisible to the plain judge.
 void paired_rows() {
-    const p::Regime regime{p::Phase::prefill, 8192, 1, "dev"};
+    const p::Regime regime{p::Phase::prefill, 8192, 1, "dev", "fixture-exec"};
     p::LadderRow joint{"shadow", "fp8", p::Name::turbo, p::Phase::prefill, "dev", 8192, 8192, 1, 1, 1.10, 0.01, "pair receipt"};
     joint.joint = "reader";
     const p::JointLadderScope scope{"device-id", "fast@1", "candidate-base@1", "shadow@1", "reader@1",
@@ -586,8 +679,8 @@ void hy4_new_quality_rows() {
     p::Inputs in;
     in.profile = p::Name::fast;
     in.env = none;
-    const h::Regime beyond{h::Device::gfx1151, h::Topology::one_node, 40000};
-    const h::Regime inside{h::Device::gfx1151, h::Topology::one_node, 32568};
+    const h::Regime beyond{h::Device::gfx1151, h::Topology::one_node, 40000, "fixture-exec"};
+    const h::Regime inside{h::Device::gfx1151, h::Topology::one_node, 32568, "fixture-exec"};
     require(h::resolve(inside, in)->find("prompt_rows")->value == "4096", "frozen grant: the qualified band still runs");
     std::vector<h::Qualified> rows(std::begin(h::qualified), std::end(h::qualified));
     rows.push_back({h::Device::gfx1151, h::Topology::one_node, {"prompt_rows", "4096", 0, 65536, "fixture wider gate row"}});
@@ -602,7 +695,7 @@ void hy4_new_quality_rows() {
          "fixture timing"}}};
     // Measured over the reference the adapter runs there (LadderArms::over).
     const std::string hy4_reference = h::resolve(beyond, in, rows)->find("prompt_rows")->ladder_reference;
-    require(hy4_reference.starts_with("ladder-arm/v2;"), "Hy4 reports the reference: " + hy4_reference);
+    require(hy4_reference.starts_with("ladder-arm/v3;"), "Hy4 reports the reference: " + hy4_reference);
     timings[0].timing.over = hy4_reference;
     const auto resolved = h::resolve(beyond, in, rows, h::incumbent_grants, timings);
     require(resolved->find("prompt_rows")->value == "4096", "a matching timing row admits the new band");
@@ -638,52 +731,89 @@ void bound_evidence() {
         const auto* entry = res.find(lever);
         return entry ? entry->ladder : std::string();
     };
-    const p::Regime at4k{p::Phase::prefill, 4096, 1, "dev"};
-    constexpr p::LadderRow fast_a8 = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.20,
+    const p::Regime at4k{p::Phase::prefill, 4096, 1, "dev", "fixture-exec"};
+    const p::LadderRow fast_a8 = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.20,
                                                     0.02, "r/a8"}, kExactArm);
-    constexpr p::LadderRow turbo_a4 = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 8192, 1, 1,
+    const p::LadderRow turbo_a4 = measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 8192, 1, 1,
                                                      1.30, 0.02, "r/a4-over-a8"}, kFastArm);
     {
         // The review case: a new FAST value qualifies and gets its own FAST record; the TURBO record (denominator a8)
         // is left untouched. It must not decide over the new FAST arm.
-        constexpr std::array rows{fast_a8, turbo_a4};
+        const std::array rows{fast_a8, turbo_a4};
         const p::Engine before{"bound", "", kRows, false, "bound-v1", {}, {}, rows};
         require(value_of(run(before, p::Name::turbo, at4k), kLever) == "a4", "TURBO row over the running FAST arm applies");
         auto requalified = kRows;
         requalified[0].value[1] = "a6";
-        constexpr p::LadderRow fast_a6 = measured_over({kLever, "a6", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1,
+        const p::LadderRow fast_a6 = measured_over({kLever, "a6", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1,
                                                         1.15, 0.02, "r/a6"}, kExactArm);
-        constexpr std::array after_rows{fast_a6, turbo_a4};
+        const std::array after_rows{fast_a6, turbo_a4};
         const p::Engine after{"bound", "", requalified, false, "bound-v1", {}, {}, after_rows};
         const auto res = run(after, p::Name::turbo, at4k);
         require(value_of(res, kLever) == "a6", "stale TURBO row (measured over a8) keeps the new FAST cell a6");
         require(route_of(res, kLever).find("timing rows measured over another fast arm") != std::string::npos,
                 "the route names the stale evidence: " + route_of(res, kLever));
         // Re-timed over the new FAST arm, the TURBO cell runs again.
-        constexpr std::array retimed_rows{fast_a6, measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1,
+        const std::array retimed_rows{fast_a6, measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1,
                                                                   8192, 1, 1, 1.25, 0.02, "r/a4-over-a6"},
-                                                                 "ladder-arm/v2;fixture-w4a4@1=a6")};
+                                                                 "fixture-w4a4@1=a6")};
         const p::Engine retimed{"bound", "", requalified, false, "bound-v1", {}, {}, retimed_rows};
         require(value_of(run(retimed, p::Name::turbo, at4k), kLever) == "a4", "TURBO row re-timed over a6 applies");
     }
     {
-        // An explicit setting of another lossy lever changes the lower arm: the TURBO row measured over the profile's
-        // FAST arm no longer decides.
+        // A later incumbent grant is part of the execution an earlier timed cell extends (review r61): the FAST row of
+        // the first lever measured with the later lever off does not decide where the grant turns it on, and a
+        // combination measured to lose keeps the incumbent execution.
         constexpr std::string_view kOther = "fixture-other@1";
         std::array<p::Lever, 2> table{kRows[0], kRows[0]};
         table[1].name = kOther;
         table[1].env = "STRIX_FIXTURE_OTHER";
         table[1].value = {"", "on", "", ""};
-        constexpr std::string_view kBoth = "ladder-arm/v2;fixture-w4a4@1=a8,fixture-other@1=on";
-        const std::array rows{measured_over(fast_a8, "ladder-arm/v2;fixture-w4a4@1=off,fixture-other@1=off"),
-                              p::incumbent_cell(kOther, "on", p::Name::fast, "r/other-grant"),
-                              measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.30,
-                                             0.02, "r/a4-over-both"}, kBoth)};
-        const p::Engine engine{"override", "", table, false, "override-v1", {}, {}, rows};
+        const auto grant = p::incumbent_cell(kOther, "on", p::Name::fast, "r/other-grant");
+        const auto fast_row = [](double speedup, std::string_view over, std::string_view receipt) {
+            return measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, speedup, 0.02,
+                                  receipt}, over);
+        };
+        const std::array isolated{fast_row(1.20, "fixture-w4a4@1=off,fixture-other@1=off", "r/a8-without-other"), grant};
+        const p::Engine without{"later-grant", "", table, false, "later-grant-v1", {}, {}, isolated};
+        const auto stale = run(without, p::Name::fast, at4k);
+        require(value_of(stale, kLever) == "off" && value_of(stale, kOther) == "on" &&
+                    route_of(stale, kLever).find("timing rows measured over another") != std::string::npos &&
+                    stale.find(kLever)->ladder_reference ==
+                        "ladder-arm/v3;fixture-exec;fixture-w4a4@1=off,fixture-other@1=on;candidate=fixture-w4a4@1=a8",
+                "a row measured without the later grant does not decide the combined arm: " + route_of(stale, kLever));
+        const std::array losing{fast_row(0.95, "fixture-w4a4@1=off,fixture-other@1=on", "r/a8-with-other-loses"),
+                                isolated[0], grant};
+        const p::Engine loses{"later-grant", "", table, false, "later-grant-v1", {}, {}, losing};
+        const auto lost = run(loses, p::Name::fast, at4k);
+        require(value_of(lost, kLever) == "off" && value_of(lost, kOther) == "on" &&
+                    route_of(lost, kLever).find("slower") != std::string::npos,
+                "a combined arm measured to lose keeps the incumbent FAST arm: " + route_of(lost, kLever));
+        const std::array combined{fast_row(1.10, "fixture-w4a4@1=off,fixture-other@1=on", "r/a8-with-other"), grant,
+                                  measured_over({kLever, "a4", p::Name::turbo, p::Phase::prefill, "dev", 1, 8192, 1, 1,
+                                                 1.30, 0.02, "r/a4-over-both"}, "fixture-w4a4@1=a8,fixture-other@1=on")};
+        const p::Engine engine{"later-grant", "", table, false, "later-grant-v1", {}, {}, combined};
         const auto plain = run(engine, p::Name::turbo, at4k);
-        require(value_of(plain, kLever) == "a4" && value_of(plain, kOther) == "on", "TURBO over the full FAST arm applies");
+        require(value_of(plain, kLever) == "a4" && value_of(plain, kOther) == "on",
+                "rows measured over the complete arms apply: " + route_of(plain, kLever));
+        // An explicit setting of the later lever changes both executions: neither row decides.
         const auto overridden = run(engine, p::Name::turbo, at4k, {{std::string(kOther), "off"}});
-        require(value_of(overridden, kLever) == "a8", "an override of another FAST lever makes the TURBO row stale");
+        require(value_of(overridden, kLever) == "off",
+                "an override of a later lever makes the rows stale: " + route_of(overridden, kLever));
+        // A repeated option resolves to its last value in the reference and in the execution alike (review r61).
+        const auto repeated = run(engine, p::Name::turbo, at4k, {{std::string(kOther), "off"}, {std::string(kOther), "on"}});
+        require(value_of(repeated, kLever) == "a4" && value_of(repeated, kOther) == "on",
+                "the last value of a repeated option is the one timed and run: " + route_of(repeated, kLever));
+        const auto repeated_off = run(engine, p::Name::turbo, at4k, {{std::string(kOther), "on"}, {std::string(kOther), "off"}});
+        require(value_of(repeated_off, kLever) == "off" && value_of(repeated_off, kOther) == "off",
+                "a repeated option ending in off is spelled off: " + route_of(repeated_off, kLever));
+        // The same receipt on another execution (device product, workload or setting) or an unknown one decides nothing.
+        for (const std::string_view execution : {std::string_view{"fixture-exec-other-device"}, std::string_view{}}) {
+            auto elsewhere = at4k;
+            elsewhere.execution = execution;
+            const auto other = run(engine, p::Name::turbo, elsewhere);
+            require(value_of(other, kLever) == "off" && value_of(other, kOther) == "on",
+                    "a receipt never crosses executions: " + std::string(execution));
+        }
     }
     {
         // --allow-pending runs only cells no measurement decides: measured slower / within noise stay below.
@@ -695,7 +825,7 @@ void bound_evidence() {
             require(value_of(res, kLever) == "off" &&
                         route_of(res, kLever).find("unqualified benchmark") == std::string::npos,
                     "allow-pending never runs a measured FAST loser x" + std::to_string(speedup));
-            const auto unmeasured = run(engine, p::Name::fast, {p::Phase::prefill, 8192, 1, "dev"}, {}, true);
+            const auto unmeasured = run(engine, p::Name::fast, {p::Phase::prefill, 8192, 1, "dev", "fixture-exec"}, {}, true);
             require(value_of(unmeasured, kLever) == "a8" &&
                         route_of(unmeasured, kLever).find("unqualified benchmark") != std::string::npos,
                     "allow-pending runs the unmeasured regime as a benchmark arm");
@@ -715,13 +845,13 @@ void bound_evidence() {
         const p::Engine ungranted{"grant", "", kRows, false, "grant-v1", {}, {}, timed_only};
         require(value_of(run(ungranted, p::Name::fast, startup), kLever) == "off", "ungranted timed cell stays below at startup");
         require(value_of(run(ungranted, p::Name::fast, at4k), kLever) == "a8", "the row decides once the prompt is known");
-        require(value_of(run(timed, p::Name::fast, {p::Phase::prefill, 16384, 1, "dev"}), kLever) == "a8",
+        require(value_of(run(timed, p::Name::fast, {p::Phase::prefill, 16384, 1, "dev", "fixture-exec"}), kLever) == "a8",
                 "outside the timed bands the grant keeps its cell");
     }
     {
         // r51: the reference names every lever with its effective value, builtins included. A FAST row measured over
         // the builtin off stops deciding once the builtin itself is another execution.
-        constexpr std::array rows{fast_a8};
+        const std::array rows{fast_a8};
         const p::Engine engine{"builtin", "", kRows, false, "builtin-v1", {}, {}, rows};
         require(value_of(run(engine, p::Name::fast, at4k), kLever) == "a8", "FAST row over the builtin off applies");
         auto rebuilt = kRows;
@@ -742,14 +872,25 @@ void bound_evidence() {
         table[1].builtin = "1";
         table[1].off = {};
         table[1].kind = p::Kind::exact;
-        const std::array rows{measured_over(fast_a8, "ladder-arm/v2;fixture-w4a4@1=off,fixture-schedule@1=1")};
+        const std::array rows{measured_over(fast_a8, "fixture-w4a4@1=off,fixture-schedule@1=1")};
         const p::Engine engine{"schedule", "", table, false, "schedule-v1", {}, {}, rows};
         require(value_of(run(engine, p::Name::fast, at4k), kLever) == "a8", "FAST row over the default schedule applies");
         const auto res = run(engine, p::Name::fast, at4k, {{std::string(kSchedule), "2"}});
         require(value_of(res, kLever) == "off" && value_of(res, kSchedule) == "2",
                 "an exact schedule override makes the FAST receipt stale: " + route_of(res, kLever));
-        require(res.find(kLever)->ladder_reference == "ladder-arm/v2;fixture-w4a4@1=off,fixture-schedule@1=2",
+        require(res.find(kLever)->ladder_reference ==
+                    "ladder-arm/v3;fixture-exec;fixture-w4a4@1=off,fixture-schedule@1=2;candidate=fixture-w4a4@1=a8",
                 "the reference spells the override: " + res.find(kLever)->ladder_reference);
+        // A tier-specific exact schedule is part of the tier's incumbent execution (review r61): the row timed under
+        // the default schedule does not decide where FAST runs schedule 2, a row timed under schedule 2 does.
+        table[1].value = {"", "2", "", ""};
+        const p::Engine tiered{"schedule", "", table, false, "schedule-v1", {}, {}, rows};
+        const auto at_two = run(tiered, p::Name::fast, at4k);
+        require(value_of(at_two, kSchedule) == "2" && value_of(at_two, kLever) == "off",
+                "a row timed under another schedule does not decide the FAST schedule: " + route_of(at_two, kLever));
+        const std::array timed_two{measured_over(fast_a8, "fixture-w4a4@1=off,fixture-schedule@1=2")};
+        const p::Engine retimed{"schedule", "", table, false, "schedule-v1", {}, {}, timed_two};
+        require(value_of(run(retimed, p::Name::fast, at4k), kLever) == "a8", "a row timed under the FAST schedule applies");
     }
     {
         // A timing row names its value: an empty value covers no cell (it would also match a6).
@@ -780,8 +921,8 @@ void bound_evidence() {
         table[1].name = kSecond;
         table[1].env = "STRIX_FIXTURE_SECOND";
         table[1].value = {"", "", "", "b4"};
-        constexpr std::string_view kBase = "ladder-arm/v2;fixture-w4a4@1=off,fixture-second@1=off";
-        constexpr std::string_view kWithFirst = "ladder-arm/v2;fixture-w4a4@1=a4,fixture-second@1=off";
+        constexpr std::string_view kBase = "fixture-w4a4@1=off,fixture-second@1=off";
+        constexpr std::string_view kWithFirst = "fixture-w4a4@1=a4,fixture-second@1=off";
         const auto turbo_row = [](std::string_view lever, std::string_view value, double speedup, std::string_view over,
                                   std::string_view receipt) {
             return measured_over({lever, value, p::Name::turbo, p::Phase::prefill, "dev", 4096, 4096, 1, 1, speedup, 0.02,
@@ -819,7 +960,7 @@ void bound_evidence() {
         table[1].value = {"", "b8", "", ""};
         const std::array rows{measured_over({kLater, "b8", p::Name::fast, p::Phase::prefill, "dev", 4096, 4096, 1, 1,
                                              1.10, 0.02, "r/b8-over-default"},
-                                            "ladder-arm/v2;fixture-w4a4@1=off,fixture-later@1=off")};
+                                            "fixture-w4a4@1=off,fixture-later@1=off")};
         const p::Engine engine{"benchmark-arm", "", table, false, "benchmark-arm-v1", {}, {}, rows};
         const auto plain = run(engine, p::Name::fast, at4k);
         require(value_of(plain, kLever) == "off" && plain.find(kLater)->status == p::Status::set &&
@@ -828,9 +969,30 @@ void bound_evidence() {
         const auto bench = run(engine, p::Name::fast, at4k, {}, true);
         require(value_of(bench, kLever) == "a8" && bench.find(kLever)->status == p::Status::unqualified,
                 "--allow-pending runs the pending cell as an unqualified benchmark");
-        require(bench.find(kLater)->ladder_reference == "ladder-arm/v2;fixture-w4a4@1=a8,fixture-later@1=off" &&
+        require(bench.find(kLater)->ladder_reference ==
+                        "ladder-arm/v3;fixture-exec;fixture-w4a4@1=a8,fixture-later@1=off;candidate=fixture-later@1=b8" &&
                     bench.find(kLater)->status != p::Status::set,
                 "the benchmark cell is part of the later cell's reference: " + route_of(bench, kLater));
+        // TURBO falls back to the FAST cells the arms resolved, the unqualified benchmark cell included (review r61):
+        // a TURBO receipt measured over that cell decides, one measured over the dropped fallback does not.
+        table[1].value = {"", "b8", "", "b4"};
+        const auto turbo_row = [](std::string_view over, std::string_view receipt) {
+            return measured_over({kLater, "b4", p::Name::turbo, p::Phase::prefill, "dev", 4096, 4096, 1, 1, 1.10, 0.02,
+                                  receipt}, over);
+        };
+        const std::array over_bench{rows[0], turbo_row("fixture-w4a4@1=a8,fixture-later@1=b8", "r/b4-over-bench")};
+        const p::Engine with_bench{"benchmark-arm", "", table, false, "benchmark-arm-v1", {}, {}, over_bench};
+        const auto bench_turbo = run(with_bench, p::Name::turbo, at4k, {}, true);
+        require(value_of(bench_turbo, kLever) == "a8" && bench_turbo.find(kLever)->status == p::Status::unqualified &&
+                    value_of(bench_turbo, kLater) == "b4" &&
+                    bench_turbo.find(kLater)->ladder_reference ==
+                        "ladder-arm/v3;fixture-exec;fixture-w4a4@1=a8,fixture-later@1=b8;candidate=fixture-later@1=b4",
+                "TURBO exports the benchmark cell its receipt was timed over: " + route_of(bench_turbo, kLater));
+        const std::array over_dropped{rows[0], turbo_row("fixture-w4a4@1=off,fixture-later@1=b8", "r/b4-over-off")};
+        const p::Engine with_dropped{"benchmark-arm", "", table, false, "benchmark-arm-v1", {}, {}, over_dropped};
+        const auto mismatch = run(with_dropped, p::Name::turbo, at4k, {}, true);
+        require(value_of(mismatch, kLever) == "a8" && value_of(mismatch, kLater) == "b8",
+                "a receipt over a fallback the run does not export decides nothing: " + route_of(mismatch, kLater));
     }
 }
 }  // namespace
@@ -845,6 +1007,8 @@ int main(int argc, char** argv) try {
     verdicts();
     bound_evidence();
     defects();
+    shipped_rows();
+    execution_binding();
     custom_adapters();
     cuda_cli_server();
     namespace q = strix::qwen;

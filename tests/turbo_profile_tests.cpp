@@ -45,18 +45,18 @@ constexpr p::Lever kRows[] = {
      .kind = p::Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {true, true, true, false},
      .target = "fp16 head", .off = "off", .source = "pending fixture"},
 };
-constexpr p::Regime kRegime{p::Phase::prefill, 8, 1, "fixture"};
+constexpr p::Regime kRegime{p::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
 constexpr p::LadderRow kTiming[] = {
     // Every row names the execution it was measured over (LadderRow::over): the levers before it at its tier (cells of
     // one tier compose in table order), itself and the later levers at the tier below.
     {"flash", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "ladder-arm/v2;flash=0,replay=256,dense=0,head=default"},
+     "ladder-arm/v3;fixture-exec;flash=0,replay=256,dense=0,head=default;candidate=flash=1"},
     {"replay", "128", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "ladder-arm/v2;flash=1,replay=256,dense=1,head=default"},
+     "ladder-arm/v3;fixture-exec;flash=1,replay=256,dense=1,head=default;candidate=replay=128"},
     {"dense", "1", p::Name::fast, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "ladder-arm/v2;flash=1,replay=256,dense=0,head=default"},
+     "ladder-arm/v3;fixture-exec;flash=1,replay=256,dense=0,head=default;candidate=dense=1"},
     {"dense", "0", p::Name::turbo, kRegime.phase, kRegime.device, 8, 8, 1, 1, 1.1, 0.01, "fixture", false, {}, {},
-     "ladder-arm/v2;flash=1,replay=128,dense=1,head=default"},
+     "ladder-arm/v3;fixture-exec;flash=1,replay=128,dense=1,head=default;candidate=dense=0"},
 };
 const p::Engine kEngine{"turbo-fixture", "", kRows, false, "fixture-turbo-v1", {}, {}, kTiming};
 const p::Engine kNoTurbo{"no-turbo-fixture", "", kRows, false};

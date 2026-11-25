@@ -233,6 +233,7 @@ struct Resolved {
     std::vector<sp::LadderRow> ladder;
     sp::Engine engine;
     sp::Resolution resolution;
+    std::string execution;  // sp::Regime::execution of the timing lookup (owned here; empty: no ordinary row decides)
     Resolved() = default;
     Resolved(const Resolved&) = delete;
     Resolved& operator=(const Resolved&) = delete;
@@ -257,8 +258,19 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
         if (record.weights == regime.weights && record.route == regime.route)
             for (const auto& row : record.ladder)
                 if (!paired_half(row)) out->ladder.push_back(row);
-    const sp::Regime timing_regime{
-        sp::Phase::prefill, regime.uniform_prompt_length && regime.linear_session ? regime.prompt_tokens : 0, 1, regime.arch};
+    // Ordinary timing rows bind the device product, the priced workload and the weight / route settings, not only the
+    // architecture: a run whose product or workload is not known (no cost identity) is decided by no ordinary row.
+    const bool priced = regime.uniform_prompt_length && regime.linear_session &&
+                        regime.workload.prompt_tokens == regime.prompt_tokens;
+    if (priced) {
+        const std::string settings = std::string("weights=") + weights_name(regime.weights) + "|route=" +
+                                     route_name(regime.route) + "|arch=" + std::string(regime.arch) +
+                                     (regime.drafter ? "|drafter" : "");
+        out->execution = sp::ladder_execution({"cuda", regime.cost_device, regime.workload, settings});
+    }
+    const sp::Regime timing_regime{sp::Phase::prefill,
+                                   regime.uniform_prompt_length && regime.linear_session ? regime.prompt_tokens : 0, 1,
+                                   regime.arch, out->execution};
     const auto cuda_admission = [&](std::string_view identity) -> TurboAdmission {
         if (regime.arch != "sm_120") return {false, "requires CUDA sm_120"};
         return turbo_admission(identity, regime, evidence);
@@ -273,9 +285,18 @@ inline std::unique_ptr<Resolved> resolve(std::optional<Name> profile, const Regi
             return cuda_admission(kDenseIdentity);
         }
         auto gate = turbo_admission(row.target, regime, evidence);
-        if (gate.ready && row.kind == Kind::exact &&
-            sp::ladder_judge(out->ladder, row.name, row.value[kTurboColumn], Name::turbo, timing_regime).rung != sp::Rung::applies)
-            return {false, "no timing gain for the schedule in this regime"};
+        if (gate.ready && row.kind == Kind::exact) {
+            // A TURBO schedule is timed on the same execution as an ordinary cell: rows of another device product,
+            // workload or setting (or a run that cannot spell its own) never decide it.
+            std::vector<sp::LadderRow> bound;
+            for (const auto& timed : out->ladder)
+                if (!timed.incumbent && !out->execution.empty() &&
+                    sp::ladder_reference_execution(timed.over) == out->execution)
+                    bound.push_back(timed);
+            if (sp::ladder_judge(bound, row.name, row.value[kTurboColumn], Name::turbo, timing_regime).rung !=
+                sp::Rung::applies)
+                return {false, "no timing gain for the schedule in this regime"};
+        }
         return gate;
     };
     const bool kv_override = std::ranges::any_of(cli, [](const auto& opt) {

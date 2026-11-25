@@ -308,8 +308,11 @@ int main(int argc, char** argv) {
             + prompt.size() + prompt_len + static_cast<std::uint64_t>(n_gen) * decode_rows + 64;
         const auto context_capacity = std::max<std::uint64_t>(max_pos, total_ctx);
         std::string cost_device;
-        if (joint_workload && profile == strix::profile::Name::turbo && !qp::turbo_evidence.empty() &&
-            !model.empty() && !prompt.empty() && opt.turbo_weights == q::TurboWeights::converted) {
+        // The device product and priced workload bind every timing receipt (paired and ordinary) of a lossy tier; the
+        // timing evidence of this table is on the converted NVFP4 pack only.
+        if (joint_workload && (profile == strix::profile::Name::fast || profile == strix::profile::Name::turbo) &&
+            !qp::turbo_evidence.empty() && !model.empty() && !prompt.empty() &&
+            opt.turbo_weights == q::TurboWeights::converted) {
             cost_device = strix::device::cuda_cost_device_identity();
             regime.cost_device = cost_device;
             regime.workload = {regime.prompt_tokens, context_capacity, 1, pf_chunk, rows_cap, decode_rows, 0, n_gen};

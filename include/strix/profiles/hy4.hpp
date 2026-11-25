@@ -56,6 +56,7 @@ struct Regime {
     Device device = Device::unknown;
     Topology topology = Topology::one_node;
     std::uint64_t prompt_tokens = 0;  // the prompt of this run (an entry point that resolves earlier: the longest it admits)
+    std::string_view execution{};     // sp::Regime::execution (caller-owned; empty: no ordinary timing row decides)
 };
 [[nodiscard]] inline Device device_of(std::string_view arch) {  // hipDeviceProp_t::gcnArchName; features after ':' ignored
     return arch.substr(0, arch.find(':')) == "gfx1151" ? Device::gfx1151 : Device::unknown;
@@ -183,7 +184,7 @@ struct Resolved {
     out->engine.ladder = std::span<const sp::LadderRow>(out->ladder);
     auto scoped = inputs;
     scoped.regime = {sp::Phase::prefill, regime.prompt_tokens, 1,
-                     regime.device == Device::unknown ? std::string_view{} : device_name(regime.device)};
+                     regime.device == Device::unknown ? std::string_view{} : device_name(regime.device), regime.execution};
     out->resolution = sp::resolve(out->engine, scoped);
     for (auto& entry : out->resolution.entries) {
         if (entry.status != sp::Status::pending && entry.status != sp::Status::unqualified) continue;

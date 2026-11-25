@@ -62,6 +62,9 @@ Options run(std::optional<Name> profile, TurboWeights w, qp::Route route, std::u
     o.turbo_weights = w;
     auto regime = qp::regime_of(o, route, tokens);
     regime.arch = "fixture";
+    // Ordinary timing rows bind the device product and the priced workload (sp::Regime::execution).
+    regime.cost_device = "fixture-cost-device";
+    regime.workload = {tokens, tokens + 1024, 1, 2048, 32, 1, 0, 100};
     std::vector<strix::profile::LadderRow> ladder;
     for (const auto& row : rows)
         if (row.weights == regime.weights && row.route == route)
@@ -70,17 +73,20 @@ Options run(std::optional<Name> profile, TurboWeights w, qp::Route route, std::u
                               1, 1, 1.1, 0.02, "fixture timing"});
     // Each timing row names its measured FAST value and the execution it was measured over (LadderArms::over): the
     // default FAST execution without explicit settings (an explicit override makes the row stale). Cells of one tier
-    // compose in table order, so the references settle within one pass per row.
+    // extend its incumbent execution in table order, so the references settle within one pass per row.
     for (auto& row : ladder)
         if (row.value.empty())
             for (const auto& lever : qp::table)
                 if (lever.name == row.lever) row.value = lever.value[static_cast<unsigned>(Name::fast)];
     std::vector<std::string> references(ladder.size());
     const bool lossy = profile && (*profile == Name::fast || *profile == Name::turbo);
-    for (std::size_t pass = 0; lossy && pass <= ladder.size(); ++pass) {
-        const qp::TurboEvidence measured[] = {{regime.weights, route, {}, {}, ladder}};
+    // The first pass reads the references with no timing row (grants, schedules and lower cells only): every row is
+    // then measured over the execution its cell extends, and the later passes settle the timed cells in table order.
+    for (std::size_t pass = 0; lossy && pass <= ladder.size() + 1U; ++pass) {
+        const qp::TurboEvidence measured[] = {
+            {regime.weights, route, {}, {}, pass == 0 ? std::span<const strix::profile::LadderRow>{} : std::span<const strix::profile::LadderRow>(ladder)}};
         const auto fast = qp::resolve(Name::fast, regime, {}, rows, measured);
-        bool settled = true;
+        bool settled = pass != 0;
         for (std::size_t i = 0; i < ladder.size(); ++i) {
             const auto* entry = fast->find(ladder[i].lever);
             if (entry == nullptr || entry->ladder_reference == references[i]) continue;
@@ -198,7 +204,8 @@ int main() {
     // 3. Explicit per-lever options override the profile (both directions) and keep today's spellings.
     {
         const Options a = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192, {{"prefill_gdn", "serial"}});
-        check(a.prefill_arith == PrefillArith::fast4 && a.prefill_gdn == PrefillGdn::serial, "explicit --prefill-gdn serial under fast");
+        // The explicit value runs; the fast4 receipt was timed with the FAST chunk16tc scan, so it does not decide here.
+        check(a.prefill_arith == PrefillArith::exact && a.prefill_gdn == PrefillGdn::serial, "explicit --prefill-gdn serial under fast");
         const Options b = run(std::nullopt, TurboWeights::off, qp::Route::large_prefill, 0, {{"prefill_arith", "fast8"}, {"prefill_attn8", "on"}});
         check(b.prefill_arith == PrefillArith::fast8 && b.prefill_attn8, "explicit levers without a profile word");
         const Options c = run(std::nullopt, TurboWeights::off, qp::Route::large_prefill, 0, {{"prefill_arith", "windows"}});
@@ -356,6 +363,12 @@ int main() {
         for (std::size_t i = 1; i < gains.size(); ++i)
             for (const auto& lever : qp::table)
                 if (lever.name == keys[i]) gains[i].value = lever.value[static_cast<unsigned>(Name::turbo)];
+        // The TURBO schedule (an exact lever, no ladder reference of its own) is timed on the run's execution.
+        const std::string execution = resolve(regime)->execution;
+        references[3] = std::string(p::kLadderArmVersion) + ";" + execution + ";drafter_window=7;candidate=drafter_window=" +
+                        std::string(gains[3].value);
+        gains[3].over = references[3];
+        check(!execution.empty(), "the priced dense CLI spells its execution");
         for (std::size_t pass = 0; pass < gains.size(); ++pass) {
             candidate_base = qp::joint_execution(resolve(regime)->resolution);
             gains[0].joint_scope.candidate_base = candidate_base;
@@ -367,7 +380,7 @@ int main() {
                 gains[i].over = references[i];
             }
         }
-        check(references[2].starts_with("ladder-arm/v2;"), ("Qwen dense reports the TURBO dense reference: " + references[2]).c_str());
+        check(references[2].starts_with("ladder-arm/v3;"), ("Qwen dense reports the TURBO dense reference: " + references[2]).c_str());
         const auto admitted = resolve(regime);
         qp::apply(options, *admitted);
         kv = qp::resolve_kv(Name::turbo, {}, regime.route, explicit_arms);
@@ -382,6 +395,9 @@ int main() {
         different_work = regime;
         ++different_work.workload.decode_rows;
         check(resolve(different_work)->find("kv_fp8")->value == "native", "joint receipt binds decode width");
+        check(resolve(different_work)->find("dense_activation")->value == "off" &&
+                  resolve(different_work)->find("drafter_window")->value == "7",
+              "ordinary and schedule receipts bind the priced workload too");
         different_work = regime;
         ++different_work.workload.verify_rows;
         check(resolve(different_work)->find("kv_fp8")->value == "native", "joint receipt binds verify width");
@@ -411,7 +427,7 @@ int main() {
             reader.push_back({regime.weights, regime.route,
                               {"decode_attn8", "", 0, p::kNoPromptBound, "fixture FAST reader receipt"}});
             const std::string fast_reader_reference = qp::resolve(Name::fast, regime, {}, reader)->find("decode_attn8")->ladder_reference;
-            check(fast_reader_reference.starts_with("ladder-arm/v2;"), "Qwen dense reports the FAST reader reference");
+            check(fast_reader_reference.starts_with("ladder-arm/v3;"), "Qwen dense reports the FAST reader reference");
             const auto fast_reader = [&](Name tier) {
                 std::vector<p::LadderRow> ladder(gains.begin(), gains.end());  // the evidence as it stands now
                 ladder.push_back({"decode_attn8", "on", Name::fast, p::Phase::prefill, regime.arch, 8192, 8192, 1, 1,
@@ -524,7 +540,9 @@ int main() {
     // band) leaves its cell at the tier below until a matching timing row is registered.
     {
         namespace p = strix::profile;
-        const qp::Regime regime{qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 8192, "fixture GPU", "sm_120", true};
+        qp::Regime regime{qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 8192, "fixture GPU", "sm_120", true};
+        regime.cost_device = "fixture-cost-device";  // a timing row binds the device product and the priced workload
+        regime.workload = {8192, 16384, 1, 2048, 32, 1, 0, 100};
         const auto lever_value = [](const qp::Resolved& r, const char* lever) { return r.find(lever)->value; };
         auto changed = qp::table[0];
         check(qp::incumbent_grant(changed, regime, qp::incumbent_grants) != nullptr, "fixture incumbent grant exists");
@@ -549,7 +567,7 @@ int main() {
                                   1.04, 0.01, "fixture timing"}};
         // Measured over the reference that runs under the cell (LadderArms::over).
         const std::string hid_reference = extended->find("prefill_hid")->ladder_reference;
-        check(hid_reference.starts_with("ladder-arm/v2;"), ("Qwen dense reports the prefill_hid reference: " + hid_reference).c_str());
+        check(hid_reference.starts_with("ladder-arm/v3;"), ("Qwen dense reports the prefill_hid reference: " + hid_reference).c_str());
         timing[0].over = hid_reference;
         const qp::TurboEvidence evidence[] = {{regime.weights, regime.route, {}, {}, timing}};
         check(lever_value(*qp::resolve(Name::fast, regime, {}, rows, evidence), "prefill_hid") == "bf16",

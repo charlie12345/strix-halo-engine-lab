@@ -146,7 +146,7 @@ void resolver() {
     // Ladder rule (shared benchmark contract): --allow-pending runs a runnable pending cell stamped unqualified where no
     // timing row decides the regime, and never where a matching row measured it slower or within noise.
     inputs.allow_pending = true;
-    inputs.regime = {::strix::profile::Phase::prefill, 8, 1, "fixture"};
+    inputs.regime = {::strix::profile::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
     r = pr::resolve(pr::Name::fast, inputs, synthetic);
     check(r.find("pending")->status == pr::Status::unqualified && r.find("absent")->status == pr::Status::pending,
           "allow-pending without a timing row runs the runnable cell as an unqualified benchmark");
@@ -203,7 +203,7 @@ void provisional_resolution() {
     Env env;
     pr::Inputs inputs{{}, lookup(env), true};
     // Ladder rule: both lossy cells run in the measured regime of their timing rows.
-    inputs.regime = {::strix::profile::Phase::prefill, 8, 1, "fixture"};
+    inputs.regime = {::strix::profile::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
     std::array<::strix::profile::LadderRow, 3> measured{{
         {"pending", "1", ::strix::profile::Name::fast, ::strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01, "host fixture"},
         {"provisional", "1", ::strix::profile::Name::fast, ::strix::profile::Phase::prefill, "fixture", 8, 8, 1, 1, 1.1, 0.01,
@@ -413,7 +413,7 @@ void identity() {
 int restart_child() {
     pr::Inputs inputs; inputs.allow_pending = true;
     // Ladder rule: the allow-pending cell runs in the regime of its timing row.
-    inputs.regime = {::strix::profile::Phase::prefill, 8, 1, "fixture"};
+    inputs.regime = {::strix::profile::Phase::prefill, 8, 1, "fixture", "fixture-exec"};
     constexpr ::strix::profile::LadderRow timing{"pending", "1", ::strix::profile::Name::fast, ::strix::profile::Phase::prefill,
                                                  "fixture", 8, 8, 1, 1, 1.1, 0.01, "host fixture"};
     const auto r = pr::resolve(pr::Name::fast, inputs, synthetic, std::span(&timing, 1));

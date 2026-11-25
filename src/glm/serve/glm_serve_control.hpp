@@ -32,7 +32,7 @@
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 12;  // v12: embed frame summary before its bytes; v11: sampled MTP (kRunSample / kRunSampleDrafts on mtp_run / mtp_enter); v10: prefill embed frame (kPrefillEmbeds); v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
+inline constexpr std::uint32_t kControlVersion = 13;  // v13: the sampled MTP window decision carries the accepted-draft count (11 words; a v12 build exchanged 10); v12: embed frame summary before its bytes; v11: sampled MTP (kRunSample / kRunSampleDrafts on mtp_run / mtp_enter); v10: prefill embed frame (kPrefillEmbeds); v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 // prefill pflags (with kPrefillMtp): a prefill_mtp session of layer units; `budget` = units to run (0: cancel it).

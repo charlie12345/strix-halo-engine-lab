@@ -396,7 +396,7 @@ element) and is allocated in `set_embed_rows`, never inside a prefill.
   agreement the ranks exchange before the first forward.
 - Serving (`strix-glm5-serve --vision`, rank 0): the API layer expands each image part to
   `<|begin_of_image|>`, the virtual ids of its rows and `<|end_of_image|>`. The lead flags every prefill command
-  whose tokens hold virtual ids (`kPrefillEmbeds`, control version 12); on the pair a fixed-size summary of the
+  whose tokens hold virtual ids (`kPrefillEmbeds`, control version 13); on the pair a fixed-size summary of the
   chunk's embed frame (byte length, span count, rows, width, axes) follows the tokens, and the follower checks it
   against the chunk's distinct virtual ids, the model width and the chunk's row bound (`embed_frame_rows_bound`)
   before it allocates; the frame itself follows, with the rows only for spans the follower does not hold yet, and

@@ -1146,7 +1146,7 @@ void test_sampled_mtp_replay() {
         const bool threw = throws_with([&] { first = gs::replay(units, solo, pf, prompt, true, 2, 64, nullptr, choice); }, "");
         CHECK(!threw && first.size() == 1 && first[0] == gs::kPrefillPending);
     }
-    CHECK(gs::kControlVersion == 12);
+    CHECK(gs::kControlVersion == 13);
     std::printf("sampled MTP replay: flags and the lead's sampler reach the engine; unknown flags and engines refused\n");
 }
 
@@ -2098,6 +2098,24 @@ int main(int argc, char** argv) {
             CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
+        // Builds of earlier layouts (v12: the 10-word sampled decision; v11: the contributor's; v9: main before this
+        // change) are refused at the first exchange on either rank, before any later field is read.
+        for (const std::uint32_t old : {12U, 11U, 9U})
+            for (const std::uint32_t rank : {0U, 1U}) {
+                gs::Channel ch(
+                    [&](std::span<const std::byte> out, std::span<std::byte> in, std::uint32_t, std::uint64_t) {
+                        std::memcpy(in.data(), out.data(), in.size());
+                        std::memcpy(in.data() + offsetof(gs::Control, version), &old, sizeof old);
+                        const std::uint32_t peer_rank = rank ^ 1U;
+                        std::memcpy(in.data() + offsetof(gs::Control, rank), &peer_rank, sizeof peer_rank);
+                    },
+                    rank);
+                gs::Control hello;
+                hello.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
+                CHECK(throws_with([&] { (void)ch.exchange(hello); },
+                                  "protocol version " + std::to_string(old) + " from the peer, expected 13"));
+            }
+        std::printf("v12 / v11 / v9 peers: refused at the first exchange on rank 0 and rank 1\n");
         std::vector<gs::WireRow> rows = {{0, 1, 3}, {1, 1, 3}, {2, 1, 9}};
         CHECK(gs::consecutive_slots(rows));
         gs::check_rows(rows, 8, 16);

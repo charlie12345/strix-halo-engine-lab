@@ -102,12 +102,16 @@ inline constexpr std::string_view kTime24k = "qwen_night-tim-c2-24k(-exact) 24,5
                                                      sp::BandEvidence evidence) {
     return {.lever = lever, .value = value, .tier = sp::Name::fast, .phase = sp::Phase::prefill, .device = "gfx1151",
             .min_context = lo, .max_context = hi, .min_lanes = 1, .max_lanes = 1, .speedup = speedup, .noise = kNoise,
-            .receipt = receipt, .band_bound = true, .band_evidence = evidence};
+            .receipt = receipt, .identity = "v1", .band_bound = true, .band_evidence = evidence};
 }
+// Lower edges (integration head 2019eacec5, bin 4f23e3450dd68600, one gfx1151 node, ABBA, warm ms, evicted 0): at 4 and
+// 16 tokens the window ties the EXACT windows (74.7 / 74.6 ms, 99.1 / 99.1 ms: no gain), from 64 it wins (282 -> 156 ms,
+// 256: 1,122 -> 377, 1,024: 4,763 -> 1,463), so the first band starts at its first winning point, 64. 2,049: 10,212 ->
+// 3,024 ms; 4,096: 25,373 -> 6,290 ms; 8,193: 68,262 (one cold EXACT) -> 13,403 / 13,067 cold, so those edges hold.
 inline constexpr sp::LadderRow kBandRows[] = {
-    band_row("wide_rows", "512", 1, 2048, kWide2k, kTime2k, {{2048}, {2048}, kGate2k, true}),
-    band_row("wide_rows", "512", 2049, 8192, kWide8k, kTime8k, {{8192}, {8192}, kGate8k, true}),
-    band_row("wide_rows", "512", 8193, 24576, kWide24k, kTime24k, {{24576}, {24064, 24576}, kGate24k, true}),
+    band_row("wide_rows", "512", 1, 2048, kWide2k, kTime2k, {{64, 256, 1024, 2048}, {2048}, kGate2k, true, true}),
+    band_row("wide_rows", "512", 2049, 8192, kWide8k, kTime8k, {{2049, 4096, 8192}, {8192}, kGate8k, false}),
+    band_row("wide_rows", "512", 8193, 24576, kWide24k, kTime24k, {{8193, 24576}, {24064, 24576}, kGate24k, false}),
 };
 
 [[nodiscard]] inline const Qualified* qualification(std::string_view lever, std::string_view value,
@@ -257,11 +261,11 @@ struct Command {
 
 [[nodiscard]] inline std::string effective_config(App app, const sp::Resolution& resolution) {
     auto json = resolution.json();
+    json.pop_back();
+    json += ",\"device_probe\":\"skipped for inspection\"";
     const auto* window = resolution.find(window_lever(app));
-    if (window && !window->reason.empty()) {
-        json.pop_back();
-        json += ",\"prefill_route\":" + sp::json_string(window->reason) + "}";
-    }
+    if (window && !window->reason.empty()) json += ",\"prefill_route\":" + sp::json_string(window->reason);
+    json += '}';
     return json;
 }
 

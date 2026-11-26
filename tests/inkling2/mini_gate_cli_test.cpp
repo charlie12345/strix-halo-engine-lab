@@ -138,14 +138,23 @@ void test_cuda_route_options() {
     using Mode = strix::serve::CliSpeculation;
     constexpr auto bf16 = strix::weight::kBf16WeightStorage;
     constexpr auto q8 = strix::weight::kQ8WeightStorage;
-    // The row default (auto) on the CUDA step program: the program runs, speculation is declined with its reason.
+    // The row default (auto) on CUDA: the verifying route (resident replay: drafter, arbiter, verify window program).
     {
         auto by_row = parse({"1", "--generate", "4"});
         cli::StepProgramOptions defaults;
         const auto route = cli::resolve_cuda_step_route(by_row, defaults, bf16, false);
-        require(by_row.generation.speculation == Mode::automatic && route.program && route.speculation == Mode::off &&
-                    !route.speculation_reason.empty(),
-                "the speculation row default on the CUDA step program: declined with its reason");
+        require(by_row.generation.speculation == Mode::automatic && !route.program &&
+                    route.speculation == Mode::automatic && route.speculation_reason.empty() && route.plain_program,
+                "the speculation row default on CUDA resolves the verifying route, plain rows on the step program");
+        // A run that can never draft under the default (token sampling) keeps the step program route, as before the
+        // verifying default; an embeddings prompt is known only at load: the verifying loader then runs every decode row
+        // on the plain-row route (DeviceCliDecoder::decode).
+        auto sampled = parse({"1", "--generate", "4", "--temperature", "0.7"});
+        const auto sampled_route = cli::resolve_cuda_step_route(sampled, defaults, bf16, false);
+        require(sampled_route.program && !sampled_route.plain_program && sampled_route.speculation == Mode::off,
+                "a sampled run under the default keeps the step program route (auto declined)");
+        require(!cli::resolve_cuda_step_route(by_row, defaults, q8, false).plain_program,
+                "Q8 weights keep every row on the resident decoder (the step program needs BF16)");
     }
     auto options = parse({"1", "--generate", "4", "--speculation", "off"});
     cli::StepProgramOptions program;
@@ -168,11 +177,15 @@ void test_cuda_route_options() {
     expect_invalid([&] { (void)resolve(q8); });
     require(resolve(bf16, true).program, "explicit native K1 preparation did not keep the BF16 program");
     program.requested = false;
-    require(resolve().program, "auto changed the default executor");
-    require(resolve(bf16, true).program && resolve(bf16, true).speculation == Mode::off,
-            "default native K1 preparation changed program selection or verifier receipt");
+    require(!resolve().program && resolve().speculation == Mode::automatic, "auto did not take the verifying route");
+    require(!resolve(bf16, true).program && resolve(bf16, true).speculation == Mode::automatic,
+            "auto with native K1 preparation did not keep the verifying route");
     expect_invalid([&] { (void)resolve(q8, true); });
-    expect_invalid([&] { (void)resolve(q8); });
+    require(!resolve(q8).program && resolve(q8).speculation == Mode::automatic, "auto on Q8 left the resident replay");
+    program.latency_forms_set = true;  // an explicit step-program option keeps the program (auto declined, reported)
+    require(resolve().program && resolve().speculation == Mode::off && !resolve().speculation_reason.empty(),
+            "an explicit step-program option did not keep the program under auto");
+    program.latency_forms_set = false;
 
     options.step_graphs = false;
     require(!resolve(q8).program && resolve(q8).speculation == Mode::automatic,
@@ -194,7 +207,11 @@ void test_cuda_route_options() {
     options.step_graphs.reset();
 
     options.dspark = "sidecar.safetensors";
+    require(!resolve().program && resolve().speculation == Mode::automatic,
+            "auto with a drafter file did not take the verifying route");
+    options.generation.speculation = Mode::off;
     expect_invalid([&] { (void)resolve(); });
+    options.generation.speculation = Mode::automatic;
     options.step_graphs = false;
     require(!resolve().program, "explicit resident DSpark route was lost");
     options.step_graphs.reset();
@@ -261,11 +278,12 @@ void test_strixpack_entry_points() {
         bool step_program;
         bool explicit_program = false;
         bool gate = false;
+        bool default_route = false;  // no route flag: the CLI's own default (auto: the verifying route)
     };
     constexpr Entry entries[]{
         {"HIP CLI", "hip", false},
         {"CUDA CLI", "cuda", false},
-        {"automatic CUDA step program", "cuda", true},
+        {"automatic CUDA route (auto speculation: resident replay)", "cuda", false, false, false, true},
         {"explicit CUDA step program", "cuda", true, true},
         {"HIP gate", "hip", false, false, true},
         {"CUDA gate", "cuda", true, false, true},
@@ -283,7 +301,7 @@ void test_strixpack_entry_points() {
                                          "--gate-arm", "FAST", "--gate-rows", "2", "--gate-mode", "decode"});
             else
                 args.insert(args.end(), {"1", "--generate", "3"});
-            if (!hip && !entry.step_program) args.emplace_back("--no-step-graph");
+            if (!hip && !entry.step_program && !entry.default_route) args.emplace_back("--no-step-graph");
             if (entry.explicit_program) args.emplace_back("--step-program");
             if (policy) args.insert(args.end(), {"--qualify-weights", policy});
             cli::StepProgramOptions program;

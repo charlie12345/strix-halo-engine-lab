@@ -129,10 +129,12 @@ public:
         }
         session_->append(backend_, chunk, workspace_.convolution_checkpoint, workspace_.kv_checkpoint, [&] {
             if constexpr (!std::is_same_v<Prepare, std::nullptr_t>) prepare();
-            // A one-row step capture stores the DSpark taps at the step descriptor's position
+            // A captured chunk (the one-row step, a verify window program) stores the DSpark taps at its device position
             // (MiniResidentBackend::store_draft_tap): it takes the tap plane from position 0, not the capture's row.
             bool capturing = false;
-            if constexpr (requires { backend_.capture_descriptor(); }) capturing = backend_.capture_descriptor() != nullptr;
+            if constexpr (requires { backend_.capture_position(); }) capturing = backend_.capture_position() != nullptr;
+            else if constexpr (requires { backend_.capture_descriptor(); })
+                capturing = backend_.capture_descriptor() != nullptr;
             ChunkForward<false> forward(*this, chunk, image_elements, capturing ? plane : taps);
             forward.run(embeddings, output);
             if constexpr (!std::is_same_v<Finalize, std::nullptr_t>) finalize(chunk, MiniConstRows(output));
@@ -346,10 +348,10 @@ private:
                     base += elements;
                 }
             } else {
+                // A taped (staged verify) chunk keeps every input row of the stream for its partial commit: one copy
+                // per stream (the input is const, so recording before the convolution is the same bytes).
                 record_tape(input, visit_state_.tape[path]);
                 backend_.convolve(visit, stream, input, visit_state_.history[path], output);
-                // A taped (staged verify) chunk keeps every input row of the stream for its partial commit.
-                if (const auto tape = visit_state_.tape[path]; !tape.empty()) backend_.copy(input, tape);
             }
         }
 

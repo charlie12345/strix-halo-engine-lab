@@ -45,7 +45,7 @@ public:
                      moe_core::grouped_w4a4::Activations moe_w4a4 = moe_core::grouped_w4a4::Activations::bf16,
                      bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
                      bool controller_one_plane = false, bool attn_projected_bias = false, bool screened_head = false,
-                     unsigned verify_rows = 0U, MiniLowBitRows lowbit = {})
+                     unsigned verify_rows = 0U, MiniLowBitRows lowbit = {}, bool plain_program = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane, false, lowbit),
           projected_bias_(attn_projected_bias) {
@@ -57,6 +57,39 @@ public:
                   << '\n';
         std::cerr << "Inkling verify_rows " << mini_verify_rows_name(levers.verify_rows, verify_rows) << '\n';
         if (dspark) drafter_.emplace(decoder_, load.positions, dspark);
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+        // The speculator's one-row steps on the CUDA step program (the program route's forms and fusion) over this
+        // decoder's own state: same KV / histories / DSpark taps, so drafting passes on the resident verify windows
+        // continue from it. Only where both routes run the same arithmetic (no FAST weight-image levers); else resident.
+        // Default on (q54: code 132.8 tok/s, prose 0.966 x the plain step program); off switch
+        // STRIX_INKLING_PLAIN_ROW_ROUTE=resident keeps every row of the verifying route on the resident decoder.
+        // A verifying-route load that cannot draft (token sampling, an embeddings prompt: the shared CLI loads it with
+        // speculation off) runs every decode row here too (decode() below), as the program route it replaced did.
+        const char* row_route = strix::envcfg::text("STRIX_INKLING_PLAIN_ROW_ROUTE");
+        if (row_route && std::string_view(row_route) == "resident") plain_program = false;
+        if (plain_program && !combine_image && !prepared_round_fold && !narrow_experts) {
+            plain_.emplace(decoder_, true, mini_latency_forms(kMiniDefaultForms));
+            decoder_.set_plain_row_route([this](unsigned token, std::span<float> logits) {
+                return plain_->decode(token, logits);
+            });
+        }
+        std::cerr << "inkling2 plain-row route=" << (plain_ ? "program" : "resident") << '\n';
+#else
+        (void)plain_program;
+#endif
+#if !defined(__HIPCC__)
+        // Verify window programs (one captured graph per window rows; device identity fixture q52r PASS): an explicit
+        // option until a timing receipt decides the default of the drafting passes. The fixture covers the EXACT
+        // levers (projected bias, screened or full head): a profile with a FAST weight-image or expert lever declines.
+        if (const char* window = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS"); window && std::string_view(window) == "1") {
+            const bool proven = !combine_image && !prepared_round_fold && !narrow_experts && !controller_one_plane &&
+                                moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias;
+            if (proven) decoder_.set_window_programs(true);
+            else std::cerr << "inkling2 verify window programs declined (unproven for this profile: the identity "
+                              "fixture covers the EXACT levers only)\n";
+        }
+        std::cerr << "inkling2 verify window programs " << (decoder_.window_programs() ? "on" : "off") << '\n';
+#endif
         // Calibration statistics (off unless STRIX_CALIB_MOMENTS=FILE): the prompt's attention / output-projection /
         // head input rows accumulate into strix/weight/calib_moments.hpp second moments, written after each prefill.
         if (const char* path = strix::envcfg::text("STRIX_CALIB_MOMENTS"); path && *path) {
@@ -85,7 +118,8 @@ public:
     }
 
     unsigned decode(unsigned token, std::span<float> logits) override {
-        return decoder_.decode(token, logits);
+        // The plain-row route when bound (the step program over this decoder's state), else the resident step.
+        return decoder_.decode_committed_row(token, logits);
     }
     unsigned prefill_embedded(std::span<const unsigned> ids, const std::shared_ptr<const session::EmbedTable>& table,
                               std::span<float> logits) override {
@@ -110,6 +144,9 @@ private:
     MiniResidentDecoder decoder_;
     spec::EngineVerifyTarget<MiniResidentDecoder> target_{decoder_};
     std::optional<MiniResidentDSpark> drafter_;
+#if defined(STRIX_INKLING2_STEP_PROGRAM)
+    std::optional<MiniCudaProgramDecoder> plain_;  // after decoder_: destroyed first (it holds the decoder)
+#endif
     std::optional<weight::calib::MomentSet> calibration_;
     std::string calibration_path_;
     bool projected_bias_ = false;
@@ -375,11 +412,13 @@ int main(int argc, char** argv) {
         std::optional<ResolvedWeights> loaded;
         auto& weights = early.plan;
         const auto step_graphs = options.step_graphs.value_or(MiniResidentBackend::default_step_graphs);
+        bool plain_program = false;  // the verifying route's one-row steps on the CUDA step program
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         const char* grouped_prepare = strix::envcfg::text("STRIX_INKLING_K1BIND");
         const bool resident_k1 = grouped_prepare && std::string_view(grouped_prepare) == "1";
         const auto route = cli::resolve_cuda_step_route(options, program_options, weights.storage, resident_k1);
         const bool step_program = route.program;
+        plain_program = route.plain_program;
         options.generation.speculation = route.speculation;
 #endif
         // The resident route's drafter (strix/spec/drafter_source.hpp), resolved after the CUDA step route (which may
@@ -416,7 +455,7 @@ int main(int argc, char** argv) {
             };
         else
 #endif
-        family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, &drafter,
+        family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, &drafter, plain_program,
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier),
                        narrow = mini_experts_nvfp4(options.tier),
@@ -442,7 +481,7 @@ int main(int argc, char** argv) {
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
                     moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, screened_head,
-                    verify_rows, std::move(lowbit));
+                    verify_rows, std::move(lowbit), plain_program);
             });
         };
         // The rows the decoder was loaded with once the shared load fell back (strix-prefill-chunk line): a second load

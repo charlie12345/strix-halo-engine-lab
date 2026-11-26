@@ -166,6 +166,9 @@ struct CudaStepRoute {
     bool program;
     serve::CliSpeculation speculation;
     std::string_view speculation_reason;
+    // The verifying route's plain rows (the speculator's one-row steps) run on the CUDA step program over the resident
+    // decoder's own state (it records the DSpark taps); drafting passes stay on the resident verify windows.
+    bool plain_program = false;
 };
 
 inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepProgramOptions& program_options,
@@ -183,15 +186,27 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     if (resident_k1 && storage != weight::kBf16WeightStorage)
         throw std::invalid_argument("STRIX_INKLING_K1BIND=1 requires native BF16 weights");
 
+    // The speculation row default (auto) on a decode run takes the VERIFYING route: the resident replay holds the
+    // drafter, the arbiter and the verify window program, and the step program has no verifier (it would decline auto
+    // and run plain). An explicit step-program option (--step-program, latency forms, --no-epilogue-fusion), an explicit
+    // replay choice or a gate run keeps the former resolution. A run that can never draft (token sampling: the shared CLI
+    // loads it with speculation off) keeps the step program too; an embeddings prompt, known only at load, binds the
+    // plain rows of the verifying route to the step program instead (DeviceCliDecoder::decode).
+    const bool verifying = requested_mode == Mode::automatic && has_decode && !options.gate_manifest &&
+                           !options.step_graphs && !program_options.requested && !program_options.latency_forms_set &&
+                           program_options.epilogue_fusion && !token_sampling_enabled(options.generation.sampling);
     // E1 handles both packed and grouped decode. Its backend resolves the
     // K1 projection batch and the eager fallback for tapped recipes.
-    const bool program = program_options.requested || (has_decode && !options.step_graphs);
+    const bool program = !verifying && (program_options.requested || (has_decode && !options.step_graphs));
     if (!program) {
         if (!program_options.epilogue_fusion)
             throw std::invalid_argument("--no-epilogue-fusion requires the CUDA step program");
         if (program_options.latency_forms_set)
             throw std::invalid_argument("latency forms select step-program leaves: decode through --step-program");
-        return {false, requested_mode, {}};
+        // q52c (RTX, 11-26): plain prose rows ran 101.5 tok/s on the step program vs 91.7 on the resident auto route; the
+        // step program needs BF16 weights and no route tap, like its own route.
+        return {false, requested_mode, {},
+                verifying && storage == weight::kBf16WeightStorage && !resident_k1 && !options.gate_order_null};
     }
     require_mini_expert_consumer(options.tier, false);
     if (options.gate_order_null)

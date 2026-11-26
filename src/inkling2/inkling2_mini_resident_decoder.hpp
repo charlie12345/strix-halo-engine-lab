@@ -22,6 +22,7 @@
 #include "strix/logit_rows.hpp"
 #include "strix/serve/cohort_passes.hpp"
 #include "strix/session/embed_splice_device.hpp"
+#include "strix/session/linear_verify_step.hpp"
 
 #if !defined(__HIPCC__)
 #include "cuda/core/step_inputs.cuh"
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <bitset>
 #include <chrono>
 #include <cstdio>
@@ -407,6 +409,17 @@ public:
     }
     [[nodiscard]] std::span<float> step_program_embeddings() noexcept { return embeddings_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
+    // Verify window programs (MiniResidentBackend::try_window_graph): an explicit opt-in until the device identity
+    // fixture (tests/inkling2/mini_window_program_device_fixture.hpp) proves every stage of the captured window equal to
+    // the eager verify pass; off, every staged verify window runs eagerly (the incumbent route).
+    void set_window_programs(bool enabled) noexcept { window_programs_ = enabled; }
+    [[nodiscard]] bool window_programs() const noexcept { return window_programs_; }
+    // The final hidden rows of the last append (device rows, the head inputs) and the DSpark tap plane (device, every
+    // position): read-only views for the window program identity fixture.
+    [[nodiscard]] std::span<const float> last_hidden_rows(unsigned rows) const {
+        return hidden_.span().first(std::size_t{rows} * kHiddenWidth);
+    }
+    [[nodiscard]] std::span<const std::uint16_t> draft_tap_plane() const noexcept { return draft_taps_.span(); }
     [[nodiscard]] std::span<float> step_program_logits() noexcept { return logits_.span().first(kOutputVocabulary); }
     [[nodiscard]] core::ResidentGreedy& step_program_greedy() noexcept { return greedy_; }
     // The lever's screened head (nullptr: the full head) and the count of a step the program picked through it.
@@ -663,10 +676,16 @@ public:
         std::ranges::copy(top, output);
     }
 
-    // A one-row verify window (a speculator serial step) is the plain decode step, committed at once.
+    // A one-row verify window (a speculator serial step) is the plain decode step, committed at once. A drafting run may
+    // bind a plain-row route (set_plain_row_route: the CUDA step program over this decoder's own state, recording the
+    // DSpark taps): it takes the step unless the low-bit rows apply to it.
     [[nodiscard]] unsigned decode_committed_row(unsigned token, std::span<float> logits) {
+        if (plain_row_ && !backend_.lowbit_applies(MiniAppendKind::decode, 1U)) return plain_row_(token, logits);
         return decode(token, logits);
     }
+    using PlainRowRoute = std::function<unsigned(unsigned, std::span<float>)>;
+    void set_plain_row_route(PlainRowRoute route) { plain_row_ = std::move(route); }
+    [[nodiscard]] bool plain_row_route() const noexcept { return static_cast<bool>(plain_row_); }
 
     void commit(unsigned rows) {
         auto& state = slots_.front()->state();
@@ -788,6 +807,30 @@ private:
     }
 
 #if !defined(__HIPCC__)
+    // The window program of a staged verify window on `state`: block row r = (id r, position committed + r, the
+    // state's slot), every row valid (each stores its own KV row on the sequence's caches). Empty when the window is
+    // outside the lanes form (one row, more rows than a lanes launch) or its slot has no directory entry.
+    [[nodiscard]] std::optional<MiniResidentBackend::WindowProgram> window_program(const MiniResidentSessionState& state,
+                                                                                std::span<const unsigned> ids) {
+        const auto rows = static_cast<std::uint32_t>(ids.size());
+        if (rows < 2U || rows > attn::lanes::kMaxPreparedBf16Lanes || rows > exec::kStepMaxRows) return std::nullopt;
+        std::uint32_t slot = 0;
+        while (slot < slots_.size() && &slots_[slot]->state() != &state) ++slot;
+        if (slot >= slots_.size() || slot >= decode_rows_) return std::nullopt;
+        // The shared linear verify descriptor: it also sets the header valid mask that exec::step_row_valid reads (a block
+        // with rows but no mask made every row invalid: ids read 0, no K/V store, picks 0; q52).
+        MiniResidentBackend::WindowProgram program{};
+        program.block = session::linear_verify_step(
+            {rows, state.committed(), slot, 0U, session::LinearVerifyRows::inclusive_valid}, ids);
+        auto& owner = *slots_[slot];
+        const auto planes = owner.planes();
+        program.lanes = {exec::step_lane_view(backend_.window_block(), slot_directory_.data(), decode_rows_, rows),
+                         {reinterpret_cast<std::uintptr_t>(planes.keys.data()),
+                          reinterpret_cast<std::uintptr_t>(planes.values.data()),
+                          reinterpret_cast<std::uintptr_t>(owner.history().data())}};
+        return program;
+    }
+
     // Embedding of a cohort program: the ids come from the device step block (padded rows read id 0).
     void embed_lanes(MiniMutableRows output, unsigned rows, MiniAppendKind kind) {
         const auto table = weights_.bf16("embed.weight");
@@ -919,6 +962,14 @@ private:
         }
         backend_.rms(output.data(), gain.data(), output.data(), rows);
 #else
+        if (backend_.window_capturing()) {
+            // A captured verify window reads its ids from the window block (row r = the window's id r).
+            backend_.check(cuda::core::step_inputs::enqueue(backend_.window_block(),
+                cuda::core::step_inputs::Linear{{lane_anchor_.data(), lane_ids_.data()}}, stream_.get()));
+            backend_.check(enqueue_mini_cuda_embeddings(table.data(), gain.data(), lane_ids_.data(), output.data(), rows,
+                                                        stream_.get()));
+            return;
+        }
         if (!step) {
             // The caller's token span can be pageable.
             mini_gpu::copy(token_ids_.data(), ids.data(), ids.size_bytes(), mini_gpu::host_to_device, stream_.get());
@@ -1180,6 +1231,20 @@ private:
             backend_.abandon_capture();
             screened_graph_ = screened;
         }
+#if !defined(__HIPCC__)
+        // A staged verify window whose picks nobody reads as scores replays its window program (one graph per window
+        // rows; MiniResidentBackend::try_window_graph). The program captures the head it ran: a change of head form drops
+        // it with the step graph (abandon_capture / reset_step_graph).
+        std::optional<MiniResidentBackend::WindowProgram> window;
+        if (window_programs_ && kind == MiniAppendKind::verify && multi_pick && host_logits.empty() && !scores_read &&
+            !lowbit && backend_.step_graphs())
+            window = window_program(state, ids);
+        struct ClearWindow {
+            MiniResidentBackend& backend;
+            ~ClearWindow() { backend.set_window_program(nullptr); }
+        } clear_window{backend_};
+        backend_.set_window_program(window ? &*window : nullptr);
+#endif
         try {
             backend_.set_step_token(decode_step ? std::optional<unsigned>{ids.front()} : std::nullopt);
             MiniResidentForward forward(backend_, state, workspace(&state));
@@ -1249,6 +1314,10 @@ private:
                 },
                 [&] {
                     if (!pick_next) return;
+#if !defined(__HIPCC__)
+                    // A replayed window program re-ran the captured picks and their pinned reply copy.
+                    if (backend_.window_replayed()) greedy.replayed(static_cast<unsigned>(verify_top.size()));
+#endif
                     if (verify_top.empty()) token = checked_token(greedy, 0U);
                     else for (std::size_t row = 0; row < verify_top.size(); ++row)
                         verify_top[row] = checked_token(greedy, row);
@@ -1463,6 +1532,10 @@ private:
         float* scores = nullptr;
     } pending_scores_;
     std::optional<Screen> screen_;
+    PlainRowRoute plain_row_;  // set_plain_row_route: the speculator's one-row steps (empty: this decoder's decode)
+#if !defined(__HIPCC__)
+    bool window_programs_{false};  // set_window_programs: opt-in until the device identity fixture passes
+#endif
 #if defined(__HIPCC__)
     bool verify_lanes_pick_{false};  // verify rows level 2 admitted (set_verify_rows): lanes screened picks
 #endif

@@ -6,6 +6,21 @@ inline constexpr FormatId kQ8WeightStorage{"gguf.q8_0", 1};
 // Low-bit resident row storages produced at load from a BF16 matrix (strix/weight/host_lowbit.hpp layout).
 inline constexpr FormatId kQ4G64WeightStorage{"strix.q4_g64", 1};
 inline constexpr FormatId kQ6G64WeightStorage{"strix.q6_g64", 1};
+// Strix pack storages for the host grouped reference. Native consumers are admitted separately.
+inline constexpr FormatId kSP4WeightStorage{"strix.sp4", 1};
+inline constexpr FormatId kSP3WeightStorage{"strix.sp3", 1};
+inline constexpr FormatId kSP2WeightStorage{"strix.sp2", 1};
+[[nodiscard]] inline unsigned strixpack_bits(FormatId id) noexcept {
+    if (id == kSP2WeightStorage) return 2U;
+    if (id == kSP3WeightStorage) return 3U;
+    if (id == kSP4WeightStorage) return 4U;
+    return 0U;
+}
+[[nodiscard]] inline bool is_strixpack_storage(FormatId id) noexcept { return strixpack_bits(id) != 0U; }
+// Strix pack SP4 with the fixed 4-bit table {1,3,5,8,10,14,18,24} (strix/weight/host_lowbit.hpp sp::, 68 B per 128
+// weights, one scale byte per 32): produced only by strix-lowbit-calib-pack (calibrated pack, never at load). The
+// per-tensor base travels in the pack entry and reaches the consumers as ResidentMatrixView::outer_exponent.
+inline constexpr FormatId kSP4TWeightStorage{"strix.sp4t", 1};
 inline constexpr std::uint64_t plain_linear = 1ull << 0;
 inline constexpr std::uint64_t quantized_linear = 1ull << 1;
 inline constexpr std::uint64_t transformed_linear = 1ull << 2;

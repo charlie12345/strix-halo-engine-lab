@@ -1,6 +1,10 @@
 #include "hy4/serve/session_service.hpp"
+#include "hy4/hy4_speculation.hpp"
+#include "strix/profiles/hy4.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/model_family_registry.hpp"
+#include "strix/serve/serial_session_owner.hpp"
 #include "strix/weight/tensor_map.hpp"
 #include <algorithm>
 #include <charconv>
@@ -54,10 +58,34 @@ const Prepared& prepared(const sv::ServiceSelection& selection) {
     return *p;
 }
 
+class Service final : public sv::SessionService {
+    static sv::ApiConfig api_config(const Prepared& p) {
+        sv::ApiConfig config;
+        bind_api(config, p.options, p.pack);
+        config.status_slots = 1;
+        config.strict_context_limit = true;
+        return config;
+    }
+
+    SessionAssets assets_;
+    sv::GenerationQueue queue_;
+    sv::SerialSessionOwner owner_;
+    sv::ApiService api_;
+public:
+    Service(const Prepared& p, SessionAssets assets)
+        : assets_(std::move(assets)), owner_(queue_, *assets_.engine),
+          api_(api_config(p), sv::ApiTokenizerBinding(assets_.tokenizer), queue_, assets_.engine->context_tokens(), false) {}
+
+    sv::SessionRuntime& runtime() override { return owner_.runtime(); }
+    void handle(const sv::HttpRequest& r, sv::HttpResponseWriter& w) override { api_.handle(r, w); }
+};
+
 }  // namespace
 
-Options parse_options(std::span<const std::string> args) {
+Options parse_options(std::span<const std::string> arguments) {
     Options o;
+    std::vector<std::string> args(arguments.begin(), arguments.end());
+    ::strix::profile::take_options(profile::engine(), args, o.profile);
     for (std::size_t i = 0; i < args.size(); ++i) {
         const auto& a = args[i];
         const auto value = [&]() -> const std::string& {
@@ -75,7 +103,13 @@ Options parse_options(std::span<const std::string> args) {
             if (o.model_id.empty()) throw std::invalid_argument("--model-id must not be empty");
             o.model_id_given = true;
         } else if (a == "--print-effective-config") o.print_effective_config = true;
-        else if (a == "--profile") (void)::strix::profile::parse(value()); // Host-only service inspection.
+        else if (a == "--prompt-rows") o.prompt_rows = number<std::uint32_t>(a, value());
+        else if (a == "--head-q8") {
+            const auto& mode = value();
+            if (mode != "0" && mode != "1") throw std::invalid_argument("--head-q8 expects 0 or 1");
+            o.head_q8 = mode == "1";
+        }
+        else if (::strix::session::speculation_opt_out_argument(a)) o.no_mtp = true;
         else if (a == "--help" || a == "-h") o.help = true;
         else throw std::invalid_argument("unknown hy4_flash option: " + a + " (see --help)");
     }
@@ -98,6 +132,8 @@ PackFacts read_pack_facts(const Options& options) {
         throw std::invalid_argument(options.gguf + ": eos_token_id " + std::to_string(*eos->unsigned_value) + " differs from the template's 120025");
     if (const auto* ctx = info.find_metadata(std::string(kArchitecture) + ".context_length"); ctx && ctx->unsigned_value)
         facts.context_length = *ctx->unsigned_value;
+    if (const auto* nextn = info.find_metadata(std::string(kArchitecture) + ".nextn_predict_layers"); nextn && nextn->unsigned_value)
+        facts.next_token_block = *nextn->unsigned_value > 0U;
     if (const auto* t = info.find_metadata("general.sampling.temp"); t && t->floating_value) {
         facts.card_temperature = *t->floating_value;
         facts.card_from_pack = true;
@@ -155,7 +191,7 @@ sv::Json effective_config(const Options& options, const PackFacts& pack) {
         serve_only.push(std::move(l));
     };
     lever("bind/port/api_key", "strix-serve shell options (before --): listener and authentication only, no effect on tokens");
-    lever("http_slots", "concurrent requests are a serve concept; the CLI runs one request (no device binding yet: unresolved)");
+    lever("http_slots", "one shared session owner serializes generation requests");
 
     auto out = sv::Json::object();
     out.set("family", sv::Json(kFamily));
@@ -163,7 +199,24 @@ sv::Json effective_config(const Options& options, const PackFacts& pack) {
     out.set("values", std::move(values));
     out.set("request", std::move(request));
     out.set("serve_only", std::move(serve_only));
-    out.set("device", sv::Json("not built: hy4_hipbind / hy4_cudabind"));
+    const auto resolved = profile::resolve({profile::Device::unknown, profile::Topology::one_node, ctx}, options.profile);
+    out.set("profile", sv::parse_json(resolved->resolution.json()));
+    // The decode route the native rank resolves for a whole-model request (one node): the same shared decision.
+    ::strix::hy4::SpeculationRun run;
+    run.block_in_pack = pack.next_token_block;
+    run.no_mtp = options.no_mtp;
+    run.environment = ::strix::envcfg::text(::strix::session::speculation_environment);
+    const auto decision = ::strix::hy4::speculation(run);
+    auto speculation = sv::Json::object();
+    speculation.set("enabled", sv::Json(decision.enabled));
+    speculation.set("source", sv::Json(std::string(decision.source)));
+    speculation.set("exact", sv::Json(true));
+    out.set("speculation", std::move(speculation));
+#ifdef STRIX_HY4_SERVE_HIP
+    out.set("device", sv::Json("hip (host inspection)"));
+#else
+    out.set("device", sv::Json("host inspection only"));
+#endif
     return out;
 }
 
@@ -183,15 +236,30 @@ void bind_api(sv::ApiConfig& config, const Options& options, const PackFacts& pa
 }
 
 const char* usage() {
-    return "hy4_flash family options (strix-serve --model hy4_flash -- OPTIONS; the same parser as the CLI):\n"
+    return "hy4_flash family options (strix-serve --model hy4_flash -- OPTIONS):\n"
            "  --gguf PATH               first part of the Hy4-flash pack (tokenizer, chat template, weights)\n"
            "  --ctx N                   context cap (default: the pack's context_length)\n"
            "  --max-tokens N            default reply cap (default 4096)\n"
            "  --model-id NAME           model id reported by the API (default hy4-flash)\n"
+           "  --profile exact|fast|turbo  execution tier\n"
+           "  --prompt-rows N --head-q8 0|1  explicit profile overrides\n"
+           "  --no-mtp                  plain decode instead of the exact speculative default (also STRIX_MTP=0)\n"
            "  --print-effective-config  print the effective values and the serve-only levers, then exit\n";
 }
 
+sv::Json placement_config(const model_description::ModelDescription& model, const md::Query& query) {
+    return resolve_pair_placement(model, query).json(md::parse_policy(model), query);
+}
+
 void install_session_service(sv::ServiceFactories& factories) {
+#ifdef STRIX_HY4_SERVE_HIP
+    install_session_service(factories, load_hip_service);
+#else
+    install_session_service(factories, {});
+#endif
+}
+
+void install_session_service(sv::ServiceFactories& factories, SessionAssetLoader loader) {
     sv::ServiceFactory f;
     f.asset_option = "--gguf";
     f.validate = [](const sv::ServiceSelection& s) {
@@ -203,17 +271,26 @@ void install_session_service(sv::ServiceFactories& factories) {
     f.early_exit = [](const sv::ServiceSelection& s, std::ostream& out) -> std::optional<int> {
         const auto& p = prepared(s);
         if (p.options.help) { out << usage(); return 0; }
-        if (p.options.print_effective_config) { out << effective_config(p.options, p.pack).dump() << '\n'; return 0; }
+        if (p.options.print_effective_config) {
+            out << effective_config(p.options, p.pack).dump() << '\n';
+            return 0;
+        }
         return std::nullopt;
     };
     f.inspect = [](const sv::ServiceSelection& s, std::ostream& out) {
         const auto& p = prepared(s);
         out << s.model.id << '\t' << s.model.name << '\t' << s.model.description << '\n' << effective_config(p.options, p.pack).dump() << '\n';
     };
-    f.create = [](const sv::ServiceSelection& s) -> std::unique_ptr<sv::SessionService> {
-        if (prepared(s).options.gguf.empty()) throw std::invalid_argument("hy4_flash serve requires --gguf PATH");
-        throw std::runtime_error("hy4_flash: no device binding is built yet (hy4_hipbind / hy4_cudabind); --inspect, --family-inspect and "
-                                 "--print-effective-config run without one");
+    f.create = [loader = std::move(loader)](const sv::ServiceSelection& s) -> std::unique_ptr<sv::SessionService> {
+        const auto& p = prepared(s);
+        if (p.options.gguf.empty()) throw std::invalid_argument("hy4_flash serve requires --gguf PATH");
+        if (!loader) throw std::runtime_error("hy4_flash device binding requires a build with STRIX_FAMILY_HY4=ON");
+        md::Query q;
+        q.phase = md::Phase::decode;
+        md::admit(resolve_pair_placement(s.description, q), md::Executor::engine);
+        auto assets = loader(p.options, p.pack);
+        if (!assets.engine || !assets.tokenizer) throw std::logic_error("incomplete Hy4 serve assets");
+        return std::make_unique<Service>(p, std::move(assets));
     };
     factories.install(kFamily, std::move(f));
     register_family();  // a program serving hy4_flash admits its packs

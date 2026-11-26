@@ -12,7 +12,11 @@
 //   token with the token relayed back: the same work as one node, so the ids and logits equal the one-node run.
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_plan.hpp"
+#include "hy4/hip/hy4_hip_rows.hpp"
+#include "hy4/hy4_speculation.hpp"
 #include "strix/hy4/tp_layout.hpp"
+#include "strix/hy4/placement_policy.hpp"
+#include "strix/weight_pack.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/pair/layer_pipeline.hpp"
 #include "strix/pair/tp_inputs.hpp"
@@ -22,7 +26,9 @@
 #include "strix/pair/link_mux.hpp"
 #include "strix/pair/stage_map.hpp"
 #include "strix/profiles/hy4.hpp"
+#include "strix/spec/block_parallel.hpp"
 #include "strix/spec/drafting.hpp"
+#include "strix/spec/pair_round.hpp"
 #include "xport/hip_pipe_staging.hpp"
 
 #include <hip/hip_runtime.h>
@@ -560,6 +566,7 @@ int run_pair_stages(strix::hy4::hipbind::ForwardOptions o, const std::vector<std
 int run(int argc, char** argv) {
     const auto kept = strix::pair::strip_flags(argc, argv, "HY4", false);  // --rank / --peer / --transport -> HY4_*
     (void)kept;
+    namespace md = strix::profile::multi_device;
     strix::hy4::hipbind::ForwardOptions o;
     std::vector<std::uint32_t> prompt, teacher;
     std::uint32_t gen = 0, top = 5, cut = 0, repeat = 1;
@@ -574,10 +581,19 @@ int run(int argc, char** argv) {
     std::string tp_spec = "usb4auto";
     std::vector<double> tp_rates;
     double tp_trip_us = 0.0;
-    bool tp_force = false;
+    bool tp_force = false, measured_tp = false, pair_expected = false;
+    std::string pair_receipt = strix::envcfg::text("STRIX_PLACEMENT_RECEIPT") ?
+        strix::envcfg::text("STRIX_PLACEMENT_RECEIPT") : "";
+    std::string pair_model = STRIX_HY4_MODEL_DESCRIPTION;
+    std::optional<md::Form> pair_placement;
+    std::vector<double> verify_seeds;
     GateRef gref;           // --gate-ref (long BASE reference in pieces)
     bool head_explicit = false;
     bool print_config = false;
+    // Exact speculative decode (src/hy4/hy4_speculation.hpp): --mtp forces it, --no-mtp / STRIX_MTP=0 opt out; the
+    // EXACT prompt runs as verify rows of --prompt-vrows R (1..8, 0 = one step per position; each row bitwise the step).
+    bool top_explicit = false, no_mtp = false, want_mtp = false;
+    std::uint32_t prompt_vrows = strix::hy4::hipbind::rows::kMaxVerifyRows;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
     // The tier word (--profile exact|fast|turbo, --allow-pending) through the shared resolver; the lever options
@@ -594,7 +610,13 @@ int run(int argc, char** argv) {
         else if (a == "--gen" && more) gen = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--layers" && more) o.depth = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--context" && more) o.context = static_cast<std::uint32_t>(std::stoul(args[++i]));
-        else if (a == "--top" && more) top = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--top" && more) top = static_cast<std::uint32_t>(std::stoul(args[++i])), top_explicit = true;
+        else if (strix::session::speculation_opt_out_argument(a)) no_mtp = true;
+        else if (a == "--mtp") want_mtp = true;
+        else if (a == "--prompt-vrows" && more) {
+            prompt_vrows = static_cast<std::uint32_t>(std::stoul(args[++i]));
+            if (prompt_vrows > strix::hy4::hipbind::rows::kMaxVerifyRows) throw std::invalid_argument("--prompt-vrows 0..8");
+        }
         else if (a == "--prompt-rows" && more) o.prompt_rows = static_cast<std::uint32_t>(std::stoul(args[++i])), rows_explicit = true;
         else if (a == "--timing") timing = true;
         else if (a == "--gate-ref") gref.on = true;
@@ -617,6 +639,15 @@ int run(int argc, char** argv) {
         else if (a == "--stage-map" && more) stage_map = args[++i];
         else if (a == "--repeat" && more) repeat = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--port" && more) port = static_cast<std::uint16_t>(std::stoul(args[++i]));
+        else if (a == "--pair-expected") pair_expected = true;
+        else if (a == "--pair-model" && more) pair_model = args[++i];
+        else if (a == "--pair-receipt" && more) pair_receipt = args[++i];
+        else if (a == "--pair-placement" && more) {
+            pair_placement = md::parse_form(args[++i]);
+            if (pair_placement != md::Form::layers && pair_placement != md::Form::tensor)
+                throw std::invalid_argument("--pair-placement layers|tensor");
+        }
+        else if (a == "--verify-ms" && more) verify_seeds = strix::hy4::hipbind::rows::parse_verify_seeds(args[++i]);
         else if (a == "--tp-rank" && more) tp_rank = static_cast<int>(std::stoul(args[++i]));
         else if (a == "--tp-transport" && more) tp_spec = args[++i];
         else if (a == "--tp-trip-us" && more) tp_trip_us = std::stod(args[++i]);
@@ -633,12 +664,75 @@ int run(int argc, char** argv) {
         else if (!a.empty() && a[0] != '-') o.parts.emplace_back(a);
         else throw std::invalid_argument("unknown argument " + a);
     }
+    if (o.parts.size() == 1U) {
+        const auto parts = strix::weight_pack::gguf_parts(o.parts.front().string());
+        o.parts.assign(parts.begin(), parts.end());
+    }
+    bool layer_pair = std::getenv("HY4_RANK") != nullptr;
+    namespace hp = strix::hy4::profile;
+    namespace hr = strix::hy4::hipbind::rows;
+    hipDeviceProp_t prop{};
+    int hip_device = 0;
+    if (hipGetDevice(&hip_device) == hipSuccess) (void)hipGetDeviceProperties(&prop, hip_device);
+    const auto arch = hp::device_of(prop.gcnArchName);
+    if (layer_pair && tp_rank >= 0)
+        throw std::invalid_argument("--tp-rank replaces --rank and the automatic pair planner");
+    if ((pair_placement || pair_expected) && !layer_pair && tp_rank < 0)
+        throw std::invalid_argument("--pair-placement needs --rank or a two-node topology");
+
+    const bool stage_route = stage_map.empty() && cut == 0U && !pipe_guess && window_costs.empty();
+    strix::hy4::SpeculationRun spec_run;
+    if (!o.parts.empty() && (!print_config || (layer_pair && !pair_receipt.empty())))
+        spec_run.block_in_pack = strix::hy4::Config::from_gguf(o.parts.front()).nextn > 0U;
+    spec_run.whole_model = o.depth == 0U;
+    spec_run.no_mtp = no_mtp;
+    spec_run.environment = std::getenv(strix::session::speculation_environment);
+    spec_run.explicit_mtp = want_mtp;
+    spec_run.per_step_route = (top_explicit && top > 0U) || !teacher.empty() || !dump_path.empty() || timing || gref.on;
+    const bool spec_room = prompt.size() + gen + hr::kMaxVerifyRows <= o.context;
+    std::optional<strix::serve::Json> placement_config;
+    if (layer_pair) {
+        const auto rank = strix::pair::env_rank("HY4");
+        const auto* transport = std::getenv("HY4_TRANSPORT");
+        const auto& topology = strix::device::process_topology(static_cast<int>(rank), transport ? transport : "usb4auto");
+        const auto native = hp::resolve({arch, hp::Topology::one_node, prompt.size()}, inputs);
+        const auto* width = native->find("prompt_rows");
+        const auto rows = rows_explicit ? o.prompt_rows : width && strix::profile::applied(width->status) ?
+            static_cast<std::uint32_t>(std::stoul(width->value)) : 0U;
+        const bool compatible = stage_route && repeat == 1U && gen > 1U && spec_room && !spec_run.per_step_route &&
+            strix::hy4::speculation(spec_run).enabled && rows != 0U && (o.verify_rows == 0U || o.verify_rows == hr::kMaxVerifyRows) &&
+            tp_trip_us == 0.0 && !tp_force && verify_seeds.empty() && tp_rates.empty() &&
+            strix::envcfg::flag("STRIX_TP_CHANNEL", true) && strix::envcfg::flag("STRIX_HY4_TP_JOIN_BF16", true) &&
+            strix::envcfg::flag("STRIX_HY4_TP_DRAFT", true) && strix::envcfg::flag("STRIX_HY4_ROWS_EXPERT_UNION", true);
+        std::optional<md::BandReceipt> receipt;
+        if (!pair_receipt.empty()) receipt = md::load_band_receipt(pair_receipt);
+        const auto layout = compatible ? strix::hy4::tensor_layout(native->resolution, rows) : std::string{};
+        auto q = strix::hy4::pair_query(topology, native->resolution.profile, prompt.size(), o.context, gen,
+                                         transport ? transport : "usb4auto", hp::device_name(arch), layout,
+                                         receipt ? &*receipt : nullptr);
+        q.placement = pair_placement;
+        q.rank_executor = true;
+        const auto description = strix::model_description::load(pair_model);
+        const auto policy = md::parse_policy(description);
+        const auto decision = strix::hy4::resolve_pair_placement(description, q);
+        placement_config = decision.json(policy, q);
+        if (!print_config) std::cout << "pair placement " << placement_config->dump() << '\n';
+        if (decision.form == md::Form::tensor && !print_config) {
+            if (!stage_route || o.depth != 0 || rows == 0U)
+                throw std::invalid_argument("tensor placement needs a whole model, windows and no stage overrides");
+            if (tp_rates.empty()) for (const auto& node : topology.nodes) tp_rates.push_back(node.memory_gbytes_ps);
+            (void)strix::pair::tp::rank_rates({}, tp_rates, 2U);
+            layer_pair = false;
+            tp_rank = static_cast<int>(rank);
+            tp_spec = transport ? transport : "usb4auto";
+            measured_tp = !decision.ladder_reference.empty();
+        }
+    }
     // A pair width picked from --window-costs is a prompt_rows setting like --prompt-rows: the resolver stamps it.
     // On the interleaved pair route (no two-stage option) the shared planner picks the width from the prompt
     // length and the measured pair cost (hy4_hip_plan.hpp pair_stage_plan); the width changes no bit. The pair always runs
     // in windows, so the pick does not wait for a profile width: a profile whose prompt_rows lever is pending leaves 0 here.
-    const bool stage_route = stage_map.empty() && cut == 0U && !pipe_guess && window_costs.empty();
-    if (std::getenv("HY4_RANK") != nullptr && !rows_explicit) {
+    if (layer_pair && !rows_explicit) {
         std::uint32_t picked = strix::hy4::hipbind::pair_window_rows(prompt.size(), window_costs);
         if (picked == 0U && stage_route && !o.parts.empty() && !prompt.empty()) {
             const std::uint32_t depth = o.depth != 0U ? o.depth : strix::hy4::Config::from_gguf(o.parts.front()).layers;
@@ -650,18 +744,15 @@ int run(int argc, char** argv) {
         }
     }
     // The regime (device, topology, this prompt's length) selects the qualified FAST cells (strix/profiles/hy4.hpp).
-    namespace hp = strix::hy4::profile;
-    hp::Regime regime;
-    regime.topology = std::getenv("HY4_RANK") != nullptr ? hp::Topology::pair : hp::Topology::one_node;
-    regime.prompt_tokens = prompt.size();
-    {
-        int dev = 0;
-        hipDeviceProp_t prop{};
-        if (hipGetDevice(&dev) == hipSuccess && hipGetDeviceProperties(&prop, dev) == hipSuccess) regime.device = hp::device_of(prop.gcnArchName);
-    }
+    const hp::Regime regime{arch, layer_pair ? hp::Topology::pair : hp::Topology::one_node, prompt.size()};
     const auto resolved = hp::resolve(regime, inputs);
     const auto& profile = resolved->resolution;
-    if (print_config) { std::cout << profile.json() << '\n'; return 0; }
+    if (print_config) {
+        auto config = strix::serve::parse_json(profile.json());
+        if (placement_config) config.set("multi_device", std::move(*placement_config));
+        std::cout << config.dump() << '\n';
+        return 0;
+    }
     if (const auto* e = resolved->find("prompt_rows"); e != nullptr && !rows_explicit && strix::profile::applied(e->status))
         o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e->value));
     if (const auto* e = resolved->find("head_q8"); e != nullptr && !head_explicit && strix::profile::applied(e->status)) o.head_q8 = e->value == "1";
@@ -676,17 +767,33 @@ int run(int argc, char** argv) {
         throw std::invalid_argument("usage: strix-hy4-rank PART1.gguf [PART2.gguf] --ids-file F [--gen N] [--teacher F] [--layers D] "
                                     "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile exact|fast|turbo] "
                                     "[--rank 0|1 --cut K | --stage-map C0,C1,..,L|off --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
+    // Decode route, every tier: exact speculative decode where the pack ships its next-token block and this rank holds the
+    // whole model (one node, or a tensor-parallel rank); the shared resolver words the decision (hy4_speculation.hpp).
+    spec_run.whole_model = !layer_pair && spec_run.whole_model;
+    const auto spec_decision = strix::hy4::speculation(spec_run);
+    const bool spec_on = spec_decision.enabled && gen > 1U && spec_room;
+    // EXACT prompt (no windows): verify rows of prompt_vrows positions, each row bitwise step() at its position (the BASE
+    // reference form of the long gate, run_gate_ref); one-node whole model; per-position logits dumps keep the steps.
+    const bool rows_prompt = o.prompt_rows == 0U && prompt_vrows > 0U && spec_run.whole_model && tp_rank < 0 && !gref.on &&
+                             dump_path.empty() && !timing;
+    if ((spec_on || rows_prompt) && o.verify_rows == 0U) o.verify_rows = hr::kMaxVerifyRows;
+    if (rows_prompt) prompt_vrows = std::min(prompt_vrows, o.verify_rows);
+    o.nextn = o.nextn || spec_on;
+    std::cout << "decode " << (spec_on ? "speculative (next-token block drafts, verify rows emit the greedy ids)" : "plain steps")
+              << " [" << spec_decision.source
+              << (spec_decision.enabled && !spec_on ? (gen <= 1U ? ", one id" : ", context holds no verify pass") : "") << "]"
+              << (rows_prompt ? "; prompt as verify rows of " + std::to_string(prompt_vrows) : std::string()) << "\n" << std::flush;
     // Pair default: the shared interleaved stage map with v from the shared planner at this width (strix/pair/stage_map.hpp
     // plan_stages over the measured pair cost; bitwise equal to the two-stage cut, measured faster); --stage-map off, --cut,
     // --pipe-guess or --window-costs keep the two-stage route.
-    if (std::getenv("HY4_RANK") != nullptr && stage_route && o.prompt_rows != 0U) {
+    if (layer_pair && stage_route && o.prompt_rows != 0U) {
         const std::uint32_t depth = o.depth != 0U ? o.depth : strix::hy4::Config::from_gguf(o.parts.front()).layers;
         const auto plan = strix::hy4::hipbind::pair_stage_plan(prompt.size(), depth, o.prompt_rows);
         std::cout << "pair plan rows " << o.prompt_rows << " map " << plan.map.text() << " (" << plan.choice.reason << ")\n";
         if (plan.map.virtual_stages() > 1U) stage_map = plan.map.text();
     }
     if (stage_map == "off") stage_map.clear();
-    if (std::getenv("HY4_RANK") != nullptr && !stage_map.empty()) {
+    if (layer_pair && !stage_map.empty()) {
         if (cut != 0U || pipe_guess || !window_costs.empty())
             throw std::invalid_argument("--stage-map replaces --cut; --pipe-guess and --window-costs are two-stage options");
         return run_pair_stages(o, prompt, gen, stage_map, std::max(repeat, 1U), port);
@@ -711,12 +818,16 @@ int run(int argc, char** argv) {
             throw std::invalid_argument("--tp-rank 0|1 needs --prompt-rows (each rank prefills alone) and --tp-rates A,B (GB/s)");
         auto opened = strix::dist::open_pair(tp_spec, static_cast<std::uint32_t>(tp_rank));
         if (!opened.receipt.empty()) std::cout << "tp transport: " << opened.receipt << "\n";
-        // largest gather: half the logits row (vocab / 2 FP32); the link probe sizes fit in 1 MiB
+        // largest gather: half the logits row (vocab / 2 FP32); the link probe sizes fit in 1 MiB; speculative decode: a
+        // verify pass's MoE join at 8 rows (8 x (8 slot rows x 1536 + shared / 2) FP32) < 2 MiB
         // route: the shared policy (pair::select_route); the device-waited channel unless STRIX_TP_CHANNEL=0 (staged)
-        tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), static_cast<std::uint32_t>(tp_rank), 1U << 20,
+        tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), static_cast<std::uint32_t>(tp_rank),
+                                                                       spec_on ? std::size_t{2} << 20 : std::size_t{1} << 20,
                                                                        static_cast<hipStream_t>(fwd.stream_handle()),
                                                                        strix::envcfg::flag("STRIX_TP_CHANNEL", true));
     }
+    if (measured_tp && tpg->link().route() != strix::pair::GatherRoute::channel)
+        throw std::runtime_error("the pair did not open the measured channel route");
     std::ofstream dump;
     if (!dump_path.empty()) {
         dump.open(dump_path, std::ios::binary | std::ios::trunc);
@@ -730,19 +841,38 @@ int run(int argc, char** argv) {
     std::size_t p0 = 0;
     std::vector<float> prompt_logits;
     const std::vector<float> no_logits;
+    // The next-token block's teacher pass rides on the prompt (MtpSource installed before it): this rank drafts (one node,
+    // TP rank 0) or replays rank 0's draft rounds on its own block (TP rank 1 with STRIX_HY4_TP_DRAFT on, the default).
+    const bool draft_tp = tp_rank >= 0 && strix::envcfg::flag("STRIX_HY4_TP_DRAFT", true);
+    std::unique_ptr<hr::MtpSource<strix::hy4::hipbind::Forward>> mtp;
+    if (spec_on && (tp_rank != 1 || draft_tp)) mtp = std::make_unique<hr::MtpSource<strix::hy4::hipbind::Forward>>(fwd);
+    // EXACT prompt as verify rows (rows_prompt): forward_rows over prompt_vrows positions, committed; the last row's logits
+    // are the prompt's; with the block the rows' hidden are staged (the block's flush reuses the verify workspace) and fed.
+    const auto vrows_prompt = [&](bool feed) { return hr::prefill_verify_rows(fwd, prompt, prompt_vrows, feed); };
     // --repeat K (batched prompt): K - 1 earlier passes, each followed by reset() (bit-reproducing), so the last pass is
     // the warm figure and the first the cold one; their last-position digests must equal the final pass's.
-    for (std::uint32_t r = 1; o.prompt_rows != 0U && r < repeat; ++r) {
+    for (std::uint32_t r = 1; (o.prompt_rows != 0U || rows_prompt) && r < repeat; ++r) {
         const auto s0 = clock::now();
-        const std::uint64_t digest = fnv(fwd.prefill(prompt));
+        const std::uint64_t digest = fnv(rows_prompt ? vrows_prompt(false) : fwd.prefill(prompt));
         const double ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
         std::cout << "prefill run " << r << " of " << repeat << " tokens=" << prompt.size() << " ms=" << std::setprecision(1) << ms
                   << " tok_s=" << 1000.0 * static_cast<double>(prompt.size()) / ms << " logits_fnv64 " << std::hex << digest << std::dec
                   << "\n";
         fwd.reset();
     }
+    if (rows_prompt) {  // EXACT prompt: same bits as the position-by-position steps; the last position printed like a step
+        const auto s0 = clock::now();
+        if (mtp) mtp->install(prompt);
+        prompt_logits = vrows_prompt(mtp != nullptr);
+        prompt_ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
+        std::cout << "prefill tokens=" << prompt.size() << " verify_rows=" << prompt_vrows << " ms=" << std::setprecision(1) << prompt_ms
+                  << " tok_s=" << std::setprecision(1) << 1000.0 * static_cast<double>(prompt.size()) / prompt_ms
+                  << " logits_fnv64 " << std::hex << fnv(prompt_logits) << std::dec << " [position-by-position bits]\n";
+        p0 = prompt.size() - 1U;
+    }
     if (o.prompt_rows != 0U) {  // batched prompt: one call; the last prompt position is printed like a step
         const auto s0 = clock::now();
+        if (mtp) mtp->install(prompt);  // prefill() feeds every prompt row's hidden to the block's teacher pass
         prompt_logits = fwd.prefill(prompt);
         prompt_ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
         const auto& t = fwd.times();
@@ -790,6 +920,82 @@ int run(int argc, char** argv) {
         tp_on = true;
         std::cout << fwd.tp_receipt() << "\n" << std::flush;
     };
+    if (!verify_seeds.empty() && !spec_on) throw std::invalid_argument("--verify-ms requires speculative decode");
+    if (spec_on) {  // exact speculative decode (strix-hy4-rows --mtp, the record route): the ids of plain greedy decode
+        const auto anchor = static_cast<std::uint32_t>(std::max_element(prompt_logits.begin(), prompt_logits.end()) - prompt_logits.begin());
+        if (mtp) mtp->finish_prompt(anchor);
+        strix::spec::pair_round::Exchange pair_ex;
+        double trip_ms = 0.0;
+        if (tpg) {  // tensor-parallel pair: every verify pass (and draft round with the block on both ranks) on both ranks
+            const auto rank = static_cast<std::uint32_t>(tp_rank);
+            // trip cost measured over the gather form the passes run, agreed by both ranks (prices the seeds below)
+            const auto lc = tpg->measure_link();
+            trip_ms = strix::pair::tp::trip_cost(lc, tp_trip_us).latency_ms;
+            fwd.enable_tp(rank, {&tpg->link(), &strix::xport::tp_gather::HipPairGather::Link::fn});
+            std::cout << fwd.tp_receipt() << "\ntp link cost: " << lc.describe() << "\n";
+            // the round message rides the same gather: [2][kSlot] bytes on the device, stream-ordered after the last pass
+            constexpr std::size_t kSlot = 128;
+            static_assert(strix::spec::pair_round::kMessageBytes <= kSlot);
+            auto* slots = reinterpret_cast<std::uint8_t*>(fwd.alloc_f32(2U * kSlot / 4U));
+            const auto stream = static_cast<hipStream_t>(fwd.stream_handle());
+            auto* glink = &tpg->link();
+            pair_ex = [stream, slots, glink, rank](const std::uint8_t* mine, std::uint8_t* peer) {
+                constexpr std::size_t B = strix::spec::pair_round::kMessageBytes;
+                const auto ok = [](hipError_t e, const char* what) {
+                    if (e != hipSuccess) throw std::runtime_error(std::string("spec pair round: ") + what + ": " + hipGetErrorString(e));
+                };
+                ok(hipMemcpyAsync(slots + std::size_t{rank} * kSlot, mine, B, hipMemcpyHostToDevice, stream), "message upload");
+                strix::xport::tp_gather::HipPairGather::Link::fn(glink, stream, slots, kSlot, kSlot);
+                ok(hipMemcpyAsync(peer, slots + std::size_t{1U - rank} * kSlot, B, hipMemcpyDeviceToHost, stream), "message read");
+                ok(hipStreamSynchronize(stream), "message sync");
+            };
+        }
+        // the Arbiter's verify seeds from this rank's plain step (best of two, each rewound: the rows bench's pattern)
+        double step_ms = 0.0;
+        for (int k = 0; k < 2; ++k) {
+            const auto s0 = clock::now();
+            (void)fwd.step_greedy(anchor);
+            const double ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
+            fwd.rewind();
+            step_ms = k == 0 ? ms : std::min(step_ms, ms);
+        }
+        if (tp_rank == 1) {  // rank 1: rank 0's rounds until its end message (position checked)
+            const auto s0 = clock::now();
+            const auto fr = mtp ? hr::spec_follow(fwd, pair_ex, *mtp) : hr::spec_follow(fwd, pair_ex);
+            gen_ms = std::chrono::duration<double, std::milli>(clock::now() - s0).count();
+            tpg->finish();
+            std::cout << "spec follow rounds " << fr.rounds << " passes " << fr.passes << " rows " << fr.rows << " committed " << fr.committed
+                      << " drafts " << fr.drafts << (mtp ? " (block on both ranks, draft ids cross-checked)" : "") << "\nids (rank 0 emits)\n"
+                      << std::setprecision(1) << "time prompt_ms=" << prompt_ms << " gen_ms=" << gen_ms
+                      << " total_ms=" << std::chrono::duration<double, std::milli>(clock::now() - t0).count() << "\n";
+            return 0;
+        }
+        hr::SpecOptions so;
+        // Arbiter seeds: the shared routed-MoE pass model over this topology's plain step (one node = moe_verify_seed_ms;
+        // TP: every rank reads half of every weight, plus the pass's gathers at the measured trip)
+        hr::seed_spec_options(so, step_ms, tpg ? 2U : 1U, trip_ms, tpg ? fwd.tp_gathers_per_step() : 0U, verify_seeds);
+        so.draft_tp = draft_tp;
+        if (!verify_seeds.empty()) std::cout << "spec verify seeds explicit\n";
+        const auto res = hr::spec_decode(fwd, prompt, anchor, gen, so, *mtp, tpg ? &pair_ex : nullptr);
+        if (tpg) tpg->finish();
+        generated = res.ids;
+        gen_ms = res.wall_ms;
+        const auto passes = std::max<std::size_t>(res.steps.size(), 1U);
+        std::cout << "spec passes " << res.steps.size() << " E " << std::setprecision(3)
+                  << static_cast<double>(gen - 1U) / static_cast<double>(passes) << " proposed " << res.proposed << " accepted "
+                  << res.accepted << " rows";
+        for (std::size_t r = 1; r < res.rows_hist.size(); ++r) std::cout << " R" << r << ':' << res.rows_hist[r];
+        std::cout << std::setprecision(2) << "; plain step " << step_ms << " ms; block calls " << res.chain_calls << " drafts "
+                  << res.chain_drafts << "; wall verify " << std::setprecision(1) << res.verify_ms << " draft " << res.chain_ms << " other "
+                  << res.wall_ms - res.verify_ms - res.chain_ms << " ms" << (tpg ? (draft_tp ? " (tp, block tp)" : " (tp, block rank 0)") : "")
+                  << "\nids";
+        for (const auto id : generated) std::cout << ' ' << id;
+        std::cout << "\n" << std::setprecision(1) << "time prompt_ms=" << prompt_ms << " gen_ms=" << gen_ms
+                  << " total_ms=" << std::chrono::duration<double, std::milli>(clock::now() - t0).count() << " decode_tok_s="
+                  << std::setprecision(2) << (gen_ms > 0 ? 1000.0 * (gen - 1U) / gen_ms : 0.0) << "\n";
+        if (tpg) std::cout << fwd.tp_receipt() << "\n";
+        return 0;
+    }
     for (std::size_t p = p0; p < steps; ++p) {
         if (p < prompt.size()) token = prompt[p];
         if (!tp_placed && tp_calib_ms.size() >= kTpCalib) {
@@ -797,7 +1003,7 @@ int run(int argc, char** argv) {
             tp_placed = true;
         }
         const auto s0 = clock::now();
-        const bool batched = o.prompt_rows != 0U && p + 1U == prompt.size();
+        const bool batched = (o.prompt_rows != 0U || rows_prompt) && p + 1U == prompt.size();
         const bool device = top == 0U && !batched;  // --top 0: the shared device greedy row, no logits on the host
         const std::uint32_t device_next = device ? fwd.step_greedy(token) : 0U;
         const auto& logits = device ? no_logits : batched ? prompt_logits : fwd.step(token, state);

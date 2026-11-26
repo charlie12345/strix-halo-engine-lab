@@ -1,5 +1,6 @@
 // Shared multi-request decoder (strix/serve/cohort_decode.hpp).
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/serve/job_sampling.hpp"
 
 #include "strix/serve/short_first.hpp"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -123,6 +125,13 @@ void validate_prompt_pieces(const CohortConfig& config, PromptPieceRule rule, st
 
 CohortDecoder::~CohortDecoder() = default;
 
+void bind_mixed_service(CohortConfig& config, MixedServicePieces pieces, PromptPieceRule rule, std::uint64_t chunk) {
+    config.prompt_slice_decoding = mixed_service_piece_rows(pieces, rule, chunk);
+    if (config.prompt_slice_decoding != 0U) config.prompt_share = pieces.prompt_share;
+    config.prompt_share = env_number<double>("STRIX_SERVE_PROMPT_SHARE", config.prompt_share, 0.0, 1.0e6);
+    config.trace_steps = config.trace_steps || env_flag_default_off("STRIX_SERVE_STEP_TRACE");
+}
+
 std::uint64_t CohortDecoder::piece_rows(Lane& l, std::uint64_t want, std::uint32_t full_slice, bool bounded,
                                         bool priced, bool& over) {
     over = false;
@@ -213,6 +222,13 @@ void CohortDecoder::submit(CohortRequest request) {
 }
 
 void CohortDecoder::control(std::span<const std::uint32_t> words) { backend_.control(words); }
+
+std::uint32_t max_draft_for_live(const CohortConfig& config, std::uint32_t live) noexcept {
+    const auto& table = config.max_draft_by_live;
+    if (table.empty()) return config.max_draft;
+    const std::size_t index = live == 0U ? 0U : std::min<std::size_t>(live - 1U, table.size() - 1U);
+    return std::min(config.max_draft, table[index]);
+}
 
 bool CohortDecoder::idle() const noexcept { return waiting_.empty() && live() == 0; }
 
@@ -346,6 +362,7 @@ void CohortDecoder::step() {
     }
     if (live() == 0) return;
     ++steps_;
+    const double step_start_ms = config_.trace_steps ? now_ms() : 0.0;
 
     // Appends a lane's emitted ids through max_tokens / stop and publishes them; true = the request ends here.
     const auto deliver = [&](Lane& l, std::span<const std::uint32_t> emitted) {
@@ -566,8 +583,24 @@ void CohortDecoder::step() {
     const double t0 = now_ms();
     std::vector<Lane*> run;
     for (const auto id : plan.decode_lanes) run.push_back(lanes_[id].get());
+    // trace_steps: one line per step, after its accounting (debt_ms is the decode still owed after this step).
+    const auto trace = [&](std::size_t decode_lanes, double decode_ms) {
+        if (!config_.trace_steps) return;
+        const double end = now_ms();
+        std::size_t waiting = 0;
+        for (const auto& s : step_lanes) waiting += s.prompt ? 1U : 0U;
+        std::fprintf(stderr,
+                     "cohort-trace step %llu start_ms %.3f idle_ms %.3f prompt_rows %llu prompt_ms %.3f decode_lanes %zu "
+                     "decode_ms %.3f step_ms %.3f prompts_waiting %zu debt_ms %.3f\n",
+                     static_cast<unsigned long long>(steps_), step_start_ms,
+                     last_step_end_ms_ > 0.0 ? step_start_ms - last_step_end_ms_ : 0.0,
+                     static_cast<unsigned long long>(prompt_rows), prompt_ms, decode_lanes, decode_ms,
+                     end - step_start_ms, waiting, planner_.debt_ms());
+        last_step_end_ms_ = end;
+    };
     if (run.empty()) {
         planner_.account(prompt_ms, 0.0, 0.0, prompt_rows);
+        trace(0U, 0.0);
         return;
     }
     const std::size_t n = run.size();
@@ -575,6 +608,7 @@ void CohortDecoder::step() {
     std::vector<std::vector<float>> accept(n);
     std::vector<LaneDemand> demands(n);
     std::vector<std::size_t> device_rows(n, 0);  // leading device-draft rows of a window (context rows follow them)
+    const std::uint32_t draft_cap = max_draft_for_live(config_, live());
     std::vector<std::uint32_t> device;
     std::vector<double> device_p;
     for (std::size_t k = 0; k < n; ++k) {
@@ -586,7 +620,7 @@ void CohortDecoder::step() {
         // the backend's own cap on the lane's window (pending row + drafts)
         const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(plan.decode_lanes[k]), 1U) - 1U;
         const std::size_t room = one_row ? 0U : static_cast<std::size_t>(std::min<std::uint64_t>(
-                                                     {config_.max_draft, left - 1U, room_pos, window_cap}));
+                                                     {draft_cap, left - 1U, room_pos, window_cap}));
         std::vector<double> acc;
         device.clear();
         device_p.clear();
@@ -718,12 +752,21 @@ void CohortDecoder::step() {
         if (receipt) receipt->publish();  // the model prefix is committed: the selection state follows it
     const double decode_ms = now_ms() - t0;
     decode_ms_ += decode_ms;
-    last_decode_ms_ = decode_ms;
     std::uint32_t total_rows = 0;
     for (const auto& g : groups) total_rows += g.rows;
     rows_ += total_rows;
     observe_cost(total_rows, static_cast<std::uint32_t>(n), decode_ms);
+    // last_decode_ms_ prices the decode round a prompt pass waits beside (the gap bound). A round that carried draft
+    // rows is priced without them (the fitted row cost per draft row): a prompt arriving raises the live lanes and the
+    // next round runs under the by-live draft cap, so a lone lane's long window must not shrink the next prompt's
+    // grant. A round without drafts is recorded as measured, as in a cohort that never drafts.
+    const std::uint32_t draft_rows = total_rows - static_cast<std::uint32_t>(n);
+    last_decode_ms_ = draft_rows == 0U
+        ? decode_ms
+        : std::max(0.0, decode_ms - static_cast<double>(draft_rows) *
+                                        fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)).row_ms);
     planner_.account(prompt_ms, decode_ms, 0.0, prompt_rows);
+    trace(n, decode_ms);
 
     std::vector<std::pair<Lane*, std::string>> done;
     for (std::size_t k = 0; k < n; ++k) {

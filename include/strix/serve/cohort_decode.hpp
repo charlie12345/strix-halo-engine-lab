@@ -206,6 +206,10 @@ struct CohortResult {
     std::string_view finish = "error";
 };
 
+struct CohortConfig;
+// The draft rows a lane may carry while `live` lanes hold a request (CohortConfig::max_draft_by_live).
+[[nodiscard]] std::uint32_t max_draft_for_live(const CohortConfig& config, std::uint32_t live) noexcept;
+
 struct CohortConfig {
     static MtpContextDraftConfig default_draft() {
         MtpContextDraftConfig c;
@@ -216,6 +220,11 @@ struct CohortConfig {
     MtpContextDraftConfig draft = default_draft();  // n-gram suffix drafts plus long copy spans (copy_edit)
     double min_p = 0.0;                 // the drafter's min_probability
     std::uint32_t max_draft = 7;        // draft rows per lane per step (window = 1 + drafts)
+    // Draft rows per lane by live lanes (the engine's data): entry n - 1 caps max_draft while n lanes hold a request
+    // (prompting or decoding); lanes beyond the table take its last entry; empty = max_draft at every width. A prompt
+    // that arrives raises the live count at once, so a lane that drafts alone drops to the capped window at its next
+    // round. Example {7, 0}: drafts only while one lane is live (a backend whose windows are their own forward).
+    std::vector<std::uint32_t> max_draft_by_live{};
     CycleCost prior{};                  // the engine's measured prior: fixed + row * rows + lane * lanes (ms)
     bool learn_cost = true;             // replace the prior by the fit of the observed steps
     std::uint32_t fit_min_steps = 8;    // steps with at least two distinct row counts before the fit is used
@@ -247,7 +256,16 @@ struct CohortConfig {
     // Grouped prompts: whole short prompts ready together share one backend pass when the backend's capacity admits
     // it. A group never carries more rows than one prompt slice, so it never widens the decode gap of a slice.
     PrefillGroupPolicy prompt_group{};
+    // One stderr line per step (CohortDecoder::step): the prompt rows and wall of the step's prefill call, the decode
+    // lanes and wall of its decode round, the scheduler's idle time before it, the prompts waiting and the decode
+    // time owed (prompt_share). Diagnostic only: no schedule or bits change.
+    bool trace_steps = false;
 };
+
+// Binds a mixed-service policy (prompt_piece.hpp) to a cohort: pieces of the policy's rows beside decoding lanes where
+// the backend's rule cuts a `chunk`-row call, and, where it binds, the policy's prompt share. STRIX_SERVE_PROMPT_SHARE
+// (a number >= 0) replaces the share (the off switch of a policy's share), STRIX_SERVE_STEP_TRACE=1 sets trace_steps.
+void bind_mixed_service(CohortConfig& config, MixedServicePieces pieces, PromptPieceRule rule, std::uint64_t chunk);
 
 // Rows of the next prompt slice of a lane with `left` prompt rows unread. `want` is the planner's grant, `unit` the
 // configured slice. A full grant on the final slice absorbs a remainder of up to `tail` rows (the backend's
@@ -339,6 +357,7 @@ private:
     double decode_ms_ = 0, prompt_ms_ = 0, fake_clock_ms_ = 0, fake_now_ = 0;
     // Gap-bounded pieces: ms per row of the last prefill pass (its fixed cost removed) and of the last decode round.
     double last_row_ms_ = 0, last_decode_ms_ = 0;
+    double last_step_end_ms_ = 0;  // trace_steps: the end of the previous step (scheduler idle before the next)
     CycleLedger::FitSums sums_{};  // observed decode steps: y = ms, r = physical rows, l = lanes (CycleLedger::fit)
 };
 

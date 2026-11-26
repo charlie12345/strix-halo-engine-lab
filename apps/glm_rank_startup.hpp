@@ -3,6 +3,10 @@
 #include "glm_rank_defaults.hpp"
 #include "glm/spec/glm_spec_merge.hpp"
 #include <array>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace strix::glm::rank_defaults {
 inline bool has_startup_handshake(unsigned world, const std::string& xch, bool decode, bool reference_gate) {
@@ -43,9 +47,13 @@ struct StartupResult { unsigned rows; bool eligible; };
 // negates only the row-count value: R18 then chooses the minimum proposed rows. The existing OR vote
 // rejects a mode/config mismatch on both ranks before either can enter another collective.
 template<class Merge>
-StartupResult startup_agreement(std::array<std::uint32_t, 8> fields, bool automatic, bool enabled, Merge&& merge) {
+StartupResult startup_agreement(std::array<std::uint32_t, 8> fields, bool automatic, bool enabled, Merge&& merge,
+                                bool* turbo_prefill = nullptr, unsigned rank = 0) {
     const bool eligible = fields[0] != 0;
-    if (!enabled) return {fields[2], eligible};
+    if (!enabled) {
+        if (turbo_prefill) *turbo_prefill = false;
+        return {fields[2], eligible};
+    }
     if (automatic) fields[1] |= kAutoRowsConfig;
     spec::MergeRow rows[8];
     for (unsigned i = 0; i < 8; ++i) {
@@ -56,6 +64,9 @@ StartupResult startup_agreement(std::array<std::uint32_t, 8> fields, bool automa
     if (automatic) rows[2].value = -rows[2].value;
     spec::MergeCtl ctl;
     ctl.kind = spec::kEligibilityMerge;
+    // The eligibility merge already ORs this control word. Each rank votes with its
+    // own bit; the existing MTP flags and configurations keep their wire values.
+    if (turbo_prefill && *turbo_prefill) ctl.replay_flag = 1U << rank;
     merge(rows, 8, ctl);
     bool mismatch = false;
     const char* names[] = {"eligible", "config", "max_rows", "decode_n", "capacity-lo", "capacity-hi", "slots", "prompt-fnv1a"};
@@ -72,6 +83,7 @@ StartupResult startup_agreement(std::array<std::uint32_t, 8> fields, bool automa
     merge(&vote, 1, vote_ctl);
     if (vote.flag != 0)
         throw std::runtime_error("TP2 ranks resolved different decode configurations or max-rows modes: " + local);
+    if (turbo_prefill) *turbo_prefill = ctl.replay_flag == 3U;
     return {rows[2].id, rows[0].flag == 0};
 }
 // Used only after both peers have passed the mode vote. A fresh admission can therefore request a
@@ -86,5 +98,31 @@ unsigned recheck_rows(unsigned rows, bool enabled, Merge&& merge) {
     ctl.kind = 0x474c4d52U;
     merge(&proposal, 1, ctl);
     return proposal.id;
+}
+// MTP drafter content (r94), voted after startup_agreement returned eligible on both ranks (so both run this round):
+// FNV-1a 32 of the payload digest. Ranks whose layer-45 shards match in names and sizes but differ in payload refuse
+// at startup instead of speculating with different drafters.
+inline std::uint32_t drafter_digest_hash(std::string_view digest) noexcept {
+    std::uint32_t h = 2166136261U;
+    for (const unsigned char c : digest) h = (h ^ c) * 16777619U;
+    return h;
+}
+template<class Merge>
+void agree_drafter_digest(std::string_view digest, bool enabled, Merge&& merge) {
+    if (!enabled) return;
+    const std::uint32_t mine = drafter_digest_hash(digest);
+    spec::MergeRow row;
+    row.value = static_cast<float>(mine);
+    row.id = mine;
+    spec::MergeCtl ctl;
+    ctl.kind = spec::kEligibilityMerge;
+    merge(&row, 1, ctl);
+    spec::MergeRow vote;
+    vote.flag = row.id != mine ? 1U : 0U;
+    spec::MergeCtl vote_ctl;
+    vote_ctl.kind = spec::kConfigurationMismatchMerge;
+    merge(&vote, 1, vote_ctl);
+    if (vote.flag != 0)
+        throw std::runtime_error("TP2 ranks hold different MTP drafter payloads (this rank: " + std::string(digest) + ")");
 }
 }  // namespace strix::glm::rank_defaults

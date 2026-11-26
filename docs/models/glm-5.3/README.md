@@ -244,6 +244,26 @@ workspace, install/staging, late safety and startup reserve terms in GiB.
 | Exact / FAST chunked prefill, token-ordered MoE gate/up input transform (default; `STRIX_GLM_PF_IN_TOKEN=0` restores the tile-ordered transform) | 8K / 32K benchmark prompts, on / off arms in both orders, fresh process per arm | FAST 8K TTFT **10.55 → 10.21 s** (median of 4 pairs); exact 8K 13.195 → 12.868 s; FAST 32K 43.49 → 42.39 s (one pair); exact 32K: 56.32 -> 53.41 s and 57.63 -> 55.52 s in two pairs (off first, on first): -2.9 / -2.1 s, mean -2.5 s (-4.5 %), identical full logits files on both ranks (an earlier single pair showed -5.5 s from a slow off arm; it did not reproduce). | logits and state digests identical in every arm on both ranks; full logits files identical in the exact arms |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
+The HIP WMMA prefill bundle uses X3 linears, MLA GEMMs, KDA projections and sparse
+attention with 16-key blocks. `--profile fast` (and TURBO, which nests it) admits it
+automatically on the measured Radeon 8060S USB4 host pair (two 40 Gb/s cables and four
+streams) for one fresh text prompt of 2,049-8,192 tokens, an admitted 8,192-row chunk,
+one lane, and the EXL3 R1b/MTP route. FAST gate v2 with MoE route replay passed on 5
+windows of 8,192 tokens (1,275 rows): pooled KL 0.00018 (null 0.00007), top-1 0.9969,
+dNLL -0.0013 (se 0.0009), route-flip ratio 1.05. The band receipt is the lower observed
+8K EXACT-to-bundle ratio (12.319 to 8.227 s cold, x1.50 with a 10 % margin; see
+[glm-pf-wmma-x](../../optimizations.md#glm-pf-wmma-x)). TURBO also admits it at the
+measured 31,258-token prompt (55.006 to 35.552 s against FAST); that row is CLI-only,
+because the server prefills in chunks of at most 8,192 rows and the bundle needs the
+whole prompt in one chunk. Prompts of 2,048 tokens or fewer and other prompts above
+8,192 tokens keep the exact cores.
+
+Other executions use the FAST route, including host-only inspection, memory
+fallback to a smaller chunk, cached or interleaved prefill, and native modes
+without configuration agreement. The prompt receipt names the selected route.
+Explicit arithmetic switches retain their controls and require pair
+configuration agreement. `STRIX_GLM_PF_WMMA=0` disables the umbrella.
+
 The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
 forwards and exact MoE v3 for prefill; the speculative oracle also passes with drained exchange switching.
 Prefill rows are single runs. They replace the earlier synthetic-only result.

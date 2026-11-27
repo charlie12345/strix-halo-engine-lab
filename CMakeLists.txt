@@ -220,6 +220,12 @@ add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp s
 target_include_directories(strix_spec PRIVATE src)
 target_link_libraries(strix_spec PUBLIC strix_lookup strix_token_sampling)
 strix_target_warnings(strix_spec)
+# Shared block-diffusion drafter (DFlash family) host reference: the drafter's config.json as data, its safetensors
+# file, the forward over the target's committed taps (include/strix/spec/dflash_drafter.hpp).
+add_library(strix_spec_dflash STATIC src/spec/dflash_drafter.cpp)
+target_include_directories(strix_spec_dflash PRIVATE src)
+target_link_libraries(strix_spec_dflash PUBLIC strix_spec strix-weight strix_serve_json Threads::Threads)
+strix_target_warnings(strix_spec_dflash)
 
 # Host mathematical oracle and candidate adapter; production device paths stay unbound.
 add_library(strix_block_candidate STATIC src/core/block_draft_reference.cpp src/spec/block_candidate.cpp)
@@ -499,6 +505,11 @@ if(BUILD_TESTING)
     target_include_directories(weight_lowbit_tests PRIVATE src include)
     strix_target_warnings(weight_lowbit_tests)
     add_test(NAME weight-lowbit COMMAND weight_lowbit_tests)
+    add_executable(weight_e4m3_rows_tests tests/weight_e4m3_rows_tests.cpp)
+    target_link_libraries(weight_e4m3_rows_tests PRIVATE strix-weight)
+    target_include_directories(weight_e4m3_rows_tests PRIVATE src include)
+    strix_target_warnings(weight_e4m3_rows_tests)
+    add_test(NAME weight-e4m3-rows COMMAND weight_e4m3_rows_tests)
     add_executable(weight_lowbit_pack_tests tests/weight_lowbit_pack_tests.cpp)
     target_link_libraries(weight_lowbit_pack_tests PRIVATE strix-weight)
     target_include_directories(weight_lowbit_pack_tests PRIVATE src include)
@@ -613,6 +624,12 @@ if(NOT STRIX_CUDA_DS41_ONLY)
         src/inkling2/inkling2_mini_dspark_reference.cpp)
     target_link_libraries(strix-inkling2-mini-cpu PRIVATE strix_inkling2_mini_checkpoint strix_serve)
     strix_target_warnings(strix-inkling2-mini-cpu)
+    # Offline drafter acceptance (teacher-forced on dumped target taps): DFlash 2 vs the bundled DSpark, same taps.
+    add_executable(strix-inkling2-mini-dflash-accept
+        apps/inkling2_mini_dflash_accept.cpp
+        src/inkling2/inkling2_mini_dspark_reference.cpp)
+    target_link_libraries(strix-inkling2-mini-dflash-accept PRIVATE strix_inkling2_mini_checkpoint strix_serve strix_spec_dflash)
+    strix_target_warnings(strix-inkling2-mini-dflash-accept)
     if(MSVC)
         target_compile_options(strix-inkling2-mini-cpu PRIVATE /fp:strict)
     else()
@@ -1210,6 +1227,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-core-exl3-rows-plan-tests)
     add_test(NAME strix-core-exl3-rows-plan-tests COMMAND strix-core-exl3-rows-plan-tests)
     set_tests_properties(strix-core-exl3-rows-plan-tests PROPERTIES LABELS "cpu;core;exactness")
+    # EXL3 dense reader: the source side of the trellis -> Strix pack transcoder (docs/engine/trellis-transcode.md).
+    add_executable(strix-weight-exl3-dense-tests tests/weight/exl3_dense_test.cpp)
+    target_include_directories(strix-weight-exl3-dense-tests PRIVATE include src)
+    target_compile_features(strix-weight-exl3-dense-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-weight-exl3-dense-tests)
+    add_test(NAME strix-weight-exl3-dense-tests COMMAND strix-weight-exl3-dense-tests)
+    set_tests_properties(strix-weight-exl3-dense-tests PROPERTIES LABELS "cpu;weight")
     add_executable(strix-numeric-partition-host-tests tests/moe_core/numeric_partition_host_tests.cpp)
     target_include_directories(strix-numeric-partition-host-tests PRIVATE src)
     target_compile_features(strix-numeric-partition-host-tests PRIVATE cxx_std_20)
@@ -1816,7 +1840,7 @@ target_link_libraries(strix-hy4-ref PRIVATE strix_hy4_ref)
 include(cmake/StrixIntelHy4.cmake)
 strix_target_warnings(strix-hy4-ref)
 # DFly2 drafter tools on the oracle: target-state taps of a greedy run (the drafter's KV-share / hidden inputs).
-add_library(strix_hy4_dfly_ref STATIC src/hy4/ref/hy4_dfly_ref.cpp)
+add_library(strix_hy4_dfly_ref STATIC src/hy4/ref/hy4_dfly_ref.cpp src/hy4/ref/hy4_dfly_pack.cpp)
 target_link_libraries(strix_hy4_dfly_ref PUBLIC strix_hy4_ref)
 strix_target_warnings(strix_hy4_dfly_ref)
 add_executable(strix-hy4-dfly apps/hy4_dfly_main.cpp)
@@ -2188,6 +2212,15 @@ if(BUILD_TESTING)
     target_link_libraries(strix-spec-pair-round-tests PRIVATE strix_spec Threads::Threads)
     strix_target_warnings(strix-spec-pair-round-tests)
     add_test(NAME strix-spec-pair-round-tests COMMAND strix-spec-pair-round-tests)
+    add_executable(strix-spec-dflash-tests tests/spec_dflash_drafter_tests.cpp)
+    target_link_libraries(strix-spec-dflash-tests PRIVATE strix_spec_dflash strix_core)
+    strix_target_warnings(strix-spec-dflash-tests)
+    add_test(NAME strix-spec-dflash-tests COMMAND strix-spec-dflash-tests)
+    add_executable(strix-spec-dflash-rows-tests tests/spec_dflash_rows_tests.cpp)
+    target_include_directories(strix-spec-dflash-rows-tests PRIVATE src)
+    target_link_libraries(strix-spec-dflash-rows-tests PRIVATE strix_spec_dflash)
+    strix_target_warnings(strix-spec-dflash-rows-tests)
+    add_test(NAME strix-spec-dflash-rows-tests COMMAND strix-spec-dflash-rows-tests)
     add_executable(strix-spec-block-parallel-tests tests/spec_block_parallel_tests.cpp)
     target_include_directories(strix-spec-block-parallel-tests PRIVATE src)
     add_executable(strix-block-candidate-tests tests/block_candidate_tests.cpp)
@@ -2360,6 +2393,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-hy4-dfly-ref-tests PRIVATE strix_hy4_dfly_ref)
     strix_target_warnings(strix-hy4-dfly-ref-tests)
     add_test(NAME strix-hy4-dfly-ref-tests COMMAND strix-hy4-dfly-ref-tests)
+    # DFly2 drafter pack: the shard as Hy4 blocks (names / dims, kv_b absorb split, slot-0 gate fold, Q8_0 rows by the shared rule).
+    add_executable(strix-hy4-dfly-pack-tests tests/hy4_dfly_pack_tests.cpp)
+    target_link_libraries(strix-hy4-dfly-pack-tests PRIVATE strix_hy4_dfly_ref)
+    strix_target_warnings(strix-hy4-dfly-pack-tests)
+    add_test(NAME strix-hy4-dfly-pack-tests COMMAND strix-hy4-dfly-pack-tests)
     # Hy4 HIP binding plan (stage map: every stage a shared entry; cache plan on the shared cache-row layouts).
     add_executable(strix-hy4-hip-plan-tests tests/hy4_hip_plan_tests.cpp)
     target_link_libraries(strix-hy4-hip-plan-tests PRIVATE strix_hy4_ref)
@@ -2887,7 +2925,8 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-qwen-product-profile-tests)
     add_test(NAME strix-qwen-product-profile-tests COMMAND strix-qwen-product-profile-tests)
     add_executable(strix-qwen-profile-resolution-tests tests/qwen_profile_resolution_tests.cpp)
-    target_link_libraries(strix-qwen-profile-resolution-tests PRIVATE strix_core strix_serve_json)
+    target_link_libraries(strix-qwen-profile-resolution-tests PRIVATE strix_core strix_serve_json strix_model_description)
+    target_compile_definitions(strix-qwen-profile-resolution-tests PRIVATE STRIX_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     strix_target_warnings(strix-qwen-profile-resolution-tests)
     add_test(NAME strix-qwen-profile-resolution-tests COMMAND strix-qwen-profile-resolution-tests)
     set_tests_properties(strix-qwen-profile-resolution-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
@@ -4176,7 +4215,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_tiled_core PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}")
 
     add_executable(strix-inkling2-mini-hip apps/inkling2_mini_hip.hip)
-    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve strix_device_hip)  # a low-bit load binds its declared device
+    target_link_libraries(strix-inkling2-mini-hip PRIVATE strix_tiled_core strix_hip_runtime strix_inkling2_mini_checkpoint strix_core strix_serve strix_device_hip
+        strix_spec_dflash)  # a low-bit load binds its declared device
     strix_target_warnings(strix-inkling2-mini-hip)
     target_compile_options(strix-inkling2-mini-hip PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off -fno-fast-math
         -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
@@ -4436,6 +4476,16 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_options(strix-hip-microscaled-r1-bench PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off
             -fno-fast-math -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt)
         set_target_properties(strix-hip-microscaled-r1-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        # No-model bench of the expert-union launches against the served rows launch (R = 4 / 8 / 16): bitwise ID lines
+        # and TIME lines; not a ctest (needs a GPU).
+        add_executable(strix-hip-microscaled-r1-union-bench tests/moe_core/microscaled_r1_union_hip.hip)
+        target_link_libraries(strix-hip-microscaled-r1-union-bench PRIVATE strix_core)
+        strix_target_warnings(strix-hip-microscaled-r1-union-bench)
+        target_compile_options(strix-hip-microscaled-r1-union-bench PRIVATE -O3 -mno-wavefrontsize64 -ffp-contract=off
+            -fno-fast-math -fdenormal-fp-math=ieee -fhip-fp32-correctly-rounded-divide-sqrt
+            -Wno-error=pass-failed)
+        set_target_properties(strix-hip-microscaled-r1-union-bench PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         foreach(target strix-hip-inkling2-mini-expert-activation-test strix-hip-inkling2-mini-moe-test
                        strix-hip-inkling2-mini-dense-test strix-hip-inkling2-mini-residual-test
@@ -8505,6 +8555,7 @@ if(STRIX_FAMILY_HY4)
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
     target_link_libraries(strix_hy4_hip PRIVATE strix_state_cache strix_tiled_core)  # state image files; head Q8_0 transcode
+    target_link_libraries(strix_hy4_hip PRIVATE strix_hy4_dfly_ref strix_spec)  # DFly2 drafter pack (host) + its block preset
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
     target_link_libraries(strix-hy4-rank PRIVATE strix_state_cache strix_hy4_hip strix_dist strix_device strix_spec strix_tp_xport)  # pair: shared layer pipeline + link (gather channel); copy proposer

@@ -468,13 +468,13 @@ index-batch fixture and found 32K last-row logits bitwise equal with batching OF
 
 Qwen's registry is [prefill_identity.hpp](../include/strix/prefill_identity.hpp). Each option is
 **on by default once READY**, with an individual off switch and a master exact-FP16 switch.
-The READY mask contains `hc_output_wmma`. The implemented candidate `index_proj_wmma` stays outside READY and is default OFF pending qualification. The default prefill identity remains
+The READY mask contains `hc_output_wmma`. The product profile resolves it ON in FAST and TURBO and OFF in EXACT (`--profile exact` runs the dense-A8 reference prefill); a run without `--profile` resolves the FAST preset (`presets.default`, as `strix run` does). EXACT is the reference and costs about +4.4 s at 32K and +66.9 s at 262K against the default (audit verification, not a new measurement). The implemented candidate `index_proj_wmma` stays outside READY and is default OFF pending qualification. The FAST and TURBO prefill identity remains
 `fp16-v1+hcout16` (`prefill_identity_hash` ee2cd64684149069); `--prefill-exact-fp16` gives the plain
 `fp16-v1` identity (a0094634843e16ee).
 
 | Option | What it does | Gain | Changes bits vs FP16 identity | Measured quality | Switch off (CLI / config / API / env) |
 |---|---|---|---|---|---|
-| `hc_output_wmma` (on) | HC output: FP16 low values and Q8 coefficients, WMMA accumulation in ascending K16 order, same sigmoid and stream mix | Passed a pre-declared confirmation held-out set | yes | `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path. | `--prefill-disable hc_output_wmma` / `prefill_disable = ["hc_output_wmma"]` / server-level only / `STRIX_PREFILL_HC_OUTPUT_WMMA=0` |
+| `hc_output_wmma` (on in FAST and TURBO; off in EXACT) | HC output: FP16 low values and Q8 coefficients, WMMA accumulation in ascending K16 order, same sigmoid and stream mix | Passed a pre-declared confirmation held-out set | yes | `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path. | `--prefill-disable hc_output_wmma` / `prefill_disable = ["hc_output_wmma"]` / server-level only / `STRIX_PREFILL_HC_OUTPUT_WMMA=0` |
 | `index_proj_wmma` (off; candidate, outside READY) | BF16 indexer q/k WMMA with independent K16 panels and ordered FP32 panel addition; tag `idxproj16` | Pending local qualification | yes | Compiler, native execution, model fidelity and complete-workload gates pending | Opt in: `STRIX_PREFILL_INDEX_PROJ_WMMA=1`; off: `STRIX_PREFILL_INDEX_PROJ_WMMA=0`, `--prefill-disable index_proj_wmma`, config `prefill_disable = ["index_proj_wmma"]`; master exact switch also disables |
 | `index_score_wmma` (off; candidate, outside READY) | FAST prefill BF16 query/pool dot products, independent K16 panels with FP32 addition, per-head ReLU, unchanged selector; tag `idxscore16` | Pending local qualification | yes | Compiler, native execution, model fidelity and complete-workload gates pending; [fixture contract](engine/prefill/index-score-wmma.md) | Opt in: `STRIX_PREFILL_INDEX_SCORE_WMMA=1`; off: `STRIX_PREFILL_INDEX_SCORE_WMMA=0`, `--prefill-disable index_score_wmma`, config `prefill_disable = ["index_score_wmma"]`; master exact switch also disables |
 
@@ -561,7 +561,7 @@ Automatic HTTP budgets and batch L1 qualification remain off.
 
 **Engine:** `qwen`. **Control:** `--known-prefix-window; --known-prefix-full-rows; --known-prefix-prefill-rows; --known-prefix-expert-union; --known-window-router-rows; --prefill-numerical-profile`. **Default:** auto.
 
-The plain generation command resolves to the measured production organization with dense-A8 decode and fast-prefill-f16wmma-v1 prefill.
+The plain generation command resolves to the measured production organization with dense-A8 decode. Its prefill arithmetic follows the tier: `--profile fast` and `--profile turbo` run `fast-prefill-f16wmma-v1` (with `hc_output_wmma`), `--profile exact` runs the dense-A8 reference prefill with `hc_output_wmma` off; no `--profile` resolves the FAST preset (`presets.default`, as `strix run` does). EXACT is the reference and costs about +4.4 s at 32K and +66.9 s at 262K against the default (audit verification, not a new measurement).
 
 - **Preconditions:** Pinned verified checkpoint, qualified gfx1151 target, A8 runtime, >=16 prompt tokens, positive generation, eligible eager registered mapping, unambiguous UMA/GTT observations and sufficient backing capacity.
 - **Automatic selection:** Largest prompt-fitting T in 16384/8192/4096/2048/1024/256/64/16; automatic T16384 starts at 32,768 prompt tokens. Context rounds prompt + max(generation,512) up to 512, minimum 8192, clamped to the model maximum (262,144); T falls back from T16384 (when eligible) through 8192 -> 4096 -> 2048 before declining (insufficient-memory when no tile fits the budget; prompt-exceeds-model-context above the maximum); --unqualified-context is automatic above 8192. Explicit context is preserved. Full budgets: 8 GiB workspace / 1 GiB metadata / 120 GiB UMA / 4 GiB headroom, scaled down with available memory (headroom starts at at least 1 GiB). Native pools are priced at every T under UMA/GTT limits and can raise required headroom or lower the admitted tile. Under this pricing, 131,072 and 262,143 real-text tokens admit automatic T16384, and T8192 as before with `STRIX_QPF2K_T16K=0`, with no fallback. Routed expert union and router rows are on. Tail owners follow the admitted ladder.
@@ -5024,8 +5024,8 @@ inherit it).
   execution still requires configuration agreement for an explicit arithmetic switch.
 - **Exactness evidence:** FAST identity (new FP32 summation order). FAST gate v2 with MoE route replay, pair, 5 windows
   of 8,192 tokens (prose, JSON, two 32K-document slices), 1,275 held-out rows: pooled KL 0.00018 (one-ulp null
-  0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Gate re-score pending: the current gate v2 re-run with the free-running arms passes with route replay, fails the absolute bars free-running (KL 0.363, top-1 0.902; the exact arm's own free one-ulp null gives KL 0.367) and passes with --allow-null-floor. Which rule applies is a pending gate policy decision; the FAST default stays until the owner decides. Free-running
-  (no replay) KL is not discriminating on GLM: the exact arm's own one-ulp null flips routes as much. The product
+  0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Re-scored under the corrected gate on the held-out set tools/strix-gate/heldout/v1, no null floor: PASS in both classes, 2,304- and 8,192-token prompts, 9 windows, 2,295 rows; replay KL < 0.00001, top-1 0.9991; free-running KL 0.0039 / 0.0032, top-1 0.979 / 0.985 (one-ulp free null KL 0.0031 / 0.0026); two exact runs bitwise equal. The earlier free-running KL 0.363 came from two 11-19 windows where the exact arm's own one-ulp null reached KL 0.69 / 1.06: on such content free-running
+  (no replay) KL is not discriminating on GLM, the exact arm's own one-ulp null flips routes as much. The product
   route's head dump is bitwise equal to the gated arm. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3
   1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). OFF equals the exact 8K logits anchors on both
   ranks.
@@ -5248,17 +5248,17 @@ The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..5
 
 <a id="ds41-fast-d1-band"></a>
 
-### DS41 FAST prefill: D1 composition and bounded decoder replay R=256 by band receipt
+### DS41 prefill: D1 composition (FAST) and bounded decoder replay R=256 (TURBO, 8K) by band receipt
 
-**Engine:** `deepseek41` (shared `bind_band_receipts` in `include/strix/engine_profile.hpp`). **Control:** profile rows `d1_prefill` and `decoder_replay` (`--profile fast|turbo`; the implicit model preset is FAST). **Default:** FAST and TURBO, per request, for prompts of 4,096-8,192 and 8,193-32,768 tokens on gfx1151.
+**Engine:** `deepseek41` (shared `bind_band_receipts` in `include/strix/engine_profile.hpp`). **Control:** profile rows `d1_prefill` and `decoder_replay` (`--profile fast|turbo`; the implicit model preset is FAST). **Default:** D1 in FAST and TURBO, per request, for prompts of 4,096-8,192 and 8,193-32,768 tokens on gfx1151; R=256 in TURBO only, 4,096-8,192 (no tier above 8,192: explicit `STRIX_DS41_DECODER_REPLAY=256` only).
 
-Startup exports the previous prefill route. Each request resolves the profile again with its own execution key (backend, device product, priced workload, row split, cone, head rows, window, lanes, MoE chunk). The two band rows of each lever bind to that run's own reference, so the D1 composition (BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert) and, on top of it, the bounded decoder replay R=256 run only inside their measured bands. Both ranks exchange the request fingerprint; either rank declining keeps the previous route on both.
+Startup exports the previous prefill route. Each request resolves the profile again with its own execution key (backend, device product, priced workload, row split, cone, head rows, window, lanes, MoE chunk). The two band rows of each lever bind to that run's own reference, so the D1 composition (BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert) and, on top of it in TURBO up to 8,192 tokens, the bounded decoder replay R=256 run only inside their measured bands. Both ranks exchange the request fingerprint; either rank declining keeps the previous route on both.
 
-- **Exactness evidence:** Bit-changing. FAST gate v2 D1: KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035), route flips 1.05 x null. D1R (with R=256): KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037), route flips 0.37 x null. Pair, 8K and 32K classes, 28 windows, 1,764 rows, final PASS. Gate re-score pending: the current gate v2 re-run on the saved D1 / D1R dumps gives NO VERDICT (rule R3: 7 of the 28 windows are greedy, every label equals the reference top-1; without them the 32K class has fewer than 800 rows). The metrics are unchanged; non-greedy 32K windows must be dumped again on the GPU. The FAST default stays until the owner decides. The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
+- **Exactness evidence:** Bit-changing. Held-out gate v2 re-score (window set `tools/strix-gate/heldout/v1`: prose en / es, code, chat; reference-only pre-filter dropped 2 of 15 windows at 8,128 and 2 at 32,768; no null floor; 13 windows / 819 rows per class): D1 final PASS at 8,128 (KL 0.0105, top-1 0.961, dNLL +0.0003 se 0.0064, route flips 1.07 x null) and 32,768 (KL 0.0142, top-1 0.965, dNLL -0.0024 se 0.0090, flips 1.06 x null); pooled 1,638 rows PASS. D1R (D1 + R=256): FAST FAIL at 8,128 (KL 0.0122, top-1 0.961, dNLL +0.0122 se 0.0080 > +0.01) and 32,768 (KL 0.0200, top-1 0.961, dNLL +0.0225 se 0.0111; windows en32-a +0.117 and chat32-b +0.126 fail); TURBO tier PASS at 8,128, FAIL at 32,768 (the same two windows). The former 28-window receipt (D1 KL 0.0093, D1R KL 0.0101, both PASS) is superseded: 7 of its windows were greedy (rule R3). The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
 - **Off switch:** `--profile exact`, or any explicit `STRIX_DS41_FAST_PREFILL` / `STRIX_DS41_DECODER_REPLAY` value.
-- **Measured gain:** Pair CLI, 8,192 tokens: EXACT 1,128.5, D1 1,614 / 1,647, D1 + R256 1,855 tok/s. 32,768 tokens: EXACT 1,257.2, D1 1,808.6, D1 + R256 1,981 tok/s. Measured before integration; the integrated build needs its device check.
-- **Served scope:** the HTTP server and `strix run` (the same binary) enter the same admission (`DevicePrefill::run_full_prompt`) for a fresh whole text prompt run as one piece, at any slot count (`served_full_prompt`), and resolve the CLI's cells: the idle group-pass storage of a multi-slot server is not a lane, a DSpark seed of at most R rows rides on R=256 (`plan_bounded_replay` computes the same rows for any seed <= R; without the replay the seed declines), and in FAST / TURBO `--prefill-rows auto` holds the band's 32,768 rows when they fit under the same memory rule (`whole_prompt_band`, `served_piece_rows`; the default pieces stay 16,384, EXACT is unchanged). Serving-only routes keep the previous route and the decline line names the condition: in-run prefix-cache capture (the default `--cache-profile agent`; the bounded replay cannot write mid-run states), continuations, image rows, phase-B units while another request decodes, and servers with a disk tier. The receipts are pair-CLI runs; timed points are 8,128 / 8,192 and 32,768 tokens, the lower band edges (4,096, 8,193) are covered by the gate classes but untimed.
-- **Band edges:** the receipts are pair-CLI runs; timed points are 8,128 / 8,192 and 32,768 tokens, and the lower band edges (pair CLI ABBA, warm run, FAST = D1 + R=256 vs EXACT): 4,096 x1.60 (4,089 -> 2,557 ms), 6,000 x1.57, 8,193 x1.58 (7,172 -> 4,537 ms), 16,384 x1.55; the nominal edges stay. D1 without R=256 is not a product execution (an explicit lever leaves the measured composition).
+- **Measured gain:** Pair CLI, 8,192 tokens: EXACT 1,128.5, D1 (FAST) 1,614 / 1,647, D1 + R256 (TURBO) 1,855 tok/s. 32,768 tokens: EXACT 1,257.2, D1 (FAST, TURBO) 1,808.6, D1 + R256 (explicit only) 1,981 tok/s. FAST gives up 11-13 % at 8K and 8.7 % at 32K by losing R256; no other passing lever recovers it. Measured before integration; the integrated build needs its device check.
+- **Served scope:** the HTTP server and `strix run` (the same binary) enter the same admission (`DevicePrefill::run_full_prompt`) for a fresh whole text prompt run as one piece, at any slot count (`served_full_prompt`), and resolve the CLI's cells: the idle group-pass storage of a multi-slot server is not a lane, a DSpark seed of at most R rows rides on R=256 (`plan_bounded_replay` computes the same rows for any seed <= R; without the replay the seed declines, so since the held-out re-score a seeded FAST request, and a seeded TURBO request above 8,192, keeps the previous prefill route while the CLI runs D1), and in FAST / TURBO `--prefill-rows auto` holds the band's 32,768 rows when they fit under the same memory rule (`whole_prompt_band`, `served_piece_rows`; the default pieces stay 16,384, EXACT is unchanged). Serving-only routes keep the previous route and the decline line names the condition: in-run prefix-cache capture (the default `--cache-profile agent`; the bounded replay cannot write mid-run states), continuations, image rows, phase-B units while another request decodes, and servers with a disk tier. The receipts are pair-CLI runs; timed points are 8,128 / 8,192 and 32,768 tokens, the lower band edges (4,096, 8,193) are covered by the gate classes but untimed.
+- **Band edges:** the receipts are pair-CLI runs; timed points are 8,128 / 8,192 and 32,768 tokens. D1 alone at the lower edges (quality runner, no row split, no cone, head 64, two runs with equal hashes): 4,096 EXACT 9.84 / 9.01 s, D1 7.55 / 7.56 s (x1.19-1.30); 8,193 EXACT 17.81 / 17.68 s, D1 14.61 / 14.58 s (x1.21); D1 + R=256 at 4,096: 4.24 / 4.23 s. The nominal edges stay. Earlier pair-CLI ABBA of D1 + R=256 vs EXACT: 4,096 x1.60 (4,089 -> 2,557 ms), 6,000 x1.57, 8,193 x1.58 (7,172 -> 4,537 ms), 16,384 x1.55.
 - **Engines:** DeepSeek V4.1 Flash bound. Qwen3.8 Flash Next, Qwen3.8-27B and Hy4 Flash use the same band mechanism for their own rows. Inkling 2 Mini, GLM-5.3 Flash, MiniMax M3.1 Flash and Nemotron 3.5 Bolt E4B have no DeepSeek prefill composition. Same class of serve-vs-CLI gap (a serve-only option or piece plan that leaves the CLI's measured route), to check per engine: Qwen HIP serve (1024-row cache checkpoints and T8192 pieces against the CLI's whole-prompt FAST rows), Hy4 Flash (served `prompt_rows` against the FAST row qualified at <= 4K), GLM-5.3 Flash pair (band rows that need MemAvailable for auto max-rows 8192; a server holding more memory can fall out of them), MiniMax M3.1 Flash pair (closed: the serve default transport is now the host route usb4-auto, as the CLI's; see the row MiniMax serving: host pair route by default), Gemma 4 (server sizes the EXL3 core for 8 streams, CLI for 1; the INT8 global KV shadow TURBO default g4-dattn-f2 is resolved per request by the server with the CLI's band rows). Inkling 2 Mini served chunks were aligned with the CLI earlier (shared served chunk ladder).
 - **Implementation / evidence:** [rows](../include/strix/deepseek41_pair_profile_table.hpp), [execution key](../src/deepseek41_pair_defaults.cpp), [paired admission](../src/hip_deepseek41_prefill.hip), [tests](../tests/deepseek41_pair_defaults_tests.cpp)
 
@@ -6724,9 +6724,8 @@ without failing. **Device plan:** `bash scripts/bench/bench.sh campaign band-edg
 middle and upper edge of each band); a row's edge is set from those timings, never before.
 
 No band row has an untimed lower edge. Timed lower edges (timed points in brackets): DeepSeek V4.1 Flash pair D1
-prefill 4,096-8,192 (4,096, 6,000, 8,128, 8,192) and 8,193-32,768 (8,193, 16,384, 32,768), decoder replay R=256
-4,096-8,192 (4,096, 6,000, 8,192) and 8,193-32,768 (8,193, 16,384, 32,768): FAST D1 + R=256 against EXACT x1.60 / x1.57
-/ x1.58 / x1.55 at 4,096 / 6,000 / 8,193 / 16,384, nominal edges kept; GLM-5.3 Flash pair FAST WMMA prefill bundle
+prefill 4,096-8,192 (4,096, 8,128, 8,192) and 8,193-32,768 (8,193, 32,768), D1 alone against EXACT x1.19-1.30 / x1.21
+at 4,096 / 8,193 (quality runner), and TURBO decoder replay R=256 4,096-8,192 (4,096, 8,128, 8,192), nominal edges kept; GLM-5.3 Flash pair FAST WMMA prefill bundle
 2,049-8,192 (2,049, 4,096, 8,192): x1.37 / x1.47 at 2,049 / 4,096, edge kept and the row states the lower ratio x1.37;
 Qwen3.8 Flash Next TURBO cap9 4,096-8,192 (timed 4,096, 8,192) and 8,193-32,768 (8,193, 32,768);
 Qwen3.8 27B 512-row window 2,049-8,192 (2,049, 4,096, 8,192) and 8,193-24,576 (8,193, 24,576); the 27B 1-2,048 row is
@@ -7397,3 +7396,53 @@ The GLM FAST prefill band ([glm-pf-wmma-x](#glm-pf-wmma-x)) is admitted per meas
 | Inkling 2 Mini | not bound: no GLM prefill layout list |
 | Hy4 Flash | not bound: no GLM prefill layout list |
 | Nemotron 3.5 Bolt E4B | not bound: no GLM prefill layout list |
+
+<a id="moe-r1-union-hip-plan"></a>
+## HIP microscaled R1 plan: one weight read per routed expert for 8+ cohort rows
+
+**Engine:** `shared`. **Control:** STRIX_MOE_R1_UNION (read once); expert_union parameter of microscaled_r1::launch / launch_rows. **Default:** on (HIP) at 8 or more rows per launch; rows kernels below 8 rows, on CUDA and on the host.
+
+A served cohort pass routes R rows x 8 slots; at C8 the 64 assignments fall on about 44 distinct experts. The rows kernels read and decode an expert once per assignment and round each input per wave. The plan's gate_up union reads and decodes each chunk of an expert's weights once for all rows routed to it (up to 4 rows per pass: 8 inputs of accumulators spill on gfx1151), with the pass rows rounded once to BF16 codes in LDS (4 codes of padding per chunk: one bank pair per lane). The down projection keeps the rows kernel in nvfp4 (the union down is slower there) and runs the union in mxfp8.
+
+- **Shared home:** src/moe_core/microscaled_r1.hpp (decode_chunk_inputs, stream_inputs, dot_inputs_streamed, gate_up_union, launch)
+- **Tier and regime:** EXACT; multi-request decode, 8..16 rows per MoE launch
+- **Exactness evidence:** bit for bit per row (same FMA chain in ascending K, same decoded weight, same rounded input, same butterfly). No-model bench: union and plan equal rows on activations and outputs, 18/18 cases. Device fixture: an 8-row plan launch equals eight one-row launches. ISA of every existing kernel identical. Served EXACT ids equal with the switch on and off (C1 / C2 / C4 / C8).
+- **Off switch:** STRIX_MOE_R1_UNION=0
+- **Measured gain:** no-model bench per visit at R=8 (served routes): nvfp4 1,210 -> 1,043 us (-13.8%), mxfp8 2,351 -> 1,933 us (-17.8%). Served EXACT Inkling 2 Mini, 8 slots, one binary: C8 pass 95.4 -> 88.8 ms, aggregate 52.01 -> 55.24 tok/s (x1.062).
+- **Preconditions:** HIP, microscaled expert matrix, input rows of whole chunks and 8-byte aligned for the LDS staging (otherwise global loads, same bits), 8..16 rows per launch.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: experts are not microscaled R1 matrices |
+| Qwen3.8 27B dense | not bound: dense model |
+| DeepSeek V4.1 Flash | not bound: experts are not microscaled R1 matrices on HIP |
+| GLM 5.3 Flash | not bound: experts are not microscaled R1 matrices on HIP |
+| MiniMax M3.1 Flash | not bound: experts are not microscaled R1 matrices on HIP |
+| Inkling 2 Mini | bound: served cohort passes (decode::launch_rows, nvfp4 and mxfp8 experts) |
+| Hy4 Flash | not bound: experts are not microscaled R1 matrices on HIP |
+| Nemotron 3.5 Bolt E4B | not bound: experts are not microscaled R1 matrices on HIP |
+<a id="inkling-hip-served-lanes"></a>
+
+## Inkling 2 Mini HIP: served cohort passes in lane mode
+
+**Engine:** `inkling2`. **Control:** STRIX_INKLING_HIP_LANES. **Default:** on for every HIP cohort pass of 2..16 lanes.
+
+A served cohort pass runs its lane-stateful stages (K/V and post convolutions, position-scaled clips and their rounding, cache store and attention) as one launch over the pass's lanes; each lane reads its slot, position and id from the pass's step block.
+
+- **Shared home:** include/strix/exec/step_lanes.hpp (make_cohort_step), attn_core prepared GQA lane forms; Inkling binds them in MiniResidentDecoder::decode_slots_served
+- **Tier and regime:** EXACT, FAST, TURBO; HIP multi-request decode
+- **Exactness evidence:** EXACT: each lane keeps its one-row step bits. HIP cohort-lanes fixture, served route and incumbent body: logits, K/V rows and histories bitwise against each lane alone at widths 2 3 4 8 9 16 17 (12 steps); served C8 ids equal with the switch on and off.
+- **Off switch:** STRIX_INKLING_HIP_LANES=0
+- **Measured gain:** one gfx1151 node, strix-serve EXACT, 8 slots, 8 concurrent requests of 128 tokens, same binary (receipt coh3 t1): 8-row pass 103.5 -> 95.6 ms ((span 128 - span 32) / 96), aggregate with prefill 49.10 -> 51.73 tok/s (x1.054); one request unchanged (26.71 / 26.64 tok/s). Kernel trace (receipt coh3 p1): the lane-stateful stages were about 2,900 launches per 8-row pass.
+- **Preconditions:** HIP, a cohort pass of at least two lanes, no host taps recorded (a recorded drafter tap keeps one launch per lane), at most 32 rows per step block.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: its own HIP cohort (one shared scheduler pending) |
+| Qwen3.8 27B dense | not bound: same Qwen route |
+| DeepSeek V4.1 Flash | not bound: pair session, no lane cohort |
+| GLM 5.3 Flash | not bound: pair app, no lane cohort |
+| MiniMax M3.1 Flash | not bound: pair app, no lane cohort |
+| Inkling 2 Mini | bound: HIP served passes and the incumbent cohort body (CUDA: cohort programs already in lane mode) |
+| Hy4 Flash | not bound: own session service |
+| Nemotron 3.5 Bolt E4B | not bound: no served cohort |

@@ -1,4 +1,5 @@
 #include "../apps/qwen_effective_config.hpp"
+#include "strix/model_description.hpp"
 #include <iostream>
 #include <map>
 #include <type_traits>
@@ -158,7 +159,7 @@ void defaults_matrix() {
 // candidates without a speed row change no resolved value: every tier, with or without --allow-pending, runs the
 // builtin until a ladder row shows the TURBO cell faster than FAST in the regime.
 void registered_controls_resolve_builtin() {
-    const char* registered[] = {"decode_numerical_profile", "gsq_expert_pack", "hc_output_wmma", "moe_small", "moe_tile64",
+    const char* registered[] = {"decode_numerical_profile", "gsq_expert_pack", "moe_small", "moe_tile64",
         "moe_direct_b", "moe_tiers", "moe_down_lds_epi", "moe_route_ctrl", "gsq_prefill_f16", "dense_q6p_pack",
         "dense_trellis_pack"};
     for (const char* key : registered) {
@@ -349,6 +350,95 @@ void common_adapters() {
     check(c.options.product_profile.json().find("\"engine\"")==std::string::npos,"legacy JSON has no engine tag");
 }
 #endif
+// EXACT is bitwise the reference: no bit-changing prefill lever resolves to a non-off value in the default (exact) or
+// quality column, whatever the regime, while FAST and TURBO keep the FP16 WMMA prefill route and the HC output WMMA
+// (their cells leave the incumbent route on). The off value is the reference identity (dense-a8 prefill, serial HC out).
+void exact_resolves_no_bit_changing_prefill_lever() {
+    const Env env;
+    for (const std::uint64_t context : {0U, 2048U, 8192U, 32768U, 262144U}) {
+        for (const bool allow : {false, true}) {
+            pr::Inputs input{{}, lookup(env), allow};
+            input.regime = {strix::profile::Phase::prefill, context, 1, "gfx1151"};
+            for (const auto tier : {pr::Name::standard, pr::Name::quality}) {
+                const auto r = pr::resolve(tier, input);
+                for (const char* key : {"prefill_f16wmma", "hc_output_wmma"}) {
+                    const auto* entry = r.find(key);
+                    check(entry && entry->status == pr::Status::set && entry->value == entry->lever->off,
+                          "EXACT resolves the reference value of the FP16 WMMA prefill rows");
+                }
+                for (const auto& entry : r.entries)
+                    check(entry.lever->kind != strix::profile::Kind::bit_changing || !strix::profile::applied(entry.status) ||
+                              entry.value == entry.lever->off,
+                          "no bit-changing lever is applied in EXACT");
+            }
+            for (const auto tier : {pr::Name::fast, pr::Name::turbo}) {
+                const auto r = pr::resolve(tier, input);
+                for (const char* key : {"prefill_f16wmma", "hc_output_wmma"}) {
+                    const auto* entry = r.find(key);
+                    check(!entry || entry->value != entry->lever->off, "FAST and TURBO keep the FP16 WMMA prefill rows");
+                }
+            }
+        }
+    }
+    // The shared route reader sees the same resolution: only the exact tier turns the automatic FP16 arithmetic off.
+    for (const auto tier : {pr::Name::standard, pr::Name::fast, pr::Name::turbo}) {
+        dc::Options options;
+        const Env empty;
+        pr::Inputs input{{}, lookup(empty), false};
+        input.regime = {strix::profile::Phase::prefill, 8192, 1, "gfx1151"};
+        options.product_profile = pr::resolve(tier, input);
+        check(dc::product_profile_prefill_f16_off(options) == (tier == pr::Name::standard),
+              "the route reads the prefill_f16wmma row: off in EXACT only");
+    }
+}
+// No --profile = the model preset: the tier presets.default of the model data names, admitted as `strix run` admits it
+// (the launcher passes --profile <tier> with the preset marker), at every context and with or without --allow-pending.
+std::string cells(const pr::Resolution& r) {
+    std::string out;
+    for (const auto& entry : r.entries)
+        out += std::string(entry.lever->name) + "=" + entry.value + ":" + std::string(pr::status_name(entry.status)) + ";";
+    return out;
+}
+void implicit_preset_is_the_model_preset() {
+    const auto description = strix::model_description::load(std::string(STRIX_SOURCE_DIR) + "/models/qwen3.8-flash-next.toml");
+    const auto* declared = description.find("presets.default");
+    const auto* word = declared ? std::get_if<std::string>(&declared->data) : nullptr;
+    check(word && *word == pr::name(pr::kImplicit), "kImplicit is the tier models/qwen3.8-flash-next.toml presets.default names");
+    const Env env;
+    for (const std::uint64_t context : {0U, 2048U, 8192U, 8193U, 32768U, 262144U}) {
+        for (const bool allow : {false, true}) {
+            pr::Inputs input{{}, lookup(env), allow};
+            input.regime = {strix::profile::Phase::prefill, context, 1, "gfx1151"};
+            input.max_prompt_tokens = context;
+            input.regimes = pr::fast_regimes;
+            const auto implicit = pr::resolve_requested(std::nullopt, input);
+            std::string previous;
+            if (const char* prior = strix::profile::environment({}, strix::profile::kPresetEnv)) previous = prior;
+            check(strix::profile::export_environment(strix::profile::kPresetEnv, "1"), "set the preset marker");
+            const auto launcher = pr::resolve(pr::kImplicit, input);
+            check(strix::profile::export_environment(strix::profile::kPresetEnv, previous.c_str()), "restore the preset marker");
+            check(implicit.profile == pr::Name::fast && cells(implicit) == cells(launcher),
+                  "no --profile resolves the cells of `strix run` without --profile (FAST, preset admission)");
+            check(cells(pr::resolve_requested(pr::Name::fast, input)) == cells(pr::resolve(pr::Name::fast, input)) &&
+                      cells(pr::resolve_requested(pr::Name::standard, input)) == cells(pr::resolve(pr::Name::standard, input)),
+                  "a named --profile resolves as named");
+            // The previous default arithmetic of the FP16 WMMA prefill rows (their builtin value) stays the default.
+            for (const char* key : {"prefill_f16wmma", "hc_output_wmma"}) {
+                const auto* entry = implicit.find(key);
+                check(entry && entry->value == entry->lever->builtin,
+                      "no --profile keeps the FP16 WMMA prefill rows at their builtin value");
+            }
+            // Provisional cells (outside the FAST bundle's qualified prompts) wait for --allow-pending, as under the preset.
+            for (const auto& entry : implicit.entries)
+                check(entry.status != pr::Status::provisional || allow, "no --profile applies no provisional cell by itself");
+        }
+    }
+    dc::Options options;
+    pr::Inputs input{{}, lookup(env), false};
+    input.regime = {strix::profile::Phase::prefill, 32768, 1, "gfx1151"};
+    options.product_profile = pr::resolve_requested(std::nullopt, input);
+    check(!dc::product_profile_prefill_f16_off(options), "no --profile runs the FP16 WMMA prefill route");
+}
 }
 int main(int argc,char** argv) try {
     emit=argc==2 && std::string_view(argv[1])=="--fixtures";
@@ -356,6 +446,8 @@ int main(int argc,char** argv) try {
     route_prune_startup_binding();
     prefill_startup_binding();
     registered_controls_resolve_builtin();
+    exact_resolves_no_bit_changing_prefill_lever();
+    implicit_preset_is_the_model_preset();
     product_matrix(); admission_matrix(); defaults_matrix(); config_matrix(); identities();
 #ifndef STRIX_STEP1_ORIGINAL
     common_adapters();

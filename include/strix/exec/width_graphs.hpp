@@ -12,7 +12,7 @@
 
 #include "strix/device/runtime.hpp"
 #include "strix/exec/descriptor.hpp"
-#include "strix/exec/width_replay.hpp"
+#include "strix/exec/graph_runner.hpp"
 
 #include <array>
 #include <cstddef>
@@ -26,14 +26,16 @@
 
 namespace strix::exec {
 
-class WidthStepGraphs {
+template <class Binding>
+class BoundWidthStepGraphs {
 public:
     using Policy = WidthReplayPolicy;
     using Stream = device::native::Stream;
 
-    WidthStepGraphs() = default;
-    ~WidthStepGraphs() {
-        discard_all();
+    explicit BoundWidthStepGraphs(GraphRows layout = GraphRows::cohort) : runner_(layout) {}
+    explicit BoundWidthStepGraphs(const StreamGraphPrograms& programs) : runner_(programs) {}
+    ~BoundWidthStepGraphs() {
+        invalidate();
         if (device_) (void)STRIX_WIDTH_RT(Free)(device_);
 #if defined(__HIPCC__)
         if (staging_) (void)hipHostFree(staging_);
@@ -41,8 +43,8 @@ public:
         if (staging_) (void)cudaFreeHost(staging_);
 #endif
     }
-    WidthStepGraphs(const WidthStepGraphs&) = delete;
-    WidthStepGraphs& operator=(const WidthStepGraphs&) = delete;
+    BoundWidthStepGraphs(const BoundWidthStepGraphs&) = delete;
+    BoundWidthStepGraphs& operator=(const BoundWidthStepGraphs&) = delete;
 
     // The device step block every captured kernel reads. Stable for the lifetime of this object.
     [[nodiscard]] StepBlock* block() {
@@ -76,82 +78,68 @@ public:
     // graph launch error has uncertain submission state and propagates. The serial owner drains the
     // stream (which also retires the staging copy) before the next call.
     template <class Work>
-    bool try_launch(Stream stream, bool enabled, bool stable_layout, const StepBlock& input, Work&& work) {
-        const auto width = input.h.rows;
-        const auto at = Policy::index(width);
-        const auto action = policy_.select(enabled, width, stable_layout);
-        if (action == WidthReplayAction::eager) {
-            if (at < Policy::kWidths) discard(at);
-            return false;
-        }
-        try {
-            (void)block();
-        } catch (...) {
-            policy_.fail(width);
-            return false;
-        }
-        if (action == WidthReplayAction::capture && !capture(stream, at, work)) {
-            discard(at);
-            policy_.fail(width);
-            (void)STRIX_WIDTH_RT(GetLastError)();
-            return false;
-        }
-        upload(stream, input);
-        const auto status = STRIX_WIDTH_RT(GraphLaunch)(exec_[at], stream);
-        if (status != STRIX_WIDTH_RT(Success)) {
-            discard(at);
-            policy_.fail(width);
-            device::native::check(status, "launch width step graph");
-        }
-        return true;
+    bool try_launch(Stream stream, bool enabled, bool stable_layout, const StepBlock& input,
+                    Work&& work, const Binding& binding = {}) {
+        return runner_.run(*this, stream, enabled, stable_layout, input, binding, work);
+    }
+
+    // Uses the immutable stream program table passed at construction. A nonrectangular
+    // group layout or an unlisted shape declines before capture, upload or launch.
+    template <class Work>
+    bool try_launch_for_streams(Stream stream, bool enabled, bool stable_layout, const StepBlock& input,
+                                std::uint32_t active_streams, Work&& work, const Binding& binding = {}) {
+        return runner_.run_for_streams(*this, stream, enabled, stable_layout, input, binding, work, active_streams);
     }
 
     [[nodiscard]] bool capturing() const noexcept { return capturing_; }
     [[nodiscard]] unsigned instantiations() const noexcept { return instantiations_; }
     // Kernel/copy/memset nodes of the installed program of `width`; 0 when none is installed.
     [[nodiscard]] std::size_t nodes(std::uint32_t width) const noexcept {
+        return runner_.uses_stream_programs() ? 0U : nodes_for_key(width);
+    }
+    [[nodiscard]] std::size_t nodes_for_streams(std::uint32_t active_streams) const noexcept {
+        return runner_.rows_per_stream(active_streams) ? nodes_for_key(active_streams) : 0U;
+    }
+    [[nodiscard]] const Policy& policy() const noexcept { return runner_.policy(); }
+
+    void invalidate() noexcept { runner_.invalidate(*this); }
+    void reset() noexcept { runner_.reset(*this); }
+
+private:
+    friend class StepGraphRunner<Binding>;
+
+    [[nodiscard]] std::size_t nodes_for_key(std::uint32_t width) const noexcept {
         const auto at = Policy::index(width);
         return at < Policy::kWidths && exec_[at] ? nodes_[at] : 0U;
     }
-    [[nodiscard]] const Policy& policy() const noexcept { return policy_; }
 
-    void invalidate() noexcept {
-        discard_all();
-        policy_.invalidate();
-    }
-    void reset() noexcept {
-        discard_all();
-        policy_.reset();
+    void launch(Stream stream, std::uint32_t at) {
+        device::native::check(STRIX_WIDTH_RT(GraphLaunch)(exec_[at], stream), "launch width step graph");
     }
 
-private:
     template <class Work>
     bool capture(Stream stream, std::uint32_t at, Work& work) {
-        discard(at);
-        if (STRIX_WIDTH_RT(StreamBeginCapture)(stream, STRIX_WIDTH_RT(StreamCaptureModeThreadLocal)) !=
-            STRIX_WIDTH_RT(Success)) return false;
-        capturing_ = true;
-        bool enqueued = false;
         try {
-            work();
-            enqueued = true;
+            (void)block();
         } catch (...) {
-            // The caller retries the step through its eager path after capture ends.
-        }
-        STRIX_WIDTH_RT(Graph_t) graph{};
-        const auto end = STRIX_WIDTH_RT(StreamEndCapture)(stream, &graph);
-        capturing_ = false;
-        if (!enqueued || end != STRIX_WIDTH_RT(Success) || !graph) {
-            if (graph) (void)STRIX_WIDTH_RT(GraphDestroy)(graph);
             return false;
         }
+        const bool installed = record(stream, at, work);
+        if (!installed) (void)STRIX_WIDTH_RT(GetLastError)();
+        return installed;
+    }
+
+    template <class Work>
+    bool record(Stream stream, std::uint32_t at, Work& work) {
+        discard(at);
+        const auto graph = device::native::record_step_graph(stream, capturing_, work);
+        if (!graph) return false;
         std::size_t count = 0;
-        (void)STRIX_WIDTH_RT(GraphGetNodes)(graph, nullptr, &count);
-#if defined(__HIPCC__)
-        const auto status = hipGraphInstantiate(&exec_[at], graph, nullptr, nullptr, 0U);
-#else
-        const auto status = cudaGraphInstantiate(&exec_[at], graph, 0U);
-#endif
+        if (!device::native::inspect_raw_step_graph(graph, count)) {
+            (void)STRIX_WIDTH_RT(GraphDestroy)(graph);
+            return false;
+        }
+        const auto status = device::native::instantiate_step_graph(&exec_[at], graph);
         (void)STRIX_WIDTH_RT(GraphDestroy)(graph);
         if (status != STRIX_WIDTH_RT(Success)) {
             exec_[at] = nullptr;
@@ -159,22 +147,15 @@ private:
         }
         nodes_[at] = count;
         ++instantiations_;
-        policy_.captured(width_of(at));
         return true;
     }
-
-    [[nodiscard]] static constexpr std::uint32_t width_of(std::uint32_t at) noexcept { return at + 1U; }
 
     void discard(std::uint32_t at) noexcept {
         if (exec_[at]) (void)STRIX_WIDTH_RT(GraphExecDestroy)(exec_[at]);
         exec_[at] = nullptr;
         nodes_[at] = 0U;
     }
-    void discard_all() noexcept {
-        for (std::uint32_t at = 0; at < Policy::kWidths; ++at) discard(at);
-    }
-
-    Policy policy_;
+    StepGraphRunner<Binding> runner_;
     std::array<STRIX_WIDTH_RT(GraphExec_t), Policy::kWidths> exec_{};
     std::array<std::size_t, Policy::kWidths> nodes_{};
     StepBlock* device_{};
@@ -182,6 +163,8 @@ private:
     bool capturing_{};
     unsigned instantiations_{};
 };
+
+using WidthStepGraphs = BoundWidthStepGraphs<IndirectGraphBinding>;
 
 }  // namespace strix::exec
 

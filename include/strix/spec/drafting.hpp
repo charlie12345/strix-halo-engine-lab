@@ -222,7 +222,8 @@ struct ArbiterConfig {
     // first one-row pass 33-37 ms against a ~9.5 ms plain step; learned as the plain row's price, it made every
     // drafted window look cheaper than serial, and serial was never measured again (auto drafted on prose at 0.65x
     // of off). An ignored width is priced as if unmeasured (seeds or neighbours); an unmeasured, unseeded plain row
-    // still forces a serial pass, so the plain row is learned from a warm pass. 0 = every wall counts.
+    // still forces a serial pass, so the plain row is learned from a warm pass. A cold model pass is left out of the
+    // probe_loss episode's net (it neither closes the episode nor paces the next probe). 0 = every wall counts.
     std::uint32_t cold_walls = 0;
     double lookup_overhead_ms = 0.0;    // extra cost of a lookup pass (the proposal itself is computed every step: sunk)
     std::array<double, 2> lookup_prior{1.0, 2.0};  // Beta prior (accept, reject) per depth for lookup
@@ -231,6 +232,7 @@ struct ArbiterConfig {
     double model_sd = 0.0;
     ArbiterMode mode = ArbiterMode::Adaptive;
     ChanceWindowTables chance_window{};
+    std::vector<std::uint32_t> max_draft_by_live{};
 };
 
 struct StepInput {
@@ -250,6 +252,7 @@ struct StepInput {
     // ChanceWindow only: one probability per already-drafted ID, in proposal order. Empty omits the model arm.
     // This replaces the pre-draft model inputs. Proposal work is sunk, so decisions price verification only.
     std::span<const float> model_confidence{};
+    std::uint32_t live_lanes = 1;
 };
 
 struct Decision {
@@ -307,6 +310,10 @@ public:
     // Posterior mean of the conditional survival at `depth` (decisions bound the cumulative survival, see .cpp).
     [[nodiscard]] double survival(Source source, std::uint32_t bucket, std::uint32_t depth) const;
     [[nodiscard]] const ArbiterConfig& config() const { return config_; }
+    // ArbiterConfig::probe_loss episode state (receipts): an episode is open; the realized loss (ms) of the last closed
+    // one (< 0: none closed yet).
+    [[nodiscard]] bool episode_open() const noexcept { return episode_open_; }
+    [[nodiscard]] double episode_loss_ms() const noexcept { return episode_loss_ms_; }
 
 private:
     struct Beta { double a = 0, b = 0; };

@@ -26,6 +26,36 @@ constexpr std::string_view fast_prefill_attention_receipt =
 // because a8 prefill rows are byte-identical to g4-a8-v1 decode rows (byte receipt 4e914dcf: KV and per-row logits on
 // 56/56 teacher-v2 parents; served ids equal to decode-fed rows at C1/C4).
 [[maybe_unused]] constexpr std::string_view fast_a8_prefill_receipt = "g4-a8-v1 9ba0cf53 + a8 prefill byte receipt 4e914dcf";
+// Gate v2 decode of g4-dattn-f2 (scripts/bench/gemma4/fast-gate-v2.sh, tools/strix-gate/gate_v2.py --format steps):
+// Q4_K_M, reference exact decode (fast prompt prefill at 32K/64K), candidate FAST + g4-dattn-f2, null one FP16 ulp on the
+// anchor embedding (STRIX_DENSE_NULL), 128 teacher-forced held-out rows per case (code/en/es).
+constexpr std::string_view dattn_gate_receipt =
+    "g4-dattn-f2 gate v2 decode: TURBO PASS 2K (1,536 rows: KL 0.0030, top-1 0.986, dNLL +0.0038) / 8K (1,152: 0.0029, "
+    "0.985, +0.0041) / 32K (1,024: 0.0032, "
+    "0.987, +0.0042) / 64K (1,024: 0.0019, 0.981, -0.0003); FAST FAIL (per-window dNLL > 0.01 under the null-capped se)";
+// Decode C1 ABBA, FAST exact attention vs FAST + g4-dattn-f2 (Q4_K_M, 128 greedy tokens, fresh process per run).
+constexpr std::string_view dattn_turbo_timing = "g4-dattn-f2 decode C1 ABBA vs exact attention";
+// TURBO band receipts of g4-dattn-f2 (bound per run to its own FAST reference by profile::bind_band_receipts): each band
+// starts at its timed lower edge; speedup = that edge's measured decode ratio (the ratio grows with the context).
+constexpr strix::profile::LadderRow dattn_band(std::uint64_t lo, std::uint64_t hi, double speedup, double noise) {
+    strix::profile::LadderRow row{};
+    row.lever = "decode_attention";
+    row.value = "g4-dattn-f2";
+    row.tier = strix::profile::Name::turbo;
+    row.phase = strix::profile::Phase::decode;
+    row.device = "gfx1151";
+    row.min_context = lo;
+    row.max_context = hi;
+    row.speedup = speedup;
+    row.noise = noise;
+    row.receipt = dattn_turbo_timing;
+    row.identity = "v1";
+    row.band_bound = true;
+    row.band_evidence.timed = {lo};
+    row.band_evidence.gated = {lo};
+    row.band_evidence.gate_scope = dattn_gate_receipt;
+    return row;
+}
 // Profile columns: default, fast, quality, turbo (an empty turbo cell reads the fast cell). One row per lever;
 // an owner merge (or a passed gate) flips its own `runnable` / `ready` column (and, if its switch name differs, `env`) on its own row.
 constexpr Lever table[] = {
@@ -34,14 +64,16 @@ constexpr Lever table[] = {
      .kind = Kind::bit_changing, .apps = engine | decode_bench,
      .source = "g4-a8-v1 (A8G32 activations, integer dots; byte gates exact); "
                "qualified: held-out fidelity bands met", .identity = {{{"g4-v1", "v1"}, {"g4-a8-v1", "v1"}}}},
-    // FAST decode attention at depth (global layers): int8 KV groups (one FP16 scale per 16 features) from the
-    // per-stream mirror, split-K over 128-key tiles, FP32 softmax and sums, ordered merge (g4-dattn-f2; g4-dattn-f1 =
-    // FP16 operands, selectable). Pending its fast-parity receipt (decode after 8K/32K/64K prompts); until
-    // then FAST runs the exact attention. STRIX_G4_DECODE_ATTN=exact is the OFF switch.
-    {.name = "decode_attention", .env = "STRIX_G4_DECODE_ATTN", .value = {"exact", "g4-dattn-f2", "exact"},
-     .builtin = "exact", .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, true, true},
-     .kind = Kind::bit_changing, .apps = engine | decode_bench, .target = "g4-dattn-f2",
-     .source = "pending: g4-dattn-f2 qualification receipt (fast-parity, decode after 8K/32K/64K prompts)", .identity = {{{"exact", "v1"}, {"g4-dattn-f2", "v1"}}}},
+    // Decode attention at depth (global layers): int8 KV groups (kv-shadow-i8g16-v1: one FP16 scale per 16 features)
+    // from the per-stream mirror, split-K over 128-key tiles, FP32 softmax and sums, ordered merge (g4-dattn-f2;
+    // g4-dattn-f1 = FP16 operands, selectable). Gate v2 decode (dattn_gate_receipt): FAST fails (per-window dNLL),
+    // TURBO passes, so FAST runs the exact attention and TURBO runs g4-dattn-f2 in the bands of its timing rows
+    // (dattn_band rows in ladder_rows). The decode attention identity in every receipt states the KV read precision.
+    // STRIX_G4_DECODE_ATTN=exact is the OFF switch.
+    {.name = "decode_attention", .env = "STRIX_G4_DECODE_ATTN", .value = {"exact", "exact", "exact", "g4-dattn-f2"},
+     .builtin = "exact", .required = {false, false, false, false}, .ready = {true, true, true, true},
+     .runnable = {true, true, true, true}, .kind = Kind::bit_changing, .apps = engine | decode_bench, .off = "exact",
+     .source = dattn_gate_receipt, .identity = {{{"exact", "v1"}, {"g4-dattn-f2", "v1"}}}},
     // A8 FFN epilogue fused into the A8 PLE-gate linear prologue: active whenever the g4-a8-v1 decode identity
     // runs (a no-op otherwise); ids and bytes equal the separate epilogue. STRIX_G4_A8_FFN_PLE_FUSE=0 switches it off.
     {.name = "a8_ffn_ple_fuse", .env = "STRIX_G4_A8_FFN_PLE_FUSE", .value = {"1", "1", "1"}, .builtin = "1",
@@ -169,6 +201,11 @@ constexpr strix::profile::LadderRow ladder_rows[] = {
     strix::profile::incumbent_cell("prefill_route", "fast", strix::profile::Name::fast, fast_prefill_receipt, "g4-wmma-pf-v1"),
     strix::profile::incumbent_cell("prefill_route_attention", "flash", strix::profile::Name::fast,
                                    fast_prefill_attention_receipt, "g4-flash-attn-v1"),
+    // g4-dattn-f2 in TURBO from 8K up (8K/32K/64K decode +8.9 / +46 / +82 %, noise <= 2 %); 256..2K prompts are within
+    // noise (the 2K gate passed, its +4.9 % did not clear the noise bar) and stay exact.
+    dattn_band(8192, 32767, 1.089, 0.02),
+    dattn_band(32768, 65279, 1.460, 0.01),
+    dattn_band(65280, 65536, 1.819, 0.01),
 };
 } // namespace
 
@@ -291,8 +328,6 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
     Resolution out;
     out.name = profile;
     out.app = app;
-    std::vector<strix::profile::LadderRow> ladder(inputs.ladder.begin(), inputs.ladder.end());
-    ladder.insert(ladder.end(), std::begin(ladder_rows), std::end(ladder_rows));
     const auto* allow = environment(inputs.env, "STRIX_G4_PROFILE_ALLOW_PENDING");
     out.allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     // The lower arm the ladder rows are bound to: the explicit settings below run in every tier; a lever outside this
@@ -312,91 +347,80 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
         }
         return std::nullopt;
     };
-    const auto build_arms = [&] {
-        return strix::profile::ladder_arms(levers, std::span<const strix::profile::LadderRow>(ladder), inputs.regime,
-            [&](const Lever& lever, unsigned c) {
-                return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
-            }, explicit_value, out.allow_pending);
-    };
-    auto arms = build_arms();
-    std::deque<std::string> band_references;
-    strix::profile::settle_band_receipts(ladder, arms, band_references, build_arms);
-    for (const auto& lever : levers) {
-        if (!(lever.apps & unsigned(app))) continue;
-        const auto column = strix::profile::value_column(lever, profile);
-        const auto& wanted = lever.value[column];
-        const auto admit = [&](unsigned c) {
+    const auto regime = strix::profile::measured_receipt_regime(inputs.regime, inputs.env);
+    strix::profile::resolve_rows(levers, profile, regime, out.allow_pending, inputs.ladder, ladder_rows,
+        [&](const Lever& lever, unsigned c) {
             return strix::profile::column_admission(lever, c, out.allow_pending, strix::profile::model_preset());
-        };
-        const auto refuse = [&](std::string_view why) {
-            throw std::invalid_argument(std::string("profile '") + profile::name(profile) + "' requires " +
-                                        std::string(lever.name) + " = " + std::string(wanted) + ": " + std::string(why));
-        };
-        const auto switched_off = [&](std::string_view v) { return !lever.off.empty() && (v == lever.off || v == "off"); };
-        const auto* given = lookup(inputs.cli, lever.name);
-        const auto* asset = lever.asset ? lookup(inputs.assets, lever.name) : nullptr;
-        const char* exported = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env).c_str());
-        Entry entry{&lever, std::string(wanted), Status::set, {}};
-        if ((given && switched_off(*given)) || (!given && exported && switched_off(exported))) {
-            // Off switches win over the profile and over asset discovery.
-            entry.value = "off";
-            entry.status = Status::off;
-        } else if (given) {
-            entry.value = *given;
-            entry.status = Status::explicit_cli;
-        } else if (exported && !lever.asset) {
-            entry.value = exported;
-            entry.status = Status::explicit_env;
-        } else if (exported) {
-            // A non-off env on an asset lever asks for it; the path still comes from discovery.
-            if (asset) { entry.value = *asset; entry.status = Status::explicit_env; }
-            else { entry.value = std::string(lever.builtin); entry.status = Status::absent; }
-        } else if (wanted.empty()) {
-            continue;
-        } else {
-            auto cell = strix::profile::select_profile_cell(lever, ladder, profile, inputs.regime, admit, out.allow_pending,
-                                                            arms);
-            entry.ladder = std::move(cell.route);
-            entry.ladder_reference = std::move(cell.reference);
-            const bool lowered_turbo = profile == Name::turbo && cell.tier == Name::fast;
-            const auto selected_column = lowered_turbo ? strix::profile::value_column(lever, cell.tier) : column;
-            const auto admission = cell.benchmark ? strix::profile::Status::unqualified : admit(selected_column);
-            if (profile == Name::turbo) entry.value = cell.value;
-            if ((!entry.ladder.empty() && cell.value == lever.builtin) ||
-                admission == strix::profile::Status::pending) {
-                if (lever.builtin_unqualified)
-                    refuse(std::string(lever.source) + (entry.ladder.empty()
-                        ? (lever.runnable[column] ? " (--allow-pending runs the unqualified implementation, benchmarking only)" : "")
-                        : ": " + entry.ladder));
-                entry.target = lever.target.empty() ? wanted : lever.target;
-                entry.value = lever.builtin;
-                entry.status = Status::pending;
-            } else if (admission == strix::profile::Status::set && entry.value == lever.builtin) {
-                entry.status = Status::builtin;
+        }, explicit_value, [app](const Lever& lever) { return (lever.apps & unsigned(app)) != 0; },
+        [&](const Lever& lever, unsigned column, const auto& admit, strix::profile::LadderCell cell) {
+            const auto wanted = lever.value[column];
+            const auto refuse = [&](std::string_view why) {
+                throw std::invalid_argument(std::string("profile '") + profile::name(profile) + "' requires " +
+                                            std::string(lever.name) + " = " + std::string(wanted) + ": " + std::string(why));
+            };
+            const auto switched_off = [&](std::string_view v) { return !lever.off.empty() && (v == lever.off || v == "off"); };
+            const auto* given = lookup(inputs.cli, lever.name);
+            const auto* asset = lever.asset ? lookup(inputs.assets, lever.name) : nullptr;
+            const char* exported = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env).c_str());
+            Entry entry{&lever, std::string(wanted), Status::set, {}};
+            if ((given && switched_off(*given)) || (!given && exported && switched_off(exported))) {
+                // Off switches win over the profile and over asset discovery.
+                entry.value = "off";
+                entry.status = Status::off;
+            } else if (given) {
+                entry.value = *given;
+                entry.status = Status::explicit_cli;
+            } else if (exported && !lever.asset) {
+                entry.value = exported;
+                entry.status = Status::explicit_env;
+            } else if (exported) {
+                // A non-off env on an asset lever asks for it; the path still comes from discovery.
+                if (asset) { entry.value = *asset; entry.status = Status::explicit_env; }
+                else { entry.value = std::string(lever.builtin); entry.status = Status::absent; }
+            } else if (wanted.empty()) {
+                return;
             } else {
-                if (admission == strix::profile::Status::unqualified) entry.status = Status::unqualified;
-                if (lever.asset) {
-                    if (asset) entry.value = *asset;
-                    else if (lever.required[selected_column] && admission == strix::profile::Status::set)
-                        refuse("pass " + std::string(lever.option) + (app == App::engine ? "" : " (not available in this app)"));
-                    else { entry.value = lever.builtin; entry.status = Status::absent; }
+                entry.ladder = std::move(cell.route);
+                entry.ladder_reference = std::move(cell.reference);
+                const bool lowered_turbo = profile == Name::turbo && cell.tier == Name::fast;
+                const auto selected_column = lowered_turbo ? strix::profile::value_column(lever, cell.tier) : column;
+                const auto admission = cell.benchmark ? strix::profile::Status::unqualified : admit(selected_column);
+                if (profile == Name::turbo) entry.value = cell.value;
+                if ((!entry.ladder.empty() && cell.value == lever.builtin) ||
+                    admission == strix::profile::Status::pending) {
+                    if (lever.builtin_unqualified)
+                        refuse(std::string(lever.source) + (entry.ladder.empty()
+                            ? (lever.runnable[column] ? " (--allow-pending runs the unqualified implementation, benchmarking only)" : "")
+                            : ": " + entry.ladder));
+                    entry.target = lever.target.empty() ? wanted : lever.target;
+                    entry.value = lever.builtin;
+                    entry.status = Status::pending;
+                } else if (admission == strix::profile::Status::set && entry.value == lever.builtin) {
+                    entry.status = Status::builtin;
+                } else {
+                    if (admission == strix::profile::Status::unqualified) entry.status = Status::unqualified;
+                    if (lever.asset) {
+                        if (asset) entry.value = *asset;
+                        else if (lever.required[selected_column] && admission == strix::profile::Status::set)
+                            refuse("pass " + std::string(lever.option) + (app == App::engine ? "" : " (not available in this app)"));
+                        else { entry.value = lever.builtin; entry.status = Status::absent; }
+                    }
                 }
             }
-        }
-        if ((entry.status == Status::explicit_env || entry.status == Status::explicit_cli) && !lever.asset &&
-            entry.value != lever.builtin) {
-            // An explicit request for a value that a column declares but no column can run here is refused.
-            bool declared = false, runnable = false;
-            for (std::size_t p = 0; p < lever.value.size(); ++p) {
-                if (p == static_cast<std::size_t>(Name::turbo) && lever.value[p].empty()) continue;
-                if (lever.value[p] == entry.value) { declared = true; runnable |= lever.runnable[p]; }
+            if ((entry.status == Status::explicit_env || entry.status == Status::explicit_cli) && !lever.asset &&
+                entry.value != lever.builtin) {
+                // An explicit request for a value that a column declares but no column can run here is refused.
+                bool declared = false, runnable = false;
+                for (std::size_t p = 0; p < lever.value.size(); ++p) {
+                    if (p == static_cast<std::size_t>(Name::turbo) && lever.value[p].empty()) continue;
+                    if (lever.value[p] == entry.value) { declared = true; runnable |= lever.runnable[p]; }
+                }
+                if (declared && !runnable)
+                    throw std::invalid_argument(std::string(lever.env.empty() ? lever.option : lever.env) + "=" + entry.value +
+                                                " is not in this build (" + std::string(lever.source) + ")");
             }
-            if (declared && !runnable)
-                throw std::invalid_argument(std::string(lever.env.empty() ? lever.option : lever.env) + "=" + entry.value +
-                                            " is not in this build (" + std::string(lever.source) + ")");
-        }
-        out.entries.push_back(std::move(entry));
-    }
+            out.entries.push_back(std::move(entry));
+    });
     return out;
 }
 

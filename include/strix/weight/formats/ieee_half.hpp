@@ -11,6 +11,8 @@
 
 namespace strix::weight::ieee_half {
 
+enum class NanMode : std::uint8_t { preserve, quiet };
+
 // Exact IEEE binary16 decoding, including signed zeros and NaN payloads.
 // Preserve the established host, HIP and CUDA conversion forms.
 STRIX_HALF_HD inline float decode(std::uint16_t h) {
@@ -40,6 +42,35 @@ STRIX_HALF_HD inline float decode(std::uint16_t h) {
     const std::uint32_t normal = sign | ((exponent + 112U) << 23U) | (mantissa << 13U);
     return __builtin_bit_cast(float, exponent == 0x1fU ? special : exponent == 0U ? small : normal);
 #endif
+}
+
+// Opt in per format. Quiet on the input bits so no host or device FP
+// operation consumes a signaling value merely to change its NaN payload.
+STRIX_HALF_HD inline float decode(std::uint16_t h, NanMode mode) {
+    if (mode == NanMode::quiet && (h & 0x7c00U) == 0x7c00U && (h & 0x03ffU) != 0U)
+        h = static_cast<std::uint16_t>(h | 0x0200U);
+    return decode(h);
+}
+
+// FP32 -> FP16, RNE, gradual underflow, signed zero. False means nonfinite or
+// rounding overflow; callers must fail the request, never silently clip.
+STRIX_HALF_HD inline bool encode_finite(float x, std::uint16_t& out) {
+    const auto u = __builtin_bit_cast(std::uint32_t, x), a = u & 0x7fffffffU;
+    const auto sign = std::uint16_t((u >> 16U) & 0x8000U);
+    if (a >= 0x7f800000U) return false;
+    if (a < 0x33000000U) { out = sign; return true; }
+    if (a < 0x38800000U) {
+        const unsigned shift = 126U - (a >> 23U);
+        const auto m = (a & 0x7fffffU) | 0x800000U;
+        const auto q = m >> shift, remainder = m & ((1U << shift) - 1U);
+        const auto midpoint = 1U << (shift - 1U);
+        out = std::uint16_t(sign | (q + unsigned(remainder > midpoint || (remainder == midpoint && (q & 1U)))));
+        return true;
+    }
+    const auto q = ((a - 0x38000000U) + 0xfffU + ((a >> 13U) & 1U)) >> 13U;
+    if (q >= 0x7c00U) return false;
+    out = std::uint16_t(sign | q);
+    return true;
 }
 
 } // namespace strix::weight::ieee_half

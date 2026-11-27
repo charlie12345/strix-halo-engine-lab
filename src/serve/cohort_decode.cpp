@@ -1,7 +1,9 @@
 // Shared multi-request decoder (strix/serve/cohort_decode.hpp).
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/spec/draft_depth.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/serve/job_sampling.hpp"
+#include "strix/serve/lane_speculation.hpp"
 
 #include "strix/serve/short_first.hpp"
 
@@ -14,6 +16,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace strix::serve {
@@ -76,6 +79,29 @@ std::uint32_t sample_lane(CohortBackend& backend, std::uint32_t lane, TokenSampl
     if (backend.samples_on_device()) return backend.sample_final(lane, sampler, position);
     return sampler.decide(backend.read_final_logits(lane), position, nullptr).token;
 }
+// The lane's counters of one request (CohortResult::lane_speculation): integers and booleans only.
+struct LaneSpecCounts {
+    std::uint64_t steps = 0, suspends = 0, resumes = 0;
+};
+std::string lane_speculation_receipt(const LaneSpeculator& sp, std::uint32_t lane, const LaneSpecCounts& counts) {
+    const auto& drafter = sp.drafter();
+    const auto& stats = drafter.stats();
+    const auto& arbiter = drafter.arbiter();
+    const auto u = [](std::uint64_t v) { return std::to_string(v); };
+    const auto b = [](bool v) { return std::string(v ? "true" : "false"); };
+    const auto source = [&](spec::Source s) {
+        const auto k = static_cast<std::size_t>(s);
+        return "{\"passes\":" + u(stats.source_passes[k]) + ",\"proposed\":" + u(stats.source_proposed[k]) +
+               ",\"accepted\":" + u(stats.source_accepted[k]) + "}";
+    };
+    return "{\"lane\":" + u(lane) + ",\"steps\":" + u(counts.steps) + ",\"suspends\":" + u(counts.suspends) +
+           ",\"resumes\":" + u(counts.resumes) + ",\"chained\":" + b(sp.chained()) + ",\"lookup_only\":" +
+           b(sp.lookup_only()) + ",\"chain_starts\":" + u(sp.chain_starts()) + ",\"ready_false\":" +
+           u(sp.ready_refusals()) + ",\"chain_null\":" + u(sp.chain_refusals()) + ",\"passes\":" + u(stats.passes) +
+           ",\"emitted\":" + u(stats.emitted) + ",\"model\":" + source(spec::Source::model) + ",\"lookup\":" +
+           source(spec::Source::lookup) + ",\"serial\":" + source(spec::Source::serial) + ",\"episode_open\":" +
+           b(arbiter.episode_open()) + ",\"episode_closed_loss\":" + b(arbiter.episode_loss_ms() >= 0.0) + "}";
+}
 }  // namespace
 
 void CohortBackend::prefill_group(std::span<const CohortPrompt> members) {
@@ -94,6 +120,14 @@ struct CohortDecoder::Lane {
     std::uint64_t bytes = 0;
     std::unique_ptr<MtpContextDraft> drafter;
     std::optional<TokenSampler> sampler;
+    // Lone-lane speculation (CohortConfig::lane_speculation): the lane's speculator, made at its first speculator step
+    // and kept for the request (suspended while the lane takes the round), and the ids it emitted that the context
+    // drafter has not seen yet (fed to it when the lane takes the round again), after the pending token spec_anchor.
+    std::unique_ptr<LaneSpeculator> speculator;
+    std::vector<std::uint32_t> spec_unseen;
+    std::uint32_t spec_anchor = 0;
+    bool spec_lookup_only = false;  // counted in lane_speculation_lookup_only
+    std::uint64_t spec_steps = 0, spec_suspends = 0, spec_resumes = 0;  // this request's (CohortResult::lane_speculation)
     std::vector<double> tried, kept;  // kept histogram per draft row index: rows the target verified / kept
     std::uint64_t prompt_start = 0;   // prompt rows restored at admission (a group member starts from 0 only)
     bool whole = false;               // the backend's prefill reads the whole prompt and emits the first id
@@ -106,13 +140,46 @@ struct CohortDecoder::Lane {
     }
 };
 
+struct CohortDecoder::StepScratch {
+    struct DecodeLane {
+        std::vector<std::uint32_t> drafts, chosen;
+        std::vector<float> accept;
+        std::string refused;
+        std::size_t device_rows = 0;  // leading device-draft rows (context rows follow them)
+    };
+    struct Receipts {
+        std::vector<std::unique_ptr<MtpSelectionReceipt>>& storage;
+        ~Receipts() { storage.clear(); }
+    };
+
+    explicit StepScratch(std::size_t lanes) : decode(lanes) {}
+
+    std::vector<std::pair<Lane*, std::string>> done;
+    std::vector<std::uint32_t> decode_ids;  // the lanes that take the round (not a speculator step)
+    std::vector<StepLane> step_lanes;
+    StepPlan plan;
+    std::vector<std::uint64_t> group;
+    std::vector<std::uint32_t> others;
+    std::vector<GroupCandidate> candidates;
+    std::vector<CohortPrompt> members;
+    std::vector<Lane*> run;
+    std::vector<DecodeLane> decode;
+    std::vector<LaneDemand> demands;
+    std::vector<std::uint32_t> device;
+    std::vector<double> device_p, acc, device_acc;
+    RowPlanner row_planner;
+    std::vector<std::unique_ptr<MtpSelectionReceipt>> receipts;
+};
+
 CohortDecoder::CohortDecoder(CohortBackend& backend, CohortConfig config) : backend_(backend), config_(std::move(config)) {
     // Every running lane holds at least one row, so a step never parks a lane: lanes <= rows of one forward.
     const std::uint32_t n = std::min(backend_.lanes(), backend_.rows_per_forward());
     if (n == 0) throw std::invalid_argument("cohort decoder: backend has no lanes");
     validate_prompt_pieces(config_, backend_.prompt_piece_rule(),
                            config_.prompt_slice_decoding != 0U ? backend_.prompt_call_chunk(config_.prompt_slice) : 0U);
+    if (config_.lane_speculation.enabled) lane_spec_rows_ = validate_lane_speculation(backend_, config_.lane_speculation);
     lanes_.resize(n);
+    step_scratch_ = std::make_unique<StepScratch>(n);
 }
 
 void validate_prompt_pieces(const CohortConfig& config, PromptPieceRule rule, std::uint64_t slice_first_chunk) {
@@ -236,10 +303,7 @@ void CohortDecoder::submit(CohortRequest request) {
 void CohortDecoder::control(std::span<const std::uint32_t> words) { backend_.control(words); }
 
 std::uint32_t max_draft_for_live(const CohortConfig& config, std::uint32_t live) noexcept {
-    const auto& table = config.max_draft_by_live;
-    if (table.empty()) return config.max_draft;
-    const std::size_t index = live == 0U ? 0U : std::min<std::size_t>(live - 1U, table.size() - 1U);
-    return std::min(config.max_draft, table[index]);
+    return spec::draft_depth_for_lanes(config.max_draft_by_live, live, config.max_draft);
 }
 
 bool CohortDecoder::idle() const noexcept { return waiting_.empty() && live() == 0; }
@@ -350,6 +414,24 @@ void CohortDecoder::finish(Lane& lane, std::string error) {
     if (lane.sampler) lane.result.sampling_receipt = job_sampling_receipt(*lane.sampler);
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
         if (lanes_[i].get() != &lane) continue;
+        if (lane.speculator && lane.speculator->started()) {
+            lane.result.lane_speculation = lane_speculation_receipt(*lane.speculator, static_cast<std::uint32_t>(i),
+                                                                    {lane.spec_steps, lane.spec_suspends, lane.spec_resumes});
+            if (config_.lane_speculation.log) {
+                std::string line = lane.result.lane_speculation;
+                line.pop_back();  // the closing brace: the drafter's stats and the decoder's totals follow
+                std::fprintf(stderr,
+                             "strix-lane-spec %s,\"totals\":{\"steps\":%llu,\"suspends\":%llu,\"resumes\":%llu,"
+                             "\"lookup_only_lanes\":%llu,\"ready_false\":%llu},\"stats\":%s}\n",
+                             line.c_str(), static_cast<unsigned long long>(lane_spec_steps_),
+                             static_cast<unsigned long long>(lane_spec_suspends_),
+                             static_cast<unsigned long long>(lane_spec_resumes_),
+                             static_cast<unsigned long long>(lane_spec_lookup_only_),
+                             static_cast<unsigned long long>(lane_spec_ready_false_),
+                             lane.speculator->drafter().stats().json().c_str());
+                std::fflush(stderr);
+            }
+        }
         used_bytes_ -= lane.bytes;
         // prefix capture is optional: its failure must never keep the lane from retiring
         try {
@@ -404,6 +486,7 @@ void CohortDecoder::step() {
         }
     }
     if (live() == 0) return;
+    auto& round = *step_scratch_;
     ++steps_;
     const double step_start_ms = config_.trace_steps ? now_ms() : 0.0;
 
@@ -429,7 +512,8 @@ void CohortDecoder::step() {
     };
     // A whole-prompt lane whose prefill just ended: its first id comes from the prefill's last row (the selection
     // policy, the sampler on its final logits, or its greedy id). The id is not committed: it is the lane's pending row.
-    std::vector<std::pair<Lane*, std::string>> first_done;
+    auto& first_done = round.done;
+    first_done.clear();
     const auto emit_first = [&](std::uint32_t index) {
         Lane& l = *lanes_[index];
         if (!l.whole || l.prompt_left() != 0) {
@@ -479,7 +563,8 @@ void CohortDecoder::step() {
     first_done.clear();
 
     // 1. Prompt service: decode first, one bounded slice of the chosen prompt (short-first with aging, prompt debt).
-    std::vector<StepLane> step_lanes;
+    auto& step_lanes = round.step_lanes;
+    step_lanes.clear();
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
         const auto& l = lanes_[i];
         if (!l) continue;
@@ -525,13 +610,15 @@ void CohortDecoder::step() {
     limits.prompt_units = units;
     limits.prompt_share = config_.prompt_share;
     limits.short_first_rows = config_.short_first_rows;
-    const StepPlan plan = planner_.plan(step_lanes, limits);
+    auto& plan = round.plan;
+    planner_.plan(step_lanes, limits, plan);
     for (const auto l : plan.overtaken) ++lanes_[l]->overtakes;
     double prompt_ms = 0;
     std::uint64_t prompt_rows = 0;
     // Grouped prompts: when the planner's head is a whole short prompt, other whole short prompts that arrived after
     // it may share its pass (plan_prefill_group: arrival order, one route class, at most one slice of rows).
-    std::vector<std::uint32_t> group;
+    auto& group = round.group;
+    group.clear();
     if (!plan.prompt.empty() && config_.prompt_group.groups()) {
         const std::uint32_t head = plan.prompt.front().lane;
         const Lane& h = *lanes_[head];
@@ -543,14 +630,16 @@ void CohortDecoder::step() {
         const std::uint64_t want = std::min<std::uint64_t>(units[0], gap_room);
         const PrefillGroupCapacity capacity = backend_.prompt_group_capacity();
         if (capacity.members >= 2U && h.prompt_start == 0 && h.prompt_read == 0 && h.prompt_left() <= head_rows) {
-            std::vector<std::uint32_t> others;
+            auto& others = round.others;
+            others.clear();
             for (std::size_t i = 0; i < lanes_.size(); ++i) {
                 const auto& c = lanes_[i];
                 if (c && i != head && c->prompt_start == 0 && c->prompt_read == 0 && c->prompt_left() > 0 && c->order > h.order)
                     others.push_back(static_cast<std::uint32_t>(i));
             }
             std::sort(others.begin(), others.end(), [&](auto a, auto b) { return lanes_[a]->order < lanes_[b]->order; });
-            std::vector<GroupCandidate> candidates;
+            auto& candidates = round.candidates;
+            candidates.clear();
             const auto offer = [&](std::uint32_t i) {
                 const std::uint64_t rows = lanes_[i]->prompt_left();
                 GroupCandidate c;
@@ -564,23 +653,25 @@ void CohortDecoder::step() {
             for (const auto i : others) offer(i);
             PrefillGroupPolicy policy = config_.prompt_group;
             policy.max_rows = static_cast<std::uint32_t>(std::min<std::uint64_t>(policy.max_rows, want));
-            for (const auto id : plan_prefill_group(candidates, policy, PrefillGroupCost{},
-                                                    std::numeric_limits<double>::infinity(), capacity))
-                group.push_back(static_cast<std::uint32_t>(id));
+            plan_prefill_group(candidates, policy, PrefillGroupCost{}, std::numeric_limits<double>::infinity(),
+                               capacity, group);
         }
     }
     // A backend failure of a prompt pass fails the lanes of that pass, as a failed verify does, and ends this step (no
     // first id is pending yet); a contract violation (std::logic_error) stays fatal after the cleanup.
-    const auto fail_prompt = [&](std::span<const std::uint32_t> indices, const std::exception& ex) {
-        std::vector<Lane*> failed;
-        for (const auto i : indices) failed.push_back(lanes_[i].get());
+    const auto fail_prompt = [&](auto indices, const std::exception& ex) {
+        auto& failed = round.run;
+        failed.clear();
+        for (const auto i : indices) failed.push_back(lanes_[static_cast<std::size_t>(i)].get());
         fail_lanes(failed, std::string("prefill: ") + ex.what());
     };
     if (group.size() > 1) {
-        std::vector<CohortPrompt> members;
+        auto& members = round.members;
+        members.clear();
         for (const auto i : group) {
-            const Lane& m = *lanes_[i];
-            members.push_back({i, std::span<const std::uint32_t>(m.request.prompt.data(), m.prompt_left()), true});
+            const Lane& m = *lanes_[static_cast<std::size_t>(i)];
+            members.push_back({static_cast<std::uint32_t>(i),
+                               std::span<const std::uint32_t>(m.request.prompt.data(), m.prompt_left()), true});
             prompt_rows += m.prompt_left();
         }
         account_gap(prompt_rows, false);
@@ -590,10 +681,10 @@ void CohortDecoder::step() {
             backend_.prefill_group(members);
         } catch (const std::exception& ex) {
             if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) {
-                cleanup_keeping_contract_error([&] { fail_prompt(group, ex); });
+                cleanup_keeping_contract_error([&] { fail_prompt(std::span<const std::uint64_t>(group), ex); });
                 throw;
             }
-            fail_prompt(group, ex);
+            fail_prompt(std::span<const std::uint64_t>(group), ex);
             return;
         }
         prompt_ms = now_ms() - t0;
@@ -601,14 +692,14 @@ void CohortDecoder::step() {
         ++prompt_groups_;
         grouped_prompts_ += group.size();
         for (const auto i : group) {
-            Lane& m = *lanes_[i];
+            Lane& m = *lanes_[static_cast<std::size_t>(i)];
             const std::uint64_t rows = m.prompt_left();
             prompt_rows += rows;
             m.prompt_read += rows;
             m.position += rows;
             if (m.request.prefilled) m.request.prefilled(m.prompt_read);
         }
-        for (const auto i : group) emit_first(i);
+        for (const auto i : group) emit_first(static_cast<std::uint32_t>(i));
     } else if (!plan.prompt.empty()) {
         Lane& l = *lanes_[plan.prompt.front().lane];
         const std::uint64_t want = plan.prompt.front().rows ? plan.prompt.front().rows : units[0];
@@ -628,10 +719,10 @@ void CohortDecoder::step() {
         } catch (const std::exception& ex) {
             const std::uint32_t one[1] = {plan.prompt.front().lane};
             if (dynamic_cast<const std::logic_error*>(&ex) != nullptr) {
-                cleanup_keeping_contract_error([&] { fail_prompt(one, ex); });
+                cleanup_keeping_contract_error([&] { fail_prompt(std::span<const std::uint32_t>(one), ex); });
                 throw;
             }
-            fail_prompt(one, ex);
+            fail_prompt(std::span<const std::uint32_t>(one), ex);
             return;
         }
         prompt_ms = now_ms() - t0;
@@ -648,10 +739,95 @@ void CohortDecoder::step() {
     }
     for (auto& [l, error] : first_done) finish(*l, std::move(error));
 
-    // 2. Decode round: every decoding lane holds its certain row; draft rows are bought by plan_rows.
+    // 2. Lone-lane speculation (CohortConfig::lane_speculation): while at most max_live requests are live, a greedy
+    // decoding lane runs one speculator step (one verify + commit of its own) instead of the round; the ids go through
+    // the round's delivery. A lane that takes the round again suspends its speculator (kept: learned walls and
+    // acceptance) and its context drafter first reads the ids the speculator emitted. Ends are applied after the round.
+    auto& done = round.done;  // speculator ends first, then the round's (applied after the round)
+    done.clear();
+    auto& decode_ids = round.decode_ids;  // the lanes of the round
+    decode_ids.clear();
+    double spec_ms = 0;
+    std::size_t spec_lanes = 0;
+    const bool speculate = config_.lane_speculation.enabled && live() <= config_.lane_speculation.max_live;
+    for (const auto id : plan.decode_lanes) {
+        Lane& l = *lanes_[id];
+        if (speculate && !l.sampler && !l.request.selection) {
+            const double s0 = now_ms();
+            auto& sp = l.speculator;
+            if (!sp) sp = std::make_unique<LaneSpeculator>(backend_, id, config_.lane_speculation, lane_spec_rows_);
+            if (!sp->active()) {
+                // the stream is the prompt then the emitted ids; its last token is the pending one (not committed)
+                std::vector<std::uint32_t> stream = l.request.prompt;
+                stream.insert(stream.end(), l.result.ids.begin(), l.result.ids.end());
+                if (stream.size() != l.position + 1U || stream.back() != l.pending)
+                    throw std::logic_error("cohort decoder: lane speculation out of step with the lane");
+                const bool resume = sp->started();
+                const std::uint64_t refused = sp->ready_refusals();
+                sp->start(l.pending, stream);
+                lane_spec_ready_false_ += sp->ready_refusals() - refused;
+                if (resume) {
+                    ++lane_spec_resumes_;
+                    ++l.spec_resumes;
+                }
+                if (sp->lookup_only() && !l.spec_lookup_only) {
+                    l.spec_lookup_only = true;
+                    ++lane_spec_lookup_only_;
+                }
+            }
+            const std::uint64_t left = token_limit(l.request) - l.result.ids.size();
+            const std::uint64_t room_pos = backend_.max_positions() - l.position;  // rows position .. position + R - 1
+            const std::uint64_t window = std::max<std::uint32_t>(backend_.max_window(id), 1U);
+            const auto room = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>({left, room_pos, std::uint64_t{lane_spec_rows_}, window}));
+            spec::StepParams params;
+            params.remaining = params.max_rows = room;
+            params.context = l.position;
+            if (l.request.stop.size() == 1U) params.eos = l.request.stop.front();
+            std::vector<std::uint32_t> out;
+            const spec::StepRecord record = sp->step(out, params);
+            if (record.emitted == 0U || out.empty() || out.size() > room)
+                throw std::logic_error("cohort decoder: lane speculation produced an invalid window");
+            ++lane_spec_steps_;
+            ++l.spec_steps;
+            rows_ += record.rows;
+            l.result.steps += 1;
+            l.result.drafted += record.rows - 1U;
+            l.result.accepted += record.accepted;
+            l.position += out.size();
+            if (l.drafter) {
+                if (l.spec_unseen.empty()) l.spec_anchor = l.pending;
+                l.spec_unseen.insert(l.spec_unseen.end(), out.begin(), out.end());
+            }
+            if (deliver(l, out)) done.emplace_back(&l, std::string());
+            spec_ms += now_ms() - s0;
+            ++spec_lanes;
+            continue;
+        }
+        if (l.speculator && l.speculator->active()) {
+            l.speculator->suspend();
+            ++lane_spec_suspends_;
+            ++l.spec_suspends;
+        }
+        if (!l.spec_unseen.empty()) {
+            if (l.drafter) {
+                // one observe-only cycle: the context drafter's context follows the lane (pending, then the ids)
+                std::vector<double> unused;
+                (void)l.drafter->begin_cycle(l.spec_anchor, std::span<const std::uint32_t>(), 0U, 0U, unused,
+                                             config_.min_p);
+                l.drafter->finish_cycle(l.spec_unseen);
+            }
+            l.spec_unseen.clear();
+        }
+        decode_ids.push_back(id);
+    }
+    if (spec_lanes != 0U) decode_ms_ += spec_ms;
+
+    // 3. Decode round: every decoding lane holds its certain row; draft rows are bought by plan_rows.
     const double t0 = now_ms();
-    std::vector<Lane*> run;
-    for (const auto id : plan.decode_lanes) run.push_back(lanes_[id].get());
+    auto& run = round.run;
+    run.clear();
+    for (const auto id : decode_ids) run.push_back(lanes_[id].get());
     // trace_steps: one line per step, after its accounting (debt_ms is the decode still owed after this step).
     const auto trace = [&](std::size_t decode_lanes, double decode_ms) {
         if (!config_.trace_steps) return;
@@ -668,33 +844,46 @@ void CohortDecoder::step() {
         last_step_end_ms_ = end;
     };
     if (run.empty()) {
-        planner_.account(prompt_ms, 0.0, 0.0, prompt_rows);
-        trace(0U, 0.0);
+        planner_.account(prompt_ms, spec_ms, 0.0, prompt_rows);
+        trace(spec_lanes, spec_ms);
+        for (auto& [l, error] : done) finish(*l, std::move(error));
         return;
     }
     const std::size_t n = run.size();
-    std::vector<std::vector<std::uint32_t>> drafts(n);
-    std::vector<std::vector<float>> accept(n);
-    std::vector<LaneDemand> demands(n);
-    std::vector<std::size_t> device_rows(n, 0);  // leading device-draft rows of a window (context rows follow them)
-    const std::uint32_t draft_cap = max_draft_for_live(config_, live());
-    std::vector<std::uint32_t> device;
-    std::vector<double> device_p, acc, device_acc;
+    auto& demands = round.demands;
+    demands.resize(n);
+    const auto backend_rows = backend_.rows_per_forward();
+    const auto batch_rows = config_.uniform_verify_windows
+        ? std::min(backend_rows, backend_.max_batch_verify_rows()) : 0U;
+    const bool uniform = batch_rows >= n;
+    auto draft_cap = max_draft_for_live(config_, live());
+    if (uniform) draft_cap = std::min(draft_cap, batch_rows / static_cast<std::uint32_t>(n) - 1U);
+    auto& device = round.device;
+    auto& device_p = round.device_p;
+    auto& acc = round.acc;
+    auto& device_acc = round.device_acc;
     for (std::size_t k = 0; k < n; ++k) {
         Lane& l = *run[k];
+        auto& temp = round.decode[k];
+        auto& drafts = temp.drafts;
+        auto& accept = temp.accept;
+        auto& device_rows = temp.device_rows;
+        drafts.clear();
+        accept.clear();
+        device_rows = 0;
         const std::uint64_t left = token_limit(l.request) - l.result.ids.size();
         const std::uint64_t room_pos = backend_.max_positions() - l.position - 1U;
         // a selection that reads logits decides one row per step from the lane's final logits
         const bool one_row = l.request.selection && l.request.selection_reads_logits;
         // the backend's own cap on the lane's window (pending row + drafts)
-        const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(plan.decode_lanes[k]), 1U) - 1U;
+        const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(decode_ids[k]), 1U) - 1U;
         const std::size_t room = one_row ? 0U : static_cast<std::size_t>(std::min<std::uint64_t>(
                                                      {draft_cap, left - 1U, room_pos, window_cap}));
         acc.clear();
         device.clear();
         device_p.clear();
         if (!l.sampler && room != 0 && backend_.device_drafts()) {
-            backend_.propose(plan.decode_lanes[k], static_cast<std::uint32_t>(room), device, device_p);
+            backend_.propose(decode_ids[k], static_cast<std::uint32_t>(room), device, device_p);
             if (device.size() > room) device.resize(room);
         }
         device_acc.resize(device.size());
@@ -711,48 +900,49 @@ void CohortDecoder::step() {
             // is the confident prefix: the context drafter continues it, or replaces it with a long exact copy span
             // expected to deliver more rows.
             const auto replaced = l.drafter->stats().replaced_cycles;
-            auto context = l.drafter->begin_cycle(l.pending, device, device.size(), room, acc, config_.min_p,
-                                                  device.empty() ? -1.0 : device_expected);
+            const auto context = l.drafter->begin_cycle_view(l.pending, device, device.size(), room, acc, config_.min_p,
+                                                            device.empty() ? -1.0 : device_expected);
             if (device.empty() || l.drafter->stats().replaced_cycles != replaced) {
-                drafts[k] = std::move(context);
+                drafts.assign(context.begin(), context.end());
             } else {
-                drafts[k] = device;
-                drafts[k].insert(drafts[k].end(), context.begin(), context.end());
+                drafts = device;
+                drafts.insert(drafts.end(), context.begin(), context.end());
                 device_acc.insert(device_acc.end(), acc.begin(), acc.end());
                 probabilities = &device_acc;
-                device_rows[k] = device.size();
+                device_rows = device.size();
             }
         } else if (!device.empty()) {
-            drafts[k] = device;
+            drafts = device;
             probabilities = &device_acc;
-            device_rows[k] = device.size();
+            device_rows = device.size();
         }
-        if (drafts[k].size() > room) drafts[k].resize(room);
-        device_rows[k] = std::min(device_rows[k], drafts[k].size());
-        accept[k].push_back(1.0F);
+        if (drafts.size() > room) drafts.resize(room);
+        device_rows = std::min(device_rows, drafts.size());
+        accept.push_back(1.0F);
         const double w = config_.accept_weight;
-        for (std::size_t d = 0; d < drafts[k].size(); ++d) {
+        for (std::size_t d = 0; d < drafts.size(); ++d) {
             const double claim = d < probabilities->size() ? (*probabilities)[d] : config_.accept_prior;
             const double p = w > 0.0 && d < l.tried.size() ? (l.kept[d] + w * claim) / (l.tried[d] + w) : claim;
-            accept[k].push_back(static_cast<float>(p));
+            accept.push_back(static_cast<float>(p));
         }
         // drain rate: tokens per step the lane realized so far, this step's full offer counted as one more step
         // (a lane that is not paced realizes what it is offered, so the slowest lane's rate is its potential)
         double chain = 1.0, expected = 1.0;  // the pending row is certain
-        for (std::size_t d = 1; d < accept[k].size(); ++d) expected += chain *= static_cast<double>(accept[k][d]);
+        for (std::size_t d = 1; d < accept.size(); ++d) expected += chain *= static_cast<double>(accept[d]);
         demands[k].rate = (static_cast<double>(l.result.ids.size()) + expected) / static_cast<double>(l.result.steps + 1U);
-        demands[k].lane = plan.decode_lanes[k];
+        demands[k].lane = decode_ids[k];
         demands[k].remaining_tokens = static_cast<std::uint32_t>(left);
         demands[k].min_rows = 1;
-        demands[k].max_rows = 1U + static_cast<std::uint32_t>(drafts[k].size());
-        demands[k].accept = accept[k];
+        demands[k].max_rows = 1U + static_cast<std::uint32_t>(drafts.size());
+        demands[k].accept = accept;
         demands[k].waited_ms = l.waited_ms;
     }
     RowLimits row_limits;
-    row_limits.rows_per_forward = backend_.rows_per_forward();
+    row_limits.rows_per_forward = uniform ? batch_rows : backend_rows;
+    row_limits.uniform_windows = uniform;
     row_limits.drain = waiting_.empty();  // nobody waits for a lane: a lane that ends early frees nothing
-    const RowPlan rp =
-        plan_rows(demands, fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)), row_limits, config_.accept_prior);
+    const RowPlan& rp = round.row_planner.plan(demands, fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)),
+                                              row_limits, config_.accept_prior);
 
     auto scratch = std::exchange(verification_, {});
     auto& [groups, tokens, top, keep] = scratch;
@@ -767,7 +957,8 @@ void CohortDecoder::step() {
         const bool reads_scores = l.request.selection ? l.request.selection_reads_logits : l.sampler.has_value();
         groups[k] = {demands[k].lane, rows, reads_scores};
         tokens.push_back(run[k]->pending);
-        tokens.insert(tokens.end(), drafts[k].begin(), drafts[k].begin() + (rows - 1U));
+        const auto& drafts = round.decode[k].drafts;
+        tokens.insert(tokens.end(), drafts.begin(), drafts.begin() + (rows - 1U));
     }
     std::size_t base = 0;
     for (std::size_t k = 0; k < n; ++k) {
@@ -787,6 +978,9 @@ void CohortDecoder::step() {
             if (auto& selection = run[k]->request.selection) selection->discard();
         verification_ = std::move(scratch);
         fail_lanes(std::span<Lane* const>(run.data(), n), std::string(what) + ": " + ex.what());
+        // Lanes that already finished in this step's speculator pass are not in `run`: finish them as well.
+        for (auto& [l, error] : done) finish(*l, std::move(error));
+        done.clear();
     };
     try {
         backend_.verify(groups, tokens, top);
@@ -798,31 +992,34 @@ void CohortDecoder::step() {
         return;
     }
     keep.resize(n);
-    std::vector<std::vector<std::uint32_t>> chosen(n);  // the ids each lane emits this step
-    std::vector<std::unique_ptr<MtpSelectionReceipt>> receipts(n);
-    std::vector<std::string> refused(n);
+    auto& receipts = round.receipts;
+    receipts.resize(n);
+    const StepScratch::Receipts clear_receipts{receipts};
     base = 0;
     for (std::size_t k = 0; k < n; ++k) {
         Lane& l = *run[k];
         const std::uint32_t rows = groups[k].rows;
+        auto& picked = round.decode[k];
+        auto& chosen = picked.chosen;  // the ids each lane emits this step
+        picked.refused.clear();
         if (auto& selection = l.request.selection) {
             try {
                 if (l.request.selection_reads_logits) {
-                    chosen[k] = {selection->select(backend_.read_final_logits(groups[k].lane))};
+                    chosen = {selection->select(backend_.read_final_logits(groups[k].lane))};
                     receipts[k] = selection->seal();
                 } else {
                     auto window = select_greedy_window(*selection,
                                                        std::span<const std::uint32_t>(tokens.data() + base + 1U, rows - 1U),
                                                        std::span<const std::uint32_t>(top.data() + base, rows));
-                    chosen[k] = std::move(window.ids);
+                    chosen = std::move(window.ids);
                     receipts[k] = std::move(window.receipt);
                 }
             } catch (const MtpSelectionError& error) {
                 selection->discard();
-                refused[k] = std::string("selection: ") + error.what();
-                chosen[k].clear();
+                picked.refused = std::string("selection: ") + error.what();
+                chosen.clear();
             }
-            keep[k] = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(chosen[k].size()));
+            keep[k] = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(chosen.size()));
         } else {
             if (auto& sampler = l.sampler) {
                 // Context drafts have no lossless sampled acceptance. This lane holds just its pending row.
@@ -831,8 +1028,8 @@ void CohortDecoder::step() {
             std::uint32_t a = 1;  // the pending row is always kept; each draft row equal to the target's choice is too
             while (a < rows && tokens[base + a] == top[base + a - 1U]) ++a;
             keep[k] = a;
-            chosen[k].assign(top.begin() + static_cast<std::ptrdiff_t>(base),
-                             top.begin() + static_cast<std::ptrdiff_t>(base + a));
+            chosen.assign(top.begin() + static_cast<std::ptrdiff_t>(base),
+                          top.begin() + static_cast<std::ptrdiff_t>(base + a));
         }
         base += rows;
     }
@@ -862,20 +1059,20 @@ void CohortDecoder::step() {
         ? decode_ms
         : std::max(0.0, decode_ms - static_cast<double>(draft_rows) *
                                         fitted_cost(sums_, config_, static_cast<std::uint32_t>(n)).row_ms);
-    planner_.account(prompt_ms, decode_ms, 0.0, prompt_rows);
-    trace(n, decode_ms);
+    planner_.account(prompt_ms, decode_ms + spec_ms, 0.0, prompt_rows);
+    trace(n + spec_lanes, decode_ms + spec_ms);
 
-    std::vector<std::pair<Lane*, std::string>> done;
     for (std::size_t k = 0; k < n; ++k) {
         Lane& l = *run[k];
-        if (!refused[k].empty()) {
-            done.emplace_back(&l, std::move(refused[k]));
+        auto& picked = round.decode[k];
+        if (!picked.refused.empty()) {
+            done.emplace_back(&l, std::move(picked.refused));
             continue;
         }
-        const std::span<const std::uint32_t> emitted(chosen[k]);
+        const std::span<const std::uint32_t> emitted(picked.chosen);
         if (l.drafter) {
             // the context drafter's own rows follow the device rows of the window
-            const std::size_t off = device_rows[k], delivered_rows = groups[k].rows - 1U, hit_rows = keep[k] - 1U;
+            const std::size_t off = picked.device_rows, delivered_rows = groups[k].rows - 1U, hit_rows = keep[k] - 1U;
             l.drafter->finish_cycle(emitted, delivered_rows > off ? delivered_rows - off : 0U,
                                     hit_rows > off ? hit_rows - off : 0U);
         }
@@ -885,9 +1082,9 @@ void CohortDecoder::step() {
         if (!l.tried.empty()) {
             for (std::uint32_t r = 0; r < hits; ++r) l.tried[r] += 1.0, l.kept[r] += 1.0;
             if (hits < delivered) l.tried[hits] += 1.0;
-            if (delivered == 0 && !drafts[k].empty()) {
+            if (delivered == 0 && !picked.drafts.empty()) {
                 l.tried[0] += 1.0;
-                if (drafts[k][0] == emitted[0]) l.kept[0] += 1.0;
+                if (picked.drafts[0] == emitted[0]) l.kept[0] += 1.0;
             }
         }
         l.result.steps += 1;

@@ -137,6 +137,8 @@ struct FakeEng {
     std::vector<std::uint64_t> h, frontier;
     std::vector<bool> ready;
     std::uint64_t calls = 0, steps = 0, cycles = 0, prefills = 0;
+    std::atomic<unsigned> idle_quiesces{0};
+    void quiesce_idle() { ++idle_quiesces; }
     std::vector<std::size_t> step_rows;
     std::vector<std::string> log;
     struct Seed { std::uint32_t slot, y0; std::uint64_t p; };
@@ -678,6 +680,47 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     return out;
 }
 
+void pair_idle_quiesce() {
+    Loopback link;
+    FakeEng lead_engine(1), follow_engine(1);
+    gs::Channel lead_channel(link.side(0), 0), follow_channel(link.side(1), 1);
+    const auto hello = hello_for(1, 4096, 2);
+    std::thread follower([&] { gs::follow(follow_engine, follow_channel, hello, 1, 4096); });
+    lead_channel.hello(hello);
+    sv::GenerationQueue queue(8);
+    gs::LeadConfig config;
+    config.slots = 1;
+    config.capacity = 4096;
+    config.heartbeat_seconds = 60;
+    config.quiesce_idle_transport = true;
+    std::atomic<bool> stop{false};
+    gs::Lead<FakeEng> lead(lead_engine, lead_channel, queue, config, stop);
+    std::thread runner([&] { lead.loop(); });
+    const auto quiesced = [&](unsigned count) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (lead_engine.idle_quiesces == count && follow_engine.idle_quiesces == count) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    CHECK(quiesced(1));  // independent of the configured 60-second heartbeat
+    sv::GenerationJob request;
+    request.prompt = {5, 6, 7};
+    request.max_tokens = 1;
+    auto ticket = queue.submit(std::move(request));
+    bool done = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done && std::chrono::steady_clock::now() < deadline)
+        (void)ticket->wait(std::chrono::milliseconds(20), done);
+    CHECK(done);
+    CHECK(quiesced(2));  // one new paired receive retirement on the next idle transition
+    stop.store(true);
+    runner.join();
+    follower.join();
+    CHECK(lead_engine.idle_quiesces == 2 && follow_engine.idle_quiesces == 2);
+}
+
 void queued_successor_interleave() {
     // Final grouped chunks must pay their debt before a queued successor prefills (also when slots are reused).
     for (const bool grouped : {false, true}) {
@@ -1201,7 +1244,7 @@ void test_sampled_mtp_replay() {
         const bool threw = throws_with([&] { first = gs::replay(units, solo, pf, prompt, true, 2, 64, nullptr, choice); }, "");
         CHECK(!threw && first.size() == 1 && first[0] == gs::kPrefillPending);
     }
-    CHECK(gs::kControlVersion == 14);
+    static_assert(gs::kControlVersion == 15);
     std::printf("sampled MTP replay: flags and the lead's sampler reach the engine; unknown flags and engines refused\n");
 }
 
@@ -1670,6 +1713,7 @@ void prefix_root_sibling() {
 }
 
 int main(int argc, char** argv) {
+    pair_idle_quiesce();
     test_sampled_mtp_replay();
     test_sampled_mtp_serve();
     test_sampled_mtp_stop();
@@ -1773,7 +1817,10 @@ int main(int argc, char** argv) {
         // Store rule = MemAvailable >= snapshot bound + the GLM load admission's RAM margin (8 GiB default).
         constexpr std::uint64_t GiB = 1ULL << 30, MiB = 1ULL << 20;
         CHECK(gs::kPrefixMemoryMargin == 8 * GiB);
+        CHECK(gs::prefix_snapshot_bound(0) == 152'633'400ULL);
         const auto bound2k = gs::prefix_snapshot_bound(1994);
+        CHECK(bound2k == 192'449'592ULL);
+        CHECK(gs::prefix_snapshot_bound(UINT64_MAX) == UINT64_MAX);
         // Measured on the GLM 4.05 bpw pair (rank 1 serving, 2K prompt): MemAvailable 14976 MiB. The former fixed
         // 16 GiB floor refused every store there; the snapshot (< 200 MiB) plus the margin fits.
         std::istringstream rank1("MemFree: 0 kB\nMemAvailable: 15335424 kB\n");
@@ -2165,10 +2212,10 @@ int main(int argc, char** argv) {
             CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
-        // Builds of earlier layouts (v13: no stop decision in a sampled window; v12: the 10-word sampled decision; v11: the
-        // contributor's; v9: main before this change) are refused at the first exchange on either rank, before any later
-        // field is read.
-        for (const std::uint32_t old : {13U, 12U, 11U, 9U})
+        // Builds of earlier layouts (v14: the idle heartbeat cannot retire posted GPU-direct receives; v13: no stop
+        // decision in a sampled window; v12: the 10-word sampled decision; v11: the contributor's; v9: main before this
+        // change) are refused at the first exchange on either rank, before any later field is read.
+        for (const std::uint32_t old : {14U, 13U, 12U, 11U, 9U})
             for (const std::uint32_t rank : {0U, 1U}) {
                 gs::Channel ch(
                     [&](std::span<const std::byte> out, std::span<std::byte> in, std::uint32_t, std::uint64_t) {
@@ -2181,7 +2228,8 @@ int main(int argc, char** argv) {
                 gs::Control hello;
                 hello.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
                 CHECK(throws_with([&] { (void)ch.exchange(hello); },
-                                  "protocol version " + std::to_string(old) + " from the peer, expected 14"));
+                                  "protocol version " + std::to_string(old) + " from the peer, expected " +
+                                      std::to_string(gs::kControlVersion)));
             }
         std::printf("v13 / v12 / v11 / v9 peers: refused at the first exchange on rank 0 and rank 1\n");
         std::vector<gs::WireRow> rows = {{0, 1, 3}, {1, 1, 3}, {2, 1, 9}};

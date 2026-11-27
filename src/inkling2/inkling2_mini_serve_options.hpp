@@ -63,9 +63,12 @@ struct MiniServeOptions {
     // Resolved screened-head lever (mini_screened_head), the value the CLI and the gate read.
     bool screened_head = false;
     // Speculation (kMiniSpeculation, or an explicit --speculation off|auto): requested, and admitted (HIP: lanes draft
-    // from their context through one-lane verify windows while one lane is live; a CUDA server declines).
+    // from their context through one-lane verify windows while one lane is live; CUDA: lane_speculation).
     bool speculation_requested = false;
     bool speculation = false;
+    // CUDA: an admitted speculation runs the shared lone-lane speculator (CohortConfig::lane_speculation: the command
+    // line's speculator step while one lane is live, the model's DSpark sidecar on slot 0's taps).
+    bool lane_speculation = false;
     MiniSpeculationPolicy speculation_policy{};  // the resolved rule (mini_speculation_line)
 };
 
@@ -128,7 +131,7 @@ struct MiniServeCohort {
     // The prompt chunk the load admitted (serve::load_with_chunk_ladder; 0 = MiniServeOptions::prefill_rows): the
     // cohort's prompt slice.
     unsigned prefill_rows = 0;
-    // Prompt pieces beside decoding lanes (shared mixed-service data): the CUDA held-back route's long pieces.
+    // Prompt pieces beside decoding lanes (shared mixed-service data, mini_serve_pieces).
     serve::MixedServicePieces mixed_service = serve::kMixedServiceShortPieces;
     // The served route lever as the load admitted it: the chunk ladder's first candidate runs the command line's route,
     // a smaller candidate (slot capacity) the held-back route.

@@ -4,6 +4,7 @@
 #include "strix/token_sampling_device.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -37,6 +38,23 @@ void test_same_transform() {
     auto m = policy(0.7F, 1.0F, 1); m.min_p = 0.05F;
     expect(!strix::same_token_transform(policy(0.7F, 1.0F, 1), k) && !strix::same_token_transform(policy(0.7F, 1.0F, 1), m),
         "top_k and min_p are");
+}
+
+void test_host_boundary_oracle() {
+    constexpr std::array<float, 2> signed_zeros{-0.0F, 0.0F};
+    constexpr strix::TokenSamplingPolicy top_one{1.0F, 1U, 1.0F, 0.0F, 0U};
+    const auto tie = strix::make_token_distribution(signed_zeros, {}, top_one);
+    expect(tie.sample(0.5) == 0U, "the host transform breaks the signed-zero tie by token ID");
+
+    for (const float top_p : {1.0F, 0.75F}) {
+        const strix::TokenSamplingPolicy row_policy{1.0F, 0U, top_p, 0.0F, 0U};
+        const std::vector<float> logits(top_p < 1.0F ? 8192U : 6144U, 0.0F);
+        const auto host = strix::make_token_distribution(logits, {}, row_policy);
+        expect(host.tokens().size() == 6144U, "both host boundary policies keep 6144 tokens");
+        for (const double u : {std::nextafter(0.5, 0.0), 0.5, std::nextafter(0.5, 1.0)}) {
+            expect(host.sample(u) == 3071U, "host CDF sums individually normalized weights at the boundary");
+        }
+    }
 }
 
 void test_plan() {
@@ -89,8 +107,24 @@ void test_plan() {
 
 }  // namespace
 
-int main() {
+// The catalogue row of the device sampler (docs/optimizations.md#inkling2-device-sampled-rows) states this boundary:
+// rows with at most 2,048 entries after cutoff and top-k take the host-equal sequential CDF; larger rows may pick an
+// adjacent token at a CDF boundary, so STRIX_SAMPLE_PATH=host is the off switch where the host CDF is required.
+static_assert(strix::device_top_p_candidates == 2048U, "update the device sampler catalogue row with this boundary");
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--expect-host-path") {
+        // Run with STRIX_SAMPLE_PATH=host: the off switch of the device sampler selects the host transform.
+        const auto sampled = policy(0.7F, 0.9F, 7U);
+        expect(strix::token_sampling_path(sampled) == strix::TokenSamplingPath::host,
+               "STRIX_SAMPLE_PATH=host selects the host sampler");
+        expect(!strix::device_token_sampling_enabled(sampled), "the host path disables device sampling");
+        if (failures != 0) { std::cerr << failures << " failure(s)\n"; return EXIT_FAILURE; }
+        std::cout << "host sampling path selected\n";
+        return EXIT_SUCCESS;
+    }
     test_same_transform();
+    test_host_boundary_oracle();
     test_plan();
     if (failures != 0) { std::cerr << failures << " failure(s)\n"; return EXIT_FAILURE; }
     std::cout << "device sampling plan tests passed\n";

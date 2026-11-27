@@ -1,6 +1,14 @@
 // Calibrated low-bit packs and per-matrix numerical diagnostics. See docs/engine/lowbit-calibration.md.
 #include "strix/serve/json.hpp"
+#include "core/sha256.hpp"
+#include <bit>
 #include "strix/weight/admission.hpp"
+#include <functional>
+
+#if defined(STRIX_PACK_INKLING2_MINI)
+#include "inkling2/inkling2_mini_pack_source.hpp"
+#endif
+
 #include "strix/weight/calib_moments.hpp"
 #include "strix/weight/calib_provenance.hpp"
 #include "strix/weight/host_lowbit.hpp"
@@ -98,7 +106,7 @@ struct Rule {
 };
 
 struct Args {
-    std::string model, out, report, dequant_out, plan, probe;
+    std::string model, out, report, dequant_out, plan, probe, checked_role;
     std::vector<std::string> moments, eval, heldout;
     std::size_t moments_bytes = std::numeric_limits<std::size_t>::max();
     std::vector<Rule> rules;
@@ -106,6 +114,7 @@ struct Args {
     double damp = 0.01;
     unsigned threads = 0, proxy_stride = 1;
     bool compare = false, table_auto = false;
+    bool inkling2_mini = false;
 };
 
 std::uint64_t integer(std::string_view text) {
@@ -126,6 +135,7 @@ Args parse(int argc, char** argv) {
             return argv[++i];
         };
         if (arg == "--model") a.model = value();
+        else if (arg == "--inkling2-mini") a.inkling2_mini = true;
         else if (arg == "--moments") a.moments.push_back(value());
         else if (arg == "--eval") a.eval.push_back(value());
         else if (arg == "--plan") a.plan = value();
@@ -137,6 +147,7 @@ Args parse(int argc, char** argv) {
         }
         else if (arg == "--heldout") a.heldout.push_back(value());
         else if (arg == "--out") a.out = value();
+        else if (arg == "--checked-role") a.checked_role = value();
         else if (arg == "--report") a.report = value();
         else if (arg == "--technique") a.technique = parse_technique(value());
         else if (arg == "--damp") a.damp = std::stod(value());
@@ -159,37 +170,31 @@ Args parse(int argc, char** argv) {
     if (a.model.empty()) throw std::invalid_argument("need --model");
     if (!a.probe.empty()) {
         if (!a.plan.empty() || !a.rules.empty() || !a.out.empty() || !a.dequant_out.empty() || !a.report.empty() ||
-            !a.moments.empty() || !a.eval.empty() || !a.heldout.empty() || a.compare)
+            !a.moments.empty() || !a.eval.empty() || !a.heldout.empty() || !a.checked_role.empty() || a.compare)
             throw std::invalid_argument("--probe-source is a read-only standalone operation");
         return a;
     }
+    if (!a.checked_role.empty() && a.out.empty()) throw std::invalid_argument("--checked-role requires --out");
     if (a.rules.empty() == a.plan.empty())
         throw std::invalid_argument("need --storage rules or --plan");
     if (!a.eval.empty() && a.eval.size() != a.moments.size())
         throw std::invalid_argument("need one --eval file for each --moments file");
-    if (a.moments.empty() && (a.technique != Technique::rtn || a.compare))
-        throw std::invalid_argument("only standalone RTN can run without --moments");
+    if (a.moments.empty() && a.compare) throw std::invalid_argument("--compare requires --moments");
     if (!a.moments.empty() && a.heldout.empty())
         throw std::invalid_argument("moments require at least one --heldout gate manifest");
     if (a.threads == 0U) a.threads = std::max(1U, std::thread::hardware_concurrency());
     return a;
 }
 
-wei::PackMatrixSource matrix_source(const wei::PackCheckpoint& checkpoint, const wei::RawTensor& tensor) {
-    wei::PackMatrixSource source;
-    if (const auto status = wei::PackMatrixSource::bind(checkpoint, tensor, source); !status)
-        throw std::runtime_error(status.detail);
-    return source;
-}
+using ResolveSource = std::function<wei::PackMatrixSource(std::string_view)>;
 
-void probe(const wei::PackCheckpoint& checkpoint, const std::string& name) {
+void probe(const wei::PackCheckpoint& checkpoint, const std::string& name, const ResolveSource& resolve) {
     const auto* tensor = checkpoint.find(name);
-    if (!tensor) throw std::invalid_argument("checkpoint lacks " + name);
-    const auto source = matrix_source(checkpoint, *tensor);
+    const auto source = resolve(name);
     std::vector<float> decoded;
     if (const auto status = source.decode(decoded); !status) throw std::runtime_error(status.detail);
     const auto digest = wei::digest_bytes(std::as_bytes(std::span(decoded)));
-    std::cout << name << " dtype=" << tensor->wire_dtype << " rows=" << source.rows << " columns=" << source.columns
+    std::cout << name << " dtype=" << (tensor ? tensor->wire_dtype : "microscaled") << " rows=" << source.rows << " columns=" << source.columns
               << " fp32_sha256=";
     constexpr char hex[] = "0123456789abcdef";
     for (const auto byte : digest.bytes) std::cout << hex[byte >> 4U] << hex[byte & 15U];
@@ -197,22 +202,32 @@ void probe(const wei::PackCheckpoint& checkpoint, const std::string& name) {
 }
 
 struct Selection {
-    const wei::RawTensor* tensor;
+    std::string name;
     Format format;
+    Technique technique;
     bool processed = false;
 };
 
-std::map<std::string_view, Selection> select(const Args& args, const wei::PackCheckpoint& checkpoint) {
-    std::map<std::string_view, Selection> selected;
+std::map<std::string, Selection, std::less<>> select(const Args& args, const wei::PackCheckpoint& checkpoint,
+                                                     const ResolveSource& resolve) {
+    std::map<std::string, Selection, std::less<>> selected;
     if (!args.plan.empty()) {
         std::ifstream in(args.plan);
         std::string line;
         if (!std::getline(in, line)) throw std::invalid_argument("cannot read " + args.plan);
         if (line.ends_with('\r')) line.pop_back();
-        if (line != "tensor\tformat\tbytes") throw std::invalid_argument("invalid pack plan header");
+        const bool coders = line == "tensor\tformat\tbytes\tcoder";
+        if (!coders && line != "tensor\tformat\tbytes") throw std::invalid_argument("invalid pack plan header");
         std::set<std::string> names;
         while (std::getline(in, line)) {
             if (line.ends_with('\r')) line.pop_back();
+            Technique technique = args.technique;
+            if (coders) {
+                const auto tab = line.rfind('\t');
+                if (tab == std::string::npos) throw std::invalid_argument("missing pack plan coder field");
+                if (tab + 1U != line.size()) technique = parse_technique(std::string_view(line).substr(tab + 1U));
+                line.resize(tab);
+            }
             const auto first = line.find('\t');
             const auto last = line.rfind('\t');
             if (first == 0 || first == last) throw std::invalid_argument("invalid pack plan row");
@@ -221,12 +236,10 @@ std::map<std::string_view, Selection> select(const Args& args, const wei::PackCh
             if (!names.insert(name).second) throw std::invalid_argument("duplicate pack plan row for " + name);
             const auto bytes = integer(std::string_view(line).substr(last + 1U));
             if (name_format == "keep") continue;
-            const auto* tensor = checkpoint.find(name);
-            if (!tensor) throw std::invalid_argument("checkpoint lacks planned matrix " + name);
-            const auto source = matrix_source(checkpoint, *tensor);
+            const auto source = resolve(name);
             if (bytes != wei::strixpack_matrix_bytes(wei::strixpack_format(name_format), source.rows, source.columns))
                 throw std::invalid_argument("pack plan bytes disagree with geometry of " + name);
-            selected.emplace(tensor->name, Selection{tensor, parse_format(name_format)});
+            selected.emplace(name, Selection{name, parse_format(name_format), technique});
         }
         if (!in.eof()) throw std::runtime_error("cannot finish reading " + args.plan);
     } else {
@@ -238,10 +251,13 @@ std::map<std::string_view, Selection> select(const Args& args, const wei::PackCh
             const auto rule = std::ranges::find_if(args.rules, [&](const Rule& r) {
                 return tensor.name.find(r.substring) != std::string::npos;
             });
-            if (rule != args.rules.end()) selected.emplace(tensor.name, Selection{&tensor, rule->format});
+            if (rule != args.rules.end()) selected.emplace(tensor.name, Selection{tensor.name, rule->format, args.technique});
         }
     }
     if (selected.empty()) throw std::invalid_argument("no matrices selected");
+    if (args.moments.empty() && std::ranges::any_of(selected, [](const auto& item) {
+            return item.second.technique != Technique::rtn;
+        })) throw std::invalid_argument("calibrated matrices require --moments");
     return selected;
 }
 
@@ -379,18 +395,57 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 
 }  // namespace
 
+constexpr std::string_view kUsage =
+    "usage: strix-lowbit-calib-pack --model INDEX (--storage SUBSTRING=q4|q6|sp4|sp3|sp2 ... | --plan FILE) [options]\n"
+    "  --inkling2-mini          read the model through the Inkling 2 Mini source adapter\n"
+    "  --moments FILE           activation moments (repeatable); --moments-bytes N caps the bytes read\n"
+    "  --eval FILE / --heldout FILE   scoring inputs (repeatable)\n"
+    "  --out FILE               calibrated pack; --checked-role ROLE checks one projection role of it\n"
+    "  --report FILE            per-matrix numerical report\n"
+    "  --technique NAME --damp X --threads N --compare --proxy-stride N --table fixed|auto\n"
+    "  --dequant-out FILE       dequantised copy for diagnostics\n"
+    "  --probe-source FILE      read-only standalone probe\n"
+    "See docs/engine/lowbit-calibration.md.\n";
+
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (const std::string_view arg = argv[i]; arg == "--help" || arg == "-h") {
+            std::cout << kUsage;
+            return 0;
+        }
     try {
         const auto args = parse(argc, argv);
         const auto t0 = std::chrono::steady_clock::now();
         wei::PackCheckpoint checkpoint;
         if (const auto status = wei::PackCheckpoint::open(args.model, checkpoint); !status)
             throw std::runtime_error("index " + args.model + ": " + status.detail);
+#if defined(STRIX_PACK_INKLING2_MINI)
+        strix::inkling2::MiniTextWeights mini;
+        if (args.inkling2_mini)
+            if (const auto status = mini.open(args.model); !status) throw std::runtime_error(status.detail);
+#else
+        if (args.inkling2_mini) throw std::runtime_error("Inkling 2 Mini source adapter unavailable");
+#endif
+        const ResolveSource resolve = [&](std::string_view name) {
+            wei::PackMatrixSource source;
+#if defined(STRIX_PACK_INKLING2_MINI)
+            if (args.inkling2_mini) {
+                if (const auto status = strix::inkling2::mini_pack_source(checkpoint, mini, name, source); !status)
+                    throw std::runtime_error(status.detail);
+                return source;
+            }
+#endif
+            const auto* tensor = checkpoint.find(name);
+            if (!tensor) throw std::runtime_error("checkpoint lacks " + std::string(name));
+            if (const auto status = wei::PackMatrixSource::bind(checkpoint, *tensor, source); !status)
+                throw std::runtime_error(status.detail);
+            return source;
+        };
         if (!args.probe.empty()) {
-            probe(checkpoint, args.probe);
+            probe(checkpoint, args.probe, resolve);
             return 0;
         }
-        auto selected = select(args, checkpoint);
+        auto selected = select(args, checkpoint, resolve);
         const bool report_sp = std::ranges::any_of(selected, [](const auto& item) { return is_sp(item.second.format); });
         // Diagnostics and the pack take new paths, including when their names
         // resolve through equivalent parent paths.
@@ -407,7 +462,7 @@ int main(int argc, char** argv) {
             wei::Digest256 digest{};
             if (const auto status = checkpoint.digest(digest); !status)
                 throw std::runtime_error("checkpoint digest: " + status.detail);
-            writer.emplace(digest, args.out, names);
+            writer.emplace(digest, args.out, names, args.checked_role.empty() ? wei::PackVersion::legacy : wei::PackVersion::checked);
         }
         std::ofstream report;
         if (!args.report.empty()) {
@@ -418,24 +473,25 @@ int main(int argc, char** argv) {
             report << '\n';
         }
         DequantTensors dequant_out;
+        wei::Digest256 calibration{};
         double total_rtn = 0.0, total_sel = 0.0;
         const auto process = [&](Selection& selection, const wei::calib::InputMoments* input,
                                  const wei::calib::InputMoments* held, const std::vector<float>& importance,
                                  const std::vector<float>& factor, const std::vector<std::uint8_t>& dead) {
-            const auto* t = selection.tensor;
-            if (selection.processed) throw std::runtime_error("multiple moment inputs for " + t->name);
-            const auto source = matrix_source(checkpoint, *t);
+            const auto& name = selection.name;
+            if (selection.processed) throw std::runtime_error("multiple moment inputs for " + name);
+            const auto source = resolve(name);
             const auto n = source.rows, k = source.columns;
             if (input && (input->width != k || held->width != k))
-                throw std::runtime_error(t->name + ": width differs from its input");
+                throw std::runtime_error(name + ": width differs from its input");
             const auto format = selection.format;
             const auto input_name = input ? input->name : "-";
             const auto block = is_sp(format) ? wei::sp::SP2Storage::elements : wei::Q4G64Storage::elements;
-            if (k % block != 0U) throw std::runtime_error(t->name + ": width is not a multiple of pack block");
+            if (k % block != 0U) throw std::runtime_error(name + ": width is not a multiple of pack block");
             wei::Digest256 digest{};
             std::vector<float> w;
             if (const auto status = source.decode(w, writer ? &digest : nullptr); !status)
-                throw std::runtime_error(t->name + ": " + status.detail);
+                throw std::runtime_error(name + ": " + status.detail);
             struct Arm {
                 Format format;
                 bool fit;
@@ -456,18 +512,18 @@ int main(int argc, char** argv) {
             };
             const bool fit = is_sp(format) && args.table_auto;
             std::vector<Arm> arms{{format, fit, Technique::rtn}};
-            if (args.technique != Technique::rtn) arms.push_back({format, fit, args.technique});
+            if (selection.technique != Technique::rtn) arms.push_back({format, fit, selection.technique});
             if (args.compare && !is_sp(format)) {
                 for (const auto tech : {Technique::importance, Technique::feedback, Technique::both})
-                    if (tech != args.technique) arms.push_back({format, false, tech});
+                    if (tech != selection.technique) arms.push_back({format, false, tech});
                 const Format other = format == Format::q4 ? Format::q6 : Format::q4;
                 arms.push_back({other, false, Technique::rtn});
-                if (args.technique != Technique::rtn) arms.push_back({other, false, args.technique});
+                if (selection.technique != Technique::rtn) arms.push_back({other, false, selection.technique});
             } else if (args.compare) {  // SP: the other table mode and the incumbent q4_g64, rtn and the technique
                 arms.push_back({format, !fit, Technique::rtn});
-                if (args.technique != Technique::rtn) arms.push_back({format, !fit, args.technique});
+                if (selection.technique != Technique::rtn) arms.push_back({format, !fit, selection.technique});
                 arms.push_back({Format::q4, false, Technique::rtn});
-                if (args.technique != Technique::rtn) arms.push_back({Format::q4, false, args.technique});
+                if (selection.technique != Technique::rtn) arms.push_back({Format::q4, false, selection.technique});
             }
             for (const auto& a : arms) {
                 const auto tech = a.tech;
@@ -477,14 +533,14 @@ int main(int argc, char** argv) {
                     err = gq::output_error(w.data(), coded.dequant.data(), n, k, held->h, args.threads,
                                            held->layout == wei::calib::MomentLayout::diagonal, args.proxy_stride);
                     if (!err.available())
-                        throw std::runtime_error(t->name + ": proxy signal on input " + input_name +
+                        throw std::runtime_error(name + ": proxy signal on input " + input_name +
                                                  " is zero or not finite, relative error unavailable");
                 }
-                const bool chosen = a.format == format && a.fit == fit && tech == args.technique;
+                const bool chosen = a.format == format && a.fit == fit && tech == selection.technique;
                 if (a.format == format && a.fit == fit && tech == Technique::rtn) total_rtn += err.error;
                 if (chosen) total_sel += err.error;
                 if (!args.report.empty()) {
-                    report << t->name << '\t' << input_name << '\t' << (input ? input->rows : 0U) << '\t' << (held ? held->rows : 0U) << '\t'
+                    report << name << '\t' << input_name << '\t' << (input ? input->rows : 0U) << '\t' << (held ? held->rows : 0U) << '\t'
                            << format_name(a.format) << '\t' << technique_name(tech) << '\t' << err.relative() << '\t'
                            << (chosen ? 1 : 0);
                     if (report_sp) report << '\t' << coded.table << '\t' << weight_sqnr_db(w, coded.dequant);
@@ -493,10 +549,16 @@ int main(int argc, char** argv) {
                 if (chosen && !args.dequant_out.empty()) {
                     std::vector<std::uint16_t> bf(coded.dequant.size());
                     for (std::size_t i = 0; i < bf.size(); ++i) bf[i] = exact_bf16(coded.dequant[i]);
-                    dequant_out[t->name] = {{n, k}, std::move(bf)};
+                    dequant_out[name] = {{n, k}, std::move(bf)};
                 }
-                if (chosen && writer)
-                    writer->add(t->name, storage_id(a.format, a.fit), n, k, digest, std::move(coded.bytes), coded.header);
+                if (chosen && writer) {
+                    wei::PackCoding coding;
+                    if (!args.checked_role.empty())
+                        coding = {args.checked_role, std::string("clip-") + technique_name(tech) +
+                                  (a.fit ? "-fitted@1" : "-fixed@1"), calibration};
+                    writer->add(name, storage_id(a.format, a.fit), n, k, digest, std::move(coded.bytes), coded.header,
+                                std::move(coding));
+                }
             }
             selection.processed = true;
         };
@@ -506,7 +568,30 @@ int main(int argc, char** argv) {
             wei::calib::Provenance heldout, all_cal, all_eval;
             for (const auto& manifest : args.heldout) heldout.add_manifest(manifest);
             for (std::size_t layer = 0; layer < args.moments.size(); ++layer) {
-                const auto cal = wei::calib::MomentSet::read(args.moments[layer], args.moments_bytes);
+                const auto& fit_path = args.moments[layer];
+                const auto cal = [&] {
+                    if (args.checked_role.empty() || args.technique == Technique::rtn)
+                        return wei::calib::MomentSet::read(fit_path, args.moments_bytes);
+                    std::shared_ptr<const wei::Source> fit;
+                    if (const auto status = wei::open_source(fit_path, fit); !status)
+                        throw std::runtime_error("open calibration moments: " + status.detail);
+                    auto stream = wei::source_stream(fit);
+                    auto result = wei::calib::MomentSet::read(*stream, fit_path, args.moments_bytes);
+                    wei::Digest256 fit_digest{};
+                    if (const auto status = wei::digest_slice({fit, {0, fit->size()}}, fit_digest); !status)
+                        throw std::runtime_error("digest calibration moments: " + status.detail);
+                    strix::core::Sha256 hash;
+                    constexpr std::string_view tag = "strix-pack-calibration@1";
+                    hash.update(tag.data(), tag.size());
+                    hash.update(fit_digest.bytes.data(), fit_digest.bytes.size());
+                    const auto damp = std::bit_cast<std::uint64_t>(args.damp);
+                    std::array<std::uint8_t, 8> bits{};
+                    for (unsigned i = 0; i < bits.size(); ++i)
+                        bits[i] = static_cast<std::uint8_t>(damp >> (i * 8U));
+                    hash.update(bits.data(), bits.size());
+                    calibration = {hash.finish()};
+                    return result;
+                }();
                 std::optional<wei::calib::MomentSet> eval;
                 if (!args.eval.empty())
                     eval.emplace(wei::calib::MomentSet::read(args.eval[layer], args.moments_bytes - cal.moment_bytes()));
@@ -530,8 +615,9 @@ int main(int argc, char** argv) {
                     if (!held) throw std::runtime_error("evaluation statistics lack " + input.name);
                     wei::calib::require_rows(input, "calibration");
                     wei::calib::require_rows(*held, eval ? "evaluation" : "calibration");
-                    const bool needs_factor = feedback(args.technique) || (args.compare && std::ranges::any_of(
-                        inputs, [](const Selection* item) { return !is_sp(item->format); }));
+                    const bool needs_factor = std::ranges::any_of(inputs, [&](const Selection* item) {
+                        return feedback(item->technique) || (args.compare && !is_sp(item->format));
+                    });
                     std::vector<float> factor;
                     std::vector<std::uint8_t> dead;
                     if (needs_factor) {
@@ -550,6 +636,10 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // Explicit RTN selections need no rows, even when other matrices use calibration.
+        for (auto& [name, selection] : selected)
+            if (!selection.processed && selection.technique == Technique::rtn && !args.compare)
+                process(selection, nullptr, nullptr, {}, {}, {});
         for (const auto& [name, selection] : selected)
             if (!selection.processed)
                 throw std::runtime_error(std::string(name) + " is selected but no statistics input lists it");
@@ -560,7 +650,12 @@ int main(int argc, char** argv) {
         if (writer)
             if (const auto status = writer->finish(); !status) throw std::runtime_error("write pack: " + status.detail);
         if (!args.dequant_out.empty()) write_dequant(args.dequant_out, dequant_out);
-        std::cout << "strix-lowbit-calib-pack/v1 matrices " << selected.size() << " technique " << technique_name(args.technique)
+        const auto first_technique = selected.begin()->second.technique;
+        const bool homogeneous = std::ranges::all_of(selected, [&](const auto& item) {
+            return item.second.technique == first_technique;
+        });
+        std::cout << "strix-lowbit-calib-pack/v1 matrices " << selected.size() << " technique "
+                  << (homogeneous ? technique_name(first_technique) : "mixed")
                   << " damp " << args.damp << " output-error ";
         if (args.moments.empty()) std::cout << "unavailable";
         else std::cout << "rtn " << total_rtn << " selected " << total_sel << " ratio "

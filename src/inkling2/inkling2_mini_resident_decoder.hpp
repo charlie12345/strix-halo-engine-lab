@@ -225,7 +225,7 @@ public:
     // the output projection. If a later chunk fails after an earlier one
     // committed, retire the session so a retry cannot append the prefix twice.
     [[nodiscard]] unsigned prefill(std::span<const unsigned> prompt, std::span<float> logits = {}) {
-        backend_.abandon_capture();
+        backend_.abandon_step_capture();  // the verify window programs stay (prewarm_window_programs)
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, logits);
         return state.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
@@ -239,7 +239,7 @@ public:
     [[nodiscard]] unsigned prefill_spliced(std::span<const unsigned> prompt, const session::EmbedSplice& splice,
                                    std::span<float> logits = {}) {
         if (splice.empty()) return prefill(prompt, logits);
-        backend_.abandon_capture();
+        backend_.abandon_step_capture();
         auto& state = slots_.front()->state();
         validate_inputs(state, prompt, logits);
         splice.validate(prompt.size(), kHiddenWidth);
@@ -291,8 +291,8 @@ public:
     // the command line's verify arithmetic (append, MiniAppendKind::verify: every row on its one-row decode body), and
     // under the verify rows lever every slot binds its own convolution tape (a partial commit is copies, no replay).
     // One window is staged at a time (the decoder's one checkpoint workspace). Off: one row per lane, as before.
-    // Declined (returns false) where the window rows would not run the one-row decode's target arithmetic: a dual
-    // BF16 / low-bit image decodes one row on the low-bit image but verifies on BF16 (backend lowbit_applies).
+    // Declined (returns false) where the window rows would not run the one-row decode's target arithmetic (backend
+    // lowbit_applies: a dual BF16 / low-bit image decodes and verifies on the low-bit copies, so it keeps its windows).
     bool set_slot_windows(bool enabled) {
         if (slots_.size() > 1U) throw std::logic_error("set slot windows before allocating slots");
         const bool same_target = backend_.lowbit_applies(MiniAppendKind::decode, 1U) ==
@@ -409,11 +409,50 @@ public:
     }
     [[nodiscard]] std::span<float> step_program_embeddings() noexcept { return embeddings_.span().first(kHiddenWidth); }
     [[nodiscard]] std::span<float> step_program_hidden() noexcept { return hidden_.span().first(kHiddenWidth); }
-    // Verify window programs (MiniResidentBackend::try_window_graph): an explicit opt-in until the device identity
-    // fixture (tests/inkling2/mini_window_program_device_fixture.hpp) proves every stage of the captured window equal to
-    // the eager verify pass; off, every staged verify window runs eagerly (the incumbent route).
+    // Verify window programs (MiniResidentBackend::try_window_graph): the device identity fixture
+    // (tests/inkling2/mini_window_program_device_fixture.hpp, q52r) proves every stage of the captured window equal to
+    // the eager verify pass for the EXACT levers; the owner (the CUDA CLI) turns them on for that profile. Off, every
+    // staged verify window runs eagerly.
     void set_window_programs(bool enabled) noexcept { window_programs_ = enabled; }
     [[nodiscard]] bool window_programs() const noexcept { return window_programs_; }
+    // Capture the verify window program of every width 2..max_verify_rows() before the first request (load time, slot 0
+    // empty): the first window of a width otherwise captures inside the timed decode (+18..+28 ms per width on the RTX
+    // PRO, q53), and those one-time walls steered the arbiter's probe episodes (the q53 / q60 collapses, the q62 prose
+    // deficit). Each width runs one staged window of token 0 at position 0 through the program route, then the slot is
+    // reset (fresh frontier, histories cleared; the prompt overwrites the rows and taps it wrote). The head form is
+    // settled first as the greedy one-row decode step would settle it, so that step does not drop the programs again.
+    // Returns the number of widths captured (0: programs off, graphs off, or not at load).
+    unsigned prewarm_window_programs() {
+#if !defined(__HIPCC__)
+        auto& state = slots_.front()->state();
+        if (!window_programs_ || !backend_.step_graphs() || state.committed() != 0U || state.staged()) return 0U;
+        const bool screened = !backend_.lowbit_applies(MiniAppendKind::decode, 1U) &&
+            mini_screened_pick(head_.reason, screen_.has_value(), MiniAppendKind::decode, true, false, false);
+        if (screened != screened_graph_) {
+            backend_.abandon_capture();
+            screened_graph_ = screened;
+        }
+        const auto before = backend_.window_graphs().instantiations();
+        const std::array<unsigned, kMaxVerifyRows> ids{};
+        for (unsigned rows = 2U; rows <= max_verify_rows(); ++rows) {
+            (void)forward_rows(ids.data(), rows, LogitRows::all);
+            reset_slot(0U);
+        }
+        mini_gpu::synchronize(stream_.get());
+        return backend_.window_graphs().instantiations() - before;
+#else
+        return 0U;
+#endif
+    }
+    // Verify window programs captured over this decoder's lifetime (prewarm included): a count that does not grow during
+    // a timed decode shows that no capture wall entered it.
+    [[nodiscard]] unsigned window_program_captures() const noexcept {
+#if !defined(__HIPCC__)
+        return backend_.window_graphs().instantiations();
+#else
+        return 0U;
+#endif
+    }
     // The final hidden rows of the last append (device rows, the head inputs) and the DSpark tap plane (device, every
     // position): read-only views for the window program identity fixture.
     [[nodiscard]] std::span<const float> last_hidden_rows(unsigned rows) const {
@@ -458,10 +497,14 @@ public:
         }
 #if !defined(__HIPCC__)
         // A cohort decode program per width (captured once, replayed for any slots and positions). The lone
-        // slot-0 lane keeps its one-row step graph; DSpark taps step lanes one at a time.
-        if (draft_taps_.span().empty() && !(slots.size() == 1U && slots.front() == 0U)) {
+        // slot-0 lane keeps its one-row step graph. The program stores no DSpark taps: with taps captured, a slot-0
+        // row decoded inside it leaves slot 0's tap plane short of its frontier (slot0_taps_complete() false until
+        // the slot's next sequence), so the cohort keeps its programs and slot 0 drafts without the model afterwards.
+        if (!(slots.size() == 1U && slots.front() == 0U)) {
             const auto width = cohort_policy_.width(static_cast<std::uint32_t>(slots.size()), decode_rows_);
             if (width != 0U) {
+                if (!draft_taps_.span().empty() && std::ranges::find(slots, 0U) != slots.end())
+                    slot0_taps_stale_ = true;
                 decode_cohort(slots, ids, top, width);
                 return;
             }
@@ -615,7 +658,19 @@ public:
 
     // Final-row scores of the last decode_slots() call, exactly as the greedy pick saw them (after the
     // output softcap). Lane `row` follows the slot order of that call. Valid until the next decode_slots().
-    [[nodiscard]] bool final_logits_supported() const { return draft_taps_.span().empty(); }
+    // With DSpark taps captured, lanes outside a cohort program step one at a time (each overwrites the score row), so
+    // several lanes' rows are readable only where every decode width runs a cohort program (CUDA, programs on: one
+    // forward per width; a lone lane keeps its own row).
+    [[nodiscard]] bool final_logits_supported() const {
+        if (draft_taps_.span().empty()) return true;
+#if !defined(__HIPCC__)
+        for (unsigned lanes = 2; lanes <= decode_rows_; ++lanes)
+            if (cohort_policy_.width(lanes, decode_rows_) == 0U) return false;
+        return true;
+#else
+        return false;
+#endif
+    }
     [[nodiscard]] std::uint32_t logit_width() const { return kOutputVocabulary; }
     // The last pick was screened and its score row waits for the first score read (materialize_scores): a greedy
     // caller that never reads scores never pays the full head projection.
@@ -653,6 +708,11 @@ public:
         if (state.poisoned()) throw std::logic_error("invalid Mini resident tap frontier");
         return draft_taps_.span().first(MiniDSparkTapPlan::elements(state.committed()));
     }
+    // Every committed slot-0 row has its DSpark tap (taps captured and no slot-0 row decoded inside a cohort program
+    // since the slot's sequence started): the model drafter's input is complete.
+    [[nodiscard]] bool slot0_taps_complete() const noexcept { return !draft_taps_.span().empty() && !slot0_taps_stale_; }
+    // Sequences slot 0 has started (reset_slot(0)): a model drafter reading slot 0's taps restarts its context on a change.
+    [[nodiscard]] std::uint64_t slot0_sequence() const noexcept { return slot0_sequence_; }
 
     // EngineVerifyTarget binding. All replies are validated before exposing the
     // staged rows. A caller may also request the raw scores for every row.
@@ -686,6 +746,10 @@ public:
     using PlainRowRoute = std::function<unsigned(unsigned, std::span<float>)>;
     void set_plain_row_route(PlainRowRoute route) { plain_row_ = std::move(route); }
     [[nodiscard]] bool plain_row_route() const noexcept { return static_cast<bool>(plain_row_); }
+    // decode_committed_row takes the plain-row route (not a calibrated low-bit decode row).
+    [[nodiscard]] bool plain_row_applies() const noexcept {
+        return plain_row_ && !backend_.lowbit_applies(MiniAppendKind::decode, 1U);
+    }
 
     void commit(unsigned rows) {
         auto& state = slots_.front()->state();
@@ -811,7 +875,9 @@ private:
     // state's slot), every row valid (each stores its own KV row on the sequence's caches). Empty when the window is
     // outside the lanes form (one row, more rows than a lanes launch) or its slot has no directory entry.
     [[nodiscard]] std::optional<MiniResidentBackend::WindowProgram> window_program(const MiniResidentSessionState& state,
-                                                                                std::span<const unsigned> ids) {
+                                                                                std::span<const unsigned> ids,
+                                                                                unsigned pick_rows, bool lanes_screened,
+                                                                                bool screened) {
         const auto rows = static_cast<std::uint32_t>(ids.size());
         if (rows < 2U || rows > attn::lanes::kMaxPreparedBf16Lanes || rows > exec::kStepMaxRows) return std::nullopt;
         std::uint32_t slot = 0;
@@ -823,6 +889,8 @@ private:
         program.block = session::linear_verify_step(
             {rows, state.committed(), slot, 0U, session::LinearVerifyRows::inclusive_valid}, ids);
         auto& owner = *slots_[slot];
+        program.binding = {owner.history().data(), state.convolution_tape_data(), workspace(&state).draft_taps.data(),
+                           state.convolution_tape_rows(), pick_rows, lanes_screened, screened};
         const auto planes = owner.planes();
         program.lanes = {exec::step_lane_view(backend_.window_block(), slot_directory_.data(), decode_rows_, rows),
                          {reinterpret_cast<std::uintptr_t>(planes.keys.data()),
@@ -909,6 +977,10 @@ private:
 #endif
 
     void reset_slot(unsigned slot) {
+        if (slot == 0U) {  // a fresh sequence: its taps are written from row 0
+            slot0_taps_stale_ = false;
+            ++slot0_sequence_;
+        }
         // KV visibility is determined by the fresh frontier. No old row is read.
         slots_.at(slot)->reset([&](std::span<float> history) {
             mini_gpu::clear(history.data(), history.size_bytes(), stream_.get());
@@ -1238,7 +1310,7 @@ private:
         std::optional<MiniResidentBackend::WindowProgram> window;
         if (window_programs_ && kind == MiniAppendKind::verify && multi_pick && host_logits.empty() && !scores_read &&
             !lowbit && backend_.step_graphs())
-            window = window_program(state, ids);
+            window = window_program(state, ids, static_cast<unsigned>(verify_top.size()), lanes_screened, screened);
         struct ClearWindow {
             MiniResidentBackend& backend;
             ~ClearWindow() { backend.set_window_program(nullptr); }
@@ -1533,8 +1605,10 @@ private:
     } pending_scores_;
     std::optional<Screen> screen_;
     PlainRowRoute plain_row_;  // set_plain_row_route: the speculator's one-row steps (empty: this decoder's decode)
+    bool slot0_taps_stale_{false};  // a slot-0 row ran in a cohort program (no tap store) since the slot's reset
+    std::uint64_t slot0_sequence_{0};  // reset_slot(0) calls (slot0_sequence)
 #if !defined(__HIPCC__)
-    bool window_programs_{false};  // set_window_programs: opt-in until the device identity fixture passes
+    bool window_programs_{false};  // set_window_programs: the owner decides (the CUDA CLI: on for the EXACT levers)
 #endif
 #if defined(__HIPCC__)
     bool verify_lanes_pick_{false};  // verify rows level 2 admitted (set_verify_rows): lanes screened picks

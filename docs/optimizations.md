@@ -1,5 +1,92 @@
 # Optimizations
 
+<a id="platform-fast-capture-nonfinite"></a>
+### FAST candidate failure capture
+
+`fast_logit_gate.py seal --capture-nonfinite` retains sealed candidate logits so that a valid paired FAST comparison records a nonfinite candidate as FAIL. Add the same switch to `witness` if needed. Omit the switch to refuse nonfinite dumps at sealing. This host-only qualification option changes no engine arithmetic or defaults.
+
+<a id="platform-fast-null-control-witness"></a>
+### FAST null control evidence
+
+`gate_v2.py qual --null-control-witness WITNESS.json` checks that the launcher recorded the same binary, model and numerical configuration for the reference and each order-only null. It binds the control to the consumed logits and, for head dumps, to the full prompt IDs. This explicit gate option requires launcher evidence and preserves engine defaults.
+
+<a id="platform-fast-frozen-qualification"></a>
+### Preregistered FAST gate evidence
+
+`gate_v2.py qual --frozen-qualification PLAN.json SHA256` binds the scored case set, content classes and token IDs to a published digest. It evaluates each reference against the plan's historical NLL distribution for that class, including when the new batch has fewer than three windows. The plan can also require a numerical envelope for each witnessed null before it can relax acceptance limits. This host gate option preserves engine defaults.
+
+<a id="platform-fast-document-uncertainty"></a>
+### Document-cluster dNLL uncertainty
+
+`gate_v2.py qual --document-uncertainty` reports an additional pooled dNLL standard error from independent documents declared in the frozen plan. This option is diagnostic and preserves the gate's row-based verdict.
+
+<a id="platform-fp8-tail-guard"></a>
+### FP8 attention tail guard
+
+The shared `live_tile_keys` guard bounds valid positions before reading an aligned E4M3 shadow tile. Its host oracle covers stale finite scales and nonfinite tail bytes. Device conformance and binding to the launched attention paths are pending.
+
+<a id="platform-numerical-identity-options"></a>
+### KV and numeric identity options
+
+The shared resolver offers explicit `ExactOverride::require_native`. The active MiniMax rank receipt reports the resolved product tier and uses native KV. `SamplingPolicyIdentity::canonical_zero_v2` normalizes both signs of zero when hashing a policy. `NanMode::quiet` exposes quiet signaling-NaN decoding for formats that choose that policy. These API options require a binding and a versioned identity before use in a product.
+<a id="pair-startup-contract"></a>
+### Shared two-rank startup contract
+GLM and MiniMax rank and serve, DeepSeek pair serve, and Hy4 rank send a versioned
+304-byte startup record in each direction. Bindings compare executable and model
+content, GPU architecture, route and profile, and the fields that govern the
+entry point's frame layout. Each peer refuses a mismatch before model traffic.
+Hy4 also binds teacher-forced continuation IDs. The existing GPU-direct
+bootstrap compares the communicator route policy before route calibration.
+Resource offers can differ and are resolved by their admission policy.
+[Shared record](../include/strix/pair/handshake.hpp) · [Host cases](../tests/pair_lockstep_tests.cpp).
+<a id="pair-half-sum-wire-contract"></a>
+### Shared GLM and MiniMax half-sum wire contract
+The shared schedule describes two FP32 half-sums per layer and a final argmax.
+Each engine supplies its tag vocabulary and trailer identity. Host traces cover
+both ranks, decode at 1 and 8 rows, prefill at 32 rows, and inline and deferred
+CRC. The extraction preserves frame bytes and message counts.
+[Implementation](../src/xport/half_sum_wire.hpp).
+<a id="pair-state-staging"></a>
+### Shared pair handoff staging
+The Qwen pair handoff binds the shared two-slot pinned staging implementation
+with its existing piece capacity. The wire programs retain their ordering and
+copy fences. Host fixtures cover both copy directions, trailing short pieces,
+failed receipts and state ownership.
+[Implementation](../src/xport/hip_state_staging.hpp).
+<a id="pair-split-phase-plan"></a>
+### Explicit split-phase pair planning
+Callers supply prefill and decode estimates and a named transition with link,
+time and per-rank peak memory requirements. The planner checks matching device
+and calibration evidence and budgets the transition before comparing the whole
+request against one device. The returned receipt is a prediction. Production
+selection requires a bound runner and a same-regime device receipt.
+[Planner](../include/strix/pair/planner.hpp) · [Host cases](../tests/pair_planner_tests.cpp).
+<a id="glm-served-fast-band-parity"></a>
+### GLM FAST band admission for one active serving lane
+The pair server and rank entry point resolve `pf_wmma` through the same selector.
+An eligible, fresh, whole text prompt takes the existing FAST band of 2,049 to
+8,192 rows with one actual lane, an admitted 8,192-row workspace, and the measured
+route. Slot reservation is independent of that lane count. `STRIX_GLM_PF_WMMA=0`
+turns the bundle off. Server timing and same-identity native checks are pending.
+[Band receipt](#glm-pf-wmma-x) · [Resolver](../apps/glm_rank_defaults.hpp).
+<a id="minimax-pair-transport-capabilities"></a>
+### MiniMax pair transport capability parity
+`STRIX_MM_USB4_CAPS` accepts `streams,joint,ready,deferred-crc,chunks,crc-overlap,gpu-lean`
+as comma-separated explicit capabilities on negotiated USB4 transports. Rank and
+serve report the same effective mask and supply it to both the opener and the
+communicator. Unset or empty leaves the mask at zero. Joint calibration also
+requires `STRIX_DIST_USB4_CALIBRATE=joint` and eligible links. Native timing and
+qualification are pending for the new serving cells.
+[Resolver](../src/minimax/engine/mm_defaults.cpp) · [Parity cases](../tests/serve_cli_parity_tests.cpp).
+<a id="glm-pair-idle-quiesce"></a>
+### GLM pair idle receive retirement
+With a live GPU-direct link, both GLM serving ranks retire queued device
+receives at the first idle heartbeat. They execute the same operation after
+acknowledging the heartbeat command. The heartbeat remains a 512-byte control
+block. The host fixture checks startup, work and return to idle. Native
+idle-and-resume qualification is pending.
+[Lead](../src/glm/serve/glm_serve_lead.hpp) · [Fixture](../tests/glm_serve_cpu_tests.cpp).
+
 <a id="ds41-single-attention-read-ahead"></a>
 ### Single DeepSeek attention read-ahead
 
@@ -13,6 +100,13 @@ Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-
 Cooperative two-rank DSpark candidate exchange. The payload, zero padding and transfer order are preserved. Reuses two host allocations after warm-up. Device timing pending. The host code lives in `src/hip_deepseek41_batch_dspark.hip`.
 
 Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=affected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="hip-pinned-decision-readback"></a>
+### HIP pinned decision readback
+
+`STRIX_HIP_PINNED_REPLIES=1` opts DeepSeek HIP DSpark and GLM HIP into a reusable per-engine host reply buffer. DSpark submits its token and confidence copies before one completion fence, removing one fence and two transient allocations per draft. GLM applies the same staging to checkpoint flags and selected IDs with the existing fence positions. If pinning is refused, the session uses reusable pageable storage. The default is off because live scheduling can use observed draft and decode times. Host tests compare IDs and confidence bits and count fences. Native token/state identity and timings are pending.
+
+DeepSeek and GLM bind the HIP option. Inkling, both Qwen engines, MiniMax, Hy4 and Nemotron keep their existing routes.
 
 <a id="hy4-engram-request-staging-reuse"></a>
 ### Hy4 Engram request staging reuse
@@ -35,12 +129,29 @@ Device target row verification, including mixed streams and optional KV mirrors.
 
 Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=affected.
 
+<a id="cpu-portable-operator-dispatch"></a>
+### CPU portable operator dispatch
+
+The optional CPU operator library selects a runtime capability level and gives each level the
+complete portable A8 quantization, Q8_0 GEMV and RMSNorm table. Synthetic CPU feature descriptors
+exercise the selector and compare the results bitwise with the host oracles. The selected level
+currently records capabilities while all operator entries run the same portable arithmetic.
+The shared code lives in `src/cpu/core/select.cpp`. The opt-in build flag is `STRIX_BACKEND_CPU`.
+
 <a id="cohort-verification-scratch-reuse"></a>
 ### Cohort verification scratch reuse
 
-Backends using the shared cohort decoder. Host cohort tests compare cohort and solo IDs, including device-draft and per-lane selection hooks. Reuses verification and commit staging across host rounds. Wall time unmeasured. The host code lives in `src/serve/cohort_decode.cpp`.
+Backends using the shared cohort decoder. Host cohort tests compare cohort and solo IDs, including device-draft and per-lane selection hooks. Reuses prompt planning, lane drafts, row planning, verification and commit buffers across host rounds. The steady-state counting fixture checks the full greedy IDs and committed state digest. Device wall time is unmeasured. The host code lives in `src/serve/cohort_decode.cpp`.
 
-Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+Engine matrix: inkling2-mini=HIP and CUDA HTTP cohorts, qwen3.8-flash-next=unaffected, qwen3.8-27b=CUDA cohort, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+
+<a id="reference-gpu-serve-admission"></a>
+### Reference GPU serve admission
+
+The shared `strix-serve` shell explains the supported Intel family entry point and
+the RMSNorm operator scope of Vulkan and Metal when those backends are requested
+at the shell level. Host tests cover early refusal and the reference operator
+boundary. See the [experimental backend coverage](architecture/backends.md#experimental-intel-vulkan-and-metal-backends).
 
 Qwen guarded wave reductions can use exact DPP/permlanex16 exchanges (build-time lever, off by default: configure with `-DSTRIX_DPP_REDUCE=ON`; the all-on build uses it); addition trees are unchanged, native byte-equality qualification is pending, and no speed gain is claimed.
 
@@ -122,6 +233,20 @@ resolution before adding overrides. `ON` means enabled; `auto` means enabled whe
 The [JSON catalog](optimizations.json) provides the same controls for tools; the [README](../README.md)
 is the compact overview, and [toggles](toggles.md) lists every switch by area. Run commands and agent instructions are in [AGENTS.md](../AGENTS.md).
 
+### Generic HIP device admission
+
+The shared HIP device gate accepts an explicit `--device-profile generic-hip` on an
+unambiguous AMD wave32 device. The catalogue hardware match never grants a budget or
+schedule by itself. Existing qualification decisions are still scoped to their receipt.
+The host fixture covers RDNA3, RDNA3.5, RDNA4, CDNA and unknown device descriptors.
+[Generic HIP devices](devices.md#generic-hip-admission)
+
+### Unmeasured device catalogue entries
+
+The shared device catalogue provides planning identities for additional AMD, Intel and Apple GPU families.
+Entries marked `unmeasured` carry no capacity or throughput estimates and confer no route qualification.
+The interconnect catalogue references the shared topology classes. [Device catalogue](devices.md#catalogue)
+
 Exactness requires fixed model content, prompt, state, profile pair and capacity. Qwen fast FP16 prefill,
 dense A8, GSQ, DeepSeek trellis and GLM R1b are distinct numerical identities. Speculation verifies committed
 tokens against its target from the prefill handoff state; draft changes can affect acceptance without changing
@@ -152,6 +277,29 @@ becomes default without a percentage threshold. See [controls](engine/serving/pr
 and [qualification](engine/serving/ds41-prefix-cache-qualification.md).
 
 ## Baselines, inspection and exactness
+
+### Native profile resolution through the product launchers
+
+**Engine:** shared. **Control:** `--native-profile`. **Default:** off.
+
+Use `strix run`, `strix serve` or `strix-serve` with `--native-profile` to use the engine's own admission and tier
+selection. An explicit `--profile` reaches the engine directly. When omitted, the engine selects its usual default.
+This mode also leaves KV selection to the engine. Use an asset with `--print-effective-config` to print the
+engine receipt. Applicable backend, asset and placement checks still run. The engine's supported tiers and
+explicit switches apply, including any provisional rows admitted by that native entry point.
+
+- **Evidence:** Host tests cover the forwarded arguments, the native inspection path and the scoped selection of
+  preset admission. This switch makes no throughput claim.
+
+### Published tier throughput check
+
+**Engine:** shared. **Control:** `tools/ci/check_tier_monotonicity.py`. **Default:** checked in CI.
+
+The throughput check reads the published results by model, revision, hardware, route, prompt and phase.
+It compares adjacent tiers using the median of reported repeats or separated bounds when only ranges are
+available. A new decrease fails CI. See `tools/ci/tier_monotonicity_known.tsv` for the historical decreases
+and remove an entry when its replacement receipt meets the tier guarantee. A decrease in this table warrants
+a controlled device comparison with the same route and prompts before attributing it to a particular lever.
 
 | Engine | Master baseline | Inspect before device work | Scope / precedence |
 |---|---|---|---|
@@ -349,6 +497,18 @@ HTTP serving (`--http-serve`) without an explicit tiled configuration resolves t
 - **Off switch:** `STRIX_SERVE_PREFILL=0` with an explicit tiled configuration; `--prefix-cache-block-rows 0` (T-sized checkpoints). Explicit `--known-prefix-prefill-rows` and budgets always win; `--baseline` / `STRIX_BASELINE=1` suppresses the automatic T.
 - **Measured gain:** One Strix Halo node, same binary, interleaved arms, identical token IDs, versus explicit T2048: cold TTFT 21.95 vs 22.93 s at 17K tokens (-4.3 %), 11.08/11.11 vs 11.53/11.58 s for two 8.5K prompts (-3.9 %/-4.0 %); eight staggered 8.5K prompts queued: TTFT p50 65.3 vs 66.4-71.7 s, wave wall 103.7 vs 105.2-110.2 s. T8192 uses capacity: 29 vs 55 admitted slots, a queueing tradeoff only above 29 concurrent requests.
 - **Implementation / evidence:** [Resolver](../apps/qwen_effective_config.hpp), [serving](engine/serving/serving.md#default-prompt-prefill)
+
+<a id="qwen-http-slot-admission"></a>
+
+### Qwen HTTP slot growth at cohort admission
+
+**Engine:** Qwen Flash Next HIP HTTP cohort. **Control:** `--http-slot-build admission`. **Default:** `--http-slot-build on-demand`.
+
+When queued work needs more slots, the scheduler keeps stepping the active cohort and prepares additional slots before admitting the next cohort. The allocator enters its device-wide setup phase with zero live lanes. The same capacity ceiling and per-slot memory checks apply. An admission can wait for the current cohort to drain.
+
+- **Exactness evidence:** The host replay checks the full IDs and final state digests for active and queued requests, including declined growth. Native identity and timing are pending.
+- **Measured gain:** Pending. The HTTP slots gate compares the largest active-stream token gap and next-cohort TTFT with staggered arrivals.
+- **Implementation / evidence:** [Slot policy](../include/strix/serve/slot_capacity.hpp), [serving](engine/serving/serving.md), [gate](../tests/http_slots_gpu_gate.py).
 
 <a id="qwen-residency"></a>
 
@@ -1285,7 +1445,7 @@ than the decode window read back the one argmax the engine returns for them (the
   8,193-24,575) and runs with MTP on are covered by the gate classes, not by a timing receipt.
 - **Implementation / evidence:** [profile rows](../include/strix/profiles/qwen_dense_hip.hpp),
   [shared band receipts](../include/strix/engine_profile.hpp), [prefill windows](../include/strix/qwen35/prefill_windows.hpp),
-  [model page](models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-app)
+  [model page](models/qwen3.8-27b/README.md#fast-prefill-window-hip-decode-and-speculative-apps)
 
 <a id="qwen27-hip-decode-attn-row-share"></a>
 
@@ -3998,7 +4158,7 @@ Use chunked gemv prefill with the R1 arithmetic identity.
 - **Exactness evidence:** Real-model logits are bitwise equal on both ranks to previous exact R1 prefill; 1K/8K/32K gates. This does not assert R1b decode equality to R1.
 - **Off switch:** --prefill ref; STRIX_GLM_PREFILL=ref if no CLI prefill override
 - **Measured gain:** 1K/8K/32K TTFT 4.268/34.70/144.75 s = 240/236/226 tok/s
-- **Implementation / evidence:** [Resolver](../apps/glm_rank_defaults.hpp), [admission](../apps/glm_rank_main.cpp)
+- **Implementation / evidence:** [Resolver](../src/glm/load/glm_rank_defaults.hpp), [admission](../apps/glm_rank_main.cpp)
 
 <a id="glm-identity"></a>
 
@@ -4059,7 +4219,7 @@ Compute host transport CRC using parallel workers while retaining integrity chec
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_CRC_PARALLEL=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-hp-crc-overlap"></a>
 
@@ -4075,7 +4235,7 @@ Overlap host CRC work with exchange transfers.
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_HOST_CRC_OVERLAP=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-hp-chunk-bytes"></a>
 
@@ -4091,7 +4251,7 @@ Split host exchange payloads into 1 MiB chunks.
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_HOST_CHUNK_BYTES=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-hsa-no-fragment-allocator"></a>
 
@@ -4107,7 +4267,7 @@ Disable the HSA fragment allocator so production allocation granules fit GTT.
 - **Exactness evidence:** Measurement: production decode and prefill configuration; allocator granules fit GTT; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** HSA_DISABLE_FRAGMENT_ALLOCATOR=0
 - **Measured gain:** production decode and prefill configuration; allocator granules fit GTT
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-r1b-dense-auto"></a>
 
@@ -4123,7 +4283,7 @@ Select dense variant 7 within the R1b generation identity.
 - **Exactness evidence:** Measurement: R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_R1B_DENSE=2
 - **Measured gain:** R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-r1b-hc-v4"></a>
 
@@ -4139,7 +4299,7 @@ Use HC variant 4 within the R1b generation identity.
 - **Exactness evidence:** Measurement: with r1b-dense-auto, R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_R1B_HC=1
 - **Measured gain:** with r1b-dense-auto, R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-hc-pre-v7"></a>
 
@@ -4155,7 +4315,7 @@ Use the qualified v7 pre-HC reduction/normalization schedule.
 - **Exactness evidence:** Measurement: hc_pre 77.4-77.9 vs 102.1-102.8 us, gates 0-7 bitwise; tokens match reference; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_HC_PRE_V=4
 - **Measured gain:** hc_pre 77.4-77.9 vs 102.1-102.8 us, gates 0-7 bitwise; tokens match reference
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-post-exchange-fast"></a>
 
@@ -4171,7 +4331,7 @@ Consume post-exchange values through fused fast kernels rather than separate ref
 - **Exactness evidence:** Measurement: fast post-exchange consumers match STRIX_GLM_POST=ref and reference (real model, 6 layers); compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_POST=ref
 - **Measured gain:** fast post-exchange consumers match STRIX_GLM_POST=ref and reference (real model, 6 layers)
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-attn-fast"></a>
 
@@ -4187,7 +4347,7 @@ Install FastAttn at the attention seam, preserving the selected identity and sta
 - **Exactness evidence:** Measurement: FastAttn matches STRIX_GLM_ATTN=ref (G3), Tier A 12-40x; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_ATTN=ref
 - **Measured gain:** FastAttn matches STRIX_GLM_ATTN=ref (G3), Tier A 12-40x
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-attn-tierb-fused"></a>
 
@@ -4203,7 +4363,7 @@ Use fused Tier-B attention projections from raw weights instead of prepared libr
 - **Exactness evidence:** Measurement: fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_TIERB=lib
 - **Measured gain:** fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-xfer-boundary-fused"></a>
 
@@ -4219,7 +4379,7 @@ Fuse exchange reduction and its dependent boundary work.
 - **Exactness evidence:** Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_BOUNDARY=0
 - **Measured gain:** Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-xfer-producer-publish"></a>
 
@@ -4251,7 +4411,7 @@ Use raw-only expert storage and the bitwise FastMoe implementation so the TP2 mo
 - **Exactness evidence:** Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT); compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_MOE=ref (excluded from master baseline for capacity)
 - **Measured gain:** FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-max-rows-auto"></a>
 ### Memory-admitted prefill chunk rows
@@ -4309,7 +4469,7 @@ Grouped expert work in exact chunked prefill; calls of 128 rows or more run rout
 - **Exactness evidence:** Bitwise for all outputs: v7, v10, v11 and v14 route routed and shared experts through the X2 / X3 cores with the v3 expert order, gather/scatter and fold (X3 keeps the X2 DOT2 chains, reduce4 and split order; only the operand source changes); v3 and v11 row buckets run the same statements for every live row; the device plan's pairs, tiles and groups are byte-equal to the host plan for every gated call, and invalid ids raise the engine's flag instead of throwing; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.
 - **Off switch:** STRIX_GLM_PF_EXACTMOE_V=11, 10, 7 (previous large-call cores) or 3; STRIX_GLM_PF_EXACTMOE_V3_RCAP=0; STRIX_GLM_PF_EXACTMOE_PLAN=host; 1 for the baseline
 - **Measured gain:** 8K TTFT 25.24 -> 20.32 s (-19.5 %) and 1K 3.75 -> 3.18 s (-15 %) vs STRIX_GLM_PF_EXACTMOE_V=7 in the same run (two pairs each, 8,192-row chunks); MoE call v7 -> v11: 128 rows 17.2 -> 10.1 ms, 512 rows 29.2 -> 16.9 ms, 4096 rows 127 -> 75 ms; v3 row buckets -18 to -22 % on calls of 33-100 rows
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [MoE](../src/glm/prefill/glm_pf_exact_moe.hip), [tests](../tests/hip_glm_pf_exact_moe_tests.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [MoE](../src/glm/prefill/glm_pf_exact_moe.hip), [tests](../tests/hip_glm_pf_exact_moe_tests.hip)
 
 <a id="glm-pf-exact-x"></a>
 
@@ -4325,7 +4485,7 @@ Register-blocked exact prefill linear: LDS-decoded weights reused over 64 rows, 
 - **Exactness evidence:** Bitwise: X/X2/X3 keep the TM path's DOT2 chains, fold and split order (X3 reads the wave-uniform activation pairs with scalar loads; LDS holds only decoded weights); dense outputs byte-equal TM for row tails 1..32, 2047/2048/2049 and 4096-row calls, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the X=0 path.
 - **Off switch:** STRIX_GLM_PF_EXACT_X=2 (previous X2 core) or 0
 - **Measured gain:** X3: 8K TTFT 21.42 -> 18.37 s (-14.3 %) vs STRIX_GLM_PF_EXACT_X=2 in the same run (two pairs, MoE v10 in both arms); X2 earlier: 8K 29.59 -> 27.93 s (-5.6 %) vs X=0; logits bitwise on both ranks. Row floor 2048 -> 64 (32 with FAST WMMA), pair, fresh process per arm: 1,024-token prompt exact 2.429 -> 2.055 s (-15.4 %), logits, state and tokens identical on both ranks; served 8,192-token prompt admitted while another request decodes, FAST profile: time to first token about 22.6 -> 18.56 s (362 -> 441 tok/s), every chunk call on the WMMA core (6,496 launches, none bypassed) and the same 16 tokens as the request served alone (before, the first token differed); background stream 2.03 -> 2.71 tok/s during the prefill, longest stall 1.64 -> 1.23 s. The 8K whole-prompt route is unchanged (8.93 s, same logits)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [X core](../src/glm/prefill/glm_pf_exact_x.hpp), [tests](../tests/hip_glm_pf_exact_tests.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [X core](../src/glm/prefill/glm_pf_exact_x.hpp), [tests](../tests/hip_glm_pf_exact_tests.hip)
 
 <a id="glm-pf-obar-v5"></a>
 
@@ -4344,7 +4504,7 @@ is widened to f32 once per block (v7). v10 keeps v7's k order and merge and stag
 - **Exactness evidence:** Bitwise equal to v7, v5 and the decode kernel on the prefill gate (probabilities, o-bar, outputs; NaN/Inf/subnormal latents, list lengths 1..2051).
 - **Off switch:** STRIX_GLM_PF_OBAR=7 (v7), =5 (v5) or =2 (v2)
 - **Measured gain:** 9.0-10.2 vs 16.6-17.3 us/row per DSA layer at chunk positions 4096..28672 (6.6 vs 11.3 at 0); v5 was 2.9x v2
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-mla-gemm-v2"></a>
 
@@ -4361,7 +4521,7 @@ The MLA query absorption and output projection GEMMs keep every output's chain (
 - **Exactness evidence:** Absorbed queries and outputs bitwise equal to v1 and to the decode kernel on the prefill gate.
 - **Off switch:** STRIX_GLM_PF_MLA_GEMM=1
 - **Measured gain:** absorb 6.1 -> 4.6 and output 4.1 -> 3.3 us/row per DSA layer (32 heads per rank)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-mla-gemm-v3"></a>
 
@@ -4379,7 +4539,7 @@ the v2 chain (k ascending from +0, fmaf), so the result has the same bits as v2.
 - **Exactness evidence:** Bitwise: every arm on both ranks of the pair equals the public exact anchors at 8K and 32K (prefill logits and state).
 - **Off switch:** STRIX_GLM_PF_MLA_GEMM=2 (v2) or 1 (legacy tiled GEMM); --baseline selects v2
 - **Measured gain:** Two-node pair, alternating arms: MLA GEMM time per rank 0.715 -> 0.425 s at 8K (-41 %), 2.853 -> 1.628 s at 32K (-43 %); TTFT 8,192 tokens 15.34 -> 15.05 s (534 -> 544 tok/s, -1.9 %), 32,768 tokens 62.36 -> 60.91 s (525 -> 538 tok/s, -2.3 %)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-dense-rows-v3"></a>
 
@@ -4398,7 +4558,7 @@ parity and keep the v2 tile.
 - **Exactness evidence:** Device test v3 == v2 bitwise over every tile and the grouped production shapes (417 checks, 0 failures); logits bitwise equal on both ranks at 8K across v3 / v2 / v1.
 - **Off switch:** STRIX_GLM_PF_DENSE_ROWS=2 (v2) or 1 (v1)
 - **Measured gain:** TTFT at 8,192 tokens at parity with v2 within noise (14.29 vs 14.33 s; a second pair run 14.80 vs 14.72 s, medians of two runs; 14.49 s with v1). Grouped calls at 8192 rows: KDA 9.33 -> 6.77 ms, indexer 8.98 -> 6.62 ms; at 4096 rows 4.17 -> 2.89 ms and 4.14 -> 2.83 ms
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-dense-rows-v4"></a>
 
@@ -4433,7 +4593,7 @@ with the same weight conversion). Calls with more than 4096 inputs (the 16384-lo
 - **Exactness evidence:** Device test v2 == v1 bitwise over the production shapes (80/80); logits and state bitwise equal v1 on both ranks of the pair at 1K and 8K.
 - **Off switch:** STRIX_GLM_PF_DENSE_ROWS=1
 - **Measured gain:** 8K TTFT 15.06 -> 14.92 s (544 -> 549 tok/s, -0.9 %), 1K warm 2.80 -> 2.75 s (366 -> 372 tok/s, -1.9 %), every v2 arm faster than every v1 arm; KDA f_b / g_b (128 -> 4096) 1.19-1.21x at 8192 rows
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-kda-pack"></a>
 
@@ -4473,7 +4633,7 @@ selections overlap and share latent lines in L2, while a row's absorbed query is
 - **Exactness evidence:** Bitwise equal to v6 and v3 on the kernel fixtures; complete same-identity tokens plus logits/state digests on the pair.
 - **Off switch:** STRIX_GLM_PF_SCORES=6 (v6), =5 (v5), =4 (v4), =3 (v3) or =2 (v2)
 - **Measured gain:** v7 4.90 / 6.08 / 7.87 / 9.89 vs v6 4.96 / 8.42 / 9.41 / 10.46 us/row per DSA layer at chunk positions 0 / 4096 / 12288 / 28672 (-1 / -28 / -16 / -5 %; groups of 16 or 64 rows gained less, all rows at once lost 38 % at position 0); rank 0 of a 32K pair prefill 2.59-2.60 -> 2.26-2.28 s in scores, 32K TTFT 65.68 -> 65.54 s (-0.2 %, mean of both run orders, not slower); at 8K scores 0.533 -> 0.485 s, TTFT 16.23 -> 16.12 s (-0.6 %). v6 3.40 / 8.27 / 10.38 vs v5 4.57 / 9.27 / 11.39 us/row per DSA layer at chunk positions 0 / 4096 / 28672 (-26 / -11 / -9 %); v5 was 8.6-11.5 vs 14.0 for v4 at 4096..28672, v4 -8..-17 % vs v3, v3 -22 % vs v2. Rank 0 of a 32K pair prefill 2.94-2.99 -> 2.61-2.63 s in scores. Together with KDA scan v3 on the two-node pair: 32K TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders), logits bitwise equal on both ranks
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-kda-scan-v3"></a>
 <a id="glm-pf-kda-scan-v5"></a>
@@ -4498,7 +4658,7 @@ state (non-finite values are absorbing).
 - **Exactness evidence:** Raw scan outputs, outputs and states after every chunk bitwise equal to v1 and to the decode kernel on the prefill gate (real and synthetic weights, special rows).
 - **Off switch:** STRIX_GLM_PF_KDA_SCAN=5 (v5), =3 (v3) or =1 (v1)
 - **Measured gain:** v6 prep + conv + scan 2.02 -> 1.82 us/row per KDA layer at C=4096 (2.00 -> 1.82 at C=2048; layer bench, v5 and v6 paired per repetition; v6 bitwise == decode on the prefill gate, 52 checks); v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %); rank 0 of an 8K pair prefill 0.355 -> 0.340 s in the scan, 8K TTFT 16.60 vs 16.60 s (mean of 8 arms, both run orders: neutral); v3 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0 / 4096 / 28672 (-33 %); rank 0 of an 8K pair prefill 0.534 -> 0.355 s in the scan, of a 32K one 2.15-2.22 -> 1.43-1.44 s; 8K TTFT 16.63 -> 16.34 s (-1.7 %, alone). Together with MLA scores v6: 32K TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders), logits bitwise equal on both ranks
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 ### Prefill pipeline and async exchange start
 
@@ -4513,7 +4673,7 @@ Overlap two whole layers of the chunked prefill, and start the host exchange asy
 - **Exactness evidence:** Prefill gate bitwise to the reference row-by-row prefill (token, logits, all state bytes); TTFT logits equal on both ranks at 1K/8K/32K.
 - **Off switch:** STRIX_GLM_PF_PIPELINE=1, STRIX_DIST_ASYNC_START=0, or --baseline
 - **Measured gain:** 8K about -4 %; the exchange is fully hidden (GPU idle per 2K prefill 0.97 to 0.09 s)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 ### Prefill chunk rows 4096
 
@@ -4528,7 +4688,7 @@ Process prefill in 4096-row chunks.
 - **Exactness evidence:** Logits equal to the reference prefill on both ranks at 1K/8K/32K.
 - **Off switch:** --max-rows 2048 / 1024, or --baseline
 - **Measured gain:** with the pipeline on: 8K 35.1 s at 1024, 32.1 s at 2048, 30.1-30.8 s at 4096; 32K 136.7 to 128.4 s vs 2048
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-mtp-spec"></a>
 
@@ -4545,7 +4705,7 @@ cache in chunks during prefill. Committed tokens are the target's greedy tokens.
 - **Exactness evidence:** Full token vectors and prompt logits equal --mtp 0 on 7 prompts, both ranks; MTP-fill prefill equals the row-by-row bootstrap; speculative runs exact in every arm with identical adaptive decisions on both ranks.
 - **Off switch:** --mtp 0 (or --mtp-spec 0, STRIX_GLM_MTP_SPEC=0, --baseline); STRIX_GLM_SPEC_XCH=comm and STRIX_GLM_SPEC_KDA_TREE=1 restore the previous verify exchange and tree
 - **Measured gain:** Decode chat / code / JSON 40.3-40.6 -> 26.98 / 22.46 / 24.98 ms/token (1.50x / 1.79x / 1.62x); cost: TTFT 8K +2.9 %, 32K +8.7 % (MTP cache fill)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
 
 `STRIX_GLM_MOE_PIPE=1` is included as an opt-in experiment (default off, not yet gated); the fused decode HC norm
 (`STRIX_GLM_HC_NORM`) is now a default, see [below](#glm-hc-norm-fused).
@@ -4563,7 +4723,7 @@ TP2 ranks take the same decision without an extra exchange. The serve keeps the 
 - **Exactness evidence:** committed tokens are the greedy verify tokens in every arm; token fnv equal ON vs OFF on 3 prompts.
 - **Off switch:** STRIX_SPEC_ARBITER=0 (or --baseline) keeps the MTP chain alone.
 - **Measured gain:** pair ABBA, 256 tokens: 20.4 -> 15.1 ms/token (1K), 21.1 -> 15.0 (6K), 19.7 -> 13.7 (copy prompt).
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
 
 <a id="glm-pf-indexer-v2"></a>
 
@@ -4581,7 +4741,7 @@ ascending, then the tail) with a parallel radix digit search and ballot compacti
 - **Exactness evidence:** Keys, scaled head weights, token lists and counts bitwise equal to scores v2 / select v1 and to the decode indexer on the prefill gate.
 - **Off switch:** STRIX_GLM_PF_IDX=2 (v2) or =1 (v1); STRIX_GLM_PF_SELECT=1
 - **Measured gain:** at chunk position 28672 (8192 pools): scores 5.3 vs 9.6, select 0.38 vs 0.99 us/row per DSA layer; at 4096: 1.17 vs 1.81 and 0.08 vs 0.50
-- **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [29-item resolver](../src/glm/load/glm_rank_defaults.hpp)
 
 <a id="glm-pf-hc-fuse"></a>
 
@@ -4601,7 +4761,7 @@ the chain's 24 outputs over three CTAs (same bits).
 - **Exactness evidence:** Fused expand + normed chains bitwise equal to the unfused expand + v2 / v1 sites on the prefill gate (fixture-free mode included; only NaN payloads may differ in flagged runs); pair logits bitwise.
 - **Off switch:** STRIX_GLM_PF_HC_FUSE=0, or --baseline
 - **Measured gain:** Two-node pair TTFT, ABBA x2: 1K -1.1 %, 8K -1.3 %
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-sumexp"></a>
 
@@ -4622,7 +4782,7 @@ are unchanged.
 - **Exactness evidence:** Pair kernel bitwise equal to the sum followed by the fused expand over the device stress set (35 checks, 0 failures); hoist placements 0 / 1 / 2 bitwise (47 checks, 0 failures); pair logits bitwise on both ranks at 1K, 8K and 32K.
 - **Off switch:** STRIX_GLM_PF_SUMEXP=0 (sum, then the fused expand, previous seam order); STRIX_GLM_PF_HC_HOIST=0; --baseline
 - **Measured gain:** Seam sum + fused expand 4.26 -> 3.91 ms per call (-8.2 %); 8,192-token TTFT unchanged within noise (14.34-14.40 s on both arms)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [engine seam](../src/glm/engine/engine.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [engine seam](../src/glm/engine/engine.hip)
 
 <a id="glm-pf-mixnorm"></a>
 
@@ -4641,7 +4801,7 @@ read back. Covers the plain sites and the sites already fed by the fused expand 
 - **Exactness evidence:** Device gate bitwise against the two-kernel path over 1 to 4096 rows and special values (only propagated NaN payloads may differ, positions equal); pair logits bitwise equal the anchors at 1K, 8K and 32K.
 - **Off switch:** STRIX_GLM_PF_MIXNORM=0, or --baseline
 - **Measured gain:** Two-node pair TTFT, alternating arms: 8,192 tokens 15.07 -> 14.95 s (544 -> 548 tok/s, -0.8 %), 32,768 tokens 63.23 -> 62.23 s (518 -> 527 tok/s, -1.6 %)
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-hc-expand-bw"></a>
 
@@ -4662,7 +4822,7 @@ earlier model-private two-rows-per-block kernel (`STRIX_GLM_PF_HC_EXPAND_ROWS`, 
 - **Exactness evidence:** Device fixture bitwise against the original one-row kernel (payload, guards and flag by memcmp, special values, the pair-sum path, the mapped receive view); pair logits, state and token digests equal at 8K.
 - **Off switch:** STRIX_GLM_PF_HC_EXPAND_BW=0, or --baseline
 - **Measured gain:** None in wall time: two-node pair, 8,192 tokens, ABAB with two prefills per process, prefill cold / warm 13.84 / 14.56 s (two-row kernel) vs 13.81 / 14.50 s, within the spread of each arm. The traced per-call time fell 10.8 -> 2.2 ms, but that is the GPU share each kernel got while the other prefill stream ran; isolated, the shared kernel costs the same as the one-row kernel. The change removes a model-private kernel family.
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [shared row expansion](../src/core/hc_expand_rows.hpp), [GLM policy](../src/glm/prefill/glm_hc_expand_bw.inc)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [shared row expansion](../src/core/hc_expand_rows.hpp), [GLM policy](../src/glm/prefill/glm_hc_expand_bw.inc)
 
 <a id="glm-pf-staged"></a>
 
@@ -4682,7 +4842,7 @@ views only if both offer them; stderr reports the outcome.
 - **Exactness evidence:** Prefill anchors exact on the pair (16/16); logits bitwise against STRIX_GLM_PF_STAGED=0.
 - **Off switch:** STRIX_GLM_PF_STAGED=0, or --baseline
 - **Measured gain:** Two-node pair warm TTFT, ABBA: 1K 2.856 / 2.860 -> 2.832 / 2.838 s (-0.8 %), 8K 15.43 / 15.41 -> 15.28 / 15.25 s (-0.9 %), every staged arm below every unstaged arm; 32K neutral (63.07 vs 63.13 s, one pair, logits identical). Default-on prefill with all three pair levers: 1K 2.83 s, 8K 15.27 s, 32K 63.1 s
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
 
 <a id="glm-hc-norm-fused"></a>
 
@@ -4698,7 +4858,7 @@ R1b decode fuses the hyper-connection finish (hc_fin) with the following RMSNorm
 - **Exactness evidence:** Tokens and R8 rows equal the reference.
 - **Off switch:** STRIX_GLM_HC_NORM=0, or --baseline
 - **Measured gain:** Pair ABA x2: C1 MTP decode -2.3 %, R8 -3.1 %
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
 
 <a id="glm-hc-site"></a>
 
@@ -4717,7 +4877,7 @@ last workgroup to arrive runs the unchanged finish. 2 = also two launches at 2..
   queued repeats; pair decode tokens and R8 rows equal the reference on both ranks.
 - **Off switch:** STRIX_GLM_HC_SITE=0, or --baseline
 - **Measured gain:** Pair, fresh process per arm, --mtp 0: C1 -1.45 % (39.72 / 39.71 -> 39.12 / 39.16 ms/token); R8 unchanged
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
 
 <a id="glm-step-flag"></a>
 
@@ -4735,7 +4895,7 @@ their checks.
 - **Exactness evidence:** No arithmetic change; pair decode tokens and R8 rows equal the reference on both ranks.
 - **Off switch:** STRIX_GLM_STEP_FLAG=0, or --baseline
 - **Measured gain:** Pair, fresh process per arm, --mtp 0: C1 -0.2 % (39.07 / 39.12 -> 39.00 / 39.03 ms/token); R8 within noise
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
+- **Implementation / evidence:** [resolver](../src/glm/load/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
 
 <a id="glm-pf-wmma-x"></a>
 
@@ -4777,7 +4937,7 @@ inherit it).
   execution still requires configuration agreement for an explicit arithmetic switch.
 - **Exactness evidence:** FAST identity (new FP32 summation order). FAST gate v2 with MoE route replay, pair, 5 windows
   of 8,192 tokens (prose, JSON, two 32K-document slices), 1,275 held-out rows: pooled KL 0.00018 (one-ulp null
-  0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Free-running
+  0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Gate re-score pending: the current gate v2 re-run with the free-running arms passes with route replay, fails the absolute bars free-running (KL 0.363, top-1 0.902; the exact arm's own free one-ulp null gives KL 0.367) and passes with --allow-null-floor. Which rule applies is a pending gate policy decision; the FAST default stays until the owner decides. Free-running
   (no replay) KL is not discriminating on GLM: the exact arm's own one-ulp null flips routes as much. The product
   route's head dump is bitwise equal to the gated arm. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3
   1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). OFF equals the exact 8K logits anchors on both
@@ -5007,13 +5167,22 @@ The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..5
 
 Startup exports the previous prefill route. Each request resolves the profile again with its own execution key (backend, device product, priced workload, row split, cone, head rows, window, lanes, MoE chunk). The two band rows of each lever bind to that run's own reference, so the D1 composition (BF16 flash attention, FP16 dense, relaxed MoE with FP16 down, FP16 Engram and shared expert) and, on top of it, the bounded decoder replay R=256 run only inside their measured bands. Both ranks exchange the request fingerprint; either rank declining keeps the previous route on both.
 
-- **Exactness evidence:** Bit-changing. FAST gate v2 D1: KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035), route flips 1.05 x null. D1R (with R=256): KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037), route flips 0.37 x null. Pair, 8K and 32K classes, 28 windows, 1,764 rows, final PASS. The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
+- **Exactness evidence:** Bit-changing. FAST gate v2 D1: KL 0.0093, top-1 0.972, dNLL -0.0037 (se 0.0035), route flips 1.05 x null. D1R (with R=256): KL 0.0101, top-1 0.972, dNLL +0.0001 (se 0.0037), route flips 0.37 x null. Pair, 8K and 32K classes, 28 windows, 1,764 rows, final PASS. Gate re-score pending: the current gate v2 re-run on the saved D1 / D1R dumps gives NO VERDICT (rule R3: 7 of the 28 windows are greedy, every label equals the reference top-1; without them the 32K class has fewer than 800 rows). The metrics are unchanged; non-greedy 32K windows must be dumped again on the GPU. The FAST default stays until the owner decides. The bounded replay equals the full run with the key floor bit for bit; deferred serve pieces, snapshot points and group passes take the exact plan.
 - **Off switch:** `--profile exact`, or any explicit `STRIX_DS41_FAST_PREFILL` / `STRIX_DS41_DECODER_REPLAY` value.
 - **Measured gain:** Pair CLI, 8,192 tokens: EXACT 1,128.5, D1 1,614 / 1,647, D1 + R256 1,855 tok/s. 32,768 tokens: EXACT 1,257.2, D1 1,808.6, D1 + R256 1,981 tok/s. Measured before integration; the integrated build needs its device check.
 - **Served scope:** the HTTP server and `strix run` (the same binary) enter the same admission (`DevicePrefill::run_full_prompt`) for a fresh whole text prompt run as one piece, at any slot count (`served_full_prompt`), and resolve the CLI's cells: the idle group-pass storage of a multi-slot server is not a lane, a DSpark seed of at most R rows rides on R=256 (`plan_bounded_replay` computes the same rows for any seed <= R; without the replay the seed declines), and in FAST / TURBO `--prefill-rows auto` holds the band's 32,768 rows when they fit under the same memory rule (`whole_prompt_band`, `served_piece_rows`; the default pieces stay 16,384, EXACT is unchanged). Serving-only routes keep the previous route and the decline line names the condition: in-run prefix-cache capture (the default `--cache-profile agent`; the bounded replay cannot write mid-run states), continuations, image rows, phase-B units while another request decodes, and servers with a disk tier. The receipts are pair-CLI runs; timed points are 8,128 / 8,192 and 32,768 tokens, the lower band edges (4,096, 8,193) are covered by the gate classes but untimed.
 - **Band edges:** the receipts are pair-CLI runs; timed points are 8,128 / 8,192 and 32,768 tokens, and the lower band edges (pair CLI ABBA, warm run, FAST = D1 + R=256 vs EXACT): 4,096 x1.60 (4,089 -> 2,557 ms), 6,000 x1.57, 8,193 x1.58 (7,172 -> 4,537 ms), 16,384 x1.55; the nominal edges stay. D1 without R=256 is not a product execution (an explicit lever leaves the measured composition).
 - **Engines:** DeepSeek V4.1 Flash bound. Qwen3.8 Flash Next, Qwen3.8-27B and Hy4 Flash use the same band mechanism for their own rows. Inkling 2 Mini, GLM-5.3 Flash, MiniMax M3.1 Flash and Nemotron 3.5 Bolt E4B have no DeepSeek prefill composition. Same class of serve-vs-CLI gap (a serve-only option or piece plan that leaves the CLI's measured route), to check per engine: Qwen HIP serve (1024-row cache checkpoints and T8192 pieces against the CLI's whole-prompt FAST rows), Hy4 Flash (served `prompt_rows` against the FAST row qualified at <= 4K), GLM-5.3 Flash pair (band rows that need MemAvailable for auto max-rows 8192; a server holding more memory can fall out of them), MiniMax M3.1 Flash pair (serve default transport usb4gpu vs CLI usb4-auto, a parity exception never measured on the same transport), Gemma 4 (server sizes the EXL3 core for 8 streams, CLI for 1). Inkling 2 Mini served chunks were aligned with the CLI earlier (shared served chunk ladder).
 - **Implementation / evidence:** [rows](../include/strix/deepseek41_pair_profile_table.hpp), [execution key](../src/deepseek41_pair_defaults.cpp), [paired admission](../src/hip_deepseek41_prefill.hip), [tests](../tests/deepseek41_pair_defaults_tests.cpp)
+
+<a id="serve-bench-prompt-ids"></a>
+
+### Fixed token IDs for HTTP band measurements
+
+**Engine:** shared benchmark client. **Control:** `tools/serve_bench.py --prompt-ids-file FILE`. Pass a JSON array of token IDs to a completions endpoint. Repeat the option to cycle through fixtures. The host test checks that 2,048- and 8,192-token fixtures reach the request boundary with every ID intact.
+
+- **Use:** Measure the same prompt IDs at a band edge on the CLI and over HTTP. This option changes the benchmark input. Engine admission and serving defaults are unchanged.
+- **Engines:** DeepSeek V4.1 Flash is the initial measurement target. Any binding with a token-array completions endpoint can use the same client.
 
 <a id="mm-pf-msa-q16"></a>
 
@@ -5567,6 +5736,14 @@ measured (`complete`, `covered_ms`); nothing is extended over a failed read or p
 - **Measured:** Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.
 - **Off switch:** `STRIX_POWER_SAMPLER=0`.
 
+<a id="multi-device-gain-bar"></a>
+### Multi-device gain comparison
+
+- **Shared home:** `include/strix/pair/device_gain.hpp`
+- **Preconditions:** Comparable single-device and multi-device costs per phase, under the same numerical class and workload. Prefill includes any handoff.
+- **Admission:** The explicit `RouteRequest::multi_device_gain` requires both phases to clear their comparison. A missing or ambiguous comparison refuses the multi-device option, including pinned routes. Positive infinity for the single-device cost denotes a model that cannot fit on one device.
+- **Evidence:** Fake-device planner and deployment fixtures. Device timings are pending.
+
 <a id="platform-route-receipt"></a>
 
 ### Shared route receipt
@@ -5671,6 +5848,15 @@ End to end, same binary with the route off and on: 8K prefill -2.3 %, 32K prefil
 OFF: `STRIX_QPF2K_HC_RECOMPUTE_NORM=0`; restart. `=1` also admits the route with the lane-chain output forms, which
 were not measured and therefore keep the image by default. Unsupported sites retain the image.
 See [admission, lifetime, resources and the native ticket](engine/prefill/hc-normalized-recompute.md).
+
+## Measured profile receipts
+
+Set `STRIX_PROFILE_STRICT_RECEIPTS=1` to require a winning recorded timing in the requested regime and an admitted
+column for automatic FAST/TURBO promotion. A band reference must match the complete execution, including pack and
+route settings outside the lever table, every effective lever identity, and the candidate identity. Historical grants
+alone and provisional columns without explicit benchmark permission fall back to the lower tier. With the setting
+unset, historical grants and band rows without a recorded reference retain compatibility admission. Explicit lever
+settings keep their precedence. The control changes automatic FAST/TURBO admission.
 
 ## HC low-band layout
 
@@ -5976,6 +6162,9 @@ another with the single-row instruction sequence.
 
 ## Hy4-flash prompt windows: bf16 epilogue in the producers' store
 
+The rank and HTTP entry points share the explicit profile option parser. `--prompt-rows=N` and `--head-q8=0|1`
+also accept a separate argument for the value. Both entry points reject malformed values before model load.
+
 **Engine:** `hy4`. **Control:** `STRIX_HY4_PF_STORE_EPILOGUE`. **Default:** on.
 
 The windowed prompt (`--prompt-rows`) ran a separate `glu::launch_epilogue<Round::bf16>` pass over every Q8_0 Linear
@@ -6044,7 +6233,7 @@ decode, verify and one-row calls keep the BF16 tile. The CLI, the step-program l
 ## Inkling 2 Mini prompt prefill: rotated integer A4W4 experts (TURBO, HIP)
 
 **Engine:** `inkling2-mini` (HIP gfx1151). **Control:** TURBO cell `iu4` of lever `inkling2-mini-moe-w4a4@1`,
-`STRIX_INK_MOE_W4A4`. **Default:** on under `--profile turbo` for prompts of 4,307..32,760 tokens on gfx1151, in the
+`STRIX_INK_MOE_W4A4`. **Default:** on under `--profile turbo` for prompts of 1,143..32,760 tokens on gfx1151, in the
 CLI and in `strix-serve` (same resolver, same rows); off in every other profile and regime.
 
 Multi-row prompt-prefill chunks of every expert layer run the shared rotated integer class
@@ -6053,14 +6242,14 @@ built once at load (13.00 GB at Inkling 2 Mini shapes), tokens and the SwiGLU ou
 grouped GEMM runs the integer WMMA. Decode, one-row calls, other devices and prompt sizes outside the rows keep the
 BF16 tile; CUDA declines the class.
 
-- **Preconditions:** HIP gfx1151, `--profile turbo`, a prompt inside a ladder row (4,307..8,236 tokens x1.091;
+- **Preconditions:** HIP gfx1151, `--profile turbo`, a prompt inside a ladder row (1,143..4,306 tokens x1.117; 4,307..8,236 tokens x1.091;
   8,237..32,760 tokens x1.068). The route line `strix-ladder/v1 inkling2-mini-moe-w4a4@1 ...` names the row.
   The rows are band receipts bound to the run's own execution (backend, device product, prompt, context capacity,
   prefill chunk; one spelling for the CLI, the gate and the server): a run whose execution is not known, and the
   narrow-experts image (`STRIX_MOE_EXPERTS_NVFP4=1`), keep the BF16 tile.
 - **Quality (TURBO, declared):** gate v2, prefill regime, 16 held-out prose windows (1,008 rows, routes replayed),
   against the BF16 tile of the same engine: KL 0.0179, top-1 0.9296, dNLL +0.0035, free route-flip ratio 5.55. It
-  does not pass the FAST gate (top-1, windows, flip ratio), so it is a TURBO cell only.
+  does not pass the FAST gate (top-1, windows, flip ratio), so it is a TURBO cell only. Gate re-score pending: the dumps of these 16 windows were not kept, so the current gate cannot re-run this receipt; the iu4 prefill windows must be dumped again, including prompts of 1,143..4,306 tokens. The 1,143..4,306-token band reuses this gate: no window of that length is known to be in it.
 - **Off switch:** `STRIX_INK_MOE_W4A4=0`, or any profile other than `turbo`.
 - **Measured gain (TURBO over EXACT, prompt prefill, one gfx1151 node, kernel 7.4.0-rc1, default power, load below 3,
   one binary, medians):**
@@ -6229,7 +6418,8 @@ Both options are pending native token and logit identity checks.
 <a id="inkling2-sp4t-head"></a>
 ## Inkling 2 Mini decode head: Strix pack SP4, fixed table (`strix.sp4t`)
 
-**Engine:** `inkling2-mini` (HIP). **Control:** lever `inkling2-mini-lowbit-head@1` (`STRIX_INK_LOWBIT_HEAD=sp4t`) or
+**Engine:** `inkling2-mini` (HIP). **Control:** lever `inkling2-mini-lowbit-head@1` (`STRIX_INK_LOWBIT_HEAD=sp4t`, command
+line and HIP server) or
 `--qualify-decode-weights weights.head.sp4t@1`, with `STRIX_LOWBIT_PACK` naming a calibrated `strix.sp4t` pack.
 **Default:** off in every tier; an explicit option runnable under `--profile fast` and `--profile turbo`.
 
@@ -6257,6 +6447,71 @@ two applied at the store), dispatched by `enqueue_resident_q8_rows` (`src/core/r
 |---|---|
 | inkling2-mini | bound (HIP head, decode steps) |
 | qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: the decode head has no calibrated pack path and no resident low-bit rows |
+
+<a id="inkling2-sp4t-attention-head"></a>
+## Inkling 2 Mini decode attention projections and head: Strix pack SP4, fixed table (`strix.sp4t`), with speculation
+
+**Engine:** `inkling2-mini` (HIP). **Control:** `STRIX_INK_LOWBIT_HEAD=sp4t-attn` (command line and HIP server, `--profile
+fast` / `turbo`) or `--qualify-decode-weights weights.attention_head.sp4t@1`, with
+`STRIX_LOWBIT_PACK` naming a calibrated `strix.sp4t` pack of the attention query / key / value / output projections and
+the head (`strix-lowbit-calib-pack`, one `--storage ROLE.weight=sp4` per role `attn.wq_du`, `attn.wk_dv`, `attn.wv_dv`,
+`attn.wo_ud`, `llm.unembed`, `--table fixed --technique both --damp 0.1`).
+**Default:** off in every tier; an explicit decode-only qualification arm under `--profile fast`. MTP speculation stays on
+with the arm: its verify windows run the same low-bit copies.
+
+**Shared home:** the grouped SP4 projections ([below](#shared-sp4t-grouped-projections)) and the SP4 head consumer
+([above](#inkling2-sp4t-head)); policy `weights.attention_head.sp4t@1` in `include/strix/weight/levers.hpp`. Inkling binds
+it in `src/inkling2/inkling2_mini_weight_options.hpp` (qualifiable policy), `src/inkling2/inkling2_mini_resident_backend.hpp`
+(a dual image verifies on its low-bit copies, `kMiniMaxVerifyRows <= kMiniLowBitStepBand`) and
+`apps/inkling2_mini_gpu_main.hpp` (a decode-only arm no longer declines speculation; the TURBO row still does).
+
+- **Exactness evidence:** bit-changing (lossy weights). With the arm unset the incumbent gfx1151 ISA is identical (43
+  objects) and the host suite passes (1065 of 1065). With the arm, speculative output equals plain decode on the same
+  low-bit target (512 tokens, code and prose prompts; low-bit rows are bitwise per row across row counts).
+- **Quality (gate v2, decode, 39 held-out windows, 2,457 rows, route replay, null-relative):** pooled KL 0.00207, top-1
+  0.9813, dNLL -0.00014 (se 0.00149), route flip ratio 0.00; the prose, code and structured classes pass (final, 819
+  rows each); 32 windows pass, 7 are unresolved (six on dNLL +0.0103 to +0.0149, under their fail bounds; one on top-1 0.921)
+  and are cleared by their class, none fails: **FAST PASS**. By context band (13 windows, 819 rows each): 8K KL 0.00226 / dNLL +0.00013, 32K 0.00187 /
+  +0.00027, 64K 0.00209 / -0.00081, all PASS.
+- **Measured gain:** CLI B=1 under `--profile fast` (MTP), 1,024-token held-out prefixes, 512 tokens, two rounds, gfx1151
+  with its bound `lowbit_rows` plan: code 18.55 -> 16.94 ms per token (+9.5 % tokens/s), prose 17.42 -> 16.16 ms
+  (+7.8 %). Token ids equal the BF16 run on both prompts; MTP acceptance is unchanged (prose 429 / 437 both arms). The
+  same arm without speculation decodes at 28.5 ms (the former decline). Served decode not measured: the arm is command
+  line only.
+- **Why no FAST row yet:** a FAST decision row (`kMiniWeightLoadDecisionRows`, decode regime) needs a served receipt at
+  the step widths 1, 8 and 16 (16 slots, context 16384, ABBA against FAST); the served lever exists
+  (`STRIX_INK_LOWBIT_HEAD=sp4t-attn` with `STRIX_LOWBIT_PACK`; the CUDA server refuses it). The gate PASS above is its
+  quality half.
+- **Off switch:** do not pass the qualification arm.
+
+| model | SP4 attention + head decode arm |
+|---|---|
+| inkling2-mini | bound (HIP, explicit decode-only arm, command line) |
+| qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: no resident low-bit attention route on the shared projection dispatch and no calibrated `strix.sp4t` pack |
+
+<a id="shared-sp4t-grouped-projections"></a>
+## Grouped Strix pack SP4 resident projections (`strix.sp4t`)
+
+**Engine:** shared (HIP). **Control:** a model's qualification arm `weights.attention_head.sp4t@1` with a calibrated
+`strix.sp4t` pack (`STRIX_LOWBIT_PACK`). **Default:** inactive unless a model loads SP4 attention projections.
+
+**Shared home:** `resident_q8_projections_admitted` / `enqueue_resident_q8_projections` (`src/core/resident_q8_rows.hpp`):
+a run of `strix.sp4t` projections sharing one input (query, key and value of one visit) is one small-M
+`gemm_sp4<Capacity>` launch, each projection scaled by its tensor's 2^base, admitted under the group-scale form only
+(as the standalone SP4 entry). Policy `weights.attention_head.sp4t@1` (tagged attention roles and the head in
+`strix.sp4t`) in `include/strix/weight/levers.hpp`.
+
+- **Exactness evidence:** every row of the grouped launch equals the standalone SP4 entry bitwise (HIP fixture
+  `strix-hip-sp4-rows-tests`, query / key / value widths 3072 / 1024 / 1024 by 2304 with distinct tensor bases, rows 1 to
+  33; the FP32 sweep and folded forms are refused). Incumbent gfx1151 ISA identical (43 objects); the new
+  `sp4_kernel<RowTiles, 10>` uses no scratch and no spill (VGPR 122 / 165, the counts of the one-projection kernel).
+- **Gain:** enables SP4 attention projections at q4_g64 bytes; measured on the binding row (Inkling 2 Mini).
+- **Off switch:** do not select an SP4 attention policy.
+
+| model | SP4 grouped projections |
+|---|---|
+| inkling2-mini | bound (explicit decode-only arm, HIP) |
+| qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: no calibrated `strix.sp4t` pack of their attention projections; reachable through `enqueue_resident_q8_projections` on HIP (CUDA has no SP4 consumer) |
 
 <a id="inkling2-served-chunk-ladder"></a>
 
@@ -6294,7 +6549,7 @@ The CUDA server builds its decoder with the command line's decode form: every de
 
 - **Shared home:** include/strix/serve/decode_form.hpp (serve::resolve_decode_form); src/moe_core/microscaled_r1.hpp (packed one-row body, launch_rows).
 - **Tier and regime:** EXACT reference (the CLI's EXACT decode form; the served ids change from main's grouped bits); RTX PRO server, 8 slots, C1 and C8.
-- **Exactness evidence:** EXACT reference = the CLI's packed decode form. The served EXACT ids CHANGE against main's grouped server (q20 / q35: DIFFER); every lane equals its lone run at any width (q39 / q41 / q42: C8 lanes == C1 8/8, FAST == EXACT; CUDA fixture run_r1_rows: every launch_rows row == a one-row launch). CLI == server (fixed defect): the CUDA server runs the command line's route by default (served route row kMiniServedCliRoute, builtin 1; STRIX_INK_SERVED_CLI_ROUTE=0 = the former held-back route, where the last prompt token was the first decode row: q43 1/8 ids equal to the CLI). It prefills every prompt row on the CLI's calls and emits the first id from the final prefill row: q45 8/8 server ids == CLI ids (same rendering, reasoning_effort none) at the held-back route's speed (C1 102.1 vs 103.0 tok/s, C8 209.5-215.1 vs 213.0-213.3, gap 177-180 vs 177-179 ms, slot bytes equal); q44 fixture: served prefill == CLI prefill bitwise (first id, scores, KV, histories, 4 decode steps; pieces included). The served EXACT ids change from the held-back route's to the CLI's. A HIP server runs the route only with STRIX_INK_SERVED_CLI_ROUTE=1. Main's grouped server was not CLI == server either (q20).
+- **Exactness evidence:** EXACT reference = the CLI's packed decode form. The served EXACT ids CHANGE against main's grouped server (q20 / q35: DIFFER); every lane equals its lone run at any width (q39 / q41 / q42: C8 lanes == C1 8/8, FAST == EXACT; CUDA fixture run_r1_rows: every launch_rows row == a one-row launch). CLI == server (fixed defect): the CUDA server runs the command line's route by default (served route row kMiniServedCliRoute, builtin 1; STRIX_INK_SERVED_CLI_ROUTE=0 = the former held-back route, where the last prompt token was the first decode row: q43 1/8 ids equal to the CLI). It prefills every prompt row on the CLI's calls and emits the first id from the final prefill row: q45 8/8 server ids == CLI ids (same rendering, reasoning_effort none) at the held-back route's speed (C1 102.1 vs 103.0 tok/s, C8 209.5-215.1 vs 213.0-213.3, gap 177-180 vs 177-179 ms, slot bytes equal); q44 fixture: served prefill == CLI prefill bitwise (first id, scores, KV, histories, 4 decode steps; pieces included). The served EXACT ids change from the held-back route's to the CLI's. A HIP server runs the route only with STRIX_INK_SERVED_CLI_ROUTE=1. Main's grouped server was not CLI == server either (q20). HIP (gfx1151, C8, 8 prompts x 256 tokens, EXACT): the default served route's ids equal the command line route's (receipts S9 == EB8 == EB8z, 8/8); main's held-back cohort route with grouped decode (EA8) differs in 7 of 8 prompts, so the HIP served EXACT ids also change, to the CLI's.
 - **Off switch:** --grouped-decode.
 - **Measured gain:** RTX PRO 6000 server (cuda_pf2-kit, context 34816, 8 slots, EXACT): C1 decode 66.5 tok/s (main's grouped served form, q36) -> 100.2 tok/s (q42) / 100.7 tok/s (q43); C8 aggregate 166.8 tok/s (aa53a1a07, q27) -> 207.0 / 212.2 / 212.6 tok/s (q42, 3 reps). Command: cd wave4/turbo/cuda_pf2-kit && bash ticket.sh q42.
 - **Preconditions:** CUDA server; HIP server: only through the served route lever row (refuses the flags).
@@ -6404,6 +6659,40 @@ against the shared expert-major plan. SP2, SP3 and SP4 use 36, 52 and 68 bytes p
 A plan can promote higher-use experts to SP3 under a declared memory budget.
 Synthetic fixtures compare packed bytes and FP32 reference arithmetic. Model quality and device timing are pending.
 
+<a id="strixpack-host-simd"></a>
+## Strix Pack host SIMD
+
+**Shared home** `src/core/strixpack_cpu.cpp` and `src/core/strixpack_cpu_x86.hpp`.
+**Control** Automatic AVX2/FMA or AVX-512 dispatch when processor and OS state support it.
+Callers can choose `CpuIsa::scalar` for comparison. The grouped reference uses the shared fused
+projection. Its SIMD lanes hold independent weight rows and apply a fused multiply-add in ascending K.
+The [conformance suite](engine/strix-pack-v1.md#exactness-classes) compares the decode and projection bits
+to the scalar oracle and the common fixtures. This is pack-level exactness on the host reference route.
+
+Single-thread Release measurement on Core i7-13700K, Windows Balanced power plan, 4096×4096 packed
+rows, one activation vector for projection. Each result is the median of three runs, each with
+seven interleaved timed passes per ISA after warm-up. The numerator is packed bytes read, including
+the group scales. Decode writes FP32 weights. Projection writes one FP32 result per row.
+
+| Format | Decode scalar to AVX2 (MB/s) | Decode gain | Fused scalar to AVX2 (MB/s) | Fused gain |
+|---|---:|---:|---:|---:|
+| SP4 | 371 to 671 | 1.81× | 159 to 925 | 5.83× |
+| SP3 | 155 to 513 | 3.31× | 72 to 365 | 5.06× |
+| SP2 | 191 to 392 | 2.05× | 95 to 621 | 6.54× |
+
+MB/s uses decimal units. AVX-512 compiled in the same build and requires an AVX-512 host for execution.
+
+| Model | Production engine binding |
+|---|---|
+| inkling2-mini | Host reference only |
+| qwen3.8-flash-next | Host reference only |
+| qwen3.8-27b | Host reference only |
+| deepseek-v4.1-flash | Host reference only |
+| glm-5.3-flash | Host reference only |
+| minimax-m3.1-flash | Host reference only |
+| hy4-flash | Host reference only |
+| nemotron-3.5-bolt-e4b | Host reference only |
+
 <a id="strixpack-layer-moments"></a>
 ## Layer-streamed calibration moments
 
@@ -6434,6 +6723,25 @@ writing payloads. Host tests check arithmetic and reject inconsistent shard mapp
 
 The offline source contract applies to matrices in the supported encodings and ranks. ERNIE has a
 sizing example and needs a model binding. See [calibrated low-bit packs](engine/lowbit-calibration.md#host-strix-packs-for-grouped-experts).
+
+<a id="strixpack-host-role-study"></a>
+## CPU Strix pack role study
+
+`--pack-study` is an explicit CPU option to capture diagonal moments and routes and isolate compact
+projections on held-out text. The shared Strix pack reference decodes each group scale once and uses
+the existing ascending-column FMA chain. A model description carries formats and coder choices.
+Logical weight bytes per B1 decode step are computed from the checkpoint and model schedule.
+
+| Model | CPU role study binding |
+|---|---|
+| qwen3.8-flash-next | Pending |
+| qwen3.8-27b | Pending |
+| deepseek-v4.1-flash | Pending |
+| glm-5.3-flash | Pending |
+| minimax-m3.1-flash | Pending |
+| hy4-flash | Pending |
+| nemotron-3.5-bolt-e4b | Pending |
+| inkling2-mini | Text CPU reference with BF16, NVFP4 and MXFP8 sources |
 
 ### Hy4 Flash measured pair placement and verification costs
 
@@ -6620,15 +6928,15 @@ One-row callers of the residual bank readout and of a one-projection rounded nar
 
 ## Session row append: staged verify window programs
 
-**Engine:** `shared`. **Control:** backend member try_window_graph(chunk, work, taped); Inkling 2 Mini: STRIX_INKLING_WINDOW_PROGRAMS=1. **Default:** off (no backend replays a window by default: q53 measured a loss with it on).
+**Engine:** `shared`. **Control:** backend member try_window_graph(chunk, work, taped); Inkling 2 Mini: STRIX_INKLING_WINDOW_PROGRAMS=0 (off switch). **Default:** on for Inkling 2 Mini CUDA with the EXACT levers the fixture covers (every width captured at load when a drafter is loaded; prompts keep the window programs).
 
-A taped staged verify window is offered to the backend after its eager checkpoints; a backend may replay one captured program per window rows, else the work runs eagerly. Off by default: identity passes, but the drafter's acceptance collapses with the programs on (q53).
+A taped staged verify window is offered to the backend after its eager checkpoints; a backend may replay one captured program per window rows, else the work runs eagerly. Inkling 2 Mini CUDA captures every width at load (a drafter loaded) and keeps the programs across prompts, so no capture wall enters a timed decode.
 
 - **Shared home:** include/strix/session/kv_row_append.hpp, src/core/resident_greedy.hpp; src/inkling2 binding
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative decode (verify windows)
-- **Exactness evidence:** EXACT verification: q52r device fixture (Inkling 2 Mini CUDA, programs vs eager windows) 42,525 items, 0 differing, programs ran at every width 2..8; q53: ids equal to the q46 resident run with the programs on. Host: tests/session_conv_tape_tests.cpp (offer after the checkpoints, accept == decline), strix-e2i-step-inputs-tests (window block valid mask).
-- **Off switch:** default off; STRIX_INKLING_WINDOW_PROGRAMS=1 turns the Inkling 2 Mini programs on for the EXACT levers the fixture covers (other profiles decline with the reason)
-- **Measured gain:** none measured: q53 (RTX PRO, code, CLI EXACT 256 tokens, programs on) 93.13 tok/s vs 132.80 with the programs off: the drafter's acceptance collapses (26/92, mean 1.3 vs 201/343, 3.94); cause open.
+- **Exactness evidence:** EXACT verification: q52r device fixture (Inkling 2 Mini CUDA, programs vs eager windows) 42,525 items, 0 differing, programs ran at every width 2..8; q53: ids equal to the q46 resident run with the programs on; q64: ids equal to q46 R0 (code) and q47 Fp (prose) with the load-time capture. Host: tests/session_conv_tape_tests.cpp (offer after the checkpoints, accept == decline), strix-e2i-step-inputs-tests (window block valid mask).
+- **Off switch:** STRIX_INKLING_WINDOW_PROGRAMS=0 runs every staged verify window eagerly; profiles the fixture does not cover decline with the reason
+- **Measured gain:** q64 (RTX PRO, Inkling 2 Mini CUDA CLI EXACT 256 tokens, --speculation auto, the default: programs on, every width captured at load, prewarmed 7 == captured 7; ids equal in all 10 arms): code 176.51 / 176.99 tok/s warm and 174.82 / 176.82 / 176.17 cold vs 133.57 / 132.50 eager (+32.9 %, 51 model passes 201/342 in every arm); prose 99.51 vs 99.22 eager (programs not slower). Earlier q62 (widths captured inside the decode): code +28.4 %, prose 97.81 vs 99.41 (-1.6 %): that capture wall is what the load-time capture removed. The q53 / q60 collapses (4 / 6 model passes) were capture walls closing the arbiter's probe episode, fixed in the shared arbiter (cold passes out of the episode).
 - **Preconditions:** a backend that defines try_window_graph; taped staged verify windows of 2..16 rows without score reads.
 
 | Model | Binding |
@@ -6638,7 +6946,7 @@ A taped staged verify window is offered to the backend after its eager checkpoin
 | DeepSeek V4.1 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
 | GLM 5.3 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
 | MiniMax M3.1 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
-| Inkling 2 Mini | bound (opt-in): CUDA resident decoder window programs; default off (q53) |
+| Inkling 2 Mini | bound: CUDA resident decoder window programs, default on (EXACT levers; q52r identity, q62 timing) |
 | Hy4 Flash | not bound: no backend defines try_window_graph; appends unchanged (eager) |
 | Nemotron 3.5 Bolt E4B | not bound: no backend defines try_window_graph; appends unchanged (eager) |
 
@@ -6667,3 +6975,291 @@ In a drafting run the speculator's one-row steps run on the CUDA step program ov
 | Inkling 2 Mini | bound: CUDA CLI (this row) |
 | Hy4 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
 | Nemotron 3.5 Bolt E4B | not bound: no CUDA step program with drafter taps next to a verifying route |
+
+<a id="speculation-probability-binary64-v1"></a>
+
+### Sampled speculation probability identity binary64-v1
+
+The shared sampled-cycle API accepts `SpeculationProbabilityIdentity::binary64_v1`
+for supplied probability rows. It uses a binary64 compensated total in token ID
+order, nearest-even division, the existing binary64 token decision and residual
+sums in token order. Admission requires IEEE binary64 evaluation, nearest-even
+rounding and gradual subnormals. The counter-key inputs and draws are the caller's.
+The identity is opt-in. Calls with `SpeculationProbabilityIdentity::legacy` keep the
+platform's long-double normalization and receipt arithmetic. The binary64 golden
+covers a target bonus on a cumulative boundary, a halfway normalization and a
+rejected proposal that consumes a residual draw. No latency measurement is available.
+
+<a id="device-sampling-boundaries"></a>
+
+### Device sampling-v1 boundaries
+
+The device bit key ranks positive zero above negative zero. For an exact signed-zero
+tie, the host transform picks the smaller token ID. With more than 2,048 kept
+entries, the device's unfiltered inverse CDF compares a scaled draw against raw
+weights in a fixed parallel order. The device's large top-p uses fixed-point
+mass quantiles. The host sums normalized entries sequentially. These forms can
+select adjacent tokens even when the exponential weights are exact. The shared
+device test executable accepts `--boundary-audit-only` for signed zeros and
+draws around 0.5 in both large-row forms.
+
+Select `STRIX_SAMPLE_PATH=host` on the shared sampling-v1 route to use the host
+transform for target and draft. The device draft vocabulary API accepts append-only
+entry IDs. A different vocabulary with the same number of entries requires a new
+sampler.
+<a id="cuda-native-nvfp4-images"></a>
+### CUDA native NVFP4 images
+Shared CUDA core and Qwen builds select CUDA images through
+`CMAKE_CUDA_ARCHITECTURES` and `STRIX_CUDA_NVFP4_ARCHITECTURES`. The latter
+defaults to `120a`. Set it empty to build without native FP4 instructions.
+For example, configure with `-DCMAKE_CUDA_ARCHITECTURES=89-real` and
+`-DSTRIX_CUDA_NVFP4_ARCHITECTURES=` for a portable Ada build. The
+`121a` native image is an explicit build choice. The launch contract checks
+for an image matching the current compute capability before an NVFP4 kernel
+can run. Compilation of an image supplies no device quality or timing receipt.
+The shared build rules live in `cmake/StrixCudaArchs.cmake`.
+### Captured decode graph contracts
+The CUDA decode catalog and the native launchers share host geometry plans for the
+covered operator families. Debug and test capture compares a bound kernel's
+grid, block and dynamic shared memory with the native node before installation.
+The physical program also checks command kind, dependencies and node count.
+A device-specific shared-memory budget is part of the transition plan.
+Scalar and width runners share the submission order. They record on a cache
+miss, upload a fresh descriptor on each use and launch exactly once. A
+linear inclusive verify window requires consecutive positions from one slot,
+the declared parent/ancestor chain and matching valid bits. Each window binding
+names its convolution history, tape, tap plane, tape stride and head form.
+Changing a captured destination invalidates that width. A launch error reaches
+the owner because some work may already have been submitted.
+The route resolver matches verification, taps, single-row sampling and sampled
+verification independently. The Inkling CUDA CLI uses those requirements when
+selecting its decoder. The shared CLI also checks the verification interface
+on the loaded decoder before starting forced speculation.
+Host tests exercise two physical bindings over stable fake allocations, replay
+different tokens and positions, move tape storage and compare a partial commit
+with an eager forward walk. Opaque stream capture can inspect native kernels
+and transfer nodes. Checking a kernel against an independent predicted shape
+requires a declared leaf. Device token, logit and state qualification is recorded
+separately for each binding.
+<a id="strixpack-mapped-host"></a>
+## Mapped Strix pack v3
+The v3 writer streams one matrix and records per-tensor coding metadata and SHA-256. The host reader checks only
+requested payloads and reuses read-only mapped views. Whole-file verification is explicit. V2 readers and writing
+defaults retain the established sidecar contract. The grouped CPU bank caches each routed expert projection and can
+warm experts in descending route-count order. The mapped organization preserves packed bytes. SP4, SP3 and SP2
+conversion changes the source weights and requires explicit opt-in. See [the user guide](engine/strix-pack.md).
+| Engine | V3 mapped projection | Expert-granular loading |
+|---|---|---|
+| Inkling 2 Mini | Explicit CPU option for bound projections | Physical banks reuse mapped expert projections across visits |
+| Qwen3.8 Flash-Next | Shared host API | Device binding pending |
+| Qwen3.8 27B | Shared host API | Dense model |
+| DeepSeek V4.1 Flash | Shared host API | Device binding pending |
+| GLM 5.3 Flash | Shared host API | Device binding pending |
+| MiniMax M3.1 Flash | Shared host API | Device binding pending |
+| Hy4 Flash | Shared host API | Device binding pending |
+| Nemotron 3.5 Bolt E4B | Shared host API | Dense model |
+<a id="arbiter-cold-episode"></a>
+## Speculation arbiter: cold passes are left out of the probe episode
+**Engine:** `shared`. **Control:** none (ArbiterConfig::cold_walls > 0 with probe_loss > 0). **Default:** on wherever both are set (today: the serial generation CLI with learned walls).
+A probe episode's realized net leaves out the first wall of every window width (a capture or first-touch wall is neither a price nor the drafter's loss): before, the capture walls of an unlucky opening closed the episode and paced the next probe beyond the request.
+- **Shared home:** src/spec/drafting.cpp, include/strix/spec/drafting.hpp
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; speculative decode
+- **Exactness evidence:** EXACT: the arbiter only chooses windows; emitted ids are the target's picks. q62 ids equal in all 7 arms. Host: strix-spec-drafting-tests cold_episode_tests (4 seeds, measured q53 opening and cold walls: >= 90 % model passes after the cold opening).
+- **Off switch:** cold_walls = 0 (every wall counts) or STRIX_SPEC_PROBE_LOSS=0 (fixed re-probe interval)
+- **Measured gain:** q62 (RTX PRO, Inkling 2 Mini CUDA CLI EXACT 256 tokens, code, window programs on): 170.81 / 169.28 tok/s with 51 model passes (201/342); the q53 / q60 runs before the fix collapsed to 4 / 6 model passes (93.13 / 107.52 tok/s) when the first-capture walls of an unlucky opening closed the episode.
+- **Preconditions:** learned walls (learn_costs) with cold_walls > 0 and a charged probe_loss
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | unchanged: no probe_loss row (fixed re-probe interval) |
+| Qwen3.8 27B dense | unchanged: no probe_loss row (fixed re-probe interval) |
+| DeepSeek V4.1 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
+| GLM 5.3 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
+| MiniMax M3.1 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
+| Inkling 2 Mini | bound: CUDA CLI --speculation auto (probe_loss 0.015, cold_walls 1) |
+| Hy4 Flash | unchanged: no probe_loss row (fixed re-probe interval) |
+| Nemotron 3.5 Bolt E4B | unchanged: no probe_loss row (fixed re-probe interval) |
+
+<a id="inkling2-device-sampled-rows"></a>
+
+## CUDA CLI sampled rows on the device
+
+**Engine:** `inkling2-mini`. **Control:** STRIX_SAMPLE_PATH=host (off switch). **Default:** on (CUDA CLI, token sampling, step program route).
+
+A sampled CLI row is drawn on the device by the shared sampler (one 4-byte reply) instead of copying the 201K-float row to the host and transforming it there.
+
+- **Shared home:** src/serve/serial_generation_cli.cpp (SerialGenerationDecoder::decode_sampled), strix/cuda/token_sampling_device.hpp; src/inkling2 binding
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI sampled decode
+- **Exactness evidence:** Same draws within these limits: a row with at most 2,048 entries after cutoff and top-k (device_top_p_candidates) runs one workgroup with sequential sums in token id order, the host TokenSampler's CDF. Larger rows use fixed parallel sums (no top-p) or mass quantiles in rank-key order (top-p): at a CDF boundary the device may pick the adjacent token, and the device rank key orders +0 above -0 where the host ties both zeros by token id. Greedy rows are unaffected. STRIX_SAMPLE_PATH=host where the host CDF is required. q59: ids Sd == Sh == Sd2 == Sh2 == q56 So (T 0.7 seed 7); greedy G == q46 R0. Host: strix-serial-generation-cli-tests (device decision path), strix-token-sampling-device-plan-tests (2,048 boundary pinned, host boundary oracle), strix-token-sampling-host-path-tests (STRIX_SAMPLE_PATH=host selects the host sampler); device: token_sampling_device_cases (6,144-entry rows past the boundary).
+- **Off switch:** STRIX_SAMPLE_PATH=host
+- **Measured gain:** q59 (RTX PRO, CLI EXACT 256 tokens, code, T 0.7 seed 7): 94.06 / 93.90 tok/s on the device vs 91.95 / 91.97 host (+2.2 %); greedy 97.78.
+- **Preconditions:** CUDA build with the step program route; a sampled request (temperature > 0)
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: the CLI samples on the host |
+| Qwen3.8 27B dense | not bound: the CLI samples on the host |
+| DeepSeek V4.1 Flash | not bound: the CLI samples on the host |
+| GLM 5.3 Flash | not bound: the CLI samples on the host |
+| MiniMax M3.1 Flash | not bound: the CLI samples on the host |
+| Inkling 2 Mini | bound: CUDA CLI step program route |
+| Hy4 Flash | not bound: the CLI samples on the host |
+| Nemotron 3.5 Bolt E4B | not bound: the CLI samples on the host |
+
+<a id="inkling2-served-lone-lane-spec"></a>
+
+## CUDA server: lone-lane speculation on the command line's speculator step
+
+**Engine:** `inkling2-mini`. **Control:** server --speculation auto|off (resolved speculation auto). **Default:** on for CUDA serving when the resolved speculation is auto and a drafter is loaded, while one lane is live (max_live 1); two or more live lanes take the cohort round (one-row route).
+
+While one lane is live, the CUDA server runs the command line's speculator step for it (same drafter setup, arbiter and verify windows as the CLI's auto); two or more live lanes take the cohort round. One strix-lane-spec line per finished request carries the lane's receipt.
+
+- **Shared home:** src/serve/cohort_decode.cpp (LaneSpeculator, strix-lane-spec receipt), src/spec/drafting.cpp; src/inkling2/inkling2_mini_serve.cpp binding
+- **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA served decode, one live lane
+- **Exactness evidence:** EXACT: the lone lane verifies every window on the target (LaneSpeculator: the command line's drafter setup, arbiter and verify windows; DSpark drafter on slot 0); sampled lanes draft nothing (max_draft 0). q65: served code C1 ids == CLI Ac 2/2; served C1 == q45 8/8; C8 == C1 8/8 x3. Host: strix-cohort-lane-speculation-tests, strix-fixed-kv-cohort-tests.
+- **Off switch:** --speculation off (every lane on the one-row route)
+- **Measured gain:** q65 (RTX PRO, Inkling 2 Mini CUDA server EXACT, 656-token code prompt, --speculation auto): C1 172.71 tok/s = 0.966x the command line's 178.83 at the same effort (q63 before the slot 0 tape fix: 0.56x); C8 median 215.4 tok/s. The 0.98 served/CLI band is not reached (1.4 points short); the remaining ~0.9 ms per step sits in the served step, not in the decisions (53 vs 51 model passes).
+- **Preconditions:** CUDA build, a drafter loaded, resolved speculation auto, exactly one live lane; HIP keeps the context-draft cohort route
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no served lane speculator |
+| Qwen3.8 27B dense | not bound: no served lane speculator |
+| DeepSeek V4.1 Flash | not bound: no served lane speculator |
+| GLM 5.3 Flash | not bound: no served lane speculator |
+| MiniMax M3.1 Flash | not bound: no served lane speculator |
+| Inkling 2 Mini | bound: CUDA server, one live lane (q65) |
+| Hy4 Flash | not bound: no served lane speculator |
+| Nemotron 3.5 Bolt E4B | not bound: no served lane speculator |
+
+<a id="inkling2-chat-default-effort"></a>
+
+## Chat default reasoning effort from the model file (command line = server)
+
+**Engine:** `inkling2-mini`. **Control:** models/inkling2-mini.toml [chat] reasoning_effort; a request's own reasoning_effort overrides it. **Default:** none for the command line (--messages) and the server; before, the command line rendered an absent effort as 0.9.
+
+**User-visible change:** the command line output for the same `--messages` prompt changes. A chat request that names no reasoning effort is rendered with the model file's default (`none`) by both front ends; earlier builds of the command line rendered it as 0.9 (`high`), so the prompt ids, and therefore the generated text, differ from those builds. Name `reasoning_effort` in the request to keep a specific effort.
+
+- **Shared home:** src/serve/inkling2_chat.cpp (effort_text), models/inkling2-mini.toml [chat]
+- **Tier and regime:** every tier; command line --messages and served chat
+- **Exactness evidence:** Changes the prompt, not the arithmetic: a --messages request without reasoning_effort now renders effort 0 (none), as the server does, so its prompt ids and its command line output differ from earlier builds for the same input; the same request renders the same ids through both front ends (inkling2-mini-chat-test parity). Reference rows rebased to the new default: q65 command line code auto 178.83 / plain 97.51 tok/s (656 prompt tokens), prose auto 98.76 / plain 102.12 (478 prompt tokens); served C1 code ids == command line Ac.
+- **Off switch:** name the effort in the request: reasoning_effort "high" (0.9) renders the earlier command line prompt
+- **Measured gain:** none claimed (front-end parity); speed references at the new default: q65 as above
+- **Preconditions:** chat input (--messages or the server's chat endpoint) that names no reasoning_effort
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not applicable: no reasoning_effort chat field |
+| Qwen3.8 27B dense | not applicable: no reasoning_effort chat field |
+| DeepSeek V4.1 Flash | not applicable: no reasoning_effort chat field |
+| GLM 5.3 Flash | not applicable: no reasoning_effort chat field |
+| MiniMax M3.1 Flash | not applicable: no reasoning_effort chat field |
+| Inkling 2 Mini | bound: command line and server read [chat] reasoning_effort |
+| Hy4 Flash | not applicable: no reasoning_effort chat field |
+| Nemotron 3.5 Bolt E4B | not applicable: no reasoning_effort chat field |
+
+<a id="g4-int8-global-kv-shadow"></a>
+### Int8 global KV shadow for decode attention at depth (shared shadow trait)
+Nemotron 3.5 Bolt E4B global layers, `STRIX_G4_DECODE_ATTN=g4-dattn-f2` (TURBO band rows from 8K; explicit option elsewhere). TURBO default on gfx1151 for one-prompt CLI decode runs (strix-gemma4 decode with --ids, or --prompt with --tokenizer) whose prompt has 8,192..65,536 tokens: the run spells its decode regime before the device backend is built and the band rows (8K x1.089, 32K x1.460, 64K x1.819) decide. Below 8K (256..2K within noise), chat / fixture runs and the server keep the exact attention: the decode attention format is one process property (prefill route choice, shadow sizing, one format per decode pass), so per-request selection in the server needs a per-format split of the global-layer attention pass. The startup line "gemma4 decode attention identity ..." and the profile JSON state the KV read precision in use. Gate v2 decode (REF exact, NULL one FP16 ulp on the anchor embedding, 128 teacher-forced held-out rows per case): 2K 1,536 rows KL 0.0030 top-1 0.986 dNLL +0.0038; 8K 1,152 rows 0.0029 / 0.985 / +0.0041; 32K 1,024 rows 0.0032 / 0.987 / +0.0042; 64K 1,024 rows 0.0019 / 0.981 / -0.0003: TURBO PASS in every band, FAST FAIL (single windows exceed dNLL 0.01 under the null-capped se). The decode attention reads int8 groups of 16 features with one FP16 scale (the shared int8-g16 shadow form) instead of the FP32 cache: 16,128 instead of 57,344 bytes per position over the seven global layers. C1 decode, Q4_K_M, `fast`, drafting off, one node, fresh process per run, ABBA: 2K 46.06 -> 48.31, 8K 41.65 -> 45.34, 32K 29.60 -> 43.21, 64K 21.18 -> 38.52 tok/s. Changes logits; each arm is deterministic. The shadow is kept beside the FP32 cache (+603,979,776 bytes per 64K stream, charged in the stream work bound). The reader trait lives in `src/attn_core/shadow_kv_read.hpp`, the split-K plan in `include/strix/attn/split_decode_plan.hpp`. Off switch: `STRIX_G4_DECODE_ATTN=exact`.
+Engine matrix: inkling2-mini=not bound (8 full-context BF16 visits, -44 % bytes with an 8-bit shadow), qwen3.8-flash-next=own kv-int8-tok-v1 (opt-in; selected reads capped at 2,051 tokens), qwen3.8-27b=not bound (16 full-attention BF16 layers, -44 % bytes with an 8-bit shadow), deepseek-v4.1-flash=unaffected (FP8 / FP4 KV), glm-5.3-flash=unaffected (2,048 selected latents), minimax-m3.1-flash=unaffected (2,048 selected positions; index-key scan only), hy4-flash=unaffected (2,048 selected latents), nemotron-3.5-bolt-e4b=affected.
+
+<a id="row-share-attention-rows-past-the-table"></a>
+## Row-share attention: windows past the table (the 64-row EXACT prefill windows)
+
+**Engine:** `shared`. **Control:** STRIX_DECODE_ATTN_ROW_SHARE=0 (main schedule for every window). **Default:** ON in every tier (HIP devices with a measured row-share table: gfx1151)
+
+The exact decode attention walks the K/V prefix once per block for `pairs` (row, q head) pairs. Its device table holds rows 1-16; a longer window (the 64-row EXACT prefill windows) used to fall back to one pair per block, so every one of the 64 x 6 pairs of a kv head re-read the whole prefix: the quadratic term of EXACT prefill at long context. Windows past the table now take the table's last row form (3 pairs per block on gfx1151), the row the CUDA walk cap already reads.
+
+- **Shared home:** include/strix/attn_row_share.hpp (plan_table); HIP kernel bodies src/attn_core/dense_decode.hpp
+- **Tier and regime:** EXACT, FAST, TURBO (every window of 17+ rows on the exact decode attention)
+- **Exactness evidence:** Bitwise: per (row, q head) pair the one-pair arithmetic in the same order, the form only shares K/V loads. gfx1151 rows test: every form BITWISE to v0 at 17 and 64 rows (1K, 33K). Qwen 27B EXACT-64: 2,048-token tail dump == qwen_night EXACT reference (7f299303814221f5); a whole 32,768-token EXACT-64 prefill == the segmented main-schedule reference bit for bit (1,024 rows, f6e1a51d016d54c2).
+- **Off switch:** STRIX_DECODE_ATTN_ROW_SHARE=0
+- **Measured gain:** gfx1151 no-model bench, 64 rows x 16 layers (ms per window): 512 7.8 -> 6.8, 2K 72 -> 27, 8K 487 -> 115, 32K 4,528 -> 604, 64K 10,561 -> 2,317. Qwen 27B EXACT TTFT (one node, cold): 8,192 68.07 -> 46.74 s (same binary, off switch), 24,576 534.4 -> 197.6 s, 32,768 996.5 (segmented) -> 299.5-302.4 s; decode unchanged (1-row windows already in the table: 12.86 / 13.21 tok/s at 8K).
+- **Preconditions:** HIP build; a measured row-share table for the device and head shape (gfx1151, 20 WGP, GQA 6 x 4 kv, head dim 256); windows of 17 or more rows on the exact decode attention (EXACT prefill windows; FAST outside its window bands).
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| Qwen3.8 27B dense | bound: HIP decode and speculative apps on one GPU (table kv 4; 64-row EXACT prefill windows); tensor-parallel ranks (kv 2 per rank) have no table and keep the main schedule: same bits, no gain |
+| DeepSeek V4.1 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| GLM 5.3 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| MiniMax M3.1 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| Inkling 2 Mini | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| Hy4 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| Nemotron 3.5 Bolt E4B | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+
+<a id="qwen-27b-prefill-window-32k"></a>
+## Qwen 27B HIP: 512-row prefill window up to 32,768 tokens, tensor-parallel ranks and the speculative app
+
+**Engine:** `qwen`. **Control:** --profile fast|turbo (band rows); --wide N / --wide-exact N (decode), --prefill-rows N / --prefill-exact (spec). **Default:** ON in FAST and TURBO inside the gated bands (64..32,768 tokens), whole-model prefill (one rank or each --tp-rank), IU4 g64 pack, one lane
+
+FAST and TURBO prefill a Qwen 27B prompt with the 512-row IU4 window inside the gated bands, now up to 32,768 tokens, in the decode app, on each rank of the tensor-parallel decode (every rank prefills the whole prompt) and in the speculative app, all through one resolver and one band ladder.
+
+- **Shared home:** include/strix/profiles/qwen_dense_hip.hpp (band rows through the shared resolver, bind_band_receipts)
+- **Tier and regime:** FAST, TURBO
+- **Exactness evidence:** Lossy FAST lever: gate v2 PASS per class at 32,768 (cuts 32,768 + 32,256, 1,022 rows per class): prose KL 0.00006 top-1 0.9971, code 0.00004 / 0.9961, structured 0.00001 / 1.0000, pooled dNLL -0.00027. EXACT unchanged (2,048-token state-resumed tail == reference). FAST default dump at 32,768 == the gated window arm.
+- **Off switch:** --profile exact, or an explicit window option
+- **Measured gain:** One gfx1151 node: TTFT 32,768 996.5 s (EXACT-64, the previous route) -> 61.5 s default (62.35 s warm window); tensor-parallel pair 8,192: 68.9 -> 16.1 s per rank, same generated ids; spec app --prefill-bench 8192 67.8 -> 12.7 s. 65,536 (explicit --wide 512, no band): 147.7 s. Decode unchanged: 13.21 / 11.47 / 10.74 / 8.65 tok/s at 8K / 24.6K / 32K / 64K.
+- **Preconditions:** gfx1151, IU4 g64 pack, whole-model prefill, one lane, known execution; prompt inside a band.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: other engine and prefill route (its own band rows) |
+| Qwen3.8 27B dense | bound: HIP decode app, --tp-rank ranks, speculative app (this row) |
+| DeepSeek V4.1 Flash | not bound: model-specific gate rows |
+| GLM 5.3 Flash | not bound: model-specific gate rows |
+| MiniMax M3.1 Flash | not bound: model-specific gate rows |
+| Inkling 2 Mini | not bound: model-specific gate rows |
+| Hy4 Flash | not bound: model-specific gate rows |
+| Nemotron 3.5 Bolt E4B | not bound: model-specific gate rows |
+
+<a id="minimax-serve-host-route-default"></a>
+
+## MiniMax serving: host pair route by default
+
+**Engine:** `minimax`. **Control:** strix-minimax-serve / rank --transport (default usb4-auto: the host pair route); --transport usb4gpu for GPU-direct. **Default:** host route (usb4-auto) for serving and ranks in every tier; GPU-direct only on an explicit --transport usb4gpu
+
+The MiniMax server was the only pair server whose default transport was GPU-direct (usb4gpu); DeepSeek and GLM serve on usb4-auto. Every MiniMax pair receipt ran on the host route.
+
+- **Shared home:** src/minimax/engine/mm_defaults.cpp (Cli::transport, parse_cli); src/minimax/serve/session_service.hpp
+- **Tier and regime:** EXACT, FAST, TURBO; pair serving and ranks
+- **Exactness evidence:** Transport only, same arithmetic: on the 2x1x40 USB4 layout (GPU-direct streams present) the host and direct routes give identical 8K served output (receipt M3D); on layout 1 (USB4 host 2x2x40) a usb4gpu request already fell back to the host route, so the effective route there does not change. Session cache: serve/usb4-auto/fixed-width-one-session-v1 is the only route qualified for the session cache, so with this default the server admits its session cache by default on layout 1 too (the former usb4gpu request fell back to the host route without admitting it); session_cache_gate.sh: cache ON == OFF.
+- **Off switch:** --transport usb4gpu (GPU-direct)
+- **Measured gain:** 8K served TTFT on the 2x1x40 layout (receipt M3D, three runs): GPU-direct 17.33 / 17.39 / 17.36 s, host route 12.24 / 11.60 / 12.01 s (-31 %); decode equal; outputs identical. The new binary without --transport: 12.33 / 11.71 / 12.79 s, transport usb4-host, outputs identical. Layout 1: unchanged (it already ran the host route).
+- **Preconditions:** MiniMax pair serving or ranks (world 2) over USB4. Measured layouts: usb4-host 2x2x40 (layout 1, every earlier MiniMax pair receipt) and 2x1x40 (two cables, one host stream each, GPU-direct present).
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no MiniMax transport default |
+| Qwen3.8 27B dense | not bound: no MiniMax transport default |
+| DeepSeek V4.1 Flash | already usb4-auto by default (serving) |
+| GLM 5.3 Flash | already usb4-auto by default (serving) |
+| MiniMax M3.1 Flash | bound: serving and ranks default to the host route |
+| Inkling 2 Mini | not bound: no MiniMax transport default |
+| Hy4 Flash | not bound: no MiniMax transport default |
+| Nemotron 3.5 Bolt E4B | not bound: no MiniMax transport default |
+
+<a id="glm-pf-wmma-2x1x40"></a>
+
+## GLM FAST prefill band on the 2x1x40 USB4 host layout
+
+**Engine:** `glm`. **Control:** data row usb4-host-2x1x40 in kMeasuredPrefillLayouts (include/strix/glm_pair_profile_table.hpp); STRIX_GLM_PF_WMMA. **Default:** FAST / TURBO pair prompts inside the pf_wmma band (2,049..8,192 tokens) also run the bundle on the usb4-host-2x1x40 layout (two cables, one host stream each, 40 Gb/s, no direct); before, that layout declined to the exact cores. Layouts with GPU-direct streams or one cable keep the exact cores.
+
+The GLM FAST prefill band ([glm-pf-wmma-x](#glm-pf-wmma-x)) is admitted per measured link layout; the list is data. The 2x1x40 layout joins layout 1 with a lower-edge receipt.
+
+- **Shared home:** include/strix/glm_pair_profile_table.hpp (classify_link, kMeasuredPrefillLayouts)
+- **Tier and regime:** FAST, TURBO; pair prefill, 2,049..8,192 tokens
+- **Exactness evidence:** FAST: the pf_wmma bundle with the same bundle and exchange bits as its gated arm (gate and identity of glm-pf-wmma-x). Layout 1 is byte-identical to before: prefill_settings(layout 1) equals the former constants (glm_rank_defaults_common_cpu_tests). The 2x1x40 layout has its own execution key.
+- **Off switch:** STRIX_GLM_PF_WMMA=0 or --profile exact; a layout outside kMeasuredPrefillLayouts keeps the exact cores
+- **Measured gain:** Pair CLI ABAB at the 2,049-token lower edge on 2x1x40 (receipt G4B, earlier binary): exact cores 3.821 / 3.824 s, band 2.777 / 2.775 s (x1.377; layout 1: x1.37). The 8,192-token upper edge is not timed on 2x1x40 (its 8,192-row admission needs about 113 GiB per rank; that node had 101 GiB): the band's upper edges are timed on layout 1 only, and one host stream per cable may change the result at long prompts.
+- **Preconditions:** GLM pair (world 2), --profile fast or turbo, a layout listed in kMeasuredPrefillLayouts (usb4-host-2x2x40, usb4-host-2x1x40), a prompt inside the band; 2x1x40 timed at the lower edge only.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: no GLM prefill layout list |
+| Qwen3.8 27B dense | not bound: no GLM prefill layout list |
+| DeepSeek V4.1 Flash | not bound: no GLM prefill layout list |
+| GLM 5.3 Flash | bound: layout data row in kMeasuredPrefillLayouts |
+| MiniMax M3.1 Flash | not bound: no GLM prefill layout list |
+| Inkling 2 Mini | not bound: no GLM prefill layout list |
+| Hy4 Flash | not bound: no GLM prefill layout list |
+| Nemotron 3.5 Bolt E4B | not bound: no GLM prefill layout list |

@@ -38,7 +38,7 @@ constexpr Binding bindings[] = {
      "HIP one lane, known priced prompt execution; FAST plus cap9 over FAST"},
     {"qwen3.8-27b", "qwen35-hip-decode", "include/strix/profiles/qwen_dense_hip.hpp",
      strix::qwen35::hip_profile::kBandRows, strix::qwen35::hip_profile::table,
-     "HIP one rank, IU4 g64 pack, one lane, known priced execution; timing with MTP off"},
+     "HIP whole-model prefill (one rank or each tensor-parallel rank; decode and spec apps), IU4 g64 pack, one lane, known priced execution; timing with MTP off"},
 };
 
 std::string lengths(const auto& points, bool json) {
@@ -92,7 +92,8 @@ bool render(std::ostream& out, bool json) {
         if (lever == binding.levers.end()) return false;
         const auto identity = p::declared_identity(lever->identity, row.value);
         const auto tier = p::name(row.tier);
-        const auto key = row.band_bound ? std::string_view{"bind_band_receipts/LadderArms::over"} : row.over;
+        const auto key = row.band_bound && row.over.empty()
+            ? std::string_view{"bind_band_receipts/LadderArms::over"} : row.over;
         if (json) {
             if (!first) out << ',';
             const auto field = [&](std::string_view name, std::string_view value) {
@@ -129,7 +130,7 @@ bool render(std::ostream& out, bool json) {
                 << tier << " | " << row.min_context << "–" << row.max_context << " | " << floor << "–"
                 << row.max_context << " | " << edge_state;
             if (row.band_evidence.lower_edge_unproven) out << " (measured floor " << measured_floor << ')';
-            out << " | " << (row.band_bound ? "Per request" : "Fixed") << ", `" << row.lever
+            out << " | " << (row.band_bound && row.over.empty() ? "Per request" : "Fixed") << ", `" << row.lever
                 << '=' << row.value << '{' << identity << "}` | " << lengths(row.band_evidence.timed, false)
                 << " | " << lengths(row.band_evidence.gated, false) << " | " << row.receipt << ' '
                 << row.band_evidence.gate_scope << " |\n";

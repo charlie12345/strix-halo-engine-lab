@@ -3,6 +3,7 @@
 // the test fails on any difference that is not listed below with the reason serving requires it, and on any listed
 // difference that no longer exists. `--print` prints both resolved configurations side by side (the report tools use it).
 #include "strix/serve_cli_parity.hpp"
+#include "strix/env_arms.hpp"
 
 #include <span>
 
@@ -15,7 +16,7 @@
 #include <vector>
 
 #if defined(STRIX_PARITY_GLM)
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #endif
 #if defined(STRIX_PARITY_MINIMAX)
 #include "minimax/engine/mm_defaults.hpp"
@@ -39,6 +40,7 @@ namespace sp = strix::parity;
 int g_failures = 0;
 bool g_print = false;
 bool g_require_output_parity = false;
+bool g_strict_gemma = false;
 
 void check(bool ok, const std::string& what) {
     if (ok) return;
@@ -132,6 +134,7 @@ void glm() {
                   "GLM rank and serve apply the same WMMA route for " + std::string(profile) + ": " + lever);
         }
         gate("glm", values(sp::from_lines(rd::print(cli))), values(sp::from_lines(rd::print(server))), allowed);
+        gate("glm+profile-receipt", {{"profile", cli.product->json()}}, {{"profile", server.product->json()}}, {});
     }
     // The measured pair executions and each unmatched axis use the same product resolver: the TURBO literal rows
     // (8,108 / 31,258 tokens, capacity 36,864, 64 generated) and the FAST band row (2,049..8,192 tokens, any capacity,
@@ -154,6 +157,7 @@ void glm() {
         check(fast_row == (on && work.prompt >= 2049 && work.prompt <= 8192),  // TURBO nests the FAST cell in the band
               std::string("GLM FAST band row named in the route line (") + profile + " prompt " + std::to_string(work.prompt) + ")");
         gate("glm", values(sp::from_lines(printed)), values(sp::from_lines(rd::print(serve))), allowed);
+        gate("glm+measured-receipt", {{"profile", cli.product->json()}}, {{"profile", serve.product->json()}}, {});
     };
     const auto verify = [&](const rd::PrefillWork& work, const rd::EnvGet& env, bool on) {
         verify_profile("turbo", work, env, on);
@@ -189,6 +193,32 @@ void glm() {
     }, false);                                                                 // explicit off wins
     for (const char* profile : {"exact", "quality"})
         verify_profile(profile, {true, 8192, 36864, 8192, 1, 64}, none, false);
+    // Exercise the live entry points' work construction. A fresh served prompt
+    // has one active lane even when the server holds a multi-slot arena.
+    const std::vector<std::string> c1_args{"--world", "2", "--profile", "fast"};
+    const auto c1_rank = rd::scan(rd::serve_request_args(c1_args, true));
+    const auto c1_server = rd::scan(rd::serve_request_args({"--world", "2", "--profile", "fast", "--slots", "8"}, true));
+    const auto c1_cli_config = rd::resolve(c1_rank, none, complete);
+    const auto c1_serve_config = rd::resolve(c1_server, none, complete);
+    const auto cli_prompt = rd::single_lane_prefill(true, 8192, 16384, 8192, 64);
+    const auto serve_prompt = rd::serve_prefill_work(true, true, 8192, 16384, 8192, 64, true);
+    check(rd::select_prefill_wmma(c1_rank, c1_cli_config, none, cli_prompt) &&
+          rd::select_prefill_wmma(c1_server, c1_serve_config, none, serve_prompt),
+          "GLM live FAST selection matches for one CLI request and a fresh served request in an eight-slot arena");
+    for (const auto& declined : {rd::serve_prefill_work(false, true, 8192, 16384, 8192, 64, true),
+                                 rd::serve_prefill_work(true, false, 8192, 16384, 8192, 64, true),
+                                 rd::serve_prefill_work(true, true, 8192, 16384, 4096, 64, true)})
+        check(!rd::select_prefill_wmma(c1_server, c1_serve_config, none, declined),
+              "GLM serve declines the live FAST row without pair agreement, a fresh whole prompt and its measured chunk");
+    // USB4 layout 2bq through the host route: CLI and serve resolve the same FAST band row on its own execution key.
+    check(rd::select_prefill_wmma(c1_rank, c1_cli_config, none, rd::single_lane_prefill(true, 8192, 16384, 8192, 64, true, "usb4-host-2x1x40")) &&
+          rd::select_prefill_wmma(c1_server, c1_serve_config, none, rd::serve_prefill_work(true, true, 8192, 16384, 8192, 64, true, "usb4-host-2x1x40")),
+          "GLM FAST band row: CLI == serve on the measured 2bq host layout");
+    const auto c1_turbo = rd::scan(rd::serve_request_args({"--world", "2", "--profile", "turbo"}, true));
+    const auto c1_turbo_config = rd::resolve(c1_turbo, none, complete);
+    check(!rd::select_prefill_wmma(c1_turbo, c1_turbo_config, none,
+              rd::serve_prefill_work(true, true, 31258, 36864, 8192, 64, true)),
+          "GLM serve does not select the CLI-only 32K TURBO receipt");
     // Scratch storage (full arena vs routed) is spelled in the execution key: the band row binds either (the gate and
     // the FAST timing ran on the full arena), the TURBO literal key names routed scratch only.
     verify_profile("fast", {true, 8192, 8448, 8192, 1, 64, false}, none, true);
@@ -236,10 +266,11 @@ void minimax() {
     const auto server = sp::from_lines(md::effective_config(md::parse_cli("serve", {}), none));
     static constexpr sp::Allowed allowed[] = {
         {"app", "the entry point's own name", "effective_config receipt label, not an execution value"},
-        {"session_reason", "text that quotes the app and transport names", "effective_config explanation only"},
-        // EXCEPTION for the user (not measured server vs CLI on the same transport): the server defaults to the device
-        // exchange, the CLI to the host exchange.
-        {"transport", "serve default usb4gpu (device exchange), rank default usb4-auto (host exchange)"},
+        {"session_reason", "explanation of the session_cache row (quotes the app and transport names)", "effective_config explanation only"},
+        // Both entry points default to the host exchange (usb4-auto); on it the server admits its session cache across
+        // requests (serve/usb4-auto is the gated session route), which a one-shot CLI run does not have.
+        {"session_cache", "server session cache across requests on the gated host route; one-shot CLI keeps no session",
+         "tools/minimax/session_cache_gate.sh on serve/usb4-auto: automatic and explicit ON output == OFF output"},
         {"serve.*", "scheduler / speculation policy between concurrent requests; no CLI counterpart"},
         // One host-path table (mm_defaults host_defaults()), two columns:
         {"host.STRIX_DIST_USB4_TIMEOUT_MS", "transport only: a request fails within a minute when the peer is gone"},
@@ -251,6 +282,23 @@ void minimax() {
         {"host.STRIX_MM_PF_TABLE_RING.serving_reason", "the reason line exists on the server only"},
     };
     gate("minimax", cli, server, allowed);
+    check(cli.at("transport_capabilities") == "0" && server.at("transport_capabilities") == "0",
+          "MiniMax's unqualified transport capabilities stay off by default for both entry points");
+    const md::Lookup caps = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_MM_USB4_CAPS" ? "streams,joint" : nullptr;
+    };
+    for (const auto* transport : {"usb4-auto", "usb4gpu", "usb4-gpu"}) {
+        const auto c = sp::from_lines(md::effective_config(md::parse_cli("rank", {"model", "0", transport, "out"}), caps));
+        const auto s = sp::from_lines(md::effective_config(md::parse_cli("serve", {"model", "--transport", transport}), caps));
+        check(c.at("transport_capabilities") == "3" && s.at("transport_capabilities") == "3",
+              "MiniMax rank and serve publish the same explicit USB4 capability mask");
+    }
+    for (const auto* transport : {"usb4:/dev/stream", "tcp-listen:3000"}) {
+        bool refused = false;
+        try { (void)md::transport_capabilities(transport, caps); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "MiniMax capabilities require a transport with startup capability agreement");
+    }
     // FAST prefill profile rows (mm_profile_table.hpp): every row is printed by both entry points and resolves the
     // same with the bundle on, with an explicit OFF beating it, and on the FAST_I4 format (member not selected); the
     // same through the product word alone (STRIX_MM_PRODUCT_PROFILE=fast, as print_or_apply exports '--profile fast').
@@ -290,6 +338,32 @@ void minimax() {
             check(c.count(k) == 1 && s.count(k) == 1, std::string("minimax: ") + k + " printed by both entry points");
         gate("minimax+fast", c, s, allowed);
     }
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        const md::Lookup env = [tier](const char* key) -> const char* {
+            const std::string_view name(key);
+            if (name == md::kProductProfileEnv) return tier;
+            if (name == "STRIX_MM_PF_TABLE_RING") return "0";
+            return nullptr;
+        };
+        for (const auto* transport : {"usb4-auto", "usb4gpu"}) {
+            const auto profile_config = [&](const md::Cli& args) {
+                const auto all = sp::from_lines(md::effective_config(args, env));
+                sp::Config levers{{"transport", all.at("transport")},
+                                  {"host.STRIX_MM_PF_TABLE_RING", all.at("host.STRIX_MM_PF_TABLE_RING")},
+                                  {"profile_fingerprint", all.at("profile_fingerprint")}};
+                for (const auto& row : md::profile_table)
+                    levers.emplace(row.env, all.at(std::string(row.env)));
+                for (const auto& [key, value] : all)
+                    if (key.starts_with("prefill.") || key.starts_with("profile.")) levers.emplace(key, value);
+                return levers;
+            };
+            const auto rank = profile_config(md::parse_cli("rank", {"model", "0", transport, "output"}));
+            const auto serve = profile_config(md::parse_cli("serve", {"model", "--transport", transport}));
+            check(serve.at("transport") == transport && serve.at("host.STRIX_MM_PF_TABLE_RING") == "0",
+                  "MiniMax explicit transport and ring settings reach serving");
+            gate(std::string("minimax+explicit+") + tier + '+' + transport, rank, serve, {});
+        }
+    }
 }
 #endif
 
@@ -316,6 +390,7 @@ void ds41() {
         if (r.profile) {
             c["profile"] = std::string(strix::profile::name(r.profile->profile));
             c["profile.fingerprint"] = strix::profile::hex_identity(r.profile->fingerprint());
+            c["profile.receipt"] = r.profile->json();
             for (const auto& entry : r.profile->entries)
                 if (entry.lever) c["profile." + std::string(entry.lever->name)] = entry.value;
         }
@@ -336,7 +411,7 @@ void ds41() {
         const auto native = config(pd::App::rank, profile);
         check(pr::export_environment(pr::kPresetEnv, "1"), "enable DeepSeek model preset marker");
         const auto preset = config(pd::App::serve, profile);
-        check(pr::export_environment(pr::kPresetEnv, previous ? previous->c_str() : ""), "restore model preset marker");
+        strix::env_arms::set_env(pr::kPresetEnv, previous);
         gate(std::string("ds41+preset+") + profile, native, preset, allowed);
         check(preset.at("arg:--slots") == "8", "ds41: serve uses the resolved eight slots");
     }
@@ -346,9 +421,10 @@ void ds41() {
             if (dir != "/md") return std::vector<std::string>{};
             return std::vector<std::string>{"z-DSpark-MXFP4.gguf", "a-DSpark-MXFP4.gguf", "unrelated.gguf"};
         };
-        const auto draft_args = [&](pd::App app, bool opt_out) {
+        const auto draft_args = [&](pd::App app, bool opt_out, bool explicit_draft = false) {
             std::vector<std::string> args{model, "--rank", "0", "--transport", "usb4auto", "--profile", "fast"};
             if (opt_out) args.emplace_back("--no-dspark");
+            if (explicit_draft) args.insert(args.end(), {"--dspark", "/md/z-DSpark-MXFP4.gguf"});
             const auto resolved = pd::resolve(app, args, [](const char*) -> const char* { return nullptr; },
                                               with_draft, pd::Build{true});
             return sp::from_args(std::span<const std::string>(resolved.args).subspan(1));
@@ -361,6 +437,15 @@ void ds41() {
               "ds41: the server opt-out suppresses discovery");
         check(!draft_args(pd::App::rank, false).contains("arg:--dspark"),
               "ds41: automatic DSpark discovery applies only to serve");
+        const auto explicit_cli = draft_args(pd::App::rank, false, true);
+        const auto explicit_server = draft_args(pd::App::serve, false, true);
+        const auto draft_option = [](const sp::Config& options) {
+            const auto it = options.find("arg:--dspark");
+            return sp::Config{{"draft", it == options.end() ? "" : it->second}};
+        };
+        gate("ds41/explicit-draft", draft_option(explicit_cli), draft_option(explicit_server), {});
+        check(draft_option(explicit_server).at("draft") == "/md/z-DSpark-MXFP4.gguf",
+              "ds41: explicit draft takes precedence over a discoverable draft");
     }
     namespace ds = strix::deepseek41;
     ds::PrefillOptions measured;
@@ -419,7 +504,8 @@ void ds41() {
         const auto result = pd::resolve_prefill_profile(*startup.profile, o, prompt, 1U,
                                                        "gfx1151|AMD Radeon 8060S Graphics|fixture", true);
         if (!result) return {{"d1_prefill", "declined"}, {"decoder_replay", "declined"}};
-        return {{"d1_prefill", result->find("d1_prefill")->value}, {"decoder_replay", result->find("decoder_replay")->value}};
+        return {{"d1_prefill", result->find("d1_prefill")->value}, {"decoder_replay", result->find("decoder_replay")->value},
+                {"profile.receipt", result->json()}};
     };
     for (const char* profile : {"exact", "fast", "turbo"})
         for (const auto prompt : {2048U, 8192U, 32768U}) {
@@ -501,6 +587,27 @@ void ds41() {
 // additions (src/gemma4/engine/runtime.cpp). Same request words through both; every option and profile entry compared.
 void gemma() {
     namespace e = strix::gemma4::engine;
+    const auto isolated = [](auto&& resolve) {
+        // Both native executables export the selected profile to the process. Start each arm with the
+        // same environment so an exported CLI lever does not turn into an explicit HTTP override.
+        struct ProfileEnvironment {
+            // An unset switch is restored as unset: on POSIX an empty value would stay defined and count as an
+            // explicit (and refused) setting at the next resolution.
+            std::vector<std::pair<std::string, std::optional<std::string>>> saved;
+            ProfileEnvironment() {
+                for (const auto& lever : strix::gemma4::profile::levers()) {
+                    if (lever.env.empty()) continue;
+                    const std::string key(lever.env);
+                    const char* raw = strix::profile::environment({}, key);
+                    saved.emplace_back(key, raw ? std::optional<std::string>(raw) : std::nullopt);
+                }
+            }
+            ~ProfileEnvironment() {
+                for (const auto& [key, value] : saved) strix::env_arms::set_env(key, value);
+            }
+        } environment;
+        return resolve();
+    };
     const auto config = [](const e::Options& o) {
         sp::Config c;
         c["model"] = o.model.generic_string();
@@ -522,6 +629,7 @@ void gemma() {
         c["draft_mtp"] = o.draft_mtp.generic_string();
         c["profile"] = std::to_string(static_cast<int>(o.profile.name));
         c["profile.app"] = std::to_string(static_cast<unsigned>(o.profile.app));
+        c["profile.receipt"] = o.profile.json();
         for (const auto& entry : o.profile.entries)
             if (entry.lever) c["profile." + std::string(entry.lever->name)] = entry.value;
         return c;
@@ -529,32 +637,36 @@ void gemma() {
     std::vector<std::string> words{"x", "--model", "/m/model.gguf", "--rope-tables", "/m/rope"};
     std::vector<char*> argv;
     for (auto& w : words) argv.push_back(w.data());
-    const auto cli = config(e::parse_options(static_cast<int>(argv.size()), argv.data()));
-    const auto served = e::prepare_serve(static_cast<int>(argv.size()), argv.data());
+    const auto cli = isolated([&] { return config(e::parse_options(static_cast<int>(argv.size()), argv.data())); });
+    const auto served = isolated([&] { return e::prepare_serve(static_cast<int>(argv.size()), argv.data()); });
     check(!served.exit_code, "gemma: prepare_serve accepts the CLI's request words");
     static constexpr sp::Allowed allowed[] = {
         // EXCEPTION for the user: the server sizes session-fixed choices (the EXL3 core identity) for the requests that
         // can decode together (STRIX_G4_SERVE_SLOTS, default 8); the CLI runs one stream unless --streams N.
         {"streams", "the server decodes up to STRIX_G4_SERVE_SLOTS requests together"},
     };
-    gate("gemma", cli, config(served.options), allowed);
+    if (!g_strict_gemma) gate("gemma", cli, config(served.options), allowed);
 
     // Explicitly match concurrency so the test compares only model/tier settings.
+    for (const std::string model_name : {"gemma-4-e4b-it", "nemotron-3.5-bolt-e4b"})
     for (const std::string tier : {"exact", "fast", "turbo"}) {
         std::vector<std::string> tier_words = words;
+        tier_words[2] = "/m/" + model_name + ".gguf";
         tier_words.insert(tier_words.end(), {"--profile", tier, "--streams", "1", "--draft", "off"});
         std::vector<char*> tier_argv;
         for (auto& word : tier_words) tier_argv.push_back(word.data());
-        const auto native = e::parse_options(static_cast<int>(tier_argv.size()), tier_argv.data());
-        const auto server = e::prepare_serve(static_cast<int>(tier_argv.size()), tier_argv.data());
+        const auto native = isolated([&] { return e::parse_options(static_cast<int>(tier_argv.size()), tier_argv.data()); });
+        const auto server = isolated([&] { return e::prepare_serve(static_cast<int>(tier_argv.size()), tier_argv.data()); });
         check(!server.exit_code, "gemma: serve accepts " + tier);
+        check(server.deployment_slots == native.streams,
+              model_name + " " + tier + ": the HTTP scheduler receives the explicitly matched stream count");
         check(native.profile.name == strix::profile::parse(tier), "gemma: native tier survives parsing");
         const auto* identity = native.profile.find("decode_identity");
         check(identity && identity->value == (tier == "exact" ? "g4-v1" : "g4-a8-v1"),
               "gemma: " + tier + " resolves its decode identity");
         const auto* attention = native.profile.find("decode_attention");
         check(attention && attention->value == "exact", "gemma: " + tier + " keeps qualified exact decode attention");
-        gate("gemma/" + tier, config(native), config(server.options), {});
+        gate(model_name + "/" + tier, config(native), config(server.options), {});
     }
 
     namespace fs = std::filesystem;
@@ -566,8 +678,8 @@ void gemma() {
         std::vector<std::string> args{"x", "--model", model_path.string(), "--rope-tables", "rope", "--profile", tier};
         std::vector<char*> pointers;
         for (auto& arg : args) pointers.push_back(arg.data());
-        const auto options = e::parse_options(static_cast<int>(pointers.size()), pointers.data());
-        const auto server = e::prepare_serve(static_cast<int>(pointers.size()), pointers.data());
+        const auto options = isolated([&] { return e::parse_options(static_cast<int>(pointers.size()), pointers.data()); });
+        const auto server = isolated([&] { return e::prepare_serve(static_cast<int>(pointers.size()), pointers.data()); });
         check(!server.exit_code && options.draft_mtp == expected && server.options.draft_mtp == expected,
               "gemma " + tier + ": discover only a drafter with its weights file");
     };
@@ -583,36 +695,58 @@ void gemma() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::set<std::string_view> expected;
     for (int i = 1; i < argc; ++i) {
-        g_print |= std::strcmp(argv[i], "--print") == 0;
-        g_require_output_parity |= std::strcmp(argv[i], "--require-output-parity") == 0;
+        const std::string_view arg(argv[i]);
+        if (arg == "--print") g_print = true;
+        else if (arg == "--require-output-parity") g_require_output_parity = true;
+        else if (arg == "--strict-gemma") g_strict_gemma = true;
+        else if (arg.starts_with("--expect-family=")) expected.emplace(arg.substr(16));
+        else {
+            std::cerr << "FAIL: unknown parity argument " << arg << "\n";
+            return 1;
+        }
     }
     try {
         helper_tests();
+        if (g_strict_gemma) {
+#if defined(STRIX_PARITY_GEMMA4)
+            g_require_output_parity = true;
+            gemma();
+#else
+            check(false, "Gemma resolver is required for strict parity");
+#endif
+            return g_failures ? 1 : 0;
+        }
 #if defined(STRIX_PARITY_GLM)
         std::cout << "included: glm (exact/fast/turbo/quality; complete/missing MTP assets, default/opt-out)\n";
         glm();
+        expected.erase("glm");
 #else
         std::cout << "skipped: glm (resolver not linked)\n";
 #endif
 #if defined(STRIX_PARITY_MINIMAX)
         std::cout << "included: minimax\n";
         minimax();
+        expected.erase("minimax");
 #else
         std::cout << "skipped: minimax (resolver not linked)\n";
 #endif
 #if defined(STRIX_PARITY_DS41)
         std::cout << "included: ds41\n";
         ds41();
+        expected.erase("ds41");
 #else
         std::cout << "skipped: ds41 (resolver not linked)\n";
 #endif
 #if defined(STRIX_PARITY_GEMMA4)
         std::cout << "included: gemma\n";
         gemma();
+        expected.erase("gemma");
 #else
         std::cout << "skipped: gemma (strix_gemma4_engine not built)\n";
 #endif
+        for (const auto family : expected) check(false, "expected parity resolver missing: " + std::string(family));
         std::cout << "qwen: strix-qwen-effective-config-tests (serve / CLI parity case)\n";
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception: " << e.what() << "\n";

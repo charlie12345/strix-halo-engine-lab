@@ -6,6 +6,8 @@
 //   active peak  reusable scratch a slot needs only while it runs.
 // Engines fill these terms and the memory observations; the arithmetic, the limiting term and the report live here.
 // Pure host code: no device types, no engine dependency.
+#include "strix/env_flags.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -26,6 +28,22 @@ inline bool slot_should_grow(bool queued, std::size_t active, std::size_t built,
     std::size_t capacity, bool memory_ok, bool spare = false) {
     return (queued || spare) && active == built && built < capacity && memory_ok;
 }
+
+// The builder may drain the device. Grow only at the admission boundary with
+// zero live lanes. When pending work cannot fit, stop topping up the live
+// batch so that it can finish even under sustained arrivals.
+template<class Build>
+bool prepare_admission_slots(std::uint64_t pending, std::size_t active, std::size_t healthy,
+    std::size_t built, std::size_t capacity, bool spare, Build&& build) {
+    if (!pending || built >= capacity) return true;
+    if (active) return pending <= healthy - std::min(active, healthy);
+    const auto available = static_cast<std::uint64_t>(healthy + (capacity - built));
+    auto target = std::min(pending, available);
+    if (spare && target < available) ++target;
+    while (healthy < target && build()) ++healthy;
+    return true;
+}
+
 inline std::uint32_t eager_slots(std::uint32_t capacity, std::uint32_t eager = 4) {
     return eager ? std::min(capacity, eager) : capacity;
 }
@@ -266,13 +284,13 @@ inline std::string capacity_report_json(const CapacityReport& report) {
 // Unset (default): every charge is unchanged.
 inline bool slot_exact_from(const char* value) { return value && std::string_view(value) == "1"; }
 inline bool slot_exact() {
-    static const bool on = slot_exact_from(std::getenv("STRIX_SERVE_SLOT_EXACT"));
+    static const bool on = slot_exact_from(envcfg::lookup_unrecorded("STRIX_SERVE_SLOT_EXACT"));
     return on;
 }
 // STRIX_SERVE_CENSUS=1: print the memory census lines (before load, after load, at the slot probe).
 inline bool census_enabled_from(const char* value) { return value && std::string_view(value) == "1"; }
 inline bool census_enabled() {
-    static const bool on = census_enabled_from(std::getenv("STRIX_SERVE_CENSUS"));
+    static const bool on = census_enabled_from(envcfg::lookup_unrecorded("STRIX_SERVE_CENSUS"));
     return on;
 }
 

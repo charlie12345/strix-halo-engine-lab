@@ -467,10 +467,12 @@ void refreshed_selector_proofs() {
         {"serve-conversation", "src/minimax/serve/serve_runtime.cpp", "eng.set_unaligned_resume(conversation_agreed)"},
         {"serve-token-memo", "src/minimax/serve/minimax_api.cpp", "TokenMemo::enabled_by_default()"},
         {"serve-token-memo", "src/minimax/serve/minimax_api.cpp", "tokenizer->encode_marked(tail,true,marks)"},
-        {"route-receipt", "apps/minimax_rank_main.cpp", "strix::route::compare_ranks("},
-        {"route-receipt", "apps/minimax_rank_main.cpp", "strix::minimax::defaults::check_peer("},
-        {"route-receipt", "src/minimax/serve/serve_runtime.cpp", "strix::route::compare_ranks("},
-        {"route-receipt", "src/minimax/serve/serve_runtime.cpp", "strix::minimax::defaults::check_peer("},
+        // Both pair entry points agree through the shared pair hello, which carries the route and profile fingerprints.
+        {"route-receipt", "apps/minimax_rank_main.cpp", "eng.agree_pair(pair_model_identity, false)"},
+        {"route-receipt", "src/minimax/serve/serve_runtime.cpp", "eng.agree_pair(pair_model_identity, true, dspark_config)"},
+        {"route-receipt", "src/minimax/engine/engine.hip", "hello.route = strix::route::fingerprint();"},
+        {"route-receipt", "src/minimax/engine/engine.hip", "hello.profile = defaults::profile_resolution(strix::envcfg::text).fingerprint();"},
+        {"route-receipt", "src/minimax/engine/engine.hip", "strix::pair::exchange_hello(hello,"},
     };
     for (const auto& row : wiring) {
         (void)allow(row.id);
@@ -511,8 +513,10 @@ void host_pin_selector() {
 }
 void selector_boundary_proofs() {
     using namespace strix::minimax::defaults;
-    const Cli serve = parse_cli("serve", {});
-    require(serve.transport == "usb4gpu", "serve direct transport construction default");
+    // The serve default is the host route; the direct route is an explicit --transport usb4gpu, still refused below.
+    require(parse_cli("serve", {}).transport == "usb4-auto", "serve host transport construction default");
+    const Cli serve = parse_cli("serve", {"M", "--transport", "usb4gpu"});
+    require(serve.transport == "usb4gpu", "serve explicit direct transport construction");
     const Lookup explicit_cache = [](const char* key) -> const char* {
         return std::string_view(key) == "STRIX_SESSION_CACHE" ? "on" : nullptr;
     };

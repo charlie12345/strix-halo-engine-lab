@@ -381,8 +381,13 @@ void test_session_inspection() {
 void test_session_defaults() {
     // Exercise the same shared negotiated-name helper as the serving app.
     for (const bool direct_live : {false, true}) {
-        auto negotiated = md::parse_cli("serve", {});
-        check(negotiated.transport == "usb4gpu", "serve requests GPU transport by default");
+        // The default serve route is the host route even where gpu_direct streams exist (layout 2bq).
+        const auto defaulted = md::parse_cli("serve", {});
+        check(defaulted.transport == "usb4-auto", "serve requests the host transport by default");
+        check(strix::dist::negotiated_transport(defaulted.transport, direct_live, md::kRouteHost, md::kRouteGpu) ==
+                  "usb4-auto", "the default serve route stays host with or without a live direct exchange");
+        auto negotiated = md::parse_cli("serve", {"M", "--transport", "usb4gpu"});
+        check(negotiated.transport == "usb4gpu", "an explicit GPU transport is kept");
         negotiated.transport = strix::dist::negotiated_transport(negotiated.transport,
             direct_live, md::kRouteHost, md::kRouteGpu);
         for (const EnvMap& request : {EnvMap{}, EnvMap{{"STRIX_SESSION_CACHE", "1"}}}) {
@@ -536,7 +541,7 @@ void test_cli() {
     check(lines(md::effective_config(override_cli, lookup(bad_mode))).count("serve.dspark_mode=on") == 1,
           "CLI overrides env and baseline before validation");
     const auto d = md::parse_cli("serve", {"M"});
-    check(d.transport == "usb4gpu" && d.slots == 8, "serve routed transport default");
+    check(d.transport == "usb4-auto" && d.slots == 8, "serve host transport default");
     check(md::parse_cli("serve", {"M", "--transport", "usb4-auto"}).transport == "usb4-auto", "serve host override");
     const EnvMap none;
     for (const char* session : {"named:prompt.u32:16", "./prompt.u32", "fast", "default"}) {
@@ -683,6 +688,10 @@ void test_apply() {
 // resolves once; its cache identity is minimax-turbo-v1 even with every row off; the timing session moved to
 // --timing-profile with the old spelling kept; an unhonoured weight request is visible and refused.
 void test_turbo_product_profile() {
+    const EnvMap inherited_fast{{md::kProductProfileEnv, "fast"}};
+    const auto kv = md::rank_kv_resolution({}, lookup(inherited_fast));
+    check(kv.tier == strix::profile::Name::fast && kv.precision == md::kKvCaps.native && !kv.changes_output(),
+          "rank KV receipt uses the inherited product tier while keeping native storage");
     const EnvMap plain, turbo{{md::kProductProfileEnv, "turbo"}};
     const auto pr = md::profile_resolution(lookup(turbo));
     check(pr.is_turbo() && pr.versioned() == "minimax-turbo-v1", "turbo: versioned name");

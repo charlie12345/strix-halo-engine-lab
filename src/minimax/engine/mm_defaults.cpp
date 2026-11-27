@@ -4,6 +4,8 @@
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/dist/transport_caps.hpp"
+#include "strix/dist/transport_spec.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/host_memory.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
@@ -427,6 +429,10 @@ profile::Resolution profile_resolution(const Lookup& env) {
     return resolve_startup_profile(env, settings, true);
 }
 
+::strix::session::kv_precision::Resolution rank_kv_resolution(const ::strix::session::kv_precision::Request& request, const Lookup& env) {
+    return ::strix::session::kv_precision::resolve(profile_resolution(env).profile, request, kKvCaps);
+}
+
 bool profile_column_selects_bundle(const Lookup& env) {
     const char* name = env(kProductProfileEnv);
     if (name == nullptr || *name == 0 || !profile::is_name(name)) return false;
@@ -587,7 +593,10 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
     if (app != "rank" && app != "serve") throw std::invalid_argument("parse_cli: app must be rank or serve");
     Cli c;
     c.app = app;
-    if (app == "serve") c.transport = "usb4gpu";
+    // Serve and rank default to the host route (Cli::transport). Every MiniMax pair receipt ran on it: on USB4 layout 1
+    // a usb4gpu request fell back to it, and on layout 2bq (gpu_direct streams present) the negotiated direct route
+    // measured 8K served TTFT 17.3 s vs 12.0 s on the host route with identical output (receipt M3D). GPU-direct stays
+    // an explicit --transport usb4gpu.
     std::size_t i = 0;
     if (app == "rank") {  // MODEL_DIR RANK TRANSPORT OUT_DIR [options]
         if (args.size() > 2 && args[2].rfind("--", 0) != 0) c.transport = args[2];
@@ -612,6 +621,17 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
         else if (a == "--transport" && has && app == "serve") c.transport = args[++i];
     }
     return c;
+}
+
+std::uint16_t transport_capabilities(const std::string& transport, const Lookup& env) {
+    const char* setting = env("STRIX_MM_USB4_CAPS");
+    const auto bits = dist::parse_transport_capabilities(setting ? setting : "");
+    if (bits != 0) {
+        const auto kind = dist::parse_transport(transport, dist::pair_transport).kind;
+        if (kind != dist::TransportKind::usb4_auto && kind != dist::TransportKind::usb4_gpu)
+            throw std::invalid_argument("STRIX_MM_USB4_CAPS requires negotiated usb4-auto or usb4gpu transport");
+    }
+    return bits;
 }
 
 namespace {
@@ -764,6 +784,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     std::ostringstream o;
     o << "app=" << cli.app << "\n"
       << "transport=" << cli.transport << "\n"
+      << "transport_capabilities=" << transport_capabilities(cli.transport, env) << "\n"
       << "slots=" << cli.slots << "\n"
       << "capacity=" << cli.capacity << "\n"
       << "max_rows=" << cli.max_rows << "\n";

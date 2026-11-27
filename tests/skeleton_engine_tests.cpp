@@ -126,6 +126,30 @@ void shell_config_tests() {
     fs::remove_all(dir);
 }
 
+void reference_backend_refusals() {
+    struct Case {
+        std::string backend;
+        std::string_view reason;
+    };
+    const Case cases[] = {
+        {"intel", "Pass it after -- for a family that supports it or use a dedicated model reference executable"},
+        {"vulkan", "only exposes the RMSNorm operator reference"},
+        {"metal", "only exposes the RMSNorm operator reference"},
+    };
+    for (const auto& fixture : cases) {
+        std::vector<std::string> args{"serve", "--backend", fixture.backend, "--model", "skeleton"};
+        std::vector<char*> pointers;
+        for (auto& arg : args) pointers.push_back(arg.data());
+        std::ostringstream out, error;
+        const sv::ServiceFactories factories;
+        CHECK(sv::run(static_cast<int>(pointers.size()), pointers.data(), factories, out, error) == 2);
+        CHECK(out.str().empty());
+        CHECK(error.str().find("--backend " + fixture.backend) != std::string::npos);
+        CHECK(error.str().find(fixture.reason) != std::string::npos);
+        CHECK(error.str().find("strix-serve supports hip or cuda") != std::string::npos);
+    }
+}
+
 // strix-serve --device-count N --print-effective-config prints the shared resolver's config for the same query, and its
 // multi_device member is what the replica router admits (one resolver for CLI, server and router).
 void multi_device_parity() {
@@ -245,6 +269,12 @@ void native_handoff() {
     // Inspection is forwarded as inspection: the backend launcher prints the same decision and executes nothing.
     CHECK(invoke({"--device-count", "2", "--placement", "layers", "--print-effective-config"}, handed, error) == 0);
     CHECK(handed && handed->print_effective_config && handed->placement == "layers" && handed->device_count == 2);
+    CHECK(invoke({"--native-profile", "--print-effective-config"}, handed, error) == 0);
+    CHECK(handed && handed->native_profile && !handed->profile && handed->print_effective_config);
+    CHECK(invoke({"--native-profile", "--profile", "fast"}, handed, error) == 0);
+    CHECK(handed && handed->native_profile && handed->profile == strix::profile::Name::fast);
+    CHECK(invoke({"--native-profile", "--native-profile"}, handed, error) == 2);
+    CHECK(!handed && error.find("duplicate --native-profile") != std::string::npos);
     fs::remove_all(dir);
 }
 
@@ -260,10 +290,14 @@ void native_tier_placement() {
     std::ofstream(dir / "models/m.toml") << "schema = \"strix-model/v1\"\nname = \"fixture\"\n[multi_device]\nversion = 1\n"
         "[multi_device.forms.tensor]\nwire = \"fp16\"\n";
     std::vector<std::string> seen;
+    bool seen_preset = false;
     bool launched = false;
     sv::ServiceFactories family;
     sv::ServiceFactory fixture;
-    fixture.validate = [&](const sv::ServiceSelection& selection) { seen = selection.arguments; };
+    fixture.validate = [&](const sv::ServiceSelection& selection) {
+        seen = selection.arguments;
+        seen_preset = strix::profile::model_preset();
+    };
     fixture.inspect = [](const sv::ServiceSelection&, std::ostream&) {};
     fixture.create = [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> { return nullptr; };
     fixture.early_exit = [](const sv::ServiceSelection&, std::ostream&) -> std::optional<int> { return 0; };
@@ -307,12 +341,22 @@ void native_tier_placement() {
           error.find("tier is exact") == std::string::npos);
     CHECK(invoke(none, {"--asset", "w.gguf", "--device-count", "2", "--placement", "tensor"}, error) == 2);
     CHECK(!launched && error.find("tier is exact") != std::string::npos);
+    {
+        strix::profile::PresetScope parent;
+        CHECK(invoke(family, {"--native-profile", "--asset", "w.gguf", "--print-effective-config"}, error) == 0);
+        CHECK((seen == std::vector<std::string>{"w.gguf", "--print-effective-config"}));
+        CHECK(!seen_preset && strix::profile::model_preset());
+        CHECK(invoke(family, {"--native-profile", "--asset", "w.gguf", "--profile", "fast"}, error) == 0);
+        CHECK((seen == std::vector<std::string>{"w.gguf", "--profile", "fast"}));
+        CHECK(!seen_preset && strix::profile::model_preset());
+    }
     fs::remove_all(dir);
 }
 
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     shell_config_tests();
+    reference_backend_refusals();
     multi_device_parity();
     native_handoff();
     native_tier_placement();

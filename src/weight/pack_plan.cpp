@@ -77,6 +77,23 @@ std::uint64_t strixpack_matrix_bytes(FormatId format, std::uint64_t rows, std::u
     return geometry.bytes;
 }
 
+std::vector<PackRouteCount> pack_route_counts(const Json& routes) {
+    std::set<ExpertKey> seen;
+    std::vector<PackRouteCount> result;
+    for (const auto& row : routes.as_array()) {
+        const auto& fields = row.as_array();
+        if (fields.size() != 3) throw std::invalid_argument("expected routes as [layer, expert, count]");
+        PackRouteCount count{nonnegative(fields[0]), nonnegative(fields[1]), nonnegative(fields[2])};
+        if (!seen.emplace(count.layer, count.expert).second) throw std::invalid_argument("duplicate expert route count");
+        result.push_back(count);
+    }
+    std::ranges::sort(result, [](const PackRouteCount& a, const PackRouteCount& b) {
+        if (a.count != b.count) return a.count > b.count;
+        return ExpertKey{a.layer, a.expert} < ExpertKey{b.layer, b.expert};
+    });
+    return result;
+}
+
 PackPlan plan_strix_pack(const Json& description, FormatId cold, std::uint64_t hot_limit,
                         std::uint64_t budget, std::uint64_t reserve) {
     if (required(description, "schema").as_string() != "strix-pack-model/v1" || budget < reserve ||
@@ -91,20 +108,41 @@ PackPlan plan_strix_pack(const Json& description, FormatId cold, std::uint64_t h
         if (name.empty() || name.find_first_of("\t\r\n") != std::string::npos || !names.insert(name).second)
             throw std::invalid_argument("invalid or duplicate tensor name: " + name);
         plan.bytes = add(plan.bytes, bytes);
-        plan.tensors.push_back({std::move(name), storage, bytes});
+        plan.tensors.push_back({std::move(name), storage, bytes, {}});
     };
     if (const auto* retained = description.find("retained"))
         for (const auto& tensor : retained->as_array())
             emit(required(tensor, "name").as_string(), {}, nonnegative(required(tensor, "bytes")));
+    const auto emit_matrix = [&](const Json& tensor, std::string name, FormatId fallback, bool routed = true) {
+        auto storage = fallback;
+        if (const auto* format = tensor.find("format")) {
+            if (format->as_string() == "keep") {
+                const auto bytes = nonnegative(required(tensor, "source_bytes"));
+                emit(std::move(name), {}, bytes);
+                return false;
+            }
+            storage = strixpack_format(format->as_string());
+        }
+        const auto bytes = strixpack_matrix_bytes(storage, nonnegative(required(tensor, "rows")),
+                                                   nonnegative(required(tensor, "columns")));
+        emit(std::move(name), storage, bytes);
+        const auto* coder = routed ? nullptr : tensor.find("unobserved_coder");
+        if (!coder) coder = tensor.find("coder");
+        if (coder) {
+            const auto& name_coder = coder->as_string();
+            if (name_coder != "rtn" && name_coder != "importance" && name_coder != "feedback" && name_coder != "both")
+                throw std::invalid_argument("invalid pack plan coder");
+            plan.tensors.back().coder = name_coder;
+        }
+        return storage == cold;
+    };
+    if (const auto* matrices = description.find("matrices"))
+        for (const auto& tensor : matrices->as_array())
+            (void)emit_matrix(tensor, required(tensor, "name").as_string(), cold);
     std::map<ExpertKey, std::uint64_t> routes;
     if (const auto* counts = description.find("routes"))
-        for (const auto& row : counts->as_array()) {
-            const auto& fields = row.as_array();
-            if (fields.size() != 3) throw std::invalid_argument("expected routes as [layer, expert, count]");
-            const ExpertKey key{nonnegative(fields[0]), nonnegative(fields[1])};
-            if (!routes.emplace(key, nonnegative(fields[2])).second)
-                throw std::invalid_argument("duplicate expert route count");
-        }
+        for (const auto& count : pack_route_counts(*counts))
+            routes.emplace(ExpertKey{count.layer, count.expert}, count.count);
 
     std::vector<Promotion> candidates;
     const auto* groups = description.find("expert_groups");
@@ -128,13 +166,13 @@ PackPlan plan_strix_pack(const Json& description, FormatId cold, std::uint64_t h
                     const auto count = route ? route.mapped() : 0U;
                     Promotion candidate{key, count, 0U, plan.tensors.size(), 0U};
                     for (const auto& projection : projections) {
-                        const auto rows = nonnegative(required(projection, "rows"));
-                        const auto cols = nonnegative(required(projection, "columns"));
-                        const auto bytes = strixpack_matrix_bytes(cold, rows, cols);
-                        emit(expert_name(required(projection, "name").as_string(), key), cold, bytes);
+                        const auto name = expert_name(required(projection, "name").as_string(), key);
+                        const bool promotable = emit_matrix(projection, name, cold, count != 0);
+                        if (hot_limit && !promotable)
+                            throw std::invalid_argument("hot/cold promotion requires the cold format on every expert projection");
                         if (hot_limit && count)
-                            candidate.extra = add(candidate.extra,
-                                                  strixpack_matrix_bytes(kSP3WeightStorage, rows, cols) - bytes);
+                            candidate.extra = add(candidate.extra, plan.tensors.back().bytes / sp::SP2Storage::bytes *
+                                                                   (sp::SP3Storage::bytes - sp::SP2Storage::bytes));
                     }
                     candidate.last = plan.tensors.size();
                     if (hot_limit && count) candidates.push_back(candidate);

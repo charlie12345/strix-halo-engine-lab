@@ -69,9 +69,13 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     const auto resolution = resolve_mini_profile(out.weight_options, true);
     out.tier = resolution.profile;
     out.weight_options.lowbit_turbo = mini_lowbit_turbo(resolution);
-    if (mini_lowbit_head(resolution))
-        std::cerr << "STRIX_INK_LOWBIT_HEAD=sp4t declined: the SP4 head arm runs on the command line only (no served "
-                     "identity yet); using incumbent weights\n";
+    // STRIX_INK_LOWBIT_HEAD=sp4t|sp4t-attn (FAST / TURBO, explicit): the SP4 head or attention + head decode arm through the same
+    // resolver and weight load as the command line (BF16 image prefills, the SP4 copies decode; needs
+    // STRIX_LOWBIT_PACK, else the shared loader declines to the incumbent weights with its receipt line).
+    apply_mini_lowbit_head(out.weight_options, resolution);
+    if (out.weight_options.qualify != nullptr && out.weight_options.qualify_decode_only)
+        std::cerr << "STRIX_INK_LOWBIT_HEAD: served decode-only arm " << out.weight_options.qualify->id.name
+                  << " (served speed receipt pending)\n";
     out.prepared_round_fold = mini_prepared_round_fold(resolution);
     out.experts_nvfp4 = mini_experts_nvfp4(resolution);
     out.combine_image = mini_combine_image(resolution);
@@ -86,24 +90,26 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (resolved.backend.empty()) resolved.backend = backends.hip ? "hip" : "cuda";
     if (!(resolved.backend == "hip" ? backends.hip : backends.cuda))
         throw std::invalid_argument("Inkling backend " + std::string(resolved.backend) + " is not built");
+    if (out.weight_options.qualify_decode_only && resolved.backend != "hip")
+        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD: the SP4 decode arms are qualified on HIP only");
     // One speculation rule for the command line and the server (mini_speculation_policy: an explicit --speculation
     // wins over the row; speculation and a requested low-bit row never share a run). Served verify windows are
-    // admitted on HIP (the verify rows body and per-slot tapes); a CUDA server declines. The admitted windows take the
-    // verify rows body; a run that does not speculate keeps the row's level.
+    // admitted on HIP (the verify rows body and per-slot tapes: each greedy lane drafts from its context while one lane
+    // is live) and on CUDA as the shared lone-lane speculator (lane_speculation). The admitted windows take the verify
+    // rows body; a run that does not speculate keeps the row's level.
     out.speculation_policy = mini_speculation_policy(explicit_speculation.value_or(mini_speculation(resolution)),
-                                                     explicit_speculation.has_value(), out.weight_options.lowbit_turbo,
-                                                     resolved.backend == "hip" ? std::string_view{}
-                                                                               : std::string_view{"backend cuda"});
+                                                     explicit_speculation.has_value(), out.weight_options.lowbit_turbo);
     out.weight_options.lowbit_turbo = out.speculation_policy.lowbit;
     out.speculation_requested = out.speculation_policy.requested;
     out.speculation = out.speculation_policy.admitted;
+    out.lane_speculation = out.speculation && resolved.backend != "hip";
     out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
     // Admission of the served route lever (kMiniServedCliRoute): a server of either backend runs the command line's
     // route (mini_served_prefill_emits_first; the receipt carries requested / admitted, mini_served_route_startup_field).
     const bool hip = resolved.backend == "hip";
-    out.served_route_requested = mini_served_route_request(resolution, hip);
+    out.served_route_requested = mini_served_route_request(resolution);
     out.served_cli_route = mini_served_prefill_emits_first(hip, out.served_route_requested);
     if (hip && (out.packed_decode_flag || out.grouped_decode_flag))
         throw std::invalid_argument("a HIP Inkling server takes no decode form flag (the served route lever row sets it)");
@@ -132,9 +138,9 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
         if (explicit_rows) out.lane_rows = out.prefill_rows;
         out.prefill_tail = mini_prefill_tail_capacity(out.prefill_rows, schedule.tail_divisor, out.context);
     }
-    // An implicit chunk on a chunk-invariant backend (CUDA) retries at the command line's fallback rows when its slots
-    // fall short (serve::load_with_chunk_ladder); with the lever those smaller candidates run the held-back route. The
-    // explicit HIP tall-chunk option falls back to the incumbent 128 rows.
+    // An implicit chunk retries at the fallback rows when its slots fall short (serve::load_with_chunk_ladder): the
+    // command line's fallback rows on a chunk-invariant backend (CUDA), the held-back 128 rows on HIP; with the lever
+    // those smaller candidates run the held-back route. The explicit HIP tall-chunk option falls back to the same 128 rows.
     out.prefill_fallback_rows = explicit_rows    ? 0U
                                 : hip_tall_chunk ? kMiniServedHeldBackChunk
                                                  : mini_served_prefill_fallback_rows(hip, out.tier);
@@ -150,6 +156,13 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohor
     // context (the shared cohort drafter) and verifies the window on its slot; draft rows by live lanes are the
     // model's data (drafts only while one lane is live, the previous one-row route at two or more).
     const bool windows = opt.speculation && backend.max_window(0U) > 1U;
+    if (windows && opt.lane_speculation) {
+        // CUDA: the lone lane runs the command line's speculator step (LaneSpeculator: the same drafter setup, arbiter
+        // and verify windows as the CLI's auto, the DSpark drafter on slot 0); two or more live lanes take the round.
+        // One strix-lane-spec line per finished request (the lane's receipt and drafter stats).
+        config.lane_speculation = {true, 1U, kMiniMaxVerifyRows, kMiniProbeLoss, true};
+        return config;
+    }
     config.context_draft = windows;
     config.max_draft = windows ? kMiniMaxVerifyRows - 1U : 0U;
     if (windows) config.max_draft_by_live = mini_served_draft_by_live();
@@ -241,11 +254,12 @@ private:
                 if ((role && role->is_string() && role->as_string() == "tool") || (calls && calls->size()))
                     throw serve::ChatTemplateError("Inkling serving supports text messages");
             }
-            const auto* effort = body.find("reasoning_effort");
-            if (effort && !effort->is_null() && (!effort->is_string() || effort->as_string() != "none"))
+            // The command line's resolver (request field, else the model's chat default); served: "none" only.
+            const auto effort = serve::inkling2_reasoning_effort(body.find("reasoning_effort"));
+            if (!effort.is_string() || effort.as_string() != "none")
                 throw serve::ChatTemplateError("Inkling serving supports reasoning_effort none");
             serve::ApiChatPrompt prompt;
-            prompt.tokens = tokenizer->encode(render(*messages, {}, serve::Json("none")), true);
+            prompt.tokens = tokenizer->encode(render(*messages, {}, effort), true);
             return prompt;
         };
         config.output_parser = [](const std::string& text, bool, const serve::Json&) {

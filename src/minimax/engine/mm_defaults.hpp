@@ -99,6 +99,7 @@ PrefillPolicy prefill_policy(const Lookup& env);
 strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows);
 const profile::Engine& profile_engine();                 // tag "minimax-pair", table profile_table
 profile::Resolution profile_resolution(const Lookup& env);
+::strix::session::kv_precision::Resolution rank_kv_resolution(const ::strix::session::kv_precision::Request& request, const Lookup& env);
 // Product profile (default|fast|quality|turbo) and TURBO weight toggle of strix-minimax-rank and strix-minimax-serve:
 // print_or_apply() takes '--profile NAME' (a product name) and --turbo-weights / --turbo-weight-bits /
 // --turbo-weights-pack from argv and exports them (STRIX_MM_PRODUCT_PROFILE, STRIX_TURBO_WEIGHTS*) before anything
@@ -183,6 +184,9 @@ SessionConfig session_policy(const Cli&, const Lookup&, bool explicit_cli = fals
 SessionConfig session_config(const Cli&, const Lookup&, std::uint64_t available = UINT64_MAX,
                              bool explicit_cli = false, const std::string& explicit_directory = "");
 Cli parse_cli(const std::string& app, const std::vector<std::string>& args);  // args without argv[0]
+
+// Explicit organization options carried by the USB4 startup negotiation.
+std::uint16_t transport_capabilities(const std::string& transport, const Lookup& env);
 
 // Canonical text, one key=value per line: CLI shape, route/build switches, every item and resolved serve policy.
 // Serve configuration validates scheduler and DSpark policy, independently of process environment export.

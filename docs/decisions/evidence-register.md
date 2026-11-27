@@ -269,3 +269,59 @@ and 39 held-out windows of three content classes (prose, code, structured) at 8K
   --qualify-q8` selects the explicit Q8_0 qualification arm for both phases.
 
 Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.
+
+## Inkling 2 Mini Strix pack SP4 attention and head (decode) on gfx1151
+
+**observed** (2026-11-26). Policy `weights.attention_head.sp4t@1` (attention query / key / value / output projections
+and the output head in `strix.sp4t@1` from a calibrated pack, identity `ede1ecc1…e5ef`, every other role BF16), HIP
+on gfx1151, decode-only route (BF16 image prefills the teacher prefix, the SP4 copies run the decode steps), checkpoint
+SHA-256 `65e60f51…39d1`. Gate v2 decode with the exact BF16 reference (`--profile exact`), a null arm and route replay on the 39 held-out
+windows of three content classes (prose, code, structured) at 8K, 32K and 64K context.
+
+- Decode regime, FAST limits: PASS, 2,457 pooled rows (KL 0.00207, top-1 0.9813, dNLL -0.00014 ± 0.00149, route flip
+  ratio 0.00); every class final and PASS (819 rows each); 32 windows PASS, 7 UNRESOLVED and cleared by their class,
+  none FAIL; every context band (8K, 32K, 64K; 819 rows each) PASS.
+- Timing (command line, B=1, `--profile fast` with MTP speculation, 1,024-token held-out prefixes, 512 tokens):
+  code 18.55 -> 16.94 ms per token, prose 17.42 -> 16.16 ms. No served receipt yet, so no decision row: a FAST row
+  needs a served lever for the pack and a served speed receipt at the decode step widths.
+
+Detailed receipts (per-window reductions, tickets, timing summaries) remain outside Git.
+
+## Inkling 2 Mini CUDA: window programs at load, served lone-lane speculation, chat default effort
+
+**observed** (2026-11-26). RTX PRO, Inkling 2 Mini CUDA, `--profile exact`, `--speculation auto` with the DSpark
+drafter, 256 decode tokens per command line run; receipts q64 and q65. Catalogue rows:
+[verify window programs](../optimizations.md#verify-window-program),
+[served lone-lane speculation](../optimizations.md#inkling2-served-lone-lane-spec),
+[chat default effort](../optimizations.md#inkling2-chat-default-effort).
+
+- q64, verify window programs on by default with every width captured at load (prewarmed 7 == captured 7): code
+  176.51 / 176.99 tok/s warm and 174.82 / 176.82 / 176.17 cold against 133.57 / 132.50 eager (+32.9 %, 51 model passes
+  in every arm); prose 99.51 against 99.22 eager. Ids equal in all 10 arms (code against the resident reference, prose
+  against the earlier prose reference).
+- q65, served lone-lane speculation (one live lane): code C1 172.71 tok/s, 0.966x the command line's 178.83 for the
+  same 656-token prompt at the same effort; C8 median 215.4 tok/s. Served C1 ids equal the command line's; served
+  C8 ids equal C1. The 0.98 served/command line band is not met.
+- q65, chat default effort: the command line now renders a request without `reasoning_effort` with the model file's
+  default (`none`), as the server does. Earlier builds rendered 0.9, so the prompt ids and the output for the same
+  input change. Reference rows at the new default: code auto 178.83 / plain 97.51 tok/s (656 prompt tokens), prose auto
+  98.76 / plain 102.12 (478 prompt tokens).
+
+Detailed receipts (per-arm logs, tickets) remain outside Git.
+
+## MiniMax serving host route default and the GLM 2x1x40 prefill layout
+
+**observed** (2026-11-27). Radeon 8060S pair over USB4, layout 2x1x40 (two cables, one host stream each, GPU-direct
+streams present) unless marked layout 1. Catalogue rows:
+[MiniMax serving host route](../optimizations.md#minimax-serve-host-route-default),
+[GLM 2x1x40 prefill layout](../optimizations.md#glm-pf-wmma-2x1x40).
+
+- M3D, MiniMax served 8K TTFT, three runs per arm: GPU-direct (the former default) 17.33 / 17.39 / 17.36 s, host route
+  12.24 / 11.60 / 12.01 s; decode equal; outputs identical. The new binary without `--transport`: 12.33 / 11.71 /
+  12.79 s, transport usb4-host, identical outputs. With usb4gpu the server declined its session cache (route not
+  qualified); the host route is the qualified session-cache route (`session_cache_gate.sh`: ON == OFF).
+- G4B, GLM pair CLI ABAB at 2,049 tokens (earlier binary): default (2x1x40 not in the layout list) = exact cores
+  3.821 / 3.824 s; forced band `STRIX_GLM_PF_WMMA=1` 2.777 / 2.775 s (x1.377; layout 1 x1.37). 8,192 tokens not timed
+  on 2x1x40 (8,192-row admission needs about 113 GiB per rank; the node had 101 GiB).
+
+Detailed receipts (per-arm logs, tickets) remain outside Git.

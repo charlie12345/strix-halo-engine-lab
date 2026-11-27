@@ -454,7 +454,10 @@ void profile_parity() {
                         loaded->tier == cli.tier.profile &&
                         loaded->experts_nvfp4 == narrow && loaded->experts_nvfp4 == mini::mini_experts_nvfp4(cli.tier) &&
                         loaded->moe_w4a4 == cli.moe_w4a4 &&
-                        loaded->combine_image == mini::mini_combine_image(cli.tier),
+                        loaded->combine_image == mini::mini_combine_image(cli.tier) &&
+                        loaded->prepared_round_fold == mini::mini_prepared_round_fold(cli.tier) &&
+                        loaded->attn_projected_bias == mini::mini_attn_projected_bias(cli.tier) &&
+                        loaded->controller_one_plane == mini::mini_controller_one_plane(cli.tier),
                         "CLI and server selected different decoder inputs");
             }
         }
@@ -462,6 +465,31 @@ void profile_parity() {
     set_expert_env(nullptr);
     set_w4a4_env(nullptr);
     const auto previous_arguments = selection.arguments;
+    set_cli_route_env("1");
+    for (const auto* backend : {"hip", "cuda"}) {
+        const bool hip = std::string_view(backend) == "hip";
+        for (const auto* tier : {"exact", "fast", "turbo"}) {
+            selection.arguments = {"--checkpoint", "MODEL.safetensors", "--backend", backend, "--profile", tier,
+                                   "--speculation", "off"};
+            loaded.reset();
+            const auto cli = parse_cli(tier, backend, {"1", "--generate", "2", "--speculation", "off"});
+            const auto service = factory->create(selection);
+            const auto schedule = mini::mini_prefill_schedule(hip, cli.tier.profile);
+            require(service && loaded && loaded->served_cli_route && !loaded->speculation &&
+                    loaded->prefill_rows == std::min(schedule.chunk, loaded->context) &&
+                    loaded->prefill_tail == mini::mini_prefill_tail_capacity(loaded->prefill_rows, schedule.tail_divisor,
+                                                                          loaded->context),
+                    "Inkling's explicit served CLI route must use the matched chunk, tail and speculation levers");
+            std::ostringstream cli_receipt, server_receipt;
+            mini::cli::write_profile(cli.tier, cli_receipt, true);
+            factory->inspect(selection, server_receipt);
+            const auto word = std::string("profile ") + mini::mini_profile_name(cli.tier.profile) + ' ';
+            require(cli_receipt.str().starts_with(word) && server_receipt.str().find(word + "speculation off") != std::string::npos,
+                    "the CLI and server receipts report the same explicit tier and served speculation off");
+        }
+    }
+    set_cli_route_env(nullptr);
+    selection.arguments = previous_arguments;
     selection.arguments.back() = "exact";
     for (const auto* backend : {"hip", "cuda"}) {
         selection.arguments[3] = backend;
@@ -502,6 +530,32 @@ void profile_parity() {
         }
     }
     set_env("STRIX_INK_LOWBIT_TURBO", nullptr);
+    // STRIX_INK_LOWBIT_HEAD=sp4t: the server takes the SP4 attention + head decode arm through the same resolver as the
+    // command line (FAST and TURBO), and refuses it on CUDA.
+    for (const auto* tier : {"exact", "fast", "turbo"}) {
+        selection.arguments.back() = tier;
+        for (const auto* value : {static_cast<const char*>(nullptr), "0", "sp4t", "sp4t-attn"}) {
+            set_env("STRIX_INK_LOWBIT_HEAD", value);
+            loaded.reset();
+            const auto cli = parse_cli(tier, "hip");
+            const auto service = factory->create(selection);
+            const bool expected = std::string_view(tier) != "exact" && value && std::string_view(value) != "0";
+            require(service && loaded && cli.weights.qualify_decode_only == expected &&
+                        loaded->weight_options.qualify_decode_only == expected &&
+                        loaded->weight_options.qualify == cli.weights.qualify &&
+                        (!expected || std::string_view(value) != "sp4t-attn" ||
+                         loaded->weight_options.qualify == &strix::weight::kAttentionHeadSP4TPolicy),
+                    "CLI and server take the same SP4 attention + head decode arm");
+        }
+    }
+    selection.arguments[3] = "cuda";
+    selection.arguments.back() = "fast";
+    set_env("STRIX_INK_LOWBIT_HEAD", "sp4t-attn");
+    loaded.reset();
+    require(refuses([&] { (void)factory->create(selection); }, "qualified on HIP only"),
+            "the CUDA server refuses the SP4 attention + head arm");
+    set_env("STRIX_INK_LOWBIT_HEAD", nullptr);
+    selection.arguments[3] = "hip";
     selection.arguments.back() = "fast";
     for (const char* backend : {"hip", "cuda"}) {
         selection.arguments[3] = backend;
@@ -601,14 +655,14 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         // The served prefill resolves the down-image lever like the CLI and the gate do: off unless selected explicitly.
         require(options.combine_image == image, "down-image selection did not reach native adapter");
         require(options.controller_one_plane == controller_one_plane, "controller plane value did not reach native adapter");
-        // The served route lever (selected by every profile column): a CUDA server runs the command line's route unless
-        // STRIX_INK_SERVED_CLI_ROUTE=0; a HIP server only when STRIX_INK_SERVED_CLI_ROUTE=1 selects it explicitly.
+        // The served route lever (the builtin of every profile column): every server runs the command line's route unless
+        // STRIX_INK_SERVED_CLI_ROUTE=0.
         const bool hip_backend = std::string_view(backend) == "hip";
         const char* route_env = std::getenv("STRIX_INK_SERVED_CLI_ROUTE");
         const bool explicit_off = route_env != nullptr && std::string_view(route_env) == "0";
-        const bool route = cli_route || (!hip_backend && !explicit_off);
+        const bool route = cli_route || !explicit_off;
         require(options.served_route_requested == route && options.served_cli_route == route,
-                "served route lever: CUDA default on (explicit 0 off), HIP explicit 1 only");
+                "served route lever: default on for every backend (explicit 0 off)");
         const auto field = mini::mini_served_route_startup_field(options);
         // Without a decoder the tail is the offered capacity; the startup line prints what the decoder admitted.
         require(!route || (field.find(" prefill_tail_offered " + std::to_string(options.prefill_tail) + ' ') != std::string::npos &&
@@ -645,7 +699,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : incumbent;
             const unsigned fallback = shape.prefill_rows ? 0U
                 : tall                                  ? 128U
-                : hip_backend                           ? 0U
+                : hip_backend                           ? 128U
                 : mini::mini_cli_prefill_fallback_rows(mini::MiniPrefillBackend::cuda, options.tier);
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
                         options.prefill_tail == 0U && options.lane_rows == incumbent &&
@@ -685,9 +739,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                                    : shape.prefill_rows                ? chunk
                                                                        : mini::kMiniServeLaneRows;
             const auto rule = mini::mini_prefill_piece_rule(hip_backend, true);
-            // The chunk ladder: HIP one candidate; an implicit CUDA chunk keeps the held-back ladder, whose smaller
-            // candidates run the held-back route (the lever runs at the command line's chunk only).
-            const unsigned fallback = hip_backend || shape.prefill_rows ? 0U
+            // The chunk ladder: an implicit chunk keeps the held-back ladder (HIP: the held-back 128 rows; CUDA: the
+            // command line's fallback rows, then 128), whose smaller candidates run the held-back route (the lever runs
+            // at the command line's chunk only), so the command line's chunk never costs a session slot.
+            const unsigned fallback = shape.prefill_rows ? 0U
+                : hip_backend ? 128U
                 : mini::mini_cli_prefill_fallback_rows(mini::MiniPrefillBackend::cuda, options.tier);
             require(options.prefill_rows == chunk && mini::mini_serve_lane_rows(options) == lanes &&
                         options.prefill_tail == mini::mini_prefill_tail_capacity(chunk, cli.tail_divisor, context) &&
@@ -703,6 +759,17 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                 require(rule.align == 32U && rule.short_rows == 32U &&
                             wide.prompt_slice_decoding == (chunk > 1024U ? 1024U : 0U),
                         "lever on, CUDA: 32-row cut rule and the 1024-row pieces");
+                sv::validate_prompt_pieces(wide, rule, chunk);
+            } else {
+                // HIP: the command line's route takes the shared long pieces too (mini_serve_pieces), cut at the wave
+                // tile above the key-split bound, one decode round per piece.
+                const auto pieces = mini::mini_serve_pieces(true, true);
+                const auto wide = mini::mini_serve_scheduling(chunk, rule, pieces);
+                require(pieces.piece_rows == 1024U && pieces.prompt_share == 0.0 &&
+                            mini::mini_serve_pieces(true, false).piece_rows == 128U &&
+                            wide.prompt_slice_decoding == (chunk > 1024U ? 1024U : 0U) &&
+                            wide.prompt_share == (chunk > 1024U ? 0.0 : 1.0),
+                        "lever on, HIP: the 1024-row pieces on the command line's route, 128 rows held-back");
                 sv::validate_prompt_pieces(wide, rule, chunk);
             }
         }
@@ -804,17 +871,16 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         if (std::string_view(field) == "--speculation") strings.pop_back();
         strings.pop_back();
     }
-    // Served speculation (kMiniSpeculation, explicit --speculation auto here): admitted on HIP (one-lane verify windows),
-    // declined on CUDA, named in the startup line before any device work.
+    // Served speculation (kMiniSpeculation, explicit --speculation auto here): admitted on HIP (one-lane verify windows)
+    // and on CUDA (the shared lone-lane speculator), named in the startup line before any device work.
     {
         std::ostringstream out, error;
         strings.insert(strings.end(), {"--speculation", "auto", "--family-inspect"});
         const auto rc = run({}, out, error);
         strings.resize(strings.size() - 3U);
-        const bool hip = std::string_view(backend) == "hip";
         require(rc == 0 && !created &&
-                    out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
-                "served speculation: auto admitted on HIP, declined on CUDA, before any device work");
+                    out.str().find(" speculation auto") != std::string::npos,
+                "served speculation: auto admitted on HIP and CUDA, before any device work");
         // The row default (auto in every tier) resolves as the explicit flag does; an explicit off wins over it.
         std::ostringstream row_out, row_error;
         const auto flag = std::ranges::find(strings, std::string("--speculation"));
@@ -824,7 +890,7 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
         const auto row_rc = run({}, row_out, row_error);
         strings.pop_back();
         strings.insert(strings.begin() + at, {"--speculation", "off"});
-        require(row_rc == 0 && row_out.str().find(hip ? " speculation auto" : " speculation declined") != std::string::npos,
+        require(row_rc == 0 && row_out.str().find(" speculation auto") != std::string::npos,
                 "served speculation: the row default resolves auto like the command line");
         std::ostringstream off_out, off_error;
         strings.insert(strings.end(), {"--speculation", "off", "--family-inspect"});
@@ -923,11 +989,11 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
                       weights->find("status")->as_string() == (qualify_q8 ? "unqualified" : "pending"))),
                     "Inkling capability response does not match the loaded plan");
             // The served route lever: absent without a request (the held-back route), else requested / admitted /
-            // qualification of the admitted route. CUDA requests the column (on unless an explicit 0), HIP an explicit 1.
+            // qualification of the admitted route. Every backend requests the column (on unless an explicit 0).
             const auto* route = effective.find("served_route");
             const char* route_env = std::getenv("STRIX_INK_SERVED_CLI_ROUTE");
             const bool explicit_off = route_env != nullptr && std::string_view(route_env) == "0";
-            const bool admitted = cli_route || (std::string_view(backend) != "hip" && !explicit_off);
+            const bool admitted = cli_route || !explicit_off;
             const bool route_ok =
                 (route != nullptr) == admitted &&
                 (!route || (route->find("requested")->as_bool() && route->find("admitted")->as_bool() == admitted &&
@@ -1104,7 +1170,9 @@ int main(int argc, char** argv) try {
             wiring(argv[1], backend, false, false, W4a4::bf16, "exact", false, false, false, shape);
     set_cli_route_env(nullptr);
     // The explicit HIP tall-chunk option: the EXACT BF16 held-back route only (an explicit --prefill-rows, a context of
-    // 128 rows or less, another tier and CUDA keep their incumbent shapes).
+    // 128 rows or less, another tier and CUDA keep their incumbent shapes). The held-back route is an explicit 0 of the
+    // served route lever (its default runs the command line's route on every backend).
+    set_cli_route_env("0");
     set_env("STRIX_INK_HIP_SERVED_TALL_CHUNK", "1");
     for (const ServedShape shape : {ServedShape{{}, {}, {}, true}, ServedShape{{}, 2048U, 6U, true},
                                     ServedShape{{}, 64U, {}, true}, ServedShape{256U, {}, {}, true}})
@@ -1112,6 +1180,7 @@ int main(int argc, char** argv) try {
     wiring(argv[1], "hip", false, false, W4a4::bf16, "turbo");
     wiring(argv[1], "cuda", false, false, W4a4::bf16, "exact");
     set_env("STRIX_INK_HIP_SERVED_TALL_CHUNK", nullptr);
+    set_cli_route_env(nullptr);
     // The projected-bias lever per tier (default on after its RTX identity receipts): unset and 1 select the projected
     // flash, an explicit 0 keeps the image route;
     // tests/inkling2/mini_gate_cli_test.cpp pins the same table through the CLI.

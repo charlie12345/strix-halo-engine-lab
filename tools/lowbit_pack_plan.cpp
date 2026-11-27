@@ -1,6 +1,7 @@
 #include "strix/serve/json.hpp"
 #include "strix/weight/pack_plan.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 constexpr double gib = 1073741824.0;
@@ -24,7 +26,17 @@ std::uint64_t gib_bytes(const std::string& text) {
 }
 }  // namespace
 
+constexpr std::string_view kUsage =
+    "usage: strix-lowbit-pack-plan --model-description FILE --cold sp2|sp3|sp4 --budget-gib N\n"
+    "                              [--reserve-gib N] [--hot-experts N]\n"
+    "Prints the Strix pack plan (tensor, format, bytes[, coder]) that fits the device budget.\n";
+
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (const std::string_view arg = argv[i]; arg == "--help" || arg == "-h") {
+            std::cout << kUsage;
+            return 0;
+        }
     try {
         std::string description, cold;
         std::uint64_t budget = 0, reserve = 0, hot = 0;
@@ -51,10 +63,14 @@ int main(int argc, char** argv) {
         namespace wei = strix::weight;
         const auto result = wei::plan_strix_pack(strix::serve::parse_json_unique(contents.str()),
                                                  wei::strixpack_format(cold), hot, budget, reserve);
-        std::cout << "tensor\tformat\tbytes\n";
-        for (const auto& tensor : result.tensors)
+        const bool coders = std::ranges::any_of(result.tensors, [](const auto& tensor) { return !tensor.coder.empty(); });
+        std::cout << "tensor\tformat\tbytes" << (coders ? "\tcoder\n" : "\n");
+        for (const auto& tensor : result.tensors) {
             std::cout << tensor.tensor << '\t' << (tensor.storage.name.empty() ? "keep" : wei::strixpack_label(tensor.storage))
-                      << '\t' << tensor.bytes << '\n';
+                      << '\t' << tensor.bytes;
+            if (coders) std::cout << '\t' << tensor.coder;
+            std::cout << '\n';
+        }
         std::cerr << (result.fits() ? "FIT" : "OVER BUDGET") << " bytes=" << result.bytes << " GiB=" << std::fixed
                   << std::setprecision(1) << static_cast<double>(result.bytes) / gib << " budget_bytes=" << result.budget
                   << " reserve_bytes=" << result.reserve << " hot_experts=" << result.hot_experts << '\n';

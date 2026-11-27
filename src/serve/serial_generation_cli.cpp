@@ -1,6 +1,8 @@
 #include "strix/serve/serial_generation_cli.hpp"
 
 #include "core/dense_linear.hpp"
+#include "strix/exec/route_capabilities.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
@@ -10,10 +12,12 @@
 #include "strix/serve/prefill_chunk_fallback.hpp"
 #include "strix/session/embed_rows.hpp"
 #include "strix/session/cli_output.hpp"
+#include "strix/spec/block_setup.hpp"
 #include "strix/spec/greedy_continuation.hpp"
 #include "strix/spec/probe_policy.hpp"
 #include "strix/spec/verify_cost_table.hpp"
 #include "strix/token_sampling.hpp"
+#include "strix/token_sampling_device.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -315,6 +319,31 @@ TextInput read_text_input(const char* path) {
 
 std::string read_text(const char* path) { return read_text_input(path).text; }
 
+// Per-round diagnostic (STRIX_SPEC_ROUND_LOG=N; off by default): the first N verify rounds of a speculating run, one
+// stderr line each, written after the round's commit (spec::RoundSink): no effect on any decision or bit. Two runs that
+// should decide alike (e.g. an executor switched on and off) are compared line by line; the first differing line names
+// the round, and its fields what differs (source / window, drafts, the target's pick at every verified row, accepted).
+class RoundLog final : public spec::RoundSink {
+public:
+    RoundLog(std::ostream& out, std::uint32_t rounds) : out_(out), left_(rounds) {}
+    void round(const spec::RoundRecord& record) override {
+        if (left_ == 0U) return;
+        --left_;
+        out_ << "spec-round " << index_++ << " context " << record.context << " source "
+             << spec::source_name(record.source) << " rows " << record.rows << " accepted " << record.accepted
+             << " copy " << record.copy << " ext " << record.ext << " drafts";
+        for (const auto id : record.drafts) out_ << ' ' << id;
+        out_ << " picks";
+        for (const auto id : record.greedy) out_ << ' ' << id;
+        out_ << '\n';
+    }
+
+private:
+    std::ostream& out_;
+    std::uint32_t left_;
+    std::uint32_t index_ = 0;
+};
+
 }  // namespace
 
 // --messages with image parts: the shared media layer normalizes them (data URLs / base64 only: the CLI has no
@@ -549,10 +578,15 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     // A sampled request verifies rows with the serial sampler's draw at each position (same policy and request
     // identity as the serial path below), so the ids equal serial sampled decode.
     const auto row_rule = greedy ? spec::RowRule{} : spec::RowRule(options.sampling, sampler_options.request_identity);
-    if (verify && !greedy && !verify->supports_row_rule(true)) {
-        if (options.speculation != CliSpeculation::automatic)
-            throw std::invalid_argument("this target cannot verify sampled rows");
-        verify = nullptr;
+    if (verify_rows > 1U) {
+        const exec::DecodeCapabilities offered{.verifier = verify != nullptr, .sampling = true,
+            .sampled_verifier = !greedy && verify && verify->supports_row_rule(true)};
+        if (!offered.provides({.verifier = true, .sampled_verifier = !greedy})) {
+            if (options.speculation != CliSpeculation::automatic)
+                throw std::invalid_argument(verify ? "this target cannot verify sampled rows" :
+                                                     "this target cannot verify a window");
+            verify = nullptr;
+        }
     }
     std::optional<spec::BlockDrafter> drafter;
     // Opened (file read) before the decode clock; stored after it.
@@ -564,50 +598,60 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     std::uint32_t cost_seeded = 0, cost_recorded = 0, chain_k = 0;
     bool cost_stored = false, prices_frozen = false;
     SerialGreedyRequestResult generated;
+    bool device_sampled = false;  // the serial path's sampled rows decided on the device (decode_sampled)
     const auto decode_start = Clock::now();
     if (verify) {
-        spec::BlockConfig config;
-        config.hybrid = false;  // The optional chain owns a complete, independent block (an engine may opt in).
-        if (options.speculation != CliSpeculation::verify) decoder->tune_speculation(config);
-        spec::apply_probe_loss(config.arbiter, family.speculation_probe_loss);
-        if (config.arbiter.windows.empty() || max_rows > config.arbiter.windows.back())
-            throw std::invalid_argument("target exceeds the supported verify row count");
-        config.max_block = max_rows;
-        config.force_lookup = options.speculation == CliSpeculation::lookup;
-        auto* chain = options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
-        if (!chain) config.hybrid = false;
-        chain_k = chain && config.chain ? std::min(config.chain_max_k, max_rows > 1U ? max_rows - 1U : 0U) : 0U;
-        // Frozen prices (strix/spec/verify_cost_table.hpp): a table that prices every window of this run (and a chain
-        // depth) is the whole cost model, so the row choices are a function of the table and the acceptance history,
-        // not of this run's host clock. Otherwise auto learns verify + commit and draft walls in this run. The
-        // diagnostic keeps its original equal prices.
-        prices_frozen = cost_table && spec::table_prices_run(*cost_table, config.arbiter.windows, max_rows, chain_k);
-        config.fixed_costs = options.speculation == CliSpeculation::verify || prices_frozen;
-        config.frozen_prices = prices_frozen;
-        // Learned walls: the first pass of a width can carry its one-time work (graph capture), never a price.
-        if (!config.fixed_costs) config.arbiter.cold_walls = 1;
-        if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
-        // Frozen prices also price the exploration (ArbiterConfig::priced_exploration: probes never buy a window that
-        // cannot pay and never move the arm hysteresis) and stop a drafter whose realized cycles lose at those prices
-        // (ArbiterConfig::cycle_half_life_tokens).
-        if (prices_frozen) spec::set_frozen_price_rules(config.arbiter);
-        drafter.emplace(config, chain);
-        // Before seeding: switching the drafter to sampled rows resets its learned observations.
-        drafter->set_row_rule(row_rule);
-        if (options.speculation == CliSpeculation::verify)
-            for (std::uint32_t row = 1; row <= max_rows; ++row) drafter->seed_verify_ms(row, 1.0);
-        else
-            decoder->seed_speculation(*drafter);
+        // The shared block setup (strix/spec/block_setup.hpp); this command line adds its request modes, the frozen
+        // prices of its cost table and the diagnostic's equal prices.
+        spec::BlockSetup setup;
+        setup.max_rows = max_rows;
+        setup.probe_loss = family.speculation_probe_loss;
+        if (options.speculation != CliSpeculation::verify)
+            setup.tune = [&](spec::BlockConfig& config) { decoder->tune_speculation(config); };
+        setup.chain = [&](spec::BlockConfig& config) -> spec::ChainDrafter* {
+            config.force_lookup = options.speculation == CliSpeculation::lookup;
+            return options.speculation == CliSpeculation::automatic ? decoder->chain_drafter(next, prompt_size) : nullptr;
+        };
+        setup.prices = [&](spec::BlockConfig& config, spec::ChainDrafter* chain) {
+            chain_k = chain && config.chain ? std::min(config.chain_max_k, max_rows > 1U ? max_rows - 1U : 0U) : 0U;
+            // Frozen prices (strix/spec/verify_cost_table.hpp): a table that prices every window of this run (and a
+            // chain depth) is the whole cost model, so the row choices are a function of the table and the acceptance
+            // history, not of this run's host clock. Otherwise auto learns verify + commit and draft walls in this run.
+            // The diagnostic keeps its original equal prices.
+            prices_frozen = cost_table && spec::table_prices_run(*cost_table, config.arbiter.windows, max_rows, chain_k);
+            config.fixed_costs = options.speculation == CliSpeculation::verify || prices_frozen;
+            config.frozen_prices = prices_frozen;
+            if (config.fixed_costs) spec::set_context_cost(config.arbiter, "off");
+            // Frozen prices also price the exploration (ArbiterConfig::priced_exploration: probes never buy a window
+            // that cannot pay and never move the arm hysteresis) and stop a drafter whose realized cycles lose at those
+            // prices (ArbiterConfig::cycle_half_life_tokens).
+            if (prices_frozen) spec::set_frozen_price_rules(config.arbiter);
+        };
+        setup.row_rule = row_rule;
+        setup.seed = [&](spec::BlockDrafter& built) {
+            if (options.speculation == CliSpeculation::verify)
+                for (std::uint32_t row = 1; row <= max_rows; ++row) built.seed_verify_ms(row, 1.0);
+            else
+                decoder->seed_speculation(built);
+        };
+        (void)spec::make_block_drafter(drafter, setup);
         // Walls measured by earlier runs win over the engine's declared seeds (applied after them).
         if (cost_table) {
             const auto& seeds = cost_prior ? *cost_prior : *cost_table;
             cost_seeded = spec::seed_verify_costs(seeds, *drafter, max_rows);
             if (chain_k > 0U) (void)spec::seed_draft_costs(seeds, *drafter, chain_k);
         }
-        generated =spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
-                                                           row_rule);
+        std::optional<RoundLog> round_log;
+        if (const int rounds = envcfg::integer("STRIX_SPEC_ROUND_LOG", 0); rounds > 0)
+            round_log.emplace(std::cerr, static_cast<std::uint32_t>(rounds));
+        generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
+                                                           row_rule, round_log ? &*round_log : nullptr);
     } else {
+        // A decoder that samples on the device decides every sampled row there: the same ids for the request's seed,
+        // without the logits row's host copy and host transform (STRIX_SAMPLE_PATH=host keeps the host path).
+        device_sampled = sampler && device_token_sampling_enabled(options.sampling) && decoder->samples_on_device();
         generated = execute_serial_token_continuation(request, [&](std::uint32_t input, std::uint64_t position) {
+            if (device_sampled) return decoder->decode_sampled(input, *sampler, position + 1U);
             const auto selected = decoder->decode(input, logits);
             return sampler ? sampler->decide(logits, position + 1U, nullptr).token : selected;
         }, emit);
@@ -624,6 +668,7 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     out << "timing prompt_tokens " << prompt_size << " prefill_ms " << prefill_ms
         << " decode_tokens " << generated.steps_executed << " decode_ms "
         << (generated.steps_executed ? decode_ms : 0.0) << " decode_tok_s " << decode_tok_s << '\n';
+    if (sampler) out << "sampling path " << (device_sampled ? "device" : "host") << '\n';
     if (options.speculation != CliSpeculation::off) {
         const spec::SpecStats empty;
         const auto& stats = drafter ? drafter->stats() : empty;
@@ -653,6 +698,10 @@ std::uint32_t SerialGenerationDecoder::prefill_embedded(std::span<const std::uin
                                                        std::span<float> logits) {
     if (table) throw std::invalid_argument("this family takes no provided embedding rows");
     return prefill(ids, logits);
+}
+
+std::uint32_t SerialGenerationDecoder::decode_sampled(std::uint32_t, TokenSampler&, std::uint64_t) {
+    throw std::logic_error("this decoder does not sample on the device");
 }
 
 int run_serial_generation_cli(int argc, char** argv, const SerialGenerationFamily& family,

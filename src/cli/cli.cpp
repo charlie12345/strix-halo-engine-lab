@@ -1,5 +1,6 @@
 #include "strix/cli/cli.hpp"
 #include "strix/build_info.hpp"
+#include "strix/profile/all_on.hpp"
 #include "detail.hpp"
 
 #include <algorithm>
@@ -17,7 +18,7 @@ constexpr std::string_view usage =
     "       strix plan MODEL --context N [--devices FILE] --json\n"
     "       strix run|serve [--model] MODEL [--profile exact|fast|turbo] [--backend hip|cuda]\n"
     "             [--asset PATH] [--device-count N] [--placement single|replica|layers|tensor|speculation]\n"
-    "             [--print-effective-config] [--dry-run] [-- ENGINE_ARGS]\n"
+    "             [--native-profile] [--print-effective-config] [--dry-run] [-- ENGINE_ARGS]\n"
     "             (serve also takes --host H and --port P)\n"
     "       strix update | rollback\n";
 
@@ -204,6 +205,9 @@ Request parse(const std::vector<std::string>& args) {
         else if (launch && arg == "--dry-run" && !r.dry_run) r.dry_run = true;
         else if (launch && arg == "--print-effective-config" && !r.print_effective_config)
             r.print_effective_config = true;
+        else if (launch && arg == "--native-profile" && !r.native_profile) r.native_profile = true;
+        else if (launch && arg == "--all-on" && !r.all_on) r.all_on = true;
+        else if (launch && arg == "--all-on-band" && r.all_on_band.empty()) r.all_on_band = value();
         else if (launch && (arg == "--profile" || arg.starts_with("--profile=")) && !r.profile)
             r.profile = profile::parse_tier(arg == "--profile" ? std::string_view(value()) : std::string_view(arg).substr(10));
         else if (launch && arg == "--asset" && r.asset.empty()) r.asset = value();
@@ -291,6 +295,7 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
             (!query.placement || query.placement == profile::multi_device::Form::layers ||
              query.placement == profile::multi_device::Form::tensor);
         Command cmd{executable, {}};
+        cmd.backend = std::string(route.backend);
         if (hy4_shell) cmd.args.insert(cmd.args.end(), {"--model", entry.id});
         if (!route.model_flag.empty()) cmd.args.emplace_back(route.model_flag);
         cmd.args.push_back(std::move(asset));
@@ -315,6 +320,7 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
         }
         if (hy4_shell) {
             if (req.profile) cmd.args.insert(cmd.args.end(), {"--profile", std::string(profile::tier_word(*req.profile))});
+            if (req.native_profile) cmd.args.emplace_back("--native-profile");
             if (req.device_count) cmd.args.insert(cmd.args.end(), {"--device-count", std::to_string(req.device_count)});
             if (!req.placement.empty()) cmd.args.insert(cmd.args.end(), {"--placement", req.placement});
             if (req.print_effective_config) cmd.args.emplace_back("--print-effective-config");
@@ -322,11 +328,14 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
             cmd.args.insert(cmd.args.end(), rest.begin(), rest.end());
             return cmd;
         }
+        if (req.native_profile) profile::append_native_profile(cmd.args, req.profile);
         if (description) {
             // A native --profile in the engine arguments (or a model without [presets]) keeps its passthrough (no preset injection), but the explicit
             // placement is still validated: the description stays available independently of argument injection.
-            if (!req.profile && !req.print_effective_config && (native_profile_arguments(rest) || !description->find("presets"))) {
-                if (const auto word = native_profile_word(rest); !word.empty()) {
+            if (req.native_profile || (!req.profile && !req.print_effective_config &&
+                    (native_profile_arguments(rest) || !description->find("presets")))) {
+                if (req.profile) query.tier = *req.profile;
+                else if (const auto word = native_profile_word(rest); !word.empty()) {
                     try { query.tier = profile::parse_tier(word); } catch (const std::invalid_argument&) {}   // the engine rejects it
                 }
                 cmd.placement = profile::multi_device::resolve(*description, query);
@@ -359,6 +368,7 @@ int launch(const Request& request, const std::vector<model_registry::Entry>& ent
     }
     if (req.print_effective_config && !req.dry_run && description && req.asset.empty() &&
         req.args.empty() && alias(entry, req.model)) {
+        if (req.native_profile) invalid("--native-profile inspection requires an engine asset");
         out << profile::resolve_model_preset(*description, req.profile, req.backend.empty() ? "hip" : req.backend,
                                              placement_query(req)).config.dump() << '\n';
         return 0;
@@ -368,6 +378,11 @@ int launch(const Request& request, const std::vector<model_registry::Entry>& ent
         if (req.verb == Verb::serve) command.args.insert(command.args.begin(), {"--registry-root", data.string()});
         else command.args.insert(command.args.end(), {"--pair-model", (data / entry.description).string()});
     }
+    // --all-on / STRIX_ALL_ON=1: the shared resolver prints one line per lever and, on a real launch, exports the levers.
+    std::optional<profile::all_on::Scope> all_on;
+    if (req.all_on || profile::all_on::env_requested())
+        all_on.emplace(profile::all_on::begin(description, req.profile, command.backend.empty() ? req.backend : command.backend,
+                                              req.all_on_band, out, !req.dry_run, command.args));
     if (command.preset && req.print_effective_config)
         out << command.preset->config.dump() << '\n' << std::flush;
     if (req.dry_run) {
@@ -388,7 +403,7 @@ int launch(const Request& request, const std::vector<model_registry::Entry>& ent
     if (command.placement && !req.print_effective_config)
         profile::multi_device::admit(*command.placement, profile::multi_device::Executor::engine);
     std::optional<profile::PresetScope> scope;
-    if (command.preset) scope.emplace();
+    if (req.native_profile || command.preset) scope.emplace(!req.native_profile);
     return execute(command);
 }
 

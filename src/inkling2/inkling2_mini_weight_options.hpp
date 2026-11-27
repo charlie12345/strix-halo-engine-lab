@@ -7,6 +7,7 @@
 #include "strix/model_data/inkling2_mini.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "strix/serve/row_budget.hpp"
+#include "strix/spec/probe_policy.hpp"
 #include "strix/weight/lowbit_pack.hpp"
 #include "strix/weight/resolve.hpp"
 
@@ -36,10 +37,12 @@ struct MiniWeightOptions {
 };
 
 // The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
-// the shared head-only low-bit rows (attention BF16), plus attention-only Q8_0.
-inline constexpr std::array<weight::WeightLoadPolicy, 8> kMiniQualifiablePolicies{
+// the shared head-only low-bit rows (attention BF16), plus attention-only Q8_0 and the Strix pack SP4 attention + head
+// row (from a calibrated pack, STRIX_LOWBIT_PACK).
+inline constexpr std::array<weight::WeightLoadPolicy, 9> kMiniQualifiablePolicies{
     kMiniWeightLoadPolicy, weight::kAttentionQ8Policy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
-    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy, kMiniSp4HeadPolicy};
+    weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy, kMiniSp4HeadPolicy,
+    weight::kAttentionHeadSP4TPolicy};
 
 inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
     if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
@@ -108,21 +111,28 @@ inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
     return tier.profile == profile::Name::turbo;
 }
 
-// STRIX_INK_LOWBIT_HEAD: "sp4t" selects the SP4 head arm in FAST or TURBO; "0" (builtin) leaves the head as is.
-inline bool mini_lowbit_head(const profile::Resolution& tier) {
+// STRIX_INK_LOWBIT_HEAD, in FAST or TURBO: "sp4t" selects the SP4 head arm (kMiniSp4HeadPolicy); "sp4t-attn" the SP4
+// attention projections + head arm (weights.attention_head.sp4t@1, the arm of --qualify-decode-weights); "0" (builtin)
+// leaves the weights as they are. nullptr: no arm.
+inline const weight::WeightLoadPolicy* mini_lowbit_head_policy(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniLowBitHead);
-    if (entry == nullptr || entry->value == "0") return false;
-    if (entry->value != "sp4t") throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0 or sp4t");
-    return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo;
+    if (entry == nullptr || entry->value == "0") return nullptr;
+    const weight::WeightLoadPolicy* policy = entry->value == "sp4t"        ? &kMiniSp4HeadPolicy
+                                             : entry->value == "sp4t-attn" ? &weight::kAttentionHeadSP4TPolicy
+                                                                           : nullptr;
+    if (policy == nullptr) throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0, sp4t or sp4t-attn");
+    return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo ? policy : nullptr;
 }
+inline bool mini_lowbit_head(const profile::Resolution& tier) { return mini_lowbit_head_policy(tier) != nullptr; }
 
-// The lever's arm is the decode-only head qualification arm of kMiniSp4HeadPolicy: it needs STRIX_LOWBIT_PACK and
-// combines with no other weight arm.
+// The lever's arm is a decode-only qualification arm (the BF16 image prefills, the SP4 copies decode): it needs
+// STRIX_LOWBIT_PACK and combines with no other weight arm. The command line and the server call this one rule.
 inline void apply_mini_lowbit_head(MiniWeightOptions& options, const profile::Resolution& tier) {
-    if (!mini_lowbit_head(tier)) return;
+    const auto* policy = mini_lowbit_head_policy(tier);
+    if (policy == nullptr) return;
     if (options.qualify != nullptr || options.qualify_q8 || options.lowbit_turbo || options.disable_q8)
-        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD=sp4t combines with no other weight arm");
-    options.qualify = &kMiniSp4HeadPolicy;
+        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD combines with no other weight arm");
+    options.qualify = policy;
     options.qualify_decode_only = true;
 }
 
@@ -330,8 +340,9 @@ inline unsigned mini_speculation_verify_rows(unsigned verify_rows, bool speculat
 
 // The effective speculation of one run, the one rule of the command line and the server. `requested`: the run asks
 // for speculation (an explicit --speculation / --dspark, else the row kMiniSpeculation); `explicit_request`: it came
-// from the run's own flags. A calibrated low-bit target (the q4 row) and speculation never share a run: a verify window
-// runs the incumbent verify body, so its picks would not be the low-bit decode's picks. The explicit request wins: an
+// from the run's own flags. The calibrated low-bit TURBO row (the q4 row) and speculation never share a run: its receipt
+// measured plain decode only (an explicit decode-only qualification arm verifies on its own low-bit copies and may
+// speculate, apps/inkling2_mini_gpu_main.hpp). The explicit request wins: an
 // explicit speculation declines the low-bit row (incumbent weights, as before); a row default yields to the requested
 // low-bit row (plain decode on that target). A backend without verify windows declines with its own reason.
 struct MiniSpeculationPolicy {
@@ -397,15 +408,11 @@ inline bool mini_served_cli_route(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_SERVED_CLI_ROUTE must be 0 or 1");
 }
 
-// The served route a server of the backend requests: CUDA the resolved value (the profile columns select it); HIP only an
-// explicit setting (STRIX_INK_SERVED_CLI_ROUTE=1), so a HIP server keeps the held-back route by default until the
-// route's per-slot working memory on HIP (the command line's chunk instead of the 128-row held-back chunk) is decided.
-inline bool mini_served_route_request(const profile::Resolution& tier, bool hip) {
-    if (!mini_served_cli_route(tier)) return false;
-    if (!hip) return true;
-    const auto* entry = tier.find(kMiniServedCliRoute);
-    return entry->status == profile::Status::explicit_env || entry->status == profile::Status::explicit_cli;
-}
+// The served route a server requests: the resolved value on every backend (the builtin runs it; an explicit 0 keeps the
+// held-back route). The route's per-slot working memory (the command line's chunk instead of the 128-row held-back
+// chunk) never costs a session slot: the served load's chunk ladder (mini_served_prefill_fallback_rows) keeps the held-back
+// 128 rows as the smaller candidate wherever the command line's chunk would.
+inline bool mini_served_route_request(const profile::Resolution& tier) { return mini_served_cli_route(tier); }
 
 // The command line's receipt of the served route lever: the requested value as the resolution holds it (unparsed, so a
 // malformed server setting never aborts the command line) and that it does not apply here.
@@ -444,6 +451,21 @@ inline const char* mini_verify_rows_name(unsigned active, unsigned selected) {
 // command line keeps the decoder's level (its verify windows screen through the lanes pick).
 inline unsigned mini_served_verify_rows(unsigned active, bool served_cli_route, std::size_t admitted_slots) {
     return active >= kMiniVerifyLanesPick && (served_cli_route || admitted_slots < 2U) ? 1U : active;
+}
+
+// Verify window programs (CUDA, MiniResidentDecoder::set_window_programs): default on for the levers the device identity
+// fixture proves (q52r: the EXACT levers, projected bias, screened or full head; timing q62), off switch
+// STRIX_INKLING_WINDOW_PROGRAMS=0. The one rule of the command line (apps/inkling2_mini_gpu_main.hpp) and the server.
+inline bool mini_window_programs_requested() {
+    const char* value = strix::envcfg::text("STRIX_INKLING_WINDOW_PROGRAMS");
+    return !(value && std::string_view(value) == "0");
+}
+inline bool mini_window_programs_proven(bool combine_image, bool prepared_round_fold, bool narrow_experts,
+                                        bool controller_one_plane, moe_core::grouped_w4a4::Activations moe_w4a4,
+                                        bool attn_projected_bias, weight::RoleStorage storage) {
+    return !combine_image && !prepared_round_fold && !narrow_experts && !controller_one_plane &&
+           moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 && attn_projected_bias &&
+           storage.attention == weight::kBf16WeightStorage && storage.head == weight::kBf16WeightStorage;
 }
 
 // What the decoder's backend admitted of the resolved levers: the effective state every entry point reports.
@@ -509,7 +531,7 @@ inline constexpr std::string_view kMiniBuildBackend = "cuda";
 // The charged re-probe episodes this backend's build runs: the model TOML's [speculation.probe_loss] row for it
 // (spec::resolve_probe_loss), the fixed interval where the TOML has none.
 #if defined(__HIPCC__)
-inline constexpr double kMiniProbeLoss = 0.0;
+inline constexpr double kMiniProbeLoss = strix::spec::kFixedReprobeInterval;
 #else
 inline constexpr double kMiniProbeLoss = model_data::inkling2_mini::speculation::probe_loss::cuda;
 #endif

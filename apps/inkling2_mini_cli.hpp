@@ -3,6 +3,7 @@
 #include "core/dense_linear.hpp"
 #include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
+#include "strix/exec/route_capabilities.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/head_gate_cli.hpp"
 
@@ -22,6 +23,8 @@ namespace strix::inkling2::cli {
 struct Options {
     serve::SerialGenerationOptions generation;
     const char* dspark{};
+    const char* host_pack{};
+    const char* host_pack_hot{};
     bool dspark_off{};  // --dspark off: no drafter, not even the model's sidecar under auto
     const char* gate_manifest{};
     const char* gate_out{};
@@ -48,7 +51,13 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                 options.dspark = options.dspark_off ? nullptr : file;
                 return true;
             }
-            if (!native) return false;
+            if (!native) {
+                if (argument != "--host-pack" && argument != "--host-pack-hot") return false;
+                auto& path = argument == "--host-pack" ? options.host_pack : options.host_pack_hot;
+                if (path) throw std::invalid_argument("duplicate " + std::string(argument));
+                path = value();
+                return true;
+            }
             if (argument == "--step-graph" || argument == "--no-step-graph")
                 options.step_graphs = argument == "--step-graph";
             else if (argument == "--gate-manifest") options.gate_manifest = value();
@@ -81,6 +90,16 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                  generation.sampling_requested))
         throw std::invalid_argument("gate mode takes no prompt, --tokenize, --generate, --logits or sampling options");
     options.tier = resolve_mini_profile(options.weights, native && !generation.tokenize_file);
+    if (options.host_pack_hot && !options.host_pack)
+        throw std::invalid_argument("--host-pack-hot requires --host-pack");
+    if (options.host_pack) {
+        if ((options.tier.profile != profile::Name::fast && options.tier.profile != profile::Name::turbo) ||
+            generation.tokenize_file)
+            throw std::invalid_argument("--host-pack requires CPU generation with --profile fast or --profile turbo");
+        if (generation.logits && std::filesystem::exists(generation.logits) && std::filesystem::exists(options.host_pack) &&
+            std::filesystem::equivalent(generation.logits, options.host_pack))
+            throw std::invalid_argument("logits output must differ from the host pack");
+    }
     // The speculation row (kMiniSpeculation) is the default of a generating run; an explicit --speculation wins.
     if (!generation.speculation_requested && !gate && !generation.tokenize_file && family.supports_speculation &&
         mini_speculation(options.tier))
@@ -171,6 +190,13 @@ struct CudaStepRoute {
     bool plain_program = false;
 };
 
+enum class CudaDecoder { program, resident };
+inline constexpr exec::DecodeCandidate<CudaDecoder> kProgramDecoder{CudaDecoder::program, exec::DecodeCapabilities{.sampling = true}};
+inline constexpr exec::DecodeCandidate<CudaDecoder> kCudaDecoders[]{
+    kProgramDecoder,
+    {CudaDecoder::resident, {.verifier = true, .taps = true, .sampling = true}},
+};
+
 inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepProgramOptions& program_options,
                                              weight::FormatId storage, bool resident_k1) {
     using Mode = serve::CliSpeculation;
@@ -192,12 +218,19 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     // replay choice or a gate run keeps the former resolution. A run that can never draft (token sampling: the shared CLI
     // loads it with speculation off) keeps the step program too; an embeddings prompt, known only at load, binds the
     // plain rows of the verifying route to the step program instead (DeviceCliDecoder::decode).
-    const bool verifying = requested_mode == Mode::automatic && has_decode && !options.gate_manifest &&
+    const bool automatic_route = requested_mode == Mode::automatic && has_decode && !options.gate_manifest &&
                            !options.step_graphs && !program_options.requested && !program_options.latency_forms_set &&
-                           program_options.epilogue_fusion && !token_sampling_enabled(options.generation.sampling);
+                           program_options.epilogue_fusion;
+    const bool sampled = token_sampling_enabled(options.generation.sampling);
+    const auto verifying_route = automatic_route
+        ? exec::resolve_decode_route(std::span{kCudaDecoders},
+              {.verifier = true, .taps = true, .sampling = sampled, .sampled_verifier = sampled})
+        : std::nullopt;
+    const bool verifying = verifying_route == CudaDecoder::resident;
     // E1 handles both packed and grouped decode. Its backend resolves the
     // K1 projection batch and the eager fallback for tapped recipes.
-    const bool program = !verifying && (program_options.requested || (has_decode && !options.step_graphs));
+    const bool program = verifying_route ? *verifying_route == CudaDecoder::program :
+                         program_options.requested || (has_decode && !options.step_graphs);
     if (!program) {
         if (!program_options.epilogue_fusion)
             throw std::invalid_argument("--no-epilogue-fusion requires the CUDA step program");
@@ -214,15 +247,17 @@ inline CudaStepRoute resolve_cuda_step_route(const Options& options, const StepP
     if (options.dspark)
         throw std::invalid_argument("CUDA step program does not support --dspark; choose resident replay "
                                     "with --step-graph or --no-step-graph");
-    if (requested_mode == Mode::verify || requested_mode == Mode::lookup)
+    const auto selected = std::span{&kProgramDecoder, 1U};
+    const auto can_verify = exec::resolve_decode_route(selected, {.verifier = true, .sampled_verifier = sampled});
+    if ((requested_mode == Mode::verify || requested_mode == Mode::lookup) && !can_verify)
         throw std::invalid_argument("CUDA step program has no verifier; choose resident replay "
                                     "with --step-graph or --no-step-graph for forced drafting");
     if (storage != weight::kBf16WeightStorage)
         throw std::invalid_argument("CUDA step program requires BF16 weights; choose resident replay "
                                     "with --step-graph or --no-step-graph for Q8_0");
-    if (requested_mode == Mode::automatic)
+    if (requested_mode == Mode::automatic && !can_verify)
         return {true, Mode::off, "CUDA step program has no verifier"};
-    return {true, Mode::off, {}};
+    return {true, requested_mode, {}};
 }
 
 inline void write_profile(const profile::Resolution& tier, std::ostream& output, bool device) {

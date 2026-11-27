@@ -3,6 +3,7 @@
 #include "channel_device.hpp"
 #include "wire.hpp"
 #include "small_progress.hpp"
+#include "failure_log.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_argmax_core.hpp"
 
@@ -532,13 +533,21 @@ std::string Channel<Traits>::name() const {
 
 template<class Traits>
 void Channel<Traits>::fail(const std::string& why) {
+    bool first = false;
     {
         std::lock_guard<std::mutex> g(failure_mutex_);
-        if (failure_.empty()) failure_ = why;
+        first = remember_first_failure(failure_, why);
     }
     failed_.store(true, std::memory_order_release);
     __atomic_store_n(&flags_host_[kRxFlag], ~std::uint64_t{0}, __ATOMIC_RELEASE);
-    transport_->abort(why);
+    // Never delay the abort or hold the failure mutex for diagnostic I/O.
+    try {
+        transport_->abort(why);
+    } catch (...) {
+        if (first) log_failure(failure_, options_.rank);
+        throw;
+    }
+    if (first) log_failure(failure_, options_.rank);
     throw std::runtime_error(why);
 }
 
@@ -672,12 +681,14 @@ void Channel<Traits>::run() {
             last = Clock::now();
         }
     } catch (const std::exception& e) {
+        bool first = false;
         if (!failed_.load()) {
             std::lock_guard<std::mutex> g(failure_mutex_);
-            if (failure_.empty()) failure_ = e.what();
+            first = remember_first_failure(failure_, e.what());
             failed_.store(true);
         }
         __atomic_store_n(&flags_host_[kRxFlag], ~std::uint64_t{0}, __ATOMIC_RELEASE);
+        if (first) log_failure(failure_, options_.rank);
     }
 }
 

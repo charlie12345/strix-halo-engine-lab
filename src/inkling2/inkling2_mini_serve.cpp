@@ -2,6 +2,7 @@
 #include "inkling2_mini_config.hpp"
 #include "inkling2_mini_schedule.hpp"
 
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/inkling2_chat.hpp"
 
@@ -103,6 +104,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.speculation_requested = out.speculation_policy.requested;
     out.speculation = out.speculation_policy.admitted;
     out.lane_speculation = out.speculation && resolved.backend != "hip";
+    mini_record_verify_rows_idle(mini_verify_rows(resolution), out.speculation, std::cerr);
     out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);
@@ -118,13 +120,23 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // route: the command line's chunk where the backend's prefill is chunk-invariant (CUDA), else 128 rows; the lever:
     // the command line's chunk and tail rule), clamped to the context. Lanes: mini_serve_lane_rows.
     auto schedule = mini_served_prefill_schedule_from_env(hip, out.served_cli_route, out.tier);
-    // Explicit HIP option (STRIX_INK_HIP_SERVED_TALL_CHUNK=1, off in every tier): the held-back EXACT BF16 route tries
+    // Explicit HIP option (STRIX_INK_HIP_SERVED_TALL_CHUNK=1, off by default; mini_served_tall_chunk_admitted: FAST and TURBO
+    // that run the BF16 expert tile; not bitwise, so never an EXACT lever): the held-back BF16 route tries
     // the command line's chunk although HIP is not declared chunk-invariant (a distinct identity); the shared chunk
     // ladder keeps it only where its whole load keeps the 128-row chunk's slot capacity, else the incumbent 128 rows.
-    const bool hip_tall_chunk = hip && !out.served_cli_route && !explicit_rows &&
-        out.tier == profile::Name::standard && out.moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16 &&
-        !out.experts_nvfp4 && out.context > kMiniServedHeldBackChunk &&
-        env_flag_default_off("STRIX_INK_HIP_SERVED_TALL_CHUNK");
+    const bool tall_requested = env_flag_default_off("STRIX_INK_HIP_SERVED_TALL_CHUNK");
+    const bool hip_tall_chunk = mini_served_tall_chunk_admitted(
+        hip, out.tier, out.served_cli_route, explicit_rows.has_value(), out.context,
+        out.moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16, out.experts_nvfp4,
+        out.weight_options.qualify != nullptr && out.weight_options.qualify_decode_only,
+        tall_requested);
+    // One record with --all-on: an exported tall chunk this server does not run says so (all_on_engaged.hpp).
+    if (tall_requested)
+        (void)profile::all_on::engaged("STRIX_INK_HIP_SERVED_TALL_CHUNK", hip_tall_chunk,
+                                       out.served_cli_route ? "the served command line route already runs its own chunk"
+                                       : out.tier == profile::Name::standard ? "EXACT: the tall chunk changes decode ids"
+                                                                             : "not admitted for this route, tile or context",
+                                       std::cerr);
     if (hip_tall_chunk) schedule.chunk = mini_prefill_schedule(hip, out.tier).chunk;
     out.prefill_rows = std::min(explicit_rows.value_or(schedule.chunk), out.context);
     if (!out.served_cli_route) {

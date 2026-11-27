@@ -2,9 +2,13 @@
 // same prompts OFF and with e4b-eagle sessions (oracle drafter for acceptance, host reference drafter for the real
 // code path), single and concurrent streams, DraftMode::on with k = 1..7; ids must equal OFF exactly.
 #include "common.hpp"
+
+#include <array>
+#include <optional>
 #include "gemma4/eagle/session.hpp"
 #include "gemma4/eagle/mtp/session.hpp"
 #include "gemma4/engine/coordinator.hpp"
+#include "gemma4/engine/runtime.hpp"
 #include "mock.hpp"
 
 #if !defined(STRIX_G4_DRAFT_ROWS_API)
@@ -25,14 +29,23 @@ struct State final : en::StreamState {
     std::string digest() const override { return std::to_string(s.hashes.back()); }
     // MTP sessions need a KV view to draft; the scripted MTP drafter below never reads it (eagle sessions ignore it).
     bool kv_view(std::uint32_t, const KvTxn*, KvView& out) const override { out = {}; return true; }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>* binds = nullptr; // (prompt tokens, lanes) of bind_request
+    std::string form; // the band rule of the server: the INT8 KV form for one live request, exact otherwise
+    void bind_request(std::uint32_t prompt_tokens, std::uint32_t lanes) override {
+        if (binds) binds->emplace_back(prompt_tokens, lanes);
+        if (binds) form = lanes == 1 ? "g4-dattn-f2" : "exact";
+    }
+    std::string decode_attention() const override { return form; }
 };
 struct Backend final : en::Backend {
     MockTarget target;
     ModelConfig c;
     Backend() { c.hidden = target.hidden; c.vocab = target.vocab; }
     State* last = nullptr; // the coordinator creates the stream right before calling the draft factory
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> binds;
     std::unique_ptr<en::StreamState> create_stream() override {
         auto state = std::make_unique<State>();
+        state->binds = &binds;
         last = state.get();
         return state;
     }
@@ -183,6 +196,66 @@ int main() {
         // The confidence window is DEFAULT ON for MTP sessions; every section except the confidence one below checks the
         // AutoPolicy path, so it runs with the OFF switch.
         set_env("STRIX_G4_MTP_CONF", "0");
+        {
+            // Per-request decode regime: every admitted stream is bound once with its prompt length and the number of
+            // live requests including itself (the server resolves the TURBO decode attention band rows from them).
+            Backend bound;
+            en::Coordinator two(bound, {});
+            for (const std::size_t n : {std::size_t(5), std::size_t(9)}) {
+                en::Request req;
+                req.prompt.assign(n, 7);
+                req.max_tokens = 4;
+                req.dflash = en::DraftMode::off;
+                (void)two.submit(req);
+            }
+            EAGLE_CHECK(bound.binds.size() == 2 && bound.binds[0] == std::make_pair(5U, 1U) &&
+                        bound.binds[1] == std::make_pair(9U, 2U), "bind_request: prompt length and live lanes per admitted stream");
+            two.run();
+            // Each receipt names the decode attention form its request ran (the KV precision is never silent).
+            const auto form_of = [&](std::size_t slot) {
+                const auto receipt = two.receipt(slot);
+                const auto* f = receipt.find("decode_attention");
+                return f ? f->as_string() : std::string("(absent)");
+            };
+            EAGLE_CHECK(form_of(0) == "g4-dattn-f2" && form_of(1) == "exact",
+                        "receipt: per-request decode attention form, got %s / %s", form_of(0).c_str(), form_of(1).c_str());
+            en::Request later;
+            later.prompt.assign(6, 7);
+            later.max_tokens = 2;
+            later.dflash = en::DraftMode::off;
+            (void)two.submit(later);
+            EAGLE_CHECK(bound.binds.size() == 3 && bound.binds[2] == std::make_pair(6U, 1U), "bind_request: finished requests do not count as lanes");
+        }
+        {
+            // The server's own per-request band resolver (runtime.cpp server_decode_bands), with an injected device regime:
+            // TURBO on the device backend installs it; each request resolves the CLI band row from its prompt length,
+            // its generation (admitted - prompt = the request's max_tokens, what the CLI passes) and the live lanes.
+            namespace pr = strix::gemma4::profile;
+            en::Options o;
+            o.backend = "device";
+            o.profile = pr::resolve(pr::Name::turbo, pr::App::engine, pr::Inputs{});
+            std::vector<std::array<std::uint64_t, 3>> asked;
+            const en::DecodeRegimeProvider regime = [&](std::uint64_t tokens, std::uint64_t max_tokens, std::uint32_t lanes) {
+                asked.push_back({tokens, max_tokens, lanes});
+                return std::optional<en::DecodeRegime>(en::DecodeRegime{tokens, "fixture-exec"});
+            };
+            const auto bands = en::server_decode_bands(o, regime);
+            EAGLE_CHECK(bool(bands), "TURBO on the device backend installs the per-request resolver");
+            if (bands) {
+                EAGLE_CHECK(bands(8192, 8192 + 64, 1) == 2 && bands(32768, 32768 + 128, 1) == 2 && bands(65536, 65536 + 8, 1) == 2,
+                            "one live request of 8K..64K resolves g4-dattn-f2");
+                EAGLE_CHECK(bands(4096, 4096 + 64, 1) == 0 && bands(32768, 32768 + 128, 2) == 0 && bands(65537, 65537 + 8, 1) == 0,
+                            "below 8K, past 64K and with two live requests: exact");
+                EAGLE_CHECK(!asked.empty() && asked.front() == (std::array<std::uint64_t, 3>{8192, 64, 1}),
+                            "the regime gets the prompt length, the generation and the lanes");
+            }
+            auto fast = o;
+            fast.profile = pr::resolve(pr::Name::fast, pr::App::engine, pr::Inputs{});
+            auto host = o;
+            host.backend = "host";
+            EAGLE_CHECK(!en::server_decode_bands(fast, regime) && !en::server_decode_bands(host, regime),
+                        "FAST and a non-device backend install no per-request form");
+        }
         Fixture fx;
         Rng r{41};
         // Prompt lengths at the prefill-window edges (the coordinator prefills prompt[0..n-2] in <= 8-row windows; the

@@ -52,7 +52,19 @@ public:
     // Unknown payloads must not claim a complete host retention budget.
     [[nodiscard]] virtual std::optional<std::uint64_t> retained_bytes() const { return std::nullopt; }
     [[nodiscard]] virtual std::optional<memory::Payload> native_payload() const { return {}; }
+    // Called once by the coordinator right after the stream is created or forked for a request (before any pass):
+    // `prompt_tokens` of the request and `lanes` = requests live on the coordinator including this one. A backend
+    // whose numerics depend on the request regime (the TURBO decode attention bands) binds them here.
+    virtual void bind_request(std::uint32_t prompt_tokens, std::uint32_t lanes) { (void)prompt_tokens; (void)lanes; }
+    // The decode attention form bind_request chose for this request (for example "exact" or "g4-dattn-f2": the KV
+    // precision its decode reads), named in the request's receipt. Empty when the backend has no per-request form (the
+    // process form of the effective configuration applies).
+    [[nodiscard]] virtual std::string decode_attention() const { return {}; }
 };
+// The per-request decode attention resolver of a serving backend: strix::attn::cache_shadow::Form value (0 exact,
+// 2 kv8) of a request with `prompt_tokens`, a stream admitting `admitted` positions and `lanes` live requests. It is
+// the profile resolution the one-prompt CLI uses (profile::resolve + its decode regime), called per request.
+using DecodeAttentionBands = std::function<std::int32_t(std::uint32_t prompt_tokens, std::uint32_t admitted, std::uint32_t lanes)>;
 // Rows of one exact many-row prefill call (no logits): taps per row and, when
 // requested, the final-norm hidden rows that RowPlan::export_hidden returns: every row for HiddenDemand::all_rows;
 // for last_committed at least the call's (each item's) last row: one row, or every row from a backend that
@@ -264,6 +276,7 @@ struct Result {
     double setup_ms = 0, prefill_ms = 0, decode_ms = 0, draft_ms = 0, context_ms = 0, verify_ms = 0, commit_ms = 0;
     std::uint64_t target_calls = 0, target_rows = 0;
     std::size_t peak_streams = 1;
+    std::string decode_attention; // StreamState::decode_attention of the request ("" = the process form)
     std::array<std::uint64_t, 8> windows{};
     std::uint64_t probes = 0;
     std::uint64_t multistream_auto_cycles = 0, multistream_auto_proposals = 0;

@@ -6,6 +6,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 namespace pr = strix::gemma4::profile;
 namespace pf = strix::gemma4::prefill;
@@ -372,6 +373,44 @@ void product_table() {
             outside.regime = {shared::Phase::decode, context, 1, device, "fixture-exec"};
             r = pr::resolve(pr::Name::turbo, app, outside);
             check(value(r, "decode_attention") == "exact", "turbo keeps the fast cell outside its measured bands and device");
+        }
+        // Out of band the cell is a decided builtin (not pending); a multi-stream CLI run is out of band too (timed at C1).
+        {
+            pr::Inputs outside = in();
+            outside.regime = {shared::Phase::decode, 4096, 1, "gfx1151", "fixture-exec"};
+            r = pr::resolve(pr::Name::turbo, app, outside);
+            check(status(r, "decode_attention") == pr::Status::builtin, "out of band decode_attention is builtin, not pending");
+            r = pr::resolve(pr::Name::fast, app, outside);
+            check(status(r, "decode_attention") == pr::Status::builtin, "fast reports the same builtin state");
+            pr::Inputs lanes = in();
+            lanes.regime = {shared::Phase::decode, 32768, 4, "gfx1151", "fixture-exec"};
+            r = pr::resolve(pr::Name::turbo, app, lanes);
+            check(value(r, "decode_attention") == "exact" && status(r, "decode_attention") == pr::Status::builtin,
+                  "the C1-timed bands do not apply at 4 streams");
+        }
+        // Server: prepare_serve resolves at start with no decode regime (the builtin, exact); each request then re-resolves
+        // with ITS regime (runtime.cpp server_decode_bands: same resolve() call and regime as the one-prompt CLI), so a
+        // served request of a given prompt length and lane count gets the CLI's band row: 8K-64K at one lane g4-dattn-f2,
+        // below 8K, past 64K and with several live requests exact. The startup resolution (no regime) is exact and not
+        // explicit, which is what installs the per-request resolver.
+        {
+            r = pr::resolve(pr::Name::turbo, app, in());
+            check(value(r, "decode_attention") == "exact" && status(r, "decode_attention") != pr::Status::explicit_env &&
+                  status(r, "decode_attention") != pr::Status::off, "server startup (no regime): builtin exact, not explicit");
+            for (const auto& [context, lanes, expected] : {std::tuple<std::uint64_t, unsigned, std::string_view>{8192, 1, "g4-dattn-f2"},
+                     {32768, 1, "g4-dattn-f2"}, {65536, 1, "g4-dattn-f2"}, {8191, 1, "exact"}, {4096, 1, "exact"},
+                     {32768, 2, "exact"}, {65537, 1, "exact"}}) {
+                pr::Inputs request = in();
+                request.regime = {shared::Phase::decode, context, lanes, "gfx1151", "fixture-exec"};
+                const auto served = pr::resolve(pr::Name::turbo, app, request);
+                check(value(served, "decode_attention") == expected, "the served request resolves the CLI band row");
+            }
+            check(pr::dattn_form_value == "g4-dattn-f2", "the per-request form is the g4-dattn-f2 value");
+            // An explicit user setting is never overridden per request.
+            pr::Inputs off = in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}}));
+            off.regime = {shared::Phase::decode, 32768, 1, "gfx1151", "fixture-exec"};
+            check(status(pr::resolve(pr::Name::turbo, app, off), "decode_attention") == pr::Status::off,
+                  "explicit exact stays off for every request");
         }
         r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
         check(status(r, "decode_attention") == pr::Status::off && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");

@@ -15,6 +15,7 @@
 // models/*.toml ([catalogue] engines = [...]). Nothing here names a model.
 #include "strix/engine_profile.hpp"
 #include "strix/model_description.hpp"
+#include "strix/profile/all_on_engaged.hpp"   // kLeversEnv and engaged(): the engine side of the one record
 
 #include <cstdint>
 #include <functional>
@@ -37,6 +38,12 @@ enum class Class : std::uint8_t { exact, fast, turbo, kv, unclassified };
 enum class Gate : std::uint8_t { none, pass, pending, fail };
 enum class Phase : std::uint8_t { any, prefill, decode };
 
+// A measured regime where the lever is slower than without it: --all-on does not turn it on there.
+struct Slower {
+    Phase phase = Phase::any;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> tokens;   // inclusive; nullopt: every length of the phase
+    std::string receipt;
+};
 struct Lever {
     std::string row;    // catalogue row name
     std::string name;   // lever key
@@ -51,6 +58,12 @@ struct Lever {
     std::vector<std::string> off_values;
     std::vector<std::string> args;                // ... or engine arguments
     std::vector<std::string> incompatible_with, requires_levers, default_tiers;
+    // Preconditions (catalogue "needs", required on every classified lever, [] for none): every entry must hold; an
+    // entry is alternatives "A|B|..." of atoms env:NAME (set and not an off value "0"), env:NAME=VALUE, arg:FLAG (an
+    // engine argument of the launch) and model:KEY=VALUE (the model description value, or an element of its array).
+    std::vector<std::string> needs;
+    std::string needs_reason;   // the printed reason of an unmet precondition (catalogue "needs_reason")
+    std::vector<Slower> slower;  // catalogue "slower": measured losing regimes
     std::string quality, reason;
     bool identity_pending = false;   // "identity":"pending": an exact lever whose device identity is not yet receipted
 };
@@ -74,6 +87,9 @@ struct Query {
     // "0" keeps the lever off, any other value keeps it on (source=explicit), and incompatibility and requirements
     // see that real state.
     std::function<std::optional<std::string>(std::string_view)> env_value;
+    std::vector<std::string> args;   // the engine arguments of the launch (arg: preconditions)
+    // The model description value at a dotted key as text, or each element of an array value (model: preconditions).
+    std::function<std::vector<std::string>(std::string_view)> model_values;
 };
 
 struct Line {
@@ -92,6 +108,9 @@ struct Plan {
 [[nodiscard]] Plan resolve(std::span<const Lever>, const Query&);
 
 [[nodiscard]] Tier tier_of(Name);
+// The text values of a model description key: a scalar as one element, an array element-wise, nothing when absent.
+[[nodiscard]] std::vector<std::string> model_values(const model_description::ModelDescription*, std::string_view key);
+
 [[nodiscard]] std::vector<std::string> engines_of(const model_description::ModelDescription*);
 // STRIX_ALL_ON: unset or 0 off, 1 on, anything else std::invalid_argument.
 [[nodiscard]] bool env_requested();

@@ -99,6 +99,12 @@ struct Inputs {
 };
 // Throws std::invalid_argument naming the pending piece when a required column is unavailable.
 [[nodiscard]] Resolution resolve(Name profile, App app, const Inputs& inputs = {}, std::span<const Lever> table = levers());
+// The server (prepare_serve) resolves at start with no decode regime (decode_attention = its builtin, exact); the
+// TURBO band rows of decode_attention then decide per request: the coordinator binds each stream with the request's
+// prompt length and the live lane count and the stream reads its own form (the shared attention pass dispatches per
+// row), through the same resolve() call and regime the one-prompt CLI uses (runtime.cpp server_decode_bands).
+inline constexpr std::string_view dattn_form_value = "g4-dattn-f2";
+inline constexpr std::string_view dattn_band_text = "TURBO, gfx1151, 8,192..65,536 prompt tokens, one live request";
 // Exports the switches of entries with status `set` or `unqualified` to the process environment
 // (never asset or off-switch levers). Call before anything reads (and caches) those switches.
 void apply(const Resolution& resolution);

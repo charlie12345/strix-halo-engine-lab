@@ -26,9 +26,22 @@ struct Options {
     std::uint16_t port = 8080;
     Request request;
     profile::Resolution profile; // --profile exact|fast|turbo|quality, resolved and exported by parse_options
+    profile::Inputs profile_inputs; // the explicit settings that resolution used (no decode regime): per-request re-resolution
+    // Server only (prepare_serve): the decode attention (g4-dattn-f2) is resolved per request with the CLI's regime
+    // and band rows (TURBO, device, lever not set explicitly); empty otherwise.
+    DecodeAttentionBands decode_bands;
     bool inspect = false, help = false;
 };
 Options parse_options(int argc, char** argv);
+// The decode regime of one decode run on this device (prompt length and the ladder execution word): the single place
+// the one-prompt CLI and the server spell it. No regime off gfx1151 or without a device backend.
+struct DecodeRegime { std::uint64_t prompt_tokens = 0; std::string execution; };
+using DecodeRegimeProvider =
+    std::function<std::optional<DecodeRegime>(std::uint64_t tokens, std::uint64_t max_tokens, std::uint32_t lanes)>;
+std::optional<DecodeRegime> device_decode_regime(std::uint64_t tokens, std::uint64_t max_tokens, std::uint32_t lanes);
+// Server: the per-request decode attention resolver (empty unless TURBO on the device backend with the lever not set
+// explicitly). `regime_of` is the device regime; host tests inject their own.
+DecodeAttentionBands server_decode_bands(const Options& o, DecodeRegimeProvider regime_of = device_decode_regime);
 std::string read_text(const std::filesystem::path& path);
 class Runtime {
 public:
@@ -53,6 +66,8 @@ struct ServePreparation {
     // HTTP slot override from --streams or a deployment plan (0: STRIX_G4_SERVE_SLOTS applies).
     std::uint32_t deployment_slots = 0;
     std::string output;
+    // Start lines of levers the server declines to apply (also printed to stderr by prepare_serve).
+    std::vector<std::string> notices;
     bool bind_given = false, port_given = false;
 };
 ServePreparation prepare_serve(int argc, char** argv);
@@ -62,8 +77,10 @@ enum class NativeInputContinuation { off, exact_g4_v1 };
 // Optional device library implements this factory and engine::Backend/StreamState.
 // Model/tables outlive it; begin() returns its own KvTxn recognized by forward_rows.
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
+// `bands` (server, TURBO): per-request decode attention; the shadow mirror and scratch are then allocated for the
+// largest context and every stream binds its own form (empty: the process form, STRIX_G4_DECODE_ATTN).
 std::unique_ptr<Backend> make_device_backend(const ModelManifest& model, RopeTables tables, bool inspect = false,
-    NativeInputContinuation continuation = NativeInputContinuation::off);
+    NativeInputContinuation continuation = NativeInputContinuation::off, DecodeAttentionBands bands = {});
 DraftFactory device_drafts(const dflash::Weights& weights, dflash::RopeView rope, LinearView embedding,
     Backend* backend = nullptr, bool prepare = true, LinearView head = {});
 #endif

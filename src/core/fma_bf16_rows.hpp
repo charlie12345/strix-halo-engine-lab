@@ -95,9 +95,7 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> wmma_group{};
         const auto pitch = effective_pitch(projections.front());
         const bool split = Schedule == Bf16RowsSchedule::compact_narrow &&
-            std::ranges::any_of(projections, [&](const auto& projection) {
-                return admits_bf16_compact_projection(input_width, rows, projection);
-            }) && image_routes_order_free(input, input_width, rows, projections, true);
+            bf16_compact_call_split(input, input_width, rows, projections);
         f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> compact_group{};
         for (const auto& projection : projections) {
             auto& dst = split && admits_bf16_compact_projection(input_width, rows, projection)

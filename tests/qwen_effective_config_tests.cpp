@@ -20,6 +20,7 @@
 #include "qwen_historical_resolver.hpp"
 #include <algorithm>
 #include <array>
+#include <sstream>
 #include <string>
 #include <iostream>
 #include <fstream>
@@ -28,6 +29,8 @@
 #include "../apps/http_slot_capacity.hpp"
 #include "../apps/qwen_tiled_prompt_plan.hpp"
 #include "strix/moe_route_bf16.hpp"
+#include "strix/prefill_moe_policy.hpp"
+#include "strix/profile/all_on_engaged.hpp"
 #include <limits>
 #include <set>
 #include "strix/q8_projection_organization.hpp"
@@ -3720,6 +3723,43 @@ void prefill_identity_equivalence_tests() {
 }
 
 int main(int argc, char** arguments) {
+    {   // all-on record: routed-MoE organisations declined by route control / route I8 / tune / alignment
+        setenv("STRIX_ALL_ON_LEVERS", "qwen_moe_tiers:STRIX_QPF2K_MOE_TIERS,qwen_moe_down_lds_epilogue:STRIX_QPF2K_MOE_DOWN_LDS_EPI", 1);
+        const auto policy = [](bool ctrl, const char* tiers, const char* lds) {
+            return PrefillMoePolicy::resolve([&](const char* name) -> const char* {
+                const std::string_view n(name);
+                if (n == "STRIX_QPF2K_MOE_ROUTE_CTRL") return ctrl ? "1" : nullptr;
+                if (n == "STRIX_QPF2K_MOE_TIERS") return tiers;
+                if (n == "STRIX_QPF2K_MOE_DOWN_LDS_EPI") return lds;
+                return nullptr;
+            });
+        };
+        const auto record = [](const char* tiers_why, const char* lds_why) {
+            std::ostringstream out;
+            strix::profile::all_on::engaged("STRIX_QPF2K_MOE_TIERS", tiers_why == nullptr, tiers_why ? tiers_why : "", out);
+            strix::profile::all_on::engaged("STRIX_QPF2K_MOE_DOWN_LDS_EPI", lds_why == nullptr, lds_why ? lds_why : "", out);
+            return out.str();
+        };
+        const auto control = policy(true, "1", "1");
+        expect(record(moe_tiers_decline(control, false, 82U), moe_down_lds_decline(control, false, 64U, 64U)) ==
+            std::string("all-on: lever qwen_moe_tiers source=all-on applied=no reason=route-control rounding has its own down kernel\n") + "all-on: lever qwen_moe_down_lds_epilogue source=all-on applied=no reason=route-control rounding has its own down kernel\n",
+            "route control declines the tier split and the LDS epilogue with an applied=no line each");
+        const auto plain = policy(false, "1", "1");
+        expect(record(moe_tiers_decline(plain, false, 82U), moe_down_lds_decline(plain, false, 64U, 64U)).empty(),
+            "admitted tier split and LDS epilogue print nothing");
+        expect(record(moe_tiers_decline(plain, true, 82U), moe_down_lds_decline(plain, true, 64U, 64U)) ==
+            std::string("all-on: lever qwen_moe_tiers source=all-on applied=no reason=route I8 plane is written by the certificate down kernel only\n") + "all-on: lever qwen_moe_down_lds_epilogue source=all-on applied=no reason=route I8 plane is written by the certificate down kernel only\n",
+            "route I8 declines both organisations");
+        expect(record(moe_tiers_decline(plain, false, 80U), moe_down_lds_decline(plain, false, 72U, 64U)) ==
+            std::string("all-on: lever qwen_moe_tiers source=all-on applied=no reason=tier split needs tune 82\n") + "all-on: lever qwen_moe_down_lds_epilogue source=all-on applied=no reason=raw-dot view is not 16-byte aligned\n",
+            "tune and view alignment decline the tier split and the LDS epilogue");
+        expect(moe_tiers_decline(policy(false, "3", nullptr), false, 82U) != nullptr &&
+            moe_down_lds_decline(policy(false, nullptr, nullptr), false, 64U, 64U) != nullptr,
+            "unset or invalid switch values are not admitted");
+        unsetenv("STRIX_ALL_ON_LEVERS");
+        expect(record(moe_tiers_decline(control, false, 82U), moe_down_lds_decline(control, false, 64U, 64U)).empty(),
+            "a switch that --all-on did not export prints no line");
+    }
     {
         const auto island_gate = parse({"decoder", "MODEL", "1", "--context", "33280", "--unqualified-context",
             "--generate", "256", "--optimization-profile", "manual", "--gdn-islands", "--deferred-moe-status",
@@ -4061,6 +4101,18 @@ int main(int argc, char** arguments) {
             {0x00008000U,0U},{0x00018000U,2U},{0x80000000U,0x8000U},{0x7f800000U,0x7f80U},
             {0xff800000U,0xff80U},{0x7f800001U,0x7fc0U},{0x7fffffffU,0x7fffU},{0xffffffffU,0xffffU}})
             expect(moe_route_bf16_bits(bits)==expected,"route BF16 RNE / nonfinite / denormal bits");
+    }
+    {
+        // A2: route I8 must decline every down organisation that writes BF16 route words the I8 merge cannot read: the tier
+        // split, the LDS epilogue and the TILE64 down.
+        for (const bool tiers : {false,true}) for (const bool lds : {false,true}) for (const bool t64 : {false,true}) {
+            const auto i8=moe_route_organizations(true,tiers,lds,t64);
+            const auto bf=moe_route_organizations(false,tiers,lds,t64);
+            expect(!i8.tiers && !i8.lds_epilogue && !i8.tile64_down && i8.declined==(tiers||lds||t64),
+                "route I8 declines tiers, LDS epilogue and TILE64 down");
+            expect(bf.tiers==tiers && bf.lds_epilogue==lds && bf.tile64_down==t64 && !bf.declined,
+                "route BF16 keeps tiers, LDS epilogue and TILE64 down");
+        }
     }
     {
         auto argv=mtp_fixture(); argv.insert(argv.begin()+5,13,"1");

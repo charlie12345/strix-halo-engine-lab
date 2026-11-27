@@ -8,6 +8,8 @@
 #include "strix/serve/session_api.hpp"
 #include "strix/session/speculation_default.hpp"
 #include <charconv>
+#include "strix/cli/registry_root.hpp"
+
 #include <filesystem>
 #include <iostream>
 #include <cstring>
@@ -418,12 +420,12 @@ void install_session_service(sv::ServiceFactories& factories, SessionAssetLoader
     };
     factories.install("minimax",std::move(f));
 }
-int legacy_serve(int argc,char** argv) {
+int legacy_serve(int argc,char** argv,const std::filesystem::path& shipped_root) {
     // Preserve MiniMax's family --model-id spelling behind the shell delimiter.
 #ifdef STRIX_SERVE_REGISTRY_ROOT
-    const std::string registry_root=STRIX_SERVE_REGISTRY_ROOT;
+    const std::string registry_root=strix::cli::registry_root(STRIX_SERVE_REGISTRY_ROOT,shipped_root).string();
 #else
-    const std::string registry_root=".";
+    const std::string registry_root=strix::cli::registry_root(".",shipped_root).string();
 #endif
     std::vector<std::string> args{argc ? argv[0] : "strix-minimax-serve","--registry-root",registry_root,"--model","minimax","--"};
     for(int i=1;i<argc;++i)args.emplace_back(argv[i]);

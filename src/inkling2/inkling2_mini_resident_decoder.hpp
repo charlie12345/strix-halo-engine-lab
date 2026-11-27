@@ -469,8 +469,11 @@ public:
 #endif
 
     // One forward for all lanes. Every row keeps single-row decode arithmetic,
-    // so a lane matches its own decode() stream. With DSpark tap capture on,
-    // lanes step one at a time so each committed position records its taps.
+    // so a lane matches its own decode() stream. With DSpark tap capture on, a lone lane steps on its own (slot 0
+    // records its taps); two or more lanes keep the one grouped forward, which stores no taps, so a slot-0 row decoded
+    // inside it leaves slot 0's plane short of its frontier (taps_skip_group: slot0_taps_complete() false until the
+    // slot's next sequence; the lane then drafts without the model). Stepping lanes one at a time to keep the taps
+    // would cost every live lane a whole forward (C8: 8 one-row passes per round instead of one).
     // reads_scores (CohortGroup's contract, default true = read): some lane may read its final scores (read_slot_logits)
     // after this call. Only the verify rows lever's level 2 uses it: lanes whose scores nobody reads pick through the
     // lanes form of the screened head (verify_lanes_pick_), an announced read keeps the full head.
@@ -503,21 +506,18 @@ public:
         if (!(slots.size() == 1U && slots.front() == 0U)) {
             const auto width = cohort_policy_.width(static_cast<std::uint32_t>(slots.size()), decode_rows_);
             if (width != 0U) {
-                if (!draft_taps_.span().empty() && std::ranges::find(slots, 0U) != slots.end())
-                    slot0_taps_stale_ = true;
-                decode_cohort(slots, ids, top, width);
+                taps_skip_group(slots);
+                decode_cohort(slots, ids, top, width, reads_scores);
                 return;
             }
         }
 #endif
-        if (groups_.size() == 1U || draft_taps_.span().size() != 0U) {
-            for (std::size_t row = 0; row < slots.size(); ++row)
-                top[row] = append(*groups_[row].state, ids.subspan(row, 1U), true, {}, MiniAppendKind::decode, {}, nullptr,
-                                  reads_scores);
-            // The head scores of a lone lane stay in row 0. Several lanes stepped one at a time overwrite it.
-            last_logit_rows_ = slots.size() == 1U ? 1U : 0U;
+        if (groups_.size() == 1U) {
+            top[0] = append(*groups_[0].state, ids.first(1U), true, {}, MiniAppendKind::decode, {}, nullptr, reads_scores);
+            last_logit_rows_ = 1U;  // the head scores of a lone lane stay in row 0
             return;
         }
+        taps_skip_group(slots);
 
         const auto rows = static_cast<unsigned>(ids.size());
         const auto embeddings = embeddings_.span().first(ids.size() * kHiddenWidth);
@@ -597,14 +597,13 @@ public:
             groups_.push_back({&state, {state.committed(), 1U}});
         }
         pass_ids_.assign(ids.begin(), ids.end());  // ids and top may overlap: read the inputs from the copy
-        if (groups_.size() == 1U || draft_taps_.span().size() != 0U) {
-            for (std::size_t row = 0; row < slots.size(); ++row)
-                top[row] = append(*groups_[row].state, std::span<const unsigned>(pass_ids_).subspan(row, 1U), true, {},
-                                 MiniAppendKind::decode);
-            // The head scores of a lone lane stay in row 0. Several lanes stepped one at a time overwrite it.
-            last_logit_rows_ = slots.size() == 1U ? 1U : 0U;
+        if (groups_.size() == 1U) {
+            top[0] = append(*groups_[0].state, std::span<const unsigned>(pass_ids_).first(1U), true, {},
+                            MiniAppendKind::decode);
+            last_logit_rows_ = 1U;  // the head scores of a lone lane stay in row 0
             return;
         }
+        taps_skip_group(slots);  // the grouped passes store no taps (decode_slots)
 
         // Lane r's head scores land at logit row r for any pass split.
         const auto lanes = static_cast<unsigned>(ids.size());
@@ -708,8 +707,8 @@ public:
         if (state.poisoned()) throw std::logic_error("invalid Mini resident tap frontier");
         return draft_taps_.span().first(MiniDSparkTapPlan::elements(state.committed()));
     }
-    // Every committed slot-0 row has its DSpark tap (taps captured and no slot-0 row decoded inside a cohort program
-    // since the slot's sequence started): the model drafter's input is complete.
+    // Every committed slot-0 row has its DSpark tap (taps captured and no slot-0 row decoded inside a grouped forward
+    // or a cohort program since the slot's sequence started): the model drafter's input is complete.
     [[nodiscard]] bool slot0_taps_complete() const noexcept { return !draft_taps_.span().empty() && !slot0_taps_stale_; }
     // Sequences slot 0 has started (reset_slot(0)): a model drafter reading slot 0's taps restarts its context on a change.
     [[nodiscard]] std::uint64_t slot0_sequence() const noexcept { return slot0_sequence_; }
@@ -916,9 +915,17 @@ private:
     // same transaction runs the incumbent eager forward for the R lanes. Each lane's bits are those of its
     // eager row (lane stages: shared EXACT lane forms; row-wise stages: batch invariant).
     void decode_cohort(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top,
-                       std::uint32_t width) {
+                       std::uint32_t width, bool reads_scores) {
         const auto rows = static_cast<unsigned>(slots.size());
         pending_scores_ = {};  // the cohort rewrites hidden_ and every score row it describes (last_logit_rows_)
+        // A cohort whose scores nobody reads picks every lane through the lanes form of the EXACT screened head when the
+        // screened-head lever built its plane (cuda/core/head_screened.cuh: lane l is bitwise the R=1 head of its row, the
+        // incumbent full-head token and status): the plane is read once for the cohort instead of the full BF16 head
+        // (0.92 GB) once per lane. The score rows stay deferred (pending_scores_) and are projected from hidden_ only on a
+        // read (materialize_scores), as after the one-row screened pick. A compact head keeps its own full head.
+        const bool lanes_screened = mini_cohort_lanes_screened(
+            reads_scores, screen_.has_value(), head_.reason, rows, screen_ ? screen_->max_lanes() : 0U,
+            weights_.compact_head_bound() && backend_.lowbit_chunk());
         cohort_lanes_.clear();
         for (unsigned row = 0; row < rows; ++row)
             cohort_lanes_.push_back({slots[row], groups_[row].state->committed(), ids[row]});
@@ -955,6 +962,14 @@ private:
                 forward.run_batch(groups_, rows, embeddings_.span().first(eager_rows), hidden_.span().first(eager_rows),
                                   [&] { embed(ids, embeddings_.span().first(eager_rows), rows, kind_of(rows)); });
             }
+            if (lanes_screened) {
+                greedy_.enqueue_produced_rows(rows, [&](std::uint32_t* device_tokens) {
+                    return screen_->enqueue(hidden_.data(),
+                        ::strix::cuda::core::head_argmax::EmitIndexOrNone{device_tokens}, stream_.get(), rows,
+                        kHiddenWidth);
+                }, stream_.get());
+                return;
+            }
             for (unsigned row = 0; row < rows; ++row)
                 project_head(hidden_.data() + std::size_t{row} * kHiddenWidth,
                              logits.subspan(::strix::head::logit_row_offset(row, kLogitPitch), kOutputVocabulary), true);
@@ -962,6 +977,12 @@ private:
         }, [&] {
             for (std::size_t row = 0; row < top.size(); ++row) (void)checked_token(greedy_, row);
         });
+        if (lanes_screened) {
+            pending_scores_ = {hidden_.data(), rows, logits.data()};
+            if (lanes_picks_++ == 0U)
+                std::fprintf(stderr, "Inkling CUDA cohort head screened lanes=%u max_lanes=%u\n", rows,
+                             screen_->max_lanes());
+        }
         if (launched && had_graph) {
             ++(rows < width ? padded_cohort_replays_ : full_cohort_replays_);
             auto& reported = rows < width ? reported_padded_cohort_replays_ : reported_cohort_replays_;
@@ -1432,9 +1453,10 @@ private:
     bool build_screen() {
         if (weights_.compact()) return false;
         try {
-            // Scratch for a whole verify window (the lanes pick of append); the one-row pick uses lane 0.
+            // Scratch for a whole verify window (the lanes pick of append) and a whole cohort pass (decode_cohort, one
+            // row per slot); the one-row pick uses lane 0.
             screen_.emplace(weights_.bf16("unembed.weight").data(), kOutputVocabulary, kHiddenWidth, kLogitSoftcap,
-                            stream_.get(), 8U, std::max(1U, max_verify_rows()));
+                            stream_.get(), 8U, mini_screen_lanes(max_verify_rows(), decode_rows_));
         } catch (const std::exception& error) {
             screen_.reset();
             static_cast<void>(cudaGetLastError());
@@ -1605,8 +1627,12 @@ private:
     } pending_scores_;
     std::optional<Screen> screen_;
     PlainRowRoute plain_row_;  // set_plain_row_route: the speculator's one-row steps (empty: this decoder's decode)
-    bool slot0_taps_stale_{false};  // a slot-0 row ran in a cohort program (no tap store) since the slot's reset
+    bool slot0_taps_stale_{false};  // a slot-0 row ran in a grouped forward (no tap store) since the slot's reset
     std::uint64_t slot0_sequence_{0};  // reset_slot(0) calls (slot0_sequence)
+    // A grouped forward or cohort program over `slots` stores no DSpark taps: slot 0 inside it leaves its plane short.
+    void taps_skip_group(std::span<const unsigned> slots) noexcept {
+        if (!draft_taps_.span().empty() && std::ranges::find(slots, 0U) != slots.end()) slot0_taps_stale_ = true;
+    }
 #if !defined(__HIPCC__)
     bool window_programs_{false};  // set_window_programs: the owner decides (the CUDA CLI: on for the EXACT levers)
 #endif

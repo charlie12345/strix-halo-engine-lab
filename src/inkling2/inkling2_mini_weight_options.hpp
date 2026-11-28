@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <span>
@@ -41,10 +42,10 @@ struct MiniWeightOptions {
 // The bindings a qualification key may name: the model's Q8_0 binding (legacy id included), the shared low-bit mixes and
 // the shared head-only low-bit rows (attention BF16), plus attention-only Q8_0 and the Strix pack SP4 attention + head
 // row (from a calibrated pack, STRIX_LOWBIT_PACK).
-inline constexpr std::array<weight::WeightLoadPolicy, 9> kMiniQualifiablePolicies{
+inline constexpr std::array<weight::WeightLoadPolicy, 10> kMiniQualifiablePolicies{
     kMiniWeightLoadPolicy, weight::kAttentionQ8Policy, weight::kAttentionHeadQ6Policy, weight::kAttentionQ4HeadQ6Policy,
     weight::kAttentionHeadQ4Policy, weight::kHeadQ6Policy, weight::kHeadQ4Policy, kMiniSp4HeadPolicy,
-    weight::kAttentionHeadSP4TPolicy};
+    weight::kAttentionHeadSP4TPolicy, weight::kAttentionGateHeadSP4TPolicy};
 
 inline const weight::WeightLoadPolicy& mini_weight_load_policy(const MiniWeightOptions& options) {
     if (options.qualify == nullptr || weight::same_id(options.qualify->id, kMiniWeightLoadPolicy.id))
@@ -114,7 +115,8 @@ inline bool mini_lowbit_turbo(const profile::Resolution& tier) {
 }
 
 // STRIX_INK_LOWBIT_HEAD, in FAST or TURBO: "sp4t" selects the SP4 head arm (kMiniSp4HeadPolicy); "sp4t-attn" the SP4
-// attention projections + head arm (weights.attention_head.sp4t@1, the arm of --qualify-decode-weights); "0" (builtin)
+// attention projections + head arm (weights.attention_head.sp4t@1, the arm of --qualify-decode-weights); "sp4t-attn-gate"
+// the same arm plus the attention output gate (weights.attention_gate_head.sp4t@1, explicit: STRIX_LOWBIT_PACK); "0" (builtin)
 // leaves the weights as they are. nullptr: no arm. The FAST column (TURBO inherits it) selects "sp4t-attn" on the backend
 // its receipts were taken on (HIP gfx1151): a column value on another backend selects nothing; an explicit setting keeps
 // its own admission (the server refuses a non-HIP backend with its reason).
@@ -124,10 +126,12 @@ inline bool mini_lowbit_head_explicit(const profile::Entry& entry) {
 inline const weight::WeightLoadPolicy* mini_lowbit_head_policy(const profile::Resolution& tier, bool hip = true) {
     const auto* entry = tier.find(kMiniLowBitHead);
     if (entry == nullptr || entry->value == "0") return nullptr;
-    const weight::WeightLoadPolicy* policy = entry->value == "sp4t"        ? &kMiniSp4HeadPolicy
-                                             : entry->value == "sp4t-attn" ? &weight::kAttentionHeadSP4TPolicy
-                                                                           : nullptr;
-    if (policy == nullptr) throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0, sp4t or sp4t-attn");
+    const weight::WeightLoadPolicy* policy = entry->value == "sp4t"             ? &kMiniSp4HeadPolicy
+                                             : entry->value == "sp4t-attn"      ? &weight::kAttentionHeadSP4TPolicy
+                                             : entry->value == "sp4t-attn-gate" ? &weight::kAttentionGateHeadSP4TPolicy
+                                                                                : nullptr;
+    if (policy == nullptr)
+        throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD must be 0, sp4t, sp4t-attn or sp4t-attn-gate");
     if (!hip && !mini_lowbit_head_explicit(*entry)) return nullptr;
     return tier.profile == profile::Name::fast || tier.profile == profile::Name::turbo ? policy : nullptr;
 }
@@ -411,6 +415,25 @@ inline constexpr MiniSpeculationPolicy mini_speculation_policy(bool requested, b
         policy.reason = kMiniSpeculationLowbitDecline;
     }
     return policy;
+}
+
+// The block drafter's arm of a tier under the shared per-regime selector (spec::ArmSelector), from the model data
+// (models/inkling2-mini.toml [speculation.block_by_default] / [speculation.block_wins_ties]): by_default = the block
+// drafter beside the checkpoint binds beside the MTP sidecar without being named; wins_ties = its inconclusive probe
+// episodes hand it the decode. A tier without a row binds it only when named and never takes ties.
+struct MiniBlockArm {
+    bool by_default = false;
+    bool wins_ties = false;
+};
+
+inline constexpr MiniBlockArm mini_block_arm(profile::Name tier) noexcept {
+    namespace spec_data = strix::model_data::inkling2_mini::speculation;
+    switch (tier) {
+    case profile::Name::standard: return {spec_data::block_by_default::exact, spec_data::block_wins_ties::exact};
+    case profile::Name::fast: return {spec_data::block_by_default::fast, spec_data::block_wins_ties::fast};
+    case profile::Name::turbo: return {spec_data::block_by_default::turbo, spec_data::block_wins_ties::turbo};
+    default: return {};
+    }
 }
 
 // "strix-speculation/v1 requested auto|off source row|flag effective auto|off verify_rows N[ declined <reason>]": the
@@ -740,6 +763,36 @@ inline profile::Entry mini_decode_lowbit_head(MiniWeightOptions& options, std::s
     return *entry;
 }
 
+// The decode-regime decision of the SP4 head column as a recorded decline (strix/profile/decline.hpp), for the
+// command line and the server alike. `requested` are the weight options before mini_decode_lowbit_head applied the
+// decided cell; `decided` its entry. Empty when the column ran (or asked for nothing). Otherwise the reason names the
+// ladder's route line and the residency over the instance's extent (profile::may_select): whether some request inside
+// the extent could select the column. The image is decided once at load on the extent: per-request selection of a
+// resident dual image is not bound on this route, so the reason says that every request runs the tier below.
+inline std::optional<profile::Decline> mini_lowbit_head_decline(const MiniWeightOptions& requested,
+                                                                const profile::Entry& decided, std::string_view device,
+                                                                weight::WeightLoadExtent extent,
+                                                                const MiniPromptExecution& run) {
+    if (decided.lever == nullptr || !profile::entry_declined(decided)) return std::nullopt;
+    const std::string wanted = decided.status == profile::Status::pending ? decided.target : decided.requested;
+    const auto residency = profile::may_select(kMiniProfile, kMiniLowBitHead, wanted, profile::Phase::decode,
+        device, extent.context, extent.lanes, [&](std::uint64_t context, std::uint32_t lanes) {
+            auto inputs = requested.tier;
+            // Probes come from the extent (32-bit) or a row's band edge, never above the extent's context.
+            const auto probe_context = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(context, std::numeric_limits<std::uint32_t>::max()));
+            const std::string execution = mini_decode_execution(run, weight::WeightLoadExtent{probe_context, lanes});
+            inputs.regime = {profile::Phase::decode, context, lanes, device, execution};
+            return resolve_mini_weight_profile(requested, std::move(inputs));
+        });
+    std::string reason = profile::entry_decline_reason(decided) + "; " + residency.reason;
+    if (residency.resident)
+        reason += "; the weight image is decided at load on the instance's extent (per-request selection of a resident "
+                  "image is not bound on this route): every request runs " + decided.value;
+    return profile::Decline{std::string(kMiniLowBitHead), wanted, decided.value, profile::DeclineOrigin::load,
+                            profile::decline_regime("decode", extent.context, extent.lanes, device), std::move(reason)};
+}
+
 // The run's resolution (receipt, fingerprint) states the decode-regime cell that loaded, not the prompt regime's.
 inline void mini_record_decode_entry(profile::Resolution& receipt, const profile::Entry& decoded) {
     if (decoded.lever == nullptr) return;
@@ -793,7 +846,8 @@ inline weight::WeightLoadPlan resolve_mini_resident_weight_load(profile::Name ti
     // The resident image serves every request from one position and one lane up to extent.
     auto plan = weight::resolve_weight_load(weight::builtin_registry(), policy,
         {tier, scope, formats, !options.disable_q8, qualify, kMiniWeightLoadRegimes, extent, {1, 1}}, kMiniWeightLoadDecisions);
-    if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target()))
+    if (qualify && (plan.storage != policy.target || plan.head_storage != policy.head_target() ||
+                    plan.gate_storage != policy.gate_target()))
         throw std::invalid_argument("the qualified compact weights were not admitted on this backend");
     plan.strixpack = strixpack;
     return plan;

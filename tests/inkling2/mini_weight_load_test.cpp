@@ -349,6 +349,21 @@ void test_lowbit_arms() {
                 "SP4 attention + head arm resolves strix.sp4t on every tagged role, unqualified");
         require(mini::mini_lowbit_consumers(plan.head_storage).data() == strix::core::kResidentSp4ArithmeticHip.data(),
                 "SP4 arm names the SP4 consumer identity");
+        require(plan.gate_storage == weight::kBf16WeightStorage && plan.roles().gate == weight::kBf16WeightStorage,
+                "the first SP4 arm keeps the attention output gate BF16");
+    }
+    {
+        // The SP4 attention + gate + head arm: the same decode-only arm with the output gate in strix.sp4t too.
+        mini::MiniWeightOptions arm;
+        const auto value = [] { return std::string_view("weights.attention_gate_head.sp4t@1"); };
+        require(mini::parse_mini_weight_option(arm, "--qualify-decode-weights", value, true) && arm.qualify_decode_only &&
+                    arm.qualify != nullptr && weight::same_id(arm.qualify->id, weight::kAttentionGateHeadSP4TPolicy.id),
+                "SP4 attention + gate + head decode-only arm");
+        const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::fast, arm, hip);
+        require(plan.storage == weight::kSP4TWeightStorage && plan.head_storage == weight::kSP4TWeightStorage &&
+                    plan.gate_storage == weight::kSP4TWeightStorage && plan.roles().gate == weight::kSP4TWeightStorage &&
+                    plan.status == profile::Status::unqualified,
+                "SP4 attention + gate + head arm resolves strix.sp4t on the gate too, unqualified");
     }
     for (const char* key : {"weights.head.q6_g64@1", "weights.head.q4_g64@1"}) {
         mini::MiniWeightOptions arm;
@@ -558,6 +573,19 @@ void test_capacity_and_pack_fallback() {
     std::filesystem::remove(path);
 }
 
+void test_block_arm_per_tier() {
+    // The block drafter's arm under the shared selector is model data per tier (models/inkling2-mini.toml): every
+    // measured tier binds it by default with its own tie declaration (all three measured: the block arm takes ties);
+    // a tier without a row binds it only when named.
+    using strix::profile::Name;
+    constexpr auto exact = mini::mini_block_arm(Name::standard), fast = mini::mini_block_arm(Name::fast),
+                   turbo = mini::mini_block_arm(Name::turbo), quality = mini::mini_block_arm(Name::quality);
+    require(exact.by_default && exact.wins_ties, "EXACT: block drafter by default, wins ties");
+    require(fast.by_default && fast.wins_ties, "FAST: block drafter by default, wins ties");
+    require(turbo.by_default && turbo.wins_ties, "TURBO: block drafter by default, wins ties");
+    require(!quality.by_default && !quality.wins_ties, "a tier without a row: named only, no ties");
+}
+
 void test_calibrated_row_speculation_admission() {
     // One rule for the command line and the server (mini_speculation_policy): speculation and a requested low-bit row
     // never share a run; the explicit request wins.
@@ -747,6 +775,7 @@ int main() {
         test_pack_admission();
         test_capacity_and_pack_fallback();
         test_calibrated_row_speculation_admission();
+        test_block_arm_per_tier();
         test_calibrated_pack_requires_complete_inventory();
         test_token_bytes();
     } catch (const std::exception& error) {

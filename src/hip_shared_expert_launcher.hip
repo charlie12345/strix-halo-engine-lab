@@ -1,5 +1,7 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/numeric/bf16_bits.hpp"
+#include "core/gemv_tree.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
 #include "core/row_layout.hpp"
@@ -54,34 +56,9 @@ constexpr std::uint64_t fnv_offset =
 constexpr std::uint64_t fnv_prime =
     1099511628211ULL;
 
-struct Q8Block {
-    __half scale;
-    std::int8_t values[32];
-};
-
-struct IQ4NLBlock {
-    __half d;
-    std::uint8_t qs[16];
-};
-
-struct IQ4XSBlock {
-    __half d;
-    std::uint16_t scales_h;
-    std::uint8_t scales_l[4];
-    std::uint8_t qs[128];
-};
-
-static_assert(sizeof(Q8Block) == 34);
-static_assert(sizeof(IQ4NLBlock) == 18);
-static_assert(sizeof(IQ4XSBlock) == 136);
-
-__device__ __constant__
-std::int8_t iq4_codebook[16] = {
-    -127, -104, -83, -65,
-    -49, -35, -22, -10,
-       1,   13,  25,  38,
-      53,   69,  89, 113,
-};
+using hip_ggml::Q8Block;
+using hip_ggml::IQ4NLBlock;
+using hip_ggml::IQ4XSBlock;
 
 enum class WeightKind {
     f32,
@@ -168,12 +145,7 @@ WeightKind weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
-}
+using numeric::bf16_bits::bf16_to_float;
 
 __device__ float load_activation(
     const float* value) {
@@ -194,36 +166,7 @@ __device__ void store_activation(
 __device__ void store_activation(
     std::uint16_t* destination,
     float value) {
-    const auto bits =
-        __float_as_uint(value);
-    const auto rounded =
-        bits +
-        0x7fffU +
-        ((bits >> 16U) & 1U);
-    *destination =
-        static_cast<std::uint16_t>(
-            rounded >> 16U);
-}
-
-__device__ std::uint8_t iq4_local_scale(
-    const IQ4XSBlock& block,
-    std::uint32_t subblock) {
-    const auto low_byte =
-        block.scales_l[subblock / 2U];
-    const auto low =
-        static_cast<std::uint8_t>(
-            (low_byte >>
-             (4U * (subblock % 2U))) &
-            0x0fU);
-    const auto high =
-        static_cast<std::uint8_t>(
-            (block.scales_h >>
-             (2U * subblock)) &
-            0x03U);
-    return static_cast<std::uint8_t>(
-        low |
-        static_cast<std::uint8_t>(
-            high << 4U));
+    *destination = numeric::bf16_bits::float_to_bf16(value);
 }
 
 template <WeightKind Kind>
@@ -281,19 +224,7 @@ __device__ float load_weight<WeightKind::q8_0>(
     std::uint32_t row_width,
     std::uint32_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const Q8Block*>(weights);
-    const auto blocks_per_row =
-        row_width / 32U;
-    const auto& block =
-        blocks[
-            static_cast<std::uint64_t>(row) *
-                blocks_per_row +
-            feature / 32U];
-    return __half2float(block.scale) *
-           static_cast<float>(
-               block.values[
-                   feature % 32U]);
+    return hip_ggml::q8_0_value(weights, row_width, row, feature);
 }
 
 template <>
@@ -302,28 +233,7 @@ __device__ float load_weight<WeightKind::iq4_nl>(
     std::uint32_t row_width,
     std::uint32_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const IQ4NLBlock*>(weights);
-    const auto blocks_per_row =
-        row_width / 32U;
-    const auto& block =
-        blocks[
-            static_cast<std::uint64_t>(row) *
-                blocks_per_row +
-            feature / 32U];
-    const auto within =
-        feature % 32U;
-    const auto packed =
-        block.qs[within % 16U];
-    const auto code =
-        within < 16U
-            ? static_cast<std::uint8_t>(
-                  packed & 0x0fU)
-            : static_cast<std::uint8_t>(
-                  packed >> 4U);
-    return __half2float(block.d) *
-           static_cast<float>(
-               iq4_codebook[code]);
+    return hip_ggml::iq4_nl_value(weights, row_width, row, feature);
 }
 
 template <>
@@ -332,43 +242,7 @@ __device__ float load_weight<WeightKind::iq4_xs>(
     std::uint32_t row_width,
     std::uint32_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const IQ4XSBlock*>(weights);
-    const auto blocks_per_row =
-        row_width / 256U;
-    const auto& block =
-        blocks[
-            static_cast<std::uint64_t>(row) *
-                blocks_per_row +
-            feature / 256U];
-
-    const auto within =
-        feature % 256U;
-    const auto subblock =
-        within / 32U;
-    const auto suboffset =
-        within % 32U;
-    const auto packed =
-        block.qs[
-            subblock * 16U +
-            suboffset % 16U];
-    const auto code =
-        suboffset < 16U
-            ? static_cast<std::uint8_t>(
-                  packed & 0x0fU)
-            : static_cast<std::uint8_t>(
-                  packed >> 4U);
-    const int local =
-        static_cast<int>(
-            iq4_local_scale(
-                block,
-                subblock)) -
-        32;
-
-    return __half2float(block.d) *
-           static_cast<float>(local) *
-           static_cast<float>(
-               iq4_codebook[code]);
+    return hip_ggml::iq4_xs_value(weights, row_width, row, feature);
 }
 
 #define STRIX_GGML_KIND_LOAD(kind, type)                                                          \
@@ -447,59 +321,17 @@ std::uint64_t required_weight_bytes(
         "unreachable shared-expert weight kind");
 }
 
-template <
-    typename Input,
-    WeightKind Kind>
-__global__ void projection_to_fp32_kernel(
-    const Input* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    float* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+template <typename Storage, WeightKind Kind>
+struct ProjectionToFp32 {
+    using Input = Storage;
+    using Output = float;
+    static constexpr std::uint32_t threads = kThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return load_activation(&input[feature]); }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
-
-    __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            load_activation(
-                &input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            scratch[0];
-    }
-}
+    static __device__ __forceinline__ Output finish(float sum) { return sum; }
+};
 
 __global__ void gated_activation_kernel(
     float* workspace,
@@ -533,36 +365,12 @@ __global__ void scalar_projection_kernel(
     std::uint32_t input_width,
     float* output) {
     __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            load_activation(
-                &input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                0,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
+#define GEMV_TREE_THREADS kThreads
+#define GEMV_TREE_SCRATCH scratch
+#define GEMV_TREE_WIDTH input_width
+#define GEMV_TREE_ACTIVATION(feature) load_activation(&input[feature])
+#define GEMV_TREE_WEIGHT(feature) load_weight<Kind>(weights, input_width, 0, feature)
+#include "core/gemv_tree.inc"
     if (threadIdx.x == 0) {
         *output =
             1.0F /
@@ -693,35 +501,12 @@ __global__ void down_projection_kernel(
     }
 
     __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < intermediate_size;
-         feature += kThreads) {
-        sum +=
-            intermediate[feature] *
-            load_weight<Kind>(
-                weights,
-                intermediate_size,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
+#define GEMV_TREE_THREADS kThreads
+#define GEMV_TREE_SCRATCH scratch
+#define GEMV_TREE_WIDTH intermediate_size
+#define GEMV_TREE_ACTIVATION(feature) intermediate[feature]
+#define GEMV_TREE_WEIGHT(feature) load_weight<Kind>(weights, intermediate_size, out, feature)
+#include "core/gemv_tree.inc"
     if (threadIdx.x == 0) {
         store_activation(
             &output[out],
@@ -977,7 +762,7 @@ void launch_projection_by_kind(
             return;
         }
     if(prefetch && kind==WeightKind::q8_0 && input_width%32U==0){STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Input,true,8>),dim3(output_width/8U+(output_width%8U!=0U)),dim3(256),0,hip_execution_stream(),input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output);check_hip(hipGetLastError(),"HIP shared prefetch8 gate/up launch");if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);return;}
-#define STRIX_LAUNCH_CASE(kind_name)     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,          HIP_KERNEL_NAME(             projection_to_fp32_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width),         dim3(kThreads),         0, hip_execution_stream(),         input,         reinterpret_cast<const void*>(weights.address),         input_width,         output_width,         output)
+#define STRIX_LAUNCH_CASE(kind_name)     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,          HIP_KERNEL_NAME(             core::gemv_tree::rows_kernel<ProjectionToFp32<Input, WeightKind::kind_name>>),         dim3(output_width),         dim3(kThreads),         0, hip_execution_stream(),         input,         reinterpret_cast<const void*>(weights.address),         input_width,         output_width,         output)
     switch (kind) {
     case WeightKind::f32: STRIX_LAUNCH_CASE(f32); break;
     case WeightKind::f16: STRIX_LAUNCH_CASE(f16); break;
@@ -1357,7 +1142,7 @@ template<typename Storage>
 void shared_projection_probe_typed(HipSharedQ8ProjectionRole role,HipSharedQ8ProjectionMode mode,HipSharedQ8ProjectionView input,HipSharedQ8ProjectionView weights,HipSharedQ8ProjectionView gate,HipSharedQ8ProjectionView output,unsigned width,unsigned outputs,hipStream_t stream){
     const auto* w=reinterpret_cast<const void*>(weights.address);const auto* g=reinterpret_cast<const float*>(gate.address);
     if(role==HipSharedQ8ProjectionRole::gate_up){const auto* in=reinterpret_cast<const Storage*>(input.address);auto* out=reinterpret_cast<float*>(output.address);
-        if(mode==HipSharedQ8ProjectionMode::legacy256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(projection_to_fp32_kernel<Storage,WeightKind::q8_0>),dim3(outputs),dim3(256),0,stream,in,w,width,outputs,out);
+        if(mode==HipSharedQ8ProjectionMode::legacy256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<ProjectionToFp32<Storage,WeightKind::q8_0>>),dim3(outputs),dim3(256),0,stream,in,w,width,outputs,out);
         else if(mode==HipSharedQ8ProjectionMode::virtual256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Storage,false,1>),dim3(outputs),dim3(32),0,stream,in,w,width,outputs,out);
         else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Storage,true,8>),dim3(outputs/8U+(outputs%8U!=0U)),dim3(256),0,stream,in,w,width,outputs,out);
     }else{const auto* in=reinterpret_cast<const float*>(input.address);auto* out=reinterpret_cast<Storage*>(output.address);
@@ -2903,10 +2688,10 @@ void launch_hip_mtp_shared_expert(const MtpNativeContext& c,void* raw_stream){
 void enqueue_hip_mtp_shared_expert_q8(const std::uint16_t* input,const void* gate,const void* up_weights,const void* down,
     const void* scalar,float* workspace,std::uint16_t* output,void* raw_stream) {
     const auto stream=static_cast<hipStream_t>(raw_stream);auto* up=workspace+640U;
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<ProjectionToFp32<std::uint16_t,WeightKind::q8_0>>),dim3(640U),dim3(kThreads),0,stream,
         input,gate,2560U,640U,workspace);
     check_hip(hipGetLastError(),"MTP shared Q8 gate projection");
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<ProjectionToFp32<std::uint16_t,WeightKind::q8_0>>),dim3(640U),dim3(kThreads),0,stream,
         input,up_weights,2560U,640U,up);
     check_hip(hipGetLastError(),"MTP shared Q8 up projection");
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gated_activation_kernel,dim3(3U),dim3(kThreads),0,stream,workspace,640U);

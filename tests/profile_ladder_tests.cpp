@@ -20,6 +20,7 @@
 #include "minimax/engine/mm_defaults.hpp"
 #include "cuda/models/glm/producer/profile.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <deque>
 #include <fstream>
@@ -1840,15 +1841,58 @@ void band_lower_edge() {
     require(!p::ladder_defect(engine).empty(), "quality gate lengths do not count as timing receipts");
 }
 
+// A sealed promotion row binds through the promotion key only (Regime::promotion_execution): the ordinary execution
+// with the full device product and the run scope pack / route / ranks first in its settings.
+constexpr std::string_view kProductA = "gfx1151|Radeon 8060S|cu40|mem131072|clk2900000|hip60342|drv1";
+constexpr std::string_view kProductB = "gfx1151|Radeon 8060S|cu20|mem131072|clk2900000|hip60342|drv1";
+constexpr std::string_view kPackA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+constexpr std::string_view kPackB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+struct Run {
+    std::string_view ordinary, promotion;
+};
+Run run_key(std::uint64_t prompt, std::uint32_t lanes, std::string_view product, p::LadderScope scope,
+            std::uint32_t chunk = 512, std::string_view settings = "tp2") {
+    const p::LadderExecution execution{"hip", product, {prompt, 8192, lanes, chunk}, settings, scope};
+    return {keep(p::ladder_execution(execution)), keep(p::ladder_promotion_execution(execution))};
+}
+constexpr p::LadderScope kScope{kPackA, "cli", 1};
+
+void promotion_key() {
+    const auto key = run_key(1024, 1, kProductA, kScope);
+    require(key.ordinary == "exec/v1 backend=hip device=" + std::string(kProductA) + " prompt=1024 context=8192 lanes=1 "
+            "chunk=512 prefill_rows=0 decode_rows=0 verify_rows=0 generated=0 settings=tp2",
+            "the scope leaves the ordinary execution spelling unchanged");
+    require(key.promotion == "exec/v1 backend=hip device=" + std::string(kProductA) + " prompt=1024 context=8192 "
+            "lanes=1 chunk=512 prefill_rows=0 decode_rows=0 verify_rows=0 generated=0 settings=pack=" +
+            std::string(kPackA) + "|route=cli|ranks=1|tp2", "promotion key spells the scope first");
+    require(run_key(1024, 1, kProductA, kScope, 512, "").promotion.ends_with("settings=pack=" + std::string(kPackA) +
+            "|route=cli|ranks=1"), "a run without settings spells the scope alone");
+    require(run_key(1024, 1, "gfx1151/Radeon-8060S", kScope).promotion.empty(), "a device class is not a product");
+    require(run_key(1024, 1, "gfx1151|Radeon 8060S|cu40|mem131072|clk2900000|cuda12|drv1", kScope).promotion.empty(),
+            "the product runtime must be the backend's");
+    require(run_key(1024, 1, kProductA, {"AAAA", "cli", 1}).promotion.empty(), "pack must be a SHA-256");
+    require(run_key(1024, 1, kProductA, {kPackA, "", 1}).promotion.empty(), "route must be known");
+    require(run_key(1024, 1, kProductA, {kPackA, "c|i", 1}).promotion.empty(), "route must be a token");
+    require(run_key(1024, 1, kProductA, {kPackA, "cli", 0}).promotion.empty(), "ranks must be known");
+    require(run_key(1024, 1, kProductA, kScope, 512, "x,route=serve").promotion.empty(),
+            "settings that already name a scope field are ambiguous");
+    require(run_key(1024, 1, kProductA, kScope, 512, "a;b").promotion.empty(), "settings cannot break the key");
+    require(!run_key(1024, 1, kProductA, kScope, 512, "x,routed=1").promotion.empty(), "only exact field names collide");
+    require(run_key(0, 1, kProductA, kScope).promotion.empty(), "no promotion key without the ordinary execution");
+    p::LadderRow sealed{kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1, 8192, 1, 1, 1.25, 0.02, "r/x"};
+    const std::array plain{sealed};
+    require(!p::promotion_key_wanted(plain, "") && !p::promotion_key_wanted(plain, "0"),
+            "no sealed row and no request: no pack identity is read");
+    require(p::promotion_key_wanted(plain, "1"), "a promotion capture asks for the key");
+    sealed.promotion = "fixture-band";
+    const std::array promoted{sealed};
+    require(p::promotion_key_wanted(promoted, ""), "a sealed row needs the key on every run");
+}
+
 void promoted_band() {
-    const auto execution = [](std::uint64_t prompt, std::uint32_t lanes, std::string_view product,
-                              std::string_view settings, std::uint32_t chunk) {
-        return keep(p::ladder_execution({"hip", product, {prompt, 8192, lanes, chunk}, settings}));
-    };
-    constexpr auto settings = "pack=weight-v1|route=cli|ranks=1";
-    const auto capture = execution(1024, 1, "dev-product-a", settings, 512);
+    const auto capture = run_key(1024, 1, kProductA, kScope);
     auto band = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1024, 8192, 1, 2,
-                               1.25, 0.02, "r/capture"}, kExactArm, capture);
+                               1.25, 0.02, "r/capture"}, kExactArm, capture.promotion);
     band.identity = "v1";
     band.band_bound = true;
     band.band_evidence.timed = {1024, 8192};
@@ -1856,23 +1900,28 @@ void promoted_band() {
     const std::array rows{band};
     p::Engine engine{"capture-test", "", kRows, false, "capture-test-v1", {}, {}, rows};
     require(p::ladder_defect(engine).empty(), "recaptured band is well formed");
-    const auto runs = [&](std::uint64_t prompt, std::uint32_t lanes, std::string_view key) {
-        return resolve(engine, p::Name::fast, {p::Phase::prefill, prompt, lanes, "dev", key}).find(kLever)->value == "a8";
+    const auto regime = [](std::uint64_t prompt, std::uint32_t lanes, const Run& key) {
+        return p::Regime{p::Phase::prefill, prompt, lanes, "dev", key.ordinary, false, key.promotion};
+    };
+    const auto runs = [&](std::uint64_t prompt, std::uint32_t lanes, const Run& key) {
+        return resolve(engine, p::Name::fast, regime(prompt, lanes, key)).find(kLever)->value == "a8";
     };
     require(runs(1024, 1, capture), "recaptured point is on by default");
-    const auto inside = execution(4096, 2, "dev-product-a", settings, 512);
+    const auto report = resolve(engine, p::Name::fast, regime(1024, 1, capture));
+    require(report.find(kLever)->promotion_reference == band.over, "the receipt reports the sealed key it ran under");
+    require(report.json().find("\"promotion_reference\":") != std::string::npos, "the profile JSON carries the key");
+    require(!runs(1024, 1, {capture.ordinary, {}}), "a sealed row never binds the ordinary execution alone");
+    const auto inside = run_key(4096, 2, kProductA, kScope);
     require(runs(4096, 2, inside), "only the measured band coordinates may vary");
     require(!runs(4097, 2, inside), "prompt field must agree with the live regime");
     require(!runs(4096, 1, inside), "lane field must agree with the live regime");
-    require(!runs(4096, 2, execution(4096, 2, "dev-product-b", settings, 512)), "product must match");
-    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v2|route=cli|ranks=1", 512)),
-            "pack must match");
-    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v1|route=http|ranks=1", 512)),
-            "route must match");
-    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v1|route=cli|ranks=2", 512)),
-            "topology must match");
-    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", settings, 1024)), "chunk must match");
-    require(!runs(8193, 2, execution(8193, 2, "dev-product-a", settings, 512)), "context band still bounds admission");
+    require(!runs(4096, 2, run_key(4096, 2, kProductB, kScope)), "product must match");
+    require(!runs(4096, 2, run_key(4096, 2, kProductA, {kPackB, "cli", 1})), "pack must match");
+    require(!runs(4096, 2, run_key(4096, 2, kProductA, {kPackA, "serve", 1})), "route must match");
+    require(!runs(4096, 2, run_key(4096, 2, kProductA, {kPackA, "cli", 2})), "topology must match");
+    require(!runs(4096, 2, run_key(4096, 2, kProductA, kScope, 1024)), "chunk must match");
+    require(!runs(4096, 2, run_key(4096, 2, kProductA, kScope, 512, "tp1")), "other settings must match");
+    require(!runs(8193, 2, run_key(8193, 2, kProductA, kScope)), "context band still bounds admission");
     auto edited = kRows;
     edited[0].identity[0].identity = "v2";
     engine.table = edited;
@@ -1880,17 +1929,15 @@ void promoted_band() {
     edited[0].identity[0].identity = "v1";
     edited[0].identity[1].identity = "v2";
     require(!runs(4096, 2, inside), "changing the candidate implementation retires the receipt");
-    require(resolve(engine, p::Name::standard, {p::Phase::prefill, 4096, 2, "dev", inside}).find(kLever)->value == "off",
+    require(resolve(engine, p::Name::standard, regime(4096, 2, inside)).find(kLever)->value == "off",
             "EXACT selection shares no part of the promoted cell");
 }
 
 void recaptured_grant() {
-    const auto captured = keep(p::ladder_execution({"hip", "dev-product-a", {1024, 8192, 1, 512},
-                                                   "pack=weight-v1|route=cli|ranks=1"}));
-    const auto unmatched = keep(p::ladder_execution({"hip", "dev-product-b", {1024, 8192, 1, 512},
-                                                    "pack=weight-v1|route=cli|ranks=1"}));
+    const auto captured = run_key(1024, 1, kProductA, kScope);
+    const auto unmatched = run_key(1024, 1, kProductB, kScope);
     auto band = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1024, 8192, 1, 1,
-                               1.25, 0.02, "r/capture"}, kExactArm, captured);
+                               1.25, 0.02, "r/capture"}, kExactArm, captured.promotion);
     band.identity = "v1";
     band.band_bound = true;
     band.band_evidence.timed = {1024, 8192};
@@ -1900,9 +1947,9 @@ void recaptured_grant() {
     const std::array rows{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant", "v1"), legacy, band};
     auto table = kRows;
     p::Engine engine{"retire-grant-test", "", table, false, "retire-grant-test-v1", {}, {}, rows};
-    const p::Regime measured{p::Phase::prefill, 1024, 1, "dev", captured};
-    const p::Regime out_of_scope{p::Phase::prefill, 1024, 1, "dev", unmatched};
-    const p::Regime outside{p::Phase::prefill, 8193, 1, "dev", captured};
+    const p::Regime measured{p::Phase::prefill, 1024, 1, "dev", captured.ordinary, false, captured.promotion};
+    const p::Regime out_of_scope{p::Phase::prefill, 1024, 1, "dev", unmatched.ordinary, false, unmatched.promotion};
+    const p::Regime outside{p::Phase::prefill, 8193, 1, "dev", captured.ordinary, false, captured.promotion};
     const auto runs = [&](const p::Regime& regime) {
         return resolve(engine, p::Name::fast, regime).find(kLever)->value == "a8";
     };
@@ -1955,6 +2002,128 @@ void band_chain() {
             "outside the band: the tier below");
 }
 
+// No silent declines (strix/profile/decline.hpp): one record form, a reason always, a process log that collapses
+// repeats.
+void decline_record() {
+    // TURBO can inherit a measured FAST cell without refusing the requested value.
+    // Keep the lower-tier route notice, but report a decline only when the value is not delivered.
+    p::Entry inherited{};
+    inherited.requested = "sp4t-attn";
+    inherited.value = inherited.requested;
+    inherited.status = p::Status::set;
+    inherited.ladder_lowered = true;
+    require(!p::entry_declined(inherited), "a lower-tier route supplying the requested value is not a decline");
+    inherited.value = "0";
+    require(p::entry_declined(inherited), "a lower-tier route refusing the requested value is a decline");
+    inherited.status = p::Status::pending;
+    inherited.target = "sp4t-attn";
+    require(p::entry_declined(inherited), "a pending column is still a decline");
+    const p::Decline row{"lever@1", "on", "off", p::DeclineOrigin::request,
+                         p::decline_regime("decode", 0U, 0U, "gfx1151"), "say \"why\"\nnow"};
+    require(p::decline_line(row) ==
+                "strix-decline/v1 lever=lever@1 requested=on effective=off origin=request "
+                "regime=\"phase=decode context=unknown lanes=auto device=gfx1151\" reason=\"say \\\"why\\\" now\"",
+            "decline line: " + p::decline_line(row));
+    require(p::decline_json(row) ==
+                R"({"lever":"lever@1","requested":"on","effective":"off","origin":"request",)"
+                R"("regime":"phase=decode context=unknown lanes=auto device=gfx1151","reason":"say \"why\"\nnow"})",
+            "decline json: " + p::decline_json(row));
+    require(p::decline_line({"lever@1", "", "0", p::DeclineOrigin::load, "", "x"}).find(" requested=- effective=0 ") !=
+                std::string::npos,
+            "an empty value prints as '-'");
+    std::ostringstream sink;
+    bool refused = false;
+    try {
+        p::record_decline({"lever@1", "on", "off", p::DeclineOrigin::load, "", ""}, sink);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused && sink.str().empty(), "a decline without a reason is refused, not printed");
+    p::process_declines().clear();
+    p::record_decline(row, sink);
+    p::record_decline(row, sink);
+    require(p::process_declines().snapshot().size() == 1U && sink.str().rfind("strix-decline/v1 ", 0) == 0U,
+            "the process log collapses a repeated decision and every record prints its line");
+    p::process_declines().clear();
+    // An adapter's post-resolver decline joins the resolution's receipt in all three forms, with its regime.
+    auto resolution = resolve(strix::inkling2::kMiniProfile, p::Name::fast, {p::Phase::decode, 4096U, 2U, "gfx1151"});
+    resolution.decline({"adapter-lever@1", "on", "off", p::DeclineOrigin::memory, "", "image does not fit"}, sink);
+    const auto declines = resolution.declines();
+    require(!declines.empty() && declines.back().regime == "phase=decode context=4096 lanes=2 device=gfx1151" &&
+                declines.back().origin == p::DeclineOrigin::memory,
+            "an adapter decline takes the resolution's regime");
+    require(resolution.json().find("\"declined\":[") != std::string::npos &&
+                resolution.describe().find(p::decline_line(declines.back())) != std::string::npos,
+            "the adapter decline is in the JSON receipt and the effective-config text");
+    p::process_declines().clear();
+}
+
+// Every engine table, every probed regime of FAST and TURBO: each entry whose column asked for a value that does not run
+// is exactly one recorded decline with a reason, and json / describe / receipt_lines state exactly those records.
+void declines_recorded(const p::Engine& engine) {
+    auto probes = p::ladder_probes(engine);
+    probes.push_back({p::Phase::prefill, 0, 1, {}});
+    probes.push_back({p::Phase::decode, 0, 1, {}});
+    const std::string tag(engine.tag);
+    for (const auto tier : {p::Name::fast, p::Name::turbo}) {
+        if (tier == p::Name::turbo && engine.turbo_version.empty()) continue;
+        for (const auto& regime : probes) {
+            p::Resolution resolution;
+            try {
+                resolution = resolve(engine, tier, regime);
+            } catch (const std::exception&) {
+                continue;  // a tier the table refuses is not a decline
+            }
+            const auto rows = resolution.declines();
+            std::size_t declined = 0;
+            for (const auto& entry : resolution.entries) {
+                if (!p::entry_declined(entry)) continue;
+                ++declined;
+                const auto found = std::ranges::find_if(
+                    rows, [&](const p::Decline& row) { return row.lever == entry.lever->name; });
+                require(found != rows.end() && !found->reason.empty() && found->effective == entry.value &&
+                            found->origin == p::DeclineOrigin::resolver,
+                        tag + "/" + std::string(entry.lever->name) + " declined without a record");
+            }
+            require(rows.size() == declined, tag + ": the receipt records exactly the declined entries");
+            require((resolution.json().find("\"declined\":[") != std::string::npos) == !rows.empty(),
+                    tag + ": the JSON receipt carries 'declined' exactly when some lever is declined");
+            const auto text = resolution.describe();
+            const auto lines = resolution.receipt_lines();
+            for (const auto& row : rows) {
+                const auto line = p::decline_line(row);
+                require(text.find(line) != std::string::npos && std::ranges::find(lines, line) != lines.end(),
+                        tag + ": decline line in --print-effective-config and the startup receipt: " + line);
+            }
+        }
+    }
+}
+
+// Weight residency over an instance's extent is separate from per-request selection (profile::may_select).
+void residency_split() {
+    const auto& engine = strix::inkling2::kMiniProfile;
+    const auto at = [&](std::uint64_t context, std::uint32_t lanes) {
+        const auto execution = p::ladder_execution(
+            {"hip", "gfx1151 test product", {context, context, lanes, 128U, 0U, lanes, 0U, 0U}});
+        return resolve(engine, p::Name::fast, {p::Phase::decode, context, lanes, "gfx1151", execution});
+    };
+    const auto lever = strix::inkling2::kMiniLowBitHead;
+    const auto own = p::may_select(engine, lever, "sp4t-attn", p::Phase::decode, "gfx1151", 2000U, 1U, at);
+    require(own.resident && own.reason.find("extent's own regime") != std::string::npos,
+            "inside the band the extent's own regime selects it: " + own.reason);
+    for (const std::uint32_t lanes : {0U, 1U, 16U}) {
+        const auto wide = p::may_select(engine, lever, "sp4t-attn", p::Phase::decode, "gfx1151", 16384U, lanes, at);
+        require(wide.resident && wide.reason.find("requests in 916..2141 x 1..1") != std::string::npos,
+                "a 16K instance keeps the image resident for the requests its row decides: " + wide.reason);
+    }
+    const auto short_extent = p::may_select(engine, lever, "sp4t-attn", p::Phase::decode, "gfx1151", 800U, 1U, at);
+    require(!short_extent.resident && short_extent.reason.find("(rows: 916..2141 x 1..1)") != std::string::npos,
+            "no row meets an extent below the band: " + short_extent.reason);
+    const auto other = p::may_select(engine, lever, "sp4t-attn", p::Phase::decode, "sm_120", 16384U, 1U, at);
+    require(!other.resident && other.reason.find("(no row)") != std::string::npos,
+            "a device without rows keeps nothing resident: " + other.reason);
+}
+
 int main(int argc, char** argv) try {
     if (argc < 3) return 2;
     if (argc > 3 && std::string_view(argv[3]) == "--write") {
@@ -1972,6 +2141,7 @@ int main(int argc, char** argv) try {
     band_chain();
     band_lower_edge();
     band_max_edge();
+    promotion_key();
     promoted_band();
     recaptured_grant();
     bound_evidence();
@@ -2011,6 +2181,9 @@ int main(int argc, char** argv) try {
     hy4_new_quality_rows();
     hy4_measured_window_schedule();
     for (const auto& engine : engines) walk(engine);
+    for (const auto& engine : engines) declines_recorded(engine);
+    decline_record();
+    residency_split();
     // Review r63 D: every engine table the ladder reads, the custom adapters' tables through their shared row view.
     EnumerationCount count;
     const auto each = [&](const p::Engine& engine) {

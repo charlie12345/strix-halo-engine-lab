@@ -482,7 +482,8 @@ The document is `{"schema":"strix-gate-null-witness/v1","cases":{CASE:{ARM:RECOR
 and every null arm for every scored case. Each record carries `binary_sha256`, `model_sha256`,
 `numerical_config_sha256`, `logits_sha256`, and `control`. The binary, model and configuration excluding the control
 must match the exact reference. Its control is JSON null. A null control has the engine's versioned `order` and positive
-integer `applications`. For head captures also bind `head_ids_sha256` to the SHA-256 of the full prompt's little-endian
+integer `applications`, or is the MoE route-file one-ulp control exactly as its `strix-route-file/v1` receipt reports
+it (`layer`, `seed`, positive `nudged`). For head captures also bind `head_ids_sha256` to the SHA-256 of the full prompt's little-endian
 uint32 IDs. Step and spool captures include their labels in the hashed logit file. The launcher must collect these facts
 from the executed arms. The checker validates the binding of that record to the inputs. Disabling the check permits
 historical fixtures with no launcher record.
@@ -498,6 +499,16 @@ case also includes both free-running arms with the same execution identities as
 their corresponding replayed arms. The promotion receipt records the verified
 plan, witness, binary and pack digests. Sealed-arm comparisons remain available
 for historical evidence and bit-identity checks.
+
+`promote.py` is that launcher, one band spec (`strix-promotion-band/v1`, data only) per ladder band:
+`promote.py band SPEC --stage reference` captures the reference and null arms and freezes the plan (window IDs,
+classes, per-window reference NLL, null envelope); it refuses once a candidate capture exists, so publish the
+printed plan SHA-256 first. `promote.py band SPEC --stage candidate --receipt RUN.log` captures the candidate arms,
+writes the witness, runs `qual --promotion`, takes the manifest draft from the `promotion_reference` the engine's
+profile receipt reports for the lever (the promotion key: full device product and `pack=|route=|ranks=` scope),
+times ABBA at both band ends and the recorded run (or reads `--samples` from an external harness), and seals the
+entry with `check_promotion_manifest.seal()` (`--manifest` appends it). The pack identity is
+`strix::pack_content_identity()` (`promote.py pack PATH` prints the same digest).
 
 For preregistered qualification, `qual --frozen-qualification PLAN.json SHA256` pins the complete case set, content
 classes, IDs and class-specific R4 reference distribution. Publish the SHA-256 before collecting the candidate.

@@ -2,6 +2,7 @@
 
 #include "strix/env_flags.hpp"
 #include "strix/fnv.hpp"
+#include "strix/profile/decline.hpp"
 #include "strix/turbo.hpp"
 
 #include <algorithm>
@@ -128,6 +129,10 @@ struct Regime {
     // every ordinary timing reference (LadderArms::over); empty: not known, and no ordinary timing row decides.
     std::string_view execution{};
     bool require_measured_receipts = false;
+    // The promotion key of the same run (ladder_promotion_execution()): the execution with the full device product and
+    // the run scope (pack content identity, route, rank count) first in its settings. Only a sealed promotion row
+    // (LadderRow::promotion) binds through it; every other row keeps `execution`. Empty: no promotion row decides.
+    std::string_view promotion_execution{};
 };
 
 // At startup a server often knows its capacity but cannot resolve per request before a real prompt arrives.
@@ -147,10 +152,17 @@ struct JointWorkload {
 // product (device/{hip,cuda}_cost_identity.hpp: architecture, product, compute units, memory, clocks, runtime; a device
 // class alone is not enough), the priced workload and the adapter's effective timing settings outside the table
 // (weight format, route, schedules), each spelled once after the dispatch precedence resolved them.
+// The scope of a run a sealed promotion row must equal besides the workload: the content identity of the weight pack
+// that ran (pack_content_identity(): 64 lowercase hex), the route ("cli", "serve", ...) and the rank count.
+struct LadderScope {
+    std::string_view pack_sha256{}, route{};
+    std::uint32_t ranks = 0;
+};
 struct LadderExecution {
     std::string_view backend, device;
     JointWorkload workload{};
     std::string_view settings{};
+    LadderScope scope{};
 };
 // The spelling of `execution` (empty when the backend, the device product, the prompt tokens, the context capacity,
 // the lanes or the prefill chunk is not known: no ordinary timing row decides such a run).
@@ -166,6 +178,75 @@ struct LadderExecution {
            " verify_rows=" + std::to_string(w.verify_rows) + " generated=" + std::to_string(w.generated_tokens);
     if (!execution.settings.empty()) out += " settings=" + std::string(execution.settings);
     return out;
+}
+
+// The digits of a product field "<prefix><number>" (a leading zero only where `zero` allows a zero value).
+[[nodiscard]] constexpr bool product_number(std::string_view field, std::string_view prefix, bool zero) noexcept {
+    if (!field.starts_with(prefix) || field.size() == prefix.size()) return false;
+    field.remove_prefix(prefix.size());
+    if (!zero && field.front() == '0') return false;
+    return std::all_of(field.begin(), field.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+// A full device product identity of `backend` (device/{hip,cuda}_cost_identity.hpp spelling):
+// "<arch>[:<feature>]|<name>|cu<N>|mem<N>|clk<N>|<backend><N>|drv<N>". A device class alone is not a product.
+[[nodiscard]] constexpr bool full_device_product(std::string_view backend, std::string_view device) noexcept {
+    std::string_view fields[7];
+    std::size_t count = 0;
+    for (std::size_t start = 0;;) {
+        const auto bar = device.find('|', start);
+        if (count == 7) return false;
+        fields[count++] = device.substr(start, bar == device.npos ? device.npos : bar - start);
+        if (bar == device.npos) break;
+        start = bar + 1U;
+    }
+    const auto arch = fields[0].substr(0, fields[0].find(':'));
+    return count == 7 && !arch.empty() && !fields[1].empty() && device.find(';') == device.npos &&
+           product_number(fields[2], "cu", false) && product_number(fields[3], "mem", false) &&
+           product_number(fields[4], "clk", false) && product_number(fields[5], backend, true) &&
+           product_number(fields[6], "drv", true);
+}
+// First defect of a run scope; empty: complete (pack 64 lowercase hex, route a token, at least one rank).
+[[nodiscard]] constexpr std::string_view ladder_scope_defect(const LadderScope& scope) noexcept {
+    if (scope.pack_sha256.size() != 64U ||
+        !std::all_of(scope.pack_sha256.begin(), scope.pack_sha256.end(),
+                     [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
+        return "pack is not a SHA-256 content identity";
+    if (scope.route.empty() || scope.route.find_first_of("{},;|= \t\n") != scope.route.npos)
+        return "route is not a token";
+    if (scope.ranks == 0U) return "rank count is not known";
+    return {};
+}
+// True when `settings` already names a scope field (a "pack=", "route=" or "ranks=" item between '|' / ','): the
+// promotion key spells each scope field once, from the scope.
+[[nodiscard]] constexpr bool settings_name_scope(std::string_view settings) noexcept {
+    for (std::size_t start = 0; start <= settings.size();) {
+        const auto end = settings.find_first_of("|,", start);
+        const auto item = settings.substr(start, end == settings.npos ? settings.npos : end - start);
+        const auto eq = item.find('=');
+        if (eq != item.npos) {
+            const auto name = item.substr(0, eq);
+            if (name == "pack" || name == "route" || name == "ranks") return true;
+        }
+        if (end == settings.npos) break;
+        start = end + 1U;
+    }
+    return false;
+}
+// The promotion key of a run (Regime::promotion_execution): ladder_execution() with settings
+// "pack=<sha256>|route=<route>|ranks=<n>[|<settings>]". Empty (no promotion row decides) when the ordinary execution
+// is not known, the device is not a full product identity, the scope is incomplete, or the settings carry a ';' or
+// a scope field of their own (the scope would be ambiguous). The ordinary execution keeps its own spelling, so every
+// row recorded over it still binds.
+[[nodiscard]] inline std::string ladder_promotion_execution(const LadderExecution& execution) {
+    if (!full_device_product(execution.backend, execution.device) || !ladder_scope_defect(execution.scope).empty() ||
+        execution.settings.find(';') != execution.settings.npos || settings_name_scope(execution.settings))
+        return {};
+    std::string settings = "pack=" + std::string(execution.scope.pack_sha256) + "|route=" +
+        std::string(execution.scope.route) + "|ranks=" + std::to_string(execution.scope.ranks);
+    if (!execution.settings.empty()) settings.append("|").append(execution.settings);
+    auto scoped = execution;
+    scoped.settings = settings;
+    return ladder_execution(scoped);
 }
 
 // The last value of `name` among repeated `key=value` settings: the dispatch precedence of every CLI parser that
@@ -290,6 +371,16 @@ struct LadderRow {
     std::string_view promotion{};
 };
 
+// Whether an adapter spells the promotion key (Regime::promotion_execution; it costs the pack content identity, a
+// metadata read once the persistent digest cache is warm): when its timing rows hold a sealed promotion row, or when
+// the run asks for it (`request` is the value of STRIX_PROMOTION_KEY: "1" on the captures of a promotion,
+// tools/strix-gate/promote.py).
+inline constexpr std::string_view kPromotionKeySwitch = "STRIX_PROMOTION_KEY";
+[[nodiscard]] constexpr bool promotion_key_wanted(std::span<const LadderRow> rows, std::string_view request) noexcept {
+    return request == "1" ||
+        std::any_of(rows.begin(), rows.end(), [](const LadderRow& row) { return !row.promotion.empty(); });
+}
+
 #include "strix/profile/promotion_receipts.inc"
 
 // Bound the rounding allowance to three tokens (the same fixture can differ by a few tokens by entry point).
@@ -364,6 +455,8 @@ struct ReceiptKey {
     std::string_view joint{};
     const JointLadderScope* joint_scope = nullptr;
     std::string_view identity{};
+    // The same key over the promotion execution (LadderArms::promotion_over()): what a sealed promotion row must equal.
+    std::string_view promotion_reference{};
 };
 // The capture records one actual execution. Only the two measured band coordinates can be
 // different at runtime. In particular, context capacity, prefill chunk, pack and route stay fixed.
@@ -418,7 +511,7 @@ struct BandReference {
 
 [[nodiscard]] constexpr bool promoted_band_matches(const LadderRow& row, const ReceiptKey& key) noexcept {
     const auto recorded = band_reference(row.over);
-    const auto actual = band_reference(key.reference);
+    const auto actual = band_reference(key.promotion_reference);
     const auto& regime = *key.regime;
     return ladder_band(recorded.prompt, ladder_min_context(row), row.max_context, recorded.lanes,
                        std::uint64_t{row.min_lanes}, std::uint64_t{row.max_lanes}) &&
@@ -441,7 +534,8 @@ struct BandReference {
     if (key.joint.empty()) {
         if (row.band_bound && row.identity != key.identity) return false;
         if (!row.promotion.empty())
-            return row.band_bound && !regime.execution.empty() && promoted_band_matches(row, key);
+            return row.band_bound && !regime.promotion_execution.empty() && !key.promotion_reference.empty() &&
+                promoted_band_matches(row, key);
         const auto over = row.band_bound && row.over.empty() && !regime.require_measured_receipts
             ? row.compatibility_over : row.over;
         return !key.reference.empty() && !regime.execution.empty() && over == key.reference;
@@ -497,10 +591,13 @@ struct LadderVerdict {
 // The verdict of `value` of `lever` in `tier` for `regime` over `arm`, the complete reference of the execution that runs
 // (LadderArms::over(); required: an empty arm matches no timing receipt, so only an incumbent grant can run the cell)
 // and `identity` the declared implementation identity of `value` (Lever::identity; only a grant of that identity runs).
+// `promotion_arm` is the same key over the promotion execution (LadderArms::promotion_over(); empty: no sealed
+// promotion row decides).
 [[nodiscard]] constexpr LadderVerdict ladder_judge(std::span<const LadderRow> rows, std::string_view lever,
                                                    std::string_view value, Name tier, const Regime& regime,
-                                                   std::string_view arm, std::string_view identity) noexcept {
-    return ladder_verdict(rows, {lever, value, tier, &regime, arm, {}, nullptr, identity});
+                                                   std::string_view arm, std::string_view identity,
+                                                   std::string_view promotion_arm = {}) noexcept {
+    return ladder_verdict(rows, {lever, value, tier, &regime, arm, {}, nullptr, identity, promotion_arm});
 }
 // The verdict of a paired cell (LadderRow::joint): only receipts of the same pair with the same complete scope match;
 // grants never admit a pair.
@@ -551,7 +648,8 @@ inline constexpr std::string_view kIdentityVariantOption = "--identity-variant";
             if (!v.option.starts_with("--") || v.option.size() == 2U ||
                 v.option.find_first_of("@, =\t\r\n") != std::string_view::npos ||
                 v.option == "--profile" || v.option == "--allow-pending" || v.option == kIdentityVariantOption ||
-                v.option == turbo::kWeightsOption || v.option == turbo::kBitsOption || v.option == turbo::kPackOption)
+                v.option == turbo::kWeightsOption || v.option == turbo::kBitsOption || v.option == turbo::kPackOption ||
+                v.option == turbo::kProfilePackOption)
                 return false;
             for (const auto& lever : levers) if (v.option == lever.option) return false;
         }
@@ -663,7 +761,24 @@ struct Entry {
     std::string ladder{};       // effective tier decision for this regime
     bool ladder_lowered = false;  // the ladder ran a lower cell than the column's (its route line is a notice)
     std::string ladder_reference{};  // the reference the deciding timing rows must name (LadderRow::over)
+    std::string promotion_reference{};  // the same over the promotion execution (what a sealed promotion row records)
 };
+
+// True when the entry's column (not an explicit setting) asked for a value this regime does not run, or the column
+// is pending. A lower ladder tier can supply the same requested value (e.g. TURBO inheriting FAST): its route notice
+// remains, but it is not a decline. Resolution::declines() records actual refusals.
+[[nodiscard]] inline bool entry_declined(const Entry& entry) {
+    if (entry.status == Status::pending) return true;
+    return entry.status != Status::explicit_cli && entry.status != Status::explicit_env && !entry.requested.empty() &&
+           entry.requested != entry.value;
+}
+// The reason a declined entry states: its route line, the pending target, the adapter's reason, else the resolver's.
+[[nodiscard]] inline std::string entry_decline_reason(const Entry& entry) {
+    if (!entry.ladder.empty()) return entry.ladder;
+    if (entry.status == Status::pending) return "pending column: " + entry.target + " is not admitted for this tier";
+    if (!entry.reason.empty()) return entry.reason;
+    return "no ladder row decides this regime for the column's value; the tier below runs";
+}
 
 // Adapters with their own app/option schemas bind the same qualification rule to their value columns.
 template <class Row>
@@ -728,6 +843,37 @@ struct Resolution {
     // Bit-changing switches outside the lever table that the engine applied and can attest ("name=value"). The tier
     // notice names them and then never claims the exact column.
     std::vector<std::string> engine_overrides;
+    // The regime resolve() decided in (decline_regime spelling), and the declines the adapter recorded after the
+    // resolver (load, memory, conflict, backend: decline()). Neither enters the fingerprint.
+    std::string decision_regime{};
+    std::vector<Decline> adapter_declines{};
+    // Every lever this run asked for and does not run, in table order then adapter order (strix/profile/decline.hpp):
+    // a ladder row that lowered the column in this regime, a pending column, and each decline() the adapter recorded.
+    // The receipt (json "declined", describe, receipt_lines) states exactly these.
+    [[nodiscard]] std::vector<Decline> declines() const {
+        std::vector<Decline> out;
+        for (const auto& entry : entries)
+            if (entry_declined(entry))
+                out.push_back({std::string(entry.lever->name),
+                               entry.status == Status::pending ? entry.target : entry.requested, entry.value,
+                               DeclineOrigin::resolver, decision_regime, entry_decline_reason(entry)});
+        out.insert(out.end(), adapter_declines.begin(), adapter_declines.end());
+        return out;
+    }
+    // Records a decline decided after the resolver (an empty regime takes the resolution's): writes its line to `out`,
+    // adds it to the process log and to this receipt.
+    void decline(Decline row, std::ostream& out) {
+        if (row.regime.empty()) row.regime = decision_regime;
+        record_decline(row, out);
+        for (const auto& recorded : adapter_declines)
+            if (recorded == row) return;
+        adapter_declines.push_back(std::move(row));
+    }
+    [[nodiscard]] std::vector<std::string> decline_lines() const {
+        std::vector<std::string> out;
+        for (const auto& row : declines()) out.push_back(decline_line(row));
+        return out;
+    }
     // Identity variants resolve() admitted, in declaration order; each points into engine->variants.
     [[nodiscard]] const std::vector<const IdentityVariant*>& identity_variants() const {
         if (!admitted_.empty() && (engine != admitted_engine_ || profile != admitted_profile_))
@@ -827,6 +973,9 @@ struct Resolution {
                 ",\"kind\":" + json_string(kind_name(lever.kind)) +
                 ",\"source\":" + json_string(lever.source);
             if (!entry.ladder.empty()) levers += ",\"ladder\":" + json_string(entry.ladder);
+            // The promotion key of this cell (tools/strix-gate/promote.py reads it into the manifest draft).
+            if (!entry.promotion_reference.empty())
+                levers += ",\"promotion_reference\":" + json_string(entry.promotion_reference);
             levers += "}";
             if (entry.status == Status::pending) {
                 if (!pending.empty()) pending += ',';
@@ -863,6 +1012,8 @@ struct Resolution {
             }
             out += "]";
         }
+        // "declined" only when some lever is declined: a run that declines nothing keeps its legacy JSON.
+        if (const auto rows = declines(); !rows.empty()) out += ",\"declined\":" + declines_json(rows);
         return out + ",\"levers\":{" + levers + "},\"pending\":[" + pending + "],\"unqualified\":[" + unqualified +
             "],\"provisional\":[" + provisional + "]}";
     }
@@ -925,6 +1076,7 @@ struct Resolution {
         std::vector<std::string> out{summary()};
         if (auto notice = tier_notice(); !notice.empty()) out.push_back(std::move(notice));
         if (!incumbent_identity()) out.push_back(identity());  // the incumbent's receipt lines are unchanged
+        for (auto& line : decline_lines()) out.push_back(std::move(line));
         return out;
     }
     // Line form for line-oriented --print-effective-config outputs (appended after the engine's own lines).
@@ -949,6 +1101,7 @@ struct Resolution {
             out += "identity " + std::string(variant->id) + '@' + std::to_string(variant->version) + " (" +
                 (variant->exact_identity ? "exact identity" : "bit-changing") + "; reference " +
                 std::string(variant->reference) + "; changes " + std::string(variant->changes) + ")\n";
+        for (const auto& line : decline_lines()) out += line + "\n";
         return out;
     }
     // FNV-1a 64 of what the ranks of a pair must share: the profile name, the qualification and every lever's
@@ -1150,6 +1303,9 @@ struct LadderCell {
     // The lever's judged value has band rows and the regime lies outside every one of them: the cell keeps the tier
     // below by design (a decided out-of-band state, not a pending qualification). Adapters may report it as builtin.
     bool out_of_band = false;
+    // LadderArms::promotion_over() of the same step (the key a sealed promotion row of this cell records; empty: the
+    // regime has no promotion execution).
+    std::string promotion_reference{};
 };
 
 // Version of the reference spelling (LadderRow::over). Bumped when the spelling rule changes, so a receipt written
@@ -1160,6 +1316,7 @@ struct LadderCell {
 // of every lever per tier, and the execution outside the table (Regime::execution).
 struct LadderArms {
     std::string execution;
+    std::string promotion_execution;  // Regime::promotion_execution (empty: no promotion key)
     std::vector<std::string> levers;                    // table order
     std::vector<Identities> identities;                 // Lever::identity per lever (table order)
     std::array<std::vector<std::string>, 3> values;     // standard, fast, turbo; values[t][i] = what lever i runs in t
@@ -1193,15 +1350,24 @@ struct LadderArms {
     // any spelled value has no declared identity. Ends with ";tier=<tier>": a key compares one pair of executions for
     // one tier only.
     [[nodiscard]] std::string over(Name tier, std::string_view lever, std::string_view candidate) const {
+        return over_execution(execution, tier, lever, candidate);
+    }
+    // The same key over the promotion execution (Regime::promotion_execution): what a sealed promotion row records
+    // (LadderRow::over of a promotion row) and the "promotion_reference" a receipt reports. Empty without that key.
+    [[nodiscard]] std::string promotion_over(Name tier, std::string_view lever, std::string_view candidate) const {
+        return over_execution(promotion_execution, tier, lever, candidate);
+    }
+    [[nodiscard]] std::string over_execution(std::string_view execution_key, Name tier, std::string_view lever,
+                                             std::string_view candidate) const {
         const auto at = index(lever);
         const auto& upper = values[slot(tier)];
         const auto& lower = values[slot(tier_below(tier))];
         const auto& later = incumbent[slot(tier)];
-        if (execution.empty() || at == levers.size() || upper.size() < at || lower.size() != levers.size() ||
+        if (execution_key.empty() || at == levers.size() || upper.size() < at || lower.size() != levers.size() ||
             later.size() != levers.size())
             return {};
         std::string out(kLadderArmVersion);
-        out.append(";").append(execution).append(";");
+        out.append(";").append(execution_key).append(";");
         for (std::size_t i = 0; i < levers.size(); ++i) {
             if (i != 0) out.append(",");
             if (!spell(out, i, i < at ? upper[i] : i == at ? lower[i] : later[i])) return {};
@@ -1306,9 +1472,10 @@ template <class Row, class Admission>
     // The complete key of the execution that runs under this cell (the lower cell of this lever included): only a
     // receipt of exactly that key decides; any other receipt has no effect here.
     const std::string reference = arms.over(tier, lever.name, wanted);
+    const std::string promotion_reference = arms.promotion_over(tier, lever.name, wanted);
     std::string_view identity{};
     if constexpr (requires { lever.identity; }) identity = declared_identity(lever.identity, wanted);
-    const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime, reference, identity);
+    const auto verdict = ladder_judge(rows, lever.name, wanted, tier, regime, reference, identity, promotion_reference);
     step += rung_name(verdict.rung);
     if (verdict.row) {
         if (!verdict.row->incumbent) {
@@ -1319,13 +1486,15 @@ template <class Row, class Admission>
         step += " (" + std::string(verdict.row->receipt) + ")";
     }
     const bool measured = verdict.row != nullptr && !verdict.row->incumbent;
-    if (rung_runs(verdict.rung)) return {wanted, tier, step, false, reference, measured};
+    if (rung_runs(verdict.rung)) return {wanted, tier, step, false, reference, measured, false, promotion_reference};
     // The explicit benchmark arm can collect the evidence the default needs where no measurement decides the regime.
     // It never claims qualification, and never runs a cell measured slower or within noise.
     if (tier == Name::fast && allow_pending && lever.runnable[column] && rung_unmeasured(verdict.rung))
-        return {wanted, tier, step + " (unqualified benchmark opt-in)", true, reference};
+        return {wanted, tier, step + " (unqualified benchmark opt-in)", true, reference, false, false,
+                promotion_reference};
     lower.route = step + lower.route;
     lower.reference = reference;
+    lower.promotion_reference = promotion_reference;
     lower.measured = measured;
     lower.out_of_band = verdict.rung == Rung::unmeasured && outside_every_band(rows, lever.name, wanted, tier, regime);
     return lower;
@@ -1348,6 +1517,7 @@ template <class Row, class AdmitOf, class ExplicitOf = NoExplicitSetting>
                                             const ExplicitOf& explicit_of = {}, bool allow_pending = false) {
     LadderArms arms;
     arms.execution = std::string(regime.execution);
+    arms.promotion_execution = std::string(regime.promotion_execution);
     // A timing row of a lever this table does not have decides nothing and asks no identities of it.
     const bool timed = std::any_of(rows.begin(), rows.end(), [&](const LadderRow& row) {
         return !row.incumbent && std::any_of(table.begin(), table.end(), [&](const auto& lever) { return lever.name == row.lever; });
@@ -1499,6 +1669,7 @@ inline void apply_ladder(Entry& entry, Name tier, const auto& admit, LadderCell 
     if (!ladder_judged(lever) || (tier != Name::fast && tier != Name::turbo)) return;
     entry.ladder = std::move(cell.route);
     entry.ladder_reference = std::move(cell.reference);
+    entry.promotion_reference = std::move(cell.promotion_reference);
     entry.ladder_lowered = !entry.ladder.empty() && cell.tier != tier;
     if (cell.benchmark) {
         entry.value = cell.value;
@@ -1642,6 +1813,8 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         return column_admission(lever, column, out.allow_pending, preset);
     };
     const auto regime = measured_receipt_regime(inputs.regime, inputs.env);
+    out.decision_regime =
+        decline_regime(regime.phase == Phase::prefill ? "prefill" : "decode", regime.context, regime.lanes, regime.device);
     out.entries = resolve_switches(engine.table, profile_column, regime, out.allow_pending,
         engine.ladder, {}, admit, [&](const Lever& lever) -> std::optional<SwitchSetting> {
             if (const auto* cli = last_setting(inputs.cli, lever.name)) return SwitchSetting{*cli, *cli, true};
@@ -1653,6 +1826,50 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     out.admitted_engine_ = &engine;
     out.admitted_profile_ = out.profile;
     return out;
+}
+
+// Weight residency is not per-request selection. An instance keeps the image of a lever's value resident when SOME
+// request inside its extent may select it: the extent's own regime resolves to `value`, or a ladder row of the lever
+// for the device and phase meets [1, max_context] x [1, max_lanes] (max_context 0: not bounded; max_lanes 0: left to
+// the memory budget, any lane count) and its probe at the met band's lower corner resolves to `value`. Each request
+// then resolves in its own regime and runs the value only where a row decides; elsewhere it declines for that request
+// (DeclineOrigin::request), never because of how the process started. `resolve_at(context, lanes)` returns the
+// instance's Resolution in that regime (the adapter spells Regime::execution for the probe).
+struct Residency {
+    bool resident = false;
+    std::string reason;  // resident: the regimes that may select it; not resident: the decline reason
+};
+
+template <class ResolveAt>
+[[nodiscard]] Residency may_select(const Engine& engine, std::string_view lever, std::string_view value, Phase phase,
+                                   std::string_view device, std::uint64_t max_context, std::uint32_t max_lanes,
+                                   ResolveAt&& resolve_at) {
+    const auto selects = [&](std::uint64_t context, std::uint32_t lanes) {
+        const Resolution resolution = resolve_at(context, lanes);
+        const auto* entry = resolution.find(lever);
+        return entry != nullptr && entry->value == value;
+    };
+    const auto bound = [](std::uint64_t v) { return v == 0U ? std::string("any") : std::to_string(v); };
+    const std::string extent = "context<=" + bound(max_context) + " lanes<=" + (max_lanes == 0U ? "auto" : bound(max_lanes));
+    const std::string what = std::string(lever) + "=" + std::string(value);
+    // The extent's own regime as the instance resolves it (max_lanes 0 = lanes left to the memory budget, the regime the
+    // load decided in); a lane count inside it that a row decides is found by the row probes below.
+    if (selects(max_context, max_lanes)) return {true, what + " selected in the extent's own regime (" + extent + ")"};
+    std::string rows, met;
+    for (const auto& row : engine.ladder) {
+        if (row.lever != lever || row.incumbent || row.device != device || row.phase != phase) continue;
+        if (!row.value.empty() && row.value != value) continue;
+        const auto edge = ladder_min_context(row);
+        const std::string band = std::to_string(row.min_context) + ".." + std::to_string(row.max_context) + " x " +
+                                 std::to_string(row.min_lanes) + ".." + std::to_string(row.max_lanes);
+        rows += (rows.empty() ? "" : ", ") + band;
+        if (edge == 0U || (max_context != 0U && edge > max_context) || (max_lanes != 0U && row.min_lanes > max_lanes))
+            continue;
+        if (selects(edge, row.min_lanes)) met += (met.empty() ? "" : ", ") + band;
+    }
+    if (!met.empty()) return {true, what + " resident: requests in " + met + " (" + extent + ") select it"};
+    return {false, "no " + std::string(device) + " " + (phase == Phase::prefill ? "prefill" : "decode") + " row of " +
+                       what + " meets the extent " + extent + (rows.empty() ? std::string(" (no row)") : " (rows: " + rows + ")")};
 }
 
 // First defect of an engine's ladder rows (empty: none). With any timing receipt, every row of the table declares its
@@ -1906,13 +2123,15 @@ inline void take_options(const Engine& engine, std::vector<std::string>& args, I
             request_variant(engine, inputs, a, VariantOrigin::cli);
             continue;
         }
-        if (key == turbo::kWeightsOption || key == turbo::kBitsOption || key == turbo::kPackOption) {
+        if (key == turbo::kWeightsOption || key == turbo::kBitsOption || key == turbo::kPackOption ||
+            key == turbo::kProfilePackOption) {
             std::string value;
             if (equal != std::string::npos) value = a.substr(equal + 1U);
             else if (i + 1 < args.size()) value = args[++i];
             if (value.empty()) throw std::invalid_argument(key + " requires a value");
             auto& slot = key == turbo::kWeightsOption ? inputs.weights.source :
-                key == turbo::kBitsOption ? inputs.weights.bits : inputs.weights.pack;
+                key == turbo::kBitsOption ? inputs.weights.bits :
+                key == turbo::kPackOption ? inputs.weights.pack : inputs.weights.profile_pack;
             slot = value;
             continue;
         }

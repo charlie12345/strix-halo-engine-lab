@@ -1,5 +1,7 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/numeric/bf16_bits.hpp"
+#include "core/gemv_tree.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/profile/all_on_engaged.hpp"
 #include <iostream>
@@ -258,28 +260,8 @@ constexpr std::uint64_t fnv_offset =
 constexpr std::uint64_t fnv_prime =
     1099511628211ULL;
 
-struct Q8Block {
-    __half scale;
-    std::int8_t values[32];
-};
-
-struct IQ4XSBlock {
-    __half d;
-    std::uint16_t scales_h;
-    std::uint8_t scales_l[4];
-    std::uint8_t qs[128];
-};
-
-static_assert(sizeof(Q8Block) == 34);
-static_assert(sizeof(IQ4XSBlock) == 136);
-
-__device__ __constant__
-std::int8_t iq4_codebook[16] = {
-    -127, -104, -83, -65,
-    -49, -35, -22, -10,
-       1,   13,  25,  38,
-      53,   69,  89, 113,
-};
+using hip_ggml::Q8Block;
+using hip_ggml::IQ4XSBlock;
 
 enum class WeightKind {
     f32,
@@ -387,47 +369,8 @@ SmallWeightKind small_weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
-}
-
-__device__ std::uint16_t float_to_bf16(
-    float value) {
-    const auto bits =
-        __float_as_uint(value);
-    const auto rounded =
-        bits +
-        0x7fffU +
-        ((bits >> 16U) & 1U);
-    return static_cast<std::uint16_t>(
-        rounded >> 16U);
-}
-
-__device__ std::uint8_t iq4_local_scale(
-    const IQ4XSBlock& block,
-    std::uint32_t subblock) {
-    const auto packed =
-        block.scales_l[
-            subblock / 2U];
-    const auto low =
-        static_cast<std::uint8_t>(
-            (packed >>
-             (4U *
-              (subblock % 2U))) &
-            0x0fU);
-    const auto high =
-        static_cast<std::uint8_t>(
-            (block.scales_h >>
-             (2U * subblock)) &
-            0x03U);
-    return static_cast<std::uint8_t>(
-        low |
-        static_cast<std::uint8_t>(
-            high << 4U));
-}
+using numeric::bf16_bits::bf16_to_float;
+using numeric::bf16_bits::float_to_bf16;
 
 template <WeightKind Kind>
 __device__ float load_weight(
@@ -481,21 +424,7 @@ __device__ float load_weight<WeightKind::q8_0>(
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const Q8Block*>(
-            weights);
-    const auto blocks_per_row =
-        row_width / 32U;
-    const auto& block =
-        blocks[
-            row *
-                blocks_per_row +
-            feature / 32U];
-    return __half2float(
-               block.scale) *
-           static_cast<float>(
-               block.values[
-                   feature % 32U]);
+    return hip_ggml::q8_0_value(weights, row_width, row, feature);
 }
 
 template <>
@@ -504,44 +433,7 @@ __device__ float load_weight<WeightKind::iq4_xs>(
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const IQ4XSBlock*>(
-            weights);
-    const auto blocks_per_row =
-        row_width / 256U;
-    const auto& block =
-        blocks[
-            row *
-                blocks_per_row +
-            feature / 256U];
-
-    const auto within =
-        feature % 256U;
-    const auto subblock =
-        within / 32U;
-    const auto suboffset =
-        within % 32U;
-    const auto packed =
-        block.qs[
-            subblock * 16U +
-            suboffset % 16U];
-    const auto code =
-        suboffset < 16U
-            ? static_cast<std::uint8_t>(
-                  packed & 0x0fU)
-            : static_cast<std::uint8_t>(
-                  packed >> 4U);
-    const int local =
-        static_cast<int>(
-            iq4_local_scale(
-                block,
-                subblock)) -
-        32;
-
-    return __half2float(block.d) *
-           static_cast<float>(local) *
-           static_cast<float>(
-               iq4_codebook[code]);
+    return hip_ggml::iq4_xs_value(weights, row_width, row, feature);
 }
 
 __device__ float load_small(
@@ -646,58 +538,18 @@ std::uint64_t small_weight_bytes(
 }
 
 template <WeightKind Kind>
-__global__ void project_bf16_to_fp32_kernel(
-    const std::uint16_t* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    float* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+struct ProjectBf16ToFp32 {
+    using Input = std::uint16_t;
+    using Output = float;
+    static constexpr std::uint32_t threads = kThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return bf16_to_float(input[feature]); }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
+    static __device__ __forceinline__ Output finish(float sum) { return sum; }
+};
 
-    __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            bf16_to_float(
-                input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            scratch[0];
-    }
-}
-
-// Same 256-leaf DAG as project_bf16_to_fp32_kernel<q8_0> inside one wave per row:
+// Same 256-leaf DAG as rows_kernel<ProjectBf16ToFp32<q8_0>> (core/gemv_tree.hpp) inside one wave per row:
 // leaf t=8*lane+local accumulates features t, t+256, ... in order, then the
 // LDS tree (strides 128..8 are lane shuffles 16..1, strides 4..1 are local).
 __global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_kernel(
@@ -1293,8 +1145,7 @@ void launch_projection(
     float* output) {
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
-            project_bf16_to_fp32_kernel<
-                Kind>),
+            core::gemv_tree::rows_kernel<ProjectBf16ToFp32<Kind>>),
         dim3(output_width),
         dim3(kThreads),
         0, hip_execution_stream(),
@@ -2283,7 +2134,7 @@ void testing::enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,co
     std::uint32_t output_width,float* output,void* stream) {
     const auto s=static_cast<hipStream_t>(stream);
     if(wave8) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_wave8_q8_bf16_to_fp32_kernel,dim3((output_width+7U)/8U),dim3(256),0,s,input,q8,input_width,output_width,output);
-    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_bf16_to_fp32_kernel<WeightKind::q8_0>),dim3(output_width),dim3(kThreads),0,s,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::q8_0>>),dim3(output_width),dim3(kThreads),0,s,
         input,q8,input_width,output_width,output);
     check_hip(hipGetLastError(),"PLE Q8 projection test launch");
 }

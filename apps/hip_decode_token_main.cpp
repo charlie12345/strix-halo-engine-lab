@@ -2671,7 +2671,8 @@ static int run_decode_entry(
         shared_model_inventory = strix::build_uma_owner_inventory(views);
     }
     // TURBO+ onfly INT4 g64 copies of the dense decode projections (--turbo-weights onfly): after the router copy, before any kernel plan.
-    const auto onfly_i4_owner = strix::load_hip_qwen_onfly_i4(manifest, model_residency.binding(), options.turbo);
+    const auto onfly_i4_owner = strix::load_hip_qwen_onfly_i4(manifest, model_residency.binding(), options.turbo,
+                                                                options.model_path);
     if (options.turbo.active()) {
         const auto inventory = onfly_i4_owner->owner_inventory(onfly_i4_owner);
         auto views = shared_model_inventory.pinned_views;
@@ -6200,6 +6201,10 @@ static int run_decode_entry(
             }
             // One complete configured window or one unpadded serial suffix row per call.
             const auto prefill_start = std::chrono::steady_clock::now();
+            // Prompt rows read the reference weights whatever their window size (prefill stays Q8_0), as the MTP
+            // prompt walk does: the plain and the speculative low-bit runs then enter decode from the same state.
+            std::optional<strix::q6p::iu4::SuspendScope> prompt_reference_rows;
+            prompt_reference_rows.emplace();
             for (;;) {
                 strix::decode_cli::check_yarn_memory();
                 if (!chunks.advance()) break;
@@ -6209,6 +6214,7 @@ static int run_decode_entry(
                     prefix_state->after_block(session,prompt);
                 }
             }
+            prompt_reference_rows.reset();
             if (session_cache_enabled) std::cerr << "session initial_prefill_ms=" << std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - prefill_start).count() << '\n';
             const auto initial_generation_start = std::chrono::steady_clock::now();

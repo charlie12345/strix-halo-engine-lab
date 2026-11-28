@@ -42,8 +42,9 @@ inline constexpr ::strix::session::kv_precision::Caps kKvCaps{
     "the HIP 8-bit KV form is --kv int8 (kv-int8-tok-v1)"};
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
 inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{
-    {true, true, false}, {false, false, false, false, true, false, false, false, false}, "rtn-g64",
-    "onfly INT4 g64 is built for decode dense projections only (qwen)", "converted low-bit pack loader is not implemented in this build"};
+    {true, true, true}, {false, false, false, false, true, false, false, false, false}, "rtn-g64",
+    "onfly INT4 g64 is built for decode dense projections only (qwen)",
+    "converted packs hold strix.q4_g64 decode dense projections only (qwen)"};
 struct Resolution {
     Name profile = Name::standard;
     std::vector<Entry> entries;
@@ -279,12 +280,12 @@ inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& prof
     const auto key = arg.substr(0, equal);
     if (arg == "--allow-pending") { inputs.allow_pending = true; return true; }
     namespace tb = ::strix::profile::turbo;
-    if (key == tb::kWeightsOption || key == tb::kBitsOption || key == tb::kPackOption) {
+    if (key == tb::kWeightsOption || key == tb::kBitsOption || key == tb::kPackOption || key == tb::kProfilePackOption) {
         const auto value = equal != std::string_view::npos ? arg.substr(equal + 1U) :
             (i + 1 < argc ? std::string_view(argv[++i]) : std::string_view{});
         if (value.empty() || value.starts_with("--")) throw std::invalid_argument(std::string(key) + " requires a value");
         (key == tb::kWeightsOption ? inputs.weights.source : key == tb::kBitsOption ? inputs.weights.bits :
-            inputs.weights.pack) = std::string(value);
+            key == tb::kPackOption ? inputs.weights.pack : inputs.weights.profile_pack) = std::string(value);
         return true;
     }
     const Lever* lever = nullptr;

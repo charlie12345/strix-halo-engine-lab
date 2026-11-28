@@ -3,6 +3,8 @@
 #include <hip/hip_runtime.h>
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/numeric/bf16_bits.hpp"
+#include "core/gemv_tree.hpp"
 #include "strix/profile/all_on_engaged.hpp"
 #include <iostream>
 #include "core/short_convolution.hpp"
@@ -109,34 +111,9 @@ static_assert(kRecurrentThreads == ops::recur::kStepThreads && kValueTile == ops
 constexpr std::uint64_t fnv_prime =
     1099511628211ULL;
 
-struct Q8Block {
-    __half scale;
-    std::int8_t values[32];
-};
-
-struct IQ4NLBlock {
-    __half d;
-    std::uint8_t qs[16];
-};
-
-struct IQ4XSBlock {
-    __half d;
-    std::uint16_t scales_h;
-    std::uint8_t scales_l[4];
-    std::uint8_t qs[128];
-};
-
-static_assert(sizeof(Q8Block) == 34);
-static_assert(sizeof(IQ4NLBlock) == 18);
-static_assert(sizeof(IQ4XSBlock) == 136);
-
-__device__ __constant__
-std::int8_t iq4_codebook[16] = {
-    -127, -104, -83, -65,
-    -49, -35, -22, -10,
-       1,   13,  25,  38,
-      53,   69,  89, 113,
-};
+using hip_ggml::Q8Block;
+using hip_ggml::IQ4NLBlock;
+using hip_ggml::IQ4XSBlock;
 
 enum class WeightKind {
     f32,
@@ -349,52 +326,9 @@ SmallWeightKind small_weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
-    std::uint16_t bits) {
-    return __uint_as_float(
-        static_cast<std::uint32_t>(
-            bits) << 16U);
-}
-
-__device__ std::uint16_t float_to_bf16(
-    float value) {
-    const auto bits =
-        __float_as_uint(value);
-    const auto rounded =
-        bits +
-        0x7fffU +
-        ((bits >> 16U) & 1U);
-    return static_cast<std::uint16_t>(
-        rounded >> 16U);
-}
-
-__device__ float round_bf16(
-    float value) {
-    return bf16_to_float(
-        float_to_bf16(value));
-}
-
-__device__ std::uint8_t iq4_local_scale(
-    const IQ4XSBlock& block,
-    std::uint32_t subblock) {
-    const auto low_byte =
-        block.scales_l[subblock / 2U];
-    const auto low =
-        static_cast<std::uint8_t>(
-            (low_byte >>
-             (4U *
-              (subblock % 2U))) &
-            0x0fU);
-    const auto high =
-        static_cast<std::uint8_t>(
-            (block.scales_h >>
-             (2U * subblock)) &
-            0x03U);
-    return static_cast<std::uint8_t>(
-        low |
-        static_cast<std::uint8_t>(
-            high << 4U));
-}
+using numeric::bf16_bits::bf16_to_float;
+using numeric::bf16_bits::float_to_bf16;
+using numeric::bf16_bits::round_bf16;
 
 template <WeightKind Kind>
 __device__ float load_weight(
@@ -451,21 +385,7 @@ __device__ float load_weight<WeightKind::q8_0>(
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const Q8Block*>(
-            weights);
-    const auto blocks_per_row =
-        row_width / 32U;
-    const auto& block =
-        blocks[
-            row *
-                blocks_per_row +
-            feature / 32U];
-    return __half2float(
-               block.scale) *
-           static_cast<float>(
-               block.values[
-                   feature % 32U]);
+    return hip_ggml::q8_0_value(weights, row_width, row, feature);
 }
 
 template <>
@@ -474,30 +394,7 @@ __device__ float load_weight<WeightKind::iq4_nl>(
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const IQ4NLBlock*>(
-            weights);
-    const auto blocks_per_row =
-        row_width / 32U;
-    const auto& block =
-        blocks[
-            row *
-                blocks_per_row +
-            feature / 32U];
-    const auto within =
-        feature % 32U;
-    const auto packed =
-        block.qs[
-            within % 16U];
-    const auto code =
-        within < 16U
-            ? static_cast<std::uint8_t>(
-                  packed & 0x0fU)
-            : static_cast<std::uint8_t>(
-                  packed >> 4U);
-    return __half2float(block.d) *
-           static_cast<float>(
-               iq4_codebook[code]);
+    return hip_ggml::iq4_nl_value(weights, row_width, row, feature);
 }
 
 template <>
@@ -506,44 +403,7 @@ __device__ float load_weight<WeightKind::iq4_xs>(
     std::uint32_t row_width,
     std::uint64_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const IQ4XSBlock*>(
-            weights);
-    const auto blocks_per_row =
-        row_width / 256U;
-    const auto& block =
-        blocks[
-            row *
-                blocks_per_row +
-            feature / 256U];
-
-    const auto within =
-        feature % 256U;
-    const auto subblock =
-        within / 32U;
-    const auto suboffset =
-        within % 32U;
-    const auto packed =
-        block.qs[
-            subblock * 16U +
-            suboffset % 16U];
-    const auto code =
-        suboffset < 16U
-            ? static_cast<std::uint8_t>(
-                  packed & 0x0fU)
-            : static_cast<std::uint8_t>(
-                  packed >> 4U);
-    const int local =
-        static_cast<int>(
-            iq4_local_scale(
-                block,
-                subblock)) -
-        32;
-
-    return __half2float(block.d) *
-           static_cast<float>(local) *
-           static_cast<float>(
-               iq4_codebook[code]);
+    return hip_ggml::iq4_xs_value(weights, row_width, row, feature);
 }
 
 __device__ float load_small(
@@ -653,57 +513,16 @@ std::uint64_t small_weight_bytes(
 
 
 template <WeightKind Kind>
-__global__ void project_bf16_to_fp32_kernel(
-    const std::uint16_t* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    float* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+struct ProjectBf16ToFp32 {
+    using Input = std::uint16_t;
+    using Output = float;
+    static constexpr std::uint32_t threads = kProjectionThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return bf16_to_float(input[feature]); }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
-
-    __shared__ float scratch[kProjectionThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kProjectionThreads) {
-        sum +=
-            bf16_to_float(
-                input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kProjectionThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            round_bf16(
-                scratch[0]);
-    }
-}
+    static __device__ __forceinline__ Output finish(float sum) { return round_bf16(sum); }
+};
 
 // Eight ascending virtual leaves per physical lane preserve the original
 // 256-leaf tree, including its operand order and BF16-in-FP32 epilogue.
@@ -842,56 +661,16 @@ void project_prefetch8_wave8_q8_bf16_to_fp32_kernel(
 
 
 template <WeightKind Kind>
-__global__ void project_fp32_to_bf16_kernel(
-    const float* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    std::uint16_t* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+struct ProjectFp32ToBf16 {
+    using Input = float;
+    using Output = std::uint16_t;
+    static constexpr std::uint32_t threads = kProjectionThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return input[feature]; }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
-
-    __shared__ float scratch[kProjectionThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kProjectionThreads) {
-        sum +=
-            input[feature] *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kProjectionThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            float_to_bf16(
-                scratch[0]);
-    }
-}
+    static __device__ __forceinline__ Output finish(float sum) { return float_to_bf16(sum); }
+};
 
 // One wave simulates the same256 original leaves: virtual t=8*lane+j.
 // Ascending per-leaf FMA chains and the128..1 tree are unchanged.
@@ -1496,207 +1275,6 @@ __device__ __forceinline__ constexpr std::size_t recurrent_layout_index(
                                         : L == Layout::stride33 ? gdn_recurrent_lds::Form::lane_major_pad
                                                                 : gdn_recurrent_lds::Form::lane_major,
         lane, column);
-}
-
-template <gdn_recurrent_layout_diagnostic::Layout Layout>
-__global__ __launch_bounds__(kRecurrentThreads)
-void recurrent_layout_diagnostic_kernel(
-    const float* qkv,
-    const float* beta,
-    const float* gate,
-    float* state,
-    float* core,
-    std::uint32_t key_heads,
-    std::uint32_t value_heads,
-    std::uint32_t head_dim, std::uint32_t* graph_status) {
-    __shared__ unsigned graph_reject;
-    if (graph_status != nullptr) {
-        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
-        __syncthreads();
-        if (graph_reject) return;
-    }
-    const auto tile_count =
-        head_dim /
-        kValueTile;
-    const auto block =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    const auto value_head =
-        block /
-        tile_count;
-    const auto tile =
-        block %
-        tile_count;
-    const auto lane =
-        static_cast<std::uint32_t>(
-            threadIdx.x);
-
-    if (value_head >= value_heads ||
-        lane >= head_dim) {
-        return;
-    }
-
-    const auto key_head =
-        value_head %
-        key_heads;
-    const auto value_base =
-        tile *
-        kValueTile;
-
-    const auto q_base =
-        static_cast<std::uint64_t>(
-            key_head) *
-        head_dim;
-    const auto k_base =
-        static_cast<std::uint64_t>(
-            key_heads) *
-            head_dim +
-        q_base;
-    const auto v_base =
-        static_cast<std::uint64_t>(
-            key_heads) *
-            head_dim *
-            2ULL +
-        static_cast<std::uint64_t>(
-            value_head) *
-            head_dim;
-
-    __shared__ float reduction[
-        kRecurrentThreads *
-        (Layout == gdn_recurrent_layout_diagnostic::Layout::stride33 ? 33U : kValueTile)];
-    // The first reduction's broadcast must remain immutable while every wave
-    // reads it. Reusing reduction[column] for the next tree lets lane zero
-    // overwrite a delta before another wave has consumed it.
-    __shared__ float deltas[kValueTile];
-
-    float retained[kValueTile];
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto value_index =
-            value_base +
-            column;
-        const auto state_index =
-            (static_cast<std::uint64_t>(
-                 value_head) *
-                 head_dim +
-             lane) *
-                head_dim +
-            value_index;
-        retained[column] =
-            state[state_index] *
-            expf(
-                gate[value_head]);
-        reduction[recurrent_layout_index<Layout>(lane, column)] =
-            retained[column] *
-            qkv[
-                k_base +
-                lane];
-    }
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kRecurrentThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-#pragma unroll
-            for (std::uint32_t column = 0;
-                 column < kValueTile;
-                 ++column) {
-                reduction[recurrent_layout_index<Layout>(lane, column)] +=
-                    reduction[recurrent_layout_index<Layout>(lane + stride, column)];
-            }
-        }
-        __syncthreads();
-    }
-
-    if (lane == 0) {
-#pragma unroll
-        for (std::uint32_t column = 0;
-             column < kValueTile;
-             ++column) {
-            const auto value_index =
-                value_base +
-                column;
-            deltas[column] =
-                (qkv[
-                     v_base +
-                     value_index] -
-                 reduction[recurrent_layout_index<Layout>(0U, column)]) *
-                beta[value_head];
-        }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto delta =
-            deltas[column];
-        retained[column] +=
-            qkv[
-                k_base +
-                lane] *
-            delta;
-        reduction[recurrent_layout_index<Layout>(lane, column)] =
-            retained[column] *
-            qkv[
-                q_base +
-                lane];
-    }
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kRecurrentThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-#pragma unroll
-            for (std::uint32_t column = 0;
-                 column < kValueTile;
-                 ++column) {
-                reduction[recurrent_layout_index<Layout>(lane, column)] +=
-                    reduction[recurrent_layout_index<Layout>(lane + stride, column)];
-            }
-        }
-        __syncthreads();
-    }
-
-    if (lane == 0) {
-#pragma unroll
-        for (std::uint32_t column = 0;
-             column < kValueTile;
-             ++column) {
-            core[
-                static_cast<std::uint64_t>(
-                    value_head) *
-                    head_dim +
-                value_base +
-                column] =
-                reduction[recurrent_layout_index<Layout>(0U, column)];
-        }
-    }
-
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto value_index =
-            value_base +
-            column;
-        const auto state_index =
-            (static_cast<std::uint64_t>(
-                 value_head) *
-                 head_dim +
-             lane) *
-                head_dim +
-            value_index;
-        state[state_index] =
-            retained[column];
-    }
 }
 
 template <gdn_recurrent_layout_diagnostic::Layout Layout,
@@ -2536,12 +2114,11 @@ void launch_projection(
     std::uint32_t input_width,
     std::uint32_t output_width,
     float* output, hipStream_t stream, GdnKernelLedger* ledger) {
-    record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<Kind>),
+    record_gdn_kernel(ledger, reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<Kind>>),
         dim3(output_width), dim3(kProjectionThreads));
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
-            project_bf16_to_fp32_kernel<
-                Kind>),
+            core::gemv_tree::rows_kernel<ProjectBf16ToFp32<Kind>>),
         dim3(output_width),
         dim3(kProjectionThreads),
         0,
@@ -2643,12 +2220,11 @@ void launch_output_projection(
     std::uint32_t input_width,
     std::uint32_t output_width,
     std::uint16_t* output, hipStream_t stream, GdnKernelLedger* ledger) {
-    record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_fp32_to_bf16_kernel<Kind>),
+    record_gdn_kernel(ledger, reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectFp32ToBf16<Kind>>),
         dim3(output_width), dim3(kProjectionThreads));
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
-            project_fp32_to_bf16_kernel<
-                Kind>),
+            core::gemv_tree::rows_kernel<ProjectFp32ToBf16<Kind>>),
         dim3(output_width),
         dim3(kProjectionThreads),
         0,
@@ -3420,25 +2996,13 @@ void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayo
     switch (layout) {
     case HipGdnRecurrentLayout::baseline:
     case HipGdnRecurrentLayout::stride32:
-        if constexpr (Storage == GdnRecurrentStorage::key_value) {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32>));
-        } else {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32, Storage>));
-        }
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32, Storage>));
         break;
     case HipGdnRecurrentLayout::stride33:
-        if constexpr (Storage == GdnRecurrentStorage::key_value) {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33>));
-        } else {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33, Storage>));
-        }
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33, Storage>));
         break;
     case HipGdnRecurrentLayout::transposed:
-        if constexpr (Storage == GdnRecurrentStorage::key_value) {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>));
-        } else {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed, Storage>));
-        }
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed, Storage>));
         break;
     default:
         throw std::invalid_argument("GDN recurrent LDS candidate is invalid");
@@ -6537,13 +6101,13 @@ void require_island_d1_scope(const HipLaunchContext& scope, std::uint64_t identi
 }
 const void* wave8_island_input_symbol(std::uint32_t ggml_type) {
     switch (weight_kind(ggml_type)) {
-    case WeightKind::f32: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::f32>);
-    case WeightKind::f16: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::f16>);
-    case WeightKind::bf16: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::bf16>);
+    case WeightKind::f32: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::f32>>);
+    case WeightKind::f16: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::f16>>);
+    case WeightKind::bf16: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::bf16>>);
     case WeightKind::q8_0: return reinterpret_cast<const void*>(project_prefetch8_wave8_q8_bf16_to_fp32_kernel);
-    case WeightKind::iq4_nl: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::iq4_nl>);
-    case WeightKind::iq4_xs: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::iq4_xs>);
-#define STRIX_GGML_KIND_CASE(KIND, type) case WeightKind::KIND: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::KIND>);
+    case WeightKind::iq4_nl: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::iq4_nl>>);
+    case WeightKind::iq4_xs: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::iq4_xs>>);
+#define STRIX_GGML_KIND_CASE(KIND, type) case WeightKind::KIND: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::KIND>>);
     STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
 #undef STRIX_GGML_KIND_CASE
     }
@@ -6585,7 +6149,7 @@ void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger,
     });
     const auto recurrent_symbol = config.recurrent_layout == HipGdnRecurrentLayout::baseline
         ? step_symbol
-        : reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>);
+        : reinterpret_cast<const void*>(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>);
     for (const auto& expected : ledger) {
         std::size_t selected = count;
         for (std::size_t i = 0; i < count; ++i) {
@@ -7088,11 +6652,11 @@ const void* kernel_symbol(Layout layout) {
     case Layout::reference:
         return reinterpret_cast<const void*>(recurrent_step_kernel<RecurrentStateType::f32>);
     case Layout::stride32:
-        return reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<Layout::stride32>);
+        return reinterpret_cast<const void*>(recurrent_storage_kernel<Layout::stride32>);
     case Layout::stride33:
-        return reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<Layout::stride33>);
+        return reinterpret_cast<const void*>(recurrent_storage_kernel<Layout::stride33>);
     case Layout::transposed:
-        return reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<Layout::transposed>);
+        return reinterpret_cast<const void*>(recurrent_storage_kernel<Layout::transposed>);
     }
     throw std::invalid_argument("invalid GDN recurrent diagnostic layout");
 }
@@ -7114,11 +6678,11 @@ void enqueue(Shape shape, const Bindings& bindings, Layout layout, hipStream_t s
     switch (layout) {
     case Layout::reference: STRIX_RECURRENT_LAYOUT_LAUNCH(recurrent_step_kernel<RecurrentStateType::f32>); break;
     case Layout::stride32:
-        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<Layout::stride32>)); break;
+        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_storage_kernel<Layout::stride32>)); break;
     case Layout::stride33:
-        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<Layout::stride33>)); break;
+        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_storage_kernel<Layout::stride33>)); break;
     case Layout::transposed:
-        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<Layout::transposed>)); break;
+        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_storage_kernel<Layout::transposed>)); break;
     }
 #undef STRIX_RECURRENT_LAYOUT_LAUNCH
     check_hip(hipGetLastError(), "GDN recurrent diagnostic launch");

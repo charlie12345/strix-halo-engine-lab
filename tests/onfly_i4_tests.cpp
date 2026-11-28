@@ -125,6 +125,38 @@ int main() {
         for (std::size_t c = N; c < padded; ++c)
             for (std::size_t g = 0; g < K / 64U; ++g) pad_zero = pad_zero && copy.scales[c * (K / 64U) + g] == 0;
         expect(pad_zero, "pad columns have scale 0");
+        // A calibrated pack stores the same values as strix.q4_g64 rows (128-weight superblocks: 64 code bytes, even
+        // element in the low nibble, then the FP16 scales of the two halves): the relayout gives the copy byte for byte.
+        {
+            constexpr std::size_t K2 = 256;
+            std::vector<std::uint8_t> q8b(N * K2 / 32U * 34U);
+            std::uint32_t seed2 = 7U;
+            for (std::size_t b = 0; b < N * K2 / 32U; ++b) {
+                auto* blk = q8b.data() + b * 34U;
+                const auto d = core::onfly::f32_to_f16_bits(0x1p-9f * static_cast<float>(1U + lcg(seed2) % 64U));
+                blk[0] = static_cast<std::uint8_t>(d & 255U); blk[1] = static_cast<std::uint8_t>(d >> 8U);
+                for (int j = 0; j < 32; ++j) blk[2 + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(static_cast<int>(lcg(seed2) % 255U) - 127));
+            }
+            const auto ref = core::onfly::convert_q8_0_host(q8b.data(), N, K2, rule);
+            const std::size_t row_bytes = K2 / 128U * 68U;
+            std::vector<std::uint8_t> q4(N * row_bytes, 0), relaid(core::onfly::copy_bytes(N, K2), 0xA5);
+            for (std::size_t c = 0; c < N; ++c)
+                for (std::size_t k = 0; k < K2; k += 2U) {
+                    const std::size_t byte = ((k / 16U * (padded / 16U) + c / 16U) * 16U + c % 16U) * 8U + (k % 16U) / 2U;
+                    q4[c * row_bytes + k / 128U * 68U + (k % 128U) / 2U] = ref.packed[byte];
+                }
+            for (std::size_t c = 0; c < N; ++c)
+                for (std::size_t g = 0; g < K2 / 64U; ++g) {
+                    const std::uint16_t sb = ref.scales[c * (K2 / 64U) + g];
+                    std::uint8_t* at = q4.data() + c * row_bytes + g / 2U * 68U + 64U + 2U * (g % 2U);
+                    at[0] = static_cast<std::uint8_t>(sb & 255U);
+                    at[1] = static_cast<std::uint8_t>(sb >> 8U);
+                }
+            core::onfly::q4_g64_to_copy(q4.data(), N, K2, relaid.data());
+            const bool packed_same = std::memcmp(relaid.data(), ref.packed.data(), ref.packed.size()) == 0;
+            const bool scales_same = std::memcmp(relaid.data() + ref.packed.size(), ref.scales.data(), ref.scales.size() * 2U) == 0;
+            expect(packed_same && scales_same, "q4_g64 relayout equals the IU4 copy (codes and scales, pad columns zero)");
+        }
     }
 
     // MSE clip search: equals an independent search over the same candidates and never has more squared error than the
@@ -318,11 +350,30 @@ int main() {
            canonical_cli.options.turbo.row_reduction.effective == canonical_serve.options.turbo.row_reduction.effective &&
            decode_cli::effective_prefill_argv(canonical_cli.options) == decode_cli::effective_prefill_argv(canonical_serve.options),
            "CLI and server share the canonical reduction contract and cache identity");
+    const auto legacy_cli = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly",
+        "--turbo-onfly-groups=gdn_in,gdn_out"}), {{"STRIX_IU4_ROW_REDUCTION", "legacy"}}});
     expect(canonical_cli.options.turbo.identity().find("iu4-g64g96-gc32-v1") != std::string::npos &&
-           canonical_cli.options.turbo.identity() != onfly_i4::resolve({}, no_env, true).identity(),
-           "canonical reduction changes the numerical identity only when requested");
-    expect(cli.options.turbo.row_reduction.effective == Reduction::legacy &&
-           cli.options.turbo.identity() == std::string(onfly_i4::kIdentity) + "-g3-full", "legacy default identity preserved");
+           canonical_cli.options.turbo.identity() == onfly_i4::resolve({}, no_env, true).identity(),
+           "canonical reduction is the default numerical identity");
+    expect(cli.options.turbo.row_reduction.effective == Reduction::canonical &&
+           cli.options.turbo.identity() == std::string(onfly_i4::kIdentity) + "-g3-full-iu4-g64g96-gc32-v1",
+           "default identity names the row-invariant contract");
+    expect(legacy_cli.options.turbo.row_reduction.effective == Reduction::legacy &&
+           legacy_cli.options.turbo.identity() == std::string(onfly_i4::kIdentity) + "-g3-full" &&
+           decode_cli::effective_prefill_argv(legacy_cli.options) != decode_cli::effective_prefill_argv(cli.options),
+           "explicit legacy keeps its historical identity and a separate cache identity");
+    // MTP composes with the low-bit rows: the plan of every G64/G96 site is the same at 1..8 rows (verify windows), so
+    // each row of a window sums the same K groups per wave in the same order as the one-row decode step.
+    for (const unsigned groups : {32U, 40U, 64U, 96U}) {
+        const auto one = core::iu4_rows::iu4_plan(1U, groups, core::iu4_rows::parse_row_reduction(""));
+        for (unsigned rows = 2U; rows <= 8U; ++rows) {
+            const auto plan = core::iu4_rows::iu4_plan(rows, groups, core::iu4_rows::parse_row_reduction(""));
+            expect(plan.S == one.S && plan.GC == one.GC, "default reduction: verify-window rows reduce like the decode step");
+        }
+    }
+    expect(onfly_i4::weight_format_value_option("--turbo-onfly-groups") && onfly_i4::weight_format_value_option("--turbo-onfly-scale-rule") &&
+           onfly_i4::weight_format_inline_option("--turbo-onfly-groups=gdn_in") && !onfly_i4::weight_format_inline_option("--turbo-onfly-groupsx") &&
+           !onfly_i4::weight_format_value_option("--turbo-onfly"), "onfly sub-switches are weight-format options (speculation neutral)");
     const auto canonical_native = decode_cli::initialize_prefill_config({options_for({}), {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
     expect(!canonical_native.options.turbo.row_reduction.active && canonical_native.options.turbo.identity().empty() &&
            decode_cli::effective_prefill_argv(canonical_native.options) == decode_cli::effective_prefill_argv(native.options),

@@ -64,6 +64,27 @@ struct SlotRows {
 // An engine's lone-lane speculation pieces (CohortConfig::lane_speculation) are bound with bind_lanes(): the binding
 // answers CohortBackend's lane hooks as they are asked (the model drafter of a lane, the speculator's data and seeds,
 // whether a lane's drafter inputs are complete). Without a binding the hooks keep their defaults (copy drafts only).
+// Optional slot hooks (each one detected on the decoder; absent = the CohortBackend default, so a decoder that offers
+// none behaves as before). Every hook that may touch device state first resolves a staged window (discard, as a
+// prefill does) and withdraws the readable score rows, so the one rollback checkpoint and the score rows stay sound:
+//  - release_slot(slot): the lane is free (CohortBackend::release). While a window is staged the call is deferred
+//    until the stage is resolved (commit or discard), so a staged slot is never released under its checkpoint.
+//  - propose_slot(slot, room, tokens, probability): the device drafter's proposal for the slot's next window
+//    (CohortBackend::device_drafts / propose).
+//  - restore_slot(slot, prompt) -> rows and capture_slot(slot, committed): the decoder's retained prefixes
+//    (CohortBackend::restore / capture). Through this adapter a restore covers at most prompt.size() - 1 rows: the
+//    lane's last prompt row is always read by a prefill call (a larger answer is refused as a contract error).
+//  - prefill_group_capacity() -> PrefillGroupCapacity, prefill_route_class(rows) -> class and prefill_slots(members):
+//    one grouped prompt pass (CohortBackend::prompt_group_capacity / prompt_route_class / prefill_group) on the plain
+//    prefill route; the emits-first route groups through prefill_group_first (above), else reads one member.
+//  - samples_on_device() const -> bool and sample_slot_row(row, sampler, position) -> id: device sampling of the
+//    row read_slot_logits(row, ...) would return (CohortBackend::samples_on_device / sample_final).
+//  - propose_slots(proposals): one drafter pass for the round's lanes (CohortBackend::propose_round), before the
+//    round's propose_slot calls; offered with propose_slot only.
+//  - samples_in_round() const -> bool and sample_slot_rows(samples): the round's sampled rows in one call
+//    (CohortBackend::samples_in_round / sample_round); each entry's lane field names the score row sample_slot_row
+//    would read. Offered with sample_slot_row only.
+//  - bind_slot(slot, request_id, traits) and control(words): per-request words and engine control messages.
 class FixedKvLaneBinding {
 public:
     virtual ~FixedKvLaneBinding() = default;
@@ -116,8 +137,8 @@ public:
         if constexpr (kPlainPrefill) decoder_->prefill_slot(lane, tokens, first);
     }
 
-    // Grouped whole prompts (emits-first decoders offering prefill_group_first): the decoder's capacity and route class,
-    // else the backend defaults (no grouping, the solo loop).
+    // Grouped whole prompts: emits-first decoders through prefill_group_first (capacity capped at the lanes), plain-route
+    // decoders through prefill_slots; else the backend defaults (no grouping, the solo loop).
     [[nodiscard]] PrefillGroupCapacity prompt_group_capacity() const override {
         if constexpr (kGroups) {
             if (emits_first_) {
@@ -126,11 +147,17 @@ public:
                 return capacity;
             }
         }
+        if constexpr (kSlotGroups) {
+            if (!emits_first_) return decoder_->prefill_group_capacity();  // the plain route's grouped prompt pass
+        }
         return CohortBackend::prompt_group_capacity();
     }
     [[nodiscard]] std::uint32_t prompt_route_class(std::uint64_t rows) const override {
         if constexpr (kGroups) {
             if (emits_first_) return decoder_->prefill_route_class(rows);
+        }
+        if constexpr (kSlotGroups) {
+            if (!emits_first_) return decoder_->prefill_route_class(rows);
         }
         return CohortBackend::prompt_route_class(rows);
     }
@@ -153,7 +180,13 @@ public:
                 return;
             }
         }
-        CohortBackend::prefill_group(members);
+        if constexpr (kSlotGroups) {
+            if (emits_first_) throw std::logic_error("fixed KV cohort: no grouped prompt pass on the emits-first route");
+            before_work();
+            decoder_->prefill_slots(members);
+        } else {
+            CohortBackend::prefill_group(members);
+        }
     }
 
     [[nodiscard]] std::uint32_t prefill_top(std::uint32_t lane) override {
@@ -271,12 +304,7 @@ public:
 
     std::span<const float> read_final_logits(std::uint32_t lane) override {
         if constexpr (kReadsLogits) {
-            if (lane != kNoLane && lane == prefill_lane_) return read_row(0U);  // emits-first: the prefill's row 0
-            if (const auto row = group_row(lane); row != kNoLane) return read_row(row);  // a group member's row
-            if (verify_pending_ && lane != kNoLane)
-                for (std::size_t row = 0; row < window_.size(); ++row)
-                    if (window_[row] == lane) return read_row(static_cast<std::uint32_t>(row));
-            throw std::logic_error("fixed KV cohort: final logits requested for a lane outside the pending window");
+            return read_row(final_row(lane));
         } else {
             return CohortBackend::read_final_logits(lane);
         }
@@ -304,6 +332,7 @@ public:
                 mixed_staged_ = false;
                 staged_ = false;
                 withdraw();
+                flush_releases();
                 return;
             }
         }
@@ -318,6 +347,7 @@ public:
             }
         }
         withdraw();
+        flush_releases();
     }
 
     // Lone-lane speculation: the bound engine pieces (owned here, destroyed before the decoder they may reference).
@@ -344,6 +374,97 @@ public:
         std::ranges::replace(window_, lane, kNoLane);
         for (auto& w : windows_)
             if (w.lane == lane) w.lane = kNoLane;
+        if constexpr (kReleases) {
+            if (staged_) pending_releases_.push_back(lane);  // released once the stage is resolved
+            else decoder_->release_slot(lane);
+        }
+    }
+
+    // A decoder with propose_slot may still decline at run time (device_drafts() const -> bool, e.g. no drafter loaded).
+    [[nodiscard]] bool device_drafts() const override {
+        if constexpr (kProposes && requires(const Decoder& view) { { view.device_drafts() } -> std::convertible_to<bool>; })
+            return decoder_->device_drafts();
+        else return kProposes;
+    }
+    void propose(std::uint32_t lane, std::uint32_t room, std::vector<std::uint32_t>& tokens,
+                 std::vector<double>& probability) override {
+        if constexpr (kProposes) {
+            before_work();
+            decoder_->propose_slot(lane, room, tokens, probability);
+        } else {
+            CohortBackend::propose(lane, room, tokens, probability);
+        }
+    }
+    void propose_round(std::span<const CohortProposal> lanes) override {
+        if constexpr (kRoundProposes) {
+            before_work();
+            decoder_->propose_slots(lanes);
+        } else {
+            CohortBackend::propose_round(lanes);
+        }
+    }
+
+    [[nodiscard]] std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) override {
+        if constexpr (kRetains) {
+            before_work();
+            const std::uint64_t rows = decoder_->restore_slot(lane, prompt);
+            if (!prompt.empty() && rows >= prompt.size())
+                throw std::logic_error("fixed KV cohort: a restore must leave the last prompt row to a prefill call");
+            return rows;
+        } else {
+            return CohortBackend::restore(lane, prompt);
+        }
+    }
+    void capture(std::uint32_t lane, std::span<const std::uint32_t> committed) override {
+        if constexpr (kRetains) {
+            before_work();
+            decoder_->capture_slot(lane, committed);
+        } else {
+            CohortBackend::capture(lane, committed);
+        }
+    }
+
+    [[nodiscard]] bool samples_on_device() const override {
+        if constexpr (kSamples) return decoder_->samples_on_device();
+        else return false;
+    }
+    std::uint32_t sample_final(std::uint32_t lane, TokenSampler& sampler, std::uint64_t position) override {
+        if constexpr (kSamples) {
+            return decoder_->sample_slot_row(final_row(lane), sampler, position);
+        } else {
+            return CohortBackend::sample_final(lane, sampler, position);
+        }
+    }
+    [[nodiscard]] bool samples_in_round() const override {
+        if constexpr (kRoundSamples) return decoder_->samples_in_round();
+        else return false;
+    }
+    void sample_round(std::span<CohortSample> lanes) override {
+        if constexpr (kRoundSamples) {
+            round_samples_.assign(lanes.begin(), lanes.end());
+            for (auto& s : round_samples_) s.lane = final_row(s.lane);
+            decoder_->sample_slot_rows(std::span<CohortSample>(round_samples_));
+            for (std::size_t i = 0; i < lanes.size(); ++i) lanes[i].token = round_samples_[i].token;
+        } else {
+            CohortBackend::sample_round(lanes);
+        }
+    }
+
+    void bind_lane(std::uint32_t lane, std::uint64_t request_id, std::span<const std::uint32_t> traits) override {
+        if constexpr (kBinds) {
+            before_work();
+            decoder_->bind_slot(lane, request_id, traits);
+        } else {
+            CohortBackend::bind_lane(lane, request_id, traits);
+        }
+    }
+    void control(std::span<const std::uint32_t> words) override {
+        if constexpr (kControls) {
+            before_work();
+            decoder_->control(words);
+        } else {
+            CohortBackend::control(words);
+        }
     }
 
 private:
@@ -398,7 +519,68 @@ private:
     static constexpr bool kSelectsRoute = kEmitsFirst && kPlainPrefill && requires(const Decoder& decoder) {
         { decoder.prefill_emits_first() } -> std::convertible_to<bool>;
     };
+    static constexpr bool kReleases = requires(Decoder& decoder) { decoder.release_slot(std::uint32_t{}); };
+    static constexpr bool kProposes = requires(Decoder& decoder, std::vector<std::uint32_t>& tokens,
+                                               std::vector<double>& probability) {
+        decoder.propose_slot(std::uint32_t{}, std::uint32_t{}, tokens, probability);
+    };
+    static constexpr bool kRetains = requires(Decoder& decoder, std::span<const std::uint32_t> tokens) {
+        { decoder.restore_slot(std::uint32_t{}, tokens) } -> std::convertible_to<std::uint64_t>;
+        decoder.capture_slot(std::uint32_t{}, tokens);
+    };
+    static constexpr bool kSlotGroups = requires(Decoder& decoder, const Decoder& view,
+                                                 std::span<const CohortPrompt> members) {
+        { view.prefill_group_capacity() } -> std::convertible_to<PrefillGroupCapacity>;
+        { view.prefill_route_class(std::uint64_t{}) } -> std::convertible_to<std::uint32_t>;
+        decoder.prefill_slots(members);
+    };
+    static constexpr bool kSamples = requires(Decoder& decoder, const Decoder& view, TokenSampler& sampler) {
+        { view.samples_on_device() } -> std::convertible_to<bool>;
+        { decoder.sample_slot_row(std::uint32_t{}, sampler, std::uint64_t{}) } -> std::convertible_to<std::uint32_t>;
+    };
+    static constexpr bool kRoundProposes = kProposes && requires(Decoder& decoder, std::span<const CohortProposal> lanes) {
+        decoder.propose_slots(lanes);
+    };
+    static constexpr bool kRoundSamples = kSamples && requires(Decoder& decoder, const Decoder& view,
+                                                               std::span<CohortSample> rows) {
+        { view.samples_in_round() } -> std::convertible_to<bool>;
+        decoder.sample_slot_rows(rows);
+    };
+    static constexpr bool kBinds = requires(Decoder& decoder, std::span<const std::uint32_t> traits) {
+        decoder.bind_slot(std::uint32_t{}, std::uint64_t{}, traits);
+    };
+    static constexpr bool kControls = requires(Decoder& decoder, std::span<const std::uint32_t> words) {
+        decoder.control(words);
+    };
     static constexpr std::uint32_t kNoLane = ~std::uint32_t{0};
+
+    // Before an optional hook that may touch device state: a staged window is resolved (discarded) and the score rows
+    // of the last call stop being readable, as before a prefill.
+    void before_work() {
+        discard_staged();
+        withdraw();
+    }
+
+    // The score row of `lane` that read_slot_logits / sample_slot_row serve: the emits-first prefill's row 0, else the
+    // lane's row of the pending one-row window.
+    [[nodiscard]] std::uint32_t final_row(std::uint32_t lane) const {
+        if (lane != kNoLane && lane == prefill_lane_) return 0U;  // emits-first: the prefill's row 0
+        if (const auto row = group_row(lane); row != kNoLane) return row;  // a group member's row
+        if (verify_pending_ && lane != kNoLane)
+            for (std::size_t row = 0; row < window_.size(); ++row)
+                if (window_[row] == lane) return static_cast<std::uint32_t>(row);
+        throw std::logic_error("fixed KV cohort: final logits requested for a lane outside the pending window");
+    }
+
+    // Deferred releases (kReleases) reach the decoder once no window is staged.
+    void flush_releases() {
+        if constexpr (kReleases) {
+            if (staged_) return;
+            auto lanes = std::move(pending_releases_);
+            pending_releases_.clear();
+            for (const auto lane : lanes) decoder_->release_slot(lane);
+        }
+    }
 
     void decode(std::span<const std::uint32_t> tokens, std::span<std::uint32_t> top, bool reads_scores) {
         if constexpr (kScoreReads) decoder_->decode_slots(window_, tokens, top, reads_scores);
@@ -407,6 +589,11 @@ private:
 
     // A window staged by a verify that was never committed: discard it (keep 0) so the decoder restores the slot.
     void discard_staged() {
+        discard_stage();
+        flush_releases();
+    }
+
+    void discard_stage() {
         if constexpr (kMixed) {
             if (mixed_staged_) {
                 mixed_keep_.assign(mixed_lanes_.size(), 0U);
@@ -533,6 +720,8 @@ private:
     std::vector<SlotRows> mixed_lanes_;
     std::vector<std::uint32_t> mixed_top_, mixed_keep_;
     bool mixed_staged_ = false;
+    std::vector<std::uint32_t> pending_releases_;  // kReleases: lanes released while a window was staged
+    std::vector<CohortSample> round_samples_;      // kRoundSamples: the round's entries with score rows for lanes
     std::vector<float> logits_;
     // emits-first: the lane of the last prefill call and its first id, valid until the next backend call; kept apart
     // from the verify window, so a commit right after a prefill is refused.

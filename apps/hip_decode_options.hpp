@@ -28,6 +28,7 @@
 #include "strix/wave_router_contract.hpp"
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <memory>
 #include "strix/token_sampling.hpp"
 #include "strix/serve/job_sampling.hpp"
@@ -2231,7 +2232,8 @@ inline Options parse_options(
                     value_next=false;
                     if (argv[i-1]==std::string_view("--generate")) generate=std::strtoull(arg.c_str(),nullptr,10);
                     else if (argv[i-1]==std::string_view("--prompt-ids")) prompt_ids_path=arg;
-                } else if (arg=="--generate" || arg=="--context" || strix::session::speculation_neutral_value_option(arg)) {
+                } else if (arg=="--generate" || arg=="--context" || strix::session::speculation_neutral_value_option(arg) ||
+                           strix::onfly_i4::weight_format_value_option(arg)) {
                     value_next=true;
                     if (arg!="--generate" && arg!="--context") leading=false;
                     prompt_ids_file |= arg=="--prompt-ids";
@@ -2241,7 +2243,7 @@ inline Options parse_options(
                     leading=false;
                     http_serve |= arg=="--http-serve";
                     plain &= arg.starts_with("--context=") || arg=="--unqualified-context" ||
-                        strix::session::speculation_neutral_inline_option(arg) ||
+                        strix::session::speculation_neutral_inline_option(arg) || strix::onfly_i4::weight_format_inline_option(arg) ||
                         arg=="--print-effective-config" || arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=");
                 } else {
                     ++prompt_tokens;
@@ -3992,6 +3994,10 @@ inline Options parse_options(
     const bool defer_serve_prefill = http_prefill_pending(options);
     if (!defer_serve_prefill) validate_prefix_state_cache(options);
     validate_http_serve(options, defer_serve_prefill);
+    // The preset's resident pack is named beside the model file.
+    if (auto& pack = options.product_profile_inputs.weights.profile_pack;
+        pack && !pack->empty() && std::filesystem::path(*pack).is_relative())
+        *pack = (std::filesystem::path(options.model_path).parent_path() / *pack).string();
     // Regime of the FAST cells (strix/qwen_profile_table.hpp fast_regimes): the CLI prompt, or the serving context bound.
     options.product_profile_inputs.max_prompt_tokens =
         options.tokens.empty() ? options.context_tokens : static_cast<std::uint64_t>(options.tokens.size());

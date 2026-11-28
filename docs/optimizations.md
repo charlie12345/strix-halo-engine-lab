@@ -6592,6 +6592,35 @@ it in `src/inkling2/inkling2_mini_weight_options.hpp` (qualifiable policy), `src
 | inkling2-mini | bound (HIP, explicit decode-only arm, command line) |
 | qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: no resident low-bit attention route on the shared projection dispatch and no calibrated `strix.sp4t` pack |
 
+<a id="inkling2-sp4t-attention-gate"></a>
+## Inkling 2 Mini decode attention output gate: Strix pack SP4 (`strix.sp4t`) as a per-role gate storage
+
+**Engine:** `inkling2-mini` (HIP). **Control:** `STRIX_INK_LOWBIT_HEAD=sp4t-attn-gate` (command line, `--profile fast` /
+`turbo`) or `--qualify-decode-weights weights.attention_gate_head.sp4t@1`, with `STRIX_LOWBIT_PACK` naming a calibrated
+`strix.sp4t` pack of `attn.wq_du`, `attn.wk_dv`, `attn.wv_dv`, `attn.wo_ud`, `attn.gate_attn` and `llm.unembed`
+(`--technique both --damp 0.1`; the query input of the moments lists `gate_attn` as its second consumer).
+**Default:** off in every tier; an explicit decode-only qualification arm.
+
+**Shared home:** the load policy gains a per-role `gate` storage (`WeightLoadPolicy::gate`, `RoleStorage::gate`,
+`WeightLoadPlan::gate_storage` in `include/strix/weight/levers.hpp`; `src/weight/resolve.cpp` requires a consumer for it).
+Every existing policy resolves the gate as BF16 and prints an unchanged receipt; the new policy
+`weights.attention_gate_head.sp4t@1` prints `gate strix.sp4t@1`. Inkling names its output gate as data (the
+`gate_attn` suffix of its tensor map); the gate joins the grouped SP4 run of the query input (`{gate, k, v}`), while the
+relative and sink projections stay BF16.
+
+- **Exactness evidence:** bit-changing (lossy weights). Policies without a gate role are unchanged (host tests of the
+  resolver, receipts and profile tables).
+- **Calibration note:** moments are captured without the BF16 operand image (`src/inkling2/inkling2_mini_resident_backend.hpp`):
+  the fused output gate stores the gated rows only as that image, so a long-prompt capture read an unwritten buffer.
+- **Measured gain:** CLI B=1, one request, 255 tokens, gfx1151, tokens/s EXACT / `sp4t-attn` / `sp4t-attn-gate`: plain
+  (context 660) 29.66 / 35.12 / 37.95 (-2.1 ms per token); DFlash code 64.79 / 52.78 / 72.37 (tokens per pass 5.67 /
+  4.11 / 5.43); DFlash prose (context 1879) 32.45 / 40.84 / 45.71. Token ids are equal with and without DFlash.
+- **Quality (gate v2, decode, 39 windows, head 64):** no verdict: the held-out check refuses four windows (code-04,
+  code-10, structured-01, structured-13) where every label equals the top-1 of both arms. Without them (diagnostic, not a
+  qualification): TURBO passes every class (replay KL 0.0037, top-1 0.978, dNLL +0.0028; free-running KL 0.0072) but code
+  and structured fall to 693 rows (unresolved below 800); FAST fails six windows on dNLL (+0.017 to +0.030).
+- **Off switch:** do not pass the qualification arm.
+
 <a id="shared-sp4t-grouped-projections"></a>
 ## Grouped Strix pack SP4 resident projections (`strix.sp4t`)
 
@@ -7487,18 +7516,18 @@ grid dimension, so the groups read each plane row together; the screen is now si
 | Nemotron 3.5 Bolt E4B | not bound: no served cohort screened head on HIP |
 
 <a id="inkling-hip-exact-drafter-selector"></a>
-## Inkling 2 Mini HIP EXACT CLI: the MTP sidecar and DFlash 2 under the shared per-regime selector
+## Inkling 2 Mini HIP CLI: the MTP sidecar and DFlash 2 under the shared per-regime selector (every tier)
 
-**Engine:** `inkling2-mini`. **Control:** `--dflash DIR|off`, `--dspark FILE|off`. **Default:** on (HIP, EXACT, CLI resident route).
+**Engine:** `inkling2-mini`. **Control:** `--dflash DIR|off`, `--dspark FILE|off`. **Default:** on (HIP, EXACT / FAST / TURBO, CLI resident route; per tier by model data).
 
 With both drafters beside the checkpoint (the MTP sidecar and the `dflash2` block-diffusion directory), the HIP EXACT CLI
-binds both and runs them under the shared per-regime selector; the block arm wins ties. FAST prose was slower under the
-selector (-5.1 / -5.3 %, both repetitions), so FAST, TURBO and CUDA keep the MTP sidecar alone and bind the block drafter only
-when it is named.
+binds both and runs them under the shared per-regime selector, in every tier the model data names
+(models/inkling2-mini.toml [speculation.block_by_default] / [speculation.block_wins_ties]; the block arm wins ties in all
+three). CUDA keeps the MTP sidecar alone and binds the block drafter only when it is named.
 
 - **Shared home:** include/strix/spec/arm_selector.hpp, src/serve/serial_generation_cli.cpp (chain_arms), include/strix/spec/drafter_source.hpp; binding in apps/inkling2_mini_gpu_main.hpp
-- **Tier and regime:** EXACT; one-request CLI decode with speculation
+- **Tier and regime:** EXACT, FAST, TURBO; one-request CLI decode with speculation
 - **Exactness evidence:** drafters only propose; ids equal with and without the selector (code and prose)
 - **Off switch:** `--dflash off` or `--dspark off`
-- **Measured gain:** gfx1151, 255 decode tokens: code 53.1 -> 61.0 tok/s (+14.8 %, two repetitions each), prose 29.3 -> 30.8 / 32.1 (+5.1..+9.6 %). FAST code 46.2 -> 48.7 / 50.9, FAST prose 41.2 -> 39.1 / 39.0 (stays off).
-- **Preconditions:** HIP build, EXACT, greedy auto speculation, both drafters present and valid
+- **Measured gain:** gfx1151, 255 decode tokens: code 53.1 -> 61.0 tok/s (+14.8 %, two repetitions each), prose 29.3 -> 30.8 / 32.1 (+5.1..+9.6 %). FAST (SP4 attention + head image), 7 prompts (5 code, 2 prose) x 2 repetitions, selector vs the MTP sidecar alone: geomean 1.089x (min 0.978x) with ties to the block arm, 1.081x (min 0.956x) with ties kept by the sidecar; code sc / c1 / c2 / c3 / c5 47.8 / 51.1 / 44.0 / 48.6 / 46.4 vs 46.6 / 42.0 / 43.5 / 49.7 / 38.3, prose sp / p1 39.5 / 41.5 vs 37.7 / 36.0. An earlier FAST pair on another build (prose 41.2 -> 39.1 / 39.0) did not reproduce.
+- **Preconditions:** HIP build, EXACT / FAST / TURBO, greedy auto speculation, both drafters present and valid

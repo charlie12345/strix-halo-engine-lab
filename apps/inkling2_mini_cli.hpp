@@ -28,6 +28,7 @@ struct Options {
     const char* host_pack_hot{};
     bool dspark_off{};  // --dspark off: no drafter, not even the model's sidecar under auto
     const char* dflash{};  // --dflash DIR: the block-diffusion drafter directory (config.json + model.safetensors)
+    bool dflash_off{};     // --dflash off: no block drafter, not even the registry's directory beside the model
     const char* gate_manifest{};
     const char* gate_out{};
     const char* gate_arm{};
@@ -54,7 +55,9 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                 return true;
             }
             if (argument == "--dflash" && native) {
-                options.dflash = value();
+                const char* dir = value();
+                options.dflash_off = std::string_view(dir) == "off";
+                options.dflash = options.dflash_off ? nullptr : dir;
                 return true;
             }
             if (!native) {
@@ -119,8 +122,6 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             throw std::invalid_argument("logits output must differ from the DSpark sidecar");
     }
     if (options.dflash) {
-        if (options.dspark || options.dspark_off)
-            throw std::invalid_argument("--dflash and --dspark name one drafter: choose one");
         if (gate || generation.tokenize_file || generation.speculation != serve::CliSpeculation::automatic ||
             token_sampling_enabled(generation.sampling))
             throw std::invalid_argument("--dflash requires greedy --speculation auto with model generation");

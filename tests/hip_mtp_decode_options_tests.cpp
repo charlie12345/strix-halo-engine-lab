@@ -472,6 +472,23 @@ void campaign_defaults_contract(){
                 !withdrawn.mtp.ngram_copy_edit && !withdrawn.mtp.ngram_wide_only && !withdrawn.mtp.copy_wide_auto &&
                 withdrawn.known_prefix_tail_rows==std::vector<std::uint32_t>{64U,16U} &&
                 withdrawn.mtp.copy_wide_reason.find("withdrawn")!=std::string::npos,"tails without the wide size withdraw the default");
+            {   // A server's first start dumps its calibration golden from a copy of its own options: the served wide default
+                // would make that dump invalid (copy-wide + golden dump), so the dump copy withdraws it and stays valid.
+                auto dump=def;dump.mtp.golden.clear();dump.mtp.golden_sha256.clear();dump.mtp.golden_dump="g.tmp";dump.tokens.assign(64U,1U);dump.generate_tokens=8U;
+                bool refused=false;
+                try{validate_resolved_mtp_cli(dump);}catch(const std::invalid_argument& e){refused=std::string(e.what()).find("no golden dump")!=std::string::npos;}
+                require(refused,"the served wide default is refused together with a golden dump");
+                withdraw_mtp_copy_wide(dump,"dump");
+                require(dump.mtp.copy_wide_rows.empty() && !dump.mtp.copy_wide_default && !dump.mtp.ngram_copy_edit,"withdraw clears the cycle");
+                // The withdrawn copy must validate as a whole, not merely lose the wide-copy refusal. The fixture lacks the
+                // server organization its target windows need (D1 + paired wave8 GDN, virtual Q8 LM head); a resolved
+                // server has it, so the copy gets it here and any remaining refusal fails the check.
+                dump.deferred_moe_status=dump.virtual_q8_gdn_input=dump.prefetch_q8_gdn_input=dump.virtual_q8_gdn_output=
+                    dump.wave8_q8_gdn_input=dump.wave8_q8_gdn_output=dump.virtual_q8_lm_head=true;
+                std::string dump_error;
+                try{validate_resolved_mtp_cli(dump);}catch(const std::invalid_argument& e){dump_error=e.what();}
+                if(!dump_error.empty())throw std::runtime_error("the golden dump copy validates after the withdrawal: "+dump_error);
+            }
             auto baseline=def;baseline.baseline=true;settle_mtp_copy_wide_default(baseline);
             require(!baseline.mtp.copy_wide_default && baseline.mtp.copy_wide_rows.empty(),"the baseline withdraws the default");
             auto pending=def;pending.known_prefix_prefill_rows=0U;pending.known_prefix_prefill_explicit=false;

@@ -99,6 +99,7 @@ struct Resolved {
     std::vector<std::string> notices;                          // one line each
     bool print_only = false;                                   // --print-effective-config (removed from args)
     std::optional<strix::profile::Resolution> profile;         // --profile (removed from args); always resolved
+    strix::session::kv_precision::Resolution kv;
     // STRIX_DS41_DECODE_XPORT as BatchForward resolves it (strix/ds41_decode_xport.hpp): "communicator" / "channel",
     // then the origin ("default" / "explicit"). One rule for CLI, serve and engine; both ranks also agree at load.
     std::string decode_xport;
@@ -118,11 +119,17 @@ const strix::profile::Resolution& profile_resolution();
 // Fresh whole-prompt device prefill only. The adapter supplies its measured reference route, the live lane count of
 // the pass (sequences in one prefill forward) and runtime device facts; the band rows bound the lanes.
 // A drafter seed (options.draft_rows, the serve's DSpark: 128 rows) is admitted up to the replay bound when the band
-// also resolves decoder_replay 256: plan_bounded_replay computes the same rows for any draft_rows <= R, so the seed is
-// a copy of rows the CLI's execution computes anyway. Without the replay (a cone widened by the seed) it declines.
+// also resolves a decoder_replay bound R >= draft_rows: plan_bounded_replay runs every decoder row from the cut, which
+// holds any seed <= R, so the seed adds no row and the logits and state stay the CLI's bits.
+// Without the replay (a cone widened by the seed) it declines.
 std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
     const PrefillOptions& options, std::uint64_t prompt_tokens, std::uint32_t lanes, std::string_view device_product,
     bool measured_reference);
+// The decoder_replay bound R a value / a resolution sets: 0 when off ("0") or absent; otherwise the bound the run
+// executes (a multiple of 128, at least ds41::bounded_replay_min_rows). Any other value throws std::invalid_argument.
+// The drafter seed bound is this R (seed <= R), never a separate literal.
+[[nodiscard]] std::uint32_t replay_rows_from_value(std::string_view value);
+[[nodiscard]] std::uint32_t resolved_replay_rows(const strix::profile::Resolution& resolution);
 // The served device prefill enters the one admission (DevicePrefill::run_full_prompt, the pair prefill CLI's entry)
 // for a fresh whole text prompt run as one piece, whatever the slot count: the band rows then decide as for the CLI.
 // A server with a disk tier (prefix cache directory, session directory) keeps the previous route: the cache namespace
@@ -167,7 +174,8 @@ std::span<const strix::profile::DefaultItem> default_items();
 // ds41-expert-tp2-i1152-v1), assets and lineage; unresolved fields stay empty.
 strix::profile::ExecutionReceipt host_receipt(App app, const Resolved& resolved,
                                              strix::profile::NumericalIdentity identity = {});
-Resolved resolve(App app, const std::vector<std::string>& args, const Getenv& env, const Probe& probe, const Build& build);
+Resolved resolve(App app, const std::vector<std::string>& args, const Getenv& env, const Probe& probe, const Build& build,
+                 const strix::session::kv_precision::Request& kv_request = {});
 // The printed form of --print-effective-config: "app", then every set/unset variable and argument, one per line.
 std::string describe(App app, const Resolved& r);
 

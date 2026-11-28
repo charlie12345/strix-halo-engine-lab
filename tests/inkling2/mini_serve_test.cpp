@@ -83,6 +83,30 @@ private:
 
 using FixtureCohort = sv::FixedKvCohort<FixtureDecoder>;
 
+// The served prompt group policy: on by default for whole prompts of up to one chunk, the group at most eight chunks of
+// rows (one pass per chunk), the shared switch turns it off, the shared limits tighten it.
+void prompt_group_policy() {
+    const auto env = [](std::map<std::string, std::string> values) {
+        return [values = std::move(values)](const char* name) {
+            const auto it = values.find(name);
+            return it == values.end() ? std::string() : it->second;
+        };
+    };
+    const auto on = mini::mini_serve_prompt_group(8192U, env({}));
+    require(on.groups() && on.short_rows == 8193U && on.max_rows == mini::kMiniGroupPasses * 8192U &&
+                on.max_members == 8U && !on.explicit_mode,
+            "prompt group: on by default, whole prompts of up to one chunk, one chunk of rows per sub-pass");
+    require(!mini::mini_serve_prompt_group(8192U, env({{"STRIX_SERVE_PREFILL_GROUP", "0"}})).groups(),
+            "prompt group: STRIX_SERVE_PREFILL_GROUP=0 serves every prompt alone");
+    const auto tight = mini::mini_serve_prompt_group(
+        2048U, env({{"STRIX_SERVE_PREFILL_GROUP_ROWS", "3000"}, {"STRIX_SERVE_PREFILL_GROUP_MEMBERS", "4"}}));
+    require(tight.max_rows == 3000U && tight.max_members == 4U && tight.short_rows == 2049U,
+            "prompt group: the shared limits tighten it");
+    const auto rule = mini::mini_prefill_piece_rule(true, true);
+    require(mini::mini_serve_scheduling(8192U, rule).prompt_group.short_rows == 8193U,
+            "prompt group: the served scheduling carries it");
+}
+
 void admission() {
     require(mini::mini_served_prompt_emits_first(false, false, true),
             "a calibrated decode image serves prompts emits-first on the default served route");
@@ -342,7 +366,7 @@ void set_env(const char* name, const char* value) {
 }
 void set_w4a4_env(const char* value) { set_env("STRIX_INK_MOE_W4A4", value); }
 
-// The prepared-attention round fold switch of the served process (off unless 1 selects it, in any profile).
+// The prepared-attention round fold switch of the served process (on in every profile unless 0 switches it off).
 void set_round_fold_env(const char* value) {
 #ifdef _WIN32
     require(_putenv_s("STRIX_INK_PREPARED_ROUND_FOLD", value ? value : "") == 0, "cannot set STRIX_INK_PREPARED_ROUND_FOLD");
@@ -1209,8 +1233,10 @@ int main(int argc, char** argv) try {
     }
     require(argc == 2, "expected repository root");
     set_image_env(nullptr);
-    set_round_fold_env(nullptr);
+    // The wiring matrix pins the round fold off (its own switch); its default (on) is checked below.
+    set_round_fold_env("0");
     set_cli_route_env(nullptr);
+    prompt_group_policy();
     admission();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {
@@ -1241,15 +1267,15 @@ int main(int argc, char** argv) try {
     set_w4a4_env("0");
     wiring(argv[1], "hip", false);  // the off switch still serves HIP
     set_w4a4_env(nullptr);
-    // Both selections are off by default (no profile selects them); an explicit 1 reaches the adapter, an explicit 0 keeps it off.
-    set_round_fold_env(nullptr);
+    // The round fold is on by default in every profile (unset and an explicit 1 reach the adapter), an explicit 0 keeps
+    // it off; the image selection is off by default (no profile selects it).
     set_image_env(nullptr);
-    wiring(argv[1], "hip", false);
-    set_round_fold_env("1");
-    for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, "fast", false, true);
+    for (const char* fold : {static_cast<const char*>(nullptr), "1"}) {
+        set_round_fold_env(fold);
+        for (const auto* backend : {"hip", "cuda"}) wiring(argv[1], backend, false, false, W4a4::bf16, "fast", false, true);
+    }
     set_round_fold_env("0");
     wiring(argv[1], "hip", false);
-    set_round_fold_env(nullptr);
     set_image_env("1");
     for (const auto* backend : {"hip", "cuda"})
         wiring(argv[1], backend, false, false, W4a4::bf16, "fast", true);

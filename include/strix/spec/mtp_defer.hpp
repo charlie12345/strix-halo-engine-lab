@@ -51,6 +51,32 @@ constexpr bool defer_block(bool enabled, std::uint64_t first, std::uint32_t rows
     return enabled && first + rows == position;
 }
 
+// Engines whose last block's rows are launched by their caller later (the HIP bridge: the CLI single-request path) keep the
+// deferral to the plain case: the completing block (defer_block), no prefix cache that would capture the primed rows, no
+// batch or state export that reads them, and no earlier block's priming still in flight (the order of the calls never changes).
+constexpr bool defer_final_priming(bool enabled, std::uint64_t first, std::uint32_t rows, std::uint64_t position, bool has_cache,
+                                   bool batch, bool export_state, bool earlier_priming_in_flight) noexcept {
+    return defer_block(enabled, first, rows, position) && rows > 0 && !has_cache && !batch && !export_state && !earlier_priming_in_flight;
+}
+
+// The predictor frontier invariant of a prompt: the source rows primed so far plus the rows still deferred (each source row
+// is followed by its successor token) reach the last prompt position. Checked at the end of the prompt, before any draft.
+constexpr bool prompt_frontier_reached(std::uint64_t primed_frontier, std::uint64_t deferred_rows, std::uint64_t position) noexcept {
+    return primed_frontier + deferred_rows + 1U == position;
+}
+
+// Chains that buffer the hidden rows of the prompt (spec::MtpChain: a ring of positions flushed into the MTP cache when it
+// is full or before the first draft) defer the whole prompt by sizing the ring to it: no flush runs inside the prefill, the
+// one before the first draft covers the prompt. The ring is a multiple of `grid` (the chain's widest MTP call), so the calls of
+// that flush are the calls the forced flushes would have made (same chunk grid, same bits). 0 growth when the prompt does not
+// fit `max_bytes` of float rows: the incumbent ring.
+constexpr std::uint32_t prompt_ring_rows(std::uint64_t prompt_rows, std::uint32_t hidden, std::uint64_t max_bytes,
+                                         std::uint32_t incumbent, std::uint32_t grid) noexcept {
+    if (grid == 0 || hidden == 0) return incumbent;
+    const std::uint64_t need = (prompt_rows + grid - 1U) / grid * grid;
+    return need > incumbent && need <= UINT32_MAX && need <= max_bytes / 4U / hidden ? static_cast<std::uint32_t>(need) : incumbent;
+}
+
 // An earlier prompt block (first + rows < position) is deferred through the stash: its tap rows and next tokens are copied
 // out of the block buffers (which the next block rewrites) to stash rows [stashed, stashed + pairs), and its call runs later
 // with those copies and otherwise identical arguments (same rows, positions and inputs: the same MTP bits). Calls settle in

@@ -247,16 +247,18 @@ workspace, install/staging, late safety and startup reserve terms in GiB.
 The HIP WMMA prefill bundle uses X3 linears, MLA GEMMs, KDA projections and sparse
 attention with 16-key blocks. `--profile fast` (and TURBO, which nests it) admits it
 automatically on the measured Radeon 8060S USB4 host pair (two 40 Gb/s cables and four
-streams) for one fresh text prompt of 2,049-8,192 tokens, an admitted 8,192-row chunk,
+streams) for one fresh text prompt of 1,024-8,192 tokens, an admitted 8,192-row chunk,
 one lane, and the EXL3 R1b/MTP route. FAST gate v2 with MoE route replay passed on 5
 windows of 8,192 tokens (1,275 rows): pooled KL 0.00018 (null 0.00007), top-1 0.9969,
 dNLL -0.0013 (se 0.0009), route-flip ratio 1.05. The band receipt is the lower observed
 8K EXACT-to-bundle ratio (12.319 to 8.227 s cold, x1.50 with a 10 % margin; see
 [glm-pf-wmma-x](../../optimizations.md#glm-pf-wmma-x)). TURBO also admits it at the
-measured 31,258-token prompt (55.006 to 35.552 s against FAST); that row is CLI-only,
-because the server prefills in chunks of at most 8,192 rows and the bundle needs the
-whole prompt in one chunk. Prompts of 2,048 tokens or fewer and other prompts above
-8,192 tokens keep the exact cores.
+measured 31,258-token prompt (55.006 to 35.552 s against FAST); that row is CLI-only:
+the server asks the ladder only for a fresh whole prompt (no decoding cohort, so the
+engine cuts it into 8,192-row pieces as the CLI does) up to the FAST band's own upper
+edge (the band row's data). Prompts of 2,048 tokens or fewer and other prompts above
+8,192 tokens keep the exact cores; a served prompt above the band says so in its line
+(`outside measured execution: prompt above the FAST band`).
 
 Other executions use the FAST route, including host-only inspection, memory
 fallback to a smaller chunk, cached or interleaved prefill, and native modes

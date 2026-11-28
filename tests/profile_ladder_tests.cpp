@@ -203,6 +203,29 @@ void verdicts() {
             "exact (scheduling) levers are outside the ladder");
 }
 
+// band_max_context: the widest band-bound row of a lever on one phase and device; literal rows, other levers, phases
+// and devices do not widen it, and widening a band row moves the edge with it.
+void band_max_edge() {
+    constexpr auto row = [](std::string_view lever, p::Name tier, p::Phase phase, std::string_view device,
+                            std::uint64_t lo, std::uint64_t hi, bool band) {
+        return p::LadderRow{.lever = lever, .value = "1", .tier = tier, .phase = phase, .device = device,
+                            .min_context = lo, .max_context = hi, .speedup = 1.3, .noise = 0.1, .receipt = "r",
+                            .band_bound = band};
+    };
+    constexpr std::array rows{row("pf", p::Name::fast, p::Phase::prefill, "dev", 2049, 8192, true),
+                              row("pf", p::Name::turbo, p::Phase::prefill, "dev", 31258, 31258, false),
+                              row("pf", p::Name::fast, p::Phase::decode, "dev", 1, 65536, true),
+                              row("pf", p::Name::fast, p::Phase::prefill, "other", 1, 65536, true),
+                              row("qq", p::Name::fast, p::Phase::prefill, "dev", 1, 131072, true)};
+    static_assert(p::band_max_context(rows, "pf", p::Phase::prefill, "dev") == 8192, "literal and foreign rows ignored");
+    static_assert(p::band_max_context(rows, "pf", p::Phase::prefill, "") == 0, "an empty device matches no row");
+    static_assert(p::band_max_context(rows, "zz", p::Phase::prefill, "dev") == 0, "no row: no edge");
+    constexpr std::array wider{row("pf", p::Name::fast, p::Phase::prefill, "dev", 2049, 8192, true),
+                               row("pf", p::Name::fast, p::Phase::prefill, "dev", 8193, 32768, true)};
+    static_assert(p::band_max_context(wider, "pf", p::Phase::prefill, "dev") == 32768, "a wider band row moves the edge");
+    require(p::band_max_context(rows, "pf", p::Phase::decode, "dev") == 65536, "phase selects the rows");
+}
+
 void defects() {
     const auto defect = [](p::LadderRow row) {
         const std::array rows{row};
@@ -1817,6 +1840,80 @@ void band_lower_edge() {
     require(!p::ladder_defect(engine).empty(), "quality gate lengths do not count as timing receipts");
 }
 
+void promoted_band() {
+    const auto execution = [](std::uint64_t prompt, std::uint32_t lanes, std::string_view product,
+                              std::string_view settings, std::uint32_t chunk) {
+        return keep(p::ladder_execution({"hip", product, {prompt, 8192, lanes, chunk}, settings}));
+    };
+    constexpr auto settings = "pack=weight-v1|route=cli|ranks=1";
+    const auto capture = execution(1024, 1, "dev-product-a", settings, 512);
+    auto band = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1024, 8192, 1, 2,
+                               1.25, 0.02, "r/capture"}, kExactArm, capture);
+    band.identity = "v1";
+    band.band_bound = true;
+    band.band_evidence.timed = {1024, 8192};
+    band.promotion = "fixture-band";
+    const std::array rows{band};
+    p::Engine engine{"capture-test", "", kRows, false, "capture-test-v1", {}, {}, rows};
+    require(p::ladder_defect(engine).empty(), "recaptured band is well formed");
+    const auto runs = [&](std::uint64_t prompt, std::uint32_t lanes, std::string_view key) {
+        return resolve(engine, p::Name::fast, {p::Phase::prefill, prompt, lanes, "dev", key}).find(kLever)->value == "a8";
+    };
+    require(runs(1024, 1, capture), "recaptured point is on by default");
+    const auto inside = execution(4096, 2, "dev-product-a", settings, 512);
+    require(runs(4096, 2, inside), "only the measured band coordinates may vary");
+    require(!runs(4097, 2, inside), "prompt field must agree with the live regime");
+    require(!runs(4096, 1, inside), "lane field must agree with the live regime");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-b", settings, 512)), "product must match");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v2|route=cli|ranks=1", 512)),
+            "pack must match");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v1|route=http|ranks=1", 512)),
+            "route must match");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", "pack=weight-v1|route=cli|ranks=2", 512)),
+            "topology must match");
+    require(!runs(4096, 2, execution(4096, 2, "dev-product-a", settings, 1024)), "chunk must match");
+    require(!runs(8193, 2, execution(8193, 2, "dev-product-a", settings, 512)), "context band still bounds admission");
+    auto edited = kRows;
+    edited[0].identity[0].identity = "v2";
+    engine.table = edited;
+    require(!runs(4096, 2, inside), "changing the denominator implementation retires the receipt");
+    edited[0].identity[0].identity = "v1";
+    edited[0].identity[1].identity = "v2";
+    require(!runs(4096, 2, inside), "changing the candidate implementation retires the receipt");
+    require(resolve(engine, p::Name::standard, {p::Phase::prefill, 4096, 2, "dev", inside}).find(kLever)->value == "off",
+            "EXACT selection shares no part of the promoted cell");
+}
+
+void recaptured_grant() {
+    const auto captured = keep(p::ladder_execution({"hip", "dev-product-a", {1024, 8192, 1, 512},
+                                                   "pack=weight-v1|route=cli|ranks=1"}));
+    const auto unmatched = keep(p::ladder_execution({"hip", "dev-product-b", {1024, 8192, 1, 512},
+                                                    "pack=weight-v1|route=cli|ranks=1"}));
+    auto band = measured_over({kLever, "a8", p::Name::fast, p::Phase::prefill, "dev", 1024, 8192, 1, 1,
+                               1.25, 0.02, "r/capture"}, kExactArm, captured);
+    band.identity = "v1";
+    band.band_bound = true;
+    band.band_evidence.timed = {1024, 8192};
+    auto legacy = band;
+    legacy.over = {};
+    band.promotion = "fixture-band";
+    const std::array rows{p::incumbent_cell(kLever, "a8", p::Name::fast, "r/grant", "v1"), legacy, band};
+    auto table = kRows;
+    p::Engine engine{"retire-grant-test", "", table, false, "retire-grant-test-v1", {}, {}, rows};
+    const p::Regime measured{p::Phase::prefill, 1024, 1, "dev", captured};
+    const p::Regime out_of_scope{p::Phase::prefill, 1024, 1, "dev", unmatched};
+    const p::Regime outside{p::Phase::prefill, 8193, 1, "dev", captured};
+    const auto runs = [&](const p::Regime& regime) {
+        return resolve(engine, p::Name::fast, regime).find(kLever)->value == "a8";
+    };
+    require(runs(measured), "the recaptured band replaces the historical grant");
+    require(!runs(out_of_scope), "the grant and the synthetic denominator cannot fill a recaptured band");
+    require(runs(outside), "the historical grant remains outside the recaptured band");
+    table[0].ready[1] = false;
+    table[0].provisional[1] = true;
+    require(!runs(measured), "timing alone cannot promote a provisional column");
+}
+
 // Band receipts along a chain: the second lever's band row binds over the cell the first lever's band row admits
 // (bind + arms repeated until the references settle), so both cells of a measured chain run inside their bands.
 void band_chain() {
@@ -1874,6 +1971,9 @@ int main(int argc, char** argv) try {
     verdicts();
     band_chain();
     band_lower_edge();
+    band_max_edge();
+    promoted_band();
+    recaptured_grant();
     bound_evidence();
     defects();
     shipped_rows();

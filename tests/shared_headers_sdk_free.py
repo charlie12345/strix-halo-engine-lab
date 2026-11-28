@@ -48,12 +48,14 @@ NATIVE_HEADERS = {
     "src/attn_core/cache_shadow.hpp",
     "src/attn_core/chunk_decode.hpp",
     "src/attn_core/chunk_exact_combine.hpp",
+    "src/attn_core/compressor_pool.hpp",
     "src/attn_core/dense_decode.hpp",
     "src/attn_core/shadow_kv_read.hpp",
     "src/attn_core/dense_decode_flash.hpp",
     "src/attn_core/dense_flash_prefill.hpp",
     "src/attn_core/eager_selected.hpp",
     "src/attn_core/eager_softmax.hpp",
+    "src/attn_core/fp4_index_rows.hpp",
     "src/attn_core/group_pool.hpp",
     "src/attn_core/group_score_scan.hpp",
     "src/attn_core/group_select_kernel.hpp",
@@ -71,6 +73,7 @@ NATIVE_HEADERS = {
     "src/attn_core/wmma_types.hpp",
     "src/core/a4_tiles.hpp",
     "src/core/backend_hip.hpp",
+    "src/core/controller_block_rows.hpp",  # HIP launch of the block-per-row residual controller.
     "src/core/dense_linear.hpp",
     "src/core/dense_linear_iu4.hpp",
     "src/core/f16_dense_iu4.hpp",
@@ -112,6 +115,7 @@ NATIVE_HEADERS = {
     "src/moe_core/device_plan.hpp",
     "src/moe_core/exl3_trellis.hpp",
     "src/moe_core/expert_activation.hpp",
+    "src/moe_core/expert_rows_plan.hpp",
     "src/moe_core/grouped_a8_f16.hpp",
     "src/moe_core/grouped_dispatch.hpp",
     "src/moe_core/grouped_integer_decode.hpp",
@@ -124,6 +128,7 @@ NATIVE_HEADERS = {
     "src/moe_core/route_tap_hip.hpp",
     "src/moe_core/route_project_kernel.hpp",  # HIP-only route projection body; the neutral route_project.hpp remains SDK-free.
     "src/moe_core/route_wave_kernel.hpp",
+    "src/moe_core/route_wave_split.hpp",
     "src/moe_core/split_trellis_kernels.hpp",  # HIP split-K expert bodies shared from the DeepSeek K2 adapter.
     "src/xport/bf16_wire_hip.hpp",
     "src/xport/channel_device.hpp",

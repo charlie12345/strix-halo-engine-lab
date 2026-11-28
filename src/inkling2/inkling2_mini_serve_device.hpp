@@ -135,7 +135,8 @@ inline MiniServeCohort make_mini_device_cohort(
             // STRIX_INKLING_WINDOW_PROGRAMS=0 turns them off) and its proven levers (identity fixture q52r: EXACT levers only), so a served window runs the command
             // line's window arithmetic and wall.
             window_programs = windows && mini_window_programs_requested();
-            if (window_programs && !mini_window_programs_proven(opt.combine_image, opt.prepared_round_fold,
+            // The fold the backend runs (levers), not the request: CUDA declines the default-on fold.
+            if (window_programs && !mini_window_programs_proven(opt.combine_image, levers.prepared_round_fold,
                                                                 opt.experts_nvfp4, opt.controller_one_plane,
                                                                 opt.moe_w4a4, opt.attn_projected_bias, weights.roles())) {
                 window_programs = false;
@@ -185,13 +186,22 @@ inline MiniServeCohort make_mini_device_cohort(
             // The cohort owns the decoder while the server observes its projected-bias dispatches.
             auto* observed = decoder.get();
             Cohort::PrefillPolicy policy;
-            if (!kMiniProfile.ladder.empty())
+            if (!kMiniProfile.ladder.empty()) {
                 policy = [options = weight_options, device = scope.device_class, product = scope.cost_device,
                           context = std::uint64_t{opt.context}, chunk](MiniResidentDecoder& resident,
                                                                       std::uint64_t tokens, bool first) {
                     resident.set_moe_w4a4(mini_prompt_moe(options, device, tokens, first, nullptr,
                                                           MiniPromptExecution{product, context, chunk}));
                 };
+                // The same rule for a whole waiting prompt: one the policy would run in the integer class stays alone.
+                decoder->set_prompt_integer_rows([options = weight_options, device = scope.device_class,
+                                                  product = scope.cost_device, context = std::uint64_t{opt.context},
+                                                  chunk](std::uint64_t prompt_rows) {
+                    return mini_prompt_moe(options, device, prompt_rows, true, nullptr,
+                                           MiniPromptExecution{product, context, chunk}) ==
+                           moe_core::grouped_w4a4::Activations::iu4_rot;
+                });
+            }
             // A forward's row budget holds a lone lane's whole window even under --slots 1 (the verify width is not the
             // slot count): the window is its own forward, the one-row lanes stay within the decoder's rows.
             const auto forward_rows = std::max<unsigned>(rows, windows ? decoder->max_slot_window() : 1U);
@@ -242,8 +252,7 @@ inline MiniServeCohort make_mini_device_cohort(
               << " served_route " << mini_served_route_startup_field(shown, cohort->prompt_tail_rows())
               << " prepared_round_fold " << mini_round_fold_startup_field(opt, levers)
               << " verify_rows "
-              << mini_verify_rows_name(mini_served_verify_rows(levers.verify_rows, served_route, lanes),
-                                       opt.verify_rows)
+              << mini_verify_rows_name(mini_served_verify_rows(levers.verify_rows, lanes), opt.verify_rows)
               << " down_image " << mini_down_image_name(levers.down_image, opt.combine_image)
               << " head " << mini_head_field(levers.head)
               << " experts " << (opt.experts_nvfp4 ? "nvfp4" : "checkpoint")

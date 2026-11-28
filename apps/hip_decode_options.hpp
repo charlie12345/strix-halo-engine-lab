@@ -1389,6 +1389,16 @@ inline constexpr std::array<std::uint32_t, 4> default_known_prefill_tail_rows{10
 // tiled tail block of a default size (explicit tails, a 2048-row fallback tile, an untiled prompt) or runs the baseline,
 // the default is withdrawn entirely and the command runs exactly as without it; it never turns into a startup error.
 // Explicit --mtp-copy-wide-rows keeps its own validation. Not decided while the HTTP prefill is still pending.
+// The wide copy cycle is a decode-time accelerator of a live request: a calibration golden dump (one prompt, no
+// request) never runs it, and validate_mtp_cli refuses --mtp-copy-wide-rows together with a golden dump. A server's
+// first start generates the missing golden through such a dump of its own options, so the dump copy drops the cycle.
+inline void withdraw_mtp_copy_wide(Options& options, const char* reason) {
+    auto& m = options.mtp;
+    m.copy_wide_rows.clear();
+    m.ngram_context = m.ngram_copy_edit = m.ngram_wide_only = false;
+    m.copy_wide_auto = m.copy_wide_default = false;
+    m.copy_wide_reason = reason;
+}
 inline void settle_mtp_copy_wide_default(Options& options) {
     auto& m = options.mtp;
     if (!m.copy_wide_default || http_prefill_pending(options)) return;
@@ -1397,10 +1407,7 @@ inline void settle_mtp_copy_wide_default(Options& options) {
         std::all_of(m.copy_wide_rows.begin(), m.copy_wide_rows.end(),
             [&](std::uint32_t rows) { return std::find(tails.begin(), tails.end(), rows) != tails.end(); });
     if (kept) return;
-    m.copy_wide_rows.clear();
-    m.ngram_context = m.ngram_copy_edit = m.ngram_wide_only = false;
-    m.copy_wide_auto = m.copy_wide_default = false;
-    m.copy_wide_reason = "served default withdrawn: the resolved prompt route has no tiled tail block of the wide size";
+    withdraw_mtp_copy_wide(options, "served default withdrawn: the resolved prompt route has no tiled tail block of the wide size");
 }
 inline void apply_default_known_prefill_tail_rows(Options& options, const char* schedule) {
     if (!options.known_prefix_tail_rows.empty() || options.known_prefix_tail_rows_off || !options.known_prefix_window ||
@@ -2170,9 +2177,10 @@ inline std::string qwen_ladder_execution(const Options& o, std::uint64_t prompt_
 }
 // The profile of one prefill of `prompt_tokens`: the CLI prompt, or one HTTP request's prompt (same code, same
 // regime: phase, prompt length as context, one lane, device class, execution key).
-inline strix::qwen::profile::Resolution resolve_request_product_profile(Options& o, std::uint64_t prompt_tokens) {
+inline strix::qwen::profile::Resolution resolve_request_product_profile(const Options& o, std::uint64_t prompt_tokens) {
     const std::string execution = qwen_ladder_execution(o, prompt_tokens);
     auto inputs = o.product_profile_inputs;
+    if (prompt_tokens != 0) inputs.max_prompt_tokens = prompt_tokens;
     inputs.regime = strix::profile::Regime{strix::profile::Phase::prefill, prompt_tokens, 1, o.profile_device_class, execution};
     return strix::qwen::profile::resolve_requested(o.product_profile_requested, inputs);
 }
@@ -2182,6 +2190,12 @@ inline strix::qwen::profile::Resolution resolve_request_product_profile(Options&
 inline bool product_profile_prefill_f16_off(const Options& o) {
     const auto* row = o.product_profile.find("prefill_f16wmma");
     return row && strix::profile::applied(row->status) && row->value == row->lever->off;
+}
+
+// The served form (--http-serve) has no known prompt for the resolver to size a context from, so an explicit capacity
+// other than the qualified 8192 implies --unqualified-context, as the CLI resolver decides beyond 8192.
+inline bool served_context_implies_unqualified(const Options& o) {
+    return o.http_serve && o.context_explicit && o.context_tokens != 8192U && !o.unqualified_context;
 }
 
 inline Options parse_options(
@@ -3264,12 +3278,6 @@ inline Options parse_options(
         }
         if (strix::session::kv_precision::take(argc, argv, index, options.kv_request)) {
             if (options.attention_kv_storage_explicit) throw std::invalid_argument("duplicate attention KV storage option");
-            // Refuses a precision this engine has no KV path for (fp8: gfx1151) before anything else; the tier is applied
-            // at the end (it cannot change the storage here: turbo keeps BF16 on this backend).
-            const auto early = strix::session::kv_precision::resolve(
-                strix::profile::Name::standard, options.kv_request, strix::qwen::profile::kKvCaps);
-            options.attention_kv_storage = early.precision == strix::session::kv_precision::Precision::int8
-                ? strix::AttentionKvStorage::int8_token : strix::AttentionKvStorage::bf16;
             options.attention_kv_storage_explicit = true;
             continue;
         }
@@ -3603,8 +3611,14 @@ inline Options parse_options(
             options.unqualified_context = true;
             continue;
         }
-        if (argument == "--context") {
+        if (argument == "--context" || argument.starts_with("--context=")) {
             options.context_explicit = true;
+            // Both spellings (`--context N`, `--context=N`) reach the same value; the launcher and the other
+            // engines document either one.
+            if (argument != "--context") {
+                options.context_tokens = parse_u64(argument.substr(10), "context");
+                continue;
+            }
             if (index + 1 >= argc) {
                 throw std::invalid_argument(
                     "--context requires a token count");
@@ -3906,6 +3920,10 @@ inline Options parse_options(
         throw std::invalid_argument(
             "context must be non-zero");
     }
+    // The served form has no known prompt for the resolver to size the context from: an explicit capacity other than
+    // the qualified 8192 is the same automatic unqualified-context decision the CLI resolver makes beyond 8192
+    // (docs/models/qwen3.8/README.md), not a reason to drop the qualified profile or to refuse the server.
+    if (served_context_implies_unqualified(options)) options.unqualified_context = true;
     if (options.unqualified_context && !options.context_explicit)
         throw std::invalid_argument("--unqualified-context requires --context");
     if (!options.raw_recording_path.empty()) {
@@ -3993,6 +4011,8 @@ inline Options parse_options(
     // KV precision: native BF16 in every tier (no FP8 here, so turbo keeps BF16 with a note); only --kv changes it.
     options.kv = strix::session::kv_precision::resolve(options.product_profile.profile, options.kv_request,
         strix::qwen::profile::kKvCaps);
+    options.attention_kv_storage = options.kv.precision == strix::session::kv_precision::Precision::int8
+        ? strix::AttentionKvStorage::int8_token : strix::AttentionKvStorage::bf16;
     return options;
 }
 

@@ -126,6 +126,50 @@ int main() {
         if (capacity >= qmd::stash_rows_for(0, position, block)) expect(before_last == 0, "with room, nothing runs before the TTFT");
         if (capacity == 0) expect(before_last == 3, "no stash: the earlier blocks run inline (incumbent)");
     }
+    // HIP bridge binding (defer_final_priming + prompt_frontier_reached): only the completing block of the plain case defers
+    expect(qmd::defer_final_priming(true, 0, 8192, 8192, false, false, false, false), "single block, plain case: deferred");
+    expect(!qmd::defer_final_priming(false, 0, 8192, 8192, false, false, false, false), "off");
+    expect(!qmd::defer_final_priming(true, 0, 4096, 8192, false, false, false, false), "earlier block");
+    expect(!qmd::defer_final_priming(true, 0, 8192, 8192, true, false, false, false), "prefix cache present");
+    expect(!qmd::defer_final_priming(true, 0, 8192, 8192, false, true, false, false), "batch");
+    expect(!qmd::defer_final_priming(true, 0, 8192, 8192, false, false, true, false), "state export");
+    expect(!qmd::defer_final_priming(true, 0, 8192, 8192, false, false, false, true), "earlier priming in flight");
+    // Order and frontier: blocks of `t` rows over `n` positions; block k primes the pairs (previous held row or none, rows
+    // 0..rows-2) inline except the last block, whose call is recorded. After the prompt the primed frontier plus the deferred
+    // rows reaches n - 1 whether or not the last block is deferred; the deferred call primes exactly the rows that follow the
+    // primed frontier, so settling it yields the inline state (rows, positions and tokens identical).
+    for (const std::uint32_t t : {16u, 64u, 8192u})
+        for (std::uint64_t n = 2; n < 20000; n += (n < 200 ? 1 : 997)) {
+            for (const bool defer : {false, true}) {
+                std::uint64_t frontier = 0, deferred = 0, deferred_first = 0;
+                for (std::uint64_t first = 0; first < n; first += t) {
+                    const auto rows = static_cast<std::uint32_t>(n - first < t ? n - first : t);
+                    const std::uint64_t views = (first ? 1U : 0U) + rows - 1U;
+                    if (defer && qmd::defer_final_priming(true, first, rows, n, false, false, false, false)) {
+                        deferred = views;
+                        deferred_first = frontier;
+                    } else {
+                        frontier += views;
+                    }
+                }
+                expect(qmd::prompt_frontier_reached(frontier, deferred, n), "frontier reaches the last prompt position");
+                if (deferred) {
+                    expect(deferred_first == frontier, "deferred rows start at the primed frontier");
+                    frontier += deferred;  // the settle
+                    expect(frontier + 1U == n, "after the settle the frontier is the inline one");
+                }
+                if (defer && n > 1) expect(deferred != 0 || n == 1, "a prompt with a last block defers it");
+            }
+        }
+    // Ring sized to the prompt: grows only when the whole prompt fits, always a multiple of the chain's widest call
+    static_assert(qmd::prompt_ring_rows(8192, 5120, 1ULL << 30, 512, 32) == 8192, "8K prompt: whole prompt");
+    static_assert(qmd::prompt_ring_rows(8000, 5120, 1ULL << 30, 512, 32) == 8000, "grid multiple already");
+    static_assert(qmd::prompt_ring_rows(8001, 5120, 1ULL << 30, 512, 32) == 8032, "rounded up to the grid");
+    static_assert(qmd::prompt_ring_rows(32500, 5120, 1ULL << 30, 512, 32) == 32512, "32K prompt: 666 MB of rows");
+    static_assert(qmd::prompt_ring_rows(65536, 5120, 1ULL << 30, 512, 32) == 512, "does not fit: incumbent");
+    static_assert(qmd::prompt_ring_rows(4294967264ULL, 4294967295U, ~0ULL, 512, 32) == 512, "rows x hidden x 4 past 64 bits: incumbent");
+    static_assert(qmd::prompt_ring_rows(100, 5120, 1ULL << 30, 512, 32) == 512, "short prompt: incumbent");
+    static_assert(qmd::prompt_ring_rows(8192, 0, 1ULL << 30, 512, 32) == 512, "no width: incumbent");
     if (failures) return EXIT_FAILURE;
     std::puts("qwen_mtp_defer: all checks passed");
     return EXIT_SUCCESS;

@@ -113,7 +113,8 @@ struct World {
     std::uint64_t memory = 64ULL << 30U, free_disk = 512ULL << 30U;
     std::uint64_t usable = UINT64_MAX;  // MemAvailable - host floor; UINT64_MAX leaves the probe unset
 
-    pd::Resolved run(pd::App app, const std::vector<std::string>& args) const {
+    pd::Resolved run(pd::App app, const std::vector<std::string>& args,
+                     const strix::session::kv_precision::Request& kv_request = {}) const {
         pd::Probe p;
         p.available_memory = [this] { return memory; };
         if (usable != UINT64_MAX) p.usable_memory = [this] { return usable; };
@@ -129,7 +130,7 @@ struct World {
         return pd::resolve(app, args, [this](const char* n) -> const char* {
             const auto it = env.find(n);
             return it == env.end() ? nullptr : it->second.c_str();
-        }, p, build);
+        }, p, build, kv_request);
     }
 };
 
@@ -457,9 +458,13 @@ void test_d1_request_profile() {
             };
             const auto hit = resolve(8128, measured);
             const bool expect_d1 = std::string_view(tier) != "exact";
-            const bool expect_r256 = std::string_view(tier) == "turbo";  // gate_r: R256 failed FAST, passed TURBO <= 8,192
+            // Held-out gate v2: R=512 passes FAST in 4,096..8,192; TURBO nests the FAST cell. 8,193..32,768
+            // keeps D1 without replay until its gate completes.
+            const auto expect_replay = [&](std::uint64_t prompt) -> std::string_view {
+                return expect_d1 && prompt >= 4096U && prompt <= 8192U ? "512" : "0";
+            };
             check(hit.find("d1_prefill")->value == (expect_d1 ? "1" : "0"), "D1 matches the measured execution under FAST and TURBO");
-            check(hit.find("decoder_replay")->value == (expect_r256 ? "256" : "0"), "R256 rides on the D1 band in TURBO only");
+            check(hit.find("decoder_replay")->value == expect_replay(8128), "R512 rides on the D1 band in FAST and TURBO");
             // The pair CLI / serve request (row split, exact cone, head1, automatic MoE chunk) binds the same band rows.
             ds::PrefillOptions native;
             native.world = 2;
@@ -467,8 +472,8 @@ void test_d1_request_profile() {
             for (std::uint64_t prompt : {4096U, 8192U, 8193U, 32768U}) {
                 const auto cli = resolve(prompt, native);
                 check(cli.find("d1_prefill")->value == (expect_d1 ? "1" : "0") &&
-                          cli.find("decoder_replay")->value == (expect_r256 && prompt <= 8192U ? "256" : "0"),
-                      "CLI and serve requests in the 8K and 32K bands take D1 under FAST and TURBO, R256 only in TURBO <= 8,192");
+                          cli.find("decoder_replay")->value == expect_replay(prompt),
+                      "CLI and serve requests in the 8K and 32K bands take D1 under FAST and TURBO, R512 only <= 8,192");
             }
             for (std::uint64_t prompt : {4095U, 32769U})
                 check(resolve(prompt, native).find("d1_prefill")->value == "0" &&
@@ -543,6 +548,21 @@ void test_profile() {
         auto fast_args = plain_args;
         fast_args.insert(fast_args.end(), {"--profile", "fast"});
         const auto f = w.run(app, fast_args);
+        check(f.kv.tier == f.profile->profile && f.kv.tier_word() == std::string_view("fast") &&
+                  f.kv.word() == "fp8" && !f.kv.changes_output(),
+              "native FP8 KV receipt follows the resolved FAST tier");
+        namespace kvp = strix::session::kv_precision;
+        kvp::Request other_kv;
+        kvp::set(other_kv, "bf16");
+        try {
+            (void)w.run(app, {MODEL, "--profile", "exact"}, other_kv);
+            check(false, "EXACT refuses changing DeepSeek's native FP8 KV");
+        } catch (const kvp::RequestError& error) {
+            const std::string_view message(error.what());
+            check(message.find("--kv bf16 refused") != std::string_view::npos &&
+                      message.ends_with(kvp::receipt_line(base.kv)),
+                  "non-native KV error carries DeepSeek's effective EXACT receipt");
+        }
         auto turbo_args = plain_args;
         turbo_args.insert(turbo_args.end(), {"--profile", "turbo", "--allow-pending"});
         const auto turbo = w.run(app, turbo_args);
@@ -551,10 +571,10 @@ void test_profile() {
               "IU4 is not a TURBO row (measured slower than FAST), even with --allow-pending");
         const auto* replay = turbo.profile->find("decoder_replay");
         check(replay && replay->value == "0" && replay->status == pr::Status::pending,
-              "TURBO startup leaves R256 to the request's band receipt (test_d1_request_profile)");
+              "TURBO startup leaves R512 to the request's band receipt (test_d1_request_profile)");
         const auto* fast_replay = f.profile->find("decoder_replay");
-        check(fast_replay && fast_replay->value == "0" && fast_replay->status == pr::Status::builtin,
-              "FAST never selects R256 (gate_r held-out re-score: FAST gate FAIL)");
+        check(fast_replay && fast_replay->value == "0" && fast_replay->status == pr::Status::pending,
+              "FAST startup leaves R512 to the request's band receipt (held-out gate v2 PASS)");
         auto i4_world = w;
         i4_world.env["STRIX_DS41_FAST_I4"] = "1";
         for (const auto* profile : {"fast", "turbo"}) {

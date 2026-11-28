@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <string_view>
+#include <system_error>
 #include <chrono>
 #include <stdexcept>
 #include <cstdio>
@@ -252,7 +254,6 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
         o.world != 2U || !o.tp_attention || o.expert_tp || o.stream_experts || o.layers != 40U ||
         prompt_tokens > o.max_positions || o.chunk_rows != 1024U || o.window_rows != 8U || o.attention_lanes != 4U ||
         (o.moe_chunk_rows != 0U && o.moe_chunk_rows != 4096U) || !o.engram_direct_io ||
-        o.draft_rows > ::strix::ds41::bounded_replay_min_rows ||
         o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_dense || o.fast_moe ||
         o.fast_engram || o.fast_shared || o.fast_moe_f16 || o.fast_i4 > 0 || o.null_ulp_layer >= 0 ||
         o.approx_layer_first != 0U || o.approx_layer_end != PrefillOptions{}.approx_layer_end ||
@@ -269,12 +270,31 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
     inputs.env = [](const char*) -> const char* { return nullptr; };
     inputs.regime = {p::Phase::prefill, prompt_tokens, lanes, "gfx1151", execution};
     auto out = p::resolve(profile_engine(), inputs);
-    // A drafter seed rides only on the bounded replay (the same rows for any seed <= R); D1 alone would widen its cone.
+    // A drafter seed rides only on the bounded replay (its rows above the cut, seed <= R); D1 alone would widen its cone.
     if (const auto* d1 = out.find("d1_prefill"); o.draft_rows != 0U && d1 != nullptr && d1->value == "1") {
-        const auto* replay = out.find("decoder_replay");
-        if (replay == nullptr || replay->value != "256") return std::nullopt;
+        const auto bound = resolved_replay_rows(out);
+        if (bound == 0U || o.draft_rows > bound) return std::nullopt;
     }
     return out;
+}
+
+std::uint32_t replay_rows_from_value(std::string_view value) {
+    if (value.empty() || value == "0") return 0U;
+    std::uint32_t rows = 0;
+    const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), rows);
+    // The run's own rule (hip_deepseek41_prefill.hip): a multiple of the 128-row attention window, at least the
+    // smallest qualified bound. A value the run cannot execute is a table defect, never a silent "off".
+    if (ec != std::errc{} || end != value.data() + value.size() || rows % 128U != 0U ||
+        rows < ::strix::ds41::bounded_replay_min_rows)
+        throw std::invalid_argument("ds41-decoder-replay-bounded-v1: decoder_replay = '" + std::string(value) +
+                                    "' is not a bound the run executes (0, or a multiple of 128 of at least " +
+                                    std::to_string(::strix::ds41::bounded_replay_min_rows) + ")");
+    return rows;
+}
+
+std::uint32_t resolved_replay_rows(const strix::profile::Resolution& resolution) {
+    const auto* replay = resolution.find("decoder_replay");
+    return replay == nullptr ? 0U : replay_rows_from_value(replay->value);
 }
 
 const std::vector<std::pair<std::string, std::string>>& baseline_off_items() {
@@ -320,7 +340,8 @@ strix::profile::ExecutionReceipt host_receipt(App app, const Resolved& resolved,
     return out;
 }
 
-Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_env, const Probe& probe, const Build& build) {
+Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_env, const Probe& probe, const Build& build,
+                 const ::strix::session::kv_precision::Request& kv_request) {
     Resolved r;
     std::vector<std::string> user;
     for (const auto& a : in) {
@@ -351,6 +372,7 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
         fast_env.insert_or_assign("STRIX_DS41_FAST_MOE", "0");
     profile_inputs.env = fp::lookup(fast_env, raw_env);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
+    r.kv = strix::session::kv_precision::resolve(r.profile->profile, kv_request, kKvCaps);
     const auto profile_env = strix::profile::exports(*r.profile, fast_env);
     r.set_env = profile_env;
     if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())
@@ -534,6 +556,8 @@ DsparkSettings resolve_dspark_settings() {
 }
 
 Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
+    namespace kvp = ::strix::session::kv_precision;
+    const auto kv_request = kvp::extract(argc, argv);
     std::vector<std::string> in(argv + 1, argv + argc);
     Probe probe;
     probe.available_memory = []() -> std::uint64_t {
@@ -573,7 +597,8 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
         for (std::filesystem::directory_iterator it(d, ec), end; !ec && it != end; it.increment(ec)) out.push_back(it->path().filename().string());
         return out;
     };
-    auto r = resolve(app, in, [](const char* n) { return static_cast<const char*>(std::getenv(n)); }, probe, build);
+    auto r = resolve(app, in, [](const char* n) { return static_cast<const char*>(std::getenv(n)); }, probe, build, kv_request);
+    kvp::emit_receipt(r.kv);
     if (!r.print_only && r.profile) r.profile->weights.require_honoured();
     for (const auto& [k, v] : r.set_env) {
 #ifdef _WIN32

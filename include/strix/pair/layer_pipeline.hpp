@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <span>
@@ -296,6 +297,70 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
     return out;
 }
 
+// A bulk payload crosses a link in pieces of at most `chunk` bytes (the byte stream is the same; only the transport
+// calls are bounded). The chunk keeps every call of the layer-state and tail-row messages within what the pipe frames
+// already exercise (8 MiB); it is not a proven fix: a checksum mismatch also occurred with 8 MiB calls.
+inline constexpr std::size_t link_chunk_bytes = std::size_t{8} << 20;
+inline void send_chunked(const Link& link, std::span<const std::byte> bytes, std::size_t chunk = link_chunk_bytes) {
+    if (chunk == 0) throw std::invalid_argument("link chunk must be positive");
+    for (std::size_t at = 0; at < bytes.size(); at += chunk) link.send(bytes.subspan(at, std::min(chunk, bytes.size() - at)));
+}
+inline void receive_chunked(const Link& link, std::span<std::byte> bytes, std::size_t chunk = link_chunk_bytes) {
+    if (chunk == 0) throw std::invalid_argument("link chunk must be positive");
+    for (std::size_t at = 0; at < bytes.size(); at += chunk) link.receive(bytes.subspan(at, std::min(chunk, bytes.size() - at)));
+}
+
+// One bulk message with end-to-end integrity: {magic, id, bytes, checksum, extra} + payload. The receiver answers every
+// attempt with one word (1 accepted, 0 resend); a payload that fails its checksum is requested again, at most
+// `message_attempts` times, and the two copies are compared on stderr (differing bytes, first offset, 4 KiB pages) so a
+// transport that corrupts intermittently is measured instead of guessed. Measured on the two-cable host transport (8K
+// prompt, KV of one attention layer = 32 MiB): a single run of the hand-off failed its checksum without any fault in the
+// sender, in sizes the 10 MiB pipe frames never showed.
+inline constexpr unsigned message_attempts = 3;
+inline unsigned send_verified(const Link& to, const std::uint64_t (&words)[5], std::span<const std::byte> bytes, std::size_t chunk) {
+    for (unsigned attempt = 0; attempt < message_attempts; ++attempt) {
+        to.send(std::as_bytes(std::span(words)));
+        send_chunked(to, bytes, chunk);
+        std::uint64_t ack = 0;
+        to.receive(std::as_writable_bytes(std::span(&ack, 1)));
+        if (ack == 1U) return attempt;
+        if (ack != 0U) throw std::runtime_error("bulk message: bad acknowledgement word (protocol error)");
+    }
+    throw std::runtime_error("bulk message refused " + std::to_string(message_attempts) + " times by the receiver (checksum)");
+}
+// `admit` checks the header words (id, length, extra) against what the receiver expects and throws a named protocol error
+// otherwise; it runs on every attempt BEFORE the payload is allocated or read, so a damaged length never sizes a buffer.
+inline unsigned receive_verified(const Link& from, std::uint64_t (&words)[5], std::vector<std::byte>& bytes, std::uint64_t magic,
+                                 const std::function<std::uint32_t(std::span<const std::byte>)>& check, std::size_t chunk,
+                                 const std::string& what, const std::function<void(const std::uint64_t (&)[5])>& admit) {
+    std::vector<std::byte> bad;
+    for (unsigned attempt = 0; attempt < message_attempts; ++attempt) {
+        from.receive(std::as_writable_bytes(std::span(words)));
+        if (words[0] != magic) throw std::runtime_error(what + ": bad message header");
+        admit(words);
+        bytes.resize(static_cast<std::size_t>(words[2]));
+        receive_chunked(from, bytes, chunk);
+        const bool ok = check(bytes) == words[3];
+        const std::uint64_t ack = ok ? 1U : 0U;
+        from.send(std::as_bytes(std::span(&ack, 1)));
+        if (ok) {
+            if (!bad.empty() && bad.size() == bytes.size()) {
+                std::size_t differing = 0, first = bytes.size(), pages = 0;
+                for (std::size_t i = 0; i < bytes.size(); ++i)
+                    if (bad[i] != bytes[i]) { ++differing; if (first == bytes.size()) first = i; }
+                for (std::size_t i = 0; i < bytes.size(); i += 4096U)
+                    if (std::memcmp(bad.data() + i, bytes.data() + i, std::min<std::size_t>(4096U, bytes.size() - i)) != 0) ++pages;
+                std::fprintf(stderr, "%s: checksum mismatch repaired by resend (message %llu, %zu bytes): %zu differing bytes in %zu pages, first at %zu\n",
+                             what.c_str(), static_cast<unsigned long long>(words[1]), bytes.size(), differing, pages, first);
+            }
+            return attempt;
+        }
+        if (bad.empty()) bad = bytes;
+    }
+    throw std::runtime_error(what + ": checksum mismatch (message " + std::to_string(words[1]) + ", " + std::to_string(bytes.size()) +
+                             " bytes) after " + std::to_string(message_attempts) + " attempts");
+}
+
 // End-of-prefill relay of every stage's layer state to ONE decoder stage (the planner's handoff plan: the decoder owns
 // the whole model, decode then runs there alone at single-rank cost instead of crossing every cut per token).
 // Messages travel along the line towards `decoder`: a stage below it forwards what arrives from below plus its own
@@ -308,8 +373,14 @@ struct RelayOps {
     // Checksum of one message's bytes; empty = SeamCrc (bytewise table). A binder with a hardware CRC32C passes it:
     // the relay moves the whole KV + recurrent state once, a few hundred MB at long contexts.
     std::function<std::uint32_t(std::span<const std::byte>)> checksum;
+    std::size_t chunk_bytes = link_chunk_bytes;   // largest single transport call of a message's payload
+    // Receiver-side length check of each incoming message, before its payload is allocated: the exact state bytes of one
+    // layer on this engine, from its local state layout. The decoder of a plan of two or more stages must bind it; a
+    // forwarding stage may leave it empty (only the bound below applies). A header outside it is a named protocol error.
+    std::function<std::uint64_t(std::uint32_t layer)> layer_bytes;
+    std::uint64_t max_message_bytes = std::uint64_t{1} << 32;
 };
-struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0, messages = 0; double ms = 0; };
+struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0, messages = 0, resends = 0; double ms = 0; };
 inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::uint32_t first_token, const Link* up,
                               const Link* down, const RelayOps& ops) {
     using Clock = std::chrono::steady_clock;
@@ -317,6 +388,8 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
     if (decoder >= p.stages()) throw std::invalid_argument("state relay: decoder stage outside the plan");
     if ((up != nullptr) == p.embeds() || (down != nullptr) == p.head())
         throw std::invalid_argument("layer pipeline: links do not match the stage (up: not first, down: not last)");
+    if (p.stage == decoder && p.stages() > 1U && !ops.layer_bytes)
+        throw std::invalid_argument("state relay: the decoder needs its layer state sizes (RelayOps::layer_bytes)");
     const auto start = Clock::now();
     const auto check_sum = [&](std::span<const std::byte> b) {
         if (ops.checksum) return ops.checksum(b);
@@ -326,16 +399,27 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
     // One message per layer, streamed: {state_magic, layer, bytes, checksum, token + 1 (0: none)} + bytes. A link
     // carries a count first; a forwarding stage passes each message on as it arrives, then appends its own layers.
     struct Message { std::uint64_t words[5]{}; std::vector<std::byte> bytes; };
+    const std::uint64_t layers_total = p.cuts.back();
+    const auto admit = [&](const std::uint64_t (&w)[5]) {
+        if (w[1] >= layers_total)
+            throw std::runtime_error("state relay: message names layer " + std::to_string(w[1]) + " of a " +
+                                     std::to_string(layers_total) + "-layer plan (protocol error)");
+        if (w[1] >= p.first() && w[1] < p.last())
+            throw std::runtime_error("state relay: message names layer " + std::to_string(w[1]) +
+                                     " of the receiving stage itself (protocol error)");
+        const std::uint64_t expected = ops.layer_bytes ? ops.layer_bytes(static_cast<std::uint32_t>(w[1])) : 0U;
+        if ((ops.layer_bytes && w[2] != expected) || w[2] > ops.max_message_bytes)
+            throw std::runtime_error("state relay: message length " + std::to_string(w[2]) + " bytes for layer " +
+                                     std::to_string(w[1]) + (ops.layer_bytes ? ", expected " + std::to_string(expected)
+                                                                             : ", bound " + std::to_string(ops.max_message_bytes)) +
+                                     " (protocol error)");
+    };
     const auto get_msg = [&](const Link* from) {
         Message m;
-        from->receive(std::as_writable_bytes(std::span(m.words)));
-        if (m.words[0] != state_magic) throw std::runtime_error("state relay: bad message header");
-        m.bytes.resize(static_cast<std::size_t>(m.words[2]));
-        from->receive(m.bytes);
-        if (check_sum(m.bytes) != m.words[3]) throw std::runtime_error("state relay: checksum mismatch");
+        out.resends += receive_verified(*from, m.words, m.bytes, state_magic, check_sum, ops.chunk_bytes, "state relay", admit);
         return m;
     };
-    const auto put_msg = [&](const Link* to, const Message& m) { to->send(std::as_bytes(std::span(m.words))); to->send(m.bytes); };
+    const auto put_msg = [&](const Link* to, const Message& m) { out.resends += send_verified(*to, m.words, m.bytes, ops.chunk_bytes); };
     const auto own = [&](std::uint32_t layer) {
         Message m;
         m.bytes = ops.save(layer);
@@ -379,6 +463,138 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
     }
     out.ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     return out;
+}
+
+// When the layer-split prefill beats every rank prefilling the whole prompt alone (the replicated prefill a tensor-parallel
+// decode otherwise starts from). Equal ranks, one half-window time t / 2 per stage: the flow shop wall is (W + 1) t / 2
+// against W t, a saving of (W - 1) t / 2 for W windows; the hand-off moves the state of the layers each rank lacks once
+// (about 0.12 s per 8K positions of the 27B model on the USB4 link). From three windows the saving is at least one full
+// window time, longer than that hand-off for every window width the engine runs (>= 64 rows). Below, the replicated
+// prefill stays.
+[[nodiscard]] constexpr bool pipeline_prefill_wins(std::size_t windows) noexcept { return windows >= 3U; }
+
+// Line barrier of a stage chain over its links: returns on a stage only after every stage has entered it. The head stage
+// speaks first (up), each stage forwards to the next one down the line only after hearing from below; so no rank sends or
+// reads anything but these words until all stages are here. Run it after the prefill pipes are gone (a stage that finished
+// first must not start the state hand-off while another stage's pipe progress thread still reads the shared transport;
+// the barrier only orders the hand-off after the pipes: intermittent corruption was seen with it in place) and before the first timed phase.
+inline void line_barrier(const Link* up, const Link* down) {
+    std::uint64_t word = 0x52524142ULL;
+    const auto out = [](const Link* l, std::uint64_t& w) { l->send(std::as_bytes(std::span(&w, 1))); };
+    const auto in = [](const Link* l, std::uint64_t& w) { l->receive(std::as_writable_bytes(std::span(&w, 1))); };
+    if (down) in(down, word);            // everything below has arrived
+    if (up) { out(up, word); in(up, word); }   // report up, wait for the release
+    if (down) out(down, word);           // release below
+}
+
+// Wire version of the layer-pipeline line: 2 = every bulk message of the state relay and the tail rows is answered with
+// one acknowledgement word (version 1 had none, and its builds send no hello). A stage chain checks it once, before
+// anything else crosses the line, in the line barrier's order: the request {hello_magic, version} travels up from the
+// head stage, the answer {hello_answer_magic, version} travels back down, and each word is checked before the next is
+// read. A peer of another build is refused by name instead of waiting for words it never sends: a version-1 peer's first
+// word is its line barrier word, or the echo of our request (the barrier sends back the word it received), never an
+// answer.
+inline constexpr std::uint64_t hello_magic = 0x314f4c4c45485953ULL;         // "SYHELLO1" (request, upwards)
+inline constexpr std::uint64_t hello_answer_magic = 0x414f4c4c45485953ULL;  // "SYHELLOA" (answer, downwards)
+inline constexpr std::uint64_t wire_version = 2;
+inline void line_hello(const Link* up, const Link* down, std::uint64_t version = wire_version) {
+    const auto out = [&](const Link* l, std::uint64_t magic) {
+        const std::uint64_t words[2] = {magic, version};
+        l->send(std::as_bytes(std::span(words)));
+    };
+    const auto in = [&](const Link* l, std::uint64_t magic, const char* side) {
+        std::uint64_t word = 0;
+        l->receive(std::as_writable_bytes(std::span(&word, 1)));
+        if (word != magic)
+            throw std::runtime_error(std::string("layer pipeline: the ") + side +
+                                     " peer sent no wire hello (a build before layer wire version 2); this build speaks version " +
+                                     std::to_string(version) + ": run every rank from the same build");
+        l->receive(std::as_writable_bytes(std::span(&word, 1)));
+        return word;
+    };
+    const auto refuse_if = [&](std::uint64_t peer, const char* side) {
+        if (peer != version)
+            throw std::runtime_error("layer pipeline: wire version mismatch: this build speaks version " + std::to_string(version) +
+                                     ", the " + side + " peer version " + std::to_string(peer) + ": run every rank from the same build");
+    };
+    std::uint64_t below = version;
+    if (down) below = in(down, hello_magic, "downstream");
+    if (up) { out(up, hello_magic); refuse_if(in(up, hello_answer_magic, "upstream"), "upstream"); }
+    if (down) { out(down, hello_answer_magic); refuse_if(below, "downstream"); }   // answer first: the peer names it too
+}
+
+// End-of-prefill hand-off of a layer-split prefill to a decode that runs on EVERY rank (tensor-parallel decode: each rank
+// holds the whole model and the whole sequence state). Every stage is the decoder once, in stage order, over the same
+// per-layer messages as relay_state(): afterwards every rank holds the state of every layer, bit for bit what a whole
+// prefill on that rank leaves (the layer ranges run the same launches as the whole range, so the state bytes are equal).
+// The caller runs a line barrier after the prefill pipes are gone (a stage that finished first must not send while the
+// other stage's pipe progress thread still reads the shared transport; the barrier orders the phases, it does not explain the
+// intermittent corruption seen on the host transport with it in place, whose cause is not established).
+// The first token (known on the head stage) reaches the other stages with the relay to them. One round per stage, so the
+// two directions of a link do not overlap: the wall is the sum of the rounds. Every rank is a decoder once, so ops must bind
+// layer_bytes on every rank (relay_state).
+inline RelayStats share_state(const Placement& p, std::uint32_t first_token, const Link* up, const Link* down,
+                              const RelayOps& ops) {
+    RelayStats total;
+    total.token = first_token;
+    for (std::uint32_t decoder = 0; decoder < p.stages(); ++decoder) {
+        const auto round = relay_state(p, decoder, first_token, up, down, ops);
+        total.bytes += round.bytes;
+        total.messages += round.messages;
+        total.resends += round.resends;
+        total.ms += round.ms;
+        if (p.stage == decoder) total.token = round.token;
+    }
+    return total;
+}
+
+// Per-window rows from the head stage back to the first stage after a two-stage prefill (the rows only the head computes:
+// the final trunk hidden that a speculation drafter reads on every rank). One message per window, in window order:
+// {tail_magic, window, rows, bytes, checksum} + bytes. `save` fills the head's rows of one window (its own record of them),
+// `load` hands them to the first stage. Two stages only; returns the bytes moved on this rank.
+inline constexpr std::uint64_t tail_magic = 0x314c494154594c53ULL;  // "SLYTAIL1"
+struct TailOps {
+    std::size_t row_bytes = 0;
+    std::function<void(std::uint32_t window, std::span<std::byte> out)> save;                   // head stage
+    std::function<void(std::uint32_t window, const Window&, std::span<const std::byte>)> load;  // first stage
+    std::function<std::uint32_t(std::span<const std::byte>)> checksum;                          // empty: SeamCrc
+    std::size_t chunk_bytes = link_chunk_bytes;
+};
+inline std::uint64_t return_rows(const Placement& p, std::size_t prompt_tokens, std::uint32_t width, const Link* up,
+                                 const Link* down, const TailOps& ops) {
+    p.check();
+    if (p.stages() != 2U) throw std::invalid_argument("tail rows: two stages only");
+    if (ops.row_bytes == 0) throw std::invalid_argument("tail rows: row_bytes unset");
+    const auto check_sum = [&](std::span<const std::byte> b) {
+        if (ops.checksum) return ops.checksum(b);
+        SeamCrc crc; crc.update(b); return crc.value();
+    };
+    const auto ws = windows(prompt_tokens, width);
+    std::uint64_t moved = 0;
+    std::vector<std::byte> bytes;
+    for (std::uint32_t w = 0; w < ws.size(); ++w) {
+        std::uint64_t words[5]{};
+        if (p.head()) {
+            if (!up) throw std::invalid_argument("tail rows: the head stage needs its upstream link");
+            bytes.resize(std::size_t(ws[w].rows) * ops.row_bytes);
+            ops.save(w, bytes);
+            words[0] = tail_magic; words[1] = w; words[2] = bytes.size(); words[3] = check_sum(bytes); words[4] = ws[w].rows;
+            (void)send_verified(*up, words, bytes, ops.chunk_bytes);
+        } else {
+            if (!down) throw std::invalid_argument("tail rows: the first stage needs its downstream link");
+            const std::uint64_t expected = std::uint64_t(ws[w].rows) * ops.row_bytes;
+            (void)receive_verified(*down, words, bytes, tail_magic, check_sum, ops.chunk_bytes, "tail rows",
+                                   [&](const std::uint64_t (&h)[5]) {
+                                       if (h[1] != w || h[4] != ws[w].rows || h[2] != expected)
+                                           throw std::runtime_error("tail rows: message does not match the window (window " +
+                                                                    std::to_string(h[1]) + ", length " + std::to_string(h[2]) +
+                                                                    " bytes, expected " + std::to_string(expected) + ")");
+                                   });
+            ops.load(w, ws[w], bytes);
+        }
+        moved += bytes.size();
+    }
+    return moved;
 }
 
 // Interleaved virtual stages on two ranks (strix/pair/stage_map.hpp): the 2v stages of a StageMap alternate between the

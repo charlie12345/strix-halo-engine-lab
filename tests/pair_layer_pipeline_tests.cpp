@@ -2,6 +2,8 @@
 // sequence state (a recurrence like a GDN layer and a causal history like an attention layer), ranks run in threads
 // connected by in-memory ordered links carrying the real shared seam pipe (strix/pair/pipe.hpp). Invariant: for any
 // number of ranks and any cuts, the composed prefill logits and every decoded id equal the single-rank run byte for byte.
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -9,10 +11,12 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "strix/pair/layer_pipeline.hpp"
@@ -187,6 +191,7 @@ std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>
                     layers::RelayOps r;
                     r.save = [&](std::uint32_t layer) { return t.save(layer, layer + 1U); };
                     r.load = [&](std::uint32_t layer, std::span<const std::byte> b) { t.load(layer, layer + 1U, b); };
+                    r.layer_bytes = [](std::uint32_t) { return std::uint64_t{H} * 8U; };
                     if (relay_decoder % 2U) r.checksum = [](std::span<const std::byte> b) {   // an injected checksum (odd decoders)
                         std::uint32_t h = 2166136261U; for (auto v : b) { h ^= std::to_integer<std::uint32_t>(v); h *= 16777619U; } return h; };
                     const auto rs = layers::relay_state(p, relay_decoder, first, up ? &lu : nullptr, down ? &ld : nullptr, r);
@@ -232,6 +237,112 @@ std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>
                 out[s].error = e.what();
                 if (s) links[s - 1U]->close();
                 if (s + 1U < stages) links[s]->close();
+            }
+        });
+    for (auto& t : threads) t.join();
+    return out;
+}
+
+// Two-stage prefill handed to a decode that runs on EVERY rank (share_state) with the head's per-window rows returned to
+// stage 0 (return_rows): each rank then decodes alone with the whole model; ids, logits bytes and the returned rows must
+// equal one rank's.
+struct Shared {
+    Result res[2];
+    std::vector<float> head_rows, first_rows;   // the final rows of every window: computed on the head, received on stage 0
+    std::uint64_t state_bytes[2]{}, tail_bytes[2]{};
+};
+Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen, std::uint32_t cut,
+                 int corrupt = 0) {
+    Shared out;
+    const std::vector<std::uint32_t> cuts{0, cut, m.layers};
+    Channel link;
+    const auto wins = layers::windows(prompt.size(), width);
+    const auto count = wins.size();
+    const std::size_t row_bytes = H * 4U;
+    std::atomic<bool> head_done{false};
+    const std::size_t chunk = 48;   // not the 40 B message header: every payload (64 B per layer, 96+ B per window) needs several calls
+    std::atomic<int> corrupt_left{corrupt};   // payload pieces to damage in flight (fault injection)
+    std::vector<std::thread> threads;
+    for (unsigned s = 0; s < 2U; ++s)
+        threads.emplace_back([&, s] {
+            try {
+                layers::Placement p{cuts, s};
+                Toy t(m, 0, m.layers, width);   // TP-style: every rank holds the whole model
+                t.stage_end = cuts[s + 1U];
+                PipeOptions po;
+                po.validate = layers::validator(1U, count, cut, width, row_bytes);
+                std::unique_ptr<Pipe> pipe;
+                if (s == 1U)
+                    pipe = std::make_unique<Pipe>(1U, count, [&](std::span<const std::byte> b) { link.send(1, b); },
+                        [&](std::span<std::byte> b) { link.receive(0, b); }, [&] { link.close(); }, po);
+                else
+                    pipe = std::make_unique<Pipe>(0U, count, [&](std::span<const std::byte> b) { link.send(0, b); },
+                        [&](std::span<std::byte> b) { link.receive(1, b); }, [&] { link.close(); }, po);
+                std::vector<float> rows;   // head: the final rows of each window, in order
+                layers::StageOps ops;
+                ops.row_bytes = row_bytes;
+                ops.forward = [&](std::span<const std::uint32_t> tok, const layers::Window& w, bool head) {
+                    t.range(p.first(), p.last(), tok.data(), w.rows, head);
+                    if (p.head()) rows.insert(rows.end(), t.x.begin(), t.x.begin() + std::ptrdiff_t(w.rows * H));
+                };
+                ops.seam = [&](PipeFrame& f, bool save, std::size_t bytes) {
+                    if (save) std::memcpy(f.payload.data(), t.x.data(), bytes); else std::memcpy(t.x.data(), f.payload.data(), bytes); };
+                ops.fence = [] {};
+                (void)layers::prefill(p, prompt, width, 1U, p.embeds() ? nullptr : pipe.get(), p.head() ? nullptr : pipe.get(), ops);
+                pipe.reset();
+                layers::Link up, down;
+                // after the pipes no single transport call may exceed the chunk (a transport that corrupts big writes)
+                const auto capped = [&](int dir) { return [&, dir](std::span<const std::byte> b) {
+                    if (b.size() > chunk) throw std::runtime_error("a single write above the chunk size");
+                    if (b.size() == chunk && corrupt_left.fetch_sub(1) > 0) {
+                        std::vector<std::byte> bad(b.begin(), b.end());
+                        bad[7] ^= std::byte{0x10};
+                        link.send(dir, bad);
+                        return;
+                    }
+                    link.send(dir, b); }; };
+                if (s == 1U) { up.send = capped(1); up.receive = [&](std::span<std::byte> b) { link.receive(0, b); }; }
+                else { down.send = capped(0); down.receive = [&](std::span<std::byte> b) { link.receive(1, b); }; }
+                // the hand-off waits for BOTH stages: the head finishes late, stage 0 must not pass the barrier before that
+                if (p.head()) { std::this_thread::sleep_for(std::chrono::milliseconds(60)); head_done.store(true); }
+                layers::line_barrier(s ? &up : nullptr, s ? nullptr : &down);
+                if (!p.head() && !head_done.load()) out.res[s].error = "hand-off started before the head stage finished";
+                const std::uint32_t first = p.head() ? t.top() : 0U;
+                layers::RelayOps r;
+                r.save = [&](std::uint32_t layer) { return t.save(layer, layer + 1U); };
+                r.load = [&](std::uint32_t layer, std::span<const std::byte> b) { t.load(layer, layer + 1U, b); };
+                r.layer_bytes = [](std::uint32_t) { return std::uint64_t{H} * 8U; };
+                r.chunk_bytes = chunk;
+                const auto rs = layers::share_state(p, first, s ? &up : nullptr, s ? nullptr : &down, r);
+                out.state_bytes[s] = rs.bytes;
+                layers::TailOps tail;
+                tail.row_bytes = row_bytes;
+                tail.chunk_bytes = chunk;
+                tail.save = [&](std::uint32_t w, std::span<std::byte> b) {
+                    std::size_t at = 0;
+                    for (std::uint32_t i = 0; i < w; ++i) at += std::size_t(wins[i].rows) * H;
+                    std::memcpy(b.data(), &rows[at], b.size());
+                };
+                std::vector<float> got;
+                tail.load = [&](std::uint32_t, const layers::Window&, std::span<const std::byte> b) {
+                    const auto n = got.size(); got.resize(n + b.size() / 4U); std::memcpy(&got[n], b.data(), b.size()); };
+                out.tail_bytes[s] = layers::return_rows(p, prompt.size(), width, s ? &up : nullptr, s ? nullptr : &down, tail);
+                if (s == 0U) out.first_rows = got; else out.head_rows = rows;
+                // decode alone on the whole model (no links)
+                t.stage_end = m.layers;
+                layers::Placement dp{{0U, m.layers}, 0U};
+                layers::DecodeOps d;
+                d.row_bytes = row_bytes;
+                d.forward = [&](std::uint32_t tok, bool head) { t.range(0, m.layers, &tok, 1U, head); };
+                d.top = [&] { return t.top(); };
+                d.export_row = [&](std::span<std::byte> b) { std::memcpy(b.data(), t.x.data(), row_bytes); };
+                d.import_row = [&](std::span<const std::byte> b) { std::memcpy(t.x.data(), b.data(), row_bytes); };
+                const auto st = layers::decode(dp, rs.token, gen, nullptr, nullptr, d);
+                out.res[s].ids = st.ids;
+                out.res[s].dec_logits = t.logits;
+            } catch (const std::exception& e) {
+                out.res[s].error = e.what();
+                link.close();
             }
         });
     for (auto& t : threads) t.join();
@@ -285,6 +396,38 @@ int main() {
             ++relayed;
         }
     }
+    // two-stage prefill shared with a decode on every rank: both ranks' ids / decode logits equal one rank; the head's
+    // per-window rows reach stage 0 byte for byte; the state moved is every layer once per direction
+    unsigned shared = 0;
+    for (std::uint32_t k = 1; k < 7; ++k) {
+        const auto r = run_share(m, prompt, width, gen, k);
+        const std::string tag = "share cut " + std::to_string(k);
+        for (unsigned s = 0; s < 2U; ++s) {
+            expect(r.res[s].error.empty(), tag + " stage " + std::to_string(s) + " error: " + r.res[s].error);
+            expect(r.res[s].ids == ref.ids, tag + " stage " + std::to_string(s) + " ids differ from one rank");
+            expect(r.res[s].dec_logits.size() == ref.dec_logits.size() &&
+                   std::memcmp(r.res[s].dec_logits.data(), ref.dec_logits.data(), ref.dec_logits.size() * 4U) == 0,
+                   tag + " stage " + std::to_string(s) + " decode logits bytes differ from one rank");
+        }
+        expect(r.state_bytes[0] == 7U * H * 8U && r.state_bytes[1] == 7U * H * 8U,
+               tag + " state bytes: every layer once per rank (sent own + received peer's)");
+        expect(r.head_rows.size() == prompt.size() * H && r.first_rows == r.head_rows, tag + " returned rows differ from the head's");
+        expect(r.tail_bytes[0] == prompt.size() * H * 4U && r.tail_bytes[1] == r.tail_bytes[0], tag + " tail bytes");
+        ++shared;
+    }
+    // a payload damaged in flight once is detected by its checksum and sent again: same ids, one resend counted by the
+    // receiver; damaged on every attempt it is refused by name (and nothing hangs)
+    {
+        const auto r = run_share(m, prompt, width, gen, 3, 1);
+        for (unsigned s = 0; s < 2U; ++s) {
+            expect(r.res[s].error.empty(), "damaged once, stage " + std::to_string(s) + " error: " + r.res[s].error);
+            expect(r.res[s].ids == ref.ids, "damaged once, stage " + std::to_string(s) + " ids differ from one rank");
+        }
+        const auto bad = run_share(m, prompt, width, gen, 3, 1 << 30);
+        expect((bad.res[0].error + bad.res[1].error).find("checksum mismatch") != std::string::npos &&
+                   (bad.res[0].error + bad.res[1].error).find("3 attempts") != std::string::npos,
+               "damaged on every attempt refused: got '" + bad.res[0].error + "' / '" + bad.res[1].error + "'");
+    }
     // pipelined speculation on the first stage: every guess policy gives the one-rank ids and decode logits bytes;
     // the stage-0 counters match the policy; a rewind that keeps the guessed state is detected.
     const unsigned sgen = 12;
@@ -320,13 +463,97 @@ int main() {
     // a stage with another model/plan identity is refused by name (and nothing hangs)
     const auto bad = run_chain(m, prompt, width, gen, {0, 3, 7}, 1U);
     expect(bad[1].error.find("seam header mismatch") != std::string::npos, "identity mismatch refused: got '" + bad[1].error + "'");
+    // Line hello: same version passes; another version or a build without the hello (its first word is the line barrier
+    // word) is refused by name on the new side, and nothing hangs (the refusing side closes the link).
+    {
+        const auto pair_run = [](const std::function<void(const layers::Link&)>& upper,
+                                 const std::function<void(const layers::Link&)>& lower) {
+            Channel ch;   // q[0]: upper -> lower, q[1]: lower -> upper
+            layers::Link to_lower{[&](std::span<const std::byte> b) { ch.send(0, b); }, [&](std::span<std::byte> b) { ch.receive(1, b); }};
+            layers::Link to_upper{[&](std::span<const std::byte> b) { ch.send(1, b); }, [&](std::span<std::byte> b) { ch.receive(0, b); }};
+            std::string err[2];
+            std::thread tu([&] { try { upper(to_lower); } catch (const std::exception& e) { err[0] = e.what(); ch.close(); } });
+            std::thread tl([&] { try { lower(to_upper); } catch (const std::exception& e) { err[1] = e.what(); ch.close(); } });
+            tu.join();
+            tl.join();
+            return std::pair{err[0], err[1]};
+        };
+        const auto hello_up = [](std::uint64_t v) { return [v](const layers::Link& l) { layers::line_hello(nullptr, &l, v); }; };
+        const auto hello_low = [](std::uint64_t v) { return [v](const layers::Link& l) { layers::line_hello(&l, nullptr, v); }; };
+        const auto same = pair_run(hello_up(layers::wire_version), hello_low(layers::wire_version));
+        expect(same.first.empty() && same.second.empty(), "line hello, same version: '" + same.first + "' / '" + same.second + "'");
+        const auto other = pair_run(hello_up(layers::wire_version), hello_low(layers::wire_version + 1U));
+        const std::string want = "wire version mismatch: this build speaks version ";
+        expect(other.first.find(want + std::to_string(layers::wire_version) + ", the downstream peer version " +
+                                std::to_string(layers::wire_version + 1U)) != std::string::npos,
+               "line hello, other version refused by the upper rank: got '" + other.first + "'");
+        expect(other.second.find(want + std::to_string(layers::wire_version + 1U) + ", the upstream peer version " +
+                                 std::to_string(layers::wire_version)) != std::string::npos,
+               "line hello, other version refused by the lower rank: got '" + other.second + "'");
+        const auto old_low = pair_run(hello_up(layers::wire_version), [](const layers::Link& l) { layers::line_barrier(&l, nullptr); });
+        expect(old_low.first.find("downstream peer sent no wire hello") != std::string::npos,
+               "line hello, a lower rank without the hello refused: got '" + old_low.first + "'");
+        const auto old_up = pair_run([](const layers::Link& l) { layers::line_barrier(nullptr, &l); }, hello_low(layers::wire_version));
+        expect(old_up.second.find("upstream peer sent no wire hello") != std::string::npos,
+               "line hello, an upper rank without the hello refused: got '" + old_up.second + "'");
+    }
+    // A damaged message HEADER (length or layer) is a named protocol error before any payload is allocated or read.
+    {
+        const auto relay_error = [](std::uint64_t layer, std::uint64_t length, bool exact) {
+            Channel ch;
+            const std::uint64_t count = 4U, header[5] = {layers::state_magic, layer, length, 0U, 1U};
+            ch.send(0, std::as_bytes(std::span(&count, 1)));
+            ch.send(0, std::as_bytes(std::span(header)));
+            layers::Link from{[&](std::span<const std::byte> b) { ch.send(1, b); }, [&](std::span<std::byte> b) { ch.receive(0, b); }};
+            layers::RelayOps ops;
+            ops.load = [](std::uint32_t, std::span<const std::byte>) {};
+            if (exact) ops.layer_bytes = [](std::uint32_t) { return std::uint64_t{64}; };
+            try {
+                (void)layers::relay_state(layers::Placement{{0, 3, 7}, 1}, 1U, 0U, &from, nullptr, ops);
+            } catch (const std::exception& e) { return std::string(e.what()); }
+            return std::string("no error");
+        };
+        const auto huge = relay_error(0U, std::uint64_t{1} << 40, true);
+        expect(huge.find("message length 1099511627776 bytes for layer 0, expected 64 (protocol error)") != std::string::npos,
+               "relay header with a huge length refused before allocation: got '" + huge + "'");
+        const auto unsized = relay_error(0U, 64U, false);
+        expect(unsized.find("the decoder needs its layer state sizes") != std::string::npos,
+               "a decoder without its layer sizes refused before reading: got '" + unsized + "'");
+        const auto own = relay_error(3U, 64U, true);
+        expect(own.find("message names layer 3 of the receiving stage itself (protocol error)") != std::string::npos,
+               "relay header naming a layer of the decoder's own stage refused before allocation: got '" + own + "'");
+        const auto wide = relay_error((std::uint64_t{1} << 32) + 1U, 64U, true);
+        expect(wide.find("of a 7-layer plan (protocol error)") != std::string::npos,
+               "relay header naming a layer past 32 bits refused: got '" + wide + "'");
+        const auto off = relay_error(1U, 65U, true);
+        expect(off.find("message length 65 bytes for layer 1, expected 64 (protocol error)") != std::string::npos,
+               "relay header with a wrong layer length refused: got '" + off + "'");
+        const auto layer = relay_error(9U, 64U, true);
+        expect(layer.find("message names layer 9 of a 7-layer plan") != std::string::npos,
+               "relay header naming a layer outside the plan refused: got '" + layer + "'");
+        Channel ch;
+        const std::uint64_t header[5] = {layers::tail_magic, 0U, std::uint64_t{1} << 40, 0U, 4U};
+        ch.send(0, std::as_bytes(std::span(header)));
+        layers::Link from{[&](std::span<const std::byte> b) { ch.send(1, b); }, [&](std::span<std::byte> b) { ch.receive(0, b); }};
+        layers::TailOps tail;
+        tail.row_bytes = 16U;
+        tail.load = [](std::uint32_t, const layers::Window&, std::span<const std::byte>) {};
+        std::string got = "no error";
+        try {
+            (void)layers::return_rows(layers::Placement{{0, 3, 7}, 0}, 10U, 4U, nullptr, &from, tail);
+        } catch (const std::exception& e) { got = e.what(); }
+        expect(got.find("tail rows: message does not match the window (window 0, length 1099511627776 bytes, expected 64)") !=
+                   std::string::npos,
+               "tail header with a damaged length refused before allocation: got '" + got + "'");
+    }
     // stage/cut validation
     bool threw = false;
     try { layers::Placement{{0, 3, 3, 7}, 0}.check(); } catch (const std::invalid_argument&) { threw = true; }
     expect(threw, "non-increasing cuts refused");
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     std::printf("PASS: layer pipeline over N ranks (%u plans, N=1..4, ids and logits bytes equal to one rank; "
-                "%u relayed decodes equal; %u pipelined-speculation runs equal, negative control detected)\n",
-                checked, relayed, spec_checked);
+                "%u relayed decodes equal; %u shared-state decodes + tail rows equal; %u pipelined-speculation runs equal, "
+                "negative control detected)\n",
+                checked, relayed, shared, spec_checked);
     return 0;
 }

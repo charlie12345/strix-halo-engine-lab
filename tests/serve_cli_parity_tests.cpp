@@ -13,6 +13,8 @@
 #include <set>
 #include <optional>
 #include <string>
+#include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #if defined(STRIX_PARITY_GLM)
@@ -137,7 +139,7 @@ void glm() {
         gate("glm+profile-receipt", {{"profile", cli.product->json()}}, {{"profile", server.product->json()}}, {});
     }
     // The measured pair executions and each unmatched axis use the same product resolver: the TURBO literal rows
-    // (8,108 / 31,258 tokens, capacity 36,864, 64 generated) and the FAST band row (2,049..8,192 tokens, any capacity,
+    // (8,108 / 31,258 tokens, capacity 36,864, 64 generated) and the FAST band rows (1,024..2,048 and 2,049..8,192 tokens, any capacity,
     // bound to the run's own execution). TURBO nests FAST inside the band. EXACT never selects the bundle.
     rd::ModelFacts complete;
     complete.mtp_present = complete.mtp_complete = true;
@@ -156,6 +158,9 @@ void glm() {
         const bool fast_row = printed.find(" fast=1 applies x1.370 noise 0.100 (GLM pair 8K FAST bundle") != std::string::npos;
         check(fast_row == (on && work.prompt >= 2049 && work.prompt <= 8192),  // TURBO nests the FAST cell in the band
               std::string("GLM FAST band row named in the route line (") + profile + " prompt " + std::to_string(work.prompt) + ")");
+        const bool short_row = printed.find("(GLM pair 1K-2K FAST bundle") != std::string::npos;
+        check(short_row == (on && work.prompt >= 1024 && work.prompt <= 2048),  // the short band row, 1,024..2,048
+              std::string("GLM short FAST band row named in the route line (") + profile + " prompt " + std::to_string(work.prompt) + ")");
         gate("glm", values(sp::from_lines(printed)), values(sp::from_lines(rd::print(serve))), allowed);
         gate("glm+measured-receipt", {{"profile", cli.product->json()}}, {{"profile", serve.product->json()}}, {});
     };
@@ -167,7 +172,8 @@ void glm() {
     verify({false, 8108, 36864, 8192, 1, 64}, none, false);
     verify({true, 4096, 36864, 8192, 1, 64}, none, true);    // FAST band
     verify({true, 8109, 36864, 8192, 1, 64}, none, true);    // FAST band
-    verify({true, 2048, 36864, 8192, 1, 64}, none, false);
+    verify({true, 2048, 36864, 8192, 1, 64}, none, true);    // short FAST band (1,024..2,048)
+    verify({true, 1023, 36864, 8192, 1, 64}, none, false);
     verify({true, 8193, 36864, 8192, 1, 64}, none, false);
     verify({true, 31258, 32768, 8192, 1, 64}, none, false);  // literal TURBO key: capacity
     verify({true, 31259, 36864, 8192, 1, 64}, none, false);
@@ -180,10 +186,10 @@ void glm() {
         return std::string_view(key) == "STRIX_GLM_PF_ATTN_WMMA_T" ? "32" : nullptr;
     }, false);
     // FAST: the band row alone decides the prompt (capacity and generated are not keys of a band receipt).
-    for (const std::uint64_t prompt : {2049ULL, 4096ULL, 8108ULL, 8192ULL})
+    for (const std::uint64_t prompt : {1024ULL, 2048ULL, 2049ULL, 4096ULL, 8108ULL, 8192ULL})
         for (const std::uint64_t capacity : {16384ULL, 36864ULL})
             verify_profile("fast", {true, prompt, capacity, 8192, 1, 512}, none, true);
-    for (const std::uint64_t prompt : {1ULL, 2048ULL, 8193ULL, 31258ULL})  // 32K stays TURBO
+    for (const std::uint64_t prompt : {1ULL, 1023ULL, 8193ULL, 31258ULL})  // 32K stays TURBO
         verify_profile("fast", {true, prompt, 36864, 8192, 1, 64}, none, false);
     verify_profile("fast", {false, 8192, 36864, 8192, 1, 64}, none, false);  // pair not voted ready
     verify_profile("fast", {true, 8192, 36864, 4096, 1, 64}, none, false);   // unmeasured chunk
@@ -219,6 +225,11 @@ void glm() {
     check(!rd::select_prefill_wmma(c1_turbo, c1_turbo_config, none,
               rd::serve_prefill_work(true, true, 31258, 36864, 8192, 64, true)),
           "GLM serve does not select the CLI-only 32K TURBO receipt");
+    // The served prompt gate is the FAST band row's own upper edge (data), not a literal: today 8,192.
+    static_assert(rd::kPrefillBandMaxPrompt == 8192, "GLM FAST pf_wmma band edge (gate v2 windows of 8,192 tokens)");
+    check(rd::serve_prefill_work(true, true, rd::kPrefillBandMaxPrompt, 36864, 8192, 64, true).pair_ready &&
+              !rd::serve_prefill_work(true, true, rd::kPrefillBandMaxPrompt + 1, 36864, 8192, 64, true).pair_ready,
+          "GLM serve asks the ladder up to the FAST band edge and not beyond");
     // Scratch storage (full arena vs routed) is spelled in the execution key: the band row binds either (the gate and
     // the FAST timing ran on the full arena), the TURBO literal key names routed scratch only.
     verify_profile("fast", {true, 8192, 8448, 8192, 1, 64, false}, none, true);
@@ -472,8 +483,8 @@ void ds41() {
         const auto server = request(pd::App::serve, "1", prompt);
         gate("ds41+prompt+" + std::to_string(prompt), cli, server, {});
         const bool banded = prompt >= 4096U && prompt <= 32768U, replay = banded && prompt <= 8192U;
-        check(cli.at("d1_prefill") == (banded ? "1" : "0") && cli.at("decoder_replay") == (replay ? "256" : "0"),
-              "ds41: both ranks use D1 inside the measured bands, TURBO R256 only up to 8,192");
+        check(cli.at("d1_prefill") == (banded ? "1" : "0") && cli.at("decoder_replay") == (replay ? "512" : "0"),
+              "ds41: both ranks use D1 inside the measured bands, R512 only up to 8,192");
     }
     // The default server (eight slots, session RAM, no disk tier) sends a fresh whole text prompt to the same device
     // admission as the CLI; the slot count is not a scope. Pieces, image rows and disk tiers keep the previous route.
@@ -494,10 +505,10 @@ void ds41() {
 
     // The options each entry really builds. The pair CLI (apps/deepseek41_prefill_main.cpp options()): positions =
     // the prompt, no row cap, no drafter seed. The default server (slot_prefill_options): positions = --context, rows =
-    // the auto capacity, and DSpark's 128-row seed. Same request -> same D1 / R256 cells (the seed rides on R256:
-    // plan_bounded_replay computes the same rows for any seed <= R). Since the held-out re-score (gate_r) R256 is a
-    // TURBO row up to 8,192 only, so a seeded server request without R256 (FAST, TURBO above 8,192) declines D1 and
-    // keeps the previous prefill route while the CLI runs D1: a known served/CLI gap until a seeded D1 receipt exists.
+    // the auto capacity, and DSpark's 128-row seed. Same request -> same D1 / replay cells (the seed rides on the
+    // replay: plan_bounded_replay computes the same rows for any seed <= R). R=512 is a FAST row up to 8,192 (held-out
+    // gate v2), so FAST and TURBO seeded server requests there resolve the CLI cells; above 8,192 (no replay
+    // row yet) the seeded server declines D1 and keeps the previous prefill route while the CLI runs D1.
     const auto cells = [&](const ds::PrefillOptions& o, const char* rank, std::uint64_t prompt, pd::App app,
                            const char* profile) -> sp::Config {
         const auto startup = pd::resolve(app, {model, "--rank", rank,
@@ -506,6 +517,10 @@ void ds41() {
         const auto result = pd::resolve_prefill_profile(*startup.profile, o, prompt, 1U,
                                                        "gfx1151|AMD Radeon 8060S Graphics|fixture", true);
         if (!result) return {{"d1_prefill", "declined"}, {"decoder_replay", "declined"}};
+        // the bound the served admission and the seed rule take (pd::resolved_replay_rows) is the resolved cell's value
+        const auto value = std::string(result->find("decoder_replay")->value);
+        if (pd::resolved_replay_rows(*result) != (value == "0" ? 0U : static_cast<std::uint32_t>(std::stoul(value))))
+            return {{"d1_prefill", "replay bound mismatch"}, {"decoder_replay", value}};
         return {{"d1_prefill", result->find("d1_prefill")->value}, {"decoder_replay", result->find("decoder_replay")->value},
                 {"profile.receipt", result->json()}};
     };
@@ -522,29 +537,50 @@ void ds41() {
             const auto cli = cells(cli_o, "0", prompt, pd::App::prefill, profile);
             const auto server = cells(serve_o, "1", prompt, pd::App::serve, profile);
             const bool fast = std::string_view(profile) != "exact", banded = fast && prompt >= 4096U;
-            const bool replay = banded && std::string_view(profile) == "turbo" && prompt <= 8192U;
+            const bool replay = banded && prompt <= 8192U;
             if (banded && !replay) {
                 check(server.at("d1_prefill") == "declined" && cli.at("d1_prefill") == "1" && cli.at("decoder_replay") == "0",
-                      std::string("ds41: without R256 the seeded server declines D1 (") + profile + ")");
+                      std::string("ds41: without the replay the seeded server declines D1 (") + profile + ")");
                 continue;
             }
             gate(std::string("ds41+request+") + profile + "+" + std::to_string(prompt), cli, server, {});
-            check(server.at("d1_prefill") == (banded ? "1" : "0") && server.at("decoder_replay") == (replay ? "256" : "0"),
+            check(server.at("d1_prefill") == (banded ? "1" : "0") && server.at("decoder_replay") == (replay ? "512" : "0"),
                   std::string("ds41: the seeded server request resolves the CLI cells (") + profile + ")");
         }
     {
         ds::PrefillOptions seeded;
         seeded.world = 2;
         seeded.max_positions = 36864;
-        seeded.draft_rows = 257;  // a seed wider than R: the bounded plan refuses it, so the band declines
+        seeded.draft_rows = 513;  // a seed wider than R: the bounded plan refuses it, so the band declines
         check(cells(seeded, "0", 8192U, pd::App::serve, "fast").at("d1_prefill") == "declined",
               "ds41: a seed wider than the replay bound declines D1");
+        // The seed bound is the resolved R (512 in the FAST 8K band), not the smallest qualified bound (256).
+        for (const std::uint32_t seed : {255U, 256U, 257U, 384U, 512U}) {
+            seeded.draft_rows = seed;
+            const auto fast8k = cells(seeded, "0", 8192U, pd::App::serve, "fast");
+            check(fast8k.at("d1_prefill") == "1" && fast8k.at("decoder_replay") == "512",
+                  "ds41: a seed of " + std::to_string(seed) + " rows <= R = 512 rides on the FAST replay");
+        }
+        // The reader takes only bounds the run executes: 0 (off) or a multiple of 128 of at least the qualified floor.
+        check(pd::replay_rows_from_value("0") == 0U && pd::replay_rows_from_value("") == 0U &&
+                  pd::replay_rows_from_value("256") == 256U && pd::replay_rows_from_value("512") == 512U &&
+                  pd::replay_rows_from_value("1024") == 1024U,
+              "ds41: the replay reader returns the executable bounds");
+        for (const char* bad : {"128", "300", "-256", "512x", "fast"}) {
+            bool refused = false;
+            try {
+                static_cast<void>(pd::replay_rows_from_value(bad));
+            } catch (const std::invalid_argument& e) {
+                refused = std::string_view(e.what()).find("ds41-decoder-replay-bounded-v1") != std::string_view::npos;
+            }
+            check(refused, std::string("ds41: the replay reader refuses a bound the run cannot execute: ") + bad);
+        }
         for (const std::uint64_t total : {std::uint64_t{8192}, std::uint64_t{32768}}) {
             strix::ds41::SuffixReplayGeometry g0, g1;
             g0.draft_rows = 0;
             g1.draft_rows = 128;
-            const auto a = strix::ds41::plan_bounded_replay(g0, 0U, total, 256U);
-            const auto b = strix::ds41::plan_bounded_replay(g1, 0U, total, 256U);
+            const auto a = strix::ds41::plan_bounded_replay(g0, 0U, total, 512U);
+            const auto b = strix::ds41::plan_bounded_replay(g1, 0U, total, 512U);
             bool same = a.replay_row_layers == b.replay_row_layers && a.layers.size() == b.layers.size();
             for (std::size_t i = 0; same && i < a.layers.size(); ++i)
                 same = a.layers[i].out_begin == b.layers[i].out_begin && a.layers[i].kv_begin == b.layers[i].kv_begin;

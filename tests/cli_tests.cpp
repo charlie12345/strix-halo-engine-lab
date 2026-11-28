@@ -424,6 +424,15 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
     req.profile = Name::fast;
     req.args = {"--kv=fp8"};
     refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "requires the turbo preset");
+    req.profile = Name::standard;
+    req.print_effective_config = false;
+    const auto exact_preset = resolve(req, entries, matrix, probes, "bin", exists, &dense);
+    require(exact_preset.args == std::vector<std::string>{"--model", "model.gguf", "--kv=fp8", "--profile", "exact"},
+            "launcher forwards EXACT and the KV selector for refusal with the engine's effective receipt");
+    req.args = {"--decode-attn8", "off"};
+    const auto exact_off = resolve(req, entries, matrix, probes, "bin", exists, &dense);
+    require(exact_off.args == std::vector<std::string>{"--model", "model.gguf", "--decode-attn8", "off", "--profile", "exact"},
+            "launcher forwards an explicit native attention selection under EXACT");
     req.args = {"--profile", "exact"};
     refuses([&] { (void)resolve(req, entries, matrix, probes, "bin", exists, &dense); }, "before engine arguments");
     refuses([] { (void)parse({"run", "qwen3.8-27b", "--profile", "quality"}); }, "requires exact, fast or turbo");
@@ -612,6 +621,27 @@ void readme_commands_resolve(const fs::path& readme, const fs::path& data) {
 // The strix run command of the Qwen flash-next entry resolves, in every tier, to engine arguments that carry only
 // route-neutral options after the asset and the prompt, so the engine's shared default (MTP drafter) is not owned away.
 void qwen_launcher_keeps_speculation_default(const fs::path& data) {
+    namespace profile = strix::profile;
+    const auto flash = strix::model_description::load((data / "models/qwen3.8-flash-next.toml").string());
+    const auto registry = strix::model_registry::load((data / "models/registry.toml").string());
+    const auto matrix = strix::support::load(data / "support/matrix.toml");
+    Probes route_probes;
+    route_probes.nodes_open = true;
+    const auto check_route = [&](std::vector<std::string> args, std::optional<profile::Name> tier) {
+        const auto command = resolve(parse(args), registry, matrix, route_probes, "test bin",
+                                     [](const auto&) { return true; }, &flash);
+        const auto word = profile::native_profile_option(command.args);
+        require(command.native_resolution && !command.preset &&
+                    (tier ? word == profile::tier_word(*tier) : !word),
+                "HIP launcher forwards EXACT and preserves the native omitted tier");
+    };
+    check_route({"run", "qwen3.8-flash-next", "--asset", "MODEL.gguf", "--backend", "hip"}, {});
+    check_route({"run", "qwen3.8-flash-next", "--asset", "MODEL.gguf", "--backend", "hip", "--profile", "exact"},
+                profile::Name::standard);
+    require(profile::model_default_tier(flash) == profile::Name::fast &&
+            !profile::uses_native_resolution(flash, "cuda", {}) &&
+            !profile::uses_native_resolution(flash, "hip", profile::Name::fast),
+            "the migration is scoped to the verified HIP entry points");
     for (const std::string tier : {"exact", "fast", "turbo"}) {
         Probes probes;
         probes.nodes_open = true;

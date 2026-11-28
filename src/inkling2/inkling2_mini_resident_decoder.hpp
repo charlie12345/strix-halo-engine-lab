@@ -21,6 +21,7 @@
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
 #include "strix/serve/cohort_passes.hpp"
+#include "strix/serve/prefill_group.hpp"
 #include "strix/session/embed_splice_device.hpp"
 #include "strix/session/linear_verify_step.hpp"
 
@@ -215,7 +216,7 @@ public:
     [[nodiscard]] std::uint64_t lanes_picks() const noexcept { return lanes_picks_; }
     [[nodiscard]] unsigned lanes_pick_capacity() const noexcept {
 #if defined(__HIPCC__)
-        return verify_lanes_pick_ && screen_ ? screen_->max_lanes() : 0U;
+        return verify_lanes_pick_ ? verify_screen_lanes() : 0U;
 #else
         return 0U;
 #endif
@@ -378,6 +379,120 @@ public:
         last_logit_rows_ = 1U;
         return token;
     }
+    // Grouped emits-first prefill (serve::FixedKvCohort::prefill_group, serve::plan_prefill_group): whole waiting prompts
+    // run their layers as ONE work, so every dense matrix and routed expert is read once for all members' rows.
+    //  - A member is exactly one solo call chunk (rows <= the call chunk, no tail rule splits it) and has more than
+    //    kMiniGroupSoloRows rows (its solo pass takes the tile body, as the group's pass does); route class 1 = alone.
+    //  - Members are packed whole, in order, into passes of at most one call chunk (mini_group_pass_members); each pass is
+    //    one packed forward (the decode lanes' append_batch) of kind prefill. Each member's attention stage runs as its own
+    //    solo chunk (MiniResidentBackend::attention_batch), its convolution histories and KV rows are its own, and its
+    //    first id comes from the one-row head of its last row, the head its solo call's last chunk runs (screened pick
+    //    where that one is screened, else the full softcap head + greedy), read after the pass completed.
+    //  - Score row r of the call is member r's last row (read_slot_logits(r)); a screened pick defers it like a lone pick.
+    //  - Refused (capacity members 0) wherever a prompt row is not the EXACT BF16 row of the solo call: a per-chunk low-bit
+    //    arithmetic choice, compact prompt weights, the integer prefill class, a narrow expert image, DSpark taps, the
+    //    held-back route; and always off the HIP backend (the CUDA prefill keeps its own route).
+    // Route class 2: a whole prompt of `rows` rows whose served prompt policy selects the integer prefill class (TURBO
+    // inside its band). Its solo call runs that class, so it is never grouped (rejected_class_mask): a group member is
+    // always an EXACT BF16 row, and the policy each member applies before the group call cannot turn the class on.
+    void set_prompt_integer_rows(std::function<bool(std::uint64_t rows)> rule) { prompt_integer_rows_ = std::move(rule); }
+    [[nodiscard]] std::uint32_t prefill_route_class(std::uint64_t rows) const {
+        return mini_group_route_class(rows) | (prompt_integer_rows_ && prompt_integer_rows_(rows) ? 2U : 0U);
+    }
+    [[nodiscard]] serve::PrefillGroupCapacity prefill_group_capacity() const noexcept {
+        serve::PrefillGroupCapacity capacity;
+        if (const char* why = group_refusal()) {
+            capacity.members = 0U;
+            capacity.reason = why;
+            return capacity;
+        }
+        capacity.members = decode_rows_;
+        capacity.rows = std::uint64_t{kMiniGroupPasses} * prefill_rows_;
+        capacity.member_rows = prefill_rows_;
+        capacity.rejected_class_mask = 1U | 2U;  // mini_group_route_class: alone only; 2: the integer prefill class
+        capacity.passes = kMiniGroupPasses;
+        capacity.reason = "bf16-tile-rows";
+        return capacity;
+    }
+    void prefill_group_first(std::span<const unsigned> slots, std::span<const std::span<const unsigned>> prompts,
+                             std::span<unsigned> tops) {
+#if defined(__HIPCC__)
+        if (const char* why = group_refusal())
+            throw std::logic_error(std::string("Inkling 2 Mini: grouped prefill refused: ") + why);
+        const std::size_t members = slots.size();
+        if (members < 2U || members != prompts.size() || members != tops.size() || members > decode_rows_)
+            throw std::invalid_argument("Inkling 2 Mini: invalid prompt group size");
+        std::vector<std::size_t> rows(members);
+        for (std::size_t m = 0; m < members; ++m) {
+            rows[m] = prompts[m].size();
+            if (rows[m] <= kMiniGroupSoloRows || rows[m] > prefill_rows_)
+                throw std::logic_error("Inkling 2 Mini: a group member must be one solo chunk of more than the tight rows");
+            if (std::ranges::find(slots.first(m), slots[m]) != slots.begin() + static_cast<std::ptrdiff_t>(m))
+                throw std::invalid_argument("Inkling 2 Mini: duplicate slot in a prompt group");
+        }
+        const auto passes = mini_group_pass_members(rows, prefill_rows_);
+        for (std::size_t m = 0; m < members; ++m) {
+            reset_slot(slots[m]);
+            validate_inputs(slots_.at(slots[m])->state(), prompts[m], {});
+        }
+        last_logit_rows_ = 0U;
+        pending_scores_ = {};  // every forward below rewrites hidden_ (a lone prefill drops it the same way)
+        if (!group_heads_) group_heads_.emplace(std::size_t{decode_rows_} * kHiddenWidth);
+        backend_.set_step_token(std::nullopt);
+        // The prompt head is the lone prefill's: pick_next on the call's last row, no host scores, kind prefill.
+        const bool screened = !backend_.lowbit_applies(MiniAppendKind::prefill, kMiniGroupSoloRows + 1U) &&
+            mini_screened_pick(head_.reason, screen_.has_value(), MiniAppendKind::prefill, true, false, false);
+        std::size_t first = 0;
+        for (const auto count : passes) {
+            groups_.clear();
+            pass_ids_.clear();
+            unsigned total = 0;
+            for (std::size_t m = first; m < first + count; ++m) {
+                auto& state = slots_.at(slots[m])->state();
+                groups_.push_back({&state, {state.committed(), static_cast<unsigned>(rows[m])}});
+                pass_ids_.insert(pass_ids_.end(), prompts[m].begin(), prompts[m].end());
+                total += static_cast<unsigned>(rows[m]);
+            }
+            const auto embeddings = embeddings_.span().first(std::size_t{total} * kHiddenWidth);
+            const auto hidden = hidden_.span().first(embeddings.size());
+            try {
+                MiniResidentForward forward(backend_, workspace());
+                forward.append_batch(groups_, total, embeddings, hidden, [&] {
+                    embed(pass_ids_, embeddings, total, MiniAppendKind::prefill);
+                }, [](MiniConstRows) {}, [] {});
+            } catch (...) {
+                backend_.abandon_capture();
+                throw;
+            }
+            std::size_t at = 0;
+            for (std::size_t m = first; m < first + count; ++m) {
+                at += rows[m];
+                const float* input = hidden_.data() + (at - 1U) * kHiddenWidth;
+                mini_gpu::copy(group_heads_->data() + m * kHiddenWidth, input, std::size_t{kHiddenWidth} * sizeof(float),
+                               mini_gpu::device_to_device, stream_.get());
+                if (screened) {
+                    greedy_.enqueue_produced([&](HipGreedyRowsReply* reply) {
+                        backend_.check(screen_->enqueue(input, reply, stream_.get()));
+                    });
+                    note_screened_pick();
+                } else {
+                    const auto row_scores = logits_.span().subspan(
+                        ::strix::head::logit_row_offset(static_cast<unsigned>(m), kLogitPitch), kOutputVocabulary);
+                    project_head(input, row_scores, true);
+                    greedy_.enqueue(row_scores, stream_.get());
+                }
+                mini_gpu::synchronize(stream_.get());
+                tops[m] = checked_token(greedy_, 0U);
+            }
+            first += count;
+        }
+        last_logit_rows_ = static_cast<unsigned>(members);
+        if (screened) pending_scores_ = {group_heads_->data(), static_cast<unsigned>(members), logits_.data()};
+#else
+        (void)slots, (void)prompts, (void)tops;
+        throw std::logic_error("Inkling 2 Mini: grouped prompt prefill is a HIP route");
+#endif
+    }
     // Admitted tail capacity (serve::CohortBackend::prompt_tail_rows), the cut rule of served pieces and the first
     // chunk of one prefill call (prompt_piece_rule / prompt_call_chunk).
     [[nodiscard]] unsigned prefill_tail_rows() const noexcept { return tail_rows_; }
@@ -483,7 +598,7 @@ public:
         // Served route lever (the decoder was built with it): balanced packed passes, decode_slots_served below. Without
         // the lever every cohort takes the incumbent body that follows.
         if (served_cli_route_) {
-            decode_slots_served(slots, ids, top);
+            decode_slots_served(slots, ids, top, reads_scores);
             return;
         }
 #endif
@@ -531,7 +646,7 @@ public:
 #if defined(__HIPCC__)
         // Cohort weights follow decode admission even when the packed kernels use verify geometry.
         const bool lanes_screened = !backend_.lowbit_applies(MiniAppendKind::decode, rows) &&
-                                    verify_lanes_pick_ && !reads_scores && rows > 1U && rows <= screen_->max_lanes();
+                                    verify_lanes_pick_ && !reads_scores && rows > 1U && rows <= verify_screen_lanes();
 #endif
         select_lowbit_cohort(groups_, rows);
         MiniResidentForward forward(backend_, workspace());
@@ -584,7 +699,8 @@ public:
     // lane's bits do not depend on the cohort width. The whole cohort is checked before the first pass writes;
     // serve::run_cohort_passes copies the input ids before any pass (ids and top may overlap) and publishes the picks
     // only after every pass finished: a pass that throws retires every lane of the cohort and top stays untouched.
-    void decode_slots_served(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top) {
+    void decode_slots_served(std::span<const unsigned> slots, std::span<const unsigned> ids, std::span<unsigned> top,
+                             bool reads_scores) {
         if (slots.empty() || slots.size() != ids.size() || slots.size() != top.size() || slots.size() > decode_rows_)
             throw std::invalid_argument("Inkling 2 Mini: invalid decode batch size");
 
@@ -608,6 +724,7 @@ public:
         // Lane r's head scores land at logit row r for any pass split.
         const auto lanes = static_cast<unsigned>(ids.size());
         MiniResidentSessionState::require_batch(groups_);
+        bool screened = false;
         ::strix::serve::run_cohort_passes(ids, top, mini_cohort_pass_cap(backend_.packed_decode(), kCohortPassRows),
                                           pass_ids_, pass_picks_,
                                           [&](unsigned first, unsigned rows, std::span<const unsigned> pass_ids,
@@ -620,12 +737,23 @@ public:
             const auto kind = rows <= kMaxVerifyRows ? MiniAppendKind::verify : MiniAppendKind::decode;
             const auto groups = std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows);
             select_lowbit_cohort(groups, lanes);
+            // Head (mini_served_pass_screened): a one-pass cohort whose scores nobody reads picks through the lanes
+            // form of the EXACT screened head; its score rows are recomputed on a read (pending_scores_ below).
+            screened = mini_served_pass_screened(served_lanes_pick_, reads_scores,
+                                                 backend_.lowbit_applies(MiniAppendKind::decode, rows), rows, lanes,
+                                                 screen_ ? screen_->max_lanes() : 0U);
             MiniResidentForward forward(backend_, workspace());
             const auto pass = [&] {
                 forward.append_batch(groups, rows,
                                      embeddings, hidden, [&] {
                     embed(pass_ids, embeddings, rows, kind, lanes);
                 }, [&](MiniConstRows output) {
+                    if (screened) {
+                        greedy_.enqueue_produced_rows(rows, [&](HipGreedyRowsReply* replies) {
+                            return screen_->enqueue_lanes(output.data(), rows, kHiddenWidth, replies, stream_.get());
+                        });
+                        return;
+                    }
                     project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
                     greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
                 }, [&] {
@@ -651,6 +779,13 @@ public:
             for (const auto& group : groups_) group.state->poison();
             last_logit_rows_ = 0U;
         });
+        if (screened) {
+            // The one pass's head inputs stay in hidden_ until the next forward (materialize_scores reads them).
+            pending_scores_ = {hidden_.data(), lanes, logits_.data()};
+            ++lanes_picks_;
+            if (served_screened_passes_++ == 0U)
+                std::cerr << "Inkling HIP served cohort head screened lanes=" << lanes << '\n';
+        }
         last_logit_rows_ = lanes;
     }
 #endif
@@ -812,6 +947,10 @@ public:
         const bool effective = level != 0U && max_verify_rows() > 1U;
         const bool lanes_pick = effective && level >= 2U && admit_lanes_pick();
         verify_lanes_pick_ = lanes_pick;
+        // Served route (decode_slots_served): its cohort passes pick through the lanes form whenever the decoder has
+        // its BF16 screen (the HIP binding of the screened head, on unless STRIX_SCREENED_HEAD=0), as the CUDA cohort
+        // does; this lever (verify rows) governs verify windows only.
+        served_lanes_pick_ = served_cli_route_ && (lanes_pick || admit_lanes_pick());
 #else
         static_cast<void>(level);
         const bool effective = false;
@@ -1326,7 +1465,7 @@ private:
         // Level 2 keeps the full single-row head for announced score reads and screens unread verify windows in lanes.
         need_scores = need_scores || (verify_lanes_pick_ && scores_read);
         const bool lanes_screened = !lowbit && verify_lanes_pick_ && pick_next && multi_pick && !need_scores &&
-                                    verify_top.size() <= screen_->max_lanes();
+                                    verify_top.size() <= verify_screen_lanes();
 #else
         // A CUDA verify window whose scores nobody reads (no host rows, no announced read) picks every row through the
         // lanes form of the EXACT screened head (cuda/core/head_screened.cuh: lane l is the R=1 head of its row, the
@@ -1528,19 +1667,47 @@ private:
 
     // Verify rows level 2: rebuild the screened head with as many lanes as one pass-1 group holds on this device (the
     // plane is read once for all of them, screened_head_plan::pass1_lanes against the shared memory of the device the
-    // screen launches on). Declined (the one-row screen kept) without a screened head or with fewer than two lanes.
+    // screen launches on); the served route sizes it for its cohort width (mini_screen_lanes: its pass-1 groups read the
+    // plane rows together). Declined (the one-row screen kept) without a screened head or with fewer than two lanes.
     bool admit_lanes_pick() {
         if (!screen_) return false;
         int device = 0;
         mini_gpu::check(hipGetDevice(&device), "query the Mini head device");
-        const auto lanes = core::hip_screened_head::pass1_lanes(kHiddenWidth, kMaxVerifyRows, device);
+        const auto group = core::hip_screened_head::pass1_lanes(kHiddenWidth, kMaxVerifyRows, device);
+        const auto lanes = mini_screen_lanes(served_cli_route_, served_head_wide_, group,
+                                             std::min(decode_rows_, kCohortPassRows), core::screened_head_plan::kMaxLanes);
         if (lanes < 2U) return false;
         emplace_screen(lanes);
-        if (screen_) return true;
+        if (screen_) {
+            screen_group_lanes_ = std::min(group, lanes);
+            return true;
+        }
         emplace_screen(1U);
         return false;
     }
+
+    // Rows a verify window (or the incumbent cohort body) screens through the lanes pick: one pass-1 group, as before the
+    // served screen was sized for the cohort width.
+    [[nodiscard]] unsigned verify_screen_lanes() const noexcept {
+        return screen_ ? std::min(screen_->max_lanes(), screen_group_lanes_) : 0U;
+    }
 #endif
+
+    // Why grouped prompt prefill is off for this decoder (nullptr: it may group); see prefill_group_first.
+    [[nodiscard]] const char* group_refusal() const noexcept {
+#if defined(__HIPCC__)
+        if (!served_cli_route_ || !prefill_emits_first()) return "held-back-route";
+        if (decode_rows_ < 2U) return "one-slot";
+        if (lowbit_timing_) return "per-chunk-lowbit-arithmetic";
+        if (backend_.lowbit_applies(MiniAppendKind::prefill, kMiniGroupSoloRows + 1U)) return "compact-prompt-weights";
+        if (backend_.prefill_iu4_selected()) return "integer-prefill-class";
+        if (weight_plan_.narrow_bytes() != 0U) return "narrow-expert-image";
+        if (!draft_taps_.span().empty()) return "draft-taps";
+        return nullptr;
+#else
+        return "hip-only";
+#endif
+    }
 
     // Tail rows one prefill call of `rows` rows absorbs (mini_call_tail_rows within the admitted capacity).
     [[nodiscard]] unsigned call_tail_rows(std::size_t rows) const noexcept {
@@ -1609,7 +1776,9 @@ private:
     std::vector<MiniResidentAppendGroup> groups_;
     std::vector<unsigned> pass_ids_;    // decode_slots input snapshot
     std::vector<unsigned> pass_picks_;  // decode_slots picks, published after the last pass
+    std::optional<mini_gpu::Buffer<float>> group_heads_;  // the last row of each member of the last prompt group
     bool served_cli_route_;             // served route lever, fixed at construction (admits_served_route)
+    std::function<bool(std::uint64_t)> prompt_integer_rows_;  // set_prompt_integer_rows (empty: no integer class)
     bool calibrated_decode_;            // calibrated decode-only image bound (BF16 prefill rows, compact decode rows)
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;
@@ -1654,13 +1823,19 @@ private:
     bool window_programs_{false};  // set_window_programs: the owner decides (the CUDA CLI: on for the EXACT levers)
 #endif
 #if defined(__HIPCC__)
+    bool served_lanes_pick_{false};  // served cohort passes may pick through the lanes screen (set_verify_rows)
     bool verify_lanes_pick_{false};  // verify rows level 2 admitted (set_verify_rows): lanes screened picks
+    unsigned screen_group_lanes_{0};  // lanes one pass-1 group stages (admit_lanes_pick): the verify windows' cap
+    // Served cohort head (mini_screen_lanes): the screen sized for the cohort width (default on);
+    // STRIX_INKLING_SERVED_HEAD_WIDE=0 keeps it at one pass-1 group (wider served passes take the pitched rows head).
+    const bool served_head_wide_{strix::envcfg::flag("STRIX_INKLING_SERVED_HEAD_WIDE", true)};
 #endif
     bool screened_graph_{false};
     MiniHead head_{};                  // the effective greedy head (set_screened_head / release_screen)
     std::uint64_t screened_picks_{};  // greedy picks that ran screened (note_screened_pick)
     std::uint64_t lanes_picks_{};     // multi-row picks through the lanes screened head (lanes_picks)
     std::uint64_t served_lane_passes_{};  // served cohort passes run in lane mode (mini_served_pass_lanes)
+    std::uint64_t served_screened_passes_{};  // served passes picked by the screened lanes head
     std::array<unsigned, kMaxVerifyRows> verify_ids_{}, verify_top_{};
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};

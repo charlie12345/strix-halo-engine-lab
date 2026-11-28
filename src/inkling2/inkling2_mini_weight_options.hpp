@@ -34,6 +34,7 @@ struct MiniWeightOptions {
     // The shared policy of an explicit qualification arm (--qualify-weights KEY); nullptr: none.
     const weight::WeightLoadPolicy* qualify{};
     bool qualify_decode_only{};
+    bool require_decode_pack{};  // explicit --qualify-decode-weights, never a profile default
     bool lowbit_turbo{};  // resolved from the shared profile lever
 };
 
@@ -221,10 +222,12 @@ bool parse_mini_weight_option(MiniWeightOptions& options, std::string_view argum
         options.tier.cli.emplace_back(std::string(spec::kBlockDraftLeverName), value());
     } else if (native && argument == "--qualify-q8") {
         options.qualify_decode_only = false;
+        options.require_decode_pack = false;
         options.qualify_q8 = true;
         options.qualify = &weight::kAttentionHeadQ8Policy;
     } else if (native && (argument == "--qualify-weights" || argument == "--qualify-decode-weights")) {
         options.qualify_decode_only = argument == "--qualify-decode-weights";
+        options.require_decode_pack = options.qualify_decode_only;
         const std::string_view key(value());
         options.qualify = weight::find_weight_load_policy(key, kMiniQualifiablePolicies);
         const bool strixpack = options.qualify && weight::is_strixpack_storage(options.qualify->target);
@@ -270,8 +273,8 @@ inline bool mini_moe_w4a4(const profile::Resolution& tier) {
 }
 
 // Resolved state of the prepared-attention round fold (HIP: the stage's plain BF16 rounds fold into their producers,
-// same bits; off unless STRIX_INK_PREPARED_ROUND_FOLD=1 selects it, in any profile). The serial CLI and the server
-// read it from the same resolution.
+// same bits; on in every profile, STRIX_INK_PREPARED_ROUND_FOLD=0 keeps the separate rounds). The serial CLI and the
+// server read it from the same resolution.
 inline bool mini_prepared_round_fold(const profile::Resolution& tier) {
     const auto* entry = tier.find(kMiniPreparedRoundFold);
     if (entry == nullptr || entry->value == "0") return false;
@@ -482,11 +485,12 @@ inline const char* mini_verify_rows_name(unsigned active, unsigned selected) {
     return selected >= kMiniVerifyLanesPick ? "on+lanes-pick-declined" : "on";
 }
 // The level a server runs of the decoder's admitted one (its startup receipt): the server stages no verify window, so
-// its lanes pick screens only cohorts of two or more distinct admitted slots on the incumbent served route. The served
-// CLI route (packed passes, decode_slots_served) and a one-slot server run level 1 (on+lanes-pick-declined); a one-slot
-// command line keeps the decoder's level (its verify windows screen through the lanes pick).
-inline unsigned mini_served_verify_rows(unsigned active, bool served_cli_route, std::size_t admitted_slots) {
-    return active >= kMiniVerifyLanesPick && (served_cli_route || admitted_slots < 2U) ? 1U : active;
+// its lanes pick screens only cohorts of two or more distinct admitted slots (the incumbent served route, and the
+// served CLI route's one-pass cohorts, mini_served_pass_screened). A one-slot server runs level 1
+// (on+lanes-pick-declined); a one-slot command line keeps the decoder's level (its verify windows screen through the
+// lanes pick).
+inline unsigned mini_served_verify_rows(unsigned active, std::size_t admitted_slots) {
+    return active >= kMiniVerifyLanesPick && admitted_slots < 2U ? 1U : active;
 }
 
 // Verify window programs (CUDA, MiniResidentDecoder::set_window_programs): default on for the levers the device identity
@@ -810,6 +814,7 @@ inline weight::WeightLoadPlan mini_plain_weight_fallback(profile::Name tier, con
     incumbent.qualify = nullptr;
     incumbent.qualify_q8 = false;
     incumbent.qualify_decode_only = false;
+    incumbent.require_decode_pack = false;
     incumbent.lowbit_turbo = false;
     auto plan = resolve_mini_resident_weight_load(tier, incumbent, scope, extent);
     plan.reason = reason;
@@ -832,8 +837,8 @@ inline std::uint32_t mini_weight_slot_capacity(std::uint64_t free, std::uint64_t
     return slots;
 }
 
-// Keep the admitted handle through staging and verification. Destroy any failed image before
-// rebuilding the incumbent, and publish the fallback plan with the weights that actually loaded.
+// Keep the admitted handle through staging and verification. For profile-selected weights, destroy any failed
+// image before rebuilding the incumbent, and publish the fallback plan with the weights that actually loaded.
 template <class Load>
 auto load_mini_weight_pack(weight::WeightLoadPlan& plan, profile::Name tier, const MiniWeightOptions& options,
                            const weight::WeightLoadScope& incumbent_scope, weight::WeightLoadExtent extent,
@@ -848,6 +853,7 @@ auto load_mini_weight_pack(weight::WeightLoadPlan& plan, profile::Name tier, con
         if (const auto checked = rows.admitted->verify_identity(); !checked) throw std::runtime_error(checked.detail);
         return loaded;
     } catch (const std::runtime_error& error) {
+        if (options.require_decode_pack) throw;
         if (options.qualify == &kMiniSp4HeadPolicy)
             (void)profile::all_on::engaged("STRIX_INK_LOWBIT_HEAD", false,
                                            "no calibrated pack was admitted; incumbent weights", receipt);

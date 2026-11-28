@@ -3,8 +3,11 @@
 #include "strix/exec/descriptor.hpp"
 #include "strix/serve/decode_form.hpp"
 
+#include <cstddef>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace strix::inkling2 {
 
@@ -70,6 +73,30 @@ constexpr unsigned mini_cohort_pass_cap(bool packed_decode, unsigned backend_one
 // block or with host taps recorded keeps the per-lane launches. `selected` = STRIX_INKLING_HIP_LANES (default on).
 constexpr bool mini_served_pass_lanes(bool selected, unsigned rows, bool host_taps_off) noexcept {
     return selected && host_taps_off && rows > 1U && rows <= exec::kStepMaxRows;
+}
+
+// Head of a served cohort pass (HIP, decode_slots_served): the pass picks through the lanes form of the EXACT screened
+// head (one plane read for its lanes, each lane with the token and status of its one-row pick) when the decoder sized
+// its screen for lanes (`lanes_pick`: the screened head's HIP binding), nothing reads the cohort's scores, the pass keeps the decode weights
+// (`lowbit` off), the whole cohort is this one pass (the skipped score rows are recomputed on a read from hidden_, which
+// keeps only the last pass's head inputs) and the screen holds its rows. Otherwise the pitched rows head.
+constexpr bool mini_served_pass_screened(bool lanes_pick, bool reads_scores, bool lowbit, unsigned rows, unsigned lanes,
+                                         unsigned screen_lanes) noexcept {
+    return lanes_pick && !reads_scores && !lowbit && rows > 1U && rows == lanes && rows <= screen_lanes;
+}
+
+// Lanes the HIP BF16 screen is sized for (admit_lanes_pick). `group` = the lanes one pass-1 block stages on the device
+// (screened_head_plan::pass1_lanes); fewer than two declines the lanes pick (0). Verify windows screen at most `group`
+// rows. The served route sizes the screen for its cohort width (`cohort`, at most `cap` = screened_head_plan::kMaxLanes)
+// when `wide` is selected (STRIX_INKLING_SERVED_HEAD_WIDE, default on): a pass wider than a group runs its pass-1 groups
+// as the fastest grid dimension, so the groups read each plane row together instead of the full BF16 head once per pass;
+// every lane keeps its one-row pick (EXACT).
+constexpr unsigned mini_screen_lanes(bool served, bool wide, unsigned group, unsigned cohort, unsigned cap) noexcept {
+    if (group < 2U || cap < 2U) return 0U;
+    const unsigned held = group < cap ? group : cap;
+    if (!served || !wide) return held;
+    const unsigned width = cohort < cap ? cohort : cap;
+    return width > held ? width : held;
 }
 
 // HIP targets the exact down-image lever (inkling2-mini-combine-down-image@1) is qualified on: the NaN identity fixture and
@@ -169,6 +196,41 @@ constexpr MiniResidentRoute mini_resident_chunk_route(MiniAppendKind kind, unsig
 // the verify-kind cohorts of up to kMiniMaxVerifyRows lanes; a lane's bits do not depend on the cohort width.
 constexpr bool mini_packed_cohort_rows(bool hip, bool packed_decode, bool served_route_rows) noexcept {
     return packed_decode && (served_route_rows || !hip);
+}
+
+// Grouped prompt service (HIP, the served route lever): waiting whole prompts run as ONE grouped work, their rows
+// concatenated in passes of at most one call chunk. A prompt of at most kMiniGroupSoloRows rows runs alone: dense BF16
+// rows up to core::gemv_rows::max_rows take the tight-rows body, a pass of more rows the tile body, so the member's own
+// row count decides its bits and only a member the tile body serves in its solo call may share a pass. A member also
+// has to be ONE solo call chunk (rows <= the call chunk), which no tail rule splits.
+inline constexpr unsigned kMiniGroupSoloRows = 16U;
+// Sub-passes of one group work while no lane decodes (serve::PrefillGroupCapacity::passes): a burst of up to eight whole
+// prompts (each at most one call chunk) starts decoding together. With fewer passes the members left out of the first
+// group meet decoding lanes and fall back to bounded pieces one prompt at a time (two passes at a 4096-row chunk left
+// two of eight burst prompts there). The trade: the burst's first ids arrive together, after the whole group work.
+inline constexpr unsigned kMiniGroupPasses = 8U;
+
+// Route class of a prompt of `rows` rows for grouping: 1 = alone only (tight-rows body), 0 = groupable.
+constexpr unsigned mini_group_route_class(unsigned long long rows) noexcept { return rows <= kMiniGroupSoloRows ? 1U : 0U; }
+
+// Whole members, in order, packed into passes of at most `chunk` rows: the member count of each pass (a pass never
+// splits a member; a member of more than `chunk` rows is refused with an empty result).
+inline std::vector<unsigned> mini_group_pass_members(std::span<const std::size_t> rows, unsigned chunk) {
+    std::vector<unsigned> passes;
+    std::size_t used = 0;
+    unsigned count = 0;
+    for (const auto n : rows) {
+        if (n == 0U || n > chunk) return {};
+        if (count != 0U && used + n > chunk) {
+            passes.push_back(count);
+            used = 0;
+            count = 0;
+        }
+        used += n;
+        ++count;
+    }
+    if (count != 0U) passes.push_back(count);
+    return passes;
 }
 
 }  // namespace strix::inkling2
